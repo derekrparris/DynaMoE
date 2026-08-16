@@ -1,4 +1,4 @@
-# DynaMoE# DynaMoE
+# DynaMoE
 
 *Dynamic, SSD-streamed Mixture-of-Experts LLM inference on Apple Silicon.*
 
