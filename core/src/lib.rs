@@ -1,14 +1,8 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+// This macro sets up the internal C-FFI boundary
+uniffi::setup_scaffolding!();
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+// The #[uniffi::export] tag tells UniFFI to generate Swift code for this function
+#[uniffi::export]
+pub fn hello_from_dynamoe(name: String) -> String {
+    format!("Hello, {}! The DynaMoE Rust engine is awake and ready.", name)
 }

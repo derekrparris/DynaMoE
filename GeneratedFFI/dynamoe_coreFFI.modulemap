@@ -1,0 +1,4 @@
+module dynamoe_coreFFI {
+    header "dynamoe_coreFFI.h"
+    export *
+}
