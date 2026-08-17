@@ -399,6 +399,38 @@ fileprivate class UniffiHandleMap<T> {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
+    typealias FfiType = UInt32
+    typealias SwiftType = UInt32
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt32 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterDouble: FfiConverterPrimitive {
+    typealias FfiType = Double
+    typealias SwiftType = Double
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Double {
+        return try lift(readDouble(&buf))
+    }
+
+    public static func write(_ value: Double, into buf: inout [UInt8]) {
+        writeDouble(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterString: FfiConverter {
     typealias SwiftType = String
     typealias FfiType = RustBuffer
@@ -436,18 +468,229 @@ fileprivate struct FfiConverterString: FfiConverter {
         writeBytes(&buf, value.utf8)
     }
 }
-public func helloFromDynamoe(name: String) -> String {
-    return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_dynamoe_core_fn_func_hello_from_dynamoe(
-        FfiConverterString.lower(name),$0
-    )
-})
+
+
+public struct ModelSummary {
+    public var filePath: String
+    public var sizeGb: Double
+    public var tensorCount: UInt32
+    public var tensors: [TensorMetadata]
+    public var error: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(filePath: String, sizeGb: Double, tensorCount: UInt32, tensors: [TensorMetadata], error: String?) {
+        self.filePath = filePath
+        self.sizeGb = sizeGb
+        self.tensorCount = tensorCount
+        self.tensors = tensors
+        self.error = error
+    }
 }
-/**
- * Memory-maps a Safetensors file and reads its metadata structure
- */
-public func inspectModelWeights(filePath: String) -> String {
-    return try!  FfiConverterString.lift(try! rustCall() {
+
+
+
+extension ModelSummary: Equatable, Hashable {
+    public static func ==(lhs: ModelSummary, rhs: ModelSummary) -> Bool {
+        if lhs.filePath != rhs.filePath {
+            return false
+        }
+        if lhs.sizeGb != rhs.sizeGb {
+            return false
+        }
+        if lhs.tensorCount != rhs.tensorCount {
+            return false
+        }
+        if lhs.tensors != rhs.tensors {
+            return false
+        }
+        if lhs.error != rhs.error {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(filePath)
+        hasher.combine(sizeGb)
+        hasher.combine(tensorCount)
+        hasher.combine(tensors)
+        hasher.combine(error)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeModelSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ModelSummary {
+        return
+            try ModelSummary(
+                filePath: FfiConverterString.read(from: &buf), 
+                sizeGb: FfiConverterDouble.read(from: &buf), 
+                tensorCount: FfiConverterUInt32.read(from: &buf), 
+                tensors: FfiConverterSequenceTypeTensorMetadata.read(from: &buf), 
+                error: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ModelSummary, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.filePath, into: &buf)
+        FfiConverterDouble.write(value.sizeGb, into: &buf)
+        FfiConverterUInt32.write(value.tensorCount, into: &buf)
+        FfiConverterSequenceTypeTensorMetadata.write(value.tensors, into: &buf)
+        FfiConverterOptionString.write(value.error, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelSummary_lift(_ buf: RustBuffer) throws -> ModelSummary {
+    return try FfiConverterTypeModelSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelSummary_lower(_ value: ModelSummary) -> RustBuffer {
+    return FfiConverterTypeModelSummary.lower(value)
+}
+
+
+public struct TensorMetadata {
+    public var name: String
+    public var shapeDisplay: String
+    public var dtype: String
+    public var sizeMb: Double
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String, shapeDisplay: String, dtype: String, sizeMb: Double) {
+        self.name = name
+        self.shapeDisplay = shapeDisplay
+        self.dtype = dtype
+        self.sizeMb = sizeMb
+    }
+}
+
+
+
+extension TensorMetadata: Equatable, Hashable {
+    public static func ==(lhs: TensorMetadata, rhs: TensorMetadata) -> Bool {
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.shapeDisplay != rhs.shapeDisplay {
+            return false
+        }
+        if lhs.dtype != rhs.dtype {
+            return false
+        }
+        if lhs.sizeMb != rhs.sizeMb {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(name)
+        hasher.combine(shapeDisplay)
+        hasher.combine(dtype)
+        hasher.combine(sizeMb)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTensorMetadata: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TensorMetadata {
+        return
+            try TensorMetadata(
+                name: FfiConverterString.read(from: &buf), 
+                shapeDisplay: FfiConverterString.read(from: &buf), 
+                dtype: FfiConverterString.read(from: &buf), 
+                sizeMb: FfiConverterDouble.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TensorMetadata, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.shapeDisplay, into: &buf)
+        FfiConverterString.write(value.dtype, into: &buf)
+        FfiConverterDouble.write(value.sizeMb, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTensorMetadata_lift(_ buf: RustBuffer) throws -> TensorMetadata {
+    return try FfiConverterTypeTensorMetadata.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTensorMetadata_lower(_ value: TensorMetadata) -> RustBuffer {
+    return FfiConverterTypeTensorMetadata.lower(value)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
+    typealias SwiftType = String?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeTensorMetadata: FfiConverterRustBuffer {
+    typealias SwiftType = [TensorMetadata]
+
+    public static func write(_ value: [TensorMetadata], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeTensorMetadata.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [TensorMetadata] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [TensorMetadata]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeTensorMetadata.read(from: &buf))
+        }
+        return seq
+    }
+}
+public func inspectModelWeights(filePath: String) -> ModelSummary {
+    return try!  FfiConverterTypeModelSummary.lift(try! rustCall() {
     uniffi_dynamoe_core_fn_func_inspect_model_weights(
         FfiConverterString.lower(filePath),$0
     )
@@ -469,10 +712,7 @@ private var initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_dynamoe_core_checksum_func_hello_from_dynamoe() != 37281) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_dynamoe_core_checksum_func_inspect_model_weights() != 29074) {
+    if (uniffi_dynamoe_core_checksum_func_inspect_model_weights() != 44168) {
         return InitializationResult.apiChecksumMismatch
     }
 

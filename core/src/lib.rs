@@ -4,40 +4,92 @@ use memmap2::MmapOptions;
 use safetensors::SafeTensors;
 use std::fs::File;
 
-#[uniffi::export]
-pub fn hello_from_dynamoe(name: String) -> String {
-    format!("Hello, {}! The DynaMoE automated build is working!", name)
+#[derive(uniffi::Record)]
+pub struct TensorMetadata {
+    pub name: String,
+    pub shape_display: String,
+    pub dtype: String,
+    pub size_mb: f64,
 }
 
-/// Memory-maps a Safetensors file and reads its metadata structure
+#[derive(uniffi::Record)]
+pub struct ModelSummary {
+    pub file_path: String,
+    pub size_gb: f64,
+    pub tensor_count: u32,
+    pub tensors: Vec<TensorMetadata>,
+    pub error: Option<String>,
+}
+
 #[uniffi::export]
-pub fn inspect_model_weights(file_path: String) -> String {
-    // 1. Open the file handle
+pub fn inspect_model_weights(file_path: String) -> ModelSummary {
     let file = match File::open(&file_path) {
         Ok(f) => f,
-        Err(e) => return format!("Error: Could not open file.\nDetails: {}", e),
+        Err(e) => {
+            return ModelSummary {
+                file_path,
+                size_gb: 0.0,
+                tensor_count: 0,
+                tensors: Vec::new(),
+                error: Some(format!("Could not open file: {}", e)),
+            }
+        }
     };
 
-    // 2. Ask the macOS kernel to memory-map the file. 
-    // This is `unsafe` in Rust because another process *could* modify the file while we read it.
     let mmap = match unsafe { MmapOptions::new().map(&file) } {
         Ok(m) => m,
-        Err(e) => return format!("Error: Could not memory-map file.\nDetails: {}", e),
+        Err(e) => {
+            return ModelSummary {
+                file_path,
+                size_gb: 0.0,
+                tensor_count: 0,
+                tensors: Vec::new(),
+                error: Some(format!("Could not memory-map file: {}", e)),
+            }
+        }
     };
 
-    // 3. Parse the Safetensors header to find the weight matrices
     let tensors = match SafeTensors::deserialize(&mmap) {
         Ok(t) => t,
-        Err(e) => return format!("Error: Invalid safetensors format.\nDetails: {:?}", e),
+        Err(e) => {
+            return ModelSummary {
+                file_path,
+                size_gb: 0.0,
+                tensor_count: 0,
+                tensors: Vec::new(),
+                error: Some(format!("Invalid safetensors format: {:?}", e)),
+            }
+        }
     };
 
-    // 4. Extract some basic info to prove it worked
-    let tensor_count = tensors.names().len();
-    let total_bytes = mmap.len();
-    let size_in_gb = total_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let size_gb = mmap.len() as f64 / (1024.0 * 1024.0 * 1024.0);
+    let tensor_count = tensors.names().len() as u32;
 
-    format!(
-        "✅ Successfully memory-mapped weights!\n\nFile: {}\nSize: {:.2} GB\nMatrices Found: {}", 
-        file_path, size_in_gb, tensor_count
-    )
+    let mut tensor_list = Vec::new();
+
+    for name in tensors.names() {
+        if let Ok(tensor) = tensors.tensor(name) {
+            let shape_str = format!("{:?}", tensor.shape());
+            let dtype_str = format!("{:?}", tensor.dtype());
+            let size_mb = tensor.data().len() as f64 / (1024.0 * 1024.0);
+
+            tensor_list.push(TensorMetadata {
+                name: name.to_string(),
+                shape_display: shape_str,
+                dtype: dtype_str,
+                size_mb,
+            });
+        }
+    }
+
+    // Sort matrices alphabetically for clean UI presentation
+    tensor_list.sort_by(|a, b| a.name.cmp(&b.name));
+
+    ModelSummary {
+        file_path,
+        size_gb,
+        tensor_count,
+        tensors: tensor_list,
+        error: None,
+    }
 }
