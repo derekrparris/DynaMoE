@@ -121,6 +121,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = AB4C57DD30324B5B0082A516 /* Build configuration list for PBXNativeTarget "DynaMoE" */;
 			buildPhases = (
+				ABD5C1E83033A115009C869C /* Build Rust Engine & FFI */,
 				AB4C57B630324B5A0082A516 /* Sources */,
 				AB4C57B730324B5A0082A516 /* Frameworks */,
 				AB4C57B830324B5A0082A516 /* Resources */,
@@ -252,6 +253,27 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		ABD5C1E83033A115009C869C /* Build Rust Engine & FFI */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust Engine & FFI";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -e # Abort the build immediately if any command fails\n\n# 1. Xcode strips external paths. We must inject Cargo and Homebrew into the PATH.\nexport PATH=\"$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"\n\n# 2. Navigate to your Rust core directory\ncd \"$SRCROOT/../core\"\n\n# 3. Check if Xcode is building for Debug or Release\nif [ \"$CONFIGURATION\" = \"Release\" ]; then\n    CARGO_TARGET_DIR=\"release\"\n    CARGO_BUILD_FLAG=\"--release\"\nelse\n    CARGO_TARGET_DIR=\"debug\"\n    CARGO_BUILD_FLAG=\"\"\nfi\n\n# 4. Compile the Rust library\necho \"Compiling Rust Engine ($CONFIGURATION)...\"\ncargo build $CARGO_BUILD_FLAG\n\n# 5. Generate the UniFFI Swift Bindings\necho \"Generating Swift Bindings...\"\ncargo run --bin uniffi-bindgen generate \\\n    --library \"target/$CARGO_TARGET_DIR/libdynamoe_core.dylib\" \\\n    --language swift \\\n    --out-dir \"$SRCROOT/../GeneratedFFI\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		AB4C57B630324B5A0082A516 /* Sources */ = {
@@ -426,6 +448,7 @@
 				ENABLE_RESOURCE_ACCESS_CONTACTS = NO;
 				ENABLE_RESOURCE_ACCESS_LOCATION = NO;
 				ENABLE_RESOURCE_ACCESS_PHOTO_LIBRARY = NO;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = "$(SRCROOT)/../GeneratedFFI";
@@ -486,6 +509,7 @@
 				ENABLE_RESOURCE_ACCESS_CONTACTS = NO;
 				ENABLE_RESOURCE_ACCESS_LOCATION = NO;
 				ENABLE_RESOURCE_ACCESS_PHOTO_LIBRARY = NO;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = "$(SRCROOT)/../GeneratedFFI";
