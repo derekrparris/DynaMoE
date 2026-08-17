@@ -443,6 +443,16 @@ public func helloFromDynamoe(name: String) -> String {
     )
 })
 }
+/**
+ * Memory-maps a Safetensors file and reads its metadata structure
+ */
+public func inspectModelWeights(filePath: String) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_dynamoe_core_fn_func_inspect_model_weights(
+        FfiConverterString.lower(filePath),$0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -460,6 +470,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.contractVersionMismatch
     }
     if (uniffi_dynamoe_core_checksum_func_hello_from_dynamoe() != 37281) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_dynamoe_core_checksum_func_inspect_model_weights() != 29074) {
         return InitializationResult.apiChecksumMismatch
     }
 

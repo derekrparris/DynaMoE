@@ -7,8 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		AB745446303255F6008D5321 /* dynamoe_core.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB745445303255F6008D5321 /* dynamoe_core.swift */; };
 		AB74544B30326473008D5321 /* libdynamoe_core.a in Frameworks */ = {isa = PBXBuildFile; fileRef = AB74544A30325872008D5321 /* libdynamoe_core.a */; };
+		ABD5C1EA3033AB4D009C869C /* dynamoe_core.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABD5C1E93033AB4D009C869C /* dynamoe_core.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -32,10 +32,9 @@
 		AB4C57BA30324B5A0082A516 /* DynaMoE.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DynaMoE.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		AB4C57C930324B5B0082A516 /* DynaMoETests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DynaMoETests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		AB4C57D330324B5B0082A516 /* DynaMoEUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DynaMoEUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		AB745445303255F6008D5321 /* dynamoe_core.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = dynamoe_core.swift; sourceTree = "<group>"; };
-		AB74544730325623008D5321 /* dynamoe_coreFFI.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = dynamoe_coreFFI.h; sourceTree = "<group>"; };
 		AB745448303256FF008D5321 /* DynaMoE-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "DynaMoE-Bridging-Header.h"; sourceTree = "<group>"; };
 		AB74544A30325872008D5321 /* libdynamoe_core.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libdynamoe_core.a; path = ../core/target/debug/libdynamoe_core.a; sourceTree = "<group>"; };
+		ABD5C1E93033AB4D009C869C /* dynamoe_core.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = dynamoe_core.swift; path = ../GeneratedFFI/dynamoe_core.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -89,8 +88,6 @@
 				AB4C57CC30324B5B0082A516 /* DynaMoETests */,
 				AB4C57D630324B5B0082A516 /* DynaMoEUITests */,
 				AB4C57BB30324B5A0082A516 /* Products */,
-				AB745445303255F6008D5321 /* dynamoe_core.swift */,
-				AB74544730325623008D5321 /* dynamoe_coreFFI.h */,
 				AB745448303256FF008D5321 /* DynaMoE-Bridging-Header.h */,
 				AB74544930325872008D5321 /* Frameworks */,
 			);
@@ -109,6 +106,7 @@
 		AB74544930325872008D5321 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
+				ABD5C1E93033AB4D009C869C /* dynamoe_core.swift */,
 				AB74544A30325872008D5321 /* libdynamoe_core.a */,
 			);
 			name = Frameworks;
@@ -280,7 +278,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				AB745446303255F6008D5321 /* dynamoe_core.swift in Sources */,
+				ABD5C1EA3033AB4D009C869C /* dynamoe_core.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

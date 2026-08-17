@@ -9,6 +9,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 uniffi = { version = "0.28", features = ["build", "cli"] }
+memmap2 = "0.9"
+safetensors = "0.4"
+anyhow = "1.0"
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }
