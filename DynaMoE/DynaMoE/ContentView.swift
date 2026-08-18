@@ -3,29 +3,28 @@
 //  DynaMoE
 //
 //  Created by Derek Parris on 8/16/26.
-//
 
 import SwiftUI
 import UniformTypeIdentifiers
+import Metal
 
-// Make UniFFI record identifiable for SwiftUI Table usage
 extension TensorMetadata: Identifiable {
     public var id: String { name }
 }
 
 struct ContentView: View {
+    // Hold the active Rust engine in memory so the file stays mapped
+    @State private var engine: DynaMoeEngine? = nil
+    
     @State private var summary: ModelSummary? = nil
     @State private var errorMessage: String? = nil
+    @State private var metalStatus: String = "GPU Status: Waiting for weights..."
     @State private var searchText: String = ""
     @State private var isImporterPresented: Bool = false
 
     var filteredTensors: [TensorMetadata] {
         guard let tensors = summary?.tensors else { return [] }
-        if searchText.isEmpty {
-            return tensors
-        } else {
-            return tensors.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
-        }
+        return searchText.isEmpty ? tensors : tensors.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
     }
 
     var body: some View {
@@ -37,15 +36,9 @@ struct ContentView: View {
                         .font(.title2)
                         .fontWeight(.bold)
                     
-                    if let summary = summary {
-                        Text("\(summary.tensorCount) matrices | \(String(format: "%.2f", summary.sizeGb)) GB (mmap mapped)")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                    } else {
-                        Text("No model loaded")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                    }
+                    Text(metalStatus)
+                        .font(.subheadline)
+                        .foregroundColor(metalStatus.contains("✅") ? .green : .secondary)
                 }
                 
                 Spacer()
@@ -61,71 +54,86 @@ struct ContentView: View {
             Divider()
 
             if let err = errorMessage {
-                ContentUnavailableView("Error Loading Model", systemImage: "exclamationmark.triangle", description: Text(err))
-            } else if let summary = summary {
-                // Filter bar & Table View
+                ContentUnavailableView("Error", systemImage: "exclamationmark.triangle", description: Text(err))
+            } else if summary != nil {
                 VStack(spacing: 0) {
                     HStack {
-                        Image(systemName: "magnifyingglass")
-                            .foregroundColor(.secondary)
-                        TextField("Filter tensors (e.g. 'attn', 'expert', 'mlp')...", text: $searchText)
-                            .textFieldStyle(.plain)
+                        Image(systemName: "magnifyingglass").foregroundColor(.secondary)
+                        TextField("Filter tensors...", text: $searchText).textFieldStyle(.plain)
                     }
-                    .padding(8)
-                    .background(Color(NSColor.controlBackgroundColor))
-                    .cornerRadius(6)
-                    .padding(10)
+                    .padding(8).background(Color(NSColor.controlBackgroundColor)).cornerRadius(6).padding(10)
 
                     Table(filteredTensors) {
                         TableColumn("Tensor Name", value: \.name)
-                        TableColumn("Shape") { tensor in
-                            Text(tensor.shapeDisplay)
-                                .font(.system(.body, design: .monospaced))
-                        }
-                        TableColumn("Dtype") { tensor in
-                            Text(tensor.dtype)
-                                .font(.system(.body, design: .monospaced))
-                                .foregroundColor(.blue)
-                        }
-                        TableColumn("Size") { tensor in
-                            Text(String(format: "%.2f MB", tensor.sizeMb))
-                                .font(.system(.body, design: .monospaced))
-                        }
+                        TableColumn("Shape") { t in Text(t.shapeDisplay).font(.system(.body, design: .monospaced)) }
+                        TableColumn("Dtype") { t in Text(t.dtype).font(.system(.body, design: .monospaced)).foregroundColor(.blue) }
+                        TableColumn("Size") { t in Text(String(format: "%.2f MB", t.sizeMb)).font(.system(.body, design: .monospaced)) }
                     }
                 }
             } else {
-                ContentUnavailableView("No Weights Loaded", systemImage: "doc.badge.gearshape", description: Text("Select a .safetensors file to inspect its memory-mapped tensor layout."))
+                ContentUnavailableView("No Weights Loaded", systemImage: "memorychip", description: Text("Select a .safetensors file to test Metal Zero-Copy Handoff."))
             }
         }
         .frame(minWidth: 800, minHeight: 500)
-        .fileImporter(
-            isPresented: $isImporterPresented,
-            allowedContentTypes: [.data],
-            allowsMultipleSelection: false
-        ) { result in
+        .fileImporter(isPresented: $isImporterPresented, allowedContentTypes: [.data], allowsMultipleSelection: false) { result in
             switch result {
             case .success(let urls):
                 guard let url = urls.first else { return }
                 if url.startAccessingSecurityScopedResource() {
                     defer { url.stopAccessingSecurityScopedResource() }
-                    let res = inspectModelWeights(filePath: url.path)
-                    if let err = res.error {
-                        self.errorMessage = err
-                        self.summary = nil
-                    } else {
-                        self.errorMessage = nil
-                        self.summary = res
-                    }
+                    loadAndBridgeToMetal(filePath: url.path)
                 } else {
-                    self.errorMessage = "macOS Sandbox denied file access."
+                    errorMessage = "macOS Sandbox denied file access."
                 }
             case .failure(let error):
-                self.errorMessage = error.localizedDescription
+                errorMessage = error.localizedDescription
             }
         }
     }
-}
-
-#Preview {
-    ContentView()
+    
+    // MARK: - Metal Zero-Copy Logic
+    private func loadAndBridgeToMetal(filePath: String) {
+        do {
+            // 1. Initialize the stateful Rust engine (mmaps the file)
+            let loadedEngine = try DynaMoeEngine(filePath: filePath)
+            self.engine = loadedEngine
+            self.summary = try loadedEngine.getSummary()
+            self.errorMessage = nil
+            
+            // 2. Get the default Apple Silicon GPU
+            guard let device = MTLCreateSystemDefaultDevice() else {
+                metalStatus = "❌ Failed to initialize Metal GPU."
+                return
+            }
+            
+            // 3. Convert Rust's u64 address into a Swift memory pointer
+            let address = UInt(loadedEngine.bufferBaseAddress())
+            guard let pointer = UnsafeMutableRawPointer(bitPattern: address) else {
+                metalStatus = "❌ Invalid memory pointer received from Rust."
+                return
+            }
+            let length = Int(loadedEngine.bufferLength())
+            
+            // 4. THE HANDOFF: Tell Metal to wrap the SSD pointer directly without copying
+            guard let buffer = device.makeBuffer(
+                bytesNoCopy: pointer,
+                length: length,
+                options: .storageModeShared,
+                deallocator: { _, _ in
+                    // Empty closure: Rust owns the lifecycle, so Metal shouldn't try to free it.
+                }
+            ) else {
+                metalStatus = "❌ Metal rejected the buffer (Page Alignment Error?)"
+                return
+            }
+            
+            let mbSize = Double(buffer.length) / (1024.0 * 1024.0)
+            metalStatus = "✅ Zero-Copy Active! GPU is directly mapping \(String(format: "%.2f", mbSize)) MB"
+            
+        } catch {
+            self.errorMessage = "Core Engine Error: \(error.localizedDescription)"
+            self.summary = nil
+            self.engine = nil
+        }
+    }
 }

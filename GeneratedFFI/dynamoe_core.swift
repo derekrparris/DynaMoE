@@ -415,6 +415,22 @@ fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
+    typealias FfiType = UInt64
+    typealias SwiftType = UInt64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterDouble: FfiConverterPrimitive {
     typealias FfiType = Double
     typealias SwiftType = Double
@@ -470,21 +486,163 @@ fileprivate struct FfiConverterString: FfiConverter {
 }
 
 
+
+
+public protocol DynaMoeEngineProtocol : AnyObject {
+    
+    func bufferBaseAddress()  -> UInt64
+    
+    func bufferLength()  -> UInt64
+    
+    func getSummary() throws  -> ModelSummary
+    
+}
+
+open class DynaMoeEngine:
+    DynaMoeEngineProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_dynamoe_core_fn_clone_dynamoeengine(self.pointer, $0) }
+    }
+public convenience init(filePath: String)throws  {
+    let pointer =
+        try rustCallWithError(FfiConverterTypeEngineError.lift) {
+    uniffi_dynamoe_core_fn_constructor_dynamoeengine_new(
+        FfiConverterString.lower(filePath),$0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_dynamoe_core_fn_free_dynamoeengine(pointer, $0) }
+    }
+
+    
+
+    
+open func bufferBaseAddress() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_dynamoe_core_fn_method_dynamoeengine_buffer_base_address(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func bufferLength() -> UInt64 {
+    return try!  FfiConverterUInt64.lift(try! rustCall() {
+    uniffi_dynamoe_core_fn_method_dynamoeengine_buffer_length(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+open func getSummary()throws  -> ModelSummary {
+    return try  FfiConverterTypeModelSummary.lift(try rustCallWithError(FfiConverterTypeEngineError.lift) {
+    uniffi_dynamoe_core_fn_method_dynamoeengine_get_summary(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDynaMoeEngine: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = DynaMoeEngine
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> DynaMoeEngine {
+        return DynaMoeEngine(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: DynaMoeEngine) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DynaMoeEngine {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: DynaMoeEngine, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDynaMoeEngine_lift(_ pointer: UnsafeMutableRawPointer) throws -> DynaMoeEngine {
+    return try FfiConverterTypeDynaMoeEngine.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDynaMoeEngine_lower(_ value: DynaMoeEngine) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeDynaMoeEngine.lower(value)
+}
+
+
 public struct ModelSummary {
-    public var filePath: String
     public var sizeGb: Double
     public var tensorCount: UInt32
     public var tensors: [TensorMetadata]
-    public var error: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(filePath: String, sizeGb: Double, tensorCount: UInt32, tensors: [TensorMetadata], error: String?) {
-        self.filePath = filePath
+    public init(sizeGb: Double, tensorCount: UInt32, tensors: [TensorMetadata]) {
         self.sizeGb = sizeGb
         self.tensorCount = tensorCount
         self.tensors = tensors
-        self.error = error
     }
 }
 
@@ -492,9 +650,6 @@ public struct ModelSummary {
 
 extension ModelSummary: Equatable, Hashable {
     public static func ==(lhs: ModelSummary, rhs: ModelSummary) -> Bool {
-        if lhs.filePath != rhs.filePath {
-            return false
-        }
         if lhs.sizeGb != rhs.sizeGb {
             return false
         }
@@ -504,18 +659,13 @@ extension ModelSummary: Equatable, Hashable {
         if lhs.tensors != rhs.tensors {
             return false
         }
-        if lhs.error != rhs.error {
-            return false
-        }
         return true
     }
 
     public func hash(into hasher: inout Hasher) {
-        hasher.combine(filePath)
         hasher.combine(sizeGb)
         hasher.combine(tensorCount)
         hasher.combine(tensors)
-        hasher.combine(error)
     }
 }
 
@@ -527,20 +677,16 @@ public struct FfiConverterTypeModelSummary: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ModelSummary {
         return
             try ModelSummary(
-                filePath: FfiConverterString.read(from: &buf), 
                 sizeGb: FfiConverterDouble.read(from: &buf), 
                 tensorCount: FfiConverterUInt32.read(from: &buf), 
-                tensors: FfiConverterSequenceTypeTensorMetadata.read(from: &buf), 
-                error: FfiConverterOptionString.read(from: &buf)
+                tensors: FfiConverterSequenceTypeTensorMetadata.read(from: &buf)
         )
     }
 
     public static func write(_ value: ModelSummary, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.filePath, into: &buf)
         FfiConverterDouble.write(value.sizeGb, into: &buf)
         FfiConverterUInt32.write(value.tensorCount, into: &buf)
         FfiConverterSequenceTypeTensorMetadata.write(value.tensors, into: &buf)
-        FfiConverterOptionString.write(value.error, into: &buf)
     }
 }
 
@@ -641,27 +787,78 @@ public func FfiConverterTypeTensorMetadata_lower(_ value: TensorMetadata) -> Rus
     return FfiConverterTypeTensorMetadata.lower(value)
 }
 
+
+public enum EngineError {
+
+    
+    
+    case FileError(details: String
+    )
+    case MmapError(details: String
+    )
+    case ParseError(details: String
+    )
+}
+
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
-    typealias SwiftType = String?
+public struct FfiConverterTypeEngineError: FfiConverterRustBuffer {
+    typealias SwiftType = EngineError
 
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EngineError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .FileError(
+            details: try FfiConverterString.read(from: &buf)
+            )
+        case 2: return .MmapError(
+            details: try FfiConverterString.read(from: &buf)
+            )
+        case 3: return .ParseError(
+            details: try FfiConverterString.read(from: &buf)
+            )
+
+         default: throw UniffiInternalError.unexpectedEnumCase
         }
-        writeInt(&buf, Int8(1))
-        FfiConverterString.write(value, into: &buf)
     }
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterString.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
+    public static func write(_ value: EngineError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        
+        case let .FileError(details):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(details, into: &buf)
+            
+        
+        case let .MmapError(details):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(details, into: &buf)
+            
+        
+        case let .ParseError(details):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(details, into: &buf)
+            
         }
+    }
+}
+
+
+extension EngineError: Equatable, Hashable {}
+
+extension EngineError: Foundation.LocalizedError {
+    public var errorDescription: String? {
+        String(reflecting: self)
     }
 }
 
@@ -689,13 +886,6 @@ fileprivate struct FfiConverterSequenceTypeTensorMetadata: FfiConverterRustBuffe
         return seq
     }
 }
-public func inspectModelWeights(filePath: String) -> ModelSummary {
-    return try!  FfiConverterTypeModelSummary.lift(try! rustCall() {
-    uniffi_dynamoe_core_fn_func_inspect_model_weights(
-        FfiConverterString.lower(filePath),$0
-    )
-})
-}
 
 private enum InitializationResult {
     case ok
@@ -712,7 +902,16 @@ private var initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_dynamoe_core_checksum_func_inspect_model_weights() != 44168) {
+    if (uniffi_dynamoe_core_checksum_method_dynamoeengine_buffer_base_address() != 62258) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_dynamoe_core_checksum_method_dynamoeengine_buffer_length() != 30514) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_dynamoe_core_checksum_method_dynamoeengine_get_summary() != 2314) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_dynamoe_core_checksum_constructor_dynamoeengine_new() != 45198) {
         return InitializationResult.apiChecksumMismatch
     }
 
