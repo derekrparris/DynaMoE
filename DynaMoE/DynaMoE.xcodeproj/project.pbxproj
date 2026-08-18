@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		AB74544B30326473008D5321 /* libdynamoe_core.a in Frameworks */ = {isa = PBXBuildFile; fileRef = AB74544A30325872008D5321 /* libdynamoe_core.a */; };
+		ABCD95923034F3D100186C2F /* ComputeShaders.metal in Sources */ = {isa = PBXBuildFile; fileRef = ABCD95913034F3D100186C2F /* ComputeShaders.metal */; };
 		ABD5C1EA3033AB4D009C869C /* dynamoe_core.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABD5C1E93033AB4D009C869C /* dynamoe_core.swift */; };
 /* End PBXBuildFile section */
 
@@ -34,6 +35,7 @@
 		AB4C57D330324B5B0082A516 /* DynaMoEUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = DynaMoEUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		AB745448303256FF008D5321 /* DynaMoE-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "DynaMoE-Bridging-Header.h"; sourceTree = "<group>"; };
 		AB74544A30325872008D5321 /* libdynamoe_core.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libdynamoe_core.a; path = ../core/target/debug/libdynamoe_core.a; sourceTree = "<group>"; };
+		ABCD95913034F3D100186C2F /* ComputeShaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = ComputeShaders.metal; sourceTree = "<group>"; };
 		ABD5C1E93033AB4D009C869C /* dynamoe_core.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = dynamoe_core.swift; path = ../GeneratedFFI/dynamoe_core.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -84,6 +86,7 @@
 		AB4C57B130324B5A0082A516 = {
 			isa = PBXGroup;
 			children = (
+				ABCD95913034F3D100186C2F /* ComputeShaders.metal */,
 				AB4C57BC30324B5A0082A516 /* DynaMoE */,
 				AB4C57CC30324B5B0082A516 /* DynaMoETests */,
 				AB4C57D630324B5B0082A516 /* DynaMoEUITests */,
@@ -278,6 +281,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				ABCD95923034F3D100186C2F /* ComputeShaders.metal in Sources */,
 				ABD5C1EA3033AB4D009C869C /* dynamoe_core.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
