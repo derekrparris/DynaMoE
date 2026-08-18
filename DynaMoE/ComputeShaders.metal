@@ -8,19 +8,36 @@
 #include <metal_stdlib>
 using namespace metal;
 
-/// MSL Compute Kernel: Reads mapped FP16/Half weights directly off the SSD address space
-kernel void inspect_tensor_weights(
-    device const char* rawBaseBuffer [[buffer(0)]],
+/// Helper: Decodes FP8 (E4M3) byte to FP32 float in GPU registers
+inline float unpack_e4m3(uchar u) {
+    uint sign = (u >> 7) & 0x01;
+    uint exp  = (u >> 3) & 0x0F;
+    uint mant = u & 0x07;
+    
+    float val = 0.0f;
+    if (exp == 0) {
+        // Subnormal numbers (2^-6 = 0.015625)
+        val = ((float)mant / 8.0f) * 0.015625f;
+    } else {
+        // Normalized numbers (Bias = 7)
+        val = (1.0f + ((float)mant / 8.0f)) * pow(2.0f, (float)exp - 7.0f);
+    }
+    return sign ? -val : val;
+}
+
+/// MSL Kernel: Reads raw 8-bit MXFP8 weights directly off SSD and dequantizes them
+kernel void dequantize_mxfp8_weights(
+    device const uchar* rawBaseBuffer [[buffer(0)]],
     device float* outputPreview [[buffer(1)]],
     constant uint64_t& byteOffset [[buffer(2)]],
     uint id [[thread_position_in_grid]]
 ) {
-    // 1. Cast the raw byte pointer at the exact tensor offset into a half-precision (FP16) float pointer
-    device const half* tensorWeights = (device const half*)(rawBaseBuffer + byteOffset);
+    // 1. Address raw byte stream at the exact tensor offset
+    device const uchar* mxfp8Bytes = rawBaseBuffer + byteOffset;
 
-    // 2. Read the weight value from GPU Unified Memory
-    half rawWeight = tensorWeights[id];
+    // 2. Fetch raw byte from virtual address space
+    uchar rawByte = mxfp8Bytes[id];
 
-    // 3. Convert FP16 -> FP32 and write to output buffer
-    outputPreview[id] = float(rawWeight);
+    // 3. Dequantize FP8 -> FP32 in threadgroup registers
+    outputPreview[id] = unpack_e4m3(rawByte);
 }

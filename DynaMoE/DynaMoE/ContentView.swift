@@ -189,7 +189,7 @@ struct ContentView: View {
               let device = MTLCreateSystemDefaultDevice(),
               let commandQueue = device.makeCommandQueue(),
               let defaultLibrary = device.makeDefaultLibrary(),
-              let kernelFunction = defaultLibrary.makeFunction(name: "inspect_tensor_weights") else {
+              let kernelFunction = defaultLibrary.makeFunction(name: "dequantize_mxfp8_weights") else {
             gpuComputeOutput = "❌ Error setting up Metal pipeline."
             return
         }
