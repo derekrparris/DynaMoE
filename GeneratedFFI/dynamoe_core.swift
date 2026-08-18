@@ -711,14 +711,18 @@ public struct TensorMetadata {
     public var shapeDisplay: String
     public var dtype: String
     public var sizeMb: Double
+    public var offsetStart: UInt64
+    public var offsetEnd: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(name: String, shapeDisplay: String, dtype: String, sizeMb: Double) {
+    public init(name: String, shapeDisplay: String, dtype: String, sizeMb: Double, offsetStart: UInt64, offsetEnd: UInt64) {
         self.name = name
         self.shapeDisplay = shapeDisplay
         self.dtype = dtype
         self.sizeMb = sizeMb
+        self.offsetStart = offsetStart
+        self.offsetEnd = offsetEnd
     }
 }
 
@@ -738,6 +742,12 @@ extension TensorMetadata: Equatable, Hashable {
         if lhs.sizeMb != rhs.sizeMb {
             return false
         }
+        if lhs.offsetStart != rhs.offsetStart {
+            return false
+        }
+        if lhs.offsetEnd != rhs.offsetEnd {
+            return false
+        }
         return true
     }
 
@@ -746,6 +756,8 @@ extension TensorMetadata: Equatable, Hashable {
         hasher.combine(shapeDisplay)
         hasher.combine(dtype)
         hasher.combine(sizeMb)
+        hasher.combine(offsetStart)
+        hasher.combine(offsetEnd)
     }
 }
 
@@ -760,7 +772,9 @@ public struct FfiConverterTypeTensorMetadata: FfiConverterRustBuffer {
                 name: FfiConverterString.read(from: &buf), 
                 shapeDisplay: FfiConverterString.read(from: &buf), 
                 dtype: FfiConverterString.read(from: &buf), 
-                sizeMb: FfiConverterDouble.read(from: &buf)
+                sizeMb: FfiConverterDouble.read(from: &buf), 
+                offsetStart: FfiConverterUInt64.read(from: &buf), 
+                offsetEnd: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -769,6 +783,8 @@ public struct FfiConverterTypeTensorMetadata: FfiConverterRustBuffer {
         FfiConverterString.write(value.shapeDisplay, into: &buf)
         FfiConverterString.write(value.dtype, into: &buf)
         FfiConverterDouble.write(value.sizeMb, into: &buf)
+        FfiConverterUInt64.write(value.offsetStart, into: &buf)
+        FfiConverterUInt64.write(value.offsetEnd, into: &buf)
     }
 }
 
@@ -798,6 +814,8 @@ public enum EngineError {
     )
     case ParseError(details: String
     )
+    case TensorNotFound(name: String
+    )
 }
 
 
@@ -822,6 +840,9 @@ public struct FfiConverterTypeEngineError: FfiConverterRustBuffer {
             )
         case 3: return .ParseError(
             details: try FfiConverterString.read(from: &buf)
+            )
+        case 4: return .TensorNotFound(
+            name: try FfiConverterString.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -848,6 +869,11 @@ public struct FfiConverterTypeEngineError: FfiConverterRustBuffer {
         case let .ParseError(details):
             writeInt(&buf, Int32(3))
             FfiConverterString.write(details, into: &buf)
+            
+        
+        case let .TensorNotFound(name):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(name, into: &buf)
             
         }
     }

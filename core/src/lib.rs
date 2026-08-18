@@ -11,15 +11,16 @@ pub enum EngineError {
     FileError { details: String },
     MmapError { details: String },
     ParseError { details: String },
+    TensorNotFound { name: String },
 }
 
-// UniFFI requires Display so Swift can render error strings
 impl fmt::Display for EngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             EngineError::FileError { details } => write!(f, "File error: {}", details),
             EngineError::MmapError { details } => write!(f, "Mmap error: {}", details),
             EngineError::ParseError { details } => write!(f, "Parse error: {}", details),
+            EngineError::TensorNotFound { name } => write!(f, "Tensor not found: {}", name),
         }
     }
 }
@@ -30,6 +31,8 @@ pub struct TensorMetadata {
     pub shape_display: String,
     pub dtype: String,
     pub size_mb: f64,
+    pub offset_start: u64,
+    pub offset_end: u64,
 }
 
 #[derive(uniffi::Record)]
@@ -69,11 +72,20 @@ impl DynaMoeEngine {
 
         for name in tensors.names() {
             if let Ok(tensor) = tensors.tensor(name) {
+                // Get header offset and data slice relative to mmap base
+                let data_ptr = tensor.data().as_ptr() as usize;
+                let base_ptr = self.mmap.as_ptr() as usize;
+                
+                let offset_start = (data_ptr - base_ptr) as u64;
+                let offset_end = offset_start + tensor.data().len() as u64;
+
                 tensor_list.push(TensorMetadata {
                     name: name.to_string(),
                     shape_display: format!("{:?}", tensor.shape()),
                     dtype: format!("{:?}", tensor.dtype()),
                     size_mb: tensor.data().len() as f64 / (1024.0 * 1024.0),
+                    offset_start,
+                    offset_end,
                 });
             }
         }
