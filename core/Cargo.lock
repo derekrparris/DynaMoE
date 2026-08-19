@@ -360,6 +360,8 @@ version = "0.1.0"
 dependencies = [
  "memmap2",
  "safetensors",
+ "serde",
+ "serde_json",
  "tokenizers",
  "uniffi",
 ]

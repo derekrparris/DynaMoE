@@ -12,6 +12,8 @@ memmap2 = "0.9"
 safetensors = "0.4"
 uniffi = { version = "0.28", features = ["build", "cli"] }
 tokenizers = "0.20"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }

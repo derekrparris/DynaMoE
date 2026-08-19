@@ -490,10 +490,6 @@ fileprivate struct FfiConverterString: FfiConverter {
 
 public protocol DynaMoeEngineProtocol : AnyObject {
     
-    func bufferBaseAddress()  -> UInt64
-    
-    func bufferLength()  -> UInt64
-    
     func getSummary() throws  -> ModelSummary
     
 }
@@ -555,20 +551,6 @@ public convenience init(filePath: String)throws  {
 
     
 
-    
-open func bufferBaseAddress() -> UInt64 {
-    return try!  FfiConverterUInt64.lift(try! rustCall() {
-    uniffi_dynamoe_core_fn_method_dynamoeengine_buffer_base_address(self.uniffiClonePointer(),$0
-    )
-})
-}
-    
-open func bufferLength() -> UInt64 {
-    return try!  FfiConverterUInt64.lift(try! rustCall() {
-    uniffi_dynamoe_core_fn_method_dynamoeengine_buffer_length(self.uniffiClonePointer(),$0
-    )
-})
-}
     
 open func getSummary()throws  -> ModelSummary {
     return try  FfiConverterTypeModelSummary.lift(try rustCallWithError(FfiConverterTypeEngineError.lift) {
@@ -858,16 +840,18 @@ public struct ModelSummary {
     public var tensorCount: UInt32
     public var layerCount: UInt32
     public var maxExpertId: UInt32
+    public var shards: [ShardMetadata]
     public var tensors: [TensorMetadata]
     public var layers: [LayerSummary]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(sizeGb: Double, tensorCount: UInt32, layerCount: UInt32, maxExpertId: UInt32, tensors: [TensorMetadata], layers: [LayerSummary]) {
+    public init(sizeGb: Double, tensorCount: UInt32, layerCount: UInt32, maxExpertId: UInt32, shards: [ShardMetadata], tensors: [TensorMetadata], layers: [LayerSummary]) {
         self.sizeGb = sizeGb
         self.tensorCount = tensorCount
         self.layerCount = layerCount
         self.maxExpertId = maxExpertId
+        self.shards = shards
         self.tensors = tensors
         self.layers = layers
     }
@@ -889,6 +873,9 @@ extension ModelSummary: Equatable, Hashable {
         if lhs.maxExpertId != rhs.maxExpertId {
             return false
         }
+        if lhs.shards != rhs.shards {
+            return false
+        }
         if lhs.tensors != rhs.tensors {
             return false
         }
@@ -903,6 +890,7 @@ extension ModelSummary: Equatable, Hashable {
         hasher.combine(tensorCount)
         hasher.combine(layerCount)
         hasher.combine(maxExpertId)
+        hasher.combine(shards)
         hasher.combine(tensors)
         hasher.combine(layers)
     }
@@ -920,6 +908,7 @@ public struct FfiConverterTypeModelSummary: FfiConverterRustBuffer {
                 tensorCount: FfiConverterUInt32.read(from: &buf), 
                 layerCount: FfiConverterUInt32.read(from: &buf), 
                 maxExpertId: FfiConverterUInt32.read(from: &buf), 
+                shards: FfiConverterSequenceTypeShardMetadata.read(from: &buf), 
                 tensors: FfiConverterSequenceTypeTensorMetadata.read(from: &buf), 
                 layers: FfiConverterSequenceTypeLayerSummary.read(from: &buf)
         )
@@ -930,6 +919,7 @@ public struct FfiConverterTypeModelSummary: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.tensorCount, into: &buf)
         FfiConverterUInt32.write(value.layerCount, into: &buf)
         FfiConverterUInt32.write(value.maxExpertId, into: &buf)
+        FfiConverterSequenceTypeShardMetadata.write(value.shards, into: &buf)
         FfiConverterSequenceTypeTensorMetadata.write(value.tensors, into: &buf)
         FfiConverterSequenceTypeLayerSummary.write(value.layers, into: &buf)
     }
@@ -951,11 +941,94 @@ public func FfiConverterTypeModelSummary_lower(_ value: ModelSummary) -> RustBuf
 }
 
 
+public struct ShardMetadata {
+    public var index: UInt32
+    public var filename: String
+    public var baseAddress: UInt64
+    public var length: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(index: UInt32, filename: String, baseAddress: UInt64, length: UInt64) {
+        self.index = index
+        self.filename = filename
+        self.baseAddress = baseAddress
+        self.length = length
+    }
+}
+
+
+
+extension ShardMetadata: Equatable, Hashable {
+    public static func ==(lhs: ShardMetadata, rhs: ShardMetadata) -> Bool {
+        if lhs.index != rhs.index {
+            return false
+        }
+        if lhs.filename != rhs.filename {
+            return false
+        }
+        if lhs.baseAddress != rhs.baseAddress {
+            return false
+        }
+        if lhs.length != rhs.length {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(index)
+        hasher.combine(filename)
+        hasher.combine(baseAddress)
+        hasher.combine(length)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShardMetadata: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShardMetadata {
+        return
+            try ShardMetadata(
+                index: FfiConverterUInt32.read(from: &buf), 
+                filename: FfiConverterString.read(from: &buf), 
+                baseAddress: FfiConverterUInt64.read(from: &buf), 
+                length: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ShardMetadata, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.index, into: &buf)
+        FfiConverterString.write(value.filename, into: &buf)
+        FfiConverterUInt64.write(value.baseAddress, into: &buf)
+        FfiConverterUInt64.write(value.length, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShardMetadata_lift(_ buf: RustBuffer) throws -> ShardMetadata {
+    return try FfiConverterTypeShardMetadata.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShardMetadata_lower(_ value: ShardMetadata) -> RustBuffer {
+    return FfiConverterTypeShardMetadata.lower(value)
+}
+
+
 public struct TensorMetadata {
     public var name: String
     public var shapeDisplay: String
     public var dtype: String
     public var sizeMb: Double
+    public var shardIndex: UInt32
     public var offsetStart: UInt64
     public var offsetEnd: UInt64
     public var category: String
@@ -964,11 +1037,12 @@ public struct TensorMetadata {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(name: String, shapeDisplay: String, dtype: String, sizeMb: Double, offsetStart: UInt64, offsetEnd: UInt64, category: String, layerIndex: UInt32?, expertId: UInt32?) {
+    public init(name: String, shapeDisplay: String, dtype: String, sizeMb: Double, shardIndex: UInt32, offsetStart: UInt64, offsetEnd: UInt64, category: String, layerIndex: UInt32?, expertId: UInt32?) {
         self.name = name
         self.shapeDisplay = shapeDisplay
         self.dtype = dtype
         self.sizeMb = sizeMb
+        self.shardIndex = shardIndex
         self.offsetStart = offsetStart
         self.offsetEnd = offsetEnd
         self.category = category
@@ -991,6 +1065,9 @@ extension TensorMetadata: Equatable, Hashable {
             return false
         }
         if lhs.sizeMb != rhs.sizeMb {
+            return false
+        }
+        if lhs.shardIndex != rhs.shardIndex {
             return false
         }
         if lhs.offsetStart != rhs.offsetStart {
@@ -1016,6 +1093,7 @@ extension TensorMetadata: Equatable, Hashable {
         hasher.combine(shapeDisplay)
         hasher.combine(dtype)
         hasher.combine(sizeMb)
+        hasher.combine(shardIndex)
         hasher.combine(offsetStart)
         hasher.combine(offsetEnd)
         hasher.combine(category)
@@ -1036,6 +1114,7 @@ public struct FfiConverterTypeTensorMetadata: FfiConverterRustBuffer {
                 shapeDisplay: FfiConverterString.read(from: &buf), 
                 dtype: FfiConverterString.read(from: &buf), 
                 sizeMb: FfiConverterDouble.read(from: &buf), 
+                shardIndex: FfiConverterUInt32.read(from: &buf), 
                 offsetStart: FfiConverterUInt64.read(from: &buf), 
                 offsetEnd: FfiConverterUInt64.read(from: &buf), 
                 category: FfiConverterString.read(from: &buf), 
@@ -1049,6 +1128,7 @@ public struct FfiConverterTypeTensorMetadata: FfiConverterRustBuffer {
         FfiConverterString.write(value.shapeDisplay, into: &buf)
         FfiConverterString.write(value.dtype, into: &buf)
         FfiConverterDouble.write(value.sizeMb, into: &buf)
+        FfiConverterUInt32.write(value.shardIndex, into: &buf)
         FfiConverterUInt64.write(value.offsetStart, into: &buf)
         FfiConverterUInt64.write(value.offsetEnd, into: &buf)
         FfiConverterString.write(value.category, into: &buf)
@@ -1234,6 +1314,31 @@ fileprivate struct FfiConverterSequenceTypeLayerSummary: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeShardMetadata: FfiConverterRustBuffer {
+    typealias SwiftType = [ShardMetadata]
+
+    public static func write(_ value: [ShardMetadata], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeShardMetadata.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ShardMetadata] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ShardMetadata]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeShardMetadata.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeTensorMetadata: FfiConverterRustBuffer {
     typealias SwiftType = [TensorMetadata]
 
@@ -1270,12 +1375,6 @@ private var initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_dynamoe_core_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
-    }
-    if (uniffi_dynamoe_core_checksum_method_dynamoeengine_buffer_base_address() != 62258) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_dynamoe_core_checksum_method_dynamoeengine_buffer_length() != 30514) {
-        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_dynamoe_core_checksum_method_dynamoeengine_get_summary() != 2314) {
         return InitializationResult.apiChecksumMismatch

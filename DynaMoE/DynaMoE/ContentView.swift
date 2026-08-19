@@ -15,7 +15,10 @@ struct ContentView: View {
     @State private var searchText: String = ""
     @State private var selectedCategory: String = "All"
     
-    // File Importer States
+    // Multi-Shard Metal Buffers
+    @State private var shardBuffers: [UInt32: MTLBuffer] = [:]
+    
+    // File Importers
     @State private var isWeightImporterPresented: Bool = false
     @State private var isTokenizerImporterPresented: Bool = false
     
@@ -74,10 +77,13 @@ struct ContentView: View {
                 
                 Spacer()
                 
-                // Action Buttons with Isolated File Importers
                 HStack(spacing: 8) {
                     Button(tokenizer == nil ? "Load tokenizer.json" : "Tokenizer Loaded ✅") {
+                        #if os(macOS)
+                        selectTokenizerWithOpenPanel()
+                        #else
                         isTokenizerImporterPresented = true
+                        #endif
                     }
                     .buttonStyle(.bordered)
                     .fileImporter(
@@ -97,24 +103,39 @@ struct ContentView: View {
                         }
                     }
                     
-                    Button("Select .safetensors") {
+                    Button("Select Model Folder / Index") {
+                        #if os(macOS)
+                        selectModelWithOpenPanel()
+                        #else
                         isWeightImporterPresented = true
+                        #endif
                     }
                     .buttonStyle(.borderedProminent)
                     .fileImporter(
                         isPresented: $isWeightImporterPresented,
-                        allowedContentTypes: [.data],
-                        allowsMultipleSelection: false
+                        allowedContentTypes: [.folder, .json, .data],
+                        allowsMultipleSelection: true
                     ) { result in
                         switch result {
                         case .success(let urls):
-                            guard let url = urls.first else { return }
-                            if url.startAccessingSecurityScopedResource() {
-                                defer { url.stopAccessingSecurityScopedResource() }
-                                loadAndBridgeToMetal(filePath: url.path)
-                            } else {
-                                errorMessage = "macOS Sandbox denied file access."
+                            guard let primaryUrl = urls.first else { return }
+                            
+                            // Start security access for all selected items/folders
+                            for url in urls {
+                                _ = url.startAccessingSecurityScopedResource()
                             }
+                            
+                            // If a directory was picked, locate model.safetensors.index.json inside it
+                            var targetPath = primaryUrl.path
+                            if primaryUrl.hasDirectoryPath {
+                                let indexPath = primaryUrl.appendingPathComponent("model.safetensors.index.json").path
+                                if FileManager.default.fileExists(atPath: indexPath) {
+                                    targetPath = indexPath
+                                }
+                            }
+                            
+                            loadAndBridgeToMetal(filePath: targetPath)
+                            
                         case .failure(let error):
                             errorMessage = error.localizedDescription
                         }
@@ -219,6 +240,9 @@ struct ContentView: View {
                         TableColumn("Dtype") { t in
                             Text(t.dtype).font(.system(.body, design: .monospaced)).foregroundColor(.blue)
                         }
+                        TableColumn("Shard") { t in
+                            Text("Shard #\(t.shardIndex)").font(.system(.caption, design: .monospaced)).foregroundColor(.secondary)
+                        }
                         TableColumn("Size") { t in
                             Text(String(format: "%.2f MB", t.sizeMb)).font(.system(.body, design: .monospaced))
                         }
@@ -231,7 +255,7 @@ struct ContentView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Selected: \(tensor.name)")
                                     .font(.headline)
-                                Text("Category: \(tensor.category) | Offset: \(tensor.offsetStart) bytes")
+                                Text("Category: \(tensor.category) | Shard #\(tensor.shardIndex) | Offset: \(tensor.offsetStart) bytes")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             }
@@ -260,7 +284,7 @@ struct ContentView: View {
                     }
                 }
             } else {
-                ContentUnavailableView("No Weights Loaded", systemImage: "memorychip", description: Text("Select a .safetensors file to inspect MoE layer topology."))
+                ContentUnavailableView("No Weights Loaded", systemImage: "memorychip", description: Text("Select a .safetensors or index.json file to inspect MoE layer topology."))
             }
         }
         .frame(minWidth: 900, minHeight: 650)
@@ -292,144 +316,141 @@ struct ContentView: View {
     }
     
     // MARK: - Execute Token Embedding Lookup (h_0)
-        private func executeEmbeddingLookup(tokenIds: [UInt32]) {
-            guard let engine = engine,
-                  let summary = summary,
-                  let device = MTLCreateSystemDefaultDevice(),
-                  let commandQueue = device.makeCommandQueue(),
-                  let defaultLibrary = device.makeDefaultLibrary() else {
-                gpuComputeOutput = "❌ Error setting up Metal embedding pipeline."
+    private func executeEmbeddingLookup(tokenIds: [UInt32]) {
+        guard let summary = summary,
+              let device = MTLCreateSystemDefaultDevice(),
+              let commandQueue = device.makeCommandQueue(),
+              let defaultLibrary = device.makeDefaultLibrary() else {
+            gpuComputeOutput = "❌ Error setting up Metal embedding pipeline."
+            return
+        }
+
+        do {
+            guard let embedWeight = summary.tensors.first(where: {
+                ($0.name.contains("embed_tokens") || $0.name.contains("embed") || $0.name.contains("wte")) &&
+                $0.name.contains("weight") && !$0.name.contains("scale")
+            }) else {
+                gpuComputeOutput = "❌ Couldn't locate embedding weight tensor."
                 return
             }
 
-            do {
-                guard let embedWeight = summary.tensors.first(where: {
-                    ($0.name.contains("embed_tokens") || $0.name.contains("embed") || $0.name.contains("wte")) &&
-                    $0.name.contains("weight") && !$0.name.contains("scale")
-                }) else {
-                    gpuComputeOutput = "❌ Couldn't locate embedding weight tensor."
-                    return
-                }
-
-                var weightOffset = embedWeight.offsetStart
-                var hiddenDim: UInt32 = 2048 // Qwen 35B hidden dimension
-                let tokenCount = tokenIds.count
-                let totalVectorElements = tokenCount * Int(hiddenDim)
-                
-                guard let tokenBuffer = device.makeBuffer(bytes: tokenIds, length: tokenCount * MemoryLayout<UInt32>.stride, options: .storageModeShared),
-                      let h0OutputBuffer = device.makeBuffer(length: totalVectorElements * MemoryLayout<Float>.stride, options: .storageModeShared) else { return }
-                
-                let address = UInt(engine.bufferBaseAddress())
-                guard let pointer = UnsafeMutableRawPointer(bitPattern: address) else { return }
-                let length = Int(engine.bufferLength())
-                guard let rawBaseBuffer = device.makeBuffer(bytesNoCopy: pointer, length: length, options: .storageModeShared, deallocator: nil) else { return }
-                
-                guard let commandBuffer = commandQueue.makeCommandBuffer(),
-                      let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
-
-                let isBF16 = embedWeight.dtype.contains("BF16") || embedWeight.dtype.contains("BFLOAT16")
-                
-                if isBF16 {
-                    // Execute BF16 Kernel
-                    guard let kernelFunction = defaultLibrary.makeFunction(name: "lookup_embeddings_bf16") else { return }
-                    let pipelineState = try device.makeComputePipelineState(function: kernelFunction)
-                    
-                    computeEncoder.setComputePipelineState(pipelineState)
-                    computeEncoder.setBuffer(rawBaseBuffer, offset: 0, index: 0)
-                    computeEncoder.setBuffer(tokenBuffer, offset: 0, index: 1)
-                    computeEncoder.setBuffer(h0OutputBuffer, offset: 0, index: 2)
-                    computeEncoder.setBytes(&weightOffset, length: MemoryLayout<UInt64>.stride, index: 3)
-                    computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 4)
-                } else {
-                    // Execute MXFP8 Kernel
-                    let embedScale = summary.tensors.first(where: {
-                        $0.name.contains(embedWeight.name.replacingOccurrences(of: ".weight", with: "")) &&
-                        ($0.name.contains("scale") || $0.name.contains("scales"))
-                    })
-                    var scaleOffset = embedScale?.offsetStart ?? weightOffset
-                    
-                    guard let kernelFunction = defaultLibrary.makeFunction(name: "lookup_embeddings_mxfp8") else { return }
-                    let pipelineState = try device.makeComputePipelineState(function: kernelFunction)
-                    
-                    computeEncoder.setComputePipelineState(pipelineState)
-                    computeEncoder.setBuffer(rawBaseBuffer, offset: 0, index: 0)
-                    computeEncoder.setBuffer(tokenBuffer, offset: 0, index: 1)
-                    computeEncoder.setBuffer(h0OutputBuffer, offset: 0, index: 2)
-                    computeEncoder.setBytes(&weightOffset, length: MemoryLayout<UInt64>.stride, index: 3)
-                    computeEncoder.setBytes(&scaleOffset, length: MemoryLayout<UInt64>.stride, index: 4)
-                    computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 5)
-                }
-                
-                let gridSize = MTLSize(width: totalVectorElements, height: 1, depth: 1)
-                let threadgroupSize = MTLSize(width: min(totalVectorElements, 256), height: 1, depth: 1)
-                computeEncoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
-                
-                computeEncoder.endEncoding()
-                commandBuffer.commit()
-                commandBuffer.waitUntilCompleted()
-                
-                let rawFloatPtr = h0OutputBuffer.contents().bindMemory(to: Float.self, capacity: totalVectorElements)
-                var h0Sample: [String] = []
-                for i in 0..<8 {
-                    h0Sample.append(String(format: "%.6f", rawFloatPtr[i]))
-                }
-                
-                gpuComputeOutput = "🚀 Generated h_0 Vector (\(embedWeight.dtype)) [\(tokenCount) x \(hiddenDim)]! First 8 dims of Token #0: [\(h0Sample.joined(separator: ", "))]"
-                
-            } catch {
-                gpuComputeOutput = "❌ Embedding Lookup Error: \(error.localizedDescription)"
+            guard let rawBaseBuffer = shardBuffers[embedWeight.shardIndex] else {
+                gpuComputeOutput = "❌ Shard #\(embedWeight.shardIndex) buffer not loaded."
+                return
             }
+
+            var weightOffset = embedWeight.offsetStart
+            var hiddenDim: UInt32 = 2048 // Qwen 35B hidden dimension
+            let tokenCount = tokenIds.count
+            let totalVectorElements = tokenCount * Int(hiddenDim)
+            
+            guard let tokenBuffer = device.makeBuffer(bytes: tokenIds, length: tokenCount * MemoryLayout<UInt32>.stride, options: .storageModeShared),
+                  let h0OutputBuffer = device.makeBuffer(length: totalVectorElements * MemoryLayout<Float>.stride, options: .storageModeShared),
+                  let commandBuffer = commandQueue.makeCommandBuffer(),
+                  let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
+
+            let isBF16 = embedWeight.dtype.contains("BF16") || embedWeight.dtype.contains("BFLOAT16")
+            
+            if isBF16 {
+                guard let kernelFunction = defaultLibrary.makeFunction(name: "lookup_embeddings_bf16") else { return }
+                let pipelineState = try device.makeComputePipelineState(function: kernelFunction)
+                
+                computeEncoder.setComputePipelineState(pipelineState)
+                computeEncoder.setBuffer(rawBaseBuffer, offset: 0, index: 0)
+                computeEncoder.setBuffer(tokenBuffer, offset: 0, index: 1)
+                computeEncoder.setBuffer(h0OutputBuffer, offset: 0, index: 2)
+                computeEncoder.setBytes(&weightOffset, length: MemoryLayout<UInt64>.stride, index: 3)
+                computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 4)
+            } else {
+                let embedScale = summary.tensors.first(where: {
+                    $0.name.contains(embedWeight.name.replacingOccurrences(of: ".weight", with: "")) &&
+                    ($0.name.contains("scale") || $0.name.contains("scales"))
+                })
+                var scaleOffset = embedScale?.offsetStart ?? weightOffset
+                
+                guard let kernelFunction = defaultLibrary.makeFunction(name: "lookup_embeddings_mxfp8") else { return }
+                let pipelineState = try device.makeComputePipelineState(function: kernelFunction)
+                
+                computeEncoder.setComputePipelineState(pipelineState)
+                computeEncoder.setBuffer(rawBaseBuffer, offset: 0, index: 0)
+                computeEncoder.setBuffer(tokenBuffer, offset: 0, index: 1)
+                computeEncoder.setBuffer(h0OutputBuffer, offset: 0, index: 2)
+                computeEncoder.setBytes(&weightOffset, length: MemoryLayout<UInt64>.stride, index: 3)
+                computeEncoder.setBytes(&scaleOffset, length: MemoryLayout<UInt64>.stride, index: 4)
+                computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 5)
+            }
+            
+            let gridSize = MTLSize(width: totalVectorElements, height: 1, depth: 1)
+            let threadgroupSize = MTLSize(width: min(totalVectorElements, 256), height: 1, depth: 1)
+            computeEncoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            
+            computeEncoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            
+            let rawFloatPtr = h0OutputBuffer.contents().bindMemory(to: Float.self, capacity: totalVectorElements)
+            var h0Sample: [String] = []
+            for i in 0..<8 {
+                h0Sample.append(String(format: "%.6f", rawFloatPtr[i]))
+            }
+            
+            gpuComputeOutput = "🚀 Generated h_0 Vector (\(embedWeight.dtype)) [\(tokenCount) x \(hiddenDim)] from Shard #\(embedWeight.shardIndex)! First 8 dims of Token #0: [\(h0Sample.joined(separator: ", "))]"
+            
+        } catch {
+            gpuComputeOutput = "❌ Embedding Lookup Error: \(error.localizedDescription)"
         }
-    
+    }
+
     private func loadAndBridgeToMetal(filePath: String) {
         do {
             let loadedEngine = try DynaMoeEngine(filePath: filePath)
-            self.engine = loadedEngine
-            self.summary = try loadedEngine.getSummary()
-            self.errorMessage = nil
-            self.selectedTensorID = nil
-            self.gpuComputeOutput = nil
+            let loadedSummary = try loadedEngine.getSummary()
             
             guard let device = MTLCreateSystemDefaultDevice() else {
                 metalStatus = "❌ Failed to initialize Metal GPU."
                 return
             }
             
-            let address = UInt(loadedEngine.bufferBaseAddress())
-            guard let pointer = UnsafeMutableRawPointer(bitPattern: address) else {
-                metalStatus = "❌ Invalid memory pointer received from Rust."
-                return
-            }
-            let length = Int(loadedEngine.bufferLength())
+            // Map every shard into Metal zero-copy space
+            var buffers: [UInt32: MTLBuffer] = [:]
+            var mappedGB: Double = 0.0
             
-            guard let buffer = device.makeBuffer(
-                bytesNoCopy: pointer,
-                length: length,
-                options: .storageModeShared,
-                deallocator: nil
-            ) else {
-                metalStatus = "❌ Metal rejected buffer."
-                return
+            for shard in loadedSummary.shards {
+                let address = UInt(shard.baseAddress)
+                guard let pointer = UnsafeMutableRawPointer(bitPattern: address) else { continue }
+                let length = Int(shard.length)
+                
+                if let buffer = device.makeBuffer(bytesNoCopy: pointer, length: length, options: .storageModeShared, deallocator: nil) {
+                    buffers[shard.index] = buffer
+                    mappedGB += Double(length) / (1024.0 * 1024.0 * 1024.0)
+                }
             }
             
-            let mbSize = Double(buffer.length) / (1024.0 * 1024.0)
-            metalStatus = "✅ Zero-Copy Active! GPU mapped \(String(format: "%.2f", mbSize)) MB"
+            self.engine = loadedEngine
+            self.summary = loadedSummary
+            self.shardBuffers = buffers
+            self.errorMessage = nil
+            self.selectedTensorID = nil
+            self.gpuComputeOutput = nil
+            
+            metalStatus = "✅ Zero-Copy Active! \(loadedSummary.shards.count) Shards Mapped (\(String(format: "%.2f", mappedGB)) GB)"
             
         } catch {
             self.errorMessage = "Core Engine Error: \(error.localizedDescription)"
             self.summary = nil
             self.engine = nil
+            self.shardBuffers.removeAll()
         }
     }
 
     private func executeGpuShader(on tensor: TensorMetadata) {
-        guard let engine = engine,
-              let summary = summary,
+        guard let summary = summary,
               let device = MTLCreateSystemDefaultDevice(),
               let commandQueue = device.makeCommandQueue(),
               let defaultLibrary = device.makeDefaultLibrary(),
-              let kernelFunction = defaultLibrary.makeFunction(name: "dequantize_mxfp8_paired") else {
-            gpuComputeOutput = "❌ Error setting up Metal pipeline."
+              let kernelFunction = defaultLibrary.makeFunction(name: "dequantize_mxfp8_paired"),
+              let rawBaseBuffer = shardBuffers[tensor.shardIndex] else {
+            gpuComputeOutput = "❌ Error setting up Metal pipeline or missing shard buffer."
             return
         }
 
@@ -446,15 +467,6 @@ struct ContentView: View {
             weightOffset = weightTensor.offsetStart
             scaleOffset  = scaleTensor.offsetStart
 
-            let address = UInt(engine.bufferBaseAddress())
-            guard let pointer = UnsafeMutableRawPointer(bitPattern: address) else { return }
-            let length = Int(engine.bufferLength())
-            
-            guard let rawBaseBuffer = device.makeBuffer(bytesNoCopy: pointer, length: length, options: .storageModeShared, deallocator: nil) else {
-                gpuComputeOutput = "❌ Failed to instantiate Metal base buffer."
-                return
-            }
-            
             let sampleCount = 8
             let outputByteLength = sampleCount * MemoryLayout<Float>.stride
             guard let outputBuffer = device.makeBuffer(length: outputByteLength, options: .storageModeShared) else { return }
@@ -482,10 +494,47 @@ struct ContentView: View {
                 sampleValues.append(String(format: "%.6f", rawFloatPtr[i]))
             }
             
-            gpuComputeOutput = "⚡ MXFP8 Dequantized! First 8 weights for '\(baseName)': [\(sampleValues.joined(separator: ", "))]"
+            gpuComputeOutput = "⚡ MXFP8 Dequantized! First 8 weights for '\(baseName)' (Shard #\(tensor.shardIndex)): [\(sampleValues.joined(separator: ", "))]"
             
         } catch {
             gpuComputeOutput = "❌ Pipeline Error: \(error.localizedDescription)"
         }
     }
+
+    #if os(macOS)
+    private func selectTokenizerWithOpenPanel() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.json, .data]
+        panel.message = "Select tokenizer.json"
+        panel.prompt = "Load Tokenizer"
+        
+        if panel.runModal() == .OK, let url = panel.url {
+            loadTokenizer(filePath: url.path)
+        }
+    }
+
+    private func selectModelWithOpenPanel() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.json, .data, .folder]
+        panel.message = "Select Model Snapshot Folder or model.safetensors.index.json"
+        panel.prompt = "Load Model"
+        
+        if panel.runModal() == .OK, let url = panel.url {
+            var targetPath = url.path
+            if url.hasDirectoryPath {
+                let indexPath = url.appendingPathComponent("model.safetensors.index.json").path
+                if FileManager.default.fileExists(atPath: indexPath) {
+                    targetPath = indexPath
+                }
+            }
+            loadAndBridgeToMetal(filePath: targetPath)
+        }
+    }
+    #endif
 }
