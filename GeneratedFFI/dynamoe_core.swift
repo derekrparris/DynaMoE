@@ -632,17 +632,105 @@ public func FfiConverterTypeDynaMoeEngine_lower(_ value: DynaMoeEngine) -> Unsaf
 }
 
 
-public struct ModelSummary {
-    public var sizeGb: Double
-    public var tensorCount: UInt32
-    public var tensors: [TensorMetadata]
+public struct LayerSummary {
+    public var layerIndex: UInt32
+    public var totalTensors: UInt32
+    public var routedExpertCount: UInt32
+    public var totalSizeMb: Double
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(sizeGb: Double, tensorCount: UInt32, tensors: [TensorMetadata]) {
+    public init(layerIndex: UInt32, totalTensors: UInt32, routedExpertCount: UInt32, totalSizeMb: Double) {
+        self.layerIndex = layerIndex
+        self.totalTensors = totalTensors
+        self.routedExpertCount = routedExpertCount
+        self.totalSizeMb = totalSizeMb
+    }
+}
+
+
+
+extension LayerSummary: Equatable, Hashable {
+    public static func ==(lhs: LayerSummary, rhs: LayerSummary) -> Bool {
+        if lhs.layerIndex != rhs.layerIndex {
+            return false
+        }
+        if lhs.totalTensors != rhs.totalTensors {
+            return false
+        }
+        if lhs.routedExpertCount != rhs.routedExpertCount {
+            return false
+        }
+        if lhs.totalSizeMb != rhs.totalSizeMb {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(layerIndex)
+        hasher.combine(totalTensors)
+        hasher.combine(routedExpertCount)
+        hasher.combine(totalSizeMb)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLayerSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LayerSummary {
+        return
+            try LayerSummary(
+                layerIndex: FfiConverterUInt32.read(from: &buf), 
+                totalTensors: FfiConverterUInt32.read(from: &buf), 
+                routedExpertCount: FfiConverterUInt32.read(from: &buf), 
+                totalSizeMb: FfiConverterDouble.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LayerSummary, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.layerIndex, into: &buf)
+        FfiConverterUInt32.write(value.totalTensors, into: &buf)
+        FfiConverterUInt32.write(value.routedExpertCount, into: &buf)
+        FfiConverterDouble.write(value.totalSizeMb, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLayerSummary_lift(_ buf: RustBuffer) throws -> LayerSummary {
+    return try FfiConverterTypeLayerSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLayerSummary_lower(_ value: LayerSummary) -> RustBuffer {
+    return FfiConverterTypeLayerSummary.lower(value)
+}
+
+
+public struct ModelSummary {
+    public var sizeGb: Double
+    public var tensorCount: UInt32
+    public var layerCount: UInt32
+    public var maxExpertId: UInt32
+    public var tensors: [TensorMetadata]
+    public var layers: [LayerSummary]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(sizeGb: Double, tensorCount: UInt32, layerCount: UInt32, maxExpertId: UInt32, tensors: [TensorMetadata], layers: [LayerSummary]) {
         self.sizeGb = sizeGb
         self.tensorCount = tensorCount
+        self.layerCount = layerCount
+        self.maxExpertId = maxExpertId
         self.tensors = tensors
+        self.layers = layers
     }
 }
 
@@ -656,7 +744,16 @@ extension ModelSummary: Equatable, Hashable {
         if lhs.tensorCount != rhs.tensorCount {
             return false
         }
+        if lhs.layerCount != rhs.layerCount {
+            return false
+        }
+        if lhs.maxExpertId != rhs.maxExpertId {
+            return false
+        }
         if lhs.tensors != rhs.tensors {
+            return false
+        }
+        if lhs.layers != rhs.layers {
             return false
         }
         return true
@@ -665,7 +762,10 @@ extension ModelSummary: Equatable, Hashable {
     public func hash(into hasher: inout Hasher) {
         hasher.combine(sizeGb)
         hasher.combine(tensorCount)
+        hasher.combine(layerCount)
+        hasher.combine(maxExpertId)
         hasher.combine(tensors)
+        hasher.combine(layers)
     }
 }
 
@@ -679,14 +779,20 @@ public struct FfiConverterTypeModelSummary: FfiConverterRustBuffer {
             try ModelSummary(
                 sizeGb: FfiConverterDouble.read(from: &buf), 
                 tensorCount: FfiConverterUInt32.read(from: &buf), 
-                tensors: FfiConverterSequenceTypeTensorMetadata.read(from: &buf)
+                layerCount: FfiConverterUInt32.read(from: &buf), 
+                maxExpertId: FfiConverterUInt32.read(from: &buf), 
+                tensors: FfiConverterSequenceTypeTensorMetadata.read(from: &buf), 
+                layers: FfiConverterSequenceTypeLayerSummary.read(from: &buf)
         )
     }
 
     public static func write(_ value: ModelSummary, into buf: inout [UInt8]) {
         FfiConverterDouble.write(value.sizeGb, into: &buf)
         FfiConverterUInt32.write(value.tensorCount, into: &buf)
+        FfiConverterUInt32.write(value.layerCount, into: &buf)
+        FfiConverterUInt32.write(value.maxExpertId, into: &buf)
         FfiConverterSequenceTypeTensorMetadata.write(value.tensors, into: &buf)
+        FfiConverterSequenceTypeLayerSummary.write(value.layers, into: &buf)
     }
 }
 
@@ -713,16 +819,22 @@ public struct TensorMetadata {
     public var sizeMb: Double
     public var offsetStart: UInt64
     public var offsetEnd: UInt64
+    public var category: String
+    public var layerIndex: UInt32?
+    public var expertId: UInt32?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(name: String, shapeDisplay: String, dtype: String, sizeMb: Double, offsetStart: UInt64, offsetEnd: UInt64) {
+    public init(name: String, shapeDisplay: String, dtype: String, sizeMb: Double, offsetStart: UInt64, offsetEnd: UInt64, category: String, layerIndex: UInt32?, expertId: UInt32?) {
         self.name = name
         self.shapeDisplay = shapeDisplay
         self.dtype = dtype
         self.sizeMb = sizeMb
         self.offsetStart = offsetStart
         self.offsetEnd = offsetEnd
+        self.category = category
+        self.layerIndex = layerIndex
+        self.expertId = expertId
     }
 }
 
@@ -748,6 +860,15 @@ extension TensorMetadata: Equatable, Hashable {
         if lhs.offsetEnd != rhs.offsetEnd {
             return false
         }
+        if lhs.category != rhs.category {
+            return false
+        }
+        if lhs.layerIndex != rhs.layerIndex {
+            return false
+        }
+        if lhs.expertId != rhs.expertId {
+            return false
+        }
         return true
     }
 
@@ -758,6 +879,9 @@ extension TensorMetadata: Equatable, Hashable {
         hasher.combine(sizeMb)
         hasher.combine(offsetStart)
         hasher.combine(offsetEnd)
+        hasher.combine(category)
+        hasher.combine(layerIndex)
+        hasher.combine(expertId)
     }
 }
 
@@ -774,7 +898,10 @@ public struct FfiConverterTypeTensorMetadata: FfiConverterRustBuffer {
                 dtype: FfiConverterString.read(from: &buf), 
                 sizeMb: FfiConverterDouble.read(from: &buf), 
                 offsetStart: FfiConverterUInt64.read(from: &buf), 
-                offsetEnd: FfiConverterUInt64.read(from: &buf)
+                offsetEnd: FfiConverterUInt64.read(from: &buf), 
+                category: FfiConverterString.read(from: &buf), 
+                layerIndex: FfiConverterOptionUInt32.read(from: &buf), 
+                expertId: FfiConverterOptionUInt32.read(from: &buf)
         )
     }
 
@@ -785,6 +912,9 @@ public struct FfiConverterTypeTensorMetadata: FfiConverterRustBuffer {
         FfiConverterDouble.write(value.sizeMb, into: &buf)
         FfiConverterUInt64.write(value.offsetStart, into: &buf)
         FfiConverterUInt64.write(value.offsetEnd, into: &buf)
+        FfiConverterString.write(value.category, into: &buf)
+        FfiConverterOptionUInt32.write(value.layerIndex, into: &buf)
+        FfiConverterOptionUInt32.write(value.expertId, into: &buf)
     }
 }
 
@@ -814,8 +944,6 @@ public enum EngineError {
     )
     case ParseError(details: String
     )
-    case TensorNotFound(name: String
-    )
 }
 
 
@@ -840,9 +968,6 @@ public struct FfiConverterTypeEngineError: FfiConverterRustBuffer {
             )
         case 3: return .ParseError(
             details: try FfiConverterString.read(from: &buf)
-            )
-        case 4: return .TensorNotFound(
-            name: try FfiConverterString.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -870,11 +995,6 @@ public struct FfiConverterTypeEngineError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(3))
             FfiConverterString.write(details, into: &buf)
             
-        
-        case let .TensorNotFound(name):
-            writeInt(&buf, Int32(4))
-            FfiConverterString.write(name, into: &buf)
-            
         }
     }
 }
@@ -885,6 +1005,55 @@ extension EngineError: Equatable, Hashable {}
 extension EngineError: Foundation.LocalizedError {
     public var errorDescription: String? {
         String(reflecting: self)
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionUInt32: FfiConverterRustBuffer {
+    typealias SwiftType = UInt32?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt32.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt32.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeLayerSummary: FfiConverterRustBuffer {
+    typealias SwiftType = [LayerSummary]
+
+    public static func write(_ value: [LayerSummary], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeLayerSummary.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [LayerSummary] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [LayerSummary]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeLayerSummary.read(from: &buf))
+        }
+        return seq
     }
 }
 

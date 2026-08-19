@@ -12,33 +12,56 @@ struct ContentView: View {
     @State private var errorMessage: String? = nil
     @State private var metalStatus: String = "GPU Status: Waiting for weights..."
     @State private var searchText: String = ""
+    @State private var selectedCategory: String = "All"
     @State private var isImporterPresented: Bool = false
     
-    // Selection and GPU Compute State
     @State private var selectedTensorID: String? = nil
     @State private var gpuComputeOutput: String? = nil
-    
+
+    let categoryFilters = ["All", "Self-Attention", "MoE Router", "Routed Expert", "Shared Expert", "Embedding", "LM Head"]
+
     var filteredTensors: [TensorMetadata] {
         guard let tensors = summary?.tensors else { return [] }
-        return searchText.isEmpty ? tensors : tensors.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
+        return tensors.filter { tensor in
+            let matchesSearch = searchText.isEmpty || tensor.name.localizedCaseInsensitiveContains(searchText)
+            let matchesCategory = (selectedCategory == "All") || tensor.category.contains(selectedCategory)
+            return matchesSearch && matchesCategory
+        }
     }
-    
+
     var selectedTensor: TensorMetadata? {
         summary?.tensors.first(where: { $0.name == selectedTensorID })
     }
-    
+
     var body: some View {
         VStack(spacing: 0) {
-            // Header Bar
+            // Header Bar with MoE Topology Metrics
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("DynaMoE Tensor Inspector")
+                    Text("DynaMoE Tensor & MoE Inspector")
                         .font(.title2)
                         .fontWeight(.bold)
                     
-                    Text(metalStatus)
+                    if let summary = summary {
+                        HStack(spacing: 12) {
+                            Text(metalStatus)
+                                .foregroundColor(metalStatus.contains("✅") ? .green : .secondary)
+                            Text("•")
+                            Text("\(summary.layerCount) Layers")
+                                .fontWeight(.semibold)
+                            if summary.maxExpertId > 0 {
+                                Text("•")
+                                Text("\(summary.maxExpertId) Routed Experts/Layer")
+                                    .foregroundColor(.purple)
+                                    .fontWeight(.semibold)
+                            }
+                        }
                         .font(.subheadline)
-                        .foregroundColor(metalStatus.contains("✅") ? .green : .secondary)
+                    } else {
+                        Text(metalStatus)
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                    }
                 }
                 
                 Spacer()
@@ -52,24 +75,53 @@ struct ContentView: View {
             .background(Color(NSColor.windowBackgroundColor))
             
             Divider()
-            
+
             if let err = errorMessage {
                 ContentUnavailableView("Error", systemImage: "exclamationmark.triangle", description: Text(err))
             } else if summary != nil {
                 VStack(spacing: 0) {
-                    // Search Bar
-                    HStack {
-                        Image(systemName: "magnifyingglass").foregroundColor(.secondary)
-                        TextField("Filter tensors...", text: $searchText).textFieldStyle(.plain)
+                    // Search & Topology Filter Chips
+                    VStack(spacing: 8) {
+                        HStack {
+                            Image(systemName: "magnifyingglass").foregroundColor(.secondary)
+                            TextField("Filter tensors by name or layer...", text: $searchText).textFieldStyle(.plain)
+                        }
+                        .padding(8)
+                        .background(Color(NSColor.controlBackgroundColor))
+                        .cornerRadius(6)
+
+                        // Category Filter Chips
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(categoryFilters, id: \.self) { cat in
+                                    Button(action: { selectedCategory = cat }) {
+                                        Text(cat)
+                                            .font(.caption)
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 4)
+                                            .background(selectedCategory == cat ? Color.accentColor : Color(NSColor.controlColor))
+                                            .foregroundColor(selectedCategory == cat ? .white : .primary)
+                                            .cornerRadius(12)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
                     }
-                    .padding(8)
-                    .background(Color(NSColor.controlBackgroundColor))
-                    .cornerRadius(6)
                     .padding(10)
-                    
-                    // Interactive Tensor Table
+
+                    // Tensor Table
                     Table(filteredTensors, selection: $selectedTensorID) {
                         TableColumn("Tensor Name", value: \.name)
+                        TableColumn("Category") { t in
+                            Text(t.category)
+                                .font(.caption)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(t.category.contains("Expert") ? Color.purple.opacity(0.15) : Color.blue.opacity(0.15))
+                                .foregroundColor(t.category.contains("Expert") ? .purple : .blue)
+                                .cornerRadius(4)
+                        }
                         TableColumn("Shape") { t in
                             Text(t.shapeDisplay).font(.system(.body, design: .monospaced))
                         }
@@ -79,21 +131,16 @@ struct ContentView: View {
                         TableColumn("Size") { t in
                             Text(String(format: "%.2f MB", t.sizeMb)).font(.system(.body, design: .monospaced))
                         }
-                        TableColumn("Byte Offset Range") { t in
-                            Text("\(t.offsetStart) ..< \(t.offsetEnd)")
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundColor(.secondary)
-                        }
                     }
                     
-                    // GPU Inspector Action Bar
+                    // Selected Tensor & GPU Execution Bar
                     if let tensor = selectedTensor {
                         Divider()
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Selected: \(tensor.name)")
                                     .font(.headline)
-                                Text("Shape: \(tensor.shapeDisplay) | Offset: \(tensor.offsetStart) bytes")
+                                Text("Category: \(tensor.category) | Offset: \(tensor.offsetStart) bytes")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             }
@@ -122,10 +169,10 @@ struct ContentView: View {
                     }
                 }
             } else {
-                ContentUnavailableView("No Weights Loaded", systemImage: "memorychip", description: Text("Select a .safetensors file to test Metal Zero-Copy Handoff."))
+                ContentUnavailableView("No Weights Loaded", systemImage: "memorychip", description: Text("Select a .safetensors file to inspect MoE layer topology."))
             }
         }
-        .frame(minWidth: 850, minHeight: 550)
+        .frame(minWidth: 900, minHeight: 600)
         .fileImporter(isPresented: $isImporterPresented, allowedContentTypes: [.data], allowsMultipleSelection: false) { result in
             switch result {
             case .success(let urls):
@@ -182,8 +229,7 @@ struct ContentView: View {
             self.engine = nil
         }
     }
-    
-    // MARK: - Execute MSL Shader on Selected Tensor
+
     private func executeGpuShader(on tensor: TensorMetadata) {
         guard let engine = engine,
               let summary = summary,
@@ -194,11 +240,10 @@ struct ContentView: View {
             gpuComputeOutput = "❌ Error setting up Metal pipeline."
             return
         }
-        
+
         do {
             let pipelineState = try device.makeComputePipelineState(function: kernelFunction)
             
-            // 1. Resolve weight and paired scale byte offsets
             var weightOffset = tensor.offsetStart
             var scaleOffset = tensor.offsetStart
             
@@ -208,8 +253,7 @@ struct ContentView: View {
             
             weightOffset = weightTensor.offsetStart
             scaleOffset  = scaleTensor.offsetStart
-            
-            // 2. Wrap mapped pointer for Metal
+
             let address = UInt(engine.bufferBaseAddress())
             guard let pointer = UnsafeMutableRawPointer(bitPattern: address) else { return }
             let length = Int(engine.bufferLength())
@@ -219,12 +263,10 @@ struct ContentView: View {
                 return
             }
             
-            // 3. Output buffer for 8 sample weights (FP32)
             let sampleCount = 8
             let outputByteLength = sampleCount * MemoryLayout<Float>.stride
             guard let outputBuffer = device.makeBuffer(length: outputByteLength, options: .storageModeShared) else { return }
             
-            // 4. Encode & Dispatch
             guard let commandBuffer = commandQueue.makeCommandBuffer(),
                   let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
             
@@ -242,7 +284,6 @@ struct ContentView: View {
             commandBuffer.commit()
             commandBuffer.waitUntilCompleted()
             
-            // 5. Read back dequantized floats
             let rawFloatPtr = outputBuffer.contents().bindMemory(to: Float.self, capacity: sampleCount)
             var sampleValues: [String] = []
             for i in 0..<sampleCount {
