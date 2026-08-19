@@ -56,3 +56,65 @@ kernel void dequantize_mxfp8_paired(
     
     outputPreview[id] = unscaledWeight * blockScale;
 }
+
+/// MSL Kernel: Looks up token IDs in mapped MXFP8 embedding tables and outputs hidden state h_0
+kernel void lookup_embeddings_mxfp8(
+    device const uchar* rawBaseBuffer [[buffer(0)]],
+    device const uint32_t* tokenIds [[buffer(1)]],
+    device float* outputHiddenStates [[buffer(2)]],
+    constant uint64_t& weightOffset [[buffer(3)]],
+    constant uint64_t& scaleOffset [[buffer(4)]],
+    constant uint32_t& hiddenDim [[buffer(5)]], // e.g., 3072
+    uint id [[thread_position_in_grid]]
+) {
+    uint tokenIdx = id / hiddenDim;
+    uint dimIdx = id % hiddenDim;
+    uint32_t targetTokenId = tokenIds[tokenIdx];
+    
+    // 1. Calculate row offsets for target token ID
+    // 3072 hidden floats stored as 768 packed U32 words (4 bytes each)
+    uint32_t u32PerRow = hiddenDim / 4;
+    uint32_t u32GlobalIdx = (targetTokenId * u32PerRow) + (dimIdx / 4);
+    uint32_t byteInU32 = dimIdx % 4;
+    
+    device const uint32_t* u32Weights = (device const uint32_t*)(rawBaseBuffer + weightOffset);
+    uint32_t packedWord = u32Weights[u32GlobalIdx];
+    uchar rawFp8Byte = (packedWord >> (byteInU32 * 8)) & 0xFF;
+    
+    // 2. Fetch block scale (32 weights share 1 scale byte for 3072 dim / 96 scales)
+    uint32_t scalesPerRow = hiddenDim / 32;
+    uint32_t scaleGlobalIdx = (targetTokenId * scalesPerRow) + (dimIdx / 32);
+    
+    device const uchar* scales = rawBaseBuffer + scaleOffset;
+    uchar scaleByte = scales[scaleGlobalIdx];
+    
+    // 3. Dequantize and write to output hidden state h_0
+    float unscaledWeight = unpack_e4m3(rawFp8Byte);
+    float blockScale = decode_e8m0_scale(scaleByte);
+    
+    outputHiddenStates[id] = unscaledWeight * blockScale;
+}
+
+/// MSL Kernel: Unpacks BF16 (bfloat16) embedding rows into FP32 h_0 hidden state
+kernel void lookup_embeddings_bf16(
+    device const ushort* rawBaseBuffer [[buffer(0)]],
+    device const uint32_t* tokenIds [[buffer(1)]],
+    device float* outputHiddenStates [[buffer(2)]],
+    constant uint64_t& weightOffset [[buffer(3)]],
+    constant uint32_t& hiddenDim [[buffer(4)]],
+    uint id [[thread_position_in_grid]]
+) {
+    uint tokenIdx = id / hiddenDim;
+    uint dimIdx = id % hiddenDim;
+    uint32_t targetTokenId = tokenIds[tokenIdx];
+    
+    // Calculate 16-bit word offset for target token row
+    uint64_t baseUshortOffset = weightOffset / 2;
+    uint64_t globalIdx = baseUshortOffset + ((uint64_t)targetTokenId * hiddenDim) + dimIdx;
+    
+    // Convert BF16 to FP32 by bit-shifting top 16 bits
+    ushort rawBf16 = rawBaseBuffer[globalIdx];
+    uint32_t fp32Bits = ((uint32_t)rawBf16) << 16;
+    
+    outputHiddenStates[id] = as_type<float>(fp32Bits);
+}

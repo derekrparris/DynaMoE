@@ -15,7 +15,7 @@ struct ContentView: View {
     @State private var searchText: String = ""
     @State private var selectedCategory: String = "All"
     
-    // File Importers
+    // File Importer States
     @State private var isWeightImporterPresented: Bool = false
     @State private var isTokenizerImporterPresented: Bool = false
     
@@ -74,16 +74,51 @@ struct ContentView: View {
                 
                 Spacer()
                 
+                // Action Buttons with Isolated File Importers
                 HStack(spacing: 8) {
                     Button(tokenizer == nil ? "Load tokenizer.json" : "Tokenizer Loaded ✅") {
                         isTokenizerImporterPresented = true
                     }
                     .buttonStyle(.bordered)
+                    .fileImporter(
+                        isPresented: $isTokenizerImporterPresented,
+                        allowedContentTypes: [.json, .data],
+                        allowsMultipleSelection: false
+                    ) { result in
+                        switch result {
+                        case .success(let urls):
+                            guard let url = urls.first else { return }
+                            if url.startAccessingSecurityScopedResource() {
+                                defer { url.stopAccessingSecurityScopedResource() }
+                                loadTokenizer(filePath: url.path)
+                            }
+                        case .failure(let error):
+                            errorMessage = error.localizedDescription
+                        }
+                    }
                     
                     Button("Select .safetensors") {
                         isWeightImporterPresented = true
                     }
                     .buttonStyle(.borderedProminent)
+                    .fileImporter(
+                        isPresented: $isWeightImporterPresented,
+                        allowedContentTypes: [.data],
+                        allowsMultipleSelection: false
+                    ) { result in
+                        switch result {
+                        case .success(let urls):
+                            guard let url = urls.first else { return }
+                            if url.startAccessingSecurityScopedResource() {
+                                defer { url.stopAccessingSecurityScopedResource() }
+                                loadAndBridgeToMetal(filePath: url.path)
+                            } else {
+                                errorMessage = "macOS Sandbox denied file access."
+                            }
+                        case .failure(let error):
+                            errorMessage = error.localizedDescription
+                        }
+                    }
                 }
             }
             .padding()
@@ -91,7 +126,7 @@ struct ContentView: View {
             
             Divider()
 
-            // Tokenizer Playground
+            // Tokenizer Playground Panel
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Text("Tokenization Playground")
@@ -118,6 +153,15 @@ struct ContentView: View {
                     .font(.system(.caption, design: .monospaced))
                     .foregroundColor(tokenizer == nil ? .secondary : .purple)
                     .lineLimit(2)
+
+                if let tokenizer = tokenizer, let ids = try? tokenizer.encode(text: promptInput), !ids.isEmpty {
+                    Button("Generate Initial Hidden State h_0") {
+                        executeEmbeddingLookup(tokenIds: ids)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.blue)
+                    .padding(.top, 4)
+                }
             }
             .padding(10)
             .background(Color(NSColor.controlBackgroundColor))
@@ -128,7 +172,7 @@ struct ContentView: View {
                 ContentUnavailableView("Error", systemImage: "exclamationmark.triangle", description: Text(err))
             } else if summary != nil {
                 VStack(spacing: 0) {
-                    // Search & Topology Filter Chips
+                    // Search & Category Filter Chips
                     VStack(spacing: 8) {
                         HStack {
                             Image(systemName: "magnifyingglass").foregroundColor(.secondary)
@@ -220,33 +264,6 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 900, minHeight: 650)
-        // File Importers
-        .fileImporter(isPresented: $isWeightImporterPresented, allowedContentTypes: [.data], allowsMultipleSelection: false) { result in
-            switch result {
-            case .success(let urls):
-                guard let url = urls.first else { return }
-                if url.startAccessingSecurityScopedResource() {
-                    defer { url.stopAccessingSecurityScopedResource() }
-                    loadAndBridgeToMetal(filePath: url.path)
-                } else {
-                    errorMessage = "macOS Sandbox denied file access."
-                }
-            case .failure(let error):
-                errorMessage = error.localizedDescription
-            }
-        }
-        .fileImporter(isPresented: $isTokenizerImporterPresented, allowedContentTypes: [.json, .data], allowsMultipleSelection: false) { result in
-            switch result {
-            case .success(let urls):
-                guard let url = urls.first else { return }
-                if url.startAccessingSecurityScopedResource() {
-                    defer { url.stopAccessingSecurityScopedResource() }
-                    loadTokenizer(filePath: url.path)
-                }
-            case .failure(let error):
-                errorMessage = error.localizedDescription
-            }
-        }
     }
     
     // MARK: - Tokenizer Execution
@@ -273,6 +290,96 @@ struct ContentView: View {
             tokenIDsOutput = "❌ Encoding Error: \(error.localizedDescription)"
         }
     }
+    
+    // MARK: - Execute Token Embedding Lookup (h_0)
+        private func executeEmbeddingLookup(tokenIds: [UInt32]) {
+            guard let engine = engine,
+                  let summary = summary,
+                  let device = MTLCreateSystemDefaultDevice(),
+                  let commandQueue = device.makeCommandQueue(),
+                  let defaultLibrary = device.makeDefaultLibrary() else {
+                gpuComputeOutput = "❌ Error setting up Metal embedding pipeline."
+                return
+            }
+
+            do {
+                guard let embedWeight = summary.tensors.first(where: {
+                    ($0.name.contains("embed_tokens") || $0.name.contains("embed") || $0.name.contains("wte")) &&
+                    $0.name.contains("weight") && !$0.name.contains("scale")
+                }) else {
+                    gpuComputeOutput = "❌ Couldn't locate embedding weight tensor."
+                    return
+                }
+
+                var weightOffset = embedWeight.offsetStart
+                var hiddenDim: UInt32 = 2048 // Qwen 35B hidden dimension
+                let tokenCount = tokenIds.count
+                let totalVectorElements = tokenCount * Int(hiddenDim)
+                
+                guard let tokenBuffer = device.makeBuffer(bytes: tokenIds, length: tokenCount * MemoryLayout<UInt32>.stride, options: .storageModeShared),
+                      let h0OutputBuffer = device.makeBuffer(length: totalVectorElements * MemoryLayout<Float>.stride, options: .storageModeShared) else { return }
+                
+                let address = UInt(engine.bufferBaseAddress())
+                guard let pointer = UnsafeMutableRawPointer(bitPattern: address) else { return }
+                let length = Int(engine.bufferLength())
+                guard let rawBaseBuffer = device.makeBuffer(bytesNoCopy: pointer, length: length, options: .storageModeShared, deallocator: nil) else { return }
+                
+                guard let commandBuffer = commandQueue.makeCommandBuffer(),
+                      let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
+
+                let isBF16 = embedWeight.dtype.contains("BF16") || embedWeight.dtype.contains("BFLOAT16")
+                
+                if isBF16 {
+                    // Execute BF16 Kernel
+                    guard let kernelFunction = defaultLibrary.makeFunction(name: "lookup_embeddings_bf16") else { return }
+                    let pipelineState = try device.makeComputePipelineState(function: kernelFunction)
+                    
+                    computeEncoder.setComputePipelineState(pipelineState)
+                    computeEncoder.setBuffer(rawBaseBuffer, offset: 0, index: 0)
+                    computeEncoder.setBuffer(tokenBuffer, offset: 0, index: 1)
+                    computeEncoder.setBuffer(h0OutputBuffer, offset: 0, index: 2)
+                    computeEncoder.setBytes(&weightOffset, length: MemoryLayout<UInt64>.stride, index: 3)
+                    computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 4)
+                } else {
+                    // Execute MXFP8 Kernel
+                    let embedScale = summary.tensors.first(where: {
+                        $0.name.contains(embedWeight.name.replacingOccurrences(of: ".weight", with: "")) &&
+                        ($0.name.contains("scale") || $0.name.contains("scales"))
+                    })
+                    var scaleOffset = embedScale?.offsetStart ?? weightOffset
+                    
+                    guard let kernelFunction = defaultLibrary.makeFunction(name: "lookup_embeddings_mxfp8") else { return }
+                    let pipelineState = try device.makeComputePipelineState(function: kernelFunction)
+                    
+                    computeEncoder.setComputePipelineState(pipelineState)
+                    computeEncoder.setBuffer(rawBaseBuffer, offset: 0, index: 0)
+                    computeEncoder.setBuffer(tokenBuffer, offset: 0, index: 1)
+                    computeEncoder.setBuffer(h0OutputBuffer, offset: 0, index: 2)
+                    computeEncoder.setBytes(&weightOffset, length: MemoryLayout<UInt64>.stride, index: 3)
+                    computeEncoder.setBytes(&scaleOffset, length: MemoryLayout<UInt64>.stride, index: 4)
+                    computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 5)
+                }
+                
+                let gridSize = MTLSize(width: totalVectorElements, height: 1, depth: 1)
+                let threadgroupSize = MTLSize(width: min(totalVectorElements, 256), height: 1, depth: 1)
+                computeEncoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+                
+                computeEncoder.endEncoding()
+                commandBuffer.commit()
+                commandBuffer.waitUntilCompleted()
+                
+                let rawFloatPtr = h0OutputBuffer.contents().bindMemory(to: Float.self, capacity: totalVectorElements)
+                var h0Sample: [String] = []
+                for i in 0..<8 {
+                    h0Sample.append(String(format: "%.6f", rawFloatPtr[i]))
+                }
+                
+                gpuComputeOutput = "🚀 Generated h_0 Vector (\(embedWeight.dtype)) [\(tokenCount) x \(hiddenDim)]! First 8 dims of Token #0: [\(h0Sample.joined(separator: ", "))]"
+                
+            } catch {
+                gpuComputeOutput = "❌ Embedding Lookup Error: \(error.localizedDescription)"
+            }
+        }
     
     private func loadAndBridgeToMetal(filePath: String) {
         do {
