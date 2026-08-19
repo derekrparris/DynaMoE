@@ -1,17 +1,17 @@
 [package]
 name = "dynamoe-core"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [lib]
 name = "dynamoe_core"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
-uniffi = { version = "0.28", features = ["build", "cli"] }
 memmap2 = "0.9"
 safetensors = "0.4"
-anyhow = "1.0"
+uniffi = { version = "0.28", features = ["build", "cli"] }
+tokenizers = "0.20"
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }

@@ -632,6 +632,145 @@ public func FfiConverterTypeDynaMoeEngine_lower(_ value: DynaMoeEngine) -> Unsaf
 }
 
 
+
+
+public protocol DynaMoeTokenizerProtocol : AnyObject {
+    
+    func decode(ids: [UInt32]) throws  -> String
+    
+    func encode(text: String) throws  -> [UInt32]
+    
+}
+
+open class DynaMoeTokenizer:
+    DynaMoeTokenizerProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_dynamoe_core_fn_clone_dynamoetokenizer(self.pointer, $0) }
+    }
+public convenience init(tokenizerPath: String)throws  {
+    let pointer =
+        try rustCallWithError(FfiConverterTypeEngineError.lift) {
+    uniffi_dynamoe_core_fn_constructor_dynamoetokenizer_new(
+        FfiConverterString.lower(tokenizerPath),$0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_dynamoe_core_fn_free_dynamoetokenizer(pointer, $0) }
+    }
+
+    
+
+    
+open func decode(ids: [UInt32])throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeEngineError.lift) {
+    uniffi_dynamoe_core_fn_method_dynamoetokenizer_decode(self.uniffiClonePointer(),
+        FfiConverterSequenceUInt32.lower(ids),$0
+    )
+})
+}
+    
+open func encode(text: String)throws  -> [UInt32] {
+    return try  FfiConverterSequenceUInt32.lift(try rustCallWithError(FfiConverterTypeEngineError.lift) {
+    uniffi_dynamoe_core_fn_method_dynamoetokenizer_encode(self.uniffiClonePointer(),
+        FfiConverterString.lower(text),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDynaMoeTokenizer: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = DynaMoeTokenizer
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> DynaMoeTokenizer {
+        return DynaMoeTokenizer(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: DynaMoeTokenizer) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DynaMoeTokenizer {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: DynaMoeTokenizer, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDynaMoeTokenizer_lift(_ pointer: UnsafeMutableRawPointer) throws -> DynaMoeTokenizer {
+    return try FfiConverterTypeDynaMoeTokenizer.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDynaMoeTokenizer_lower(_ value: DynaMoeTokenizer) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeDynaMoeTokenizer.lower(value)
+}
+
+
 public struct LayerSummary {
     public var layerIndex: UInt32
     public var totalTensors: UInt32
@@ -944,6 +1083,8 @@ public enum EngineError {
     )
     case ParseError(details: String
     )
+    case TokenizerError(details: String
+    )
 }
 
 
@@ -967,6 +1108,9 @@ public struct FfiConverterTypeEngineError: FfiConverterRustBuffer {
             details: try FfiConverterString.read(from: &buf)
             )
         case 3: return .ParseError(
+            details: try FfiConverterString.read(from: &buf)
+            )
+        case 4: return .TokenizerError(
             details: try FfiConverterString.read(from: &buf)
             )
 
@@ -993,6 +1137,11 @@ public struct FfiConverterTypeEngineError: FfiConverterRustBuffer {
         
         case let .ParseError(details):
             writeInt(&buf, Int32(3))
+            FfiConverterString.write(details, into: &buf)
+            
+        
+        case let .TokenizerError(details):
+            writeInt(&buf, Int32(4))
             FfiConverterString.write(details, into: &buf)
             
         }
@@ -1029,6 +1178,31 @@ fileprivate struct FfiConverterOptionUInt32: FfiConverterRustBuffer {
         case 1: return try FfiConverterUInt32.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
+    typealias SwiftType = [UInt32]
+
+    public static func write(_ value: [UInt32], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterUInt32.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [UInt32] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [UInt32]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterUInt32.read(from: &buf))
+        }
+        return seq
     }
 }
 
@@ -1106,7 +1280,16 @@ private var initializationResult: InitializationResult = {
     if (uniffi_dynamoe_core_checksum_method_dynamoeengine_get_summary() != 2314) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_dynamoe_core_checksum_method_dynamoetokenizer_decode() != 8328) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_dynamoe_core_checksum_method_dynamoetokenizer_encode() != 14674) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_dynamoe_core_checksum_constructor_dynamoeengine_new() != 45198) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_dynamoe_core_checksum_constructor_dynamoetokenizer_new() != 5615) {
         return InitializationResult.apiChecksumMismatch
     }
 

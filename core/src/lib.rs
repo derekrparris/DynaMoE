@@ -6,12 +6,14 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 use std::sync::Arc;
+use tokenizers::Tokenizer;
 
 #[derive(Debug, uniffi::Error)]
 pub enum EngineError {
     FileError { details: String },
     MmapError { details: String },
     ParseError { details: String },
+    TokenizerError { details: String },
 }
 
 impl fmt::Display for EngineError {
@@ -20,9 +22,41 @@ impl fmt::Display for EngineError {
             EngineError::FileError { details } => write!(f, "File error: {}", details),
             EngineError::MmapError { details } => write!(f, "Mmap error: {}", details),
             EngineError::ParseError { details } => write!(f, "Parse error: {}", details),
+            EngineError::TokenizerError { details } => write!(f, "Tokenizer error: {}", details),
         }
     }
 }
+
+// MARK: - Tokenizer Engine
+
+#[derive(uniffi::Object)]
+pub struct DynaMoeTokenizer {
+    tokenizer: Tokenizer,
+}
+
+#[uniffi::export]
+impl DynaMoeTokenizer {
+    #[uniffi::constructor]
+    pub fn new(tokenizer_path: String) -> Result<Arc<Self>, EngineError> {
+        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| EngineError::TokenizerError { details: e.to_string() })?;
+        Ok(Arc::new(Self { tokenizer }))
+    }
+
+    pub fn encode(&self, text: String) -> Result<Vec<u32>, EngineError> {
+        let encoding = self.tokenizer.encode(text, true)
+            .map_err(|e| EngineError::TokenizerError { details: e.to_string() })?;
+        Ok(encoding.get_ids().to_vec())
+    }
+
+    pub fn decode(&self, ids: Vec<u32>) -> Result<String, EngineError> {
+        let text = self.tokenizer.decode(&ids, true)
+            .map_err(|e| EngineError::TokenizerError { details: e.to_string() })?;
+        Ok(text)
+    }
+}
+
+// MARK: - Model Engine Records & Objects
 
 #[derive(uniffi::Record)]
 pub struct TensorMetadata {
@@ -55,12 +89,6 @@ pub struct ModelSummary {
     pub layers: Vec<LayerSummary>,
 }
 
-#[derive(uniffi::Object)]
-pub struct DynaMoeEngine {
-    mmap: Mmap,
-}
-
-/// Helper: Parses tensor naming conventions across Qwen, Nanbeige, DeepSeek, and Llama MoE architectures
 fn parse_layer_and_expert(name: &str) -> (String, Option<u32>, Option<u32>) {
     let mut layer_idx = None;
     let mut expert_idx = None;
@@ -108,6 +136,11 @@ fn parse_layer_and_expert(name: &str) -> (String, Option<u32>, Option<u32>) {
     };
 
     (category, layer_idx, expert_idx)
+}
+
+#[derive(uniffi::Object)]
+pub struct DynaMoeEngine {
+    mmap: Mmap,
 }
 
 #[uniffi::export]
@@ -187,12 +220,10 @@ impl DynaMoeEngine {
             })
             .collect();
 
-        let layer_count = layer_summaries.len() as u32;
-
         Ok(ModelSummary {
             size_gb,
             tensor_count: tensors.names().len() as u32,
-            layer_count,
+            layer_count: layer_summaries.len() as u32,
             max_expert_id,
             tensors: tensor_list,
             layers: layer_summaries,

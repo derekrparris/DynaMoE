@@ -8,12 +8,20 @@ extension TensorMetadata: Identifiable {
 
 struct ContentView: View {
     @State private var engine: DynaMoeEngine? = nil
+    @State private var tokenizer: DynaMoeTokenizer? = nil
     @State private var summary: ModelSummary? = nil
     @State private var errorMessage: String? = nil
     @State private var metalStatus: String = "GPU Status: Waiting for weights..."
     @State private var searchText: String = ""
     @State private var selectedCategory: String = "All"
-    @State private var isImporterPresented: Bool = false
+    
+    // File Importers
+    @State private var isWeightImporterPresented: Bool = false
+    @State private var isTokenizerImporterPresented: Bool = false
+    
+    // Tokenizer Playground State
+    @State private var promptInput: String = "Hello DynaMoE, routing tokens to experts..."
+    @State private var tokenIDsOutput: String = "Load a tokenizer.json file to tokenize text"
     
     @State private var selectedTensorID: String? = nil
     @State private var gpuComputeOutput: String? = nil
@@ -35,10 +43,10 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Header Bar with MoE Topology Metrics
+            // Header Bar
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("DynaMoE Tensor & MoE Inspector")
+                    Text("DynaMoE Engine & Tokenizer Inspector")
                         .font(.title2)
                         .fontWeight(.bold)
                     
@@ -66,13 +74,53 @@ struct ContentView: View {
                 
                 Spacer()
                 
-                Button("Select .safetensors") {
-                    isImporterPresented = true
+                HStack(spacing: 8) {
+                    Button(tokenizer == nil ? "Load tokenizer.json" : "Tokenizer Loaded ✅") {
+                        isTokenizerImporterPresented = true
+                    }
+                    .buttonStyle(.bordered)
+                    
+                    Button("Select .safetensors") {
+                        isWeightImporterPresented = true
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
-                .buttonStyle(.borderedProminent)
             }
             .padding()
             .background(Color(NSColor.windowBackgroundColor))
+            
+            Divider()
+
+            // Tokenizer Playground
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Tokenization Playground")
+                        .font(.caption)
+                        .fontWeight(.bold)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                }
+                
+                HStack {
+                    TextField("Enter prompt to encode...", text: $promptInput)
+                        .textFieldStyle(.roundedBorder)
+                        .onChange(of: promptInput) { _, newValue in
+                            runTokenization(text: newValue)
+                        }
+                    
+                    Button("Encode") {
+                        runTokenization(text: promptInput)
+                    }
+                    .disabled(tokenizer == nil)
+                }
+                
+                Text(tokenIDsOutput)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(tokenizer == nil ? .secondary : .purple)
+                    .lineLimit(2)
+            }
+            .padding(10)
+            .background(Color(NSColor.controlBackgroundColor))
             
             Divider()
 
@@ -90,7 +138,6 @@ struct ContentView: View {
                         .background(Color(NSColor.controlBackgroundColor))
                         .cornerRadius(6)
 
-                        // Category Filter Chips
                         ScrollView(.horizontal, showsIndicators: false) {
                             HStack(spacing: 8) {
                                 ForEach(categoryFilters, id: \.self) { cat in
@@ -172,8 +219,9 @@ struct ContentView: View {
                 ContentUnavailableView("No Weights Loaded", systemImage: "memorychip", description: Text("Select a .safetensors file to inspect MoE layer topology."))
             }
         }
-        .frame(minWidth: 900, minHeight: 600)
-        .fileImporter(isPresented: $isImporterPresented, allowedContentTypes: [.data], allowsMultipleSelection: false) { result in
+        .frame(minWidth: 900, minHeight: 650)
+        // File Importers
+        .fileImporter(isPresented: $isWeightImporterPresented, allowedContentTypes: [.data], allowsMultipleSelection: false) { result in
             switch result {
             case .success(let urls):
                 guard let url = urls.first else { return }
@@ -186,6 +234,43 @@ struct ContentView: View {
             case .failure(let error):
                 errorMessage = error.localizedDescription
             }
+        }
+        .fileImporter(isPresented: $isTokenizerImporterPresented, allowedContentTypes: [.json, .data], allowsMultipleSelection: false) { result in
+            switch result {
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                if url.startAccessingSecurityScopedResource() {
+                    defer { url.stopAccessingSecurityScopedResource() }
+                    loadTokenizer(filePath: url.path)
+                }
+            case .failure(let error):
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+    
+    // MARK: - Tokenizer Execution
+    private func loadTokenizer(filePath: String) {
+        do {
+            let tok = try DynaMoeTokenizer(tokenizerPath: filePath)
+            self.tokenizer = tok
+            runTokenization(text: promptInput)
+        } catch {
+            tokenIDsOutput = "❌ Failed to load tokenizer.json: \(error.localizedDescription)"
+        }
+    }
+    
+    private func runTokenization(text: String) {
+        guard let tokenizer = tokenizer else {
+            tokenIDsOutput = "Load a tokenizer.json file to tokenize text"
+            return
+        }
+        do {
+            let ids = try tokenizer.encode(text: text)
+            let decoded = try tokenizer.decode(ids: ids)
+            tokenIDsOutput = "Tokens (\(ids.count)): \(ids) ➔ Decoded: \"\(decoded)\""
+        } catch {
+            tokenIDsOutput = "❌ Encoding Error: \(error.localizedDescription)"
         }
     }
     
