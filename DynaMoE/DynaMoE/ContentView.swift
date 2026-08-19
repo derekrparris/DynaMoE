@@ -17,16 +17,16 @@ struct ContentView: View {
     // Selection and GPU Compute State
     @State private var selectedTensorID: String? = nil
     @State private var gpuComputeOutput: String? = nil
-
+    
     var filteredTensors: [TensorMetadata] {
         guard let tensors = summary?.tensors else { return [] }
         return searchText.isEmpty ? tensors : tensors.filter { $0.name.localizedCaseInsensitiveContains(searchText) }
     }
-
+    
     var selectedTensor: TensorMetadata? {
         summary?.tensors.first(where: { $0.name == selectedTensorID })
     }
-
+    
     var body: some View {
         VStack(spacing: 0) {
             // Header Bar
@@ -52,7 +52,7 @@ struct ContentView: View {
             .background(Color(NSColor.windowBackgroundColor))
             
             Divider()
-
+            
             if let err = errorMessage {
                 ContentUnavailableView("Error", systemImage: "exclamationmark.triangle", description: Text(err))
             } else if summary != nil {
@@ -66,7 +66,7 @@ struct ContentView: View {
                     .background(Color(NSColor.controlBackgroundColor))
                     .cornerRadius(6)
                     .padding(10)
-
+                    
                     // Interactive Tensor Table
                     Table(filteredTensors, selection: $selectedTensorID) {
                         TableColumn("Tensor Name", value: \.name)
@@ -182,22 +182,34 @@ struct ContentView: View {
             self.engine = nil
         }
     }
-
+    
     // MARK: - Execute MSL Shader on Selected Tensor
     private func executeGpuShader(on tensor: TensorMetadata) {
         guard let engine = engine,
+              let summary = summary,
               let device = MTLCreateSystemDefaultDevice(),
               let commandQueue = device.makeCommandQueue(),
               let defaultLibrary = device.makeDefaultLibrary(),
-              let kernelFunction = defaultLibrary.makeFunction(name: "dequantize_mxfp8_weights") else {
+              let kernelFunction = defaultLibrary.makeFunction(name: "dequantize_mxfp8_paired") else {
             gpuComputeOutput = "❌ Error setting up Metal pipeline."
             return
         }
-
+        
         do {
             let pipelineState = try device.makeComputePipelineState(function: kernelFunction)
             
-            // 1. Wrap mapped pointer for Metal
+            // 1. Resolve weight and paired scale byte offsets
+            var weightOffset = tensor.offsetStart
+            var scaleOffset = tensor.offsetStart
+            
+            let baseName = tensor.name.replacingOccurrences(of: ".weight", with: "").replacingOccurrences(of: ".scales", with: "")
+            let weightTensor = summary.tensors.first(where: { $0.name == "\(baseName).weight" }) ?? tensor
+            let scaleTensor  = summary.tensors.first(where: { $0.name == "\(baseName).scales" }) ?? tensor
+            
+            weightOffset = weightTensor.offsetStart
+            scaleOffset  = scaleTensor.offsetStart
+            
+            // 2. Wrap mapped pointer for Metal
             let address = UInt(engine.bufferBaseAddress())
             guard let pointer = UnsafeMutableRawPointer(bitPattern: address) else { return }
             let length = Int(engine.bufferLength())
@@ -207,23 +219,21 @@ struct ContentView: View {
                 return
             }
             
-            // 2. Create GPU Output Buffer for 8 sample weights (FP32)
+            // 3. Output buffer for 8 sample weights (FP32)
             let sampleCount = 8
             let outputByteLength = sampleCount * MemoryLayout<Float>.stride
             guard let outputBuffer = device.makeBuffer(length: outputByteLength, options: .storageModeShared) else { return }
             
-            // 3. Prepare Command Buffer
+            // 4. Encode & Dispatch
             guard let commandBuffer = commandQueue.makeCommandBuffer(),
                   let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
-            
-            var byteOffset = tensor.offsetStart
             
             computeEncoder.setComputePipelineState(pipelineState)
             computeEncoder.setBuffer(rawBaseBuffer, offset: 0, index: 0)
             computeEncoder.setBuffer(outputBuffer, offset: 0, index: 1)
-            computeEncoder.setBytes(&byteOffset, length: MemoryLayout<UInt64>.stride, index: 2)
+            computeEncoder.setBytes(&weightOffset, length: MemoryLayout<UInt64>.stride, index: 2)
+            computeEncoder.setBytes(&scaleOffset, length: MemoryLayout<UInt64>.stride, index: 3)
             
-            // Dispatch 8 threads to read sample weights
             let gridSize = MTLSize(width: sampleCount, height: 1, depth: 1)
             let threadgroupSize = MTLSize(width: min(sampleCount, pipelineState.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
             computeEncoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
@@ -232,14 +242,14 @@ struct ContentView: View {
             commandBuffer.commit()
             commandBuffer.waitUntilCompleted()
             
-            // 4. Read back GPU Output Buffer
+            // 5. Read back dequantized floats
             let rawFloatPtr = outputBuffer.contents().bindMemory(to: Float.self, capacity: sampleCount)
             var sampleValues: [String] = []
             for i in 0..<sampleCount {
-                sampleValues.append(String(format: "%.4f", rawFloatPtr[i]))
+                sampleValues.append(String(format: "%.6f", rawFloatPtr[i]))
             }
             
-            gpuComputeOutput = "⚡ GPU Execution Complete! First 8 weights read from NVMe: [\(sampleValues.joined(separator: ", "))]"
+            gpuComputeOutput = "⚡ MXFP8 Dequantized! First 8 weights for '\(baseName)': [\(sampleValues.joined(separator: ", "))]"
             
         } catch {
             gpuComputeOutput = "❌ Pipeline Error: \(error.localizedDescription)"
