@@ -6,6 +6,16 @@ DynaMoE is a high-performance native macOS application, local inference engine, 
 
 ---
 
+## Inspiration
+
+This project was undertaken purely for the joy of exploration by someone who is not a software engineer or even a "real" developer. Just someone who is enjoying learning with the help of AI. I'm steering the ship, and Gemini 3.6 and 3.7 are largely implementing the ideas and pointing me in the right direction.
+
+The projects that originally inspired this exploration were:
+* **Colibri** https://github.com/JustVugg/colibri
+* **Flash-MoE** https://github.com/danveloper/flash-moe
+
+---
+
 ## Key Highlights & Capabilities
 
 * **Zero-Copy Apple Silicon Unified Memory Bridge:** Memory-maps multi-gigabyte SafeTensors weight shards via `memmap2` in Rust and wraps raw memory addresses directly into Metal GPU buffers (`MTLBuffer(bytesNoCopy:length:options:deallocator:)` with `.storageModeShared`), eliminating duplicate copies between CPU and GPU.
