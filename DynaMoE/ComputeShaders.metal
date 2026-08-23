@@ -228,3 +228,189 @@ kernel void moe_shared_gate_bf16(
     float sig = 1.0f / (1.0f + exp(-sum));
     outSharedWeight[tokenIdx] = sig;
 }
+
+/// MSL Kernel: Zeros a float buffer in GPU memory
+kernel void clear_vector_f32(
+    device float* buffer [[buffer(0)]],
+    uint id [[thread_position_in_grid]]
+) {
+    buffer[id] = 0.0f;
+}
+
+/// MSL Kernel: Fused MXFP8 SwiGLU Gate & Up Projections with SiLU Activation and Hadamard Product
+/// Computes inter[r] = SiLU(W_gate[r, :] * x) * (W_up[r, :] * x) for all intermediate dimensions r.
+kernel void mxfp8_swiglu_gate_up(
+    device const uchar* rawGateBuffer [[buffer(0)]],
+    device const uchar* rawUpBuffer [[buffer(1)]],
+    device const float* inputVector [[buffer(2)]],
+    device float* intermediateOutput [[buffer(3)]],
+    constant uint64_t& gateWeightOffset [[buffer(4)]],
+    constant uint64_t& gateScaleOffset [[buffer(5)]],
+    constant uint64_t& upWeightOffset [[buffer(6)]],
+    constant uint64_t& upScaleOffset [[buffer(7)]],
+    constant uint32_t& hiddenDim [[buffer(8)]],
+    constant uint32_t& intermediateDim [[buffer(9)]],
+    uint r [[thread_position_in_grid]]
+) {
+    if (r >= intermediateDim) return;
+
+    uint32_t numBlocks = hiddenDim / 32;
+    uint32_t gateWordsPerRow = hiddenDim / 4;
+    uint32_t upWordsPerRow = hiddenDim / 4;
+    uint32_t gateScalesPerRow = hiddenDim / 32;
+    uint32_t upScalesPerRow = hiddenDim / 32;
+
+    device const uint32_t* gateU32 = (device const uint32_t*)(rawGateBuffer + gateWeightOffset);
+    device const uchar* gateScales = rawGateBuffer + gateScaleOffset;
+
+    device const uint32_t* upU32 = (device const uint32_t*)(rawUpBuffer + upWeightOffset);
+    device const uchar* upScales = rawUpBuffer + upScaleOffset;
+
+    float gate_dot = 0.0f;
+    float up_dot   = 0.0f;
+
+    for (uint32_t b = 0; b < numBlocks; b++) {
+        float gScale = decode_e8m0_scale(gateScales[r * gateScalesPerRow + b]);
+        float uScale = decode_e8m0_scale(upScales[r * upScalesPerRow + b]);
+
+        float gBlockSum = 0.0f;
+        float uBlockSum = 0.0f;
+
+        for (uint32_t w = 0; w < 8; w++) {
+            uint32_t wordIdx = r * gateWordsPerRow + (b * 8 + w);
+            uint32_t gWord = gateU32[wordIdx];
+            uint32_t uWord = upU32[wordIdx];
+
+            uint32_t baseD = (b * 32) + (w * 4);
+
+            float g0 = unpack_e4m3((gWord >> 0) & 0xFF);
+            float g1 = unpack_e4m3((gWord >> 8) & 0xFF);
+            float g2 = unpack_e4m3((gWord >> 16) & 0xFF);
+            float g3 = unpack_e4m3((gWord >> 24) & 0xFF);
+
+            float u0 = unpack_e4m3((uWord >> 0) & 0xFF);
+            float u1 = unpack_e4m3((uWord >> 8) & 0xFF);
+            float u2 = unpack_e4m3((uWord >> 16) & 0xFF);
+            float u3 = unpack_e4m3((uWord >> 24) & 0xFF);
+
+            float in0 = inputVector[baseD + 0];
+            float in1 = inputVector[baseD + 1];
+            float in2 = inputVector[baseD + 2];
+            float in3 = inputVector[baseD + 3];
+
+            gBlockSum += (g0 * in0) + (g1 * in1) + (g2 * in2) + (g3 * in3);
+            uBlockSum += (u0 * in0) + (u1 * in1) + (u2 * in2) + (u3 * in3);
+        }
+
+        gate_dot += gBlockSum * gScale;
+        up_dot   += uBlockSum * uScale;
+    }
+
+    // SiLU activation: silu(x) = x / (1 + exp(-x))
+    float silu_gate = gate_dot / (1.0f + exp(-gate_dot));
+    intermediateOutput[r] = silu_gate * up_dot;
+}
+
+/// MSL Kernel: MXFP8 Down-Projection with Weighted Accumulation
+/// Computes outputAccumulator[d] += routingWeight * (W_down[d, :] * intermediateVector) for all hidden dims d.
+kernel void mxfp8_down_proj_accumulate(
+    device const uchar* rawDownBuffer [[buffer(0)]],
+    device const float* intermediateVector [[buffer(1)]],
+    device float* outputAccumulator [[buffer(2)]],
+    constant uint64_t& downWeightOffset [[buffer(3)]],
+    constant uint64_t& downScaleOffset [[buffer(4)]],
+    constant uint32_t& intermediateDim [[buffer(5)]],
+    constant uint32_t& hiddenDim [[buffer(6)]],
+    constant float& routingWeight [[buffer(7)]],
+    uint d [[thread_position_in_grid]]
+) {
+    if (d >= hiddenDim) return;
+
+    uint32_t numBlocks = intermediateDim / 32;
+    uint32_t wordsPerRow = intermediateDim / 4;
+    uint32_t scalesPerRow = intermediateDim / 32;
+
+    device const uint32_t* downU32 = (device const uint32_t*)(rawDownBuffer + downWeightOffset);
+    device const uchar* downScales = rawDownBuffer + downScaleOffset;
+
+    float down_dot = 0.0f;
+
+    for (uint32_t b = 0; b < numBlocks; b++) {
+        float dScale = decode_e8m0_scale(downScales[d * scalesPerRow + b]);
+        float blockSum = 0.0f;
+
+        for (uint32_t w = 0; w < 8; w++) {
+            uint32_t wordIdx = d * wordsPerRow + (b * 8 + w);
+            uint32_t dWord = downU32[wordIdx];
+            uint32_t baseI = (b * 32) + (w * 4);
+
+            float d0 = unpack_e4m3((dWord >> 0) & 0xFF);
+            float d1 = unpack_e4m3((dWord >> 8) & 0xFF);
+            float d2 = unpack_e4m3((dWord >> 16) & 0xFF);
+            float d3 = unpack_e4m3((dWord >> 24) & 0xFF);
+
+            blockSum += (d0 * intermediateVector[baseI + 0])
+                      + (d1 * intermediateVector[baseI + 1])
+                      + (d2 * intermediateVector[baseI + 2])
+                      + (d3 * intermediateVector[baseI + 3]);
+        }
+
+        down_dot += blockSum * dScale;
+    }
+
+    outputAccumulator[d] += routingWeight * down_dot;
+}
+
+/// MSL Kernel: Fused BF16 SwiGLU Gate & Up Projections
+kernel void bf16_swiglu_gate_up(
+    device const ushort* rawGateBuffer [[buffer(0)]],
+    device const ushort* rawUpBuffer [[buffer(1)]],
+    device const float* inputVector [[buffer(2)]],
+    device float* intermediateOutput [[buffer(3)]],
+    constant uint64_t& gateWeightOffset [[buffer(4)]],
+    constant uint64_t& upWeightOffset [[buffer(5)]],
+    constant uint32_t& hiddenDim [[buffer(6)]],
+    constant uint32_t& intermediateDim [[buffer(7)]],
+    uint r [[thread_position_in_grid]]
+) {
+    if (r >= intermediateDim) return;
+
+    uint64_t gateRowStart = (gateWeightOffset / 2) + ((uint64_t)r * hiddenDim);
+    uint64_t upRowStart   = (upWeightOffset / 2) + ((uint64_t)r * hiddenDim);
+
+    float gate_dot = 0.0f;
+    float up_dot   = 0.0f;
+
+    for (uint32_t d = 0; d < hiddenDim; d++) {
+        float inVal = inputVector[d];
+        gate_dot += bf16_to_fp32(rawGateBuffer[gateRowStart + d]) * inVal;
+        up_dot   += bf16_to_fp32(rawUpBuffer[upRowStart + d]) * inVal;
+    }
+
+    float silu_gate = gate_dot / (1.0f + exp(-gate_dot));
+    intermediateOutput[r] = silu_gate * up_dot;
+}
+
+/// MSL Kernel: BF16 Down-Projection with Weighted Accumulation
+kernel void bf16_down_proj_accumulate(
+    device const ushort* rawDownBuffer [[buffer(0)]],
+    device const float* intermediateVector [[buffer(1)]],
+    device float* outputAccumulator [[buffer(2)]],
+    constant uint64_t& downWeightOffset [[buffer(3)]],
+    constant uint32_t& intermediateDim [[buffer(4)]],
+    constant uint32_t& hiddenDim [[buffer(5)]],
+    constant float& routingWeight [[buffer(6)]],
+    uint d [[thread_position_in_grid]]
+) {
+    if (d >= hiddenDim) return;
+
+    uint64_t downRowStart = (downWeightOffset / 2) + ((uint64_t)d * intermediateDim);
+    float down_dot = 0.0f;
+
+    for (uint32_t i = 0; i < intermediateDim; i++) {
+        down_dot += bf16_to_fp32(rawDownBuffer[downRowStart + i]) * intermediateVector[i];
+    }
+
+    outputAccumulator[d] += routingWeight * down_dot;
+}
+
