@@ -80,11 +80,11 @@ flowchart LR
 - [x] **Expert Dispatch & Accumulation Pipeline**: Multi-expert parallel GPU dispatch across top-$K$ active experts and shared expert, weighted accumulation into post-MLP hidden state vector $h_{\text{mlp}}$.
 - [x] **Attention & RMSNorm Normalization Kernels**: Fast parallel threadgroup-reduced RMSNorm (`rmsnorm_bf16`), residual connection additions (`vector_add_f32`), and full transformer block forward pass execution ($h_l \to h_{l+1}$).
 
-### Phase 3: Multi-Layer Execution & Autoregressive Generation ⏳
-- [ ] Sequential multi-layer execution loop ($h_l \to h_{l+1}$) orchestrating attention and MoE blocks across full depth.
-- [ ] Final RMSNorm and `lm_head` projection kernel for vocabulary logit computation.
-- [ ] Autoregressive token sampler supporting Greedy, Temperature, Top-$P$, and Repetition Penalties.
-- [ ] Dynamic SSD expert paging and predictive prefetching engine for high-throughput inference on constrained RAM.
+### Phase 3: Multi-Layer Execution & Autoregressive Generation 🚀 *(In Progress)*
+- [x] **Sequential Multi-Layer Backbone Engine ($h_0 \to h_{40}$)**: Double-buffered GPU layer loop chaining dynamic Top-8 MoE routing, SwiGLU expert dispatch, RMSNorm, and attention residual connections across all 40 layers.
+- [ ] **Final RMSNorm & LM Head Projection**: Normalization and vocabulary matrix projection ($2048 \to 248,320$) for vocabulary logit computation.
+- [ ] **Autoregressive Generation & Sampling Loop**: Interactive token generation supporting Greedy, Temperature, Top-$P$, and Repetition Penalties.
+- [ ] **Dynamic SSD Expert Paging & Predictive Prefetching**: High-throughput inference on RAM-constrained machines via predictive SafeTensors paging.
 
 ### Phase 4: Local Server & Ecosystem Integration 🔮
 - [ ] Embedded OpenAI-compatible HTTP server (`/v1/chat/completions`, `/v1/models`).
