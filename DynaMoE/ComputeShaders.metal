@@ -414,3 +414,148 @@ kernel void bf16_down_proj_accumulate(
     outputAccumulator[d] += routingWeight * down_dot;
 }
 
+// =============================================================================
+// MARK: - RMSNorm, Vector Addition & GEMV Compute Kernels
+// =============================================================================
+
+/// MSL Kernel: RMSNorm with BF16 Scale Factors
+/// y_d = (x_d / sqrt( (1/D) * sum(x^2) + eps )) * gamma_d
+kernel void rmsnorm_bf16(
+    device const float* inVector [[buffer(0)]],
+    device const ushort* gammaBuffer [[buffer(1)]],
+    device float* outVector [[buffer(2)]],
+    constant uint64_t& gammaOffset [[buffer(3)]],
+    constant uint32_t& dim [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    threadgroup float* sharedSum [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]]
+) {
+    // 1. Parallel threadgroup reduction for sum of squares
+    float localSum = 0.0f;
+    for (uint i = tid; i < dim; i += tgSize) {
+        float v = inVector[i];
+        localSum += v * v;
+    }
+    sharedSum[tid] = localSum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = tgSize / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sharedSum[tid] += sharedSum[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float meanSquare = sharedSum[0] / (float)dim;
+    float invRms = rsqrt(meanSquare + eps);
+
+    // 2. Normalize and scale by gamma
+    uint64_t gammaStart = gammaOffset / 2;
+    for (uint i = tid; i < dim; i += tgSize) {
+        float gamma = bf16_to_fp32(gammaBuffer[gammaStart + i]);
+        outVector[i] = inVector[i] * invRms * gamma;
+    }
+}
+
+/// MSL Kernel: Parallel Element-Wise Vector Addition (Residual Connection)
+/// out[d] = a[d] + b[d]
+kernel void vector_add_f32(
+    device const float* aVector [[buffer(0)]],
+    device const float* bVector [[buffer(1)]],
+    device float* outVector [[buffer(2)]],
+    constant uint32_t& dim [[buffer(3)]],
+    uint d [[thread_position_in_grid]]
+) {
+    if (d >= dim) return;
+    outVector[d] = aVector[d] + bVector[d];
+}
+
+/// MSL Kernel: General MXFP8 Matrix-Vector GEMV (out = W * x)
+kernel void mxfp8_gemv(
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const float* inputVector [[buffer(1)]],
+    device float* outputVector [[buffer(2)]],
+    constant uint64_t& weightOffset [[buffer(3)]],
+    constant uint64_t& scaleOffset [[buffer(4)]],
+    constant uint32_t& inDim [[buffer(5)]],
+    constant uint32_t& outDim [[buffer(6)]],
+    uint row [[thread_position_in_grid]]
+) {
+    if (row >= outDim) return;
+
+    uint32_t blocksPerRow = inDim / 32;
+    uint64_t rowWeightStart = weightOffset + ((uint64_t)row * inDim);
+    uint64_t rowScaleStart  = scaleOffset  + ((uint64_t)row * blocksPerRow);
+
+    float dot = 0.0f;
+
+    for (uint32_t b = 0; b < blocksPerRow; b++) {
+        uint8_t scaleByte = rawWeightBuffer[rowScaleStart + b];
+        int scaleExp = (int)scaleByte - 127;
+        float scale = exp2((float)scaleExp);
+
+        uint64_t blkStart = rowWeightStart + ((uint64_t)b * 32);
+        uint32_t inStart = b * 32;
+
+        for (uint32_t i = 0; i < 32; i++) {
+            uint8_t byteVal = rawWeightBuffer[blkStart + i];
+            float w = unpack_e4m3(byteVal) * scale;
+            dot += w * inputVector[inStart + i];
+        }
+    }
+
+    outputVector[row] = dot;
+}
+
+/// MSL Kernel: General BF16 Matrix-Vector GEMV (out = W * x)
+kernel void bf16_gemv(
+    device const ushort* rawWeightBuffer [[buffer(0)]],
+    device const float* inputVector [[buffer(1)]],
+    device float* outputVector [[buffer(2)]],
+    constant uint64_t& weightOffset [[buffer(3)]],
+    constant uint32_t& inDim [[buffer(4)]],
+    constant uint32_t& outDim [[buffer(5)]],
+    uint row [[thread_position_in_grid]]
+) {
+    if (row >= outDim) return;
+
+    uint64_t rowWeightStart = (weightOffset / 2) + ((uint64_t)row * inDim);
+    float dot = 0.0f;
+
+    for (uint32_t i = 0; i < inDim; i++) {
+        float w = bf16_to_fp32(rawWeightBuffer[rowWeightStart + i]);
+        dot += w * inputVector[i];
+    }
+
+    outputVector[row] = dot;
+}
+
+/// MSL Kernel: Per-Head RMSNorm for Attention Heads (Q-Norm and K-Norm)
+kernel void per_head_rmsnorm_bf16(
+    device float* qkVector [[buffer(0)]],
+    device const ushort* gammaBuffer [[buffer(1)]],
+    constant uint64_t& gammaOffset [[buffer(2)]],
+    constant uint32_t& numHeads [[buffer(3)]],
+    constant uint32_t& headDim [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    uint headIdx [[thread_position_in_grid]]
+) {
+    if (headIdx >= numHeads) return;
+
+    uint32_t offset = headIdx * headDim;
+    float sumSq = 0.0f;
+    for (uint32_t d = 0; d < headDim; d++) {
+        float v = qkVector[offset + d];
+        sumSq += v * v;
+    }
+
+    float invRms = rsqrt((sumSq / (float)headDim) + eps);
+    uint64_t gammaStart = gammaOffset / 2;
+
+    for (uint32_t d = 0; d < headDim; d++) {
+        float gamma = bf16_to_fp32(gammaBuffer[gammaStart + d]);
+        qkVector[offset + d] = qkVector[offset + d] * invRms * gamma;
+    }
+}
+

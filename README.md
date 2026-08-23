@@ -74,11 +74,11 @@ flowchart LR
 - [x] Native Metal compute kernels for MXFP8 weight dequantization and BF16/MXFP8 embedding lookup ($h_0$).
 - [x] Interactive SwiftUI dashboard for layer inspection, expert distribution, and live GPU kernel execution.
 
-### Phase 2: MoE Routing & Layer Compute 🚀 *(In Progress)*
+### Phase 2: MoE Routing & Layer Compute 🚀 *(Completed)*
 - [x] **MoE Top-$K$ Gating Kernel (`mlp.gate.weight`)**: Metal shader multiplying hidden state $h_l$ against router weights, applying Softmax, and extracting top-$K$ expert indices with routing probabilities.
 - [x] **MXFP8 GEMV Compute Kernels & SwiGLU MLP**: Fused FP8 dequantization matrix-vector multiplication with SiLU activation and Hadamard product for expert projections (`gate_proj`, `up_proj`, `down_proj`).
 - [x] **Expert Dispatch & Accumulation Pipeline**: Multi-expert parallel GPU dispatch across top-$K$ active experts and shared expert, weighted accumulation into post-MLP hidden state vector $h_{\text{mlp}}$.
-- [ ] **Attention & Normalization Kernels**: RMSNorm pre-normalization, QKV projection kernels, and RoPE / Linear Attention sequence processing.
+- [x] **Attention & RMSNorm Normalization Kernels**: Fast parallel threadgroup-reduced RMSNorm (`rmsnorm_bf16`), residual connection additions (`vector_add_f32`), and full transformer block forward pass execution ($h_l \to h_{l+1}$).
 
 ### Phase 3: Multi-Layer Execution & Autoregressive Generation ⏳
 - [ ] Sequential multi-layer execution loop ($h_l \to h_{l+1}$) orchestrating attention and MoE blocks across full depth.

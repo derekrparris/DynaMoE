@@ -516,4 +516,21 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_real_ornith_path() {
+        let snapshot_dir = PathBuf::from("/Users/derekparris/.cache/huggingface/hub/models--ornith-ai--Ornith-1.5-35B-A3B-FP8/snapshots/0e048080ccd0ccf4296bfea5638036c196dccc0c");
+        let index_file = snapshot_dir.join("model.safetensors.index.json");
+        if index_file.exists() {
+            let engine = DynaMoeEngine::new(index_file.to_string_lossy().to_string());
+            assert!(engine.is_ok(), "Failed to create DynaMoeEngine for Ornith: {:?}", engine.err());
+            let engine = engine.unwrap();
+            let summary = engine.get_summary();
+            assert!(summary.is_ok(), "Failed to get summary for Ornith: {:?}", summary.err());
+            let summary = summary.unwrap();
+            println!("ORNITH SUCCESS! Loaded {} shards, {} tensors, {:.2} GB, {} layers, max expert ID {}", 
+                     summary.shards.len(), summary.tensor_count, summary.size_gb, summary.layer_count, summary.max_expert_id);
+            assert_eq!(summary.shards.len(), 16);
+        }
+    }
 }
