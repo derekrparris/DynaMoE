@@ -29,6 +29,16 @@ struct ContentView: View {
     @State private var selectedTensorID: String? = nil
     @State private var gpuComputeOutput: String? = nil
 
+    // Active Token Embedding & MoE Routing State
+    @State private var activeH0Buffer: MTLBuffer? = nil
+    @State private var activeTokenCount: Int = 0
+    @State private var activeHiddenDim: Int = 2048
+    
+    @State private var selectedLayerForRouting: Int = 0
+    @State private var routedExperts: [(id: Int, weight: Float)] = []
+    @State private var sharedExpertWeight: Float? = nil
+    @State private var routerStatusText: String? = nil
+
     let categoryFilters = ["All", "Self-Attention", "MoE Router", "Routed Expert", "Shared Expert", "Embedding", "LM Head"]
 
     var filteredTensors: [TensorMetadata] {
@@ -175,13 +185,105 @@ struct ContentView: View {
                     .foregroundColor(tokenizer == nil ? .secondary : .purple)
                     .lineLimit(2)
 
-                if let tokenizer = tokenizer, let ids = try? tokenizer.encode(text: promptInput), !ids.isEmpty {
-                    Button("Generate Initial Hidden State h_0") {
-                        executeEmbeddingLookup(tokenIds: ids)
+                HStack(spacing: 12) {
+                    if let tokenizer = tokenizer, let ids = try? tokenizer.encode(text: promptInput), !ids.isEmpty {
+                        Button(action: { executeEmbeddingLookup(tokenIds: ids) }) {
+                            Label("Generate Hidden State h_0", systemImage: "sparkles")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.blue)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.blue)
-                    .padding(.top, 4)
+                    
+                    if activeH0Buffer != nil, let summary = summary, summary.layerCount > 0 {
+                        HStack(spacing: 8) {
+                            Picker("Layer", selection: $selectedLayerForRouting) {
+                                ForEach(0..<Int(summary.layerCount), id: \.self) { l in
+                                    Text("Layer \(l)").tag(l)
+                                }
+                            }
+                            .frame(width: 120)
+                            
+                            Button(action: { executeMoERouter(layerIndex: selectedLayerForRouting, topK: 8) }) {
+                                Label("Route Top-8 Experts (GPU)", systemImage: "point.3.connected.trianglepath.dotted")
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.purple)
+                        }
+                    }
+                }
+                .padding(.top, 4)
+
+                // Live MoE Routing Visualizer Card
+                if !routedExperts.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Label("Layer \(selectedLayerForRouting) Top-8 Routed Experts (of \(summary?.maxExpertId ?? 256))", systemImage: "cpu.fill")
+                                .font(.subheadline)
+                                .fontWeight(.bold)
+                                .foregroundColor(.purple)
+                            
+                            Spacer()
+                            
+                            if let shared = sharedExpertWeight {
+                                Text(String(format: "Shared Expert Gate: %.1f%%", shared * 100.0))
+                                    .font(.caption)
+                                    .fontWeight(.bold)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 3)
+                                    .background(Color.blue.opacity(0.15))
+                                    .foregroundColor(.blue)
+                                    .cornerRadius(6)
+                            }
+                        }
+                        
+                        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 4), spacing: 8) {
+                            ForEach(Array(routedExperts.enumerated()), id: \.offset) { rank, expert in
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack {
+                                        Text("#\(rank + 1)")
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                        Text("Expert #\(expert.id)")
+                                            .font(.system(.caption, design: .monospaced))
+                                            .fontWeight(.bold)
+                                            .foregroundColor(.purple)
+                                        Spacer()
+                                        Text(String(format: "%.1f%%", expert.weight * 100.0))
+                                            .font(.system(.caption, design: .monospaced))
+                                            .fontWeight(.semibold)
+                                    }
+                                    
+                                    GeometryReader { geo in
+                                        ZStack(alignment: .leading) {
+                                            Capsule()
+                                                .fill(Color.purple.opacity(0.15))
+                                                .frame(height: 6)
+                                            Capsule()
+                                                .fill(LinearGradient(colors: [.purple, .blue], startPoint: .leading, endPoint: .trailing))
+                                                .frame(width: max(4, geo.size.width * CGFloat(expert.weight)), height: 6)
+                                        }
+                                    }
+                                    .frame(height: 6)
+                                }
+                                .padding(8)
+                                .background(Color(NSColor.controlBackgroundColor))
+                                .cornerRadius(8)
+                            }
+                        }
+                        
+                        if let status = routerStatusText {
+                            Text(status)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(10)
+                    .background(Color.purple.opacity(0.06))
+                    .cornerRadius(8)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.purple.opacity(0.2), lineWidth: 1)
+                    )
                 }
             }
             .padding(10)
@@ -390,14 +492,136 @@ struct ContentView: View {
             
             let rawFloatPtr = h0OutputBuffer.contents().bindMemory(to: Float.self, capacity: totalVectorElements)
             var h0Sample: [String] = []
-            for i in 0..<8 {
+            for i in 0..<min(8, totalVectorElements) {
                 h0Sample.append(String(format: "%.6f", rawFloatPtr[i]))
             }
+            
+            self.activeH0Buffer = h0OutputBuffer
+            self.activeTokenCount = tokenCount
+            self.activeHiddenDim = Int(hiddenDim)
             
             gpuComputeOutput = "🚀 Generated h_0 Vector (\(embedWeight.dtype)) [\(tokenCount) x \(hiddenDim)] from Shard #\(embedWeight.shardIndex)! First 8 dims of Token #0: [\(h0Sample.joined(separator: ", "))]"
             
         } catch {
             gpuComputeOutput = "❌ Embedding Lookup Error: \(error.localizedDescription)"
+        }
+    }
+
+    // MARK: - Execute MoE Top-K Router
+    private func executeMoERouter(layerIndex: Int, topK: Int = 8) {
+        guard let summary = summary,
+              let h0Buffer = activeH0Buffer,
+              let device = MTLCreateSystemDefaultDevice(),
+              let commandQueue = device.makeCommandQueue(),
+              let defaultLibrary = device.makeDefaultLibrary() else {
+            gpuComputeOutput = "❌ Missing active h_0 buffer or Metal device. Please click 'Generate Hidden State h_0' first."
+            return
+        }
+
+        do {
+            // Locate the router gate weight tensor for the target layer
+            guard let gateWeight = summary.tensors.first(where: {
+                $0.layerIndex == UInt32(layerIndex) &&
+                ($0.category == "MoE Router" || $0.name.hasSuffix("mlp.gate.weight") || $0.name.contains("mlp.gate")) &&
+                !$0.name.contains("shared") &&
+                !$0.name.contains("scale")
+            }) else {
+                gpuComputeOutput = "❌ Could not find mlp.gate.weight for Layer #\(layerIndex)."
+                return
+            }
+
+            guard let rawGateBuffer = shardBuffers[gateWeight.shardIndex] else {
+                gpuComputeOutput = "❌ Shard #\(gateWeight.shardIndex) containing Layer #\(layerIndex) gate is not loaded."
+                return
+            }
+
+            let numExpertsVal: UInt32 = summary.maxExpertId > 0 ? summary.maxExpertId : 256
+            var topKVal: UInt32 = UInt32(topK)
+            var hiddenDimVal: UInt32 = UInt32(activeHiddenDim)
+            var gateOffset: UInt64 = gateWeight.offsetStart
+            var numExperts: UInt32 = numExpertsVal
+
+            guard let outIndicesBuffer = device.makeBuffer(length: topK * MemoryLayout<UInt32>.stride, options: .storageModeShared),
+                  let outWeightsBuffer = device.makeBuffer(length: topK * MemoryLayout<Float>.stride, options: .storageModeShared),
+                  let commandBuffer = commandQueue.makeCommandBuffer(),
+                  let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
+
+            guard let kernelFunction = defaultLibrary.makeFunction(name: "moe_router_topk_bf16") else {
+                gpuComputeOutput = "❌ Failed to load moe_router_topk_bf16 kernel."
+                return
+            }
+            let pipelineState = try device.makeComputePipelineState(function: kernelFunction)
+
+            computeEncoder.setComputePipelineState(pipelineState)
+            computeEncoder.setBuffer(rawGateBuffer, offset: 0, index: 0)
+            computeEncoder.setBuffer(h0Buffer, offset: 0, index: 1)
+            computeEncoder.setBuffer(outIndicesBuffer, offset: 0, index: 2)
+            computeEncoder.setBuffer(outWeightsBuffer, offset: 0, index: 3)
+            computeEncoder.setBytes(&gateOffset, length: MemoryLayout<UInt64>.stride, index: 4)
+            computeEncoder.setBytes(&hiddenDimVal, length: MemoryLayout<UInt32>.stride, index: 5)
+            computeEncoder.setBytes(&numExperts, length: MemoryLayout<UInt32>.stride, index: 6)
+            computeEncoder.setBytes(&topKVal, length: MemoryLayout<UInt32>.stride, index: 7)
+
+            let threadsPerThreadgroup = MTLSize(width: Int(numExpertsVal), height: 1, depth: 1)
+            let threadgroups = MTLSize(width: 1, height: 1, depth: 1)
+            computeEncoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
+
+            // Also check for shared expert gate
+            var sharedOutBuffer: MTLBuffer? = nil
+            if let sharedGateWeight = summary.tensors.first(where: {
+                $0.layerIndex == UInt32(layerIndex) && $0.name.contains("shared_expert_gate") && !$0.name.contains("scale")
+            }), let sharedRawBuffer = shardBuffers[sharedGateWeight.shardIndex],
+               let sharedKernel = defaultLibrary.makeFunction(name: "moe_shared_gate_bf16") {
+                
+                let sharedPipelineState = try device.makeComputePipelineState(function: sharedKernel)
+                var sharedOffset: UInt64 = sharedGateWeight.offsetStart
+                sharedOutBuffer = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared)
+                
+                if let sharedOutBuffer = sharedOutBuffer {
+                    computeEncoder.setComputePipelineState(sharedPipelineState)
+                    computeEncoder.setBuffer(sharedRawBuffer, offset: 0, index: 0)
+                    computeEncoder.setBuffer(h0Buffer, offset: 0, index: 1)
+                    computeEncoder.setBuffer(sharedOutBuffer, offset: 0, index: 2)
+                    computeEncoder.setBytes(&sharedOffset, length: MemoryLayout<UInt64>.stride, index: 3)
+                    computeEncoder.setBytes(&hiddenDimVal, length: MemoryLayout<UInt32>.stride, index: 4)
+                    
+                    computeEncoder.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+                }
+            }
+
+            let startTime = CFAbsoluteTimeGetCurrent()
+            computeEncoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
+
+            let indicesPtr = outIndicesBuffer.contents().bindMemory(to: UInt32.self, capacity: topK)
+            let weightsPtr = outWeightsBuffer.contents().bindMemory(to: Float.self, capacity: topK)
+
+            var extractedExperts: [(id: Int, weight: Float)] = []
+            var sumProb: Float = 0.0
+            for i in 0..<topK {
+                let expertId = Int(indicesPtr[i])
+                let w = weightsPtr[i]
+                extractedExperts.append((id: expertId, weight: w))
+                sumProb += w
+            }
+            self.routedExperts = extractedExperts
+
+            if let sharedOutBuffer = sharedOutBuffer {
+                let sharedPtr = sharedOutBuffer.contents().bindMemory(to: Float.self, capacity: 1)
+                self.sharedExpertWeight = sharedPtr[0]
+            } else {
+                self.sharedExpertWeight = nil
+            }
+
+            let topExpertSummary = extractedExperts.map { "#\($0.id) (\(String(format: "%.1f%%", $0.weight * 100)))" }.joined(separator: ", ")
+            let status = "⚡ Layer #\(layerIndex) Gated on GPU in \(String(format: "%.3f", elapsedMs)) ms! Top-\(topK): [\(topExpertSummary)] (Sum: \(String(format: "%.4f", sumProb)))"
+            self.routerStatusText = status
+            self.gpuComputeOutput = status
+
+        } catch {
+            gpuComputeOutput = "❌ MoE Router Error: \(error.localizedDescription)"
         }
     }
 

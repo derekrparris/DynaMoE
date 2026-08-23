@@ -57,6 +57,12 @@ kernel void dequantize_mxfp8_paired(
     outputPreview[id] = unscaledWeight * blockScale;
 }
 
+/// Converts a BF16 (bfloat16) word into an IEEE FP32 float
+inline float bf16_to_fp32(ushort u) {
+    uint32_t bits = ((uint32_t)u) << 16;
+    return as_type<float>(bits);
+}
+
 /// MSL Kernel: Looks up token IDs in mapped MXFP8 embedding tables and outputs hidden state h_0
 kernel void lookup_embeddings_mxfp8(
     device const uchar* rawBaseBuffer [[buffer(0)]],
@@ -64,7 +70,7 @@ kernel void lookup_embeddings_mxfp8(
     device float* outputHiddenStates [[buffer(2)]],
     constant uint64_t& weightOffset [[buffer(3)]],
     constant uint64_t& scaleOffset [[buffer(4)]],
-    constant uint32_t& hiddenDim [[buffer(5)]], // e.g., 3072
+    constant uint32_t& hiddenDim [[buffer(5)]], // e.g., 2048
     uint id [[thread_position_in_grid]]
 ) {
     uint tokenIdx = id / hiddenDim;
@@ -72,7 +78,7 @@ kernel void lookup_embeddings_mxfp8(
     uint32_t targetTokenId = tokenIds[tokenIdx];
     
     // 1. Calculate row offsets for target token ID
-    // 3072 hidden floats stored as 768 packed U32 words (4 bytes each)
+    // 2048 hidden floats stored as 512 packed U32 words (4 bytes each)
     uint32_t u32PerRow = hiddenDim / 4;
     uint32_t u32GlobalIdx = (targetTokenId * u32PerRow) + (dimIdx / 4);
     uint32_t byteInU32 = dimIdx % 4;
@@ -81,7 +87,7 @@ kernel void lookup_embeddings_mxfp8(
     uint32_t packedWord = u32Weights[u32GlobalIdx];
     uchar rawFp8Byte = (packedWord >> (byteInU32 * 8)) & 0xFF;
     
-    // 2. Fetch block scale (32 weights share 1 scale byte for 3072 dim / 96 scales)
+    // 2. Fetch block scale (32 weights share 1 scale byte for 2048 dim / 64 scales)
     uint32_t scalesPerRow = hiddenDim / 32;
     uint32_t scaleGlobalIdx = (targetTokenId * scalesPerRow) + (dimIdx / 32);
     
@@ -114,7 +120,111 @@ kernel void lookup_embeddings_bf16(
     
     // Convert BF16 to FP32 by bit-shifting top 16 bits
     ushort rawBf16 = rawBaseBuffer[globalIdx];
-    uint32_t fp32Bits = ((uint32_t)rawBf16) << 16;
+    outputHiddenStates[id] = bf16_to_fp32(rawBf16);
+}
+
+/// MSL Kernel: MoE Top-K Router
+/// Computes expert gating logits (z = W_gate * h), extracts top-K expert IDs, and applies normalized Softmax.
+kernel void moe_router_topk_bf16(
+    device const ushort* rawBaseBuffer [[buffer(0)]],
+    device const float* inputHiddenState [[buffer(1)]],
+    device uint32_t* outExpertIndices [[buffer(2)]],
+    device float* outRoutingWeights [[buffer(3)]],
+    constant uint64_t& gateWeightOffset [[buffer(4)]],
+    constant uint32_t& hiddenDim [[buffer(5)]],
+    constant uint32_t& numExperts [[buffer(6)]],
+    constant uint32_t& topK [[buffer(7)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tokenIdx [[threadgroup_position_in_grid]]
+) {
+    // Shared threadgroup memory for expert logits (supports up to 256 experts)
+    threadgroup float sharedLogits[256];
     
-    outputHiddenStates[id] = as_type<float>(fp32Bits);
+    // 1. Each thread computes the dot-product logit for expert `tid`
+    if (tid < numExperts && tid < 256) {
+        uint64_t baseUshortOffset = gateWeightOffset / 2;
+        uint64_t rowOffset = baseUshortOffset + ((uint64_t)tid * (uint64_t)hiddenDim);
+        device const float* tokenH = inputHiddenState + (tokenIdx * hiddenDim);
+        
+        float sum = 0.0f;
+        for (uint32_t d = 0; d < hiddenDim; d++) {
+            float w = bf16_to_fp32(rawBaseBuffer[rowOffset + d]);
+            sum += w * tokenH[d];
+        }
+        sharedLogits[tid] = sum;
+    }
+    
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    // 2. Thread 0 extracts Top-K experts and computes numerically stable Softmax
+    if (tid == 0) {
+        uint32_t topIndices[32];
+        float topValues[32];
+        uint32_t k = min(topK, (uint32_t)32);
+        
+        for (uint32_t i = 0; i < k; i++) {
+            topValues[i] = -INFINITY;
+            topIndices[i] = 0;
+        }
+        
+        uint32_t validExperts = min(numExperts, (uint32_t)256);
+        for (uint32_t e = 0; e < validExperts; e++) {
+            float val = sharedLogits[e];
+            if (val > topValues[k - 1]) {
+                int insertPos = (int)k - 1;
+                while (insertPos > 0 && val > topValues[insertPos - 1]) {
+                    topValues[insertPos] = topValues[insertPos - 1];
+                    topIndices[insertPos] = topIndices[insertPos - 1];
+                    insertPos--;
+                }
+                topValues[insertPos] = val;
+                topIndices[insertPos] = e;
+            }
+        }
+        
+        // Softmax over selected Top-K values
+        float maxVal = topValues[0];
+        float sumExp = 0.0f;
+        float exps[32];
+        for (uint32_t i = 0; i < k; i++) {
+            exps[i] = exp(topValues[i] - maxVal);
+            sumExp += exps[i];
+        }
+        
+        float invSum = (sumExp > 0.0f) ? (1.0f / sumExp) : 0.0f;
+        
+        device uint32_t* tokenOutIndices = outExpertIndices + (tokenIdx * topK);
+        device float* tokenOutWeights = outRoutingWeights + (tokenIdx * topK);
+        
+        for (uint32_t i = 0; i < k; i++) {
+            tokenOutIndices[i] = topIndices[i];
+            tokenOutWeights[i] = exps[i] * invSum;
+        }
+    }
+}
+
+/// MSL Kernel: Computes Sigmoid activation for the Shared Expert Gate
+kernel void moe_shared_gate_bf16(
+    device const ushort* rawBaseBuffer [[buffer(0)]],
+    device const float* inputHiddenState [[buffer(1)]],
+    device float* outSharedWeight [[buffer(2)]],
+    constant uint64_t& gateWeightOffset [[buffer(3)]],
+    constant uint32_t& hiddenDim [[buffer(4)]],
+    uint tokenIdx [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (tid != 0) return;
+    
+    uint64_t baseUshortOffset = gateWeightOffset / 2;
+    device const float* tokenH = inputHiddenState + (tokenIdx * hiddenDim);
+    
+    float sum = 0.0f;
+    for (uint32_t d = 0; d < hiddenDim; d++) {
+        float w = bf16_to_fp32(rawBaseBuffer[baseUshortOffset + d]);
+        sum += w * tokenH[d];
+    }
+    
+    // Sigmoid: 1 / (1 + exp(-sum))
+    float sig = 1.0f / (1.0f + exp(-sum));
+    outSharedWeight[tokenIdx] = sig;
 }

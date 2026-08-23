@@ -510,6 +510,10 @@ mod tests {
             assert!(summary.is_ok(), "Failed to get summary: {:?}", summary.err());
             let summary = summary.unwrap();
             println!("SUCCESS! Loaded {} shards, {} tensors, {:.2} GB", summary.shards.len(), summary.tensor_count, summary.size_gb);
+            let router_tensors: Vec<_> = summary.tensors.iter().filter(|t| t.name.ends_with("gate.weight") || t.name.contains("router") || t.category == "MoE Router").take(10).collect();
+            for t in router_tensors {
+                println!("ROUTER TENSOR: name={}, shape={}, dtype={}, shard={}, offset={}", t.name, t.shape_display, t.dtype, t.shard_index, t.offset_start);
+            }
         }
     }
 }
