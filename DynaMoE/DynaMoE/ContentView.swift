@@ -10,6 +10,15 @@ struct LayerTelemetry: Identifiable {
     let l2Norm: Float
 }
 
+struct TokenPrediction: Identifiable {
+    var id: Int { rank }
+    let rank: Int
+    let tokenId: UInt32
+    let tokenString: String
+    let logit: Float
+    let probability: Float
+}
+
 extension TensorMetadata: Identifiable {
     public var id: String { name }
 }
@@ -65,6 +74,12 @@ struct ContentView: View {
     @State private var multiLayerStatusText: String? = nil
     @State private var multiLayerTelemetry: [LayerTelemetry] = []
     @State private var isExecutingMultiLayer: Bool = false
+
+    // Final RMSNorm & LM Head Vocabulary Projection State
+    @State private var activeLogitsBuffer: MTLBuffer? = nil
+    @State private var topTokenPredictions: [TokenPrediction] = []
+    @State private var lmHeadStatusText: String? = nil
+    @State private var isExecutingLMHead: Bool = false
 
     let categoryFilters = ["All", "Self-Attention", "MoE Router", "Routed Expert", "Shared Expert", "Embedding", "LM Head"]
 
@@ -247,14 +262,21 @@ struct ContentView: View {
                             }
                             .buttonStyle(.bordered)
                             .tint(.indigo)
-                            .disabled(isExecutingFullLayer || isExecutingMlp || isExecutingMultiLayer)
+                            .disabled(isExecutingFullLayer || isExecutingMlp || isExecutingMultiLayer || isExecutingLMHead)
 
                             Button(action: { executeMultiLayerForward(numLayers: targetLayerCount) }) {
                                 Label(isExecutingMultiLayer ? "Executing Backbone..." : "Execute All \(targetLayerCount) Layers", systemImage: "square.stack.3d.forward.dottedline.fill")
                             }
                             .buttonStyle(.borderedProminent)
                             .tint(.teal)
-                            .disabled(isExecutingMultiLayer || isExecutingFullLayer || isExecutingMlp)
+                            .disabled(isExecutingMultiLayer || isExecutingFullLayer || isExecutingMlp || isExecutingLMHead)
+
+                            Button(action: { executeLMHeadProjection() }) {
+                                Label(isExecutingLMHead ? "Projecting Vocab..." : "Project LM Head (Next Token)", systemImage: "text.word.spacing")
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(.pink)
+                            .disabled(isExecutingLMHead || isExecutingMultiLayer || isExecutingFullLayer || isExecutingMlp)
                         }
                     }
                 }
@@ -445,6 +467,81 @@ struct ContentView: View {
                     .overlay(
                         RoundedRectangle(cornerRadius: 8)
                             .stroke(Color.teal.opacity(0.2), lineWidth: 1)
+                    )
+                }
+
+                // Live Predicted Token Candidates Card (LM Head Output)
+                if !topTokenPredictions.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Label("LM Head Predicted Next Tokens (Top-\(topTokenPredictions.count) Candidates)", systemImage: "sparkles")
+                                .font(.subheadline)
+                                .fontWeight(.bold)
+                                .foregroundColor(.pink)
+                            Spacer()
+                            if let status = lmHeadStatusText {
+                                Text(status)
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+
+                        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 5), spacing: 8) {
+                            ForEach(topTokenPredictions) { pred in
+                                VStack(alignment: .leading, spacing: 4) {
+                                    HStack {
+                                        Text("#\(pred.rank)")
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                        Text("\"\(pred.tokenString.replacingOccurrences(of: " ", with: " "))\"")
+                                            .font(.system(.subheadline, design: .monospaced))
+                                            .fontWeight(.bold)
+                                            .foregroundColor(.pink)
+                                            .lineLimit(1)
+                                        Spacer()
+                                        Text(String(format: "%.1f%%", pred.probability * 100.0))
+                                            .font(.system(.caption, design: .monospaced))
+                                            .fontWeight(.semibold)
+                                    }
+
+                                    GeometryReader { geo in
+                                        ZStack(alignment: .leading) {
+                                            Capsule()
+                                                .fill(Color.pink.opacity(0.15))
+                                                .frame(height: 6)
+                                            Capsule()
+                                                .fill(LinearGradient(colors: [.pink, .orange], startPoint: .leading, endPoint: .trailing))
+                                                .frame(width: max(4, geo.size.width * CGFloat(pred.probability)), height: 6)
+                                        }
+                                    }
+                                    .frame(height: 6)
+
+                                    HStack {
+                                        Text("ID: \(pred.tokenId)")
+                                            .font(.system(size: 9, design: .monospaced))
+                                            .foregroundColor(.secondary)
+                                        Spacer()
+                                        Text(String(format: "logit: %.2f", pred.logit))
+                                            .font(.system(size: 9, design: .monospaced))
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                                .padding(8)
+                                .background(Color(NSColor.controlBackgroundColor))
+                                .cornerRadius(8)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .stroke(Color.pink.opacity(0.2), lineWidth: 1)
+                                )
+                            }
+                        }
+                    }
+                    .padding(10)
+                    .background(Color.pink.opacity(0.06))
+                    .cornerRadius(8)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.pink.opacity(0.2), lineWidth: 1)
                     )
                 }
             }
@@ -1889,6 +1986,186 @@ struct ContentView: View {
 
         } catch {
             gpuComputeOutput = "❌ Multi-Layer Forward Error: \(error.localizedDescription)"
+        }
+    }
+
+    private func executeLMHeadProjection() {
+        guard let summary = summary,
+              let device = MTLCreateSystemDefaultDevice(),
+              let commandQueue = device.makeCommandQueue(),
+              let defaultLibrary = device.makeDefaultLibrary(),
+              let rmsnormFunction = defaultLibrary.makeFunction(name: "rmsnorm_bf16"),
+              let gemvFunction = defaultLibrary.makeFunction(name: "bf16_gemv") else {
+            gpuComputeOutput = "❌ Error setting up Metal pipeline or missing shaders."
+            return
+        }
+
+        let inputBuffer: MTLBuffer
+        let sourceDescription: String
+        if let hFinal = activeHFinalBuffer {
+            inputBuffer = hFinal
+            sourceDescription = "h_40 (Backbone Output)"
+        } else if let h1 = activeH1Buffer {
+            inputBuffer = h1
+            sourceDescription = "h_1 (Single Block Output)"
+        } else if let h0 = activeH0Buffer {
+            inputBuffer = h0
+            sourceDescription = "h_0 (Initial Embedding)"
+        } else {
+            gpuComputeOutput = "⚠️ Please run 'Embed & Route' or 'Execute All 40 Layers' first to generate hidden activations."
+            return
+        }
+
+        // Find Final RMSNorm Tensor
+        guard let normTensor = summary.tensors.first(where: {
+            $0.name == "model.language_model.norm.weight" ||
+            $0.name == "language_model.norm.weight" ||
+            $0.name == "model.norm.weight" ||
+            ($0.name.hasSuffix(".norm.weight") && !$0.name.contains("layers."))
+        }), let normShardBuffer = shardBuffers[normTensor.shardIndex] else {
+            gpuComputeOutput = "❌ Final RMSNorm weight (model.language_model.norm.weight) not found."
+            return
+        }
+
+        // Find LM Head Weight Tensor
+        guard let lmHeadTensor = summary.tensors.first(where: {
+            $0.name == "lm_head.weight" ||
+            $0.name == "language_model.lm_head.weight" ||
+            $0.name == "model.lm_head.weight"
+        }), let lmHeadShardBuffer = shardBuffers[lmHeadTensor.shardIndex] else {
+            gpuComputeOutput = "❌ LM Head weight (lm_head.weight) not found."
+            return
+        }
+
+        isExecutingLMHead = true
+        topTokenPredictions = []
+        lmHeadStatusText = "Projecting 248,320 vocabulary logits..."
+
+        do {
+            let rmsnormPipeline = try device.makeComputePipelineState(function: rmsnormFunction)
+            let gemvPipeline = try device.makeComputePipelineState(function: gemvFunction)
+
+            var hiddenDim = UInt32(activeHiddenDim)
+            var eps: Float = 1e-6
+            var normOffset = normTensor.offsetStart
+
+            // Parse or set vocab size
+            var vocabSize: UInt32 = 248320
+            let cleanShape = lmHeadTensor.shapeDisplay.replacingOccurrences(of: "[", with: "").replacingOccurrences(of: "]", with: "").replacingOccurrences(of: " ", with: "")
+            let shapeParts = cleanShape.split(separator: ",")
+            if let first = shapeParts.first, let parsed = UInt32(first), parsed > 0 {
+                vocabSize = parsed
+            }
+
+            var lmHeadOffset = lmHeadTensor.offsetStart
+
+            // Allocate buffers
+            guard let xFinalBuffer = device.makeBuffer(length: Int(hiddenDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
+                  let logitsBuffer = device.makeBuffer(length: Int(vocabSize) * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+                gpuComputeOutput = "❌ Failed to allocate xFinal or Logits buffers."
+                isExecutingLMHead = false
+                return
+            }
+
+            let startTime = CFAbsoluteTimeGetCurrent()
+
+            guard let commandBuffer = commandQueue.makeCommandBuffer(),
+                  let computeEncoder = commandBuffer.makeComputeCommandEncoder() else {
+                isExecutingLMHead = false
+                return
+            }
+
+            // 1. Dispatch Final RMSNorm (input -> xFinal)
+            computeEncoder.setComputePipelineState(rmsnormPipeline)
+            computeEncoder.setBuffer(inputBuffer, offset: 0, index: 0)
+            computeEncoder.setBuffer(normShardBuffer, offset: 0, index: 1)
+            computeEncoder.setBuffer(xFinalBuffer, offset: 0, index: 2)
+            computeEncoder.setBytes(&normOffset, length: MemoryLayout<UInt64>.stride, index: 3)
+            computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 4)
+            computeEncoder.setBytes(&eps, length: MemoryLayout<Float>.stride, index: 5)
+
+            let normTgSize = min(1024, rmsnormPipeline.maxTotalThreadsPerThreadgroup)
+            computeEncoder.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
+            computeEncoder.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: normTgSize, height: 1, depth: 1))
+
+            // 2. Dispatch LM Head GEMV (xFinal -> logits)
+            computeEncoder.setComputePipelineState(gemvPipeline)
+            computeEncoder.setBuffer(lmHeadShardBuffer, offset: 0, index: 0)
+            computeEncoder.setBuffer(xFinalBuffer, offset: 0, index: 1)
+            computeEncoder.setBuffer(logitsBuffer, offset: 0, index: 2)
+            computeEncoder.setBytes(&lmHeadOffset, length: MemoryLayout<UInt64>.stride, index: 3)
+            computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 4)
+            computeEncoder.setBytes(&vocabSize, length: MemoryLayout<UInt32>.stride, index: 5)
+
+            let gemvTgSize = min(256, gemvPipeline.maxTotalThreadsPerThreadgroup)
+            computeEncoder.dispatchThreads(MTLSize(width: Int(vocabSize), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: gemvTgSize, height: 1, depth: 1))
+
+            computeEncoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+
+            let gpuElapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
+
+            // 3. Extract Top-10 Vocabulary Candidates
+            let logitsPtr = logitsBuffer.contents().bindMemory(to: Float.self, capacity: Int(vocabSize))
+            var topCandidates: [(id: Int, logit: Float)] = []
+            
+            for v in 0..<Int(vocabSize) {
+                let val = logitsPtr[v]
+                if topCandidates.count < 10 {
+                    topCandidates.append((id: v, logit: val))
+                    if topCandidates.count == 10 {
+                        topCandidates.sort(by: { $0.logit > $1.logit })
+                    }
+                } else if val > topCandidates.last!.logit {
+                    topCandidates[9] = (id: v, logit: val)
+                    topCandidates.sort(by: { $0.logit > $1.logit })
+                }
+            }
+
+            // Softmax over top candidates
+            let maxLogit = topCandidates.first?.logit ?? 0.0
+            var expSum: Float = 0.0
+            for c in topCandidates {
+                expSum += Darwin.exp(c.logit - maxLogit)
+            }
+
+            var predictions: [TokenPrediction] = []
+            for (idx, item) in topCandidates.enumerated() {
+                let prob = expSum > 0.0 ? (Darwin.exp(item.logit - maxLogit) / expSum) : (1.0 / Float(topCandidates.count))
+                var tokenStr = "<Token \(item.id)>"
+                if let tok = self.tokenizer {
+                    do {
+                        let decoded = try tok.decode(ids: [UInt32(item.id)])
+                        if !decoded.isEmpty {
+                            tokenStr = decoded
+                        }
+                    } catch {}
+                }
+                predictions.append(TokenPrediction(
+                    rank: idx + 1,
+                    tokenId: UInt32(item.id),
+                    tokenString: tokenStr,
+                    logit: item.logit,
+                    probability: prob
+                ))
+            }
+
+            self.topTokenPredictions = predictions
+            self.activeLogitsBuffer = logitsBuffer
+            self.isExecutingLMHead = false
+
+            let top1 = predictions.first
+            let top1Str = top1?.tokenString.replacingOccurrences(of: "\n", with: "\\n") ?? "N/A"
+            let top1Pct = String(format: "%.1f%%", (top1?.probability ?? 0) * 100.0)
+
+            let status = "✨ LM Head Projected \(vocabSize) Vocab Logits in \(String(format: "%.2f", gpuElapsedMs)) ms from \(sourceDescription)! Top Candidate: \"\(top1Str)\" (\(top1Pct) prob)"
+            self.lmHeadStatusText = status
+            self.gpuComputeOutput = status
+
+        } catch {
+            isExecutingLMHead = false
+            gpuComputeOutput = "❌ LM Head Pipeline Error: \(error.localizedDescription)"
         }
     }
 
