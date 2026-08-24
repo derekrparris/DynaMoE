@@ -312,7 +312,7 @@ kernel void fp8_swiglu_gate_up(
     float gateScale = bf16_to_fp32(rawGateScaleBuffer[(gateScaleOffset / 2) + r]);
     float upScale   = bf16_to_fp32(rawUpScaleBuffer[(upScaleOffset / 2) + r]);
 
-    // 2. Vectorized dot products over hiddenDim in chunks of 4
+    // 2. Vectorized dot products over hiddenDim in chunks of 8
     device const uchar* gRow = rawGateBuffer + gateWeightOffset + ((uint64_t)r * hiddenDim);
     device const uchar* uRow = rawUpBuffer + upWeightOffset + ((uint64_t)r * hiddenDim);
 
@@ -321,18 +321,25 @@ kernel void fp8_swiglu_gate_up(
     float up_dot0   = 0.0f;
     float up_dot1   = 0.0f;
 
-    uint32_t num4 = hiddenDim / 4;
-    for (uint32_t i = 0; i < num4; i++) {
-        uint32_t baseD = i * 4;
-        uchar4 g4 = *(device const uchar4*)(gRow + baseD);
-        uchar4 u4 = *(device const uchar4*)(uRow + baseD);
-        float4 in4 = *(device const float4*)(inputVector + baseD);
+    uint32_t num8 = hiddenDim / 8;
+    for (uint32_t i = 0; i < num8; i++) {
+        uint32_t baseD = i * 8;
+        uchar4 g4_0 = *(device const uchar4*)(gRow + baseD);
+        uchar4 g4_1 = *(device const uchar4*)(gRow + baseD + 4);
+        uchar4 u4_0 = *(device const uchar4*)(uRow + baseD);
+        uchar4 u4_1 = *(device const uchar4*)(uRow + baseD + 4);
+        float4 in4_0 = *(device const float4*)(inputVector + baseD);
+        float4 in4_1 = *(device const float4*)(inputVector + baseD + 4);
 
-        gate_dot0 += (unpack_e4m3(g4.x) * in4.x) + (unpack_e4m3(g4.y) * in4.y);
-        gate_dot1 += (unpack_e4m3(g4.z) * in4.z) + (unpack_e4m3(g4.w) * in4.w);
+        gate_dot0 += (unpack_e4m3(g4_0.x) * in4_0.x) + (unpack_e4m3(g4_0.y) * in4_0.y) +
+                     (unpack_e4m3(g4_1.x) * in4_1.x) + (unpack_e4m3(g4_1.y) * in4_1.y);
+        gate_dot1 += (unpack_e4m3(g4_0.z) * in4_0.z) + (unpack_e4m3(g4_0.w) * in4_0.w) +
+                     (unpack_e4m3(g4_1.z) * in4_1.z) + (unpack_e4m3(g4_1.w) * in4_1.w);
 
-        up_dot0 += (unpack_e4m3(u4.x) * in4.x) + (unpack_e4m3(u4.y) * in4.y);
-        up_dot1 += (unpack_e4m3(u4.z) * in4.z) + (unpack_e4m3(u4.w) * in4.w);
+        up_dot0 += (unpack_e4m3(u4_0.x) * in4_0.x) + (unpack_e4m3(u4_0.y) * in4_0.y) +
+                   (unpack_e4m3(u4_1.x) * in4_1.x) + (unpack_e4m3(u4_1.y) * in4_1.y);
+        up_dot1 += (unpack_e4m3(u4_0.z) * in4_0.z) + (unpack_e4m3(u4_0.w) * in4_0.w) +
+                   (unpack_e4m3(u4_1.z) * in4_1.z) + (unpack_e4m3(u4_1.w) * in4_1.w);
     }
 
     float finalGate = (gate_dot0 + gate_dot1) * gateScale;
@@ -361,19 +368,23 @@ kernel void fp8_down_proj_accumulate(
     // 1. Fetch BF16 per-row scale
     float downScale = bf16_to_fp32(rawDownScaleBuffer[(downScaleOffset / 2) + d]);
 
-    // 2. Vectorized dot product over intermediateDim in chunks of 4
+    // 2. Vectorized dot product over intermediateDim in chunks of 8
     device const uchar* dRow = rawDownBuffer + downWeightOffset + ((uint64_t)d * intermediateDim);
 
     float down_dot0 = 0.0f;
     float down_dot1 = 0.0f;
-    uint32_t num4 = intermediateDim / 4;
-    for (uint32_t i = 0; i < num4; i++) {
-        uint32_t baseI = i * 4;
-        uchar4 d4 = *(device const uchar4*)(dRow + baseI);
-        float4 in4 = *(device const float4*)(intermediateVector + baseI);
+    uint32_t num8 = intermediateDim / 8;
+    for (uint32_t i = 0; i < num8; i++) {
+        uint32_t baseI = i * 8;
+        uchar4 d4_0 = *(device const uchar4*)(dRow + baseI);
+        uchar4 d4_1 = *(device const uchar4*)(dRow + baseI + 4);
+        float4 in4_0 = *(device const float4*)(intermediateVector + baseI);
+        float4 in4_1 = *(device const float4*)(intermediateVector + baseI + 4);
 
-        down_dot0 += (unpack_e4m3(d4.x) * in4.x) + (unpack_e4m3(d4.y) * in4.y);
-        down_dot1 += (unpack_e4m3(d4.z) * in4.z) + (unpack_e4m3(d4.w) * in4.w);
+        down_dot0 += (unpack_e4m3(d4_0.x) * in4_0.x) + (unpack_e4m3(d4_0.y) * in4_0.y) +
+                     (unpack_e4m3(d4_1.x) * in4_1.x) + (unpack_e4m3(d4_1.y) * in4_1.y);
+        down_dot1 += (unpack_e4m3(d4_0.z) * in4_0.z) + (unpack_e4m3(d4_0.w) * in4_0.w) +
+                     (unpack_e4m3(d4_1.z) * in4_1.z) + (unpack_e4m3(d4_1.w) * in4_1.w);
     }
 
     float finalDown = (down_dot0 + down_dot1) * downScale;
@@ -591,10 +602,10 @@ kernel void bf16_gemv(
     uint32_t num4 = inDim / 4;
     for (uint32_t i = 0; i < num4; i++) {
         uint32_t base = i * 4;
-        dot0 += bf16_to_fp32(wRow[base + 0]) * inputVector[base + 0];
-        dot0 += bf16_to_fp32(wRow[base + 1]) * inputVector[base + 1];
-        dot1 += bf16_to_fp32(wRow[base + 2]) * inputVector[base + 2];
-        dot1 += bf16_to_fp32(wRow[base + 3]) * inputVector[base + 3];
+        ushort4 w4 = *(device const ushort4*)(wRow + base);
+        float4 in4 = *(device const float4*)(inputVector + base);
+        dot0 += (bf16_to_fp32(w4.x) * in4.x) + (bf16_to_fp32(w4.y) * in4.y);
+        dot1 += (bf16_to_fp32(w4.z) * in4.z) + (bf16_to_fp32(w4.w) * in4.w);
     }
 
     outputVector[row] = dot0 + dot1;

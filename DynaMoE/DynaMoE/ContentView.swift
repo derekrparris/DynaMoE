@@ -460,9 +460,13 @@ struct ContentView: View {
     @State private var topP: Float = 0.9
     @State private var topK: Int = 50
     @State private var repetitionPenalty: Float = 1.1
-    @State private var maxNewTokens: Int = 64
+    @State private var maxNewTokens: Int = 256
     @State private var isGeneratingText: Bool = false
     @State private var generatedStreamText: String = ""
+    @State private var thinkingText: String = ""
+    @State private var responseText: String = ""
+    @State private var isThinking: Bool = false
+    @State private var isThinkingExpanded: Bool = true
     @State private var generationSpeedTokPerSec: Double = 0.0
     @State private var generationTotalTokens: Int = 0
     @State private var generationElapsedMs: Double = 0.0
@@ -1104,23 +1108,58 @@ struct ContentView: View {
                             }
 
                             ScrollView {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    HStack(alignment: .top, spacing: 0) {
-                                        Text(generatedStreamText)
-                                            .font(.system(.body, design: .default))
-                                            .textSelection(.enabled)
-
-                                        if isGeneratingText {
-                                            Text("▊")
-                                                .foregroundColor(.purple)
-                                                .opacity(0.8)
-                                        }
+                                VStack(alignment: .leading, spacing: 8) {
+                                    // Collapsible Reasoning Process Block
+                                    if !thinkingText.isEmpty {
+                                        DisclosureGroup(
+                                            isExpanded: $isThinkingExpanded,
+                                            content: {
+                                                Text(thinkingText)
+                                                    .font(.system(.caption, design: .monospaced))
+                                                    .foregroundColor(.secondary)
+                                                    .textSelection(.enabled)
+                                                    .padding(8)
+                                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                                    .background(Color.secondary.opacity(0.08))
+                                                    .cornerRadius(6)
+                                            },
+                                            label: {
+                                                HStack(spacing: 6) {
+                                                    Image(systemName: isThinking ? "brain.head.profile" : "brain")
+                                                        .foregroundColor(.purple)
+                                                    Text(isThinking ? "Reasoning in progress..." : "Thought Process")
+                                                        .font(.caption)
+                                                        .fontWeight(.medium)
+                                                        .foregroundColor(.purple)
+                                                    if isThinking {
+                                                        ProgressView()
+                                                            .scaleEffect(0.5)
+                                                    }
+                                                }
+                                            }
+                                        )
                                     }
-                                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                                    // Main Text Response
+                                    if !responseText.isEmpty || (!isThinking && !generatedStreamText.isEmpty) || isGeneratingText {
+                                        HStack(alignment: .top, spacing: 0) {
+                                            let displayText = !responseText.isEmpty ? responseText : (thinkingText.isEmpty ? generatedStreamText : "")
+                                            Text(displayText)
+                                                .font(.system(.body, design: .default))
+                                                .textSelection(.enabled)
+
+                                            if isGeneratingText && !isThinking {
+                                                Text("▊")
+                                                    .foregroundColor(.purple)
+                                                    .opacity(0.8)
+                                            }
+                                        }
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
                                 }
                                 .padding(10)
                             }
-                            .frame(minHeight: 80, maxHeight: 220)
+                            .frame(minHeight: 100, maxHeight: 300)
                             .background(Color(NSColor.textBackgroundColor))
                             .cornerRadius(6)
                             .overlay(
@@ -3471,6 +3510,10 @@ struct ContentView: View {
 
         isGeneratingText = true
         generatedStreamText = ""
+        thinkingText = ""
+        responseText = ""
+        isThinking = false
+        isThinkingExpanded = true
         generationTotalTokens = 0
         generationSpeedTokPerSec = 0.0
         generationElapsedMs = 0.0
@@ -3486,25 +3529,7 @@ struct ContentView: View {
             func runTokenForward(tokenId: UInt32, step: UInt32, computeLogits: Bool) -> Bool {
                 let singleTokenPtr = singleTokenBuffer.contents().bindMemory(to: UInt32.self, capacity: 1)
                 singleTokenPtr[0] = tokenId
-
-                guard let cmdBuffer = commandQueue.makeCommandBuffer(),
-                      let enc = cmdBuffer.makeComputeCommandEncoder() else { return false }
-
-                // 1. Embed Token
-                enc.setComputePipelineState(embedPipeline)
-                enc.setBuffer(embedShardBuffer, offset: 0, index: 0)
-                enc.setBuffer(singleTokenBuffer, offset: 0, index: 1)
-                enc.setBuffer(hCurrBuffer, offset: 0, index: 2)
-                var wOffset = embedOffset
                 var hDim = hiddenDim
-                var tokCount: UInt32 = 1
-                enc.setBytes(&wOffset, length: MemoryLayout<UInt64>.stride, index: 3)
-                enc.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 4)
-                enc.setBytes(&tokCount, length: MemoryLayout<UInt32>.stride, index: 5)
-                enc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), embedPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
-                enc.endEncoding()
-                cmdBuffer.commit()
-                cmdBuffer.waitUntilCompleted()
 
                 // 2. Multi-Layer Transformer Backbone (0..<actualLayers)
                 var currentH = hCurrBuffer
@@ -3518,9 +3543,23 @@ struct ContentView: View {
                         WorkingSetManager.shared.prefetchLayerExperts(layer: l + 1, expertIds: [0, 1, 2, 3, 4, 5, 6, 7], shardBuffers: buffers)
                     }
 
-                    // --- Phase A: Attention Sub-Block ---
+                    // --- Phase A: Attention & Routing Sub-Block ---
                     guard let layerCmd1 = commandQueue.makeCommandBuffer(),
                           let layerEnc1 = layerCmd1.makeComputeCommandEncoder() else { return false }
+
+                    // Step 0: Embed Token on Layer 0
+                    if l == 0 {
+                        var wOffset = embedOffset
+                        var tokCount: UInt32 = 1
+                        layerEnc1.setComputePipelineState(embedPipeline)
+                        layerEnc1.setBuffer(embedShardBuffer, offset: 0, index: 0)
+                        layerEnc1.setBuffer(singleTokenBuffer, offset: 0, index: 1)
+                        layerEnc1.setBuffer(currentH, offset: 0, index: 2)
+                        layerEnc1.setBytes(&wOffset, length: MemoryLayout<UInt64>.stride, index: 3)
+                        layerEnc1.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 4)
+                        layerEnc1.setBytes(&tokCount, length: MemoryLayout<UInt32>.stride, index: 5)
+                        layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), embedPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                    }
 
                     // Step 1: Pre-Attention RMSNorm (currentH -> xNorm1)
                     if let norm1 = layer.norm1Tensor, let norm1Raw = buffers[norm1.shardIndex] {
@@ -3891,33 +3930,30 @@ struct ContentView: View {
                         layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
                     }
 
+                    // Step 5: MoE Routing on Post-Attention xNorm2 (Fused in layerCmd1)
+                    if let routerTensor = layer.routerTensor, let routerRaw = buffers[routerTensor.shardIndex] {
+                        var rOffset = routerTensor.offsetStart
+                        var nExp = numExperts
+                        var kVal: UInt32 = 8
+                        layerEnc1.setComputePipelineState(routerPipeline)
+                        layerEnc1.setBuffer(routerRaw, offset: 0, index: 0)
+                        layerEnc1.setBuffer(xNorm2Buffer, offset: 0, index: 1)
+                        layerEnc1.setBuffer(routerIndicesBuffer, offset: 0, index: 2)
+                        layerEnc1.setBuffer(routerWeightsBuffer, offset: 0, index: 3)
+                        layerEnc1.setBytes(&rOffset, length: MemoryLayout<UInt64>.stride, index: 4)
+                        layerEnc1.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 5)
+                        layerEnc1.setBytes(&nExp, length: MemoryLayout<UInt32>.stride, index: 6)
+                        layerEnc1.setBytes(&kVal, length: MemoryLayout<UInt32>.stride, index: 7)
+                        layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: Int(numExperts), height: 1, depth: 1))
+                    }
+
                     layerEnc1.endEncoding()
                     layerCmd1.commit()
                     layerCmd1.waitUntilCompleted()
 
-                    // --- Phase B: MoE Routing on Post-Attention xNorm2 ---
+                    // Extract Active Experts
                     var activeExperts: [(id: Int, weight: Float)] = []
-                    if let routerTensor = layer.routerTensor, let routerRaw = buffers[routerTensor.shardIndex] {
-                        guard let rCmd = commandQueue.makeCommandBuffer(),
-                              let rEnc = rCmd.makeComputeCommandEncoder() else { return false }
-
-                        var rOffset = routerTensor.offsetStart
-                        var nExp = numExperts
-                        var kVal: UInt32 = 8
-                        rEnc.setComputePipelineState(routerPipeline)
-                        rEnc.setBuffer(routerRaw, offset: 0, index: 0)
-                        rEnc.setBuffer(xNorm2Buffer, offset: 0, index: 1)
-                        rEnc.setBuffer(routerIndicesBuffer, offset: 0, index: 2)
-                        rEnc.setBuffer(routerWeightsBuffer, offset: 0, index: 3)
-                        rEnc.setBytes(&rOffset, length: MemoryLayout<UInt64>.stride, index: 4)
-                        rEnc.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 5)
-                        rEnc.setBytes(&nExp, length: MemoryLayout<UInt32>.stride, index: 6)
-                        rEnc.setBytes(&kVal, length: MemoryLayout<UInt32>.stride, index: 7)
-                        rEnc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: Int(numExperts), height: 1, depth: 1))
-                        rEnc.endEncoding()
-                        rCmd.commit()
-                        rCmd.waitUntilCompleted()
-
+                    if layer.routerTensor != nil {
                         let indPtr = routerIndicesBuffer.contents().bindMemory(to: UInt32.self, capacity: 8)
                         let wPtr = routerWeightsBuffer.contents().bindMemory(to: Float.self, capacity: 8)
                         for i in 0..<8 {
@@ -4127,7 +4163,7 @@ struct ContentView: View {
 
                     layerEnc2.endEncoding()
                     layerCmd2.commit()
-                    layerCmd2.waitUntilCompleted()
+                    // Asynchronous pipeline submission: Metal command queue guarantees in-order GPU execution.
 
                     let tempBuf = currentH
                     currentH = nextH
@@ -4223,12 +4259,36 @@ struct ContentView: View {
                 let hitRate = WorkingSetManager.shared.cacheHitRatePercent
                 let pageLat = WorkingSetManager.shared.lastPagingLatencyMs
 
+                var updatedRaw = self.generatedStreamText + decoded
+                var thinkPart = ""
+                var respPart = ""
+                var activeThink = false
+
+                if updatedRaw.contains("<think>") {
+                    if updatedRaw.contains("</think>") {
+                        let parts = updatedRaw.components(separatedBy: "</think>")
+                        thinkPart = parts[0].replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                        respPart = parts.dropFirst().joined(separator: "</think>").trimmingCharacters(in: .whitespacesAndNewlines)
+                        activeThink = false
+                    } else {
+                        thinkPart = updatedRaw.replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespaces)
+                        respPart = ""
+                        activeThink = true
+                    }
+                } else {
+                    respPart = updatedRaw
+                    activeThink = false
+                }
+
                 await MainActor.run {
-                    self.generatedStreamText += decoded
+                    self.generatedStreamText = updatedRaw
+                    self.thinkingText = thinkPart
+                    self.responseText = respPart
+                    self.isThinking = activeThink
                     self.generationTotalTokens = tokensGenerated
                     self.generationElapsedMs = elapsedMs
                     self.generationSpeedTokPerSec = tokPerSec
-                    self.generationStatusText = "⚡ Streaming: \(tokensGenerated) tokens | \(String(format: "%.1f", tokPerSec)) tok/s"
+                    self.generationStatusText = activeThink ? "🧠 Reasoning: \(tokensGenerated) tokens | \(String(format: "%.1f", tokPerSec)) tok/s" : "⚡ Streaming: \(tokensGenerated) tokens | \(String(format: "%.1f", tokPerSec)) tok/s"
                     self.currentRssGB = currentRss
                     self.residentExpertCount = resCount
                     self.totalExpertCount = totalExp
