@@ -513,11 +513,11 @@ kernel void rmsnorm_bf16(
     float meanSquare = sharedSum[0] / (float)dim;
     float invRms = rsqrt(meanSquare + eps);
 
-    // 2. Normalize and scale by gamma
+    // 2. Normalize and scale by gamma: (1.0 + gamma)
     uint64_t gammaStart = gammaOffset / 2;
     for (uint i = tid; i < dim; i += tgSize) {
         float gamma = bf16_to_fp32(gammaBuffer[gammaStart + i]);
-        outVector[i] = inVector[i] * invRms * gamma;
+        outVector[i] = inVector[i] * invRms * (1.0f + gamma);
     }
 }
 
@@ -600,19 +600,20 @@ kernel void bf16_gemv(
     outputVector[row] = dot0 + dot1;
 }
 
-/// MSL Kernel: Per-Head RMSNorm for Attention Heads (Q-Norm and K-Norm)
+/// MSL Kernel: Per-Head RMSNorm for Attention Heads (Q-Norm and K-Norm with custom stride)
 kernel void per_head_rmsnorm_bf16(
     device float* qkVector [[buffer(0)]],
     device const ushort* gammaBuffer [[buffer(1)]],
     constant uint64_t& gammaOffset [[buffer(2)]],
     constant uint32_t& numHeads [[buffer(3)]],
     constant uint32_t& headDim [[buffer(4)]],
-    constant float& eps [[buffer(5)]],
+    constant uint32_t& headStride [[buffer(5)]],
+    constant float& eps [[buffer(6)]],
     uint headIdx [[thread_position_in_grid]]
 ) {
     if (headIdx >= numHeads) return;
 
-    uint32_t offset = headIdx * headDim;
+    uint32_t offset = headIdx * headStride;
     float sumSq = 0.0f;
     for (uint32_t d = 0; d < headDim; d++) {
         float v = qkVector[offset + d];
@@ -624,7 +625,297 @@ kernel void per_head_rmsnorm_bf16(
 
     for (uint32_t d = 0; d < headDim; d++) {
         float gamma = bf16_to_fp32(gammaBuffer[gammaStart + d]);
-        qkVector[offset + d] = qkVector[offset + d] * invRms * gamma;
+        qkVector[offset + d] = qkVector[offset + d] * invRms * (1.0f + gamma);
     }
 }
+
+/// MSL Kernel: Fused Rotary Position Embeddings (RoPE) for Qwen 3.5 / Ornith 1.5 with custom stride
+kernel void apply_rope_qwen(
+    device float* qkVector [[buffer(0)]],
+    constant uint32_t& tokenPos [[buffer(1)]],
+    constant uint32_t& numHeads [[buffer(2)]],
+    constant uint32_t& headDim [[buffer(3)]],
+    constant uint32_t& rotaryDim [[buffer(4)]],
+    constant uint32_t& headStride [[buffer(5)]],
+    constant float& ropeTheta [[buffer(6)]],
+    uint headIdx [[thread_position_in_grid]]
+) {
+    if (headIdx >= numHeads) return;
+
+    uint32_t headBase = headIdx * headStride;
+    uint32_t halfRotary = rotaryDim / 2;
+
+    for (uint32_t i = 0; i < halfRotary; i++) {
+        float exponent = (2.0f * (float)i) / (float)rotaryDim;
+        float freq = 1.0f / pow(ropeTheta, exponent);
+        float angle = (float)tokenPos * freq;
+        float cosVal = cos(angle);
+        float sinVal = sin(angle);
+
+        uint32_t idx0 = headBase + i;
+        uint32_t idx1 = headBase + i + halfRotary;
+
+        float v0 = qkVector[idx0];
+        float v1 = qkVector[idx1];
+
+        qkVector[idx0] = v0 * cosVal - v1 * sinVal;
+        qkVector[idx1] = v0 * sinVal + v1 * cosVal;
+    }
+}
+
+/// MSL Kernel: Stores current K and V vectors into the Layer's KV-Cache
+kernel void store_kv_cache(
+    device const float* kVector [[buffer(0)]],
+    device const float* vVector [[buffer(1)]],
+    device float* kCacheBuffer [[buffer(2)]],
+    device float* vCacheBuffer [[buffer(3)]],
+    constant uint32_t& tokenPos [[buffer(4)]],
+    constant uint32_t& numKvHeads [[buffer(5)]],
+    constant uint32_t& headDim [[buffer(6)]],
+    uint id [[thread_position_in_grid]]
+) {
+    uint32_t kvStride = numKvHeads * headDim;
+    if (id >= kvStride) return;
+
+    uint32_t cacheOffset = (tokenPos * kvStride) + id;
+    kCacheBuffer[cacheOffset] = kVector[id];
+    vCacheBuffer[cacheOffset] = vVector[id];
+}
+
+///// MSL Kernel: Grouped-Query Attention (GQA) Autoregressive Decoding with Online Softmax & Sigmoid Output Gating
+kernel void gqa_attention_decode_fused(
+    device const float* qGateVector [[buffer(0)]], // [8192] = 16 heads * (Q[256] + Gate[256])
+    device const float* kCacheBuffer [[buffer(1)]],
+    device const float* vCacheBuffer [[buffer(2)]],
+    device float* attnOutBuffer [[buffer(3)]],     // [4096] = 16 heads * 256
+    constant uint32_t& seqLen [[buffer(4)]],
+    constant uint32_t& numQHeads [[buffer(5)]],
+    constant uint32_t& numKvHeads [[buffer(6)]],
+    constant uint32_t& headDim [[buffer(7)]],
+    uint qHeadIdx [[thread_position_in_grid]]
+) {
+    if (qHeadIdx >= numQHeads) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+
+    uint32_t qHeadBase = qHeadIdx * 512;
+    uint32_t gateBase = qHeadBase + 256;
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    // Online Softmax Accumulator (FlashAttention style, 1 pass, 0 stack arrays)
+    float acc[256];
+    for (uint32_t d = 0; d < headDim; d++) {
+        acc[d] = 0.0f;
+    }
+
+    float m = -1e20f; // running max score
+    float l = 0.0f;   // running sum of exponents
+
+    uint32_t safeLen = min(seqLen, 2048u);
+
+    for (uint32_t tau = 0; tau < safeLen; tau++) {
+        uint32_t kBase = (tau * kvStride) + kvHeadBase;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < headDim; d++) {
+            dot += qGateVector[qHeadBase + d] * kCacheBuffer[kBase + d];
+        }
+        float score = dot * invSqrtHeadDim;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+
+        l = (l * alpha) + beta;
+
+        uint32_t vBase = (tau * kvStride) + kvHeadBase;
+        for (uint32_t d = 0; d < headDim; d++) {
+            acc[d] = (acc[d] * alpha) + (beta * vCacheBuffer[vBase + d]);
+        }
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    uint32_t outOffset = qHeadIdx * headDim;
+
+    for (uint32_t d = 0; d < headDim; d++) {
+        float ctx = acc[d] * invL;
+        float g = qGateVector[gateBase + d];
+        float sig_g = 1.0f / (1.0f + exp(-g));
+        attnOutBuffer[outOffset + d] = ctx * sig_g;
+    }
+}
+
+/// MSL Kernel: Causal Depthwise 1D Convolution with SiLU activation for Linear Attention
+kernel void causal_conv1d_silu(
+    device const float* inRaw [[buffer(0)]],
+    device const ushort* convWeight [[buffer(1)]],
+    device float* convState [[buffer(2)]],
+    device float* outQKV [[buffer(3)]],
+    constant uint64_t& weightOffset [[buffer(4)]],
+    constant uint32_t& numChannels [[buffer(5)]],
+    uint c [[thread_position_in_grid]]
+) {
+    if (c >= numChannels) return;
+
+    uint32_t stateBase = c * 4;
+    float s0 = convState[stateBase + 1];
+    float s1 = convState[stateBase + 2];
+    float s2 = convState[stateBase + 3];
+    float s3 = inRaw[c];
+
+    convState[stateBase + 0] = s0;
+    convState[stateBase + 1] = s1;
+    convState[stateBase + 2] = s2;
+    convState[stateBase + 3] = s3;
+
+    uint64_t wBase = (weightOffset / 2) + ((uint64_t)c * 4);
+    float w0 = bf16_to_fp32(convWeight[wBase + 0]);
+    float w1 = bf16_to_fp32(convWeight[wBase + 1]);
+    float w2 = bf16_to_fp32(convWeight[wBase + 2]);
+    float w3 = bf16_to_fp32(convWeight[wBase + 3]);
+
+    float convVal = (w0 * s0) + (w1 * s1) + (w2 * s2) + (w3 * s3);
+    float siluVal = convVal / (1.0f + exp(-convVal));
+    outQKV[c] = siluVal;
+}
+
+/// MSL Kernel: Per-head L2 Normalization on Q and K vectors for Linear Attention
+kernel void l2_norm_qk(
+    device float* qkvVector [[buffer(0)]],
+    constant uint32_t& numHeads [[buffer(1)]],
+    constant uint32_t& headDim [[buffer(2)]],
+    uint headIdx [[thread_position_in_grid]]
+) {
+    if (headIdx >= numHeads) return;
+
+    // Q head at headIdx * 128
+    uint32_t qBase = headIdx * headDim;
+    float qSumSq = 0.0f;
+    for (uint32_t i = 0; i < headDim; i++) {
+        float v = qkvVector[qBase + i];
+        qSumSq += v * v;
+    }
+    float invQNorm = rsqrt(qSumSq + 1e-6f);
+    for (uint32_t i = 0; i < headDim; i++) {
+        qkvVector[qBase + i] *= invQNorm;
+    }
+
+    // K head at 2048 + headIdx * 128
+    uint32_t kBase = 2048 + (headIdx * headDim);
+    float kSumSq = 0.0f;
+    for (uint32_t i = 0; i < headDim; i++) {
+        float v = qkvVector[kBase + i];
+        kSumSq += v * v;
+    }
+    float invKNorm = rsqrt(kSumSq + 1e-6f);
+    for (uint32_t i = 0; i < headDim; i++) {
+        qkvVector[kBase + i] *= invKNorm;
+    }
+}
+
+/// MSL Kernel: Gated Recurrent Linear Attention (DeltaNet with Gated Delta Rule)
+kernel void linear_attention_recurrent_step(
+    device const float* qkvVector [[buffer(0)]], // [8192] = normalized Q[2048] + normalized K[2048] + V[4096]
+    device const float* zVector [[buffer(1)]],   // [4096] (Gate)
+    device const float* aVector [[buffer(2)]],   // [32]
+    device const float* bVector [[buffer(3)]],   // [32]
+    device const ushort* aLogBuf [[buffer(4)]],  // [32] (BF16)
+    device const ushort* dtBiasBuf [[buffer(5)]],// [32] (BF16)
+    device const ushort* normBuf [[buffer(6)]],  // [128] (BF16)
+    device float* stateMatrix [[buffer(7)]],     // [32 heads, 128 keyDim, 128 valDim]
+    device float* outputVector [[buffer(8)]],    // [4096]
+    constant uint64_t& aLogOffset [[buffer(9)]],
+    constant uint64_t& dtBiasOffset [[buffer(10)]],
+    constant uint64_t& normOffset [[buffer(11)]],
+    constant uint32_t& numValHeads [[buffer(12)]],// 32
+    constant uint32_t& numKeyHeads [[buffer(13)]],// 16
+    constant uint32_t& headDim [[buffer(14)]],   // 128
+    constant float& eps [[buffer(15)]],          // 1e-6
+    uint headIdx [[thread_position_in_grid]]
+) {
+    if (headIdx >= numValHeads) return;
+
+    uint32_t keyHeadIdx = headIdx / (numValHeads / numKeyHeads); // headIdx / 2
+
+    // Offsets
+    uint32_t qBase = keyHeadIdx * headDim;
+    uint32_t kBase = 2048 + (keyHeadIdx * headDim);
+    uint32_t vBase = 4096 + (headIdx * headDim);
+    uint32_t zBase = headIdx * headDim;
+    uint32_t outBase = headIdx * headDim;
+    uint32_t stateBase = headIdx * headDim * headDim;
+
+    // Decay rate computation: alpha = exp(-exp(A_log) * softplus(a + dt_bias))
+    float aLogVal = bf16_to_fp32(aLogBuf[(aLogOffset / 2) + headIdx]);
+    float dtBiasVal = bf16_to_fp32(dtBiasBuf[(dtBiasOffset / 2) + headIdx]);
+    float aVal = aVector[headIdx];
+    float bVal = bVector[headIdx];
+
+    float x = aVal + dtBiasVal;
+    float dt = (x > 20.0f) ? x : ((x < -20.0f) ? exp(x) : log(1.0f + exp(x))); // stable softplus
+    float alpha = exp(-exp(aLogVal) * dt);
+    float beta = 1.0f / (1.0f + exp(-bVal));     // sigmoid(b)
+
+    // Delta Rule:
+    // 1. Sk = S_prev * k
+    // 2. u = v - alpha * Sk
+    // 3. S_new = alpha * S_prev + beta * (u * k^T)
+    // 4. y = S_new * q
+    float Sk[128];
+    for (uint32_t i = 0; i < headDim; i++) {
+        float sum = 0.0f;
+        for (uint32_t j = 0; j < headDim; j++) {
+            uint32_t sIdx = stateBase + (i * headDim) + j;
+            sum += stateMatrix[sIdx] * qkvVector[kBase + j];
+        }
+        Sk[i] = sum;
+    }
+
+    float y[128];
+    float sumSq = 0.0f;
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    for (uint32_t i = 0; i < headDim; i++) {
+        float vi = qkvVector[vBase + i];
+        float ui = vi - (alpha * Sk[i]);
+        float betaUi = beta * ui;
+
+        float yi = 0.0f;
+        for (uint32_t j = 0; j < headDim; j++) {
+            uint32_t sIdx = stateBase + (i * headDim) + j;
+            float sOld = stateMatrix[sIdx];
+            float kj = qkvVector[kBase + j];
+            float sNew = (alpha * sOld) + (betaUi * kj);
+            stateMatrix[sIdx] = sNew;
+
+            yi += sNew * (qkvVector[qBase + j] * invSqrtHeadDim);
+        }
+        y[i] = yi;
+        sumSq += yi * yi;
+    }
+
+    // Per-head RMSNorm
+    float invRms = rsqrt((sumSq / (float)headDim) + eps);
+
+    // Apply RMSNorm weight and SiLU Gating: y = (y * invRms * norm) * SiLU(z)
+    for (uint32_t i = 0; i < headDim; i++) {
+        float normW = bf16_to_fp32(normBuf[(normOffset / 2) + i]);
+        float yNorm = y[i] * invRms * normW;
+
+        float z = zVector[zBase + i];
+        float silu_z = z / (1.0f + exp(-z));
+
+        outputVector[outBase + i] = yNorm * silu_z;
+    }
+}
+
+
+
 

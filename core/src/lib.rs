@@ -210,6 +210,12 @@ fn resolve_model_index(target_path: &Path) -> Option<(WeightIndex, PathBuf)> {
 }
 
 fn parse_layer_and_expert(name: &str) -> (String, Option<u32>, Option<u32>) {
+    // If tensor belongs to Multi-Token Prediction (MTP) auxiliary head or visual encoder, do not treat as backbone layer
+    if name.starts_with("mtp.") || name.starts_with("visual.") {
+        let cat = if name.starts_with("mtp.") { "Multi-Token Prediction" } else { "Vision" };
+        return (cat.to_string(), None, None);
+    }
+
     let mut layer_idx = None;
     let mut expert_idx = None;
 
@@ -530,7 +536,883 @@ mod tests {
             let summary = summary.unwrap();
             println!("ORNITH SUCCESS! Loaded {} shards, {} tensors, {:.2} GB, {} layers, max expert ID {}", 
                      summary.shards.len(), summary.tensor_count, summary.size_gb, summary.layer_count, summary.max_expert_id);
+            println!("=== LAYER 0 NON-EXPERT TENSORS ===");
+            for t in summary.tensors.iter().filter(|t| t.layer_index == Some(0) && !t.name.contains("experts.")) {
+                println!("  L0 (non-expert): name={}, shape={}, dtype={}, shard={}, offset={}", t.name, t.shape_display, t.dtype, t.shard_index, t.offset_start);
+            }
+            println!("=== LAYER 3 TENSORS ===");
+            for t in summary.tensors.iter().filter(|t| t.layer_index == Some(3) && !t.name.contains("experts.")) {
+                println!("  L3 (non-expert): name={}, shape={}, dtype={}, shard={}, offset={}", t.name, t.shape_display, t.dtype, t.shard_index, t.offset_start);
+            }
             assert_eq!(summary.shards.len(), 16);
+        }
+    }
+
+    #[test]
+    fn test_ornith_tokenizer() {
+        let tok_path = "/Users/derekparris/.cache/huggingface/hub/models--ornith-ai--Ornith-1.5-35B-A3B-FP8/snapshots/0e048080ccd0ccf4296bfea5638036c196dccc0c/tokenizer.json";
+        if std::path::Path::new(tok_path).exists() {
+            let tok = DynaMoeTokenizer::new(tok_path.to_string()).unwrap();
+            let prompt = "<|im_start|>user\nHello, what is 2+2?<|im_end|>\n<|im_start|>assistant\n";
+            let ids = tok.encode(prompt.to_string()).unwrap();
+            println!("ENCODED IDS ({} tokens): {:?}", ids.len(), ids);
+            for id in &ids {
+                let piece = tok.decode(vec![*id]).unwrap_or_default();
+                println!("  Token ID {}: {:?}", id, piece);
+            }
+
+            let garbled = "ブログ村|RFСТА,eg_INETdisplayTextalisesanitizeereumブログ村";
+            let g_ids = tok.encode(garbled.to_string()).unwrap();
+            println!("GARBLED 1 IDS: {:?}", g_ids);
+
+            let garbled2 = "ereum{lng是何含义izedName----</icts";
+            let g2_ids = tok.encode(garbled2.to_string()).unwrap();
+            println!("GARBLED 2 IDS: {:?}", g2_ids);
+        }
+    }
+
+    #[inline]
+    fn bf16_to_f32(u: u16) -> f32 {
+        f32::from_bits((u as u32) << 16)
+    }
+
+    #[inline]
+    fn unpack_e4m3_rs(u: u8) -> f32 {
+        let sign = (u >> 7) & 0x01;
+        let exp = (u >> 3) & 0x0F;
+        let mant = u & 0x07;
+        let val = if exp == 0 {
+            (mant as f32 / 8.0) * 0.015625
+        } else {
+            (1.0 + (mant as f32 / 8.0)) * 2.0f32.powi(exp as i32 - 7)
+        };
+        if sign != 0 { -val } else { val }
+    }
+
+    fn rmsnorm_rs(in_vec: &[f32], weight_mmap: &[u8], weight_offset: usize, out_vec: &mut [f32], eps: f32) {
+        let dim = in_vec.len();
+        let w_u16 = unsafe {
+            std::slice::from_raw_parts(weight_mmap.as_ptr().add(weight_offset) as *const u16, dim)
+        };
+        let mut sum_sq = 0.0f32;
+        for i in 0..dim {
+            sum_sq += in_vec[i] * in_vec[i];
+        }
+        let inv_rms = 1.0 / ((sum_sq / dim as f32) + eps).sqrt();
+        for i in 0..dim {
+            let w = bf16_to_f32(w_u16[i]);
+            out_vec[i] = in_vec[i] * inv_rms * (1.0 + w);
+        }
+    }
+
+    fn gemv_bf16_rs(shard_mmap: &[u8], offset: usize, in_vec: &[f32], out_vec: &mut [f32], in_dim: usize, out_dim: usize) {
+        let total_words = in_dim * out_dim;
+        let w_u16 = unsafe {
+            std::slice::from_raw_parts(shard_mmap.as_ptr().add(offset) as *const u16, total_words)
+        };
+        for row in 0..out_dim {
+            let row_start = row * in_dim;
+            let mut dot = 0.0f32;
+            for col in 0..in_dim {
+                dot += bf16_to_f32(w_u16[row_start + col]) * in_vec[col];
+            }
+            out_vec[row] = dot;
+        }
+    }
+
+    fn gemv_fp8_rs(w_mmap: &[u8], w_offset: usize, s_mmap: &[u8], s_offset: usize, in_vec: &[f32], out_vec: &mut [f32], in_dim: usize, out_dim: usize) {
+        let total_bytes = in_dim * out_dim;
+        let w_bytes = &w_mmap[w_offset..w_offset + total_bytes];
+        let s_u16 = unsafe {
+            std::slice::from_raw_parts(s_mmap.as_ptr().add(s_offset) as *const u16, out_dim)
+        };
+        for row in 0..out_dim {
+            let row_start = row * in_dim;
+            let scale = bf16_to_f32(s_u16[row]);
+            let mut dot = 0.0f32;
+            for col in 0..in_dim {
+                let raw_byte = w_bytes[row_start + col];
+                dot += unpack_e4m3_rs(raw_byte) * in_vec[col];
+            }
+            out_vec[row] = dot * scale;
+        }
+    }
+
+    #[test]
+    fn test_cpu_layer0_forward() {
+        let snapshot_dir = PathBuf::from("/Users/derekparris/.cache/huggingface/hub/models--ornith-ai--Ornith-1.5-35B-A3B-FP8/snapshots/0e048080ccd0ccf4296bfea5638036c196dccc0c");
+        let index_file = snapshot_dir.join("model.safetensors.index.json");
+        if !index_file.exists() { return; }
+
+        let engine = DynaMoeEngine::new(index_file.to_string_lossy().to_string()).unwrap();
+        let summary = engine.get_summary().unwrap();
+
+        // 1. Embedding lookup for token 248045 (<|im_start|>)
+        let embed_tensor = summary.tensors.iter().find(|t| t.name == "model.language_model.embed_tokens.weight").unwrap();
+        let embed_mmap = &engine.shards[embed_tensor.shard_index as usize].mmap;
+        let target_token_id: usize = 248045;
+        let hidden_dim: usize = 2048;
+
+        let mut h_0 = vec![0.0f32; hidden_dim];
+        let embed_u16 = unsafe {
+            std::slice::from_raw_parts(embed_mmap.as_ptr().add(embed_tensor.offset_start as usize) as *const u16, 248320 * hidden_dim)
+        };
+        for d in 0..hidden_dim {
+            h_0[d] = bf16_to_f32(embed_u16[target_token_id * hidden_dim + d]);
+        }
+        println!("h_0 first 8 dims: {:?}", &h_0[0..8]);
+
+        // 2. Layer 0 Input Layernorm
+        let norm1 = summary.tensors.iter().find(|t| t.name == "model.language_model.layers.0.input_layernorm.weight").unwrap();
+        let norm1_mmap = &engine.shards[norm1.shard_index as usize].mmap;
+        let mut x_norm1 = vec![0.0f32; hidden_dim];
+        rmsnorm_rs(&h_0, norm1_mmap, norm1.offset_start as usize, &mut x_norm1, 1e-6);
+        println!("x_norm1 first 8 dims: {:?}", &x_norm1[0..8]);
+
+        // 3. Layer 0 in_proj_qkv (8192 x 2048)
+        let in_qkv = summary.tensors.iter().find(|t| t.name == "model.language_model.layers.0.linear_attn.in_proj_qkv.weight").unwrap();
+        let in_qkv_mmap = &engine.shards[in_qkv.shard_index as usize].mmap;
+        let mut qkv = vec![0.0f32; 8192];
+        gemv_bf16_rs(in_qkv_mmap, in_qkv.offset_start as usize, &x_norm1, &mut qkv, hidden_dim, 8192);
+        println!("qkv first 8 dims (Q): {:?}", &qkv[0..8]);
+        println!("qkv middle 8 dims (K): {:?}", &qkv[2048..2056]);
+        println!("qkv value 8 dims (V): {:?}", &qkv[4096..4104]);
+
+        // 4. conv1d
+        let conv_t = summary.tensors.iter().find(|t| t.name == "model.language_model.layers.0.linear_attn.conv1d.weight").unwrap();
+        let conv_mmap = &engine.shards[conv_t.shard_index as usize].mmap;
+        let conv_u16 = unsafe {
+            std::slice::from_raw_parts(conv_mmap.as_ptr().add(conv_t.offset_start as usize) as *const u16, 8192 * 4)
+        };
+        for c in 0..4 {
+            let w0 = bf16_to_f32(conv_u16[c * 4 + 0]);
+            let w1 = bf16_to_f32(conv_u16[c * 4 + 1]);
+            let w2 = bf16_to_f32(conv_u16[c * 4 + 2]);
+            let w3 = bf16_to_f32(conv_u16[c * 4 + 3]);
+            println!("conv channel {}: [w0={}, w1={}, w2={}, w3={}]", c, w0, w1, w2, w3);
+        }
+        let mut conv_out = vec![0.0f32; 8192];
+        for c in 0..8192 {
+            let w3 = bf16_to_f32(conv_u16[c * 4 + 3]);
+            let s3 = qkv[c];
+            let conv_val = w3 * s3; // first token, previous state is 0
+            let silu_val = conv_val / (1.0 + (-conv_val).exp());
+            conv_out[c] = silu_val;
+        }
+        println!("conv_out first 8 dims: {:?}", &conv_out[0..8]);
+
+        // 5. in_proj_z (4096 x 2048)
+        let in_z = summary.tensors.iter().find(|t| t.name == "model.language_model.layers.0.linear_attn.in_proj_z.weight").unwrap();
+        let in_z_mmap = &engine.shards[in_z.shard_index as usize].mmap;
+        let mut z = vec![0.0f32; 4096];
+        gemv_bf16_rs(in_z_mmap, in_z.offset_start as usize, &x_norm1, &mut z, hidden_dim, 4096);
+        println!("z first 8 dims: {:?}", &z[0..8]);
+
+        // 6. in_proj_a (32 x 2048) & in_proj_b (32 x 2048)
+        let in_a = summary.tensors.iter().find(|t| t.name == "model.language_model.layers.0.linear_attn.in_proj_a.weight").unwrap();
+        let in_a_mmap = &engine.shards[in_a.shard_index as usize].mmap;
+        let mut a_vec = vec![0.0f32; 32];
+        gemv_bf16_rs(in_a_mmap, in_a.offset_start as usize, &x_norm1, &mut a_vec, hidden_dim, 32);
+
+        let in_b = summary.tensors.iter().find(|t| t.name == "model.language_model.layers.0.linear_attn.in_proj_b.weight").unwrap();
+        let in_b_mmap = &engine.shards[in_b.shard_index as usize].mmap;
+        let mut b_vec = vec![0.0f32; 32];
+        gemv_bf16_rs(in_b_mmap, in_b.offset_start as usize, &x_norm1, &mut b_vec, hidden_dim, 32);
+
+        println!("a_vec: {:?}", a_vec);
+        println!("b_vec: {:?}", b_vec);
+
+        // 7. L2-norm on Q (16 heads x 128) and K (16 heads x 128)
+        let num_heads: usize = 16;
+        let head_dim: usize = 128;
+        for h in 0..num_heads {
+            // Q head
+            let q_base = h * head_dim;
+            let mut q_sum_sq = 0.0f32;
+            for i in 0..head_dim {
+                let v = conv_out[q_base + i];
+                q_sum_sq += v * v;
+            }
+            let inv_q = 1.0 / (q_sum_sq + 1e-6).sqrt();
+            for i in 0..head_dim {
+                conv_out[q_base + i] *= inv_q;
+            }
+
+            // K head
+            let k_base = 2048 + (h * head_dim);
+            let mut k_sum_sq = 0.0f32;
+            for i in 0..head_dim {
+                let v = conv_out[k_base + i];
+                k_sum_sq += v * v;
+            }
+            let inv_k = 1.0 / (k_sum_sq + 1e-6).sqrt();
+            for i in 0..head_dim {
+                conv_out[k_base + i] *= inv_k;
+            }
+        }
+
+        // 8. Linear Recurrence Step
+        let a_log_t = summary.tensors.iter().find(|t| t.name == "model.language_model.layers.0.linear_attn.A_log").unwrap();
+        let a_log_mmap = &engine.shards[a_log_t.shard_index as usize].mmap;
+        let a_log_u16 = unsafe {
+            std::slice::from_raw_parts(a_log_mmap.as_ptr().add(a_log_t.offset_start as usize) as *const u16, 32)
+        };
+
+        let dt_bias_t = summary.tensors.iter().find(|t| t.name == "model.language_model.layers.0.linear_attn.dt_bias").unwrap();
+        let dt_bias_mmap = &engine.shards[dt_bias_t.shard_index as usize].mmap;
+        let dt_bias_u16 = unsafe {
+            std::slice::from_raw_parts(dt_bias_mmap.as_ptr().add(dt_bias_t.offset_start as usize) as *const u16, 32)
+        };
+
+        let lin_norm_t = summary.tensors.iter().find(|t| t.name == "model.language_model.layers.0.linear_attn.norm.weight").unwrap();
+        let lin_norm_mmap = &engine.shards[lin_norm_t.shard_index as usize].mmap;
+        let lin_norm_u16 = unsafe {
+            std::slice::from_raw_parts(lin_norm_mmap.as_ptr().add(lin_norm_t.offset_start as usize) as *const u16, 128)
+        };
+
+        let mut attn_ctx = vec![0.0f32; 4096];
+        let mut state_matrices = vec![0.0f32; 32 * 128 * 128]; // [32, 128, 128]
+
+        for h in 0..32 {
+            let key_head_idx = h / 2;
+            let q_base = key_head_idx * head_dim;
+            let k_base = 2048 + (key_head_idx * head_dim);
+            let v_base = 4096 + (h * head_dim);
+            let z_base = h * head_dim;
+            let out_base = h * head_dim;
+            let state_base = h * head_dim * head_dim;
+
+            let a_log_val = bf16_to_f32(a_log_u16[h]);
+            let dt_bias_val = bf16_to_f32(dt_bias_u16[h]);
+            let a_val = a_vec[h];
+            let b_val = b_vec[h];
+
+            let x = a_val + dt_bias_val;
+            let dt = if x > 20.0 { x } else if x < -20.0 { x.exp() } else { (1.0 + x.exp()).ln() };
+            let alpha = (-a_log_val.exp() * dt).exp();
+            let beta = 1.0 / (1.0 + (-b_val).exp());
+
+            // Sk = S_prev * k
+            let mut sk = [0.0f32; 128];
+            for i in 0..head_dim {
+                let mut sum = 0.0f32;
+                for j in 0..head_dim {
+                    sum += state_matrices[state_base + (i * head_dim) + j] * conv_out[k_base + j];
+                }
+                sk[i] = sum;
+            }
+
+            let mut y = [0.0f32; 128];
+            let mut sum_sq = 0.0f32;
+            for i in 0..head_dim {
+                let vi = conv_out[v_base + i];
+                let ui = vi - (alpha * sk[i]);
+                let beta_ui = beta * ui;
+
+                let mut yi = 0.0f32;
+                for j in 0..head_dim {
+                    let s_idx = state_base + (i * head_dim) + j;
+                    let s_old = state_matrices[s_idx];
+                    let kj = conv_out[k_base + j];
+                    let s_new = (alpha * s_old) + (beta_ui * kj);
+                    state_matrices[s_idx] = s_new;
+                    yi += s_new * conv_out[q_base + j];
+                }
+                y[i] = yi;
+                sum_sq += yi * yi;
+            }
+
+            let inv_rms = 1.0 / ((sum_sq / head_dim as f32) + 1e-6).sqrt();
+            for i in 0..head_dim {
+                let norm_w = bf16_to_f32(lin_norm_u16[i]);
+                let y_norm = y[i] * inv_rms * norm_w;
+                let z_val = z[z_base + i];
+                let silu_z = z_val / (1.0 + (-z_val).exp());
+                attn_ctx[out_base + i] = y_norm * silu_z;
+            }
+        }
+        println!("attn_ctx first 8 dims: {:?}", &attn_ctx[0..8]);
+
+        // 9. out_proj (2048 x 4096)
+        let out_proj_t = summary.tensors.iter().find(|t| t.name == "model.language_model.layers.0.linear_attn.out_proj.weight").unwrap();
+        let out_proj_mmap = &engine.shards[out_proj_t.shard_index as usize].mmap;
+        let mut attn_out = vec![0.0f32; hidden_dim];
+        gemv_bf16_rs(out_proj_mmap, out_proj_t.offset_start as usize, &attn_ctx, &mut attn_out, 4096, hidden_dim);
+        println!("attn_out first 8 dims: {:?}", &attn_out[0..8]);
+
+        // 10. Residual 1 (h_mid = h_0 + attn_out)
+        let mut h_mid = vec![0.0f32; hidden_dim];
+        for d in 0..hidden_dim {
+            h_mid[d] = h_0[d] + attn_out[d];
+        }
+        println!("h_mid first 8 dims: {:?}", &h_mid[0..8]);
+
+        // 11. post_attention_layernorm
+        let norm2 = summary.tensors.iter().find(|t| t.name == "model.language_model.layers.0.post_attention_layernorm.weight").unwrap();
+        let norm2_mmap = &engine.shards[norm2.shard_index as usize].mmap;
+        let mut x_norm2 = vec![0.0f32; hidden_dim];
+        rmsnorm_rs(&h_mid, norm2_mmap, norm2.offset_start as usize, &mut x_norm2, 1e-6);
+        println!("x_norm2 first 8 dims: {:?}", &x_norm2[0..8]);
+
+        // 12. Router (256 x 2048)
+        let router_t = summary.tensors.iter().find(|t| t.name == "model.language_model.layers.0.mlp.gate.weight").unwrap();
+        let router_mmap = &engine.shards[router_t.shard_index as usize].mmap;
+        let mut router_logits = vec![0.0f32; 256];
+        gemv_bf16_rs(router_mmap, router_t.offset_start as usize, &x_norm2, &mut router_logits, hidden_dim, 256);
+
+        // Top 8
+        let mut router_pairs: Vec<(usize, f32)> = router_logits.iter().cloned().enumerate().collect();
+        router_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let top8: Vec<(usize, f32)> = router_pairs.into_iter().take(8).collect();
+        println!("Top 8 router experts: {:?}", top8);
+
+        // Softmax on top 8
+        let max_l = top8[0].1;
+        let exp_sum: f32 = top8.iter().map(|(_, l)| (l - max_l).exp()).sum();
+        let top8_weights: Vec<(usize, f32)> = top8.iter().map(|(id, l)| (*id, (l - max_l).exp() / exp_sum)).collect();
+        println!("Top 8 normalized weights: {:?}", top8_weights);
+
+        // 13. Shared expert gate
+        let shared_gate_t = summary.tensors.iter().find(|t| t.name == "model.language_model.layers.0.mlp.shared_expert_gate.weight").unwrap();
+        let shared_gate_mmap = &engine.shards[shared_gate_t.shard_index as usize].mmap;
+        let shared_gate_u16 = unsafe {
+            std::slice::from_raw_parts(shared_gate_mmap.as_ptr().add(shared_gate_t.offset_start as usize) as *const u16, hidden_dim)
+        };
+        let mut sg_dot = 0.0f32;
+        for d in 0..hidden_dim {
+            sg_dot += bf16_to_f32(shared_gate_u16[d]) * x_norm2[d];
+        }
+        let shared_w = 1.0 / (1.0 + (-sg_dot).exp());
+        println!("Shared expert weight: {}", shared_w);
+
+        // 14. MLP Accumulation
+        let mut h_mlp = vec![0.0f32; hidden_dim];
+        let inter_dim: usize = 512;
+
+        // Shared expert
+        let sg_w = summary.tensors.iter().find(|t| t.name == "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight").unwrap();
+        let sg_s = summary.tensors.iter().find(|t| t.name == "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight_scale").unwrap();
+        let su_w = summary.tensors.iter().find(|t| t.name == "model.language_model.layers.0.mlp.shared_expert.up_proj.weight").unwrap();
+        let su_s = summary.tensors.iter().find(|t| t.name == "model.language_model.layers.0.mlp.shared_expert.up_proj.weight_scale").unwrap();
+        let sd_w = summary.tensors.iter().find(|t| t.name == "model.language_model.layers.0.mlp.shared_expert.down_proj.weight").unwrap();
+        let sd_s = summary.tensors.iter().find(|t| t.name == "model.language_model.layers.0.mlp.shared_expert.down_proj.weight_scale").unwrap();
+
+        let mut gate_vec = vec![0.0f32; inter_dim];
+        let mut up_vec = vec![0.0f32; inter_dim];
+        let mut inter_vec = vec![0.0f32; inter_dim];
+        let mut down_vec = vec![0.0f32; hidden_dim];
+
+        gemv_fp8_rs(&engine.shards[sg_w.shard_index as usize].mmap, sg_w.offset_start as usize,
+                    &engine.shards[sg_s.shard_index as usize].mmap, sg_s.offset_start as usize,
+                    &x_norm2, &mut gate_vec, hidden_dim, inter_dim);
+        gemv_fp8_rs(&engine.shards[su_w.shard_index as usize].mmap, su_w.offset_start as usize,
+                    &engine.shards[su_s.shard_index as usize].mmap, su_s.offset_start as usize,
+                    &x_norm2, &mut up_vec, hidden_dim, inter_dim);
+
+        for i in 0..inter_dim {
+            let g = gate_vec[i];
+            let silu_g = g / (1.0 + (-g).exp());
+            inter_vec[i] = silu_g * up_vec[i];
+        }
+
+        gemv_fp8_rs(&engine.shards[sd_w.shard_index as usize].mmap, sd_w.offset_start as usize,
+                    &engine.shards[sd_s.shard_index as usize].mmap, sd_s.offset_start as usize,
+                    &inter_vec, &mut down_vec, inter_dim, hidden_dim);
+
+        for d in 0..hidden_dim {
+            h_mlp[d] += down_vec[d] * shared_w;
+        }
+
+        // Top 8 routed experts
+        for (exp_id, p_k) in top8_weights {
+            let eg_w_name = format!("model.language_model.layers.0.mlp.experts.{}.gate_proj.weight", exp_id);
+            let eg_s_name = format!("model.language_model.layers.0.mlp.experts.{}.gate_proj.weight_scale", exp_id);
+            let eu_w_name = format!("model.language_model.layers.0.mlp.experts.{}.up_proj.weight", exp_id);
+            let eu_s_name = format!("model.language_model.layers.0.mlp.experts.{}.up_proj.weight_scale", exp_id);
+            let ed_w_name = format!("model.language_model.layers.0.mlp.experts.{}.down_proj.weight", exp_id);
+            let ed_s_name = format!("model.language_model.layers.0.mlp.experts.{}.down_proj.weight_scale", exp_id);
+
+            let eg_w = summary.tensors.iter().find(|t| t.name == eg_w_name).unwrap();
+            let eg_s = summary.tensors.iter().find(|t| t.name == eg_s_name).unwrap();
+            let eu_w = summary.tensors.iter().find(|t| t.name == eu_w_name).unwrap();
+            let eu_s = summary.tensors.iter().find(|t| t.name == eu_s_name).unwrap();
+            let ed_w = summary.tensors.iter().find(|t| t.name == ed_w_name).unwrap();
+            let ed_s = summary.tensors.iter().find(|t| t.name == ed_s_name).unwrap();
+
+            gemv_fp8_rs(&engine.shards[eg_w.shard_index as usize].mmap, eg_w.offset_start as usize,
+                        &engine.shards[eg_s.shard_index as usize].mmap, eg_s.offset_start as usize,
+                        &x_norm2, &mut gate_vec, hidden_dim, inter_dim);
+            gemv_fp8_rs(&engine.shards[eu_w.shard_index as usize].mmap, eu_w.offset_start as usize,
+                        &engine.shards[eu_s.shard_index as usize].mmap, eu_s.offset_start as usize,
+                        &x_norm2, &mut up_vec, hidden_dim, inter_dim);
+
+            for i in 0..inter_dim {
+                let g = gate_vec[i];
+                let silu_g = g / (1.0 + (-g).exp());
+                inter_vec[i] = silu_g * up_vec[i];
+            }
+
+            gemv_fp8_rs(&engine.shards[ed_w.shard_index as usize].mmap, ed_w.offset_start as usize,
+                        &engine.shards[ed_s.shard_index as usize].mmap, ed_s.offset_start as usize,
+                        &inter_vec, &mut down_vec, inter_dim, hidden_dim);
+
+            for d in 0..hidden_dim {
+                h_mlp[d] += down_vec[d] * p_k;
+            }
+        }
+
+        println!("h_mlp first 8 dims: {:?}", &h_mlp[0..8]);
+
+        // 15. Residual 2 (h_next = h_mid + h_mlp)
+        let mut h_next = vec![0.0f32; hidden_dim];
+        for d in 0..hidden_dim {
+            h_next[d] = h_mid[d] + h_mlp[d];
+        }
+        println!("h_next (Layer 0 output) first 8 dims: {:?}", &h_next[0..8]);
+    }
+
+    #[test]
+    fn test_cpu_full_forward() {
+        let snapshot_dir = PathBuf::from("/Users/derekparris/.cache/huggingface/hub/models--ornith-ai--Ornith-1.5-35B-A3B-FP8/snapshots/0e048080ccd0ccf4296bfea5638036c196dccc0c");
+        let index_file = snapshot_dir.join("model.safetensors.index.json");
+        if !index_file.exists() { return; }
+
+        let engine = DynaMoeEngine::new(index_file.to_string_lossy().to_string()).unwrap();
+        let summary = engine.get_summary().unwrap();
+
+        let tok_path = snapshot_dir.join("tokenizer.json");
+        let tokenizer = DynaMoeTokenizer::new(tok_path.to_string_lossy().to_string()).unwrap();
+
+        let hidden_dim = 2048usize;
+        let vocab_size = 248320usize;
+        let num_layers = 40usize;
+
+        // RoPE tables for 256 dim (rotary dim = 64)
+        let rotary_dim = 64usize;
+        let head_dim_full = 256usize;
+        let rope_theta = 1000000.0f32;
+        let mut cos_table = vec![0.0f32; rotary_dim / 2];
+        let mut sin_table = vec![0.0f32; rotary_dim / 2];
+        let pos = 0usize; // step 0
+        for i in 0..(rotary_dim / 2) {
+            let freq = 1.0 / (rope_theta.powf((2 * i) as f32 / rotary_dim as f32));
+            let angle = (pos as f32) * freq;
+            cos_table[i] = angle.cos();
+            sin_table[i] = angle.sin();
+        }
+
+        let embed_tensor = summary.tensors.iter().find(|t| t.name == "model.language_model.embed_tokens.weight").unwrap();
+        let embed_mmap = &engine.shards[embed_tensor.shard_index as usize].mmap;
+        let embed_u16 = unsafe {
+            std::slice::from_raw_parts(embed_mmap.as_ptr().add(embed_tensor.offset_start as usize) as *const u16, vocab_size * hidden_dim)
+        };
+
+        let target_token_id: usize = 248045; // <|im_start|>
+        let mut h = vec![0.0f32; hidden_dim];
+        for d in 0..hidden_dim {
+            h[d] = bf16_to_f32(embed_u16[target_token_id * hidden_dim + d]);
+        }
+
+        // KV cache & conv / linear state
+        let mut conv_states = vec![0.0f32; 30 * 8192 * 4];
+        let mut linear_states = vec![0.0f32; 30 * 32 * 128 * 128];
+        let mut kv_k_cache = vec![0.0f32; 10 * 2048 * 2 * 256];
+        let mut kv_v_cache = vec![0.0f32; 10 * 2048 * 2 * 256];
+
+        let mut lin_layer_count = 0usize;
+        let mut full_layer_count = 0usize;
+
+        for l in 0..num_layers {
+            let is_full = (l % 4 == 3);
+
+            // 1. Input layernorm
+            let norm1_name = format!("model.language_model.layers.{}.input_layernorm.weight", l);
+            let norm1 = summary.tensors.iter().find(|t| t.name == norm1_name).unwrap();
+            let mut x_norm1 = vec![0.0f32; hidden_dim];
+            rmsnorm_rs(&h, &engine.shards[norm1.shard_index as usize].mmap, norm1.offset_start as usize, &mut x_norm1, 1e-6);
+
+            let mut attn_out = vec![0.0f32; hidden_dim];
+
+            if is_full {
+                let full_idx = full_layer_count;
+                full_layer_count += 1;
+
+                // Full Attention (GQA)
+                let q_w = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.self_attn.q_proj.weight", l)).unwrap();
+                let q_s = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.self_attn.q_proj.weight_scale", l)).unwrap();
+                let k_w = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.self_attn.k_proj.weight", l)).unwrap();
+                let k_s = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.self_attn.k_proj.weight_scale", l)).unwrap();
+                let v_w = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.self_attn.v_proj.weight", l)).unwrap();
+                let v_s = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.self_attn.v_proj.weight_scale", l)).unwrap();
+                let q_norm = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.self_attn.q_norm.weight", l)).unwrap();
+                let k_norm = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.self_attn.k_norm.weight", l)).unwrap();
+                let o_w = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.self_attn.o_proj.weight", l)).unwrap();
+                let o_s = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.self_attn.o_proj.weight_scale", l)).unwrap();
+
+                let mut q_raw = vec![0.0f32; 8192];
+                let mut k_raw = vec![0.0f32; 512];
+                let mut v_raw = vec![0.0f32; 512];
+
+                gemv_fp8_rs(&engine.shards[q_w.shard_index as usize].mmap, q_w.offset_start as usize,
+                            &engine.shards[q_s.shard_index as usize].mmap, q_s.offset_start as usize,
+                            &x_norm1, &mut q_raw, hidden_dim, 8192);
+                gemv_fp8_rs(&engine.shards[k_w.shard_index as usize].mmap, k_w.offset_start as usize,
+                            &engine.shards[k_s.shard_index as usize].mmap, k_s.offset_start as usize,
+                            &x_norm1, &mut k_raw, hidden_dim, 512);
+                gemv_fp8_rs(&engine.shards[v_w.shard_index as usize].mmap, v_w.offset_start as usize,
+                            &engine.shards[v_s.shard_index as usize].mmap, v_s.offset_start as usize,
+                            &x_norm1, &mut v_raw, hidden_dim, 512);
+
+                // q_norm and k_norm
+                let qn_u16 = unsafe {
+                    std::slice::from_raw_parts(engine.shards[q_norm.shard_index as usize].mmap.as_ptr().add(q_norm.offset_start as usize) as *const u16, 256)
+                };
+                let kn_u16 = unsafe {
+                    std::slice::from_raw_parts(engine.shards[k_norm.shard_index as usize].mmap.as_ptr().add(k_norm.offset_start as usize) as *const u16, 256)
+                };
+
+                let mut q_vec = vec![0.0f32; 16 * 256];
+                let mut gate_vec = vec![0.0f32; 16 * 256];
+
+                for h_idx in 0..16 {
+                    let h_start = h_idx * 512;
+                    let mut sum_sq = 0.0f32;
+                    for d in 0..256 {
+                        let q_val = q_raw[h_start + d];
+                        sum_sq += q_val * q_val;
+                    }
+                    let inv_rms = 1.0 / ((sum_sq / 256.0) + 1e-6).sqrt();
+                    for d in 0..256 {
+                        q_vec[h_idx * 256 + d] = q_raw[h_start + d] * inv_rms * (1.0 + bf16_to_f32(qn_u16[d]));
+                        gate_vec[h_idx * 256 + d] = q_raw[h_start + 256 + d];
+                    }
+
+                    // RoPE on Q (rotary dim 64)
+                    for i in 0..(rotary_dim / 2) {
+                        let q0 = q_vec[h_idx * 256 + i];
+                        let q1 = q_vec[h_idx * 256 + i + 32];
+                        let cos = cos_table[i];
+                        let sin = sin_table[i];
+                        q_vec[h_idx * 256 + i] = q0 * cos - q1 * sin;
+                        q_vec[h_idx * 256 + i + 32] = q0 * sin + q1 * cos;
+                    }
+                }
+
+                let mut k_vec = vec![0.0f32; 2 * 256];
+                for kv_h in 0..2 {
+                    let mut sum_sq = 0.0f32;
+                    for d in 0..256 {
+                        let k_val = k_raw[kv_h * 256 + d];
+                        sum_sq += k_val * k_val;
+                    }
+                    let inv_rms = 1.0 / ((sum_sq / 256.0) + 1e-6).sqrt();
+                    for d in 0..256 {
+                        k_vec[kv_h * 256 + d] = k_raw[kv_h * 256 + d] * inv_rms * (1.0 + bf16_to_f32(kn_u16[d]));
+                    }
+                    // RoPE on K
+                    for i in 0..(rotary_dim / 2) {
+                        let k0 = k_vec[kv_h * 256 + i];
+                        let k1 = k_vec[kv_h * 256 + i + 32];
+                        let cos = cos_table[i];
+                        let sin = sin_table[i];
+                        k_vec[kv_h * 256 + i] = k0 * cos - k1 * sin;
+                        k_vec[kv_h * 256 + i + 32] = k0 * sin + k1 * cos;
+                    }
+                }
+
+                // Store in KV cache (pos = 0)
+                let kv_base = full_idx * 2048 * 2 * 256;
+                for i in 0..(2 * 256) {
+                    kv_k_cache[kv_base + i] = k_vec[i];
+                    kv_v_cache[kv_base + i] = v_raw[i];
+                }
+
+                // Step 0 GQA (single token attending to itself)
+                let mut ctx = vec![0.0f32; 16 * 256];
+                let scale = 1.0 / (256.0f32).sqrt();
+
+                for h_idx in 0..16 {
+                    let kv_h = h_idx / 8; // 16 heads / 2 kv heads = 8
+                    let mut dot = 0.0f32;
+                    for d in 0..256 {
+                        dot += q_vec[h_idx * 256 + d] * k_vec[kv_h * 256 + d];
+                    }
+                    // softmax of single element is 1.0
+                    for d in 0..256 {
+                        let v_val = v_raw[kv_h * 256 + d];
+                        let g = gate_vec[h_idx * 256 + d];
+                        let silu_g = 1.0 / (1.0 + (-g).exp());
+                        ctx[h_idx * 256 + d] = v_val * silu_g;
+                    }
+                }
+
+                // o_proj (2048 x 4096)
+                gemv_fp8_rs(&engine.shards[o_w.shard_index as usize].mmap, o_w.offset_start as usize,
+                            &engine.shards[o_s.shard_index as usize].mmap, o_s.offset_start as usize,
+                            &ctx, &mut attn_out, 4096, hidden_dim);
+            } else {
+                let lin_idx = lin_layer_count;
+                lin_layer_count += 1;
+
+                // Linear Attention
+                let in_qkv = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.linear_attn.in_proj_qkv.weight", l)).unwrap();
+                let conv_t = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.linear_attn.conv1d.weight", l)).unwrap();
+                let in_z = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.linear_attn.in_proj_z.weight", l)).unwrap();
+                let in_a = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.linear_attn.in_proj_a.weight", l)).unwrap();
+                let in_b = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.linear_attn.in_proj_b.weight", l)).unwrap();
+                let a_log_t = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.linear_attn.A_log", l)).unwrap();
+                let dt_bias_t = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.linear_attn.dt_bias", l)).unwrap();
+                let lin_norm_t = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.linear_attn.norm.weight", l)).unwrap();
+                let out_proj_t = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.linear_attn.out_proj.weight", l)).unwrap();
+
+                let mut qkv = vec![0.0f32; 8192];
+                gemv_bf16_rs(&engine.shards[in_qkv.shard_index as usize].mmap, in_qkv.offset_start as usize, &x_norm1, &mut qkv, hidden_dim, 8192);
+
+                // conv1d
+                let conv_u16 = unsafe {
+                    std::slice::from_raw_parts(engine.shards[conv_t.shard_index as usize].mmap.as_ptr().add(conv_t.offset_start as usize) as *const u16, 8192 * 4)
+                };
+                let mut conv_out = vec![0.0f32; 8192];
+                for c in 0..8192 {
+                    let w3 = bf16_to_f32(conv_u16[c * 4 + 3]);
+                    let conv_val = w3 * qkv[c];
+                    conv_out[c] = conv_val / (1.0 + (-conv_val).exp());
+                }
+
+                // L2-norm
+                for h in 0..16 {
+                    let q_base = h * 128;
+                    let mut q_sum_sq = 0.0f32;
+                    for i in 0..128 { q_sum_sq += conv_out[q_base + i] * conv_out[q_base + i]; }
+                    let inv_q = 1.0 / (q_sum_sq + 1e-6).sqrt();
+                    for i in 0..128 { conv_out[q_base + i] *= inv_q; }
+
+                    let k_base = 2048 + (h * 128);
+                    let mut k_sum_sq = 0.0f32;
+                    for i in 0..128 { k_sum_sq += conv_out[k_base + i] * conv_out[k_base + i]; }
+                    let inv_k = 1.0 / (k_sum_sq + 1e-6).sqrt();
+                    for i in 0..128 { conv_out[k_base + i] *= inv_k; }
+                }
+
+                let mut z = vec![0.0f32; 4096];
+                gemv_bf16_rs(&engine.shards[in_z.shard_index as usize].mmap, in_z.offset_start as usize, &x_norm1, &mut z, hidden_dim, 4096);
+
+                let mut a_vec = vec![0.0f32; 32];
+                gemv_bf16_rs(&engine.shards[in_a.shard_index as usize].mmap, in_a.offset_start as usize, &x_norm1, &mut a_vec, hidden_dim, 32);
+
+                let mut b_vec = vec![0.0f32; 32];
+                gemv_bf16_rs(&engine.shards[in_b.shard_index as usize].mmap, in_b.offset_start as usize, &x_norm1, &mut b_vec, hidden_dim, 32);
+
+                let a_log_u16 = unsafe {
+                    std::slice::from_raw_parts(engine.shards[a_log_t.shard_index as usize].mmap.as_ptr().add(a_log_t.offset_start as usize) as *const u16, 32)
+                };
+                let dt_bias_u16 = unsafe {
+                    std::slice::from_raw_parts(engine.shards[dt_bias_t.shard_index as usize].mmap.as_ptr().add(dt_bias_t.offset_start as usize) as *const u16, 32)
+                };
+                let lin_norm_u16 = unsafe {
+                    std::slice::from_raw_parts(engine.shards[lin_norm_t.shard_index as usize].mmap.as_ptr().add(lin_norm_t.offset_start as usize) as *const u16, 128)
+                };
+
+                let mut attn_ctx = vec![0.0f32; 4096];
+                let lin_state_base = lin_idx * (32 * 128 * 128);
+
+                for h_idx in 0..32 {
+                    let key_h = h_idx / 2;
+                    let q_base = key_h * 128;
+                    let k_base = 2048 + (key_h * 128);
+                    let v_base = 4096 + (h_idx * 128);
+                    let z_base = h_idx * 128;
+                    let out_base = h_idx * 128;
+                    let state_base = lin_state_base + h_idx * 128 * 128;
+
+                    let a_log_val = bf16_to_f32(a_log_u16[h_idx]);
+                    let dt_bias_val = bf16_to_f32(dt_bias_u16[h_idx]);
+                    let a_val = a_vec[h_idx];
+                    let b_val = b_vec[h_idx];
+
+                    let x = a_val + dt_bias_val;
+                    let dt = if x > 20.0 { x } else if x < -20.0 { x.exp() } else { (1.0 + x.exp()).ln() };
+                    let alpha = (-a_log_val.exp() * dt).exp();
+                    let beta = 1.0 / (1.0 + (-b_val).exp());
+
+                    let mut sk = [0.0f32; 128];
+                    for i in 0..128 {
+                        let mut sum = 0.0f32;
+                        for j in 0..128 {
+                            sum += linear_states[state_base + (i * 128) + j] * conv_out[k_base + j];
+                        }
+                        sk[i] = sum;
+                    }
+
+                    let mut y = [0.0f32; 128];
+                    let mut sum_sq = 0.0f32;
+                    for i in 0..128 {
+                        let vi = conv_out[v_base + i];
+                        let ui = vi - (alpha * sk[i]);
+                        let beta_ui = beta * ui;
+
+                        let mut yi = 0.0f32;
+                        for j in 0..128 {
+                            let s_idx = state_base + (i * 128) + j;
+                            let s_old = linear_states[s_idx];
+                            let kj = conv_out[k_base + j];
+                            let s_new = (alpha * s_old) + (beta_ui * kj);
+                            linear_states[s_idx] = s_new;
+                            yi += s_new * conv_out[q_base + j];
+                        }
+                        y[i] = yi;
+                        sum_sq += yi * yi;
+                    }
+
+                    let inv_rms = 1.0 / ((sum_sq / 128.0) + 1e-6).sqrt();
+                    for i in 0..128 {
+                        let norm_w = bf16_to_f32(lin_norm_u16[i]);
+                        let y_norm = y[i] * inv_rms * norm_w;
+                        let z_val = z[z_base + i];
+                        let silu_z = z_val / (1.0 + (-z_val).exp());
+                        attn_ctx[out_base + i] = y_norm * silu_z;
+                    }
+                }
+
+                gemv_bf16_rs(&engine.shards[out_proj_t.shard_index as usize].mmap, out_proj_t.offset_start as usize, &attn_ctx, &mut attn_out, 4096, hidden_dim);
+            }
+
+            // Residual 1
+            let mut h_mid = vec![0.0f32; hidden_dim];
+            for d in 0..hidden_dim {
+                h_mid[d] = h[d] + attn_out[d];
+            }
+
+            // Post attention norm
+            let norm2 = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.post_attention_layernorm.weight", l)).unwrap();
+            let mut x_norm2 = vec![0.0f32; hidden_dim];
+            rmsnorm_rs(&h_mid, &engine.shards[norm2.shard_index as usize].mmap, norm2.offset_start as usize, &mut x_norm2, 1e-6);
+
+            // Router
+            let router_t = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.mlp.gate.weight", l)).unwrap();
+            let mut router_logits = vec![0.0f32; 256];
+            gemv_bf16_rs(&engine.shards[router_t.shard_index as usize].mmap, router_t.offset_start as usize, &x_norm2, &mut router_logits, hidden_dim, 256);
+
+            let mut router_pairs: Vec<(usize, f32)> = router_logits.iter().cloned().enumerate().collect();
+            router_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let top8: Vec<(usize, f32)> = router_pairs.into_iter().take(8).collect();
+            let max_l = top8[0].1;
+            let exp_sum: f32 = top8.iter().map(|(_, l)| (l - max_l).exp()).sum();
+            let top8_weights: Vec<(usize, f32)> = top8.iter().map(|(id, l)| (*id, (l - max_l).exp() / exp_sum)).collect();
+
+            // Shared expert gate
+            let shared_gate_t = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.mlp.shared_expert_gate.weight", l)).unwrap();
+            let shared_gate_u16 = unsafe {
+                std::slice::from_raw_parts(engine.shards[shared_gate_t.shard_index as usize].mmap.as_ptr().add(shared_gate_t.offset_start as usize) as *const u16, hidden_dim)
+            };
+            let mut sg_dot = 0.0f32;
+            for d in 0..hidden_dim {
+                sg_dot += bf16_to_f32(shared_gate_u16[d]) * x_norm2[d];
+            }
+            let shared_w = 1.0 / (1.0 + (-sg_dot).exp());
+
+            // MLP
+            let mut h_mlp = vec![0.0f32; hidden_dim];
+            let inter_dim = 512usize;
+
+            // Shared expert
+            let sg_w = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.mlp.shared_expert.gate_proj.weight", l)).unwrap();
+            let sg_s = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.mlp.shared_expert.gate_proj.weight_scale", l)).unwrap();
+            let su_w = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.mlp.shared_expert.up_proj.weight", l)).unwrap();
+            let su_s = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.mlp.shared_expert.up_proj.weight_scale", l)).unwrap();
+            let sd_w = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.mlp.shared_expert.down_proj.weight", l)).unwrap();
+            let sd_s = summary.tensors.iter().find(|t| t.name == format!("model.language_model.layers.{}.mlp.shared_expert.down_proj.weight_scale", l)).unwrap();
+
+            let mut gate_vec = vec![0.0f32; inter_dim];
+            let mut up_vec = vec![0.0f32; inter_dim];
+            let mut inter_vec = vec![0.0f32; inter_dim];
+            let mut down_vec = vec![0.0f32; hidden_dim];
+
+            gemv_fp8_rs(&engine.shards[sg_w.shard_index as usize].mmap, sg_w.offset_start as usize,
+                        &engine.shards[sg_s.shard_index as usize].mmap, sg_s.offset_start as usize,
+                        &x_norm2, &mut gate_vec, hidden_dim, inter_dim);
+            gemv_fp8_rs(&engine.shards[su_w.shard_index as usize].mmap, su_w.offset_start as usize,
+                        &engine.shards[su_s.shard_index as usize].mmap, su_s.offset_start as usize,
+                        &x_norm2, &mut up_vec, hidden_dim, inter_dim);
+
+            for i in 0..inter_dim {
+                let g = gate_vec[i];
+                inter_vec[i] = (g / (1.0 + (-g).exp())) * up_vec[i];
+            }
+
+            gemv_fp8_rs(&engine.shards[sd_w.shard_index as usize].mmap, sd_w.offset_start as usize,
+                        &engine.shards[sd_s.shard_index as usize].mmap, sd_s.offset_start as usize,
+                        &inter_vec, &mut down_vec, inter_dim, hidden_dim);
+
+            for d in 0..hidden_dim {
+                h_mlp[d] += down_vec[d] * shared_w;
+            }
+
+            // Top 8 routed experts
+            for (exp_id, p_k) in top8_weights {
+                let eg_w_name = format!("model.language_model.layers.{}.mlp.experts.{}.gate_proj.weight", l, exp_id);
+                let eg_s_name = format!("model.language_model.layers.{}.mlp.experts.{}.gate_proj.weight_scale", l, exp_id);
+                let eu_w_name = format!("model.language_model.layers.{}.mlp.experts.{}.up_proj.weight", l, exp_id);
+                let eu_s_name = format!("model.language_model.layers.{}.mlp.experts.{}.up_proj.weight_scale", l, exp_id);
+                let ed_w_name = format!("model.language_model.layers.{}.mlp.experts.{}.down_proj.weight", l, exp_id);
+                let ed_s_name = format!("model.language_model.layers.{}.mlp.experts.{}.down_proj.weight_scale", l, exp_id);
+
+                let eg_w = summary.tensors.iter().find(|t| t.name == eg_w_name).unwrap();
+                let eg_s = summary.tensors.iter().find(|t| t.name == eg_s_name).unwrap();
+                let eu_w = summary.tensors.iter().find(|t| t.name == eu_w_name).unwrap();
+                let eu_s = summary.tensors.iter().find(|t| t.name == eu_s_name).unwrap();
+                let ed_w = summary.tensors.iter().find(|t| t.name == ed_w_name).unwrap();
+                let ed_s = summary.tensors.iter().find(|t| t.name == ed_s_name).unwrap();
+
+                gemv_fp8_rs(&engine.shards[eg_w.shard_index as usize].mmap, eg_w.offset_start as usize,
+                            &engine.shards[eg_s.shard_index as usize].mmap, eg_s.offset_start as usize,
+                            &x_norm2, &mut gate_vec, hidden_dim, inter_dim);
+                gemv_fp8_rs(&engine.shards[eu_w.shard_index as usize].mmap, eu_w.offset_start as usize,
+                            &engine.shards[eu_s.shard_index as usize].mmap, eu_s.offset_start as usize,
+                            &x_norm2, &mut up_vec, hidden_dim, inter_dim);
+
+                for i in 0..inter_dim {
+                    let g = gate_vec[i];
+                    inter_vec[i] = (g / (1.0 + (-g).exp())) * up_vec[i];
+                }
+
+                gemv_fp8_rs(&engine.shards[ed_w.shard_index as usize].mmap, ed_w.offset_start as usize,
+                            &engine.shards[ed_s.shard_index as usize].mmap, ed_s.offset_start as usize,
+                            &inter_vec, &mut down_vec, inter_dim, hidden_dim);
+
+                for d in 0..hidden_dim {
+                    h_mlp[d] += down_vec[d] * p_k;
+                }
+            }
+
+            // Residual 2
+            for d in 0..hidden_dim {
+                h[d] = h_mid[d] + h_mlp[d];
+            }
+
+            if l % 5 == 0 || l == 39 {
+                println!("Layer {} output h[0..4]: {:?}", l, &h[0..4]);
+            }
+        }
+
+        // Final RMSNorm
+        let final_norm = summary.tensors.iter().find(|t| t.name == "model.language_model.norm.weight").unwrap();
+        let mut x_final = vec![0.0f32; hidden_dim];
+        rmsnorm_rs(&h, &engine.shards[final_norm.shard_index as usize].mmap, final_norm.offset_start as usize, &mut x_final, 1e-6);
+        println!("x_final first 8 dims: {:?}", &x_final[0..8]);
+
+        // LM Head
+        let lm_head = summary.tensors.iter().find(|t| t.name == "lm_head.weight").unwrap();
+        let mut logits = vec![0.0f32; vocab_size];
+        gemv_bf16_rs(&engine.shards[lm_head.shard_index as usize].mmap, lm_head.offset_start as usize, &x_final, &mut logits, hidden_dim, vocab_size);
+
+        let mut logit_pairs: Vec<(usize, f32)> = logits.iter().cloned().enumerate().collect();
+        logit_pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        println!("=== TOP 10 PREDICTED TOKENS (from prompt <|im_start|>) ===");
+        for (tok_id, val) in logit_pairs.into_iter().take(10) {
+            let piece = tokenizer.decode(vec![tok_id as u32]).unwrap_or_default();
+            println!("  Token {}: logit={:.3}, text={:?}", tok_id, val, piece);
         }
     }
 }
