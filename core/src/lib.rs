@@ -60,7 +60,7 @@ impl DynaMoeTokenizer {
 
 // MARK: - Model Engine Records & Objects
 
-#[derive(uniffi::Record)]
+#[derive(uniffi::Record, Clone, Debug)]
 pub struct ShardMetadata {
     pub index: u32,
     pub filename: String,
@@ -68,7 +68,7 @@ pub struct ShardMetadata {
     pub length: u64,
 }
 
-#[derive(uniffi::Record)]
+#[derive(uniffi::Record, Clone, Debug)]
 pub struct TensorMetadata {
     pub name: String,
     pub shape_display: String,
@@ -82,7 +82,7 @@ pub struct TensorMetadata {
     pub expert_id: Option<u32>,
 }
 
-#[derive(uniffi::Record)]
+#[derive(uniffi::Record, Clone, Debug)]
 pub struct LayerSummary {
     pub layer_index: u32,
     pub total_tensors: u32,
@@ -90,7 +90,7 @@ pub struct LayerSummary {
     pub total_size_mb: f64,
 }
 
-#[derive(uniffi::Record)]
+#[derive(uniffi::Record, Clone, Debug)]
 pub struct ModelSummary {
     pub size_gb: f64,
     pub tensor_count: u32,
@@ -264,9 +264,152 @@ fn parse_layer_and_expert(name: &str) -> (String, Option<u32>, Option<u32>) {
     (category, layer_idx, expert_idx)
 }
 
+#[derive(Deserialize, Debug)]
+struct FlashMoEWeightsJson {
+    #[serde(default)]
+    pub tensors: BTreeMap<String, FlashMoETensorEntry>,
+}
+
+#[derive(Deserialize, Debug)]
+struct FlashMoETensorEntry {
+    pub offset: u64,
+    pub size: u64,
+    pub shape: Vec<u64>,
+    pub dtype: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct FlashMoELayoutJson {
+    pub expert_size: u64,
+    pub num_layers: u32,
+    pub num_experts: u32,
+    pub components: Vec<FlashMoEComponentEntry>,
+}
+
+#[derive(Deserialize, Debug)]
+struct FlashMoEComponentEntry {
+    pub name: String,
+    pub offset: u64,
+    pub size: u64,
+    pub dtype: String,
+    pub shape: Vec<u64>,
+}
+
+fn try_load_flash_moe(search_path: &Path) -> Option<(Vec<ShardHandle>, Vec<TensorMetadata>)> {
+    let base_dir = if search_path.is_file() {
+        search_path.parent().unwrap_or(Path::new(""))
+    } else {
+        search_path
+    };
+
+    let mut candidate_dirs = vec![base_dir.to_path_buf()];
+    let snapshots_dir = base_dir.join("snapshots");
+    if snapshots_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&snapshots_dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    candidate_dirs.push(entry.path());
+                }
+            }
+        }
+    }
+
+    for dir in candidate_dirs {
+        let weights_json_path = dir.join("model_weights.json");
+        let weights_bin_path = dir.join("model_weights.bin");
+        let packed_experts_dir = dir.join("packed_experts");
+        let layout_json_path = packed_experts_dir.join("layout.json");
+
+        if weights_json_path.is_file() && weights_bin_path.is_file() {
+            let weights_json_data = std::fs::read_to_string(&weights_json_path).ok()?;
+            let weights_json: FlashMoEWeightsJson = serde_json::from_str(&weights_json_data).ok()?;
+
+            let mut shard_handles = Vec::new();
+
+            // Shard 0: model_weights.bin
+            let file0 = File::open(&weights_bin_path).ok()?;
+            let mmap0 = unsafe { MmapOptions::new().map(&file0) }.ok()?;
+            shard_handles.push(ShardHandle {
+                filename: "model_weights.bin".to_string(),
+                mmap: mmap0,
+            });
+
+            let mut tensor_list = Vec::new();
+
+            // 1. Non-expert tensors from model_weights.json (Shard 0)
+            for (name, entry) in weights_json.tensors {
+                let (category, layer_index, expert_id) = parse_layer_and_expert(&name);
+                let size_mb = entry.size as f64 / (1024.0 * 1024.0);
+                tensor_list.push(TensorMetadata {
+                    name,
+                    shape_display: format!("{:?}", entry.shape),
+                    dtype: entry.dtype,
+                    size_mb,
+                    shard_index: 0,
+                    offset_start: entry.offset,
+                    offset_end: entry.offset + entry.size,
+                    category,
+                    layer_index,
+                    expert_id,
+                });
+            }
+
+            // 2. Packed experts from packed_experts/
+            if layout_json_path.is_file() {
+                if let Ok(layout_data) = std::fs::read_to_string(&layout_json_path) {
+                    if let Ok(layout) = serde_json::from_str::<FlashMoELayoutJson>(&layout_data) {
+                        for l in 0..layout.num_layers {
+                            let layer_bin_name = format!("layer_{:02}.bin", l);
+                            let layer_bin_path = packed_experts_dir.join(&layer_bin_name);
+                            if let Ok(file_l) = File::open(&layer_bin_path) {
+                                if let Ok(mmap_l) = unsafe { MmapOptions::new().map(&file_l) } {
+                                    let shard_idx = shard_handles.len() as u32;
+                                    shard_handles.push(ShardHandle {
+                                        filename: format!("packed_experts/{}", layer_bin_name),
+                                        mmap: mmap_l,
+                                    });
+
+                                    for e in 0..layout.num_experts {
+                                        let expert_base = (e as u64) * layout.expert_size;
+                                        for comp in &layout.components {
+                                            let tensor_name = format!("model.layers.{}.mlp.experts.{}.{}", l, e, comp.name);
+                                            let offset_start = expert_base + comp.offset;
+                                            let offset_end = offset_start + comp.size;
+                                            let size_mb = comp.size as f64 / (1024.0 * 1024.0);
+
+                                            tensor_list.push(TensorMetadata {
+                                                name: tensor_name,
+                                                shape_display: format!("{:?}", comp.shape),
+                                                dtype: comp.dtype.clone(),
+                                                size_mb,
+                                                shard_index: shard_idx,
+                                                offset_start,
+                                                offset_end,
+                                                category: format!("Routed Expert #{}", e),
+                                                layer_index: Some(l),
+                                                expert_id: Some(e),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            tensor_list.sort_by(|a, b| a.name.cmp(&b.name));
+            return Some((shard_handles, tensor_list));
+        }
+    }
+
+    None
+}
+
 #[derive(uniffi::Object)]
 pub struct DynaMoeEngine {
     shards: Vec<ShardHandle>,
+    custom_tensors: Option<Vec<TensorMetadata>>,
 }
 
 #[uniffi::export]
@@ -275,6 +418,14 @@ impl DynaMoeEngine {
     pub fn new(file_path: String) -> Result<Arc<Self>, EngineError> {
         let path = PathBuf::from(&file_path);
         let resolved_target = std::fs::canonicalize(&path).unwrap_or(path.clone());
+
+        // 0. Try FlashMoE Q4 Model Format
+        if let Some((shards, tensors)) = try_load_flash_moe(&path).or_else(|| try_load_flash_moe(&resolved_target)) {
+            return Ok(Arc::new(Self {
+                shards,
+                custom_tensors: Some(tensors),
+            }));
+        }
 
         let mut shard_handles = Vec::new();
 
@@ -349,7 +500,7 @@ impl DynaMoeEngine {
             });
         }
 
-        Ok(Arc::new(Self { shards: shard_handles }))
+        Ok(Arc::new(Self { shards: shard_handles, custom_tensors: None }))
     }
 
     pub fn get_summary(&self) -> Result<ModelSummary, EngineError> {
@@ -369,67 +520,88 @@ impl DynaMoeEngine {
                 base_address: shard.mmap.as_ptr() as u64,
                 length: shard_len,
             });
+        }
 
-            // Guard validation before parsing SafeTensors
-            let shard_bytes = &shard.mmap[..];
-            if shard_bytes.len() < 8 {
-                return Err(EngineError::ParseError {
-                    details: format!("Shard '{}' is too small ({} bytes) to be a valid SafeTensors file.", shard.filename, shard_bytes.len()),
-                });
-            }
-            if shard_bytes.starts_with(b"version https://git-lfs") {
-                return Err(EngineError::FileError {
-                    details: format!("Shard '{}' is a Git LFS pointer text file, not actual model weights. Run 'git lfs pull' to fetch the real tensor binaries.", shard.filename),
-                });
-            }
-            if shard_bytes.starts_with(b"{") || shard_bytes.starts_with(b"{\n") {
-                return Err(EngineError::ParseError {
-                    details: format!("Shard '{}' is a JSON text file, not a binary .safetensors weight file.", shard.filename),
-                });
-            }
-
-            let tensors = SafeTensors::deserialize(&shard.mmap).map_err(|e| EngineError::ParseError {
-                details: format!("Failed to parse shard '{}' ({:.2} MB): {:?}", shard.filename, shard_len as f64 / (1024.0 * 1024.0), e),
-            })?;
-
-            for name in tensors.names() {
-                if let Ok(tensor) = tensors.tensor(name) {
-                    let data_ptr = tensor.data().as_ptr() as usize;
-                    let base_ptr = shard.mmap.as_ptr() as usize;
-                    
-                    let offset_start = (data_ptr - base_ptr) as u64;
-                    let offset_end = offset_start + tensor.data().len() as u64;
-                    let size_mb = tensor.data().len() as f64 / (1024.0 * 1024.0);
-
-                    let (category, layer_index, expert_id) = parse_layer_and_expert(name);
-
-                    if let Some(exp) = expert_id {
-                        if exp + 1 > max_expert_id {
-                            max_expert_id = exp + 1;
-                        }
+        if let Some(ref custom) = self.custom_tensors {
+            tensor_list = custom.clone();
+            for t in &tensor_list {
+                if let Some(exp) = t.expert_id {
+                    if exp + 1 > max_expert_id {
+                        max_expert_id = exp + 1;
                     }
-
-                    if let Some(l_idx) = layer_index {
-                        let entry = layer_map.entry(l_idx).or_insert((0, BTreeMap::new(), 0.0));
-                        entry.0 += 1;
-                        if let Some(exp) = expert_id {
-                            entry.1.insert(exp, true);
-                        }
-                        entry.2 += size_mb;
+                }
+                if let Some(l_idx) = t.layer_index {
+                    let entry = layer_map.entry(l_idx).or_insert((0, BTreeMap::new(), 0.0));
+                    entry.0 += 1;
+                    if let Some(exp) = t.expert_id {
+                        entry.1.insert(exp, true);
                     }
-
-                    tensor_list.push(TensorMetadata {
-                        name: name.to_string(),
-                        shape_display: format!("{:?}", tensor.shape()),
-                        dtype: format!("{:?}", tensor.dtype()),
-                        size_mb,
-                        shard_index: shard_idx as u32,
-                        offset_start,
-                        offset_end,
-                        category,
-                        layer_index,
-                        expert_id,
+                    entry.2 += t.size_mb;
+                }
+            }
+        } else {
+            for (shard_idx, shard) in self.shards.iter().enumerate() {
+                // Guard validation before parsing SafeTensors
+                let shard_bytes = &shard.mmap[..];
+                if shard_bytes.len() < 8 {
+                    return Err(EngineError::ParseError {
+                        details: format!("Shard '{}' is too small ({} bytes) to be a valid SafeTensors file.", shard.filename, shard_bytes.len()),
                     });
+                }
+                if shard_bytes.starts_with(b"version https://git-lfs") {
+                    return Err(EngineError::FileError {
+                        details: format!("Shard '{}' is a Git LFS pointer text file, not actual model weights. Run 'git lfs pull' to fetch the real tensor binaries.", shard.filename),
+                    });
+                }
+                if shard_bytes.starts_with(b"{") || shard_bytes.starts_with(b"{\n") {
+                    return Err(EngineError::ParseError {
+                        details: format!("Shard '{}' is a JSON text file, not a binary .safetensors weight file.", shard.filename),
+                    });
+                }
+
+                let tensors = SafeTensors::deserialize(&shard.mmap).map_err(|e| EngineError::ParseError {
+                    details: format!("Failed to parse shard '{}' ({:.2} MB): {:?}", shard.filename, shard_bytes.len() as f64 / (1024.0 * 1024.0), e),
+                })?;
+
+                for name in tensors.names() {
+                    if let Ok(tensor) = tensors.tensor(name) {
+                        let data_ptr = tensor.data().as_ptr() as usize;
+                        let base_ptr = shard.mmap.as_ptr() as usize;
+                        
+                        let offset_start = (data_ptr - base_ptr) as u64;
+                        let offset_end = offset_start + tensor.data().len() as u64;
+                        let size_mb = tensor.data().len() as f64 / (1024.0 * 1024.0);
+
+                        let (category, layer_index, expert_id) = parse_layer_and_expert(name);
+
+                        if let Some(exp) = expert_id {
+                            if exp + 1 > max_expert_id {
+                                max_expert_id = exp + 1;
+                            }
+                        }
+
+                        if let Some(l_idx) = layer_index {
+                            let entry = layer_map.entry(l_idx).or_insert((0, BTreeMap::new(), 0.0));
+                            entry.0 += 1;
+                            if let Some(exp) = expert_id {
+                                entry.1.insert(exp, true);
+                            }
+                            entry.2 += size_mb;
+                        }
+
+                        tensor_list.push(TensorMetadata {
+                            name: name.to_string(),
+                            shape_display: format!("{:?}", tensor.shape()),
+                            dtype: format!("{:?}", tensor.dtype()),
+                            size_mb,
+                            shard_index: shard_idx as u32,
+                            offset_start,
+                            offset_end,
+                            category,
+                            layer_index,
+                            expert_id,
+                        });
+                    }
                 }
             }
         }
@@ -547,6 +719,25 @@ mod tests {
             assert_eq!(summary.shards.len(), 16);
         }
     }
+
+    #[test]
+    fn test_real_flashmoe_q4_path() {
+        let snapshot_dir = PathBuf::from("/Users/derekparris/.cache/huggingface/hub/models--alexintosh--Qwen3.5-35B-A3B-Q4-FlashMoE/snapshots/954605e54d19dca04d607421114b301ae9c2e061");
+        if snapshot_dir.exists() {
+            let engine = DynaMoeEngine::new(snapshot_dir.to_string_lossy().to_string());
+            assert!(engine.is_ok(), "Failed to create DynaMoeEngine for FlashMoE: {:?}", engine.err());
+            let engine = engine.unwrap();
+            let summary = engine.get_summary();
+            assert!(summary.is_ok(), "Failed to get summary for FlashMoE: {:?}", summary.err());
+            let summary = summary.unwrap();
+            println!("FLASHMOE SUCCESS! Loaded {} shards, {} tensors, {:.2} GB, {} layers, max expert ID {}", 
+                     summary.shards.len(), summary.tensor_count, summary.size_gb, summary.layer_count, summary.max_expert_id);
+            assert_eq!(summary.shards.len(), 41); // Shard 0 (model_weights.bin) + Shards 1..40 (layer_00.bin..layer_39.bin)
+            assert_eq!(summary.layer_count, 40);
+            assert_eq!(summary.max_expert_id, 256);
+        }
+    }
+
 
     #[test]
     fn test_ornith_tokenizer() {
