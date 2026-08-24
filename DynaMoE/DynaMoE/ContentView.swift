@@ -82,6 +82,254 @@ struct CachedLayer {
     let intermediateDim: UInt32
 }
 
+#if canImport(Darwin)
+import Darwin
+
+func getProcessResidentMemoryGB() -> Double {
+    var info = mach_task_basic_info()
+    var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / 4)
+    let kerr: kern_return_t = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: 1) {
+            task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+        }
+    }
+    if kerr == KERN_SUCCESS {
+        return Double(info.resident_size) / (1024.0 * 1024.0 * 1024.0)
+    }
+    return 0.0
+}
+#else
+func getProcessResidentMemoryGB() -> Double {
+    return 0.0
+}
+#endif
+
+enum MemoryBudgetMode: String, CaseIterable, Identifiable {
+    case lowMemory8GB = "8 GB (Low RAM)"
+    case balanced16GB = "16 GB (Balanced)"
+    case unrestricted = "Unrestricted (36GB+)"
+
+    var id: String { rawValue }
+
+    var maxResidentExperts: Int {
+        switch self {
+        case .lowMemory8GB: return 512       // Max 512 active resident experts at once (~768 MB)
+        case .balanced16GB: return 2048      // Max 2048 active resident experts (~3.0 GB)
+        case .unrestricted: return 10240     // All 40 layers * 256 experts resident
+        }
+    }
+
+    var targetMaxRssGB: Double {
+        switch self {
+        case .lowMemory8GB: return 8.0
+        case .balanced16GB: return 16.0
+        case .unrestricted: return 36.6
+        }
+    }
+}
+
+struct ExpertSlice {
+    let shardIndex: UInt32
+    let offset: UInt64
+    let length: UInt64
+}
+
+struct ExpertKey: Hashable {
+    let layer: Int
+    let expertId: Int
+}
+
+final class WorkingSetManager {
+    static let shared = WorkingSetManager()
+
+    private(set) var expertSlices: [ExpertKey: [ExpertSlice]] = [:]
+    private(set) var denseSlices: [ExpertSlice] = []
+    private(set) var residentExperts: Set<ExpertKey> = []
+    private var lruList: [ExpertKey] = []
+    private let prefetchQueue = DispatchQueue(label: "com.dynamoe.prefetch", qos: .userInitiated)
+
+    private(set) var totalAccesses: Int = 0
+    private(set) var cacheHits: Int = 0
+    private(set) var cacheMisses: Int = 0
+    private(set) var lastPagingLatencyMs: Double = 0.0
+
+    var totalExpertKeysCount: Int {
+        return expertSlices.count
+    }
+
+    var cacheHitRatePercent: Double {
+        guard totalAccesses > 0 else { return 100.0 }
+        return (Double(cacheHits) / Double(totalAccesses)) * 100.0
+    }
+
+    func initialize(summary: ModelSummary, shardBuffers: [UInt32: MTLBuffer], mode: MemoryBudgetMode) {
+        expertSlices.removeAll()
+        denseSlices.removeAll()
+        residentExperts.removeAll()
+        lruList.removeAll()
+        totalAccesses = 0
+        cacheHits = 0
+        cacheMisses = 0
+        lastPagingLatencyMs = 0.0
+
+        for tensor in summary.tensors {
+            let slice = ExpertSlice(
+                shardIndex: tensor.shardIndex,
+                offset: tensor.offsetStart,
+                length: tensor.offsetEnd - tensor.offsetStart
+            )
+
+            if let l = tensor.layerIndex, let exp = tensor.expertId {
+                let key = ExpertKey(layer: Int(l), expertId: Int(exp))
+                expertSlices[key, default: []].append(slice)
+            } else {
+                denseSlices.append(slice)
+            }
+        }
+
+        // Pin dense backbone immediately (Embeddings, Attn/QKV, RMSNorms, Routers, Shared Experts, LM Head)
+        pinDenseBackbone(shardBuffers: shardBuffers)
+
+        if mode == .unrestricted {
+            preFaultAll(shardBuffers: shardBuffers, summary: summary)
+        }
+    }
+
+    func pinDenseBackbone(shardBuffers: [UInt32: MTLBuffer]) {
+        for slice in denseSlices {
+            if let buf = shardBuffers[slice.shardIndex] {
+                let ptr = buf.contents().advanced(by: Int(slice.offset))
+                madvise(ptr, Int(slice.length), MADV_WILLNEED)
+            }
+        }
+    }
+
+    func preFaultAll(shardBuffers: [UInt32: MTLBuffer], summary: ModelSummary) {
+        for shard in summary.shards {
+            if let buf = shardBuffers[shard.index] {
+                madvise(buf.contents(), Int(shard.length), MADV_WILLNEED)
+            }
+        }
+        for key in expertSlices.keys {
+            residentExperts.insert(key)
+        }
+    }
+
+    func setBudgetMode(mode: MemoryBudgetMode, shardBuffers: [UInt32: MTLBuffer], summary: ModelSummary) {
+        if mode == .unrestricted {
+            preFaultAll(shardBuffers: shardBuffers, summary: summary)
+        } else {
+            let maxAllowed = mode.maxResidentExperts
+            while residentExperts.count > maxAllowed, !lruList.isEmpty {
+                let evictKey = lruList.removeFirst()
+                residentExperts.remove(evictKey)
+                if let slices = expertSlices[evictKey] {
+                    for slice in slices {
+                        if let buf = shardBuffers[slice.shardIndex] {
+                            let ptr = buf.contents().advanced(by: Int(slice.offset))
+                            madvise(ptr, Int(slice.length), MADV_DONTNEED)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func prefetchLayerExperts(layer: Int, expertIds: [Int], shardBuffers: [UInt32: MTLBuffer]) {
+        prefetchQueue.async { [weak self] in
+            guard let self = self else { return }
+            for expId in expertIds {
+                let key = ExpertKey(layer: layer, expertId: expId)
+                if let slices = self.expertSlices[key] {
+                    for slice in slices {
+                        if let buf = shardBuffers[slice.shardIndex] {
+                            let ptr = buf.contents().advanced(by: Int(slice.offset))
+                            posix_madvise(ptr, Int(slice.length), POSIX_MADV_WILLNEED)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func touchAndEvict(layer: Int, activeExpertIds: [Int], mode: MemoryBudgetMode, shardBuffers: [UInt32: MTLBuffer]) {
+        let t0 = CFAbsoluteTimeGetCurrent()
+        var pageFaulted = false
+
+        for expId in activeExpertIds {
+            let key = ExpertKey(layer: layer, expertId: expId)
+            totalAccesses += 1
+
+            if residentExperts.contains(key) {
+                cacheHits += 1
+                if let idx = lruList.firstIndex(of: key) {
+                    lruList.remove(at: idx)
+                }
+                lruList.append(key)
+            } else {
+                cacheMisses += 1
+                pageFaulted = true
+                residentExperts.insert(key)
+                lruList.append(key)
+
+                // Demand page-in from SSD
+                if let slices = expertSlices[key] {
+                    for slice in slices {
+                        if let buf = shardBuffers[slice.shardIndex] {
+                            let ptr = buf.contents().advanced(by: Int(slice.offset))
+                            madvise(ptr, Int(slice.length), MADV_WILLNEED)
+                        }
+                    }
+                }
+            }
+        }
+
+        // If not unrestricted, enforce working set budget eviction
+        if mode != .unrestricted {
+            let maxAllowed = mode.maxResidentExperts
+            while residentExperts.count > maxAllowed, !lruList.isEmpty {
+                let evictKey = lruList.removeFirst()
+                if evictKey.layer == layer && activeExpertIds.contains(evictKey.expertId) {
+                    lruList.append(evictKey)
+                    break
+                }
+                residentExperts.remove(evictKey)
+                if let slices = expertSlices[evictKey] {
+                    for slice in slices {
+                        if let buf = shardBuffers[slice.shardIndex] {
+                            let ptr = buf.contents().advanced(by: Int(slice.offset))
+                            madvise(ptr, Int(slice.length), MADV_DONTNEED)
+                        }
+                    }
+                }
+            }
+        }
+
+        if pageFaulted {
+            lastPagingLatencyMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+        }
+    }
+
+    func flushAllExperts(shardBuffers: [UInt32: MTLBuffer]) {
+        for key in residentExperts {
+            if let slices = expertSlices[key] {
+                for slice in slices {
+                    if let buf = shardBuffers[slice.shardIndex] {
+                        let ptr = buf.contents().advanced(by: Int(slice.offset))
+                        madvise(ptr, Int(slice.length), MADV_DONTNEED)
+                    }
+                }
+            }
+        }
+        residentExperts.removeAll()
+        lruList.removeAll()
+        cacheHits = 0
+        cacheMisses = 0
+        totalAccesses = 0
+        lastPagingLatencyMs = 0.0
+    }
+}
+
 extension TensorMetadata: Identifiable {
     public var id: String { name }
 }
@@ -157,6 +405,15 @@ struct ContentView: View {
     @State private var generationElapsedMs: Double = 0.0
     @State private var generationStatusText: String? = nil
     @State private var generationTask: Task<Void, Never>? = nil
+
+    // Working Set & Dynamic SSD Expert Paging State
+    @State private var memoryBudgetMode: MemoryBudgetMode = .balanced16GB
+    @State private var currentRssGB: Double = 0.0
+    @State private var residentExpertCount: Int = 0
+    @State private var totalExpertCount: Int = 0
+    @State private var cacheHitRate: Double = 100.0
+    @State private var lastPagingLatencyMs: Double = 0.0
+    @State private var pagingStatusMessage: String? = nil
 
     let categoryFilters = ["All", "Self-Attention", "MoE Router", "Routed Expert", "Shared Expert", "Embedding", "LM Head"]
 
@@ -820,6 +1077,152 @@ struct ContentView: View {
                     RoundedRectangle(cornerRadius: 8)
                         .stroke(Color.purple.opacity(0.2), lineWidth: 1)
                 )
+
+                // MARK: - Dynamic SSD Expert Paging & Working Set Controller Card
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Label("Dynamic SSD Expert Paging & Memory Controller", systemImage: "memorychip")
+                            .font(.headline)
+                            .foregroundColor(.indigo)
+
+                        Spacer()
+
+                        if let msg = pagingStatusMessage {
+                            Text(msg)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+
+                    // Memory Budget Mode Selector & Real-Time RAM Gauge
+                    HStack(spacing: 16) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Working-Set Memory Budget:")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+
+                            Picker("Working-Set Budget", selection: $memoryBudgetMode) {
+                                ForEach(MemoryBudgetMode.allCases) { mode in
+                                    Text(mode.rawValue).tag(mode)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            .frame(width: 340)
+                            .onChange(of: memoryBudgetMode) { newMode in
+                                applyMemoryBudget(newMode)
+                            }
+                        }
+
+                        Spacer()
+
+                        // Action Buttons
+                        HStack(spacing: 8) {
+                            Button(action: flushExpertCache) {
+                                Label("Flush Cache", systemImage: "trash.circle")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .help("Release all resident expert pages using madvise(MADV_DONTNEED) to minimize RAM to baseline")
+
+                            Button(action: preFaultAllWeights) {
+                                Label("Pre-Fault All", systemImage: "bolt.fill")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .help("Pre-fault all model shards into RAM for maximum raw throughput on high-RAM Macs")
+                        }
+                    }
+
+                    // Real-Time Memory & Paging Telemetry Grid
+                    HStack(spacing: 12) {
+                        // Physical RSS
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("PHYSICAL RSS")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundColor(.secondary)
+                            HStack(alignment: .bottom, spacing: 4) {
+                                Text(String(format: "%.2f", currentRssGB))
+                                    .font(.system(.title3, design: .monospaced))
+                                    .fontWeight(.bold)
+                                    .foregroundColor(currentRssGB > memoryBudgetMode.targetMaxRssGB ? .orange : .indigo)
+                                Text("GB / \(String(format: "%.0f", memoryBudgetMode.targetMaxRssGB)) GB")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(NSColor.controlBackgroundColor))
+                        .cornerRadius(6)
+
+                        // Resident Experts
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("RESIDENT EXPERTS")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundColor(.secondary)
+                            HStack(alignment: .bottom, spacing: 4) {
+                                Text("\(residentExpertCount)")
+                                    .font(.system(.title3, design: .monospaced))
+                                    .fontWeight(.bold)
+                                    .foregroundColor(.purple)
+                                Text("/ \(totalExpertCount > 0 ? "\(totalExpertCount)" : "10,240")")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(NSColor.controlBackgroundColor))
+                        .cornerRadius(6)
+
+                        // Cache Hit Rate
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("PREFETCH HIT RATE")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundColor(.secondary)
+                            HStack(alignment: .bottom, spacing: 4) {
+                                Text(String(format: "%.1f%%", cacheHitRate))
+                                    .font(.system(.title3, design: .monospaced))
+                                    .fontWeight(.bold)
+                                    .foregroundColor(cacheHitRate >= 80.0 ? .green : (cacheHitRate >= 50.0 ? .yellow : .orange))
+                                Text("(\(WorkingSetManager.shared.totalAccesses) reqs)")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(NSColor.controlBackgroundColor))
+                        .cornerRadius(6)
+
+                        // SSD Paging Latency
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("PAGING OVERHEAD")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundColor(.secondary)
+                            HStack(alignment: .bottom, spacing: 4) {
+                                Text(String(format: "%.2f", lastPagingLatencyMs))
+                                    .font(.system(.title3, design: .monospaced))
+                                    .fontWeight(.bold)
+                                    .foregroundColor(lastPagingLatencyMs < 2.0 ? .green : .blue)
+                                Text("ms/layer")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(NSColor.controlBackgroundColor))
+                        .cornerRadius(6)
+                    }
+                }
+                .padding(10)
+                .background(Color.indigo.opacity(0.06))
+                .cornerRadius(8)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.indigo.opacity(0.2), lineWidth: 1)
+                )
             }
             .padding(10)
             .background(Color(NSColor.controlBackgroundColor))
@@ -925,6 +1328,15 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 900, minHeight: 650)
+        .onAppear {
+            updatePagingStats()
+        }
+        .task {
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                updatePagingStats()
+            }
+        }
     }
     
     // MARK: - Tokenizer Execution
@@ -2123,6 +2535,15 @@ struct ContentView: View {
                     activeExperts = (0..<8).map { (id: $0, weight: 1.0 / 8.0) }
                 }
 
+                // Demand Paging & Working Set LRU Eviction for Active Experts
+                let activeIds = activeExperts.map { $0.id }
+                WorkingSetManager.shared.touchAndEvict(layer: l, activeExpertIds: activeIds, mode: memoryBudgetMode, shardBuffers: shardBuffers)
+
+                // Async Lookahead Prefetching for layer l + 1
+                if l + 1 < actualLayers {
+                    WorkingSetManager.shared.prefetchLayerExperts(layer: l + 1, expertIds: [0, 1, 2, 3, 4, 5, 6, 7], shardBuffers: shardBuffers)
+                }
+
                 for expert in activeExperts {
                     let expId = expert.id
                     var p_k = expert.weight
@@ -2316,6 +2737,7 @@ struct ContentView: View {
             let status = "🚀 Full \(actualLayers)-Layer Backbone Executed in \(String(format: "%.2f", totalElapsedMs)) ms! (Avg \(String(format: "%.3f", avgMsPerLayer)) ms/layer | \(String(format: "%.0f", layersPerSec)) layers/sec) | Final h_\(actualLayers) L2 Norm: \(String(format: "%.4f", finalL2Norm))"
             self.multiLayerStatusText = status
             self.gpuComputeOutput = "\(status)\nFirst 8 dims of h_\(actualLayers): [\(finalSamples.joined(separator: ", "))]"
+            updatePagingStats()
 
         } catch {
             gpuComputeOutput = "❌ Multi-Layer Forward Error: \(error.localizedDescription)"
@@ -2884,6 +3306,7 @@ struct ContentView: View {
         let repPen = self.repetitionPenalty
         let maxTokens = self.maxNewTokens
         let buffers = self.shardBuffers
+        let budgetMode = self.memoryBudgetMode
 
         isGeneratingText = true
         generatedStreamText = ""
@@ -2929,7 +3352,13 @@ struct ContentView: View {
                 var nextH = hNextBuffer
 
                 for l in 0..<actualLayers {
+                    if Task.isCancelled { break }
                     let layer = cachedLayers[l]
+
+                    // Async Lookahead Prefetching for layer l + 1
+                    if l + 1 < actualLayers {
+                        WorkingSetManager.shared.prefetchLayerExperts(layer: l + 1, expertIds: [0, 1, 2, 3, 4, 5, 6, 7], shardBuffers: buffers)
+                    }
 
                     // Dynamic MoE Router Top-K Shader Dispatch
                     var activeExperts: [(id: Int, weight: Float)] = []
@@ -2962,6 +3391,10 @@ struct ContentView: View {
                     } else {
                         activeExperts = (0..<8).map { (id: $0, weight: 1.0 / 8.0) }
                     }
+
+                    // Demand Paging & Working Set LRU Eviction for Active Experts
+                    let activeIds = activeExperts.map { $0.id }
+                    WorkingSetManager.shared.touchAndEvict(layer: l, activeExpertIds: activeIds, mode: budgetMode, shardBuffers: buffers)
 
                     guard let layerCmd = commandQueue.makeCommandBuffer(),
                           let layerEnc = layerCmd.makeComputeCommandEncoder() else { break }
@@ -3265,6 +3698,11 @@ struct ContentView: View {
                 let elapsedSec = CFAbsoluteTimeGetCurrent() - startTime
                 let tokPerSec = Double(tokensGenerated) / max(elapsedSec, 0.001)
                 let elapsedMs = elapsedSec * 1000.0
+                let currentRss = getProcessResidentMemoryGB()
+                let resCount = WorkingSetManager.shared.residentExperts.count
+                let totalExp = WorkingSetManager.shared.totalExpertKeysCount
+                let hitRate = WorkingSetManager.shared.cacheHitRatePercent
+                let pageLat = WorkingSetManager.shared.lastPagingLatencyMs
 
                 await MainActor.run {
                     self.generatedStreamText += decoded
@@ -3272,19 +3710,60 @@ struct ContentView: View {
                     self.generationElapsedMs = elapsedMs
                     self.generationSpeedTokPerSec = tokPerSec
                     self.generationStatusText = "⚡ Streaming: \(tokensGenerated) tokens | \(String(format: "%.1f", tokPerSec)) tok/s"
+                    self.currentRssGB = currentRss
+                    self.residentExpertCount = resCount
+                    self.totalExpertCount = totalExp
+                    self.cacheHitRate = hitRate
+                    self.lastPagingLatencyMs = pageLat
                 }
             }
 
             let finalElapsedSec = CFAbsoluteTimeGetCurrent() - startTime
             let finalTokPerSec = Double(tokensGenerated) / max(finalElapsedSec, 0.001)
             let finalElapsedMs = finalElapsedSec * 1000.0
+            let finalRss = getProcessResidentMemoryGB()
+            let finalResCount = WorkingSetManager.shared.residentExperts.count
+            let finalHitRate = WorkingSetManager.shared.cacheHitRatePercent
+            let finalPageLat = WorkingSetManager.shared.lastPagingLatencyMs
 
             await MainActor.run {
                 self.isGeneratingText = false
                 self.generationTask = nil
                 self.generationStatusText = "✨ Generated \(tokensGenerated) tokens in \(String(format: "%.2f", finalElapsedMs)) ms (\(String(format: "%.1f", finalTokPerSec)) tok/s)"
+                self.currentRssGB = finalRss
+                self.residentExpertCount = finalResCount
+                self.cacheHitRate = finalHitRate
+                self.lastPagingLatencyMs = finalPageLat
             }
         }
+    }
+
+    private func updatePagingStats() {
+        self.currentRssGB = getProcessResidentMemoryGB()
+        self.residentExpertCount = WorkingSetManager.shared.residentExperts.count
+        self.totalExpertCount = WorkingSetManager.shared.totalExpertKeysCount
+        self.cacheHitRate = WorkingSetManager.shared.cacheHitRatePercent
+        self.lastPagingLatencyMs = WorkingSetManager.shared.lastPagingLatencyMs
+    }
+
+    private func applyMemoryBudget(_ mode: MemoryBudgetMode) {
+        guard let summary = summary else { return }
+        WorkingSetManager.shared.setBudgetMode(mode: mode, shardBuffers: shardBuffers, summary: summary)
+        updatePagingStats()
+        pagingStatusMessage = "⚡ Budget updated: \(mode.rawValue)"
+    }
+
+    private func flushExpertCache() {
+        WorkingSetManager.shared.flushAllExperts(shardBuffers: shardBuffers)
+        updatePagingStats()
+        pagingStatusMessage = "🧹 Expert cache flushed (MADV_DONTNEED)"
+    }
+
+    private func preFaultAllWeights() {
+        guard let summary = summary else { return }
+        WorkingSetManager.shared.preFaultAll(shardBuffers: shardBuffers, summary: summary)
+        updatePagingStats()
+        pagingStatusMessage = "🚀 All weights pre-faulted into RAM"
     }
 
     private func loadAndBridgeToMetal(filePath: String) {
@@ -3309,7 +3788,6 @@ struct ContentView: View {
                 if let buffer = device.makeBuffer(bytesNoCopy: pointer, length: length, options: .storageModeShared, deallocator: nil) {
                     buffers[shard.index] = buffer
                     mappedGB += Double(length) / (1024.0 * 1024.0 * 1024.0)
-                    madvise(pointer, length, MADV_WILLNEED)
                 }
             }
             
@@ -3319,6 +3797,9 @@ struct ContentView: View {
             self.errorMessage = nil
             self.selectedTensorID = nil
             self.gpuComputeOutput = nil
+            
+            WorkingSetManager.shared.initialize(summary: loadedSummary, shardBuffers: buffers, mode: self.memoryBudgetMode)
+            updatePagingStats()
             
             metalStatus = "✅ Zero-Copy Active! \(loadedSummary.shards.count) Shards Mapped (\(String(format: "%.2f", mappedGB)) GB)"
             
