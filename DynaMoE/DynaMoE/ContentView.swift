@@ -59,83 +59,6 @@ struct TokenPrediction: Identifiable {
     let probability: Float
 }
 
-struct CachedLayer {
-    let layerIndex: UInt32
-    let isFullAttention: Bool
-    let fullAttnIndex: Int
-    let linAttnIndex: Int
-    
-    // Dense Backbone & Norms
-    let norm1Tensor: TensorMetadata?
-    let norm2Tensor: TensorMetadata?
-    let routerTensor: TensorMetadata?
-    let routerScale: TensorMetadata?
-    let routerBias: TensorMetadata?
-    let sharedGateTensor: TensorMetadata?
-    let sharedGateTensorScale: TensorMetadata?
-    let sharedGateTensorBias: TensorMetadata?
-    
-    // Full Attention Tensors (Periodic: layers 3, 7, 11, 15, 19, 23, 27, 31, 35, 39)
-    let qProjTensor: TensorMetadata?
-    let qScaleTensor: TensorMetadata?
-    let qBiasTensor: TensorMetadata?
-    let kProjTensor: TensorMetadata?
-    let kScaleTensor: TensorMetadata?
-    let kBiasTensor: TensorMetadata?
-    let vProjTensor: TensorMetadata?
-    let vScaleTensor: TensorMetadata?
-    let vBiasTensor: TensorMetadata?
-    let qNormTensor: TensorMetadata?
-    let kNormTensor: TensorMetadata?
-    let oProjTensor: TensorMetadata?
-    let oScaleTensor: TensorMetadata?
-    let oBiasTensor: TensorMetadata?
-
-    // Linear Attention Tensors (Layers 0, 1, 2, 4, 5, 6, ...)
-    let inProjQKV: TensorMetadata?
-    let inProjQKVScale: TensorMetadata?
-    let inProjQKVBias: TensorMetadata?
-    let conv1dTensor: TensorMetadata?
-    let inProjZ: TensorMetadata?
-    let inProjZScale: TensorMetadata?
-    let inProjZBias: TensorMetadata?
-    let inProjA: TensorMetadata?
-    let inProjAScale: TensorMetadata?
-    let inProjABias: TensorMetadata?
-    let inProjB: TensorMetadata?
-    let inProjBScale: TensorMetadata?
-    let inProjBBias: TensorMetadata?
-    let aLogTensor: TensorMetadata?
-    let dtBiasTensor: TensorMetadata?
-    let linearNormTensor: TensorMetadata?
-    let linearOutProjTensor: TensorMetadata?
-    let linearOutProjScale: TensorMetadata?
-    let linearOutProjBias: TensorMetadata?
-
-    // Shared Expert
-    let sharedGateWeight: TensorMetadata?
-    let sharedUpWeight: TensorMetadata?
-    let sharedDownWeight: TensorMetadata?
-    let sharedGateScale: TensorMetadata?
-    let sharedUpScale: TensorMetadata?
-    let sharedDownScale: TensorMetadata?
-    let sharedGateBias: TensorMetadata?
-    let sharedUpBias: TensorMetadata?
-    let sharedDownBias: TensorMetadata?
-    
-    // Routed MoE Experts
-    let expertGateWeights: [Int: TensorMetadata]
-    let expertUpWeights: [Int: TensorMetadata]
-    let expertDownWeights: [Int: TensorMetadata]
-    let expertGateScales: [Int: TensorMetadata]
-    let expertUpScales: [Int: TensorMetadata]
-    let expertDownScales: [Int: TensorMetadata]
-    let expertGateBiases: [Int: TensorMetadata]
-    let expertUpBiases: [Int: TensorMetadata]
-    let expertDownBiases: [Int: TensorMetadata]
-    let intermediateDim: UInt32
-}
-
 final class KVCacheManager {
     static let shared = KVCacheManager()
     
@@ -192,9 +115,9 @@ func getProcessResidentMemoryGB() -> Double {
 #endif
 
 enum MemoryBudgetMode: String, CaseIterable, Identifiable {
-    case lowMemory8GB = "8 GB (Low RAM)"
-    case balanced16GB = "16 GB (Balanced)"
-    case unrestricted = "Unrestricted (36GB+)"
+    case lowMemory8GB = "8 GB"
+    case balanced16GB = "16 GB"
+    case unrestricted = "Unrestricted"
 
     var id: String { rawValue }
 
@@ -498,7 +421,10 @@ struct ContentView: View {
     @State private var generationTask: Task<Void, Never>? = nil
 
     // Working Set & Dynamic SSD Expert Paging State
+    @State private var memoryExecutionMode: MemoryExecutionMode = .autoDetect
     @State private var memoryBudgetMode: MemoryBudgetMode = .balanced16GB
+    @State private var modelConfig: ModelConfig? = nil
+    @State private var detectedArchitecture: ModelArchitectureType = .hybridSsmMoe
     @State private var currentRssGB: Double = 0.0
     @State private var residentExpertCount: Int = 0
     @State private var totalExpertCount: Int = 0
@@ -531,18 +457,34 @@ struct ContentView: View {
                         .fontWeight(.bold)
                     
                     if let summary = summary {
-                        HStack(spacing: 12) {
-                            Text(metalStatus)
-                                .foregroundColor(metalStatus.contains("✅") ? .green : .secondary)
+                        HStack(spacing: 10) {
+                            HStack(spacing: 5) {
+                                Image(systemName: detectedArchitecture.icon)
+                                    .foregroundColor(.purple)
+                                Text(detectedArchitecture.shortName)
+                                    .fontWeight(.bold)
+                            }
+                            .font(.caption)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Color.purple.opacity(0.12))
+                            .cornerRadius(6)
+
                             Text("•")
+                                .foregroundColor(.secondary)
                             Text("\(summary.layerCount) Layers")
                                 .fontWeight(.semibold)
                             if summary.maxExpertId > 0 {
                                 Text("•")
-                                Text("\(summary.maxExpertId) Routed Experts/Layer")
+                                    .foregroundColor(.secondary)
+                                Text("\(summary.maxExpertId) Experts/Layer")
                                     .foregroundColor(.purple)
                                     .fontWeight(.semibold)
                             }
+                            Text("•")
+                                .foregroundColor(.secondary)
+                            Text(metalStatus)
+                                .foregroundColor(metalStatus.contains("✅") ? .green : .secondary)
                         }
                         .font(.subheadline)
                     } else {
@@ -1100,100 +1042,7 @@ struct ContentView: View {
 
                     // Live Streaming Output Window
                     if !generatedStreamText.isEmpty || isGeneratingText {
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack {
-                                Label("Stream Output", systemImage: "text.bubble.fill")
-                                    .font(.caption)
-                                    .fontWeight(.semibold)
-                                    .foregroundColor(.purple)
-
-                                Spacer()
-
-                                if generationTotalTokens > 0 {
-                                    HStack(spacing: 10) {
-                                        Text("⚡ \(String(format: "%.1f", generationSpeedTokPerSec)) tok/s")
-                                            .font(.system(.caption2, design: .monospaced))
-                                            .fontWeight(.bold)
-                                            .foregroundColor(.green)
-
-                                        Text("\(generationTotalTokens) tokens")
-                                            .font(.system(.caption2, design: .monospaced))
-                                            .foregroundColor(.secondary)
-
-                                        Text("\(String(format: "%.0f", generationElapsedMs)) ms")
-                                            .font(.system(.caption2, design: .monospaced))
-                                            .foregroundColor(.secondary)
-                                    }
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(Color.purple.opacity(0.1))
-                                    .cornerRadius(4)
-                                }
-                            }
-
-                            ScrollView {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    // Collapsible Reasoning Process Block
-                                    if !thinkingText.isEmpty {
-                                        DisclosureGroup(
-                                            isExpanded: $isThinkingExpanded,
-                                            content: {
-                                                Text(thinkingText)
-                                                    .font(.system(.caption, design: .monospaced))
-                                                    .foregroundColor(.secondary)
-                                                    .textSelection(.enabled)
-                                                    .padding(8)
-                                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                                    .background(Color.secondary.opacity(0.08))
-                                                    .cornerRadius(6)
-                                            },
-                                            label: {
-                                                HStack(spacing: 6) {
-                                                    Image(systemName: isThinking ? "brain.head.profile" : "brain")
-                                                        .foregroundColor(.purple)
-                                                    Text(isThinking ? "Reasoning in progress..." : "Thought Process")
-                                                        .font(.caption)
-                                                        .fontWeight(.medium)
-                                                        .foregroundColor(.purple)
-                                                    if isThinking {
-                                                        ProgressView()
-                                                            .scaleEffect(0.5)
-                                                    }
-                                                }
-                                            }
-                                        )
-                                    }
-
-                                    // Main Text Response
-                                    if !responseText.isEmpty || (!isThinking && !generatedStreamText.isEmpty) || isGeneratingText {
-                                        HStack(alignment: .top, spacing: 0) {
-                                            let displayText = !responseText.isEmpty ? responseText : (thinkingText.isEmpty ? generatedStreamText : "")
-                                            Text(displayText)
-                                                .font(.system(.body, design: .default))
-                                                .textSelection(.enabled)
-
-                                            if isGeneratingText && !isThinking {
-                                                Text("▊")
-                                                    .foregroundColor(.purple)
-                                                    .opacity(0.8)
-                                            }
-                                        }
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                    }
-                                }
-                                .padding(10)
-                            }
-                            .frame(minHeight: 100, maxHeight: 300)
-                            .background(Color(NSColor.textBackgroundColor))
-                            .cornerRadius(6)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 6)
-                                    .stroke(Color.purple.opacity(0.3), lineWidth: 1)
-                            )
-                        }
-                        .padding(8)
-                        .background(Color.purple.opacity(0.04))
-                        .cornerRadius(8)
+                        reasoningAndResponseSection
                     }
                 }
                 .padding(10)
@@ -1205,150 +1054,7 @@ struct ContentView: View {
                 )
 
                 // MARK: - Dynamic SSD Expert Paging & Working Set Controller Card
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Label("Dynamic SSD Expert Paging & Memory Controller", systemImage: "memorychip")
-                            .font(.headline)
-                            .foregroundColor(.indigo)
-
-                        Spacer()
-
-                        if let msg = pagingStatusMessage {
-                            Text(msg)
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-
-                    // Memory Budget Mode Selector & Real-Time RAM Gauge
-                    HStack(spacing: 16) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("Working-Set Memory Budget:")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-
-                            Picker("Working-Set Budget", selection: $memoryBudgetMode) {
-                                ForEach(MemoryBudgetMode.allCases) { mode in
-                                    Text(mode.rawValue).tag(mode)
-                                }
-                            }
-                            .pickerStyle(.segmented)
-                            .frame(width: 340)
-                            .onChange(of: memoryBudgetMode) { newMode in
-                                applyMemoryBudget(newMode)
-                            }
-                        }
-
-                        Spacer()
-
-                        // Action Buttons
-                        HStack(spacing: 8) {
-                            Button(action: flushExpertCache) {
-                                Label("Flush Cache", systemImage: "trash.circle")
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .help("Release all resident expert pages using madvise(MADV_DONTNEED) to minimize RAM to baseline")
-
-                            Button(action: preFaultAllWeights) {
-                                Label("Pre-Fault All", systemImage: "bolt.fill")
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                            .help("Pre-fault all model shards into RAM for maximum raw throughput on high-RAM Macs")
-                        }
-                    }
-
-                    // Real-Time Memory & Paging Telemetry Grid
-                    HStack(spacing: 12) {
-                        // Physical RSS
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("PHYSICAL RSS")
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundColor(.secondary)
-                            HStack(alignment: .bottom, spacing: 4) {
-                                Text(String(format: "%.2f", currentRssGB))
-                                    .font(.system(.title3, design: .monospaced))
-                                    .fontWeight(.bold)
-                                    .foregroundColor(currentRssGB > memoryBudgetMode.targetMaxRssGB ? .orange : .indigo)
-                                Text("GB / \(String(format: "%.0f", memoryBudgetMode.targetMaxRssGB)) GB")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                            }
-                        }
-                        .padding(8)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color(NSColor.controlBackgroundColor))
-                        .cornerRadius(6)
-
-                        // Resident Experts
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("RESIDENT EXPERTS")
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundColor(.secondary)
-                            HStack(alignment: .bottom, spacing: 4) {
-                                Text("\(residentExpertCount)")
-                                    .font(.system(.title3, design: .monospaced))
-                                    .fontWeight(.bold)
-                                    .foregroundColor(.purple)
-                                Text("/ \(totalExpertCount > 0 ? "\(totalExpertCount)" : "10,240")")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                            }
-                        }
-                        .padding(8)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color(NSColor.controlBackgroundColor))
-                        .cornerRadius(6)
-
-                        // Cache Hit Rate
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("PREFETCH HIT RATE")
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundColor(.secondary)
-                            HStack(alignment: .bottom, spacing: 4) {
-                                Text(String(format: "%.1f%%", cacheHitRate))
-                                    .font(.system(.title3, design: .monospaced))
-                                    .fontWeight(.bold)
-                                    .foregroundColor(cacheHitRate >= 80.0 ? .green : (cacheHitRate >= 50.0 ? .yellow : .orange))
-                                Text("(\(WorkingSetManager.shared.totalAccesses) reqs)")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                            }
-                        }
-                        .padding(8)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color(NSColor.controlBackgroundColor))
-                        .cornerRadius(6)
-
-                        // SSD Paging Latency
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("PAGING OVERHEAD")
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundColor(.secondary)
-                            HStack(alignment: .bottom, spacing: 4) {
-                                Text(String(format: "%.2f", lastPagingLatencyMs))
-                                    .font(.system(.title3, design: .monospaced))
-                                    .fontWeight(.bold)
-                                    .foregroundColor(lastPagingLatencyMs < 2.0 ? .green : .blue)
-                                Text("ms/layer")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                            }
-                        }
-                        .padding(8)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color(NSColor.controlBackgroundColor))
-                        .cornerRadius(6)
-                    }
-                }
-                .padding(10)
-                .background(Color.indigo.opacity(0.06))
-                .cornerRadius(8)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(Color.indigo.opacity(0.2), lineWidth: 1)
-                )
+                memoryControllerCard
             }
             .padding(10)
             .background(Color(NSColor.controlBackgroundColor))
@@ -1465,6 +1171,297 @@ struct ContentView: View {
         }
     }
     
+    // MARK: - Modular UI Subcomponents
+    private var shouldShowBudgetPicker: Bool {
+        if memoryExecutionMode == .dynamicStreaming { return true }
+        if memoryExecutionMode == .autoDetect {
+            let footprint = self.summary?.sizeGb ?? 18.0
+            return memoryExecutionMode.resolveEffectiveMode(modelFootprintGB: footprint) == .dynamicStreaming
+        }
+        return false
+    }
+
+    @ViewBuilder
+    private var reasoningAndResponseSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Label("Stream Output", systemImage: "text.bubble.fill")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundColor(.purple)
+
+                Spacer()
+
+                if generationTotalTokens > 0 {
+                    HStack(spacing: 10) {
+                        Text("⚡ \(String(format: "%.1f", generationSpeedTokPerSec)) tok/s")
+                            .font(.system(.caption2, design: .monospaced))
+                            .fontWeight(.bold)
+                            .foregroundColor(.green)
+
+                        Text("\(generationTotalTokens) tokens")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundColor(.secondary)
+
+                        Text("\(String(format: "%.0f", generationElapsedMs)) ms")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.purple.opacity(0.1))
+                    .cornerRadius(4)
+                }
+            }
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    // Collapsible Reasoning Process Block
+                    if !thinkingText.isEmpty {
+                        DisclosureGroup(
+                            isExpanded: $isThinkingExpanded,
+                            content: {
+                                Text(thinkingText)
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                                    .textSelection(.enabled)
+                                    .padding(8)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(Color.secondary.opacity(0.08))
+                                    .cornerRadius(6)
+                            },
+                            label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: isThinking ? "brain.head.profile" : "brain")
+                                        .foregroundColor(.purple)
+                                    Text(isThinking ? "Reasoning in progress..." : "Thought Process")
+                                        .font(.caption)
+                                        .fontWeight(.medium)
+                                        .foregroundColor(.purple)
+                                    if isThinking {
+                                        ProgressView()
+                                            .scaleEffect(0.5)
+                                    }
+                                }
+                            }
+                        )
+                    }
+
+                    // Main Text Response
+                    if !responseText.isEmpty || (!isThinking && !generatedStreamText.isEmpty) || isGeneratingText {
+                        HStack(alignment: .top, spacing: 0) {
+                            let displayText = !responseText.isEmpty ? responseText : (thinkingText.isEmpty ? generatedStreamText : "")
+                            Text(displayText)
+                                .font(.system(.body, design: .default))
+                                .textSelection(.enabled)
+
+                            if isGeneratingText && !isThinking {
+                                Text("▊")
+                                    .foregroundColor(.purple)
+                                    .opacity(0.8)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .padding(10)
+            }
+            .frame(minHeight: 100, maxHeight: 300)
+            .background(Color(NSColor.textBackgroundColor))
+            .cornerRadius(6)
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .stroke(Color.purple.opacity(0.3), lineWidth: 1)
+            )
+        }
+        .padding(8)
+        .background(Color.purple.opacity(0.04))
+        .cornerRadius(8)
+    }
+
+    @ViewBuilder
+    private var memoryControllerCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // Header: Title, Status Message & Action Buttons
+            HStack(spacing: 12) {
+                Label("Dynamic SSD Expert Paging & Memory Controller", systemImage: "memorychip")
+                    .font(.headline)
+                    .foregroundColor(.indigo)
+
+                Spacer()
+
+                if let msg = pagingStatusMessage {
+                    Text(msg)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                HStack(spacing: 8) {
+                    Button(action: flushExpertCache) {
+                        Label("Flush Cache", systemImage: "trash")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Release all resident expert pages using madvise(MADV_DONTNEED) to minimize RAM to baseline")
+
+                    Button(action: preFaultAllWeights) {
+                        Label("Pre-Fault All", systemImage: "bolt.fill")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Pre-fault all model shards into RAM for maximum raw throughput on high-RAM Macs")
+                }
+            }
+
+            // Controls Section: Execution Mode & Budget (if applicable)
+            HStack(alignment: .top, spacing: 20) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Execution Mode")
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.secondary)
+
+                    Picker("Memory Mode", selection: $memoryExecutionMode) {
+                        ForEach(MemoryExecutionMode.allCases) { mode in
+                            Text(mode.rawValue).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 320)
+                    .onChange(of: memoryExecutionMode) { newMode in
+                        applyMemoryExecutionMode(newMode)
+                    }
+                }
+
+                if shouldShowBudgetPicker {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Working-Set Budget")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                            .foregroundColor(.secondary)
+
+                        Picker("Budget", selection: $memoryBudgetMode) {
+                            ForEach(MemoryBudgetMode.allCases) { mode in
+                                Text(mode.rawValue).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: 240)
+                        .onChange(of: memoryBudgetMode) { newMode in
+                            applyMemoryBudget(newMode)
+                        }
+                    }
+                }
+
+                Spacer()
+            }
+
+            // Mode Description Callout
+            HStack(alignment: .center, spacing: 6) {
+                Image(systemName: memoryExecutionMode.icon)
+                    .font(.caption)
+                    .foregroundColor(.indigo)
+                Text(memoryExecutionMode.description)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.indigo.opacity(0.05))
+            .cornerRadius(4)
+
+            // Real-Time Memory & Paging Telemetry Grid
+            HStack(spacing: 12) {
+                // Physical RSS
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("PHYSICAL RSS")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(.secondary)
+                    HStack(alignment: .bottom, spacing: 4) {
+                        Text(String(format: "%.2f", currentRssGB))
+                            .font(.system(.title3, design: .monospaced))
+                            .fontWeight(.bold)
+                            .foregroundColor(currentRssGB > memoryBudgetMode.targetMaxRssGB ? .orange : .indigo)
+                        Text("GB / \(String(format: "%.0f", memoryBudgetMode.targetMaxRssGB)) GB")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(NSColor.controlBackgroundColor))
+                .cornerRadius(6)
+
+                // Resident Experts
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("RESIDENT EXPERTS")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(.secondary)
+                    HStack(alignment: .bottom, spacing: 4) {
+                        Text("\(residentExpertCount)")
+                            .font(.system(.title3, design: .monospaced))
+                            .fontWeight(.bold)
+                            .foregroundColor(.purple)
+                        Text("/ \(totalExpertCount > 0 ? "\(totalExpertCount)" : "10,240")")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(NSColor.controlBackgroundColor))
+                .cornerRadius(6)
+
+                // Cache Hit Rate
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("PREFETCH HIT RATE")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(.secondary)
+                    HStack(alignment: .bottom, spacing: 4) {
+                        Text(String(format: "%.1f%%", cacheHitRate))
+                            .font(.system(.title3, design: .monospaced))
+                            .fontWeight(.bold)
+                            .foregroundColor(cacheHitRate >= 80.0 ? .green : (cacheHitRate >= 50.0 ? .yellow : .orange))
+                        Text("(\(WorkingSetManager.shared.totalAccesses) reqs)")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(NSColor.controlBackgroundColor))
+                .cornerRadius(6)
+
+                // SSD Paging Latency
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("PAGING OVERHEAD")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(.secondary)
+                    HStack(alignment: .bottom, spacing: 4) {
+                        Text(String(format: "%.2f", lastPagingLatencyMs))
+                            .font(.system(.title3, design: .monospaced))
+                            .fontWeight(.bold)
+                            .foregroundColor(lastPagingLatencyMs < 2.0 ? .green : .blue)
+                        Text("ms/layer")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(NSColor.controlBackgroundColor))
+                .cornerRadius(6)
+            }
+        }
+        .padding(10)
+        .background(Color.indigo.opacity(0.06))
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.indigo.opacity(0.2), lineWidth: 1)
+        )
+    }
+
     // MARK: - Tokenizer Execution
     private func loadTokenizer(filePath: String) {
         do {
@@ -3054,210 +3051,7 @@ struct ContentView: View {
     // MARK: - Autoregressive Generation & Sampling Engine
 
     private func buildCachedLayers(summary: ModelSummary) -> [CachedLayer] {
-        var tensorsByLayer: [UInt32: [TensorMetadata]] = [:]
-        for t in summary.tensors {
-            // Ignore auxiliary multi-token prediction and vision tensors
-            if t.name.hasPrefix("mtp.") || t.name.hasPrefix("visual.") { continue }
-            if let l = t.layerIndex {
-                tensorsByLayer[l, default: []].append(t)
-            }
-        }
-
-        var cached: [CachedLayer] = []
-        let numLayers = min(targetLayerCount, Int(summary.layerCount > 0 ? summary.layerCount : 40))
-
-        var fullCount = 0
-        var linCount = 0
-
-        for l in 0..<numLayers {
-            let layerTensors = tensorsByLayer[UInt32(l)] ?? []
-
-            let isFull = (l % 4 == 3)
-            let fullIdx = isFull ? fullCount : 0
-            let linIdx = isFull ? 0 : linCount
-            if isFull { fullCount += 1 } else { linCount += 1 }
-
-            let router = layerTensors.first(where: { ($0.category == "MoE Router" || ($0.name.contains("mlp.gate") && !$0.name.contains("switch_mlp") && !$0.name.contains("proj") && !$0.name.contains("shared"))) && !$0.name.contains("scale") && !$0.name.contains("bias") })
-            let routerScale = layerTensors.first(where: { ($0.category == "MoE Router" || ($0.name.contains("mlp.gate") && !$0.name.contains("switch_mlp") && !$0.name.contains("proj") && !$0.name.contains("shared"))) && ($0.name.contains("scale") || $0.name.contains("scales")) })
-            let routerBias = layerTensors.first(where: { ($0.category == "MoE Router" || ($0.name.contains("mlp.gate") && !$0.name.contains("switch_mlp") && !$0.name.contains("proj") && !$0.name.contains("shared"))) && ($0.name.contains("bias") || $0.name.contains("biases")) })
-
-            let sharedGate = layerTensors.first(where: { ($0.category == "Shared Expert Gate" || $0.name.contains("shared_expert_gate")) && !$0.name.contains("scale") && !$0.name.contains("bias") })
-            let sharedGateScale = layerTensors.first(where: { ($0.category == "Shared Expert Gate" || $0.name.contains("shared_expert_gate")) && ($0.name.contains("scale") || $0.name.contains("scales")) })
-            let sharedGateBias = layerTensors.first(where: { ($0.category == "Shared Expert Gate" || $0.name.contains("shared_expert_gate")) && ($0.name.contains("bias") || $0.name.contains("biases")) })
-
-            let norm1 = layerTensors.first(where: { $0.name.contains("input_layernorm") })
-            let norm2 = layerTensors.first(where: { $0.name.contains("post_attention_layernorm") })
-
-            // Full Attention Tensors
-            let qProj = layerTensors.first(where: { $0.name.contains("self_attn.q_proj") && !$0.name.contains("scale") && !$0.name.contains("bias") })
-            let qScale = layerTensors.first(where: { $0.name.contains("self_attn.q_proj") && ($0.name.contains("scale") || $0.name.contains("scales")) })
-            let qBias = layerTensors.first(where: { $0.name.contains("self_attn.q_proj") && ($0.name.contains("bias") || $0.name.contains("biases")) })
-
-            let kProj = layerTensors.first(where: { $0.name.contains("self_attn.k_proj") && !$0.name.contains("scale") && !$0.name.contains("bias") })
-            let kScale = layerTensors.first(where: { $0.name.contains("self_attn.k_proj") && ($0.name.contains("scale") || $0.name.contains("scales")) })
-            let kBias = layerTensors.first(where: { $0.name.contains("self_attn.k_proj") && ($0.name.contains("bias") || $0.name.contains("biases")) })
-
-            let vProj = layerTensors.first(where: { $0.name.contains("self_attn.v_proj") && !$0.name.contains("scale") && !$0.name.contains("bias") })
-            let vScale = layerTensors.first(where: { $0.name.contains("self_attn.v_proj") && ($0.name.contains("scale") || $0.name.contains("scales")) })
-            let vBias = layerTensors.first(where: { $0.name.contains("self_attn.v_proj") && ($0.name.contains("bias") || $0.name.contains("biases")) })
-
-            let qNorm = layerTensors.first(where: { $0.name.contains("self_attn.q_norm") })
-            let kNorm = layerTensors.first(where: { $0.name.contains("self_attn.k_norm") })
-
-            let oProj = layerTensors.first(where: { ($0.name.contains("self_attn.o_proj") || $0.name.contains("linear_attn.out_proj") || $0.name.contains("o_proj") || $0.name.contains("out_proj")) && !$0.name.contains("scale") && !$0.name.contains("bias") })
-            let oScale = layerTensors.first(where: { ($0.name.contains("self_attn.o_proj") || $0.name.contains("o_proj") || $0.name.contains("out_proj")) && ($0.name.contains("scale") || $0.name.contains("scales")) })
-            let oBias = layerTensors.first(where: { ($0.name.contains("self_attn.o_proj") || $0.name.contains("o_proj") || $0.name.contains("out_proj")) && ($0.name.contains("bias") || $0.name.contains("biases")) })
-
-            // Linear Attention Tensors
-            let inQKV = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_qkv") && !$0.name.contains("scale") && !$0.name.contains("bias") })
-            let inQKVScale = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_qkv") && ($0.name.contains("scale") || $0.name.contains("scales")) })
-            let inQKVBias = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_qkv") && ($0.name.contains("bias") || $0.name.contains("biases")) })
-
-            let conv1d = layerTensors.first(where: { $0.name.contains("linear_attn.conv1d.weight") || $0.name.contains("conv1d.weight") })
-
-            let inZ = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_z") && !$0.name.contains("scale") && !$0.name.contains("bias") })
-            let inZScale = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_z") && ($0.name.contains("scale") || $0.name.contains("scales")) })
-            let inZBias = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_z") && ($0.name.contains("bias") || $0.name.contains("biases")) })
-
-            let inA = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_a") && !$0.name.contains("scale") && !$0.name.contains("bias") })
-            let inAScale = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_a") && ($0.name.contains("scale") || $0.name.contains("scales")) })
-            let inABias = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_a") && ($0.name.contains("bias") || $0.name.contains("biases")) })
-
-            let inB = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_b") && !$0.name.contains("scale") && !$0.name.contains("bias") })
-            let inBScale = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_b") && ($0.name.contains("scale") || $0.name.contains("scales")) })
-            let inBBias = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_b") && ($0.name.contains("bias") || $0.name.contains("biases")) })
-
-            let aLog = layerTensors.first(where: { $0.name.contains("linear_attn.A_log") })
-            let dtBias = layerTensors.first(where: { $0.name.contains("linear_attn.dt_bias") })
-            let linNorm = layerTensors.first(where: { $0.name.contains("linear_attn.norm") })
-
-            let linOut = layerTensors.first(where: { $0.name.contains("linear_attn.out_proj") && !$0.name.contains("scale") && !$0.name.contains("bias") })
-            let linOutScale = layerTensors.first(where: { $0.name.contains("linear_attn.out_proj") && ($0.name.contains("scale") || $0.name.contains("scales")) })
-            let linOutBias = layerTensors.first(where: { $0.name.contains("linear_attn.out_proj") && ($0.name.contains("bias") || $0.name.contains("biases")) })
-
-            // Shared Expert
-            let sharedGateW = layerTensors.first(where: { $0.name.contains("shared_expert") && $0.name.contains("gate_proj") && !$0.name.contains("scale") && !$0.name.contains("bias") })
-            let sharedUpW = layerTensors.first(where: { $0.name.contains("shared_expert") && $0.name.contains("up_proj") && !$0.name.contains("scale") && !$0.name.contains("bias") })
-            let sharedDownW = layerTensors.first(where: { $0.name.contains("shared_expert") && $0.name.contains("down_proj") && !$0.name.contains("scale") && !$0.name.contains("bias") })
-
-            let sharedGateS = layerTensors.first(where: { $0.name.contains("shared_expert") && $0.name.contains("gate_proj") && ($0.name.contains("scale") || $0.name.contains("scales")) })
-            let sharedUpS = layerTensors.first(where: { $0.name.contains("shared_expert") && $0.name.contains("up_proj") && ($0.name.contains("scale") || $0.name.contains("scales")) })
-            let sharedDownS = layerTensors.first(where: { $0.name.contains("shared_expert") && $0.name.contains("down_proj") && ($0.name.contains("scale") || $0.name.contains("scales")) })
-
-            let sharedGateB = layerTensors.first(where: { $0.name.contains("shared_expert") && $0.name.contains("gate_proj") && ($0.name.contains("bias") || $0.name.contains("biases")) })
-            let sharedUpB = layerTensors.first(where: { $0.name.contains("shared_expert") && $0.name.contains("up_proj") && ($0.name.contains("bias") || $0.name.contains("biases")) })
-            let sharedDownB = layerTensors.first(where: { $0.name.contains("shared_expert") && $0.name.contains("down_proj") && ($0.name.contains("bias") || $0.name.contains("biases")) })
-
-            var expGateW: [Int: TensorMetadata] = [:]
-            var expUpW: [Int: TensorMetadata] = [:]
-            var expDownW: [Int: TensorMetadata] = [:]
-            var expGateS: [Int: TensorMetadata] = [:]
-            var expUpS: [Int: TensorMetadata] = [:]
-            var expDownS: [Int: TensorMetadata] = [:]
-            var expGateB: [Int: TensorMetadata] = [:]
-            var expUpB: [Int: TensorMetadata] = [:]
-            var expDownB: [Int: TensorMetadata] = [:]
-
-            for t in layerTensors {
-                if let e = t.expertId {
-                    let expId = Int(e)
-                    let isScale = t.name.contains("scale") || t.name.contains("scales")
-                    let isBias = t.name.contains("bias") || t.name.contains("biases")
-                    if t.name.contains("gate_proj") {
-                        if isScale { expGateS[expId] = t }
-                        else if isBias { expGateB[expId] = t }
-                        else { expGateW[expId] = t }
-                    } else if t.name.contains("up_proj") {
-                        if isScale { expUpS[expId] = t }
-                        else if isBias { expUpB[expId] = t }
-                        else { expUpW[expId] = t }
-                    } else if t.name.contains("down_proj") {
-                        if isScale { expDownS[expId] = t }
-                        else if isBias { expDownB[expId] = t }
-                        else { expDownW[expId] = t }
-                    }
-                }
-            }
-
-            var intermediateDim: UInt32 = 512
-            if let sampleGate = sharedGateW ?? expGateW.values.first {
-                let dims = sampleGate.shapeDisplay
-                    .trimmingCharacters(in: CharacterSet(charactersIn: "[]() "))
-                    .components(separatedBy: ",")
-                    .compactMap { UInt32($0.trimmingCharacters(in: CharacterSet.whitespaces)) }
-                if dims.count >= 2 {
-                    intermediateDim = dims[0]
-                }
-            }
-
-            cached.append(CachedLayer(
-                layerIndex: UInt32(l),
-                isFullAttention: isFull,
-                fullAttnIndex: fullIdx,
-                linAttnIndex: linIdx,
-                norm1Tensor: norm1,
-                norm2Tensor: norm2,
-                routerTensor: router,
-                routerScale: routerScale,
-                routerBias: routerBias,
-                sharedGateTensor: sharedGate,
-                sharedGateTensorScale: sharedGateScale,
-                sharedGateTensorBias: sharedGateBias,
-                qProjTensor: qProj,
-                qScaleTensor: qScale,
-                qBiasTensor: qBias,
-                kProjTensor: kProj,
-                kScaleTensor: kScale,
-                kBiasTensor: kBias,
-                vProjTensor: vProj,
-                vScaleTensor: vScale,
-                vBiasTensor: vBias,
-                qNormTensor: qNorm,
-                kNormTensor: kNorm,
-                oProjTensor: oProj,
-                oScaleTensor: oScale,
-                oBiasTensor: oBias,
-                inProjQKV: inQKV,
-                inProjQKVScale: inQKVScale,
-                inProjQKVBias: inQKVBias,
-                conv1dTensor: conv1d,
-                inProjZ: inZ,
-                inProjZScale: inZScale,
-                inProjZBias: inZBias,
-                inProjA: inA,
-                inProjAScale: inAScale,
-                inProjABias: inABias,
-                inProjB: inB,
-                inProjBScale: inBScale,
-                inProjBBias: inBBias,
-                aLogTensor: aLog,
-                dtBiasTensor: dtBias,
-                linearNormTensor: linNorm,
-                linearOutProjTensor: linOut,
-                linearOutProjScale: linOutScale,
-                linearOutProjBias: linOutBias,
-                sharedGateWeight: sharedGateW,
-                sharedUpWeight: sharedUpW,
-                sharedDownWeight: sharedDownW,
-                sharedGateScale: sharedGateS,
-                sharedUpScale: sharedUpS,
-                sharedDownScale: sharedDownS,
-                sharedGateBias: sharedGateB,
-                sharedUpBias: sharedUpB,
-                sharedDownBias: sharedDownB,
-                expertGateWeights: expGateW,
-                expertUpWeights: expUpW,
-                expertDownWeights: expDownW,
-                expertGateScales: expGateS,
-                expertUpScales: expUpS,
-                expertDownScales: expDownS,
-                expertGateBiases: expGateB,
-                expertUpBiases: expUpB,
-                expertDownBiases: expDownB,
-                intermediateDim: intermediateDim
-            ))
-        }
-        return cached
+        return InferenceEngine.shared.buildCachedLayers(summary: summary, config: modelConfig, targetLayerCount: targetLayerCount)
     }
 
     private func sampleNextToken(
@@ -4460,21 +4254,17 @@ struct ContentView: View {
 
                     let intermediateDim = layer.intermediateDim
 
-                    // Active Top-8 Experts
-                    for expert in activeExperts {
-                        let expId = expert.id
-                        let p_k = expert.weight
-                        if p_k <= 0.00001 { continue }
-
-                        if let gateW = layer.expertGateWeights[expId],
-                           let upW = layer.expertUpWeights[expId],
-                           let downW = layer.expertDownWeights[expId] {
-                            let gateS = layer.expertGateScales[expId]
-                            let gateB = layer.expertGateBiases[expId]
-                            let upS = layer.expertUpScales[expId]
-                            let upB = layer.expertUpBiases[expId]
-                            let downS = layer.expertDownScales[expId]
-                            let downB = layer.expertDownBiases[expId]
+                    if layer.mlpType == .denseMlp {
+                        // Dense SwiGLU Feed-Forward (Non-MoE Dense Transformer)
+                        if let gateW = layer.denseGateWeight,
+                           let upW = layer.denseUpWeight,
+                           let downW = layer.denseDownWeight {
+                            let gateS = layer.denseGateScale
+                            let gateB = layer.denseGateBias
+                            let upS = layer.denseUpScale
+                            let upB = layer.denseUpBias
+                            let downS = layer.denseDownScale
+                            let downB = layer.denseDownBias
 
                             dispatchExpertMlp(
                                 enc: layerEnc2,
@@ -4492,40 +4282,77 @@ struct ContentView: View {
                                 accumBuf: hMlpBuffer,
                                 inDim: hiddenDim,
                                 interDim: intermediateDim,
-                                routingWeight: p_k
+                                routingWeight: 1.0
                             )
                         }
-                    }
+                    } else {
+                        // Active Top-8 Routed Experts
+                        for expert in activeExperts {
+                            let expId = expert.id
+                            let p_k = expert.weight
+                            if p_k <= 0.00001 { continue }
 
-                    // Shared Expert
-                    if let gateW = layer.sharedGateWeight,
-                       let upW = layer.sharedUpWeight,
-                       let downW = layer.sharedDownWeight {
-                        let gateS = layer.sharedGateScale
-                        let gateB = layer.sharedGateBias
-                        let upS = layer.sharedUpScale
-                        let upB = layer.sharedUpBias
-                        let downS = layer.sharedDownScale
-                        let downB = layer.sharedDownBias
+                            if let gateW = layer.expertGateWeights[expId],
+                               let upW = layer.expertUpWeights[expId],
+                               let downW = layer.expertDownWeights[expId] {
+                                let gateS = layer.expertGateScales[expId]
+                                let gateB = layer.expertGateBiases[expId]
+                                let upS = layer.expertUpScales[expId]
+                                let upB = layer.expertUpBiases[expId]
+                                let downS = layer.expertDownScales[expId]
+                                let downB = layer.expertDownBiases[expId]
 
-                        dispatchExpertMlp(
-                            enc: layerEnc2,
-                            gateW: gateW,
-                            gateS: gateS,
-                            gateB: gateB,
-                            upW: upW,
-                            upS: upS,
-                            upB: upB,
-                            downW: downW,
-                            downS: downS,
-                            downB: downB,
-                            inBuf: xNorm2Buffer,
-                            interBuf: interBuffer,
-                            accumBuf: hMlpBuffer,
-                            inDim: hiddenDim,
-                            interDim: intermediateDim,
-                            routingWeight: sharedW
-                        )
+                                dispatchExpertMlp(
+                                    enc: layerEnc2,
+                                    gateW: gateW,
+                                    gateS: gateS,
+                                    gateB: gateB,
+                                    upW: upW,
+                                    upS: upS,
+                                    upB: upB,
+                                    downW: downW,
+                                    downS: downS,
+                                    downB: downB,
+                                    inBuf: xNorm2Buffer,
+                                    interBuf: interBuffer,
+                                    accumBuf: hMlpBuffer,
+                                    inDim: hiddenDim,
+                                    interDim: intermediateDim,
+                                    routingWeight: p_k
+                                )
+                            }
+                        }
+
+                        // Shared Expert
+                        if let gateW = layer.sharedGateWeight,
+                           let upW = layer.sharedUpWeight,
+                           let downW = layer.sharedDownWeight {
+                            let gateS = layer.sharedGateScale
+                            let gateB = layer.sharedGateBias
+                            let upS = layer.sharedUpScale
+                            let upB = layer.sharedUpBias
+                            let downS = layer.sharedDownScale
+                            let downB = layer.sharedDownBias
+
+                            dispatchExpertMlp(
+                                enc: layerEnc2,
+                                gateW: gateW,
+                                gateS: gateS,
+                                gateB: gateB,
+                                upW: upW,
+                                upS: upS,
+                                upB: upB,
+                                downW: downW,
+                                downS: downS,
+                                downB: downB,
+                                inBuf: xNorm2Buffer,
+                                interBuf: interBuffer,
+                                accumBuf: hMlpBuffer,
+                                inDim: hiddenDim,
+                                interDim: intermediateDim,
+                                routingWeight: sharedW
+                            )
+                        }
                     }
 
                     // Step 6: Residual Connection 2 (nextH = hMid + hMlp)
@@ -4709,6 +4536,20 @@ struct ContentView: View {
         pagingStatusMessage = "🚀 All weights pre-faulted into RAM"
     }
 
+    private func applyMemoryExecutionMode(_ mode: MemoryExecutionMode) {
+        guard let summary = summary else { return }
+        let mappedGB = summary.sizeGb
+        let eff = mode.resolveEffectiveMode(modelFootprintGB: mappedGB)
+        if eff == .residentRAM {
+            WorkingSetManager.shared.preFaultAll(shardBuffers: shardBuffers, summary: summary)
+            pagingStatusMessage = "⚡ Operating in Full RAM Resident Mode (Zero Disk Paging)"
+        } else {
+            WorkingSetManager.shared.initialize(summary: summary, shardBuffers: shardBuffers, mode: memoryBudgetMode)
+            pagingStatusMessage = "🌊 Operating in Dynamic SSD Streaming Mode"
+        }
+        updatePagingStats()
+    }
+
     private func loadAndBridgeToMetal(filePath: String) {
         do {
             let loadedEngine = try DynaMoeEngine(filePath: filePath)
@@ -4717,6 +4558,17 @@ struct ContentView: View {
             guard let device = MTLCreateSystemDefaultDevice() else {
                 metalStatus = "❌ Failed to initialize Metal GPU."
                 return
+            }
+
+            // Attempt to load and parse HuggingFace config.json if present
+            let fileUrl = URL(fileURLWithPath: filePath)
+            let dirUrl = fileUrl.hasDirectoryPath ? fileUrl : fileUrl.deletingLastPathComponent()
+            if let cfg = ModelConfig.load(from: dirUrl) {
+                self.modelConfig = cfg
+                self.detectedArchitecture = cfg.resolveArchitectureType(summary: loadedSummary)
+            } else {
+                self.modelConfig = nil
+                self.detectedArchitecture = loadedSummary.maxExpertId > 0 ? .hybridSsmMoe : .denseTransformer
             }
             
             // Map every shard into Metal zero-copy space
@@ -4740,8 +4592,15 @@ struct ContentView: View {
             self.errorMessage = nil
             self.selectedTensorID = nil
             self.gpuComputeOutput = nil
-            
-            WorkingSetManager.shared.initialize(summary: loadedSummary, shardBuffers: buffers, mode: self.memoryBudgetMode)
+
+            let effMode = self.memoryExecutionMode.resolveEffectiveMode(modelFootprintGB: mappedGB)
+            if effMode == .residentRAM {
+                WorkingSetManager.shared.preFaultAll(shardBuffers: buffers, summary: loadedSummary)
+                self.pagingStatusMessage = "⚡ Operating in Full RAM Resident Mode (Zero Disk Paging)"
+            } else {
+                WorkingSetManager.shared.initialize(summary: loadedSummary, shardBuffers: buffers, mode: self.memoryBudgetMode)
+                self.pagingStatusMessage = "🌊 Operating in Dynamic SSD Streaming Mode"
+            }
             updatePagingStats()
             
             metalStatus = "✅ Zero-Copy Active! \(loadedSummary.shards.count) Shards Mapped (\(String(format: "%.2f", mappedGB)) GB)"
