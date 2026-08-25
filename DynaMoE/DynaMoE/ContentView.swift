@@ -3077,13 +3077,13 @@ struct ContentView: View {
             let linIdx = isFull ? 0 : linCount
             if isFull { fullCount += 1 } else { linCount += 1 }
 
-            let router = layerTensors.first(where: { $0.name.contains("mlp.gate") && !$0.name.contains("scale") && !$0.name.contains("bias") })
-            let routerScale = layerTensors.first(where: { $0.name.contains("mlp.gate") && ($0.name.contains("scale") || $0.name.contains("scales")) })
-            let routerBias = layerTensors.first(where: { $0.name.contains("mlp.gate") && ($0.name.contains("bias") || $0.name.contains("biases")) })
+            let router = layerTensors.first(where: { ($0.category == "MoE Router" || ($0.name.contains("mlp.gate") && !$0.name.contains("switch_mlp") && !$0.name.contains("proj") && !$0.name.contains("shared"))) && !$0.name.contains("scale") && !$0.name.contains("bias") })
+            let routerScale = layerTensors.first(where: { ($0.category == "MoE Router" || ($0.name.contains("mlp.gate") && !$0.name.contains("switch_mlp") && !$0.name.contains("proj") && !$0.name.contains("shared"))) && ($0.name.contains("scale") || $0.name.contains("scales")) })
+            let routerBias = layerTensors.first(where: { ($0.category == "MoE Router" || ($0.name.contains("mlp.gate") && !$0.name.contains("switch_mlp") && !$0.name.contains("proj") && !$0.name.contains("shared"))) && ($0.name.contains("bias") || $0.name.contains("biases")) })
 
-            let sharedGate = layerTensors.first(where: { $0.name.contains("shared_expert_gate") && !$0.name.contains("scale") && !$0.name.contains("bias") })
-            let sharedGateScale = layerTensors.first(where: { $0.name.contains("shared_expert_gate") && ($0.name.contains("scale") || $0.name.contains("scales")) })
-            let sharedGateBias = layerTensors.first(where: { $0.name.contains("shared_expert_gate") && ($0.name.contains("bias") || $0.name.contains("biases")) })
+            let sharedGate = layerTensors.first(where: { ($0.category == "Shared Expert Gate" || $0.name.contains("shared_expert_gate")) && !$0.name.contains("scale") && !$0.name.contains("bias") })
+            let sharedGateScale = layerTensors.first(where: { ($0.category == "Shared Expert Gate" || $0.name.contains("shared_expert_gate")) && ($0.name.contains("scale") || $0.name.contains("scales")) })
+            let sharedGateBias = layerTensors.first(where: { ($0.category == "Shared Expert Gate" || $0.name.contains("shared_expert_gate")) && ($0.name.contains("bias") || $0.name.contains("biases")) })
 
             let norm1 = layerTensors.first(where: { $0.name.contains("input_layernorm") })
             let norm2 = layerTensors.first(where: { $0.name.contains("post_attention_layernorm") })
@@ -3395,7 +3395,7 @@ struct ContentView: View {
         if prompt.contains("<|im_start|>") {
             formattedPrompt = prompt
         } else {
-            formattedPrompt = "<|im_start|>user\n\(prompt)<|im_end|>\n<|im_start|>assistant\n"
+            formattedPrompt = "<|im_start|>user\n\(prompt)<|im_end|>\n<|im_start|>assistant\n<think>\n"
         }
 
         let promptTokenIds: [UInt32]
@@ -3490,11 +3490,14 @@ struct ContentView: View {
         let embedPipeline: MTLComputePipelineState
         let embedQ4Pipeline: MTLComputePipelineState?
         let routerPipeline: MTLComputePipelineState
+        let routerQ4Pipeline: MTLComputePipelineState?
+        let routerQ8Pipeline: MTLComputePipelineState?
         let rmsnormPipeline: MTLComputePipelineState
         let gemvBF16Pipeline: MTLComputePipelineState
         let bf16GemvSimdPipeline: MTLComputePipelineState?
         let fp8GemvPipeline: MTLComputePipelineState?
         let q4GemvPipeline: MTLComputePipelineState?
+        let q8GemvPipeline: MTLComputePipelineState?
         let addPipeline: MTLComputePipelineState
         let clearPipeline: MTLComputePipelineState
         let fp8GateUpPipeline: MTLComputePipelineState?
@@ -3523,6 +3526,14 @@ struct ContentView: View {
             addPipeline = try device.makeComputePipelineState(function: addFunction)
             clearPipeline = try device.makeComputePipelineState(function: clearFunction)
 
+            if let rQ4Func = defaultLibrary.makeFunction(name: "moe_router_topk_q4") {
+                routerQ4Pipeline = try device.makeComputePipelineState(function: rQ4Func)
+            } else { routerQ4Pipeline = nil }
+
+            if let rQ8Func = defaultLibrary.makeFunction(name: "moe_router_topk_q8") {
+                routerQ8Pipeline = try device.makeComputePipelineState(function: rQ8Func)
+            } else { routerQ8Pipeline = nil }
+
             if let embedQ4Func = defaultLibrary.makeFunction(name: "lookup_embeddings_q4") {
                 embedQ4Pipeline = try device.makeComputePipelineState(function: embedQ4Func)
             } else { embedQ4Pipeline = nil }
@@ -3538,6 +3549,10 @@ struct ContentView: View {
             if let q4GemvFunc = defaultLibrary.makeFunction(name: "q4_gemv") {
                 q4GemvPipeline = try device.makeComputePipelineState(function: q4GemvFunc)
             } else { q4GemvPipeline = nil }
+
+            if let q8GemvFunc = defaultLibrary.makeFunction(name: "q8_gemv") {
+                q8GemvPipeline = try device.makeComputePipelineState(function: q8GemvFunc)
+            } else { q8GemvPipeline = nil }
 
             if let fp8GateUpFunc = defaultLibrary.makeFunction(name: "fp8_swiglu_gate_up") {
                 fp8GateUpPipeline = try device.makeComputePipelineState(function: fp8GateUpFunc)
@@ -3712,29 +3727,46 @@ struct ContentView: View {
                 var outD = outDim
                 var grp = groupSize
 
-                let isQ4 = w.dtype.contains("U32") || w.dtype.contains("Q4") || bias != nil
-                let isFP8 = !w.dtype.contains("BF16") && !w.dtype.contains("FLOAT") && !isQ4
+                let isQuantizedAffine = w.dtype.contains("U32") || w.dtype.contains("Q4") || bias != nil
+                let isFP8 = !w.dtype.contains("BF16") && !w.dtype.contains("FLOAT") && !isQuantizedAffine
 
-                if isQ4, let q4Pipe = q4GemvPipeline {
+                if isQuantizedAffine {
                     let sRaw = (scale != nil) ? buffers[scale!.shardIndex] : nil
                     let bRaw = (bias != nil) ? buffers[bias!.shardIndex] : nil
                     guard let sBuffer = sRaw, let bBuffer = bRaw else { return }
                     var sOff = scale!.offsetStart
                     var bOff = bias!.offsetStart
 
-                    enc.setComputePipelineState(q4Pipe)
-                    enc.setBuffer(wRaw, offset: 0, index: 0)
-                    enc.setBuffer(sBuffer, offset: 0, index: 1)
-                    enc.setBuffer(bBuffer, offset: 0, index: 2)
-                    enc.setBuffer(inBuf, offset: 0, index: 3)
-                    enc.setBuffer(outBuf, offset: 0, index: 4)
-                    enc.setBytes(&wOff, length: MemoryLayout<UInt64>.stride, index: 5)
-                    enc.setBytes(&sOff, length: MemoryLayout<UInt64>.stride, index: 6)
-                    enc.setBytes(&bOff, length: MemoryLayout<UInt64>.stride, index: 7)
-                    enc.setBytes(&inD, length: MemoryLayout<UInt32>.stride, index: 8)
-                    enc.setBytes(&outD, length: MemoryLayout<UInt32>.stride, index: 9)
-                    enc.setBytes(&grp, length: MemoryLayout<UInt32>.stride, index: 10)
-                    enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                    let is8Bit = (w.offsetEnd - w.offsetStart) >= UInt64(outDim) * UInt64(inDim)
+                    if is8Bit, let q8Pipe = q8GemvPipeline {
+                        enc.setComputePipelineState(q8Pipe)
+                        enc.setBuffer(wRaw, offset: 0, index: 0)
+                        enc.setBuffer(sBuffer, offset: 0, index: 1)
+                        enc.setBuffer(bBuffer, offset: 0, index: 2)
+                        enc.setBuffer(inBuf, offset: 0, index: 3)
+                        enc.setBuffer(outBuf, offset: 0, index: 4)
+                        enc.setBytes(&wOff, length: MemoryLayout<UInt64>.stride, index: 5)
+                        enc.setBytes(&sOff, length: MemoryLayout<UInt64>.stride, index: 6)
+                        enc.setBytes(&bOff, length: MemoryLayout<UInt64>.stride, index: 7)
+                        enc.setBytes(&inD, length: MemoryLayout<UInt32>.stride, index: 8)
+                        enc.setBytes(&outD, length: MemoryLayout<UInt32>.stride, index: 9)
+                        enc.setBytes(&grp, length: MemoryLayout<UInt32>.stride, index: 10)
+                        enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                    } else if let q4Pipe = q4GemvPipeline {
+                        enc.setComputePipelineState(q4Pipe)
+                        enc.setBuffer(wRaw, offset: 0, index: 0)
+                        enc.setBuffer(sBuffer, offset: 0, index: 1)
+                        enc.setBuffer(bBuffer, offset: 0, index: 2)
+                        enc.setBuffer(inBuf, offset: 0, index: 3)
+                        enc.setBuffer(outBuf, offset: 0, index: 4)
+                        enc.setBytes(&wOff, length: MemoryLayout<UInt64>.stride, index: 5)
+                        enc.setBytes(&sOff, length: MemoryLayout<UInt64>.stride, index: 6)
+                        enc.setBytes(&bOff, length: MemoryLayout<UInt64>.stride, index: 7)
+                        enc.setBytes(&inD, length: MemoryLayout<UInt32>.stride, index: 8)
+                        enc.setBytes(&outD, length: MemoryLayout<UInt32>.stride, index: 9)
+                        enc.setBytes(&grp, length: MemoryLayout<UInt32>.stride, index: 10)
+                        enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                    }
                 } else if isFP8, let fp8Pipe = fp8GemvPipeline {
                     let sRaw = (scale != nil) ? buffers[scale!.shardIndex] : wRaw
                     var sOff = scale?.offsetStart ?? 0
@@ -3839,6 +3871,7 @@ struct ContentView: View {
                     enc.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 15)
                     enc.setBytes(&grp, length: MemoryLayout<UInt32>.stride, index: 16)
                     enc.dispatchThreadgroups(MTLSize(width: Int(interDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                    enc.memoryBarrier(scope: .buffers)
 
                     // Step 2: Q4 Down Proj Accumulate
                     enc.setComputePipelineState(q4DownPipe)
@@ -3852,9 +3885,10 @@ struct ContentView: View {
                     enc.setBytes(&dBOff, length: MemoryLayout<UInt64>.stride, index: 7)
                     enc.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 8)
                     enc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 9)
-                    enc.setBytes(&p_k, length: MemoryLayout<Float>.stride, index: 10)
-                    enc.setBytes(&grp, length: MemoryLayout<UInt32>.stride, index: 11)
+                    enc.setBytes(&grp, length: MemoryLayout<UInt32>.stride, index: 10)
+                    enc.setBytes(&p_k, length: MemoryLayout<Float>.stride, index: 11)
                     enc.dispatchThreadgroups(MTLSize(width: Int(inDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                    enc.memoryBarrier(scope: .buffers)
                 } else if isFP8 {
                     guard let gS = gateS, let gSRaw = buffers[gS.shardIndex],
                           let uS = upS, let uSRaw = buffers[uS.shardIndex],
@@ -4257,16 +4291,58 @@ struct ContentView: View {
                         var rOffset = routerTensor.offsetStart
                         var nExp = numExperts
                         var kVal: UInt32 = 8
-                        layerEnc1.setComputePipelineState(routerPipeline)
-                        layerEnc1.setBuffer(routerRaw, offset: 0, index: 0)
-                        layerEnc1.setBuffer(xNorm2Buffer, offset: 0, index: 1)
-                        layerEnc1.setBuffer(routerIndicesBuffer, offset: 0, index: 2)
-                        layerEnc1.setBuffer(routerWeightsBuffer, offset: 0, index: 3)
-                        layerEnc1.setBytes(&rOffset, length: MemoryLayout<UInt64>.stride, index: 4)
-                        layerEnc1.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 5)
-                        layerEnc1.setBytes(&nExp, length: MemoryLayout<UInt32>.stride, index: 6)
-                        layerEnc1.setBytes(&kVal, length: MemoryLayout<UInt32>.stride, index: 7)
-                        layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: Int(numExperts), height: 1, depth: 1))
+                        var grp: UInt32 = 64
+
+                        if let rScale = layer.routerScale, let rBias = layer.routerBias,
+                           let rScaleRaw = buffers[rScale.shardIndex], let rBiasRaw = buffers[rBias.shardIndex] {
+                            var sOffset = rScale.offsetStart
+                            var bOffset = rBias.offsetStart
+
+                            if routerTensor.shapeDisplay.contains("512"), let rQ8 = routerQ8Pipeline {
+                                layerEnc1.setComputePipelineState(rQ8)
+                                layerEnc1.setBuffer(routerRaw, offset: 0, index: 0)
+                                layerEnc1.setBuffer(rScaleRaw, offset: 0, index: 1)
+                                layerEnc1.setBuffer(rBiasRaw, offset: 0, index: 2)
+                                layerEnc1.setBuffer(xNorm2Buffer, offset: 0, index: 3)
+                                layerEnc1.setBuffer(routerIndicesBuffer, offset: 0, index: 4)
+                                layerEnc1.setBuffer(routerWeightsBuffer, offset: 0, index: 5)
+                                layerEnc1.setBytes(&rOffset, length: MemoryLayout<UInt64>.stride, index: 6)
+                                layerEnc1.setBytes(&sOffset, length: MemoryLayout<UInt64>.stride, index: 7)
+                                layerEnc1.setBytes(&bOffset, length: MemoryLayout<UInt64>.stride, index: 8)
+                                layerEnc1.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 9)
+                                layerEnc1.setBytes(&nExp, length: MemoryLayout<UInt32>.stride, index: 10)
+                                layerEnc1.setBytes(&kVal, length: MemoryLayout<UInt32>.stride, index: 11)
+                                layerEnc1.setBytes(&grp, length: MemoryLayout<UInt32>.stride, index: 12)
+                                layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: Int(numExperts), height: 1, depth: 1))
+                            } else if let rQ4 = routerQ4Pipeline {
+                                layerEnc1.setComputePipelineState(rQ4)
+                                layerEnc1.setBuffer(routerRaw, offset: 0, index: 0)
+                                layerEnc1.setBuffer(rScaleRaw, offset: 0, index: 1)
+                                layerEnc1.setBuffer(rBiasRaw, offset: 0, index: 2)
+                                layerEnc1.setBuffer(xNorm2Buffer, offset: 0, index: 3)
+                                layerEnc1.setBuffer(routerIndicesBuffer, offset: 0, index: 4)
+                                layerEnc1.setBuffer(routerWeightsBuffer, offset: 0, index: 5)
+                                layerEnc1.setBytes(&rOffset, length: MemoryLayout<UInt64>.stride, index: 6)
+                                layerEnc1.setBytes(&sOffset, length: MemoryLayout<UInt64>.stride, index: 7)
+                                layerEnc1.setBytes(&bOffset, length: MemoryLayout<UInt64>.stride, index: 8)
+                                layerEnc1.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 9)
+                                layerEnc1.setBytes(&nExp, length: MemoryLayout<UInt32>.stride, index: 10)
+                                layerEnc1.setBytes(&kVal, length: MemoryLayout<UInt32>.stride, index: 11)
+                                layerEnc1.setBytes(&grp, length: MemoryLayout<UInt32>.stride, index: 12)
+                                layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: Int(numExperts), height: 1, depth: 1))
+                            }
+                        } else {
+                            layerEnc1.setComputePipelineState(routerPipeline)
+                            layerEnc1.setBuffer(routerRaw, offset: 0, index: 0)
+                            layerEnc1.setBuffer(xNorm2Buffer, offset: 0, index: 1)
+                            layerEnc1.setBuffer(routerIndicesBuffer, offset: 0, index: 2)
+                            layerEnc1.setBuffer(routerWeightsBuffer, offset: 0, index: 3)
+                            layerEnc1.setBytes(&rOffset, length: MemoryLayout<UInt64>.stride, index: 4)
+                            layerEnc1.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 5)
+                            layerEnc1.setBytes(&nExp, length: MemoryLayout<UInt32>.stride, index: 6)
+                            layerEnc1.setBytes(&kVal, length: MemoryLayout<UInt32>.stride, index: 7)
+                            layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: Int(numExperts), height: 1, depth: 1))
+                        }
                     }
 
                     layerEnc1.endEncoding()
@@ -4288,13 +4364,84 @@ struct ContentView: View {
                     // Shared Expert Gate Sigmoid Activation
                     var sharedW: Float = 1.0
                     if let sg = layer.sharedGateTensor, let sgRaw = buffers[sg.shardIndex] {
-                        let sgPtr = sgRaw.contents().advanced(by: Int(sg.offsetStart)).bindMemory(to: UInt16.self, capacity: Int(hiddenDim))
                         let xPtr = xNorm2Buffer.contents().bindMemory(to: Float.self, capacity: Int(hiddenDim))
                         var sum: Float = 0.0
-                        for d in 0..<Int(hiddenDim) {
-                            let u = UInt32(sgPtr[d]) << 16
-                            let w = Float(bitPattern: u)
-                            sum += w * xPtr[d]
+                        if let sgScale = layer.sharedGateTensorScale, let sgBias = layer.sharedGateTensorBias,
+                           let sgScaleRaw = buffers[sgScale.shardIndex], let sgBiasRaw = buffers[sgBias.shardIndex] {
+                            let sRaw = sgScaleRaw.contents().advanced(by: Int(sgScale.offsetStart))
+                            let bRaw = sgBiasRaw.contents().advanced(by: Int(sgBias.offsetStart))
+                            let wRaw = sgRaw.contents().advanced(by: Int(sg.offsetStart))
+                            let groupSize = 64
+                            let numGroups = Int(hiddenDim) / groupSize
+
+                            let is8Bit = (sg.offsetEnd - sg.offsetStart) >= UInt64(hiddenDim)
+                            if is8Bit {
+                                // 8-bit affine quantized shared gate
+                                for g in 0..<numGroups {
+                                    let s0 = UInt16(sRaw.load(fromByteOffset: g * 2, as: UInt8.self))
+                                    let s1 = UInt16(sRaw.load(fromByteOffset: g * 2 + 1, as: UInt8.self))
+                                    let sU16 = s0 | (s1 << 8)
+                                    let b0 = UInt16(bRaw.load(fromByteOffset: g * 2, as: UInt8.self))
+                                    let b1 = UInt16(bRaw.load(fromByteOffset: g * 2 + 1, as: UInt8.self))
+                                    let bU16 = b0 | (b1 << 8)
+
+                                    let s = Float(bitPattern: UInt32(sU16) << 16)
+                                    let b = Float(bitPattern: UInt32(bU16) << 16)
+                                    let colStart = g * groupSize
+                                    var groupSum: Float = 0.0
+                                    var groupXSum: Float = 0.0
+                                    for c in 0..<groupSize {
+                                        let col = colStart + c
+                                        let x = xPtr[col]
+                                        let w8 = Float(wRaw.load(fromByteOffset: col, as: UInt8.self))
+                                        groupSum += w8 * x
+                                        groupXSum += x
+                                    }
+                                    sum += s * groupSum + b * groupXSum
+                                }
+                            } else {
+                                // 4-bit affine quantized shared gate
+                                for g in 0..<numGroups {
+                                    let s0 = UInt16(sRaw.load(fromByteOffset: g * 2, as: UInt8.self))
+                                    let s1 = UInt16(sRaw.load(fromByteOffset: g * 2 + 1, as: UInt8.self))
+                                    let sU16 = s0 | (s1 << 8)
+                                    let b0 = UInt16(bRaw.load(fromByteOffset: g * 2, as: UInt8.self))
+                                    let b1 = UInt16(bRaw.load(fromByteOffset: g * 2 + 1, as: UInt8.self))
+                                    let bU16 = b0 | (b1 << 8)
+
+                                    let s = Float(bitPattern: UInt32(sU16) << 16)
+                                    let b = Float(bitPattern: UInt32(bU16) << 16)
+                                    let u32Start = (g * groupSize) / 8
+                                    var groupSum: Float = 0.0
+                                    var groupXSum: Float = 0.0
+                                    for u in 0..<(groupSize / 8) {
+                                        let byteIdx = (u32Start + u) * 4
+                                        let u0 = UInt32(wRaw.load(fromByteOffset: byteIdx, as: UInt8.self))
+                                        let u1 = UInt32(wRaw.load(fromByteOffset: byteIdx + 1, as: UInt8.self))
+                                        let u2 = UInt32(wRaw.load(fromByteOffset: byteIdx + 2, as: UInt8.self))
+                                        let u3 = UInt32(wRaw.load(fromByteOffset: byteIdx + 3, as: UInt8.self))
+                                        let u32 = u0 | (u1 << 8) | (u2 << 16) | (u3 << 24)
+                                        let baseCol = (u32Start + u) * 8
+                                        for nib in 0..<8 {
+                                            let w4 = Float((u32 >> (nib * 4)) & 0x0F)
+                                            let x = xPtr[baseCol + nib]
+                                            groupSum += w4 * x
+                                            groupXSum += x
+                                        }
+                                    }
+                                    sum += s * groupSum + b * groupXSum
+                                }
+                            }
+                        } else {
+                            // BF16 shared gate
+                            let sgRawPtr = sgRaw.contents().advanced(by: Int(sg.offsetStart))
+                            for d in 0..<Int(hiddenDim) {
+                                let w0 = UInt16(sgRawPtr.load(fromByteOffset: d * 2, as: UInt8.self))
+                                let w1 = UInt16(sgRawPtr.load(fromByteOffset: d * 2 + 1, as: UInt8.self))
+                                let u = UInt32(w0 | (w1 << 8)) << 16
+                                let w = Float(bitPattern: u)
+                                sum += w * xPtr[d]
+                            }
                         }
                         sharedW = 1.0 / (1.0 + exp(-sum))
                     }
@@ -4391,7 +4538,7 @@ struct ContentView: View {
 
                     layerEnc2.endEncoding()
                     layerCmd2.commit()
-                    // Asynchronous pipeline submission: Metal command queue guarantees in-order GPU execution.
+                    layerCmd2.waitUntilCompleted()
 
                     let tempBuf = currentH
                     currentH = nextH
@@ -4483,17 +4630,15 @@ struct ContentView: View {
                 var respPart = ""
                 var activeThink = false
 
-                if updatedRaw.contains("<think>") {
-                    if updatedRaw.contains("</think>") {
-                        let parts = updatedRaw.components(separatedBy: "</think>")
-                        thinkPart = parts[0].replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
-                        respPart = parts.dropFirst().joined(separator: "</think>").trimmingCharacters(in: .whitespacesAndNewlines)
-                        activeThink = false
-                    } else {
-                        thinkPart = updatedRaw.replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespaces)
-                        respPart = ""
-                        activeThink = true
-                    }
+                if updatedRaw.contains("</think>") {
+                    let parts = updatedRaw.components(separatedBy: "</think>")
+                    thinkPart = parts[0].replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    respPart = parts.dropFirst().joined(separator: "</think>").trimmingCharacters(in: .whitespacesAndNewlines)
+                    activeThink = false
+                } else if updatedRaw.contains("<think>") || formattedPrompt.contains("<think>") {
+                    thinkPart = updatedRaw.replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespaces)
+                    respPart = ""
+                    activeThink = true
                 } else {
                     respPart = updatedRaw
                     activeThink = false

@@ -243,11 +243,13 @@ fn parse_layer_and_expert(name: &str) -> (String, Option<u32>, Option<u32>) {
         "LM Head".to_string()
     } else if name.contains("self_attn") || name.contains("attention") {
         "Self-Attention".to_string()
-    } else if (name.contains("gate") || name.contains("router")) && name.contains("mlp") && expert_idx.is_none() {
+    } else if name.contains("shared_expert_gate") {
+        "Shared Expert Gate".to_string()
+    } else if (name.contains("mlp.gate.") || name.ends_with("mlp.gate")) && !name.contains("switch_mlp") && !name.contains("shared") && !name.contains("proj") {
         "MoE Router".to_string()
     } else if name.contains("shared_expert") {
         "Shared Expert".to_string()
-    } else if expert_idx.is_some() || name.contains("experts") {
+    } else if expert_idx.is_some() || name.contains("experts") || name.contains("switch_mlp") {
         if let Some(exp) = expert_idx {
             format!("Routed Expert #{}", exp)
         } else {
@@ -574,33 +576,78 @@ impl DynaMoeEngine {
 
                         let (category, layer_index, expert_id) = parse_layer_and_expert(name);
 
-                        if let Some(exp) = expert_id {
-                            if exp + 1 > max_expert_id {
-                                max_expert_id = exp + 1;
-                            }
-                        }
+                        let shape = tensor.shape();
+                        // Stacked 3D expert tensor: e.g. switch_mlp with shape [256, dim0, dim1]
+                        if shape.len() == 3 && shape[0] == 256 && (name.contains("switch_mlp") || name.contains("experts")) && expert_id.is_none() {
+                            let num_experts = shape[0];
+                            let per_expert_bytes = (tensor.data().len() / num_experts) as u64;
+                            let per_expert_size_mb = size_mb / (num_experts as f64);
+                            let sub_shape_display = format!("{:?}", &shape[1..]);
 
-                        if let Some(l_idx) = layer_index {
-                            let entry = layer_map.entry(l_idx).or_insert((0, BTreeMap::new(), 0.0));
-                            entry.0 += 1;
+                            if let Some(l_idx) = layer_index {
+                                let entry = layer_map.entry(l_idx).or_insert((0, BTreeMap::new(), 0.0));
+                                for exp_id in 0..num_experts {
+                                    entry.1.insert(exp_id as u32, true);
+                                }
+                                entry.0 += num_experts as u32;
+                                entry.2 += size_mb;
+                            }
+
+                            if max_expert_id < num_experts as u32 {
+                                max_expert_id = num_experts as u32;
+                            }
+
+                            for exp_id in 0..num_experts {
+                                let exp_name = if name.contains("switch_mlp") {
+                                    name.replace("switch_mlp", &format!("experts.{}", exp_id))
+                                } else {
+                                    name.replace("experts.", &format!("experts.{}.", exp_id))
+                                };
+                                let exp_offset_start = offset_start + (exp_id as u64) * per_expert_bytes;
+                                let exp_offset_end = exp_offset_start + per_expert_bytes;
+
+                                tensor_list.push(TensorMetadata {
+                                    name: exp_name,
+                                    shape_display: sub_shape_display.clone(),
+                                    dtype: format!("{:?}", tensor.dtype()),
+                                    size_mb: per_expert_size_mb,
+                                    shard_index: shard_idx as u32,
+                                    offset_start: exp_offset_start,
+                                    offset_end: exp_offset_end,
+                                    category: format!("Routed Expert #{}", exp_id),
+                                    layer_index,
+                                    expert_id: Some(exp_id as u32),
+                                });
+                            }
+                        } else {
                             if let Some(exp) = expert_id {
-                                entry.1.insert(exp, true);
+                                if exp + 1 > max_expert_id {
+                                    max_expert_id = exp + 1;
+                                }
                             }
-                            entry.2 += size_mb;
-                        }
 
-                        tensor_list.push(TensorMetadata {
-                            name: name.to_string(),
-                            shape_display: format!("{:?}", tensor.shape()),
-                            dtype: format!("{:?}", tensor.dtype()),
-                            size_mb,
-                            shard_index: shard_idx as u32,
-                            offset_start,
-                            offset_end,
-                            category,
-                            layer_index,
-                            expert_id,
-                        });
+                            if let Some(l_idx) = layer_index {
+                                let entry = layer_map.entry(l_idx).or_insert((0, BTreeMap::new(), 0.0));
+                                entry.0 += 1;
+                                if let Some(exp) = expert_id {
+                                    entry.1.insert(exp, true);
+                                }
+                                entry.2 += size_mb;
+                            }
+
+                            tensor_list.push(TensorMetadata {
+                                name: name.to_string(),
+                                shape_display: format!("{:?}", tensor.shape()),
+                                dtype: format!("{:?}", tensor.dtype()),
+                                size_mb,
+                                shard_index: shard_idx as u32,
+                                offset_start,
+                                offset_end,
+                                category,
+                                layer_index,
+                                expert_id,
+                            });
+                        }
                     }
                 }
             }
@@ -792,7 +839,7 @@ mod tests {
         let inv_rms = 1.0 / ((sum_sq / dim as f32) + eps).sqrt();
         for i in 0..dim {
             let w = bf16_to_f32(w_u16[i]);
-            out_vec[i] = in_vec[i] * inv_rms * (1.0 + w);
+            out_vec[i] = in_vec[i] * inv_rms * w;
         }
     }
 
@@ -1605,5 +1652,45 @@ mod tests {
             let piece = tokenizer.decode(vec![tok_id as u32]).unwrap_or_default();
             println!("  Token {}: logit={:.3}, text={:?}", tok_id, val, piece);
         }
+    }
+
+    #[test]
+    fn test_real_mlx_4bit_path() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/derekparris".to_string());
+        let snapshot_dir = std::path::PathBuf::from(home)
+            .join(".cache/huggingface/hub/models--ornith-ai--Ornith-1.5-35B-A3B-MLX-4bit/snapshots/19504d912fa8fc7622bf6b1de3db5d5d890b1f02");
+
+        if !snapshot_dir.exists() {
+            println!("Skipping test_real_mlx_4bit_path because snapshot directory is not present.");
+            return;
+        }
+
+        let engine = DynaMoeEngine::new(snapshot_dir.to_string_lossy().to_string()).expect("Failed to initialize engine for MLX 4-bit");
+        let summary = engine.get_summary().expect("Failed to get summary");
+
+        println!("Loaded MLX 4-bit Model Summary: size={:.2} GB, total_tensors={}, layers={}", summary.size_gb, summary.tensor_count, summary.layers.len());
+        assert_eq!(summary.layers.len(), 40, "Expected 40 layers in MLX model");
+
+        // Verify that every layer has 256 routed experts unbundled
+        for l in &summary.layers {
+            assert_eq!(l.routed_expert_count, 256, "Layer {} should have 256 routed experts", l.layer_index);
+        }
+
+        // Verify that router gate and shared expert gate are correctly identified
+        let router_0 = summary.tensors.iter().find(|t| t.name == "language_model.model.layers.0.mlp.gate.weight").unwrap();
+        assert_eq!(router_0.category, "MoE Router");
+
+        let shared_gate_0 = summary.tensors.iter().find(|t| t.name == "language_model.model.layers.0.mlp.shared_expert_gate.weight").unwrap();
+        assert_eq!(shared_gate_0.category, "Shared Expert Gate");
+
+        let exp0_gate_w = summary.tensors.iter().find(|t| t.name == "language_model.model.layers.0.mlp.experts.0.gate_proj.weight").unwrap();
+        assert_eq!(exp0_gate_w.category, "Routed Expert #0");
+        assert_eq!(exp0_gate_w.shape_display, "[512, 256]");
+        assert_eq!(exp0_gate_w.expert_id, Some(0));
+
+        let exp255_down_w = summary.tensors.iter().find(|t| t.name == "language_model.model.layers.0.mlp.experts.255.down_proj.weight").unwrap();
+        assert_eq!(exp255_down_w.category, "Routed Expert #255");
+        assert_eq!(exp255_down_w.shape_display, "[2048, 64]");
+        assert_eq!(exp255_down_w.expert_id, Some(255));
     }
 }

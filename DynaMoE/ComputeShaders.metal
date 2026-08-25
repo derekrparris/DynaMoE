@@ -35,6 +35,20 @@ inline float bf16_to_fp32(ushort u) {
     return as_type<float>(bits);
 }
 
+inline ushort read_u16_unaligned(device const uchar* p) {
+    return (ushort)p[0] | ((ushort)p[1] << 8);
+}
+
+inline float read_bf16_unaligned(device const uchar* p) {
+    ushort val = (ushort)p[0] | ((ushort)p[1] << 8);
+    uint32_t bits = ((uint32_t)val) << 16;
+    return as_type<float>(bits);
+}
+
+inline uint32_t read_u32_unaligned(device const uchar* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
 /// MSL Kernel: Dequantizes per-row scaled FP8 weights for preview
 kernel void dequantize_fp8_row_scaled(
     device const uchar* rawBaseBuffer [[buffer(0)]],
@@ -236,6 +250,203 @@ kernel void moe_router_topk_bf16(
         }
         
         // Softmax over selected Top-K values
+        float maxVal = topValues[0];
+        float sumExp = 0.0f;
+        float exps[32];
+        for (uint32_t i = 0; i < k; i++) {
+            exps[i] = exp(topValues[i] - maxVal);
+            sumExp += exps[i];
+        }
+        
+        float invSum = (sumExp > 0.0f) ? (1.0f / sumExp) : 0.0f;
+        
+        device uint32_t* tokenOutIndices = outExpertIndices + (tokenIdx * topK);
+        device float* tokenOutWeights = outRoutingWeights + (tokenIdx * topK);
+        
+        for (uint32_t i = 0; i < k; i++) {
+            tokenOutIndices[i] = topIndices[i];
+            tokenOutWeights[i] = exps[i] * invSum;
+        }
+    }
+}
+
+/// MSL Kernel: MoE Top-K Router with Q4 (4-bit affine quantized) weights
+kernel void moe_router_topk_q4(
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const uchar* rawScaleBuffer [[buffer(1)]],
+    device const uchar* rawBiasBuffer [[buffer(2)]],
+    device const float* inputHiddenState [[buffer(3)]],
+    device uint32_t* outExpertIndices [[buffer(4)]],
+    device float* outRoutingWeights [[buffer(5)]],
+    constant uint64_t& gateWeightOffset [[buffer(6)]],
+    constant uint64_t& scaleOffset [[buffer(7)]],
+    constant uint64_t& biasOffset [[buffer(8)]],
+    constant uint32_t& hiddenDim [[buffer(9)]],
+    constant uint32_t& numExperts [[buffer(10)]],
+    constant uint32_t& topK [[buffer(11)]],
+    constant uint32_t& groupSize [[buffer(12)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tokenIdx [[threadgroup_position_in_grid]]
+) {
+    threadgroup float sharedLogits[256];
+    
+    if (tid < numExperts && tid < 256) {
+        uint32_t numGroups = hiddenDim / groupSize;
+        device const uchar* wRow = rawWeightBuffer + gateWeightOffset + ((uint64_t)tid * (hiddenDim / 8) * 4);
+        device const uchar* sRow = rawScaleBuffer + scaleOffset + ((uint64_t)tid * numGroups * 2);
+        device const uchar* bRow = rawBiasBuffer + biasOffset + ((uint64_t)tid * numGroups * 2);
+        device const float* tokenH = inputHiddenState + (tokenIdx * hiddenDim);
+        
+        float sum = 0.0f;
+        uint32_t numU32 = hiddenDim / 8;
+        for (uint32_t i = 0; i < numU32; i++) {
+            uint32_t col = i * 8;
+            uint32_t gIdx = col / groupSize;
+            float scale = read_bf16_unaligned(sRow + gIdx * 2);
+            float bias = read_bf16_unaligned(bRow + gIdx * 2);
+            uint32_t u32 = read_u32_unaligned(wRow + i * 4);
+            
+            float x0 = tokenH[col + 0]; float x1 = tokenH[col + 1];
+            float x2 = tokenH[col + 2]; float x3 = tokenH[col + 3];
+            float x4 = tokenH[col + 4]; float x5 = tokenH[col + 5];
+            float x6 = tokenH[col + 6]; float x7 = tokenH[col + 7];
+            float xSum = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+            
+            float w0 = float(u32 & 0x0F);
+            float w1 = float((u32 >> 4) & 0x0F);
+            float w2 = float((u32 >> 8) & 0x0F);
+            float w3 = float((u32 >> 12) & 0x0F);
+            float w4 = float((u32 >> 16) & 0x0F);
+            float w5 = float((u32 >> 20) & 0x0F);
+            float w6 = float((u32 >> 24) & 0x0F);
+            float w7 = float((u32 >> 28) & 0x0F);
+            
+            float dot = w0*x0 + w1*x1 + w2*x2 + w3*x3 + w4*x4 + w5*x5 + w6*x6 + w7*x7;
+            sum += scale * dot + bias * xSum;
+        }
+        sharedLogits[tid] = sum;
+    }
+    
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    if (tid == 0) {
+        uint32_t topIndices[32];
+        float topValues[32];
+        uint32_t k = min(topK, (uint32_t)32);
+        
+        for (uint32_t i = 0; i < k; i++) {
+            topValues[i] = -INFINITY;
+            topIndices[i] = 0;
+        }
+        
+        uint32_t validExperts = min(numExperts, (uint32_t)256);
+        for (uint32_t e = 0; e < validExperts; e++) {
+            float val = sharedLogits[e];
+            if (val > topValues[k - 1]) {
+                int insertPos = (int)k - 1;
+                while (insertPos > 0 && val > topValues[insertPos - 1]) {
+                    topValues[insertPos] = topValues[insertPos - 1];
+                    topIndices[insertPos] = topIndices[insertPos - 1];
+                    insertPos--;
+                }
+                topValues[insertPos] = val;
+                topIndices[insertPos] = e;
+            }
+        }
+        
+        float maxVal = topValues[0];
+        float sumExp = 0.0f;
+        float exps[32];
+        for (uint32_t i = 0; i < k; i++) {
+            exps[i] = exp(topValues[i] - maxVal);
+            sumExp += exps[i];
+        }
+        
+        float invSum = (sumExp > 0.0f) ? (1.0f / sumExp) : 0.0f;
+        
+        device uint32_t* tokenOutIndices = outExpertIndices + (tokenIdx * topK);
+        device float* tokenOutWeights = outRoutingWeights + (tokenIdx * topK);
+        
+        for (uint32_t i = 0; i < k; i++) {
+            tokenOutIndices[i] = topIndices[i];
+            tokenOutWeights[i] = exps[i] * invSum;
+        }
+    }
+}
+
+/// MSL Kernel: MoE Top-K Router with Q8 (8-bit affine quantized) weights
+kernel void moe_router_topk_q8(
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const uchar* rawScaleBuffer [[buffer(1)]],
+    device const uchar* rawBiasBuffer [[buffer(2)]],
+    device const float* inputHiddenState [[buffer(3)]],
+    device uint32_t* outExpertIndices [[buffer(4)]],
+    device float* outRoutingWeights [[buffer(5)]],
+    constant uint64_t& gateWeightOffset [[buffer(6)]],
+    constant uint64_t& scaleOffset [[buffer(7)]],
+    constant uint64_t& biasOffset [[buffer(8)]],
+    constant uint32_t& hiddenDim [[buffer(9)]],
+    constant uint32_t& numExperts [[buffer(10)]],
+    constant uint32_t& topK [[buffer(11)]],
+    constant uint32_t& groupSize [[buffer(12)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tokenIdx [[threadgroup_position_in_grid]]
+) {
+    threadgroup float sharedLogits[256];
+    
+    if (tid < numExperts && tid < 256) {
+        uint32_t numGroups = hiddenDim / groupSize;
+        device const uchar* wRow = rawWeightBuffer + gateWeightOffset + ((uint64_t)tid * hiddenDim);
+        device const uchar* sRow = rawScaleBuffer + scaleOffset + ((uint64_t)tid * numGroups * 2);
+        device const uchar* bRow = rawBiasBuffer + biasOffset + ((uint64_t)tid * numGroups * 2);
+        device const float* tokenH = inputHiddenState + (tokenIdx * hiddenDim);
+        
+        float sum = 0.0f;
+        for (uint32_t g = 0; g < numGroups; g++) {
+            float scale = read_bf16_unaligned(sRow + g * 2);
+            float bias = read_bf16_unaligned(bRow + g * 2);
+            uint32_t colStart = g * groupSize;
+            float groupSum = 0.0f;
+            float groupXSum = 0.0f;
+            for (uint32_t c = 0; c < groupSize; c++) {
+                uint32_t col = colStart + c;
+                float x = tokenH[col];
+                float w8 = float(wRow[col]);
+                groupSum += w8 * x;
+                groupXSum += x;
+            }
+            sum += scale * groupSum + bias * groupXSum;
+        }
+        sharedLogits[tid] = sum;
+    }
+    
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    if (tid == 0) {
+        uint32_t topIndices[32];
+        float topValues[32];
+        uint32_t k = min(topK, (uint32_t)32);
+        
+        for (uint32_t i = 0; i < k; i++) {
+            topValues[i] = -INFINITY;
+            topIndices[i] = 0;
+        }
+        
+        uint32_t validExperts = min(numExperts, (uint32_t)256);
+        for (uint32_t e = 0; e < validExperts; e++) {
+            float val = sharedLogits[e];
+            if (val > topValues[k - 1]) {
+                int insertPos = (int)k - 1;
+                while (insertPos > 0 && val > topValues[insertPos - 1]) {
+                    topValues[insertPos] = topValues[insertPos - 1];
+                    topIndices[insertPos] = topIndices[insertPos - 1];
+                    insertPos--;
+                }
+                topValues[insertPos] = val;
+                topIndices[insertPos] = e;
+            }
+        }
+        
         float maxVal = topValues[0];
         float sumExp = 0.0f;
         float exps[32];
@@ -496,7 +707,7 @@ kernel void bf16_down_proj_accumulate(
 /// y_d = (x_d / sqrt( (1/D) * sum(x^2) + eps )) * gamma_d
 kernel void rmsnorm_bf16(
     device const float* inVector [[buffer(0)]],
-    device const ushort* gammaBuffer [[buffer(1)]],
+    device const uchar* gammaBuffer [[buffer(1)]],
     device float* outVector [[buffer(2)]],
     constant uint64_t& gammaOffset [[buffer(3)]],
     constant uint32_t& dim [[buffer(4)]],
@@ -524,11 +735,10 @@ kernel void rmsnorm_bf16(
     float meanSquare = sharedSum[0] / (float)dim;
     float invRms = rsqrt(meanSquare + eps);
 
-    // 2. Normalize and scale by gamma: (1.0 + gamma)
-    uint64_t gammaStart = gammaOffset / 2;
+    // 2. Normalize and scale by gamma
     for (uint i = tid; i < dim; i += tgSize) {
-        float gamma = bf16_to_fp32(gammaBuffer[gammaStart + i]);
-        outVector[i] = inVector[i] * invRms * (1.0f + gamma);
+        float gamma = read_bf16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)i * 2));
+        outVector[i] = inVector[i] * invRms * gamma;
     }
 }
 
@@ -614,7 +824,7 @@ kernel void bf16_gemv(
 /// MSL Kernel: Per-Head RMSNorm for Attention Heads (Q-Norm and K-Norm with custom stride)
 kernel void per_head_rmsnorm_bf16(
     device float* qkVector [[buffer(0)]],
-    device const ushort* gammaBuffer [[buffer(1)]],
+    device const uchar* gammaBuffer [[buffer(1)]],
     constant uint64_t& gammaOffset [[buffer(2)]],
     constant uint32_t& numHeads [[buffer(3)]],
     constant uint32_t& headDim [[buffer(4)]],
@@ -632,11 +842,10 @@ kernel void per_head_rmsnorm_bf16(
     }
 
     float invRms = rsqrt((sumSq / (float)headDim) + eps);
-    uint64_t gammaStart = gammaOffset / 2;
 
     for (uint32_t d = 0; d < headDim; d++) {
-        float gamma = bf16_to_fp32(gammaBuffer[gammaStart + d]);
-        qkVector[offset + d] = qkVector[offset + d] * invRms * (1.0f + gamma);
+        float gamma = read_bf16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)d * 2));
+        qkVector[offset + d] = qkVector[offset + d] * invRms * gamma;
     }
 }
 
@@ -763,10 +972,11 @@ kernel void gqa_attention_decode_fused(
     }
 }
 
-/// MSL Kernel: Causal Depthwise 1D Convolution with SiLU activation for Linear Attention
+///// MSL Kernel: Causal 1D Convolution with Shift Register State & SiLU Activation
+/// Used in Ornith Gated DeltaNet recurrent layer prefix
 kernel void causal_conv1d_silu(
     device const float* inRaw [[buffer(0)]],
-    device const ushort* convWeight [[buffer(1)]],
+    device const uchar* convWeight [[buffer(1)]],
     device float* convState [[buffer(2)]],
     device float* outQKV [[buffer(3)]],
     constant uint64_t& weightOffset [[buffer(4)]],
@@ -786,11 +996,11 @@ kernel void causal_conv1d_silu(
     convState[stateBase + 2] = s2;
     convState[stateBase + 3] = s3;
 
-    uint64_t wBase = (weightOffset / 2) + ((uint64_t)c * 4);
-    float w0 = bf16_to_fp32(convWeight[wBase + 0]);
-    float w1 = bf16_to_fp32(convWeight[wBase + 1]);
-    float w2 = bf16_to_fp32(convWeight[wBase + 2]);
-    float w3 = bf16_to_fp32(convWeight[wBase + 3]);
+    device const uchar* wBase = convWeight + weightOffset + ((uint64_t)c * 4 * 2);
+    float w0 = read_bf16_unaligned(wBase + 0 * 2);
+    float w1 = read_bf16_unaligned(wBase + 1 * 2);
+    float w2 = read_bf16_unaligned(wBase + 2 * 2);
+    float w3 = read_bf16_unaligned(wBase + 3 * 2);
 
     float convVal = (w0 * s0) + (w1 * s1) + (w2 * s2) + (w3 * s3);
     float siluVal = convVal / (1.0f + exp(-convVal));
@@ -837,9 +1047,9 @@ kernel void linear_attention_recurrent_step(
     device const float* zVector [[buffer(1)]],   // [4096] (Gate)
     device const float* aVector [[buffer(2)]],   // [32]
     device const float* bVector [[buffer(3)]],   // [32]
-    device const ushort* aLogBuf [[buffer(4)]],  // [32] (BF16)
-    device const ushort* dtBiasBuf [[buffer(5)]],// [32] (BF16)
-    device const ushort* normBuf [[buffer(6)]],  // [128] (BF16)
+    device const uchar* aLogBuf [[buffer(4)]],   // [32] (BF16)
+    device const uchar* dtBiasBuf [[buffer(5)]], // [32] (BF16)
+    device const uchar* normBuf [[buffer(6)]],   // [128] (BF16)
     device float* stateMatrix [[buffer(7)]],     // [32 heads, 128 keyDim, 128 valDim]
     device float* outputVector [[buffer(8)]],    // [4096]
     constant uint64_t& aLogOffset [[buffer(9)]],
@@ -864,8 +1074,8 @@ kernel void linear_attention_recurrent_step(
     uint32_t stateBase = headIdx * headDim * headDim;
 
     // Decay rate computation: alpha = exp(-exp(A_log) * softplus(a + dt_bias))
-    float aLogVal = bf16_to_fp32(aLogBuf[(aLogOffset / 2) + headIdx]);
-    float dtBiasVal = bf16_to_fp32(dtBiasBuf[(dtBiasOffset / 2) + headIdx]);
+    float aLogVal = read_bf16_unaligned(aLogBuf + aLogOffset + ((uint64_t)headIdx * 2));
+    float dtBiasVal = read_bf16_unaligned(dtBiasBuf + dtBiasOffset + ((uint64_t)headIdx * 2));
     float aVal = aVector[headIdx];
     float bVal = bVector[headIdx];
 
@@ -917,7 +1127,7 @@ kernel void linear_attention_recurrent_step(
 
     // Apply RMSNorm weight and SiLU Gating: y = (y * invRms * norm) * SiLU(z)
     for (uint32_t i = 0; i < headDim; i++) {
-        float normW = bf16_to_fp32(normBuf[(normOffset / 2) + i]);
+        float normW = read_bf16_unaligned(normBuf + normOffset + ((uint64_t)i * 2));
         float yNorm = y[i] * invRms * normW;
 
         float z = zVector[zBase + i];
@@ -1143,12 +1353,12 @@ kernel void fp8_down_proj_accumulate_simd(
 
 /// MSL Kernel: SIMDgroup Cooperative Q4 Affine SwiGLU Gate & Up Projections
 kernel void q4_swiglu_gate_up(
-    device const uint32_t* rawGateWeight [[buffer(0)]],
-    device const ushort* rawGateScales [[buffer(1)]],
-    device const ushort* rawGateBiases [[buffer(2)]],
-    device const uint32_t* rawUpWeight [[buffer(3)]],
-    device const ushort* rawUpScales [[buffer(4)]],
-    device const ushort* rawUpBiases [[buffer(5)]],
+    device const uchar* rawGateWeight [[buffer(0)]],
+    device const uchar* rawGateScales [[buffer(1)]],
+    device const uchar* rawGateBiases [[buffer(2)]],
+    device const uchar* rawUpWeight [[buffer(3)]],
+    device const uchar* rawUpScales [[buffer(4)]],
+    device const uchar* rawUpBiases [[buffer(5)]],
     device const float* inputVector [[buffer(6)]],
     device float* intermediateOutput [[buffer(7)]],
     constant uint64_t& gateWeightOffset [[buffer(8)]],
@@ -1166,13 +1376,13 @@ kernel void q4_swiglu_gate_up(
     if (r >= intermediateDim) return;
 
     uint32_t numGroups = hiddenDim / groupSize;
-    uint64_t gWRow = (gateWeightOffset / 4) + ((uint64_t)r * (hiddenDim / 8));
-    uint64_t gSRow = (gateScaleOffset / 2) + ((uint64_t)r * numGroups);
-    uint64_t gBRow = (gateBiasOffset / 2) + ((uint64_t)r * numGroups);
+    device const uchar* gWRow = rawGateWeight + gateWeightOffset + ((uint64_t)r * (hiddenDim / 8) * 4);
+    device const uchar* gSRow = rawGateScales + gateScaleOffset + ((uint64_t)r * numGroups * 2);
+    device const uchar* gBRow = rawGateBiases + gateBiasOffset + ((uint64_t)r * numGroups * 2);
 
-    uint64_t uWRow = (upWeightOffset / 4) + ((uint64_t)r * (hiddenDim / 8));
-    uint64_t uSRow = (upScaleOffset / 2) + ((uint64_t)r * numGroups);
-    uint64_t uBRow = (upBiasOffset / 2) + ((uint64_t)r * numGroups);
+    device const uchar* uWRow = rawUpWeight + upWeightOffset + ((uint64_t)r * (hiddenDim / 8) * 4);
+    device const uchar* uSRow = rawUpScales + upScaleOffset + ((uint64_t)r * numGroups * 2);
+    device const uchar* uBRow = rawUpBiases + upBiasOffset + ((uint64_t)r * numGroups * 2);
 
     float gate_sum = 0.0f;
     float up_sum   = 0.0f;
@@ -1182,13 +1392,13 @@ kernel void q4_swiglu_gate_up(
         uint32_t col = i * 8;
         uint32_t gIdx = col / groupSize;
 
-        float gScale = bf16_to_fp32(rawGateScales[gSRow + gIdx]);
-        float gBias  = bf16_to_fp32(rawGateBiases[gBRow + gIdx]);
-        float uScale = bf16_to_fp32(rawUpScales[uSRow + gIdx]);
-        float uBias  = bf16_to_fp32(rawUpBiases[uBRow + gIdx]);
+        float gScale = read_bf16_unaligned(gSRow + gIdx * 2);
+        float gBias  = read_bf16_unaligned(gBRow + gIdx * 2);
+        float uScale = read_bf16_unaligned(uSRow + gIdx * 2);
+        float uBias  = read_bf16_unaligned(uBRow + gIdx * 2);
 
-        uint32_t gU32 = rawGateWeight[gWRow + i];
-        uint32_t uU32 = rawUpWeight[uWRow + i];
+        uint32_t gU32 = read_u32_unaligned(gWRow + i * 4);
+        uint32_t uU32 = read_u32_unaligned(uWRow + i * 4);
 
         float x0 = inputVector[col + 0];
         float x1 = inputVector[col + 1];
@@ -1237,9 +1447,9 @@ kernel void q4_swiglu_gate_up(
 
 /// MSL Kernel: SIMDgroup Cooperative Q4 Affine Down-Projection with Weighted Accumulation
 kernel void q4_down_proj_accumulate(
-    device const uint32_t* rawDownWeight [[buffer(0)]],
-    device const ushort* rawDownScales [[buffer(1)]],
-    device const ushort* rawDownBiases [[buffer(2)]],
+    device const uchar* rawDownWeight [[buffer(0)]],
+    device const uchar* rawDownScales [[buffer(1)]],
+    device const uchar* rawDownBiases [[buffer(2)]],
     device const float* intermediateVector [[buffer(3)]],
     device float* outputAccumulator [[buffer(4)]],
     constant uint64_t& downWeightOffset [[buffer(5)]],
@@ -1255,9 +1465,9 @@ kernel void q4_down_proj_accumulate(
     if (d >= hiddenDim) return;
 
     uint32_t numGroups = intermediateDim / groupSize;
-    uint64_t dWRow = (downWeightOffset / 4) + ((uint64_t)d * (intermediateDim / 8));
-    uint64_t dSRow = (downScaleOffset / 2) + ((uint64_t)d * numGroups);
-    uint64_t dBRow = (downBiasOffset / 2) + ((uint64_t)d * numGroups);
+    device const uchar* dWRow = rawDownWeight + downWeightOffset + ((uint64_t)d * (intermediateDim / 8) * 4);
+    device const uchar* dSRow = rawDownScales + downScaleOffset + ((uint64_t)d * numGroups * 2);
+    device const uchar* dBRow = rawDownBiases + downBiasOffset + ((uint64_t)d * numGroups * 2);
 
     float down_sum = 0.0f;
     uint32_t numU32 = intermediateDim / 8;
@@ -1266,10 +1476,10 @@ kernel void q4_down_proj_accumulate(
         uint32_t col = i * 8;
         uint32_t gIdx = col / groupSize;
 
-        float dScale = bf16_to_fp32(rawDownScales[dSRow + gIdx]);
-        float dBias  = bf16_to_fp32(rawDownBiases[dBRow + gIdx]);
+        float dScale = read_bf16_unaligned(dSRow + gIdx * 2);
+        float dBias  = read_bf16_unaligned(dBRow + gIdx * 2);
 
-        uint32_t dU32 = rawDownWeight[dWRow + i];
+        uint32_t dU32 = read_u32_unaligned(dWRow + i * 4);
 
         float x0 = intermediateVector[col + 0];
         float x1 = intermediateVector[col + 1];
@@ -1304,9 +1514,9 @@ kernel void q4_down_proj_accumulate(
 
 /// MSL Kernel: General Q4 Affine GEMV (out = (W_q4 * in))
 kernel void q4_gemv(
-    device const uint32_t* rawWeightBuffer [[buffer(0)]],
-    device const ushort* rawScaleBuffer [[buffer(1)]],
-    device const ushort* rawBiasBuffer [[buffer(2)]],
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const uchar* rawScaleBuffer [[buffer(1)]],
+    device const uchar* rawBiasBuffer [[buffer(2)]],
     device const float* inputVector [[buffer(3)]],
     device float* outputVector [[buffer(4)]],
     constant uint64_t& weightOffset [[buffer(5)]],
@@ -1321,9 +1531,9 @@ kernel void q4_gemv(
     if (row >= outDim) return;
 
     uint32_t numGroups = inDim / groupSize;
-    uint64_t wRow = (weightOffset / 4) + ((uint64_t)row * (inDim / 8));
-    uint64_t sRow = (scaleOffset / 2) + ((uint64_t)row * numGroups);
-    uint64_t bRow = (biasOffset / 2) + ((uint64_t)row * numGroups);
+    device const uchar* wRow = rawWeightBuffer + weightOffset + ((uint64_t)row * (inDim / 8) * 4);
+    device const uchar* sRow = rawScaleBuffer + scaleOffset + ((uint64_t)row * numGroups * 2);
+    device const uchar* bRow = rawBiasBuffer + biasOffset + ((uint64_t)row * numGroups * 2);
 
     float sum = 0.0f;
     uint32_t numU32 = inDim / 8;
@@ -1332,10 +1542,10 @@ kernel void q4_gemv(
         uint32_t col = i * 8;
         uint32_t gIdx = col / groupSize;
 
-        float scale = bf16_to_fp32(rawScaleBuffer[sRow + gIdx]);
-        float bias  = bf16_to_fp32(rawBiasBuffer[bRow + gIdx]);
+        float scale = read_bf16_unaligned(sRow + gIdx * 2);
+        float bias  = read_bf16_unaligned(bRow + gIdx * 2);
 
-        uint32_t u32 = rawWeightBuffer[wRow + i];
+        uint32_t u32 = read_u32_unaligned(wRow + i * 4);
 
         float x0 = inputVector[col + 0];
         float x1 = inputVector[col + 1];
@@ -1370,9 +1580,9 @@ kernel void q4_gemv(
 
 /// MSL Kernel: Lookup Embedding Token Vector for Q4 Affine Quantization
 kernel void lookup_embeddings_q4(
-    device const uint32_t* rawWeightBuffer [[buffer(0)]],
-    device const ushort* rawScaleBuffer [[buffer(1)]],
-    device const ushort* rawBiasBuffer [[buffer(2)]],
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const uchar* rawScaleBuffer [[buffer(1)]],
+    device const uchar* rawBiasBuffer [[buffer(2)]],
     device float* outputVector [[buffer(3)]],
     constant uint32_t& tokenId [[buffer(4)]],
     constant uint64_t& weightOffset [[buffer(5)]],
@@ -1389,15 +1599,62 @@ kernel void lookup_embeddings_q4(
     uint32_t gIdx = id / groupSize;
     uint32_t numGroups = hiddenDim / groupSize;
 
-    uint64_t wRowStart = (weightOffset / 4) + ((uint64_t)tokenId * (hiddenDim / 8));
-    uint64_t sRowStart = (scaleOffset / 2) + ((uint64_t)tokenId * numGroups);
-    uint64_t bRowStart = (biasOffset / 2) + ((uint64_t)tokenId * numGroups);
+    device const uchar* wRowStart = rawWeightBuffer + weightOffset + ((uint64_t)tokenId * (hiddenDim / 8) * 4);
+    device const uchar* sRowStart = rawScaleBuffer + scaleOffset + ((uint64_t)tokenId * numGroups * 2);
+    device const uchar* bRowStart = rawBiasBuffer + biasOffset + ((uint64_t)tokenId * numGroups * 2);
 
-    uint32_t packed = rawWeightBuffer[wRowStart + u32Idx];
+    uint32_t packed = read_u32_unaligned(wRowStart + u32Idx * 4);
     float w4 = float((packed >> shift) & 0x0F);
 
-    float scale = bf16_to_fp32(rawScaleBuffer[sRowStart + gIdx]);
-    float bias  = bf16_to_fp32(rawBiasBuffer[bRowStart + gIdx]);
+    float scale = read_bf16_unaligned(sRowStart + gIdx * 2);
+    float bias  = read_bf16_unaligned(bRowStart + gIdx * 2);
 
     outputVector[id] = scale * w4 + bias;
 }
+
+/// MSL Kernel: Q8 (8-bit affine quantized) Matrix-Vector Multiplication (y = W * x)
+kernel void q8_gemv(
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const uchar* rawScaleBuffer [[buffer(1)]],
+    device const uchar* rawBiasBuffer [[buffer(2)]],
+    device const float* inputVector [[buffer(3)]],
+    device float* outputVector [[buffer(4)]],
+    constant uint64_t& weightOffset [[buffer(5)]],
+    constant uint64_t& scaleOffset [[buffer(6)]],
+    constant uint64_t& biasOffset [[buffer(7)]],
+    constant uint32_t& inDim [[buffer(8)]],
+    constant uint32_t& outDim [[buffer(9)]],
+    constant uint32_t& groupSize [[buffer(10)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    if (row >= outDim) return;
+
+    uint32_t numGroups = inDim / groupSize;
+    device const uchar* wRow = rawWeightBuffer + weightOffset + ((uint64_t)row * inDim);
+    device const uchar* sRow = rawScaleBuffer + scaleOffset + ((uint64_t)row * numGroups * 2);
+    device const uchar* bRow = rawBiasBuffer + biasOffset + ((uint64_t)row * numGroups * 2);
+
+    float threadSum = 0.0f;
+    for (uint32_t g = laneId; g < numGroups; g += 32) {
+        float scale = read_bf16_unaligned(sRow + g * 2);
+        float bias  = read_bf16_unaligned(bRow + g * 2);
+        uint32_t colStart = g * groupSize;
+        float groupSum = 0.0f;
+        float groupXSum = 0.0f;
+        for (uint32_t c = 0; c < groupSize; c++) {
+            uint32_t col = colStart + c;
+            float x = inputVector[col];
+            float w8 = float(wRow[col]);
+            groupSum += w8 * x;
+            groupXSum += x;
+        }
+        threadSum += scale * groupSum + bias * groupXSum;
+    }
+
+    float totalSum = simd_sum(threadSum);
+    if (laneId == 0) {
+        outputVector[row] = totalSum;
+    }
+}
+
