@@ -450,7 +450,7 @@ struct ContentView: View {
     @State private var selectedSessionId: UUID? = nil
     @State private var isSettingsPresented: Bool = false
     @State private var chatPromptText: String = ""
-    @State private var systemPrompt: String = "你是南北阁，一款由BOSS直聘自主研发并训练的专业大语言模型。"
+    @State private var systemPrompt: String = ModelConfig.resolveDefaultSystemPrompt(config: nil, summary: nil)
 
     var activeSessionBinding: Binding<ChatSession?> {
         Binding<ChatSession?>(
@@ -534,6 +534,7 @@ struct ContentView: View {
         .sheet(isPresented: $isSettingsPresented) {
             SettingsSheetView(
                 summary: summary,
+                modelConfig: modelConfig,
                 tokenizer: tokenizer,
                 metalStatus: metalStatus,
                 detectedArchitecture: detectedArchitecture,
@@ -614,7 +615,11 @@ struct ContentView: View {
         sessions[sessionIdx].messages.append(assistantMsg)
         
         // Build prompt formatted with chat template
-        var promptString = "<|im_start|>system\n\(systemPrompt)<|im_end|>\n"
+        var promptString = ""
+        let cleanSystem = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanSystem.isEmpty {
+            promptString += "<|im_start|>system\n\(cleanSystem)<|im_end|>\n"
+        }
         for msg in sessions[sessionIdx].messages.dropLast() {
             if msg.role == .user {
                 promptString += "<|im_start|>user\n\(msg.content)<|im_end|>\n"
@@ -2385,15 +2390,17 @@ struct ContentView: View {
                          (summary.tensors.contains(where: { $0.name.contains("dense_gate_up_proj") })) ||
                          (summary.tensors.contains(where: { $0.name.hasPrefix("model.layers.0.mlp.gate_proj") }) && summary.layerCount == 22)
 
+        let cleanSystem = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+
         let formattedPrompt: String
         if prompt.contains("<|im_start|>") {
-            if isNanbeige && !prompt.contains("<|im_start|>system") {
-                formattedPrompt = "<|im_start|>system\n你是南北阁，一款由BOSS直聘自主研发并训练的专业大语言模型。<|im_end|>\n" + prompt
+            if !cleanSystem.isEmpty && !prompt.contains("<|im_start|>system") {
+                formattedPrompt = "<|im_start|>system\n\(cleanSystem)<|im_end|>\n" + prompt
             } else {
                 formattedPrompt = prompt
             }
-        } else if isNanbeige {
-            formattedPrompt = "<|im_start|>system\n你是南北阁，一款由BOSS直聘自主研发并训练的专业大语言模型。<|im_end|>\n<|im_start|>user\n\(prompt)<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        } else if !cleanSystem.isEmpty {
+            formattedPrompt = "<|im_start|>system\n\(cleanSystem)<|im_end|>\n<|im_start|>user\n\(prompt)<|im_end|>\n<|im_start|>assistant\n<think>\n"
         } else {
             formattedPrompt = "<|im_start|>user\n\(prompt)<|im_end|>\n<|im_start|>assistant\n<think>\n"
         }
@@ -4036,6 +4043,9 @@ struct ContentView: View {
                 self.modelConfig = nil
                 self.detectedArchitecture = loadedSummary.maxExpertId > 0 ? .hybridSsmMoe : .denseTransformer
             }
+
+            // Dynamically assign model-specific default system prompt (e.g. Nanbeige, Qwen, DeepSeek)
+            self.systemPrompt = ModelConfig.resolveDefaultSystemPrompt(config: self.modelConfig, summary: loadedSummary)
 
             // Auto-load tokenizer.json from model directory if present
             let tokUrl = dirUrl.appendingPathComponent("tokenizer.json")

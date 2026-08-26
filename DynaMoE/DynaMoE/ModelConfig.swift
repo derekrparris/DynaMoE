@@ -296,4 +296,34 @@ public struct ModelConfig: Codable {
         let decoder = JSONDecoder()
         return try? decoder.decode(ModelConfig.self, from: data)
     }
+
+    /// Dynamically determines the official or suggested default system prompt for the active model architecture
+    public static func resolveDefaultSystemPrompt(config: ModelConfig?, summary: ModelSummary?) -> String {
+        let typeStr = (config?.modelType ?? "").lowercased()
+        let archStr = config?.architectures?.joined(separator: " ").lowercased() ?? ""
+
+        let isNanbeige = typeStr.contains("nanbeige") ||
+                         archStr.contains("nanbeige") ||
+                         (summary?.layerCount == 22 && summary?.maxExpertId == 0) ||
+                         (summary?.tensors.contains(where: { $0.name.contains("dense_gate_up_proj") }) == true) ||
+                         (summary?.tensors.contains(where: { $0.name.hasPrefix("model.layers.0.mlp.gate_proj") }) == true && summary?.layerCount == 22)
+
+        if isNanbeige {
+            return "你是南北阁，一款由BOSS直聘自主研发并训练的专业大语言模型。"
+        }
+
+        if typeStr.contains("qwen") || archStr.contains("qwen") {
+            return "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+        }
+
+        if typeStr.contains("deepseek") || archStr.contains("deepseek") {
+            return "You are a helpful and harmless AI assistant."
+        }
+
+        if typeStr.contains("llama") || archStr.contains("llama") {
+            return "You are a helpful, respectful and honest assistant."
+        }
+
+        return "You are a helpful AI assistant."
+    }
 }

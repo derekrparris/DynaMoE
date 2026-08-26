@@ -30,6 +30,7 @@ struct SettingsSheetView: View {
 
     // Model & Tokenizer bindings
     var summary: ModelSummary?
+    var modelConfig: ModelConfig? = nil
     var tokenizer: DynaMoeTokenizer?
     var metalStatus: String
     var detectedArchitecture: ModelArchitectureType
@@ -284,9 +285,33 @@ struct SettingsSheetView: View {
 
                 // System Prompt Editor
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("System Prompt")
-                        .font(.subheadline)
-                        .fontWeight(.semibold)
+                    HStack {
+                        Text("System Prompt")
+                            .font(.subheadline)
+                            .fontWeight(.semibold)
+
+                        Spacer()
+
+                        let defaultPrompt = ModelConfig.resolveDefaultSystemPrompt(config: modelConfig, summary: summary)
+                        let isNanbeige = defaultPrompt.contains("南北阁")
+
+                        if isNanbeige {
+                            Text("Nanbeige Preset")
+                                .font(.system(size: 10, weight: .semibold))
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.purple.opacity(0.12))
+                                .foregroundColor(.purple)
+                                .cornerRadius(4)
+                        }
+
+                        Button("Reset to Model Default") {
+                            systemPrompt = defaultPrompt
+                        }
+                        .buttonStyle(.plain)
+                        .font(.caption2)
+                        .foregroundColor(.purple)
+                    }
 
                     TextEditor(text: $systemPrompt)
                         .font(.system(.caption, design: .monospaced))
@@ -298,6 +323,10 @@ struct SettingsSheetView: View {
                             RoundedRectangle(cornerRadius: 8)
                                 .stroke(Color.primary.opacity(0.1), lineWidth: 1)
                         )
+
+                    Text("The system prompt is dynamically set based on the active model architecture. You can customize or clear it above.")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
                 }
             }
             .padding(14)
