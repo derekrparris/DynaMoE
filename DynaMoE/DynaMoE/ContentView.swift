@@ -68,15 +68,23 @@ final class KVCacheManager {
     var convStateBuffer: MTLBuffer?
     var allocatedSeqLen: Int = 2048
     
-    func reset(device: MTLDevice, config: ModelConfig? = nil, actualLayers: Int = 40, maxSeqLen: Int = 2048) {
+    func reset(
+        device: MTLDevice,
+        config: ModelConfig? = nil,
+        actualLayers: Int = 40,
+        totalLoops: Int = 1,
+        numKvHeads: Int = 8,
+        headDim: Int = 128,
+        maxSeqLen: Int = 2048
+    ) {
         self.allocatedSeqLen = maxSeqLen
         
-        let numLoops = max(1, config?.effectiveNumLoops ?? 1)
-        let numKvHeads = config?.effectiveNumKeyValueHeads ?? 2
-        let headDim = config?.effectiveHeadDim ?? 256
-        let totalSlots = actualLayers * numLoops
-        let kvStride = numKvHeads * headDim
-        let kvBytes = max(totalSlots, 40) * maxSeqLen * max(kvStride, 512) * MemoryLayout<Float>.stride
+        let loops = max(totalLoops, config?.effectiveNumLoops ?? 1)
+        let kvHeads = max(numKvHeads, config?.effectiveNumKeyValueHeads ?? 8)
+        let hDim = max(headDim, config?.effectiveHeadDim ?? 128)
+        let totalSlots = actualLayers * loops
+        let kvStride = kvHeads * hDim
+        let kvBytes = max(totalSlots, 44) * maxSeqLen * max(kvStride, 1024) * MemoryLayout<Float>.stride
         
         self.kCacheBuffer = device.makeBuffer(length: kvBytes, options: .storageModeShared)
         self.vCacheBuffer = device.makeBuffer(length: kvBytes, options: .storageModeShared)
@@ -3473,14 +3481,14 @@ struct ContentView: View {
         }
 
         // Model Hyperparameters & Dynamic Sizing
-        let hiddenDim: UInt32 = UInt32(modelConfig?.effectiveHiddenSize ?? (activeHiddenDim > 0 ? activeHiddenDim : 2048))
-        let numHeads: UInt32 = UInt32(modelConfig?.effectiveNumAttentionHeads ?? 16)
-        let numKvHeads: UInt32 = UInt32(modelConfig?.effectiveNumKeyValueHeads ?? 2)
+        let hiddenDim: UInt32 = UInt32(modelConfig?.effectiveHiddenSize ?? (isNanbeige ? 3072 : (activeHiddenDim > 0 ? activeHiddenDim : 2048)))
+        let numHeads: UInt32 = UInt32(modelConfig?.effectiveNumAttentionHeads ?? (isNanbeige ? 48 : 16))
+        let numKvHeads: UInt32 = UInt32(modelConfig?.effectiveNumKeyValueHeads ?? (isNanbeige ? 8 : 2))
         let headDim: UInt32 = UInt32(modelConfig?.effectiveHeadDim ?? 128)
         let rotaryDim: UInt32 = UInt32(modelConfig?.effectiveRotaryDim ?? 128)
-        let thetaVal: Float = modelConfig?.effectiveRopeTheta ?? 10000000.0
-        let totalLoops: Int = max(1, modelConfig?.effectiveNumLoops ?? 1)
-        let eosTokenId: UInt32 = UInt32(modelConfig?.effectiveEosTokenId ?? 248044)
+        let thetaVal: Float = modelConfig?.effectiveRopeTheta ?? (isNanbeige ? 70000000.0 : 10000000.0)
+        let totalLoops: Int = max(1, modelConfig?.effectiveNumLoops ?? (isNanbeige ? 2 : 1))
+        let eosTokenId: UInt32 = UInt32(modelConfig?.effectiveEosTokenId ?? (isNanbeige ? 166101 : 248044))
 
         let cachedLayers = buildCachedLayers(summary: summary)
         let actualLayers = cachedLayers.count
@@ -3503,7 +3511,7 @@ struct ContentView: View {
         let embedOffset = embedWeight.offsetStart
         let normOffset = normTensor.offsetStart
         let lmHeadOffset = lmHeadTensor.offsetStart
-        let eps: Float = modelConfig?.effectiveRmsNormEps ?? 1e-6
+        let eps: Float = modelConfig?.effectiveRmsNormEps ?? (isNanbeige ? 1e-5 : 1e-6)
 
         var vocabSize: UInt32 = 248320
         let cleanShape = lmHeadTensor.shapeDisplay.replacingOccurrences(of: "[", with: "").replacingOccurrences(of: "]", with: "").replacingOccurrences(of: " ", with: "")
@@ -3552,7 +3560,15 @@ struct ContentView: View {
         let buffers = self.shardBuffers
         let budgetMode = self.memoryBudgetMode
 
-        KVCacheManager.shared.reset(device: device, config: modelConfig, actualLayers: actualLayers, maxSeqLen: 2048)
+        KVCacheManager.shared.reset(
+            device: device,
+            config: modelConfig,
+            actualLayers: actualLayers,
+            totalLoops: totalLoops,
+            numKvHeads: Int(numKvHeads),
+            headDim: Int(headDim),
+            maxSeqLen: 2048
+        )
 
         isGeneratingText = true
         generatedStreamText = ""
@@ -4770,7 +4786,9 @@ struct ContentView: View {
 
             // Attempt to load and parse HuggingFace config.json if present
             let fileUrl = URL(fileURLWithPath: filePath)
-            let dirUrl = fileUrl.hasDirectoryPath ? fileUrl : fileUrl.deletingLastPathComponent()
+            var isDir: ObjCBool = false
+            FileManager.default.fileExists(atPath: filePath, isDirectory: &isDir)
+            let dirUrl = isDir.boolValue ? fileUrl : fileUrl.deletingLastPathComponent()
             if let cfg = ModelConfig.load(from: dirUrl) {
                 self.modelConfig = cfg
                 self.detectedArchitecture = cfg.resolveArchitectureType(summary: loadedSummary)

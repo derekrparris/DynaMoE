@@ -300,8 +300,8 @@ public final class InferenceEngine {
         }
 
         let numLayers = min(targetLayerCount, Int(summary.layerCount > 0 ? summary.layerCount : 40))
-        let layerAttnTypes = config?.resolveLayerAttentionTypes(totalLayers: numLayers) ?? (0..<numLayers).map { ($0 % 4 == 3) ? .fullAttention : .linearAttention }
         let arch = config?.resolveArchitectureType(summary: summary) ?? (summary.maxExpertId > 0 ? .hybridSsmMoe : .denseTransformer)
+        let layerAttnTypes = config?.resolveLayerAttentionTypes(totalLayers: numLayers) ?? (arch == .hybridSsmMoe ? (0..<numLayers).map { ($0 % 4 == 3) ? .fullAttention : .linearAttention } : Array(repeating: .fullAttention, count: numLayers))
 
         var cached: [EngineCachedLayer] = []
         var fullCount = 0
