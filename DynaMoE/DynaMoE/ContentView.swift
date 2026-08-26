@@ -452,6 +452,24 @@ struct ContentView: View {
     @State private var chatPromptText: String = ""
     @State private var systemPrompt: String = ModelConfig.resolveDefaultSystemPrompt(config: nil, summary: nil)
 
+    var isStreamingOffDisk: Bool {
+        guard let summary = summary else { return false }
+        let isMoE = (modelConfig?.isMoE ?? (totalExpertCount > 0))
+        if !isMoE {
+            // Dense models always run purely in unified RAM -> Fast Bunny
+            return false
+        }
+        let eff = memoryExecutionMode.resolveEffectiveMode(modelFootprintGB: summary.sizeGb)
+        if eff == .residentRAM {
+            return false
+        }
+        // In SSD streaming mode, if speed is actively fast (> 15 tok/s), show bunny; otherwise tortoise
+        if generationSpeedTokPerSec >= 15.0 {
+            return false
+        }
+        return true
+    }
+
     var activeSessionBinding: Binding<ChatSession?> {
         Binding<ChatSession?>(
             get: {
@@ -515,6 +533,7 @@ struct ContentView: View {
                 session: activeSessionBinding,
                 promptText: $chatPromptText,
                 isGenerating: isGeneratingText,
+                isStreamingOffDisk: isStreamingOffDisk,
                 generationSpeed: generationSpeedTokPerSec,
                 generationTokens: generationTotalTokens,
                 modelName: summary != nil ? (modelConfig?.modelType ?? detectedArchitecture.shortName) : nil,

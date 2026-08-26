@@ -207,6 +207,10 @@ public struct ModelConfig: Codable {
         return textConfig?.numExperts ?? numExperts ?? 0
     }
 
+    public var isMoE: Bool {
+        return effectiveNumExperts > 0
+    }
+
     public var effectiveNumExpertsPerTok: Int {
         return textConfig?.numExpertsPerTok ?? numExpertsPerTok ?? (effectiveNumExperts > 0 ? 8 : 0)
     }
