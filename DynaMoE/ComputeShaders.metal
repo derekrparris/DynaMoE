@@ -778,6 +778,78 @@ kernel void rmsnorm_f16(
     }
 }
 
+/// MSL Kernel: RMSNorm with BF16 Scale Factors (1.0 + gamma offset, for Qwen 3.5 / Ornith / Gemma)
+kernel void rmsnorm_offset_bf16(
+    device const float* inVector [[buffer(0)]],
+    device const uchar* gammaBuffer [[buffer(1)]],
+    device float* outVector [[buffer(2)]],
+    constant uint64_t& gammaOffset [[buffer(3)]],
+    constant uint32_t& dim [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    threadgroup float* sharedSum [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]]
+) {
+    float localSum = 0.0f;
+    for (uint i = tid; i < dim; i += tgSize) {
+        float v = inVector[i];
+        localSum += v * v;
+    }
+    sharedSum[tid] = localSum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = tgSize / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sharedSum[tid] += sharedSum[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float meanSquare = sharedSum[0] / (float)dim;
+    float invRms = rsqrt(meanSquare + eps);
+
+    for (uint i = tid; i < dim; i += tgSize) {
+        float gamma = read_bf16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)i * 2));
+        outVector[i] = inVector[i] * invRms * (1.0f + gamma);
+    }
+}
+
+/// MSL Kernel: RMSNorm with F16 Scale Factors (1.0 + gamma offset, for Qwen 3.5 / Ornith / Gemma)
+kernel void rmsnorm_offset_f16(
+    device const float* inVector [[buffer(0)]],
+    device const uchar* gammaBuffer [[buffer(1)]],
+    device float* outVector [[buffer(2)]],
+    constant uint64_t& gammaOffset [[buffer(3)]],
+    constant uint32_t& dim [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    threadgroup float* sharedSum [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]]
+) {
+    float localSum = 0.0f;
+    for (uint i = tid; i < dim; i += tgSize) {
+        float v = inVector[i];
+        localSum += v * v;
+    }
+    sharedSum[tid] = localSum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = tgSize / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sharedSum[tid] += sharedSum[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float meanSquare = sharedSum[0] / (float)dim;
+    float invRms = rsqrt(meanSquare + eps);
+
+    for (uint i = tid; i < dim; i += tgSize) {
+        float gamma = read_f16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)i * 2));
+        outVector[i] = inVector[i] * invRms * (1.0f + gamma);
+    }
+}
+
 /// MSL Kernel: Parallel Element-Wise Vector Addition (Residual Connection)
 /// out[d] = a[d] + b[d]
 kernel void vector_add_f32(
@@ -996,6 +1068,62 @@ kernel void per_head_rmsnorm_f16(
     for (uint32_t d = 0; d < headDim; d++) {
         float gamma = read_f16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)d * 2));
         qkVector[offset + d] = qkVector[offset + d] * invRms * gamma;
+    }
+}
+
+/// MSL Kernel: Per-Head RMSNorm with Offset (1.0 + gamma) for Attention Heads (Qwen 3.5 / Ornith / Gemma)
+kernel void per_head_rmsnorm_offset_bf16(
+    device float* qkVector [[buffer(0)]],
+    device const uchar* gammaBuffer [[buffer(1)]],
+    constant uint64_t& gammaOffset [[buffer(2)]],
+    constant uint32_t& numHeads [[buffer(3)]],
+    constant uint32_t& headDim [[buffer(4)]],
+    constant uint32_t& headStride [[buffer(5)]],
+    constant float& eps [[buffer(6)]],
+    uint headIdx [[thread_position_in_grid]]
+) {
+    if (headIdx >= numHeads) return;
+
+    uint32_t offset = headIdx * headStride;
+    float sumSq = 0.0f;
+    for (uint32_t d = 0; d < headDim; d++) {
+        float v = qkVector[offset + d];
+        sumSq += v * v;
+    }
+
+    float invRms = rsqrt((sumSq / (float)headDim) + eps);
+
+    for (uint32_t d = 0; d < headDim; d++) {
+        float gamma = read_bf16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)d * 2));
+        qkVector[offset + d] = qkVector[offset + d] * invRms * (1.0f + gamma);
+    }
+}
+
+/// MSL Kernel: Per-Head RMSNorm with F16 Scale Factors (1.0 + gamma offset)
+kernel void per_head_rmsnorm_offset_f16(
+    device float* qkVector [[buffer(0)]],
+    device const uchar* gammaBuffer [[buffer(1)]],
+    constant uint64_t& gammaOffset [[buffer(2)]],
+    constant uint32_t& numHeads [[buffer(3)]],
+    constant uint32_t& headDim [[buffer(4)]],
+    constant uint32_t& headStride [[buffer(5)]],
+    constant float& eps [[buffer(6)]],
+    uint headIdx [[thread_position_in_grid]]
+) {
+    if (headIdx >= numHeads) return;
+
+    uint32_t offset = headIdx * headStride;
+    float sumSq = 0.0f;
+    for (uint32_t d = 0; d < headDim; d++) {
+        float v = qkVector[offset + d];
+        sumSq += v * v;
+    }
+
+    float invRms = rsqrt((sumSq / (float)headDim) + eps);
+
+    for (uint32_t d = 0; d < headDim; d++) {
+        float gamma = read_f16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)d * 2));
+        qkVector[offset + d] = qkVector[offset + d] * invRms * (1.0f + gamma);
     }
 }
 

@@ -2521,6 +2521,8 @@ struct ContentView: View {
         let routerQ8Pipeline: MTLComputePipelineState?
         let rmsnormPipeline: MTLComputePipelineState
         let rmsnormF16Pipeline: MTLComputePipelineState?
+        let rmsnormOffsetPipeline: MTLComputePipelineState?
+        let rmsnormOffsetF16Pipeline: MTLComputePipelineState?
         let gemvBF16Pipeline: MTLComputePipelineState
         let bf16GemvSimdPipeline: MTLComputePipelineState?
         let fp8GemvPipeline: MTLComputePipelineState?
@@ -2543,6 +2545,8 @@ struct ContentView: View {
         let q4DownPipeline: MTLComputePipelineState?
         let headRmsnormPipeline: MTLComputePipelineState?
         let headRmsnormF16Pipeline: MTLComputePipelineState?
+        let headRmsnormOffsetPipeline: MTLComputePipelineState?
+        let headRmsnormOffsetF16Pipeline: MTLComputePipelineState?
         let ropePipeline: MTLComputePipelineState?
         let storeKvCachePipeline: MTLComputePipelineState?
         let gqaDecodePipeline: MTLComputePipelineState?
@@ -2559,6 +2563,14 @@ struct ContentView: View {
             if let rmsF16Func = defaultLibrary.makeFunction(name: "rmsnorm_f16") {
                 rmsnormF16Pipeline = try device.makeComputePipelineState(function: rmsF16Func)
             } else { rmsnormF16Pipeline = nil }
+
+            if let rmsOffsetFunc = defaultLibrary.makeFunction(name: "rmsnorm_offset_bf16") {
+                rmsnormOffsetPipeline = try device.makeComputePipelineState(function: rmsOffsetFunc)
+            } else { rmsnormOffsetPipeline = nil }
+
+            if let rmsOffsetF16Func = defaultLibrary.makeFunction(name: "rmsnorm_offset_f16") {
+                rmsnormOffsetF16Pipeline = try device.makeComputePipelineState(function: rmsOffsetF16Func)
+            } else { rmsnormOffsetF16Pipeline = nil }
             gemvBF16Pipeline = try device.makeComputePipelineState(function: gemvBF16Function)
             addPipeline = try device.makeComputePipelineState(function: addFunction)
             clearPipeline = try device.makeComputePipelineState(function: clearFunction)
@@ -2655,6 +2667,14 @@ struct ContentView: View {
                 headRmsnormF16Pipeline = try device.makeComputePipelineState(function: hNormF16Func)
             } else { headRmsnormF16Pipeline = nil }
 
+            if let hNormOffsetFunc = defaultLibrary.makeFunction(name: "per_head_rmsnorm_offset_bf16") {
+                headRmsnormOffsetPipeline = try device.makeComputePipelineState(function: hNormOffsetFunc)
+            } else { headRmsnormOffsetPipeline = nil }
+
+            if let hNormOffsetF16Func = defaultLibrary.makeFunction(name: "per_head_rmsnorm_offset_f16") {
+                headRmsnormOffsetF16Pipeline = try device.makeComputePipelineState(function: hNormOffsetF16Func)
+            } else { headRmsnormOffsetF16Pipeline = nil }
+
             if let ropeFunc = defaultLibrary.makeFunction(name: "apply_rope_qwen") {
                 ropePipeline = try device.makeComputePipelineState(function: ropeFunc)
             } else { ropePipeline = nil }
@@ -2710,6 +2730,7 @@ struct ContentView: View {
 
         let arch = modelConfig?.resolveArchitectureType(summary: summary) ?? (summary.maxExpertId > 0 ? .hybridSsmMoe : .denseTransformer)
         let isHybridArch = (arch == .hybridSsmMoe)
+        let isRMSNormOffset = modelConfig?.isRMSNormUnitOffset ?? (isHybridArch || arch == .hybridSsmMoe)
 
         let qOutDim: UInt32 = isHybridArch ? (numHeads * headDim * 2) : (numHeads * headDim)
         let kvOutDim: UInt32 = numKvHeads * headDim
@@ -3226,7 +3247,12 @@ struct ContentView: View {
                             var gammaOff = norm1.offsetStart
                             var epsVal = eps
                             let isNorm1F16 = (norm1.dtype.contains("F16") || norm1.dtype.contains("HALF") || norm1.dtype.contains("FLOAT16")) && !norm1.dtype.contains("BF16") && !norm1.dtype.contains("BFLOAT")
-                            let norm1Pipe = (isNorm1F16 && rmsnormF16Pipeline != nil) ? rmsnormF16Pipeline! : rmsnormPipeline
+                            let norm1Pipe: MTLComputePipelineState
+                            if isRMSNormOffset {
+                                norm1Pipe = (isNorm1F16 && rmsnormOffsetF16Pipeline != nil) ? rmsnormOffsetF16Pipeline! : (rmsnormOffsetPipeline ?? rmsnormPipeline)
+                            } else {
+                                norm1Pipe = (isNorm1F16 && rmsnormF16Pipeline != nil) ? rmsnormF16Pipeline! : rmsnormPipeline
+                            }
                             layerEnc1.setComputePipelineState(norm1Pipe)
                             layerEnc1.setBuffer(currentH, offset: 0, index: 0)
                             layerEnc1.setBuffer(norm1Raw, offset: 0, index: 1)
@@ -3254,7 +3280,12 @@ struct ContentView: View {
                             // Q-Norm (if present)
                             if let qNorm = layer.qNormTensor, let qNormRaw = buffers[qNorm.shardIndex] {
                                 let isQNormF16 = (qNorm.dtype.contains("F16") || qNorm.dtype.contains("HALF") || qNorm.dtype.contains("FLOAT16")) && !qNorm.dtype.contains("BF16") && !qNorm.dtype.contains("BFLOAT")
-                                let qHeadNormPipe = (isQNormF16 && headRmsnormF16Pipeline != nil) ? headRmsnormF16Pipeline : headRmsnormPipeline
+                                let qHeadNormPipe: MTLComputePipelineState?
+                                if isRMSNormOffset {
+                                    qHeadNormPipe = (isQNormF16 && headRmsnormOffsetF16Pipeline != nil) ? headRmsnormOffsetF16Pipeline : (headRmsnormOffsetPipeline ?? headRmsnormPipeline)
+                                } else {
+                                    qHeadNormPipe = (isQNormF16 && headRmsnormF16Pipeline != nil) ? headRmsnormF16Pipeline : headRmsnormPipeline
+                                }
                                 if let headNormPipe = qHeadNormPipe {
                                     var qNormOff = qNorm.offsetStart
                                     var nQ = numHeads
@@ -3276,7 +3307,12 @@ struct ContentView: View {
                             // K-Norm (if present)
                             if let kNorm = layer.kNormTensor, let kNormRaw = buffers[kNorm.shardIndex] {
                                 let isKNormF16 = (kNorm.dtype.contains("F16") || kNorm.dtype.contains("HALF") || kNorm.dtype.contains("FLOAT16")) && !kNorm.dtype.contains("BF16") && !kNorm.dtype.contains("BFLOAT")
-                                let kHeadNormPipe = (isKNormF16 && headRmsnormF16Pipeline != nil) ? headRmsnormF16Pipeline : headRmsnormPipeline
+                                let kHeadNormPipe: MTLComputePipelineState?
+                                if isRMSNormOffset {
+                                    kHeadNormPipe = (isKNormF16 && headRmsnormOffsetF16Pipeline != nil) ? headRmsnormOffsetF16Pipeline : (headRmsnormOffsetPipeline ?? headRmsnormPipeline)
+                                } else {
+                                    kHeadNormPipe = (isKNormF16 && headRmsnormF16Pipeline != nil) ? headRmsnormF16Pipeline : headRmsnormPipeline
+                                }
                                 if let headNormPipe = kHeadNormPipe {
                                     var kNormOff = kNorm.offsetStart
                                     var nK = numKvHeads
@@ -3462,7 +3498,12 @@ struct ContentView: View {
                             var gammaOff = norm2.offsetStart
                             var epsVal = eps
                             let isNorm2F16 = (norm2.dtype.contains("F16") || norm2.dtype.contains("HALF") || norm2.dtype.contains("FLOAT16")) && !norm2.dtype.contains("BF16") && !norm2.dtype.contains("BFLOAT")
-                            let norm2Pipe = (isNorm2F16 && rmsnormF16Pipeline != nil) ? rmsnormF16Pipeline! : rmsnormPipeline
+                            let norm2Pipe: MTLComputePipelineState
+                            if isRMSNormOffset {
+                                norm2Pipe = (isNorm2F16 && rmsnormOffsetF16Pipeline != nil) ? rmsnormOffsetF16Pipeline! : (rmsnormOffsetPipeline ?? rmsnormPipeline)
+                            } else {
+                                norm2Pipe = (isNorm2F16 && rmsnormF16Pipeline != nil) ? rmsnormF16Pipeline! : rmsnormPipeline
+                            }
                             layerEnc1.setComputePipelineState(norm2Pipe)
                             layerEnc1.setBuffer(hMidBuffer, offset: 0, index: 0)
                             layerEnc1.setBuffer(norm2Raw, offset: 0, index: 1)
@@ -3778,7 +3819,12 @@ struct ContentView: View {
                         var nOff = normOffset
                         var epsVal = eps
                         let isFinalF16 = (normTensor.dtype.contains("F16") || normTensor.dtype.contains("HALF") || normTensor.dtype.contains("FLOAT16")) && !normTensor.dtype.contains("BF16") && !normTensor.dtype.contains("BFLOAT")
-                        let finalNormPipe = (isFinalF16 && rmsnormF16Pipeline != nil) ? rmsnormF16Pipeline! : rmsnormPipeline
+                        let finalNormPipe: MTLComputePipelineState
+                        if isRMSNormOffset {
+                            finalNormPipe = (isFinalF16 && rmsnormOffsetF16Pipeline != nil) ? rmsnormOffsetF16Pipeline! : (rmsnormOffsetPipeline ?? rmsnormPipeline)
+                        } else {
+                            finalNormPipe = (isFinalF16 && rmsnormF16Pipeline != nil) ? rmsnormF16Pipeline! : rmsnormPipeline
+                        }
                         loopNormEnc.setComputePipelineState(finalNormPipe)
                         loopNormEnc.setBuffer(currentH, offset: 0, index: 0)
                         loopNormEnc.setBuffer(normShardBuffer, offset: 0, index: 1)
@@ -3809,7 +3855,12 @@ struct ContentView: View {
                 var nOff = normOffset
                 var epsVal = eps
                 let isFinalF16 = (normTensor.dtype.contains("F16") || normTensor.dtype.contains("HALF") || normTensor.dtype.contains("FLOAT16")) && !normTensor.dtype.contains("BF16") && !normTensor.dtype.contains("BFLOAT")
-                let finalNormPipe = (isFinalF16 && rmsnormF16Pipeline != nil) ? rmsnormF16Pipeline! : rmsnormPipeline
+                let finalNormPipe: MTLComputePipelineState
+                if isRMSNormOffset {
+                    finalNormPipe = (isFinalF16 && rmsnormOffsetF16Pipeline != nil) ? rmsnormOffsetF16Pipeline! : (rmsnormOffsetPipeline ?? rmsnormPipeline)
+                } else {
+                    finalNormPipe = (isFinalF16 && rmsnormF16Pipeline != nil) ? rmsnormF16Pipeline! : rmsnormPipeline
+                }
                 finalEnc.setComputePipelineState(finalNormPipe)
                 finalEnc.setBuffer(currentH, offset: 0, index: 0)
                 finalEnc.setBuffer(normShardBuffer, offset: 0, index: 1)

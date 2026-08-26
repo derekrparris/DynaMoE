@@ -301,6 +301,13 @@ public struct ModelConfig: Codable {
         return try? decoder.decode(ModelConfig.self, from: data)
     }
 
+    /// Whether the model architecture uses 0-mean unit-offset RMSNorm weights (output = x * (1 + weight))
+    public var isRMSNormUnitOffset: Bool {
+        let rawType = (textConfig != nil ? "qwen3_5_moe" : (modelType ?? "")).lowercased()
+        let archs = architectures?.map { $0.lowercased() } ?? []
+        return rawType.contains("qwen3_5") || rawType.contains("ornith") || rawType.contains("gemma") || archs.contains(where: { $0.contains("qwen3_5") || $0.contains("gemma") || $0.contains("ornith") })
+    }
+
     /// Dynamically determines the official or suggested default system prompt for the active model architecture
     public static func resolveDefaultSystemPrompt(config: ModelConfig?, summary: ModelSummary?) -> String {
         let typeStr = (config?.modelType ?? "").lowercased()
@@ -314,6 +321,11 @@ public struct ModelConfig: Codable {
 
         if isNanbeige {
             return "你是南北阁，一款由BOSS直聘自主研发并训练的专业大语言模型。"
+        }
+
+        if typeStr.contains("ornith") || archStr.contains("ornith") {
+            // Ornith chat template defaults to no system prompt
+            return ""
         }
 
         if typeStr.contains("qwen") || archStr.contains("qwen") {
