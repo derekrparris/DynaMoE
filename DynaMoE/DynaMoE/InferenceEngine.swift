@@ -149,13 +149,17 @@ public final class InferenceEngine {
     // Compute Pipelines
     public var embedPipeline: MTLComputePipelineState?
     public var embedQ4Pipeline: MTLComputePipelineState?
+    public var embedMXFP8Pipeline: MTLComputePipelineState?
     public var rmsnormPipeline: MTLComputePipelineState?
+    public var rmsnormF16Pipeline: MTLComputePipelineState?
     public var headRmsnormPipeline: MTLComputePipelineState?
+    public var headRmsnormF16Pipeline: MTLComputePipelineState?
     public var addPipeline: MTLComputePipelineState?
     public var clearPipeline: MTLComputePipelineState?
     public var ropePipeline: MTLComputePipelineState?
     public var storeKvCachePipeline: MTLComputePipelineState?
     public var gqaDecodePipeline: MTLComputePipelineState?
+    public var gqaStandardPipeline: MTLComputePipelineState?
     public var causalConv1dPipeline: MTLComputePipelineState?
     public var l2NormQkPipeline: MTLComputePipelineState?
     public var linearAttnStepPipeline: MTLComputePipelineState?
@@ -167,10 +171,13 @@ public final class InferenceEngine {
     public var fp8GemvPipeline: MTLComputePipelineState?
     public var bf16GemvSimdPipeline: MTLComputePipelineState?
     public var gemvBF16Pipeline: MTLComputePipelineState?
+    public var mxfp8GemvPipeline: MTLComputePipelineState?
     public var q4GateUpPipeline: MTLComputePipelineState?
     public var q4DownPipeline: MTLComputePipelineState?
     public var fp8GateUpPipeline: MTLComputePipelineState?
     public var fp8DownPipeline: MTLComputePipelineState?
+    public var mxfp8GateUpPipeline: MTLComputePipelineState?
+    public var mxfp8DownPipeline: MTLComputePipelineState?
     public var bf16GateUpPipeline: MTLComputePipelineState?
     public var bf16DownPipeline: MTLComputePipelineState?
 
@@ -190,11 +197,20 @@ public final class InferenceEngine {
         if let embedQ4Func = defaultLib.makeFunction(name: "lookup_embeddings_q4") {
             embedQ4Pipeline = try device.makeComputePipelineState(function: embedQ4Func)
         }
+        if let embedMXFP8Func = defaultLib.makeFunction(name: "lookup_embeddings_mxfp8") {
+            embedMXFP8Pipeline = try device.makeComputePipelineState(function: embedMXFP8Func)
+        }
         if let rmsFunc = defaultLib.makeFunction(name: "rmsnorm_bf16") {
             rmsnormPipeline = try device.makeComputePipelineState(function: rmsFunc)
         }
-        if let headNormFunc = defaultLib.makeFunction(name: "per_head_rmsnorm_bf16") {
-            headRmsnormPipeline = try device.makeComputePipelineState(function: headNormFunc)
+        if let rmsF16Func = defaultLib.makeFunction(name: "rmsnorm_f16") {
+            rmsnormF16Pipeline = try device.makeComputePipelineState(function: rmsF16Func)
+        }
+        if let hrmsFunc = defaultLib.makeFunction(name: "per_head_rmsnorm_bf16") {
+            headRmsnormPipeline = try device.makeComputePipelineState(function: hrmsFunc)
+        }
+        if let hrmsF16Func = defaultLib.makeFunction(name: "per_head_rmsnorm_f16") {
+            headRmsnormF16Pipeline = try device.makeComputePipelineState(function: hrmsF16Func)
         }
         if let addFunc = defaultLib.makeFunction(name: "vector_add_f32") {
             addPipeline = try device.makeComputePipelineState(function: addFunc)
@@ -210,6 +226,9 @@ public final class InferenceEngine {
         }
         if let gqaFunc = defaultLib.makeFunction(name: "gqa_attention_decode_fused") {
             gqaDecodePipeline = try device.makeComputePipelineState(function: gqaFunc)
+        }
+        if let gqaStdFunc = defaultLib.makeFunction(name: "gqa_attention_decode_standard") {
+            gqaStandardPipeline = try device.makeComputePipelineState(function: gqaStdFunc)
         }
         if let convFunc = defaultLib.makeFunction(name: "causal_conv1d_silu") {
             causalConv1dPipeline = try device.makeComputePipelineState(function: convFunc)
@@ -235,7 +254,7 @@ public final class InferenceEngine {
         if let q8GemvFunc = defaultLib.makeFunction(name: "q8_gemv") {
             q8GemvPipeline = try device.makeComputePipelineState(function: q8GemvFunc)
         }
-        if let fp8GemvFunc = defaultLib.makeFunction(name: "fp8_gemv") {
+        if let fp8GemvFunc = defaultLib.makeFunction(name: "mxfp8_gemv") ?? defaultLib.makeFunction(name: "fp8_gemv") {
             fp8GemvPipeline = try device.makeComputePipelineState(function: fp8GemvFunc)
         }
         if let bf16SimdFunc = defaultLib.makeFunction(name: "bf16_gemv_simd") {
@@ -255,6 +274,12 @@ public final class InferenceEngine {
         }
         if let fp8DownFunc = defaultLib.makeFunction(name: "fp8_down_proj_accumulate") {
             fp8DownPipeline = try device.makeComputePipelineState(function: fp8DownFunc)
+        }
+        if let mxfp8GateUpFunc = defaultLib.makeFunction(name: "mxfp8_swiglu_gate_up") {
+            mxfp8GateUpPipeline = try device.makeComputePipelineState(function: mxfp8GateUpFunc)
+        }
+        if let mxfp8DownFunc = defaultLib.makeFunction(name: "mxfp8_down_proj_accumulate") {
+            mxfp8DownPipeline = try device.makeComputePipelineState(function: mxfp8DownFunc)
         }
         if let bf16GateUpFunc = defaultLib.makeFunction(name: "bf16_swiglu_gate_up") {
             bf16GateUpPipeline = try device.makeComputePipelineState(function: bf16GateUpFunc)

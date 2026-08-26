@@ -45,6 +45,11 @@ inline float read_bf16_unaligned(device const uchar* p) {
     return as_type<float>(bits);
 }
 
+inline float read_f16_unaligned(device const uchar* p) {
+    ushort val = (ushort)p[0] | ((ushort)p[1] << 8);
+    return (float)as_type<half>(val);
+}
+
 inline uint32_t read_u32_unaligned(device const uchar* p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
@@ -129,9 +134,10 @@ kernel void lookup_embeddings_mxfp8(
     device const uchar* rawBaseBuffer [[buffer(0)]],
     device const uint32_t* tokenIds [[buffer(1)]],
     device float* outputHiddenStates [[buffer(2)]],
-    constant uint64_t& weightOffset [[buffer(3)]],
-    constant uint64_t& scaleOffset [[buffer(4)]],
-    constant uint32_t& hiddenDim [[buffer(5)]], // e.g., 2048
+    device const uchar* rawScaleBuffer [[buffer(3)]],
+    constant uint64_t& weightOffset [[buffer(4)]],
+    constant uint64_t& scaleOffset [[buffer(5)]],
+    constant uint32_t& hiddenDim [[buffer(6)]], // e.g., 2048, 3072
     uint id [[thread_position_in_grid]]
 ) {
     uint tokenIdx = id / hiddenDim;
@@ -139,21 +145,13 @@ kernel void lookup_embeddings_mxfp8(
     uint32_t targetTokenId = tokenIds[tokenIdx];
     
     // 1. Calculate row offsets for target token ID
-    // 2048 hidden floats stored as 512 packed U32 words (4 bytes each)
-    uint32_t u32PerRow = hiddenDim / 4;
-    uint32_t u32GlobalIdx = (targetTokenId * u32PerRow) + (dimIdx / 4);
-    uint32_t byteInU32 = dimIdx % 4;
+    uint64_t byteOffset = weightOffset + ((uint64_t)targetTokenId * hiddenDim) + dimIdx;
+    uchar rawFp8Byte = rawBaseBuffer[byteOffset];
     
-    device const uint32_t* u32Weights = (device const uint32_t*)(rawBaseBuffer + weightOffset);
-    uint32_t packedWord = u32Weights[u32GlobalIdx];
-    uchar rawFp8Byte = (packedWord >> (byteInU32 * 8)) & 0xFF;
-    
-    // 2. Fetch block scale (32 weights share 1 scale byte for 2048 dim / 64 scales)
+    // 2. Fetch block scale (32 weights share 1 scale byte)
     uint32_t scalesPerRow = hiddenDim / 32;
-    uint32_t scaleGlobalIdx = (targetTokenId * scalesPerRow) + (dimIdx / 32);
-    
-    device const uchar* scales = rawBaseBuffer + scaleOffset;
-    uchar scaleByte = scales[scaleGlobalIdx];
+    uint64_t scaleGlobalIdx = scaleOffset + ((uint64_t)targetTokenId * scalesPerRow) + (dimIdx / 32);
+    uchar scaleByte = rawScaleBuffer[scaleGlobalIdx];
     
     // 3. Dequantize and write to output hidden state h_0
     float unscaledWeight = unpack_e4m3(rawFp8Byte);
@@ -742,6 +740,44 @@ kernel void rmsnorm_bf16(
     }
 }
 
+/// MSL Kernel: RMSNorm with F16 (IEEE 754 half) Scale Factors
+kernel void rmsnorm_f16(
+    device const float* inVector [[buffer(0)]],
+    device const uchar* gammaBuffer [[buffer(1)]],
+    device float* outVector [[buffer(2)]],
+    constant uint64_t& gammaOffset [[buffer(3)]],
+    constant uint32_t& dim [[buffer(4)]],
+    constant float& eps [[buffer(5)]],
+    threadgroup float* sharedSum [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]]
+) {
+    // 1. Parallel threadgroup reduction for sum of squares
+    float localSum = 0.0f;
+    for (uint i = tid; i < dim; i += tgSize) {
+        float v = inVector[i];
+        localSum += v * v;
+    }
+    sharedSum[tid] = localSum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = tgSize / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            sharedSum[tid] += sharedSum[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float meanSquare = sharedSum[0] / (float)dim;
+    float invRms = rsqrt(meanSquare + eps);
+
+    // 2. Normalize and scale by gamma
+    for (uint i = tid; i < dim; i += tgSize) {
+        float gamma = read_f16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)i * 2));
+        outVector[i] = inVector[i] * invRms * gamma;
+    }
+}
+
 /// MSL Kernel: Parallel Element-Wise Vector Addition (Residual Connection)
 /// out[d] = a[d] + b[d]
 kernel void vector_add_f32(
@@ -760,10 +796,11 @@ kernel void mxfp8_gemv(
     device const uchar* rawWeightBuffer [[buffer(0)]],
     device const float* inputVector [[buffer(1)]],
     device float* outputVector [[buffer(2)]],
-    constant uint64_t& weightOffset [[buffer(3)]],
-    constant uint64_t& scaleOffset [[buffer(4)]],
-    constant uint32_t& inDim [[buffer(5)]],
-    constant uint32_t& outDim [[buffer(6)]],
+    device const uchar* rawScaleBuffer [[buffer(3)]],
+    constant uint64_t& weightOffset [[buffer(4)]],
+    constant uint64_t& scaleOffset [[buffer(5)]],
+    constant uint32_t& inDim [[buffer(6)]],
+    constant uint32_t& outDim [[buffer(7)]],
     uint row [[thread_position_in_grid]]
 ) {
     if (row >= outDim) return;
@@ -775,7 +812,7 @@ kernel void mxfp8_gemv(
     float dot = 0.0f;
 
     for (uint32_t b = 0; b < blocksPerRow; b++) {
-        uint8_t scaleByte = rawWeightBuffer[rowScaleStart + b];
+        uint8_t scaleByte = rawScaleBuffer[rowScaleStart + b];
         int scaleExp = (int)scaleByte - 127;
         float scale = exp2((float)scaleExp);
 
@@ -790,6 +827,91 @@ kernel void mxfp8_gemv(
     }
 
     outputVector[row] = dot;
+}
+
+/// MSL Kernel: Fused MXFP8 SwiGLU Gate & Up Projections
+kernel void mxfp8_swiglu_gate_up(
+    device const uchar* gateWeightBuffer [[buffer(0)]],
+    device const uchar* upWeightBuffer [[buffer(1)]],
+    device const float* inputVector [[buffer(2)]],
+    device float* intermediateState [[buffer(3)]],
+    device const uchar* gateScaleBuffer [[buffer(4)]],
+    device const uchar* upScaleBuffer [[buffer(5)]],
+    constant uint64_t& gateWeightOffset [[buffer(6)]],
+    constant uint64_t& gateScaleOffset [[buffer(7)]],
+    constant uint64_t& upWeightOffset [[buffer(8)]],
+    constant uint64_t& upScaleOffset [[buffer(9)]],
+    constant uint32_t& inDim [[buffer(10)]],
+    constant uint32_t& intermediateDim [[buffer(11)]],
+    uint d [[thread_position_in_grid]]
+) {
+    if (d >= intermediateDim) return;
+
+    uint32_t blocksPerRow = inDim / 32;
+    uint64_t gRowStart = gateWeightOffset + ((uint64_t)d * inDim);
+    uint64_t gScaleStart = gateScaleOffset + ((uint64_t)d * blocksPerRow);
+    uint64_t uRowStart = upWeightOffset + ((uint64_t)d * inDim);
+    uint64_t uScaleStart = upScaleOffset + ((uint64_t)d * blocksPerRow);
+
+    float gate_dot = 0.0f;
+    float up_dot = 0.0f;
+
+    for (uint32_t b = 0; b < blocksPerRow; b++) {
+        uint8_t gScaleByte = gateScaleBuffer[gScaleStart + b];
+        float gScale = exp2((float)((int)gScaleByte - 127));
+
+        uint8_t uScaleByte = upScaleBuffer[uScaleStart + b];
+        float uScale = exp2((float)((int)uScaleByte - 127));
+
+        uint64_t gBlk = gRowStart + ((uint64_t)b * 32);
+        uint64_t uBlk = uRowStart + ((uint64_t)b * 32);
+        uint32_t inStart = b * 32;
+
+        for (uint32_t i = 0; i < 32; i++) {
+            float inVal = inputVector[inStart + i];
+            gate_dot += (unpack_e4m3(gateWeightBuffer[gBlk + i]) * gScale) * inVal;
+            up_dot += (unpack_e4m3(upWeightBuffer[uBlk + i]) * uScale) * inVal;
+        }
+    }
+
+    float silu_gate = gate_dot / (1.0f + exp(-gate_dot));
+    intermediateState[d] = silu_gate * up_dot;
+}
+
+/// MSL Kernel: Fused MXFP8 Down Projection Accumulator
+kernel void mxfp8_down_proj_accumulate(
+    device const uchar* downWeightBuffer [[buffer(0)]],
+    device const float* intermediateState [[buffer(1)]],
+    device float* outputAccumulator [[buffer(2)]],
+    device const uchar* downScaleBuffer [[buffer(3)]],
+    constant uint64_t& downWeightOffset [[buffer(4)]],
+    constant uint64_t& downScaleOffset [[buffer(5)]],
+    constant uint32_t& intermediateDim [[buffer(6)]],
+    constant uint32_t& inDim [[buffer(7)]],
+    constant float& routingWeight [[buffer(8)]],
+    uint d [[thread_position_in_grid]]
+) {
+    if (d >= inDim) return;
+
+    uint32_t blocksPerRow = intermediateDim / 32;
+    uint64_t dRowStart = downWeightOffset + ((uint64_t)d * intermediateDim);
+    uint64_t dScaleStart = downScaleOffset + ((uint64_t)d * blocksPerRow);
+
+    float down_dot = 0.0f;
+
+    for (uint32_t b = 0; b < blocksPerRow; b++) {
+        uint8_t dScaleByte = downScaleBuffer[dScaleStart + b];
+        float dScale = exp2((float)((int)dScaleByte - 127));
+
+        uint64_t dBlk = dRowStart + ((uint64_t)b * 32);
+        uint32_t interStart = b * 32;
+
+        for (uint32_t i = 0; i < 32; i++) {
+            down_dot += (unpack_e4m3(downWeightBuffer[dBlk + i]) * dScale) * intermediateState[interStart + i];
+        }
+    }
+
+    outputAccumulator[d] += routingWeight * down_dot;
 }
 
 /// MSL Kernel: General BF16 Matrix-Vector GEMV (out = W * x)
@@ -845,6 +967,34 @@ kernel void per_head_rmsnorm_bf16(
 
     for (uint32_t d = 0; d < headDim; d++) {
         float gamma = read_bf16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)d * 2));
+        qkVector[offset + d] = qkVector[offset + d] * invRms * gamma;
+    }
+}
+
+/// MSL Kernel: Per-Head RMSNorm with F16 Scale Factors
+kernel void per_head_rmsnorm_f16(
+    device float* qkVector [[buffer(0)]],
+    device const uchar* gammaBuffer [[buffer(1)]],
+    constant uint64_t& gammaOffset [[buffer(2)]],
+    constant uint32_t& numHeads [[buffer(3)]],
+    constant uint32_t& headDim [[buffer(4)]],
+    constant uint32_t& headStride [[buffer(5)]],
+    constant float& eps [[buffer(6)]],
+    uint headIdx [[thread_position_in_grid]]
+) {
+    if (headIdx >= numHeads) return;
+
+    uint32_t offset = headIdx * headStride;
+    float sumSq = 0.0f;
+    for (uint32_t d = 0; d < headDim; d++) {
+        float v = qkVector[offset + d];
+        sumSq += v * v;
+    }
+
+    float invRms = rsqrt((sumSq / (float)headDim) + eps);
+
+    for (uint32_t d = 0; d < headDim; d++) {
+        float gamma = read_f16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)d * 2));
         qkVector[offset + d] = qkVector[offset + d] * invRms * gamma;
     }
 }
@@ -969,6 +1119,72 @@ kernel void gqa_attention_decode_fused(
         float g = qGateVector[gateBase + d];
         float sig_g = 1.0f / (1.0f + exp(-g));
         attnOutBuffer[outOffset + d] = ctx * sig_g;
+    }
+}
+
+/// MSL Kernel: Standard Grouped-Query Attention (GQA) Autoregressive Decoding for LLaMA / Mistral / Nanbeige
+kernel void gqa_attention_decode_standard(
+    device const float* qVector [[buffer(0)]],     // [numQHeads * headDim]
+    device const float* kCacheBuffer [[buffer(1)]],
+    device const float* vCacheBuffer [[buffer(2)]],
+    device float* attnOutBuffer [[buffer(3)]],     // [numQHeads * headDim]
+    constant uint32_t& seqLen [[buffer(4)]],
+    constant uint32_t& numQHeads [[buffer(5)]],
+    constant uint32_t& numKvHeads [[buffer(6)]],
+    constant uint32_t& headDim [[buffer(7)]],
+    uint qHeadIdx [[thread_position_in_grid]]
+) {
+    if (qHeadIdx >= numQHeads) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+
+    uint32_t qHeadBase = qHeadIdx * headDim;
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    // Online Softmax Accumulator
+    float acc[256];
+    for (uint32_t d = 0; d < headDim; d++) {
+        acc[d] = 0.0f;
+    }
+
+    float m = -1e20f; // running max score
+    float l = 0.0f;   // running sum of exponents
+
+    uint32_t safeLen = min(seqLen, 2048u);
+
+    for (uint32_t tau = 0; tau < safeLen; tau++) {
+        uint32_t kBase = (tau * kvStride) + kvHeadBase;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < headDim; d++) {
+            dot += qVector[qHeadBase + d] * kCacheBuffer[kBase + d];
+        }
+        float score = dot * invSqrtHeadDim;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+
+        l = (l * alpha) + beta;
+
+        uint32_t vBase = (tau * kvStride) + kvHeadBase;
+        for (uint32_t d = 0; d < headDim; d++) {
+            acc[d] = (acc[d] * alpha) + (beta * vCacheBuffer[vBase + d]);
+        }
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    uint32_t outOffset = qHeadIdx * headDim;
+
+    for (uint32_t d = 0; d < headDim; d++) {
+        attnOutBuffer[outOffset + d] = acc[d] * invL;
     }
 }
 

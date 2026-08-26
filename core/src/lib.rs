@@ -46,13 +46,13 @@ impl DynaMoeTokenizer {
     }
 
     pub fn encode(&self, text: String) -> Result<Vec<u32>, EngineError> {
-        let encoding = self.tokenizer.encode(text, true)
+        let encoding = self.tokenizer.encode(text, false)
             .map_err(|e| EngineError::TokenizerError { details: e.to_string() })?;
         Ok(encoding.get_ids().to_vec())
     }
 
     pub fn decode(&self, ids: Vec<u32>) -> Result<String, EngineError> {
-        let text = self.tokenizer.decode(&ids, true)
+        let text = self.tokenizer.decode(&ids, false)
             .map_err(|e| EngineError::TokenizerError { details: e.to_string() })?;
         Ok(text)
     }

@@ -74,6 +74,7 @@ public struct NestedTextConfig: Codable {
     public var numHiddenLayers: Int?
     public var numAttentionHeads: Int?
     public var numKeyValueHeads: Int?
+    public var headDim: Int?
     public var intermediateSize: Int?
     public var vocabSize: Int?
     public var numExperts: Int?
@@ -84,12 +85,19 @@ public struct NestedTextConfig: Codable {
     public var partialRotaryFactor: Float?
     public var ropeParameters: RopeParametersConfig?
     public var ropeScaling: RopeScalingConfig?
+    public var ropeTheta: Float?
+    public var numLoops: Int?
+    public var eosTokenId: Int?
+    public var bosTokenId: Int?
+    public var tieWordEmbeddings: Bool?
+    public var skipLoopFinalNorm: Bool?
 
     enum CodingKeys: String, CodingKey {
         case hiddenSize = "hidden_size"
         case numHiddenLayers = "num_hidden_layers"
         case numAttentionHeads = "num_attention_heads"
         case numKeyValueHeads = "num_key_value_heads"
+        case headDim = "head_dim"
         case intermediateSize = "intermediate_size"
         case vocabSize = "vocab_size"
         case numExperts = "num_experts"
@@ -100,6 +108,12 @@ public struct NestedTextConfig: Codable {
         case partialRotaryFactor = "partial_rotary_factor"
         case ropeParameters = "rope_parameters"
         case ropeScaling = "rope_scaling"
+        case ropeTheta = "rope_theta"
+        case numLoops = "num_loops"
+        case eosTokenId = "eos_token_id"
+        case bosTokenId = "bos_token_id"
+        case tieWordEmbeddings = "tie_word_embeddings"
+        case skipLoopFinalNorm = "skip_loop_final_norm"
     }
 }
 
@@ -110,6 +124,7 @@ public struct ModelConfig: Codable {
     public var numHiddenLayers: Int?
     public var numAttentionHeads: Int?
     public var numKeyValueHeads: Int?
+    public var headDim: Int?
     public var intermediateSize: Int?
     public var vocabSize: Int?
     public var numExperts: Int?
@@ -120,6 +135,12 @@ public struct ModelConfig: Codable {
     public var partialRotaryFactor: Float?
     public var ropeParameters: RopeParametersConfig?
     public var ropeScaling: RopeScalingConfig?
+    public var ropeTheta: Float?
+    public var numLoops: Int?
+    public var eosTokenId: Int?
+    public var bosTokenId: Int?
+    public var tieWordEmbeddings: Bool?
+    public var skipLoopFinalNorm: Bool?
     public var textConfig: NestedTextConfig?
 
     enum CodingKeys: String, CodingKey {
@@ -129,6 +150,7 @@ public struct ModelConfig: Codable {
         case numHiddenLayers = "num_hidden_layers"
         case numAttentionHeads = "num_attention_heads"
         case numKeyValueHeads = "num_key_value_heads"
+        case headDim = "head_dim"
         case intermediateSize = "intermediate_size"
         case vocabSize = "vocab_size"
         case numExperts = "num_experts"
@@ -139,6 +161,12 @@ public struct ModelConfig: Codable {
         case partialRotaryFactor = "partial_rotary_factor"
         case ropeParameters = "rope_parameters"
         case ropeScaling = "rope_scaling"
+        case ropeTheta = "rope_theta"
+        case numLoops = "num_loops"
+        case eosTokenId = "eos_token_id"
+        case bosTokenId = "bos_token_id"
+        case tieWordEmbeddings = "tie_word_embeddings"
+        case skipLoopFinalNorm = "skip_loop_final_norm"
         case textConfig = "text_config"
     }
 
@@ -157,6 +185,18 @@ public struct ModelConfig: Codable {
 
     public var effectiveNumKeyValueHeads: Int {
         return textConfig?.numKeyValueHeads ?? numKeyValueHeads ?? 2
+    }
+
+    public var effectiveHeadDim: Int {
+        if let h = textConfig?.headDim ?? headDim {
+            return h
+        }
+        let heads = effectiveNumAttentionHeads
+        return heads > 0 ? (effectiveHiddenSize / heads) : 128
+    }
+
+    public var effectiveNumLoops: Int {
+        return textConfig?.numLoops ?? numLoops ?? 1
     }
 
     public var effectiveVocabSize: Int {
@@ -182,13 +222,23 @@ public struct ModelConfig: Codable {
     public var effectiveRopeTheta: Float {
         if let t = textConfig?.ropeParameters?.ropeTheta { return t }
         if let t = ropeParameters?.ropeTheta { return t }
+        if let t = textConfig?.ropeTheta ?? ropeTheta { return t }
         return 10000000.0
     }
 
+    public var effectiveEosTokenId: Int {
+        return textConfig?.eosTokenId ?? eosTokenId ?? 248044
+    }
+
     public var effectiveRotaryDim: Int {
-        let headDim = effectiveHiddenSize / effectiveNumAttentionHeads // e.g. 2048 / 16 = 128 (or 256 for Qwen 3.5)
-        let factor = textConfig?.partialRotaryFactor ?? partialRotaryFactor ?? textConfig?.ropeParameters?.partialRotaryFactor ?? ropeParameters?.partialRotaryFactor ?? 0.25
-        return max(32, Int(Float(headDim > 0 ? headDim : 256) * factor))
+        let headDim = effectiveHeadDim
+        if let factor = textConfig?.partialRotaryFactor ?? partialRotaryFactor ?? textConfig?.ropeParameters?.partialRotaryFactor ?? ropeParameters?.partialRotaryFactor {
+            return max(32, Int(Float(headDim > 0 ? headDim : 128) * factor))
+        }
+        if textConfig != nil || (modelType ?? "").contains("qwen") || (modelType ?? "").contains("ornith") {
+            return max(32, Int(Float(headDim > 0 ? headDim : 256) * 0.25))
+        }
+        return headDim
     }
 
     public var effectiveLayerTypesStrings: [String]? {
