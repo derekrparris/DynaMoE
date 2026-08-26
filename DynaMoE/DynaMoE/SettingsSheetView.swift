@@ -27,6 +27,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
 struct SettingsSheetView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var selectedTab: SettingsTab = .models
+    @State private var isPromptSavedFeedback: Bool = false
     @ObservedObject var localModelManager: LocalModelManager = LocalModelManager.shared
 
     // Model & Tokenizer bindings
@@ -452,54 +453,88 @@ struct SettingsSheetView: View {
                 }
 
                 // Max New Tokens
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 6) {
                     HStack {
                         Text("Max Output Tokens")
                             .font(.subheadline)
+                            .fontWeight(.medium)
                         Spacer()
-                        Text("\(maxNewTokens)")
+                        Text("\(maxNewTokens) tokens")
                             .font(.system(.caption, design: .monospaced))
+                            .fontWeight(.bold)
                             .foregroundColor(.purple)
                     }
+
                     Slider(value: Binding(
                         get: { Float(maxNewTokens) },
                         set: { maxNewTokens = Int($0) }
-                    ), in: 32...4096, step: 32)
+                    ), in: 32...10000, step: 32)
+
+                    // Quick Token Presets
+                    HStack(spacing: 6) {
+                        Text("Presets:")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                        ForEach([512, 1024, 2048, 4096, 8192, 10000], id: \.self) { preset in
+                            Button("\(preset)") {
+                                maxNewTokens = preset
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 10.5, weight: maxNewTokens == preset ? .bold : .regular, design: .monospaced))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2.5)
+                            .background(maxNewTokens == preset ? Color.purple.opacity(0.18) : Color.secondary.opacity(0.08))
+                            .foregroundColor(maxNewTokens == preset ? .purple : .primary)
+                            .cornerRadius(4)
+                        }
+                    }
                 }
 
-                // System Prompt Editor
-                VStack(alignment: .leading, spacing: 6) {
+                // System Prompt Editor & Conjunction Combination
+                VStack(alignment: .leading, spacing: 8) {
                     HStack {
-                        Text("System Prompt")
+                        Text("User Default System Prompt")
                             .font(.subheadline)
                             .fontWeight(.semibold)
 
                         Spacer()
 
-                        let defaultPrompt = ModelConfig.resolveDefaultSystemPrompt(config: modelConfig, summary: summary)
-                        let isNanbeige = defaultPrompt.contains("南北阁")
-
-                        if isNanbeige {
-                            Text("Nanbeige Preset")
-                                .font(.system(size: 10, weight: .semibold))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.purple.opacity(0.12))
-                                .foregroundColor(.purple)
-                                .cornerRadius(4)
+                        if isPromptSavedFeedback {
+                            HStack(spacing: 4) {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundColor(.green)
+                                Text("Saved as Default!")
+                                    .foregroundColor(.green)
+                            }
+                            .font(.caption2)
+                            .transition(.opacity)
                         }
 
-                        Button("Reset to Model Default") {
-                            systemPrompt = defaultPrompt
+                        Button("Reset to Default") {
+                            systemPrompt = ModelConfig.getUserDefaultSystemPrompt()
                         }
                         .buttonStyle(.plain)
                         .font(.caption2)
-                        .foregroundColor(.purple)
+                        .foregroundColor(.secondary)
+
+                        Button("Save as Default") {
+                            ModelConfig.setUserDefaultSystemPrompt(systemPrompt)
+                            withAnimation {
+                                isPromptSavedFeedback = true
+                            }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                                withAnimation {
+                                    isPromptSavedFeedback = false
+                                }
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
                     }
 
                     TextEditor(text: $systemPrompt)
                         .font(.system(.caption, design: .monospaced))
-                        .frame(height: 80)
+                        .frame(height: 75)
                         .padding(6)
                         .background(Color(NSColor.controlBackgroundColor))
                         .cornerRadius(8)
@@ -508,9 +543,38 @@ struct SettingsSheetView: View {
                                 .stroke(Color.primary.opacity(0.1), lineWidth: 1)
                         )
 
-                    Text("The system prompt is dynamically set based on the active model architecture. You can customize or clear it above.")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
+                    // Active Model Required Instruct Prompt Callout
+                    let requiredPrompt = ModelConfig.resolveRequiredSystemPrompt(config: modelConfig, summary: summary, modelName: summary != nil ? (modelConfig?.modelType ?? detectedArchitecture.shortName) : nil)
+                    if !requiredPrompt.isEmpty {
+                        VStack(alignment: .leading, spacing: 5) {
+                            HStack(spacing: 5) {
+                                Image(systemName: "shield.lefthalf.filled")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.indigo)
+                                Text("Active Model Required Instruct Prompt:")
+                                    .font(.caption)
+                                    .fontWeight(.bold)
+                                    .foregroundColor(.indigo)
+                            }
+
+                            Text(requiredPrompt)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(.primary.opacity(0.85))
+                                .padding(8)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color.indigo.opacity(0.08))
+                                .cornerRadius(6)
+
+                            Text("ℹ️ DynaMoE automatically sends this required prompt in conjunction (combined) with your user prompt above.")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        .padding(.top, 2)
+                    } else {
+                        Text("This prompt is used as the default personality and instructions for all conversations.")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
                 }
             }
             .padding(14)

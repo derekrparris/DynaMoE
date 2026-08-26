@@ -452,7 +452,7 @@ struct ContentView: View {
     @State private var selectedSessionId: UUID? = nil
     @State private var isSettingsPresented: Bool = false
     @State private var chatPromptText: String = ""
-    @State private var systemPrompt: String = ModelConfig.resolveDefaultSystemPrompt(config: nil, summary: nil)
+    @State private var systemPrompt: String = ModelConfig.getUserDefaultSystemPrompt()
 
     var isStreamingOffDisk: Bool {
         guard let summary = summary else { return false }
@@ -690,9 +690,16 @@ struct ContentView: View {
         
         // Build prompt formatted with chat template
         var promptString = ""
-        let cleanSystem = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !cleanSystem.isEmpty {
-            promptString += "<|im_start|>system\n\(cleanSystem)<|im_end|>\n"
+        let modelShort = summary != nil ? (modelConfig?.modelType ?? detectedArchitecture.shortName) : nil
+        let effectiveSystem = ModelConfig.buildEffectiveSystemPrompt(
+            userPrompt: systemPrompt,
+            config: modelConfig,
+            summary: summary,
+            modelName: modelShort
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if !effectiveSystem.isEmpty {
+            promptString += "<|im_start|>system\n\(effectiveSystem)<|im_end|>\n"
         }
         for msg in sessions[sessionIdx].messages.dropLast() {
             if msg.role == .user {
@@ -2464,7 +2471,13 @@ struct ContentView: View {
                          (summary.tensors.contains(where: { $0.name.contains("dense_gate_up_proj") })) ||
                          (summary.tensors.contains(where: { $0.name.hasPrefix("model.layers.0.mlp.gate_proj") }) && summary.layerCount == 22)
 
-        let cleanSystem = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let modelShort = modelConfig?.modelType ?? detectedArchitecture.shortName
+        let cleanSystem = ModelConfig.buildEffectiveSystemPrompt(
+            userPrompt: systemPrompt,
+            config: modelConfig,
+            summary: summary,
+            modelName: modelShort
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
 
         let formattedPrompt: String
         if prompt.contains("<|im_start|>") {
@@ -2845,6 +2858,7 @@ struct ContentView: View {
         let buffers = self.shardBuffers
         let budgetMode = self.memoryBudgetMode
 
+        let neededSeqLen = max(2048, min(32768, promptTokenIds.count + maxTokens + 256))
         KVCacheManager.shared.reset(
             device: device,
             config: modelConfig,
@@ -2852,7 +2866,7 @@ struct ContentView: View {
             totalLoops: totalLoops,
             numKvHeads: Int(numKvHeads),
             headDim: Int(headDim),
-            maxSeqLen: 2048
+            maxSeqLen: neededSeqLen
         )
 
         isGeneratingText = true
@@ -4169,8 +4183,10 @@ struct ContentView: View {
                 self.detectedArchitecture = loadedSummary.maxExpertId > 0 ? .hybridSsmMoe : .denseTransformer
             }
 
-            // Dynamically assign model-specific default system prompt (e.g. Nanbeige, Qwen, DeepSeek)
-            self.systemPrompt = ModelConfig.resolveDefaultSystemPrompt(config: self.modelConfig, summary: loadedSummary)
+            // Maintain user default system prompt if already set, or initialize from user default
+            if self.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                self.systemPrompt = ModelConfig.getUserDefaultSystemPrompt()
+            }
 
             // Auto-load tokenizer.json from model directory if present
             let tokUrl = dirUrl.appendingPathComponent("tokenizer.json")

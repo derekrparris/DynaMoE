@@ -308,12 +308,30 @@ public struct ModelConfig: Codable {
         return rawType.contains("qwen3_5") || rawType.contains("ornith") || rawType.contains("gemma") || archs.contains(where: { $0.contains("qwen3_5") || $0.contains("gemma") || $0.contains("ornith") })
     }
 
-    /// Dynamically determines the official or suggested default system prompt for the active model architecture
-    public static func resolveDefaultSystemPrompt(config: ModelConfig?, summary: ModelSummary?) -> String {
+    public static let userDefaultSystemPromptKey = "dynamoe_user_default_system_prompt"
+
+    /// Reads the saved user default system prompt from UserDefaults
+    public static func getUserDefaultSystemPrompt() -> String {
+        let saved = UserDefaults.standard.string(forKey: userDefaultSystemPromptKey)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let saved = saved, !saved.isEmpty {
+            return saved
+        }
+        return "You are a helpful AI assistant."
+    }
+
+    /// Persists the user's default system prompt to UserDefaults
+    public static func setUserDefaultSystemPrompt(_ prompt: String) {
+        UserDefaults.standard.set(prompt.trimmingCharacters(in: .whitespacesAndNewlines), forKey: userDefaultSystemPromptKey)
+    }
+
+    /// Returns the required system prompt mandatory for specific models to function properly (e.g. Nanbeige instruct tuning)
+    public static func resolveRequiredSystemPrompt(config: ModelConfig?, summary: ModelSummary?, modelName: String? = nil) -> String {
+        let nameLower = (modelName ?? "").lowercased()
         let typeStr = (config?.modelType ?? "").lowercased()
         let archStr = config?.architectures?.joined(separator: " ").lowercased() ?? ""
 
-        let isNanbeige = typeStr.contains("nanbeige") ||
+        let isNanbeige = nameLower.contains("nanbeige") ||
+                         typeStr.contains("nanbeige") ||
                          archStr.contains("nanbeige") ||
                          (summary?.layerCount == 22 && summary?.maxExpertId == 0) ||
                          (summary?.tensors.contains(where: { $0.name.contains("dense_gate_up_proj") }) == true) ||
@@ -323,23 +341,54 @@ public struct ModelConfig: Codable {
             return "你是南北阁，一款由BOSS直聘自主研发并训练的专业大语言模型。"
         }
 
-        if typeStr.contains("ornith") || archStr.contains("ornith") {
-            // Ornith chat template defaults to no system prompt
+        if nameLower.contains("ornith") || typeStr.contains("ornith") || archStr.contains("ornith") {
+            // Ornith chat template defaults to clean instruct without mandatory prefix
             return ""
         }
 
-        if typeStr.contains("qwen") || archStr.contains("qwen") {
+        if nameLower.contains("qwen") || typeStr.contains("qwen") || archStr.contains("qwen") {
             return "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
         }
 
-        if typeStr.contains("deepseek") || archStr.contains("deepseek") {
+        if nameLower.contains("deepseek") || typeStr.contains("deepseek") || archStr.contains("deepseek") {
             return "You are a helpful and harmless AI assistant."
         }
 
-        if typeStr.contains("llama") || archStr.contains("llama") {
+        if nameLower.contains("llama") || typeStr.contains("llama") || archStr.contains("llama") {
             return "You are a helpful, respectful and honest assistant."
         }
 
-        return "You are a helpful AI assistant."
+        return ""
+    }
+
+    /// Dynamically determines the suggested default system prompt for the active model architecture
+    public static func resolveDefaultSystemPrompt(config: ModelConfig?, summary: ModelSummary?, modelName: String? = nil) -> String {
+        let required = resolveRequiredSystemPrompt(config: config, summary: summary, modelName: modelName)
+        if !required.isEmpty {
+            return required
+        }
+        return getUserDefaultSystemPrompt()
+    }
+
+    /// Combines the model's required system prompt with the user's custom system prompt in conjunction
+    public static func buildEffectiveSystemPrompt(
+        userPrompt: String,
+        config: ModelConfig?,
+        summary: ModelSummary?,
+        modelName: String? = nil
+    ) -> String {
+        let required = resolveRequiredSystemPrompt(config: config, summary: summary, modelName: modelName).trimmingCharacters(in: .whitespacesAndNewlines)
+        let user = userPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if !required.isEmpty && !user.isEmpty {
+            if user.contains(required) {
+                return user
+            }
+            return "\(required)\n\n\(user)"
+        } else if !required.isEmpty {
+            return required
+        } else {
+            return user
+        }
     }
 }
