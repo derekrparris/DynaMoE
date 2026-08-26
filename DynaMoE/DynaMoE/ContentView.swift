@@ -443,6 +443,32 @@ struct ContentView: View {
     @State private var lastPagingLatencyMs: Double = 0.0
     @State private var pagingStatusMessage: String? = nil
 
+    // Multi-Session Chat UI State (Antigravity Style)
+    @State private var sessions: [ChatSession] = [
+        ChatSession(title: "New Chat")
+    ]
+    @State private var selectedSessionId: UUID? = nil
+    @State private var isSettingsPresented: Bool = false
+    @State private var chatPromptText: String = ""
+    @State private var systemPrompt: String = "你是南北阁，一款由BOSS直聘自主研发并训练的专业大语言模型。"
+
+    var activeSessionBinding: Binding<ChatSession?> {
+        Binding<ChatSession?>(
+            get: {
+                if let id = selectedSessionId {
+                    return sessions.first(where: { $0.id == id }) ?? sessions.first
+                }
+                return sessions.first
+            },
+            set: { updated in
+                guard let updated = updated else { return }
+                if let idx = sessions.firstIndex(where: { $0.id == updated.id }) {
+                    sessions[idx] = updated
+                }
+            }
+        )
+    }
+
     let categoryFilters = ["All", "Self-Attention", "MoE Router", "Routed Expert", "Shared Expert", "Embedding", "LM Head"]
 
     var filteredTensors: [TensorMetadata] {
@@ -459,719 +485,107 @@ struct ContentView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Header Bar
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("DynaMoE Engine & Tokenizer Inspector")
-                        .font(.title2)
-                        .fontWeight(.bold)
-                    
-                    if let summary = summary {
-                        HStack(spacing: 10) {
-                            HStack(spacing: 5) {
-                                Image(systemName: detectedArchitecture.icon)
-                                    .foregroundColor(.purple)
-                                Text(detectedArchitecture.shortName)
-                                    .fontWeight(.bold)
-                            }
-                            .font(.caption)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(Color.purple.opacity(0.12))
-                            .cornerRadius(6)
-
-                            Text("•")
-                                .foregroundColor(.secondary)
-                            Text("\(summary.layerCount) Layers")
-                                .fontWeight(.semibold)
-                            if summary.maxExpertId > 0 {
-                                Text("•")
-                                    .foregroundColor(.secondary)
-                                Text("\(summary.maxExpertId) Experts/Layer")
-                                    .foregroundColor(.purple)
-                                    .fontWeight(.semibold)
-                            }
-                            Text("•")
-                                .foregroundColor(.secondary)
-                            Text(metalStatus)
-                                .foregroundColor(metalStatus.contains("✅") ? .green : .secondary)
-                        }
-                        .font(.subheadline)
-                    } else {
-                        Text(metalStatus)
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
+        NavigationSplitView {
+            SidebarView(
+                sessions: $sessions,
+                selectedSessionId: $selectedSessionId,
+                isSettingsPresented: $isSettingsPresented,
+                modelName: summary != nil ? (modelConfig?.modelType ?? detectedArchitecture.shortName) : nil,
+                metalStatus: metalStatus,
+                currentRssGB: currentRssGB,
+                isGenerating: isGeneratingText,
+                onNewChat: {
+                    let newSession = ChatSession(title: "New Chat")
+                    sessions.insert(newSession, at: 0)
+                    selectedSessionId = newSession.id
+                },
+                onDeleteSession: { id in
+                    sessions.removeAll(where: { $0.id == id })
+                    if sessions.isEmpty {
+                        let newSession = ChatSession(title: "New Chat")
+                        sessions.append(newSession)
+                        selectedSessionId = newSession.id
+                    } else if selectedSessionId == id {
+                        selectedSessionId = sessions.first?.id
                     }
                 }
-                
-                Spacer()
-                
-                HStack(spacing: 8) {
-                    Button(tokenizer == nil ? "Load tokenizer.json" : "Tokenizer Loaded ✅") {
-                        #if os(macOS)
-                        selectTokenizerWithOpenPanel()
-                        #else
-                        isTokenizerImporterPresented = true
-                        #endif
-                    }
-                    .buttonStyle(.bordered)
-                    .fileImporter(
-                        isPresented: $isTokenizerImporterPresented,
-                        allowedContentTypes: [.json, .data],
-                        allowsMultipleSelection: false
-                    ) { result in
-                        switch result {
-                        case .success(let urls):
-                            guard let url = urls.first else { return }
-                            if url.startAccessingSecurityScopedResource() {
-                                defer { url.stopAccessingSecurityScopedResource() }
-                                loadTokenizer(filePath: url.path)
-                            }
-                        case .failure(let error):
-                            errorMessage = error.localizedDescription
-                        }
-                    }
-                    
-                    Button("Select Model Folder / Index") {
-                        #if os(macOS)
-                        selectModelWithOpenPanel()
-                        #else
-                        isWeightImporterPresented = true
-                        #endif
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .fileImporter(
-                        isPresented: $isWeightImporterPresented,
-                        allowedContentTypes: [.folder, .json, .data],
-                        allowsMultipleSelection: true
-                    ) { result in
-                        switch result {
-                        case .success(let urls):
-                            guard let primaryUrl = urls.first else { return }
-                            
-                            // Start security access for all selected items/folders
-                            for url in urls {
-                                _ = url.startAccessingSecurityScopedResource()
-                            }
-                            
-                            // If a directory was picked, locate model.safetensors.index.json inside it
-                            var targetPath = primaryUrl.path
-                            if primaryUrl.hasDirectoryPath {
-                                let indexPath = primaryUrl.appendingPathComponent("model.safetensors.index.json").path
-                                if FileManager.default.fileExists(atPath: indexPath) {
-                                    targetPath = indexPath
-                                }
-                            }
-                            
-                            loadAndBridgeToMetal(filePath: targetPath)
-                            
-                        case .failure(let error):
-                            errorMessage = error.localizedDescription
-                        }
-                    }
+            )
+        } detail: {
+            ChatDetailView(
+                session: activeSessionBinding,
+                promptText: $chatPromptText,
+                isGenerating: isGeneratingText,
+                generationSpeed: generationSpeedTokPerSec,
+                generationTokens: generationTotalTokens,
+                modelName: summary != nil ? (modelConfig?.modelType ?? detectedArchitecture.shortName) : nil,
+                onSendMessage: { prompt in
+                    handleSendMessage(prompt)
+                },
+                onStopGeneration: {
+                    stopAutoregressiveGeneration()
+                },
+                onSelectPromptStarter: { starter in
+                    chatPromptText = starter
+                    handleSendMessage(starter)
+                    chatPromptText = ""
                 }
-            }
-            .padding()
-            .background(Color(NSColor.windowBackgroundColor))
-            
-            Divider()
-
-            // Tokenizer Playground Panel
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("Tokenization Playground")
-                        .font(.caption)
-                        .fontWeight(.bold)
-                        .foregroundColor(.secondary)
-                    Spacer()
-                }
-                
-                HStack {
-                    TextField("Enter prompt to encode...", text: $promptInput)
-                        .textFieldStyle(.roundedBorder)
-                        .onChange(of: promptInput) { _, newValue in
-                            runTokenization(text: newValue)
-                        }
-                    
-                    Button("Encode") {
-                        runTokenization(text: promptInput)
-                    }
-                    .disabled(tokenizer == nil)
-                }
-                
-                Text(tokenIDsOutput)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundColor(tokenizer == nil ? .secondary : .purple)
-                    .lineLimit(2)
-
-                HStack(spacing: 12) {
-                    if let tokenizer = tokenizer, let ids = try? tokenizer.encode(text: promptInput), !ids.isEmpty {
-                        Button(action: { executeEmbeddingLookup(tokenIds: ids) }) {
-                            Label("Generate Hidden State h_0", systemImage: "sparkles")
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.blue)
-                    }
-                    
-                    if activeH0Buffer != nil, let summary = summary, summary.layerCount > 0 {
-                        HStack(spacing: 8) {
-                            Picker("Layer", selection: $selectedLayerForRouting) {
-                                ForEach(0..<Int(summary.layerCount), id: \.self) { l in
-                                    Text("Layer \(l)").tag(l)
-                                }
-                            }
-                            .frame(width: 120)
-                            
-                            Button(action: { executeMoERouter(layerIndex: selectedLayerForRouting, topK: 8) }) {
-                                Label("Route Top-8", systemImage: "point.3.connected.trianglepath.dotted")
-                            }
-                            .buttonStyle(.bordered)
-                            
-                            Button(action: { executeMoELayerMLP(layerIndex: selectedLayerForRouting, topK: 8) }) {
-                                Label(isExecutingMlp ? "Computing MLP..." : "MoE MLP", systemImage: "bolt.fill")
-                            }
-                            .buttonStyle(.bordered)
-                            .tint(.purple)
-                            .disabled(isExecutingMlp || isExecutingFullLayer)
-
-                            Button(action: { executeFullLayerForward(layerIndex: selectedLayerForRouting) }) {
-                                Label(isExecutingFullLayer ? "Computing Block..." : "Execute Full Block (h_l → h_l+1)", systemImage: "arrow.triangle.merge")
-                            }
-                            .buttonStyle(.bordered)
-                            .tint(.indigo)
-                            .disabled(isExecutingFullLayer || isExecutingMlp || isExecutingMultiLayer || isExecutingLMHead)
-
-                            Button(action: { executeMultiLayerForward(numLayers: targetLayerCount) }) {
-                                Label(isExecutingMultiLayer ? "Executing Backbone..." : "Execute All \(targetLayerCount) Layers", systemImage: "square.stack.3d.forward.dottedline.fill")
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .tint(.teal)
-                            .disabled(isExecutingMultiLayer || isExecutingFullLayer || isExecutingMlp || isExecutingLMHead)
-
-                            Button(action: { executeLMHeadProjection() }) {
-                                Label(isExecutingLMHead ? "Projecting Vocab..." : "Project LM Head (Next Token)", systemImage: "text.word.spacing")
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .tint(.pink)
-                            .disabled(isExecutingLMHead || isExecutingMultiLayer || isExecutingFullLayer || isExecutingMlp || isGeneratingText)
-
-                            Button(action: {
-                                if isGeneratingText {
-                                    stopAutoregressiveGeneration()
-                                } else {
-                                    startAutoregressiveGeneration()
-                                }
-                            }) {
-                                Label(isGeneratingText ? "Stop Generation" : "Generate Text", systemImage: isGeneratingText ? "stop.fill" : "sparkles")
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .tint(isGeneratingText ? .red : .purple)
-                            .disabled(summary == nil || tokenizer == nil || isExecutingLMHead || isExecutingMultiLayer || isExecutingFullLayer || isExecutingMlp)
-                        }
-                    }
-                }
-                .padding(.top, 4)
-
-                // Live MoE Routing Visualizer Card
-                if !routedExperts.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Label("Layer \(selectedLayerForRouting) Top-8 Routed Experts (of \(summary?.maxExpertId ?? 256))", systemImage: "cpu.fill")
-                                .font(.subheadline)
-                                .fontWeight(.bold)
-                                .foregroundColor(.purple)
-                            
-                            Spacer()
-                            
-                            if let shared = sharedExpertWeight {
-                                Text(String(format: "Shared Expert Gate: %.1f%%", shared * 100.0))
-                                    .font(.caption)
-                                    .fontWeight(.bold)
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 3)
-                                    .background(Color.blue.opacity(0.15))
-                                    .foregroundColor(.blue)
-                                    .cornerRadius(6)
-                            }
-                        }
-                        
-                        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 4), spacing: 8) {
-                            ForEach(Array(routedExperts.enumerated()), id: \.offset) { rank, expert in
-                                ExpertRoutingBadgeView(rank: rank, expertId: expert.id, weight: expert.weight)
-                            }
-                        }
-                        
-                        if let status = routerStatusText {
-                            Text(status)
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                    .padding(10)
-                    .background(Color.purple.opacity(0.06))
-                    .cornerRadius(8)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(Color.purple.opacity(0.2), lineWidth: 1)
-                    )
-                }
-
-                // Live MoE Layer MLP Output Card
-                if let mlpStatus = layerMlpStatusText {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Label("Layer \(selectedLayerForRouting) MoE Forward Pass Output (h_mlp)", systemImage: "sparkles.rectangle.stack.fill")
-                                .font(.subheadline)
-                                .fontWeight(.bold)
-                                .foregroundColor(.green)
-                            Spacer()
-                        }
-                        
-                        Text(mlpStatus)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.primary)
-                        
-                        if let sample = layerMlpSampleOutput {
-                            Text(sample)
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                    .padding(10)
-                    .background(Color.green.opacity(0.06))
-                    .cornerRadius(8)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(Color.green.opacity(0.2), lineWidth: 1)
-                    )
-                }
-
-                // Live Full Layer Transformer Block Output Card (h_l+1)
-                if let fullStatus = fullLayerStatusText {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Label("Layer \(selectedLayerForRouting) Full Forward Block Output (h_\(selectedLayerForRouting + 1))", systemImage: "arrow.triangle.merge")
-                                .font(.subheadline)
-                                .fontWeight(.bold)
-                                .foregroundColor(.indigo)
-                            Spacer()
-                        }
-                        
-                        Text(fullStatus)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.primary)
-                        
-                        if let sample = fullLayerSampleOutput {
-                            Text(sample)
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                    .padding(10)
-                    .background(Color.indigo.opacity(0.06))
-                    .cornerRadius(8)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(Color.indigo.opacity(0.2), lineWidth: 1)
-                    )
-                }
-
-                // Live Multi-Layer Backbone Output Card (h_0 -> h_N)
-                if let multiStatus = multiLayerStatusText {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Label("Full Backbone Multi-Layer Forward Pass (h_0 → h_\(multiLayerTelemetry.count))", systemImage: "square.stack.3d.forward.dottedline.fill")
-                                .font(.subheadline)
-                                .fontWeight(.bold)
-                                .foregroundColor(.teal)
-                            Spacer()
-                        }
-                        
-                        Text(multiStatus)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.primary)
-                        
-                        // Per-layer telemetry horizontal feed
-                        if !multiLayerTelemetry.isEmpty {
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                HStack(spacing: 6) {
-                                    ForEach(multiLayerTelemetry) { item in
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text("L\(item.layerIndex)")
-                                                .font(.system(size: 10, weight: .bold, design: .monospaced))
-                                                .foregroundColor(.teal)
-                                            Text(String(format: "%.2fms", item.durationMs))
-                                                .font(.system(size: 9, design: .monospaced))
-                                                .foregroundColor(.secondary)
-                                            Text("||h||:\(String(format: "%.1f", item.l2Norm))")
-                                                .font(.system(size: 8, design: .monospaced))
-                                                .foregroundColor(.primary)
-                                            Text("[\(item.topExperts.prefix(3).map(String.init).joined(separator: ","))]")
-                                                .font(.system(size: 8, design: .monospaced))
-                                                .foregroundColor(.purple)
-                                        }
-                                        .padding(5)
-                                        .background(Color(NSColor.controlBackgroundColor))
-                                        .cornerRadius(6)
-                                        .overlay(
-                                            RoundedRectangle(cornerRadius: 6)
-                                                .stroke(Color.teal.opacity(0.3), lineWidth: 1)
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    .padding(10)
-                    .background(Color.teal.opacity(0.06))
-                    .cornerRadius(8)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(Color.teal.opacity(0.2), lineWidth: 1)
-                    )
-                }
-
-                // Live Predicted Token Candidates Card (LM Head Output)
-                if !topTokenPredictions.isEmpty {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Label("LM Head Predicted Next Tokens (Top-\(topTokenPredictions.count) Candidates)", systemImage: "sparkles")
-                                .font(.subheadline)
-                                .fontWeight(.bold)
-                                .foregroundColor(.pink)
-                            Spacer()
-                            if let status = lmHeadStatusText {
-                                Text(status)
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                            }
-                        }
-
-                        LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 5), spacing: 8) {
-                            ForEach(topTokenPredictions) { pred in
-                                VStack(alignment: .leading, spacing: 4) {
-                                    HStack {
-                                        Text("#\(pred.rank)")
-                                            .font(.caption2)
-                                            .foregroundColor(.secondary)
-                                        Text("\"\(pred.tokenString.replacingOccurrences(of: " ", with: " "))\"")
-                                            .font(.system(.subheadline, design: .monospaced))
-                                            .fontWeight(.bold)
-                                            .foregroundColor(.pink)
-                                            .lineLimit(1)
-                                        Spacer()
-                                        Text(String(format: "%.1f%%", pred.probability * 100.0))
-                                            .font(.system(.caption, design: .monospaced))
-                                            .fontWeight(.semibold)
-                                    }
-
-                                    GeometryReader { geo in
-                                        ZStack(alignment: .leading) {
-                                            Capsule()
-                                                .fill(Color.pink.opacity(0.15))
-                                                .frame(height: 6)
-                                            Capsule()
-                                                .fill(LinearGradient(colors: [.pink, .orange], startPoint: .leading, endPoint: .trailing))
-                                                .frame(width: max(4, geo.size.width * CGFloat(pred.probability)), height: 6)
-                                        }
-                                    }
-                                    .frame(height: 6)
-
-                                    HStack {
-                                        Text("ID: \(pred.tokenId)")
-                                            .font(.system(size: 9, design: .monospaced))
-                                            .foregroundColor(.secondary)
-                                        Spacer()
-                                        Text(String(format: "logit: %.2f", pred.logit))
-                                            .font(.system(size: 9, design: .monospaced))
-                                            .foregroundColor(.secondary)
-                                    }
-                                }
-                                .padding(8)
-                                .background(Color(NSColor.controlBackgroundColor))
-                                .cornerRadius(8)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 8)
-                                        .stroke(Color.pink.opacity(0.2), lineWidth: 1)
-                                )
-                            }
-                        }
-                    }
-                    .padding(10)
-                    .background(Color.pink.opacity(0.06))
-                    .cornerRadius(8)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8)
-                            .stroke(Color.pink.opacity(0.2), lineWidth: 1)
-                    )
-                }
-
-                // MARK: - Autoregressive Text Generation Playground Card
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Label("Interactive Text Generation (Autoregressive Engine)", systemImage: "sparkles")
-                            .font(.headline)
-                            .foregroundColor(.purple)
-
-                        Spacer()
-
-                        if isGeneratingText {
-                            ProgressView()
-                                .scaleEffect(0.7)
-                            Text(generationStatusText ?? "Generating tokens...")
-                                .font(.caption)
-                                .foregroundColor(.purple)
-                        } else if let status = generationStatusText {
-                            Text(status)
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-
-                    // Preset Prompts Chips
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 6) {
-                            Text("Presets:")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-
-                            Button("🌟 Mixture of Experts") {
-                                promptInput = "What is a Mixture of Experts (MoE) neural network and why is it efficient?"
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-
-                            Button("⚛️ Quantum Computing") {
-                                promptInput = "Explain the fundamental principles of quantum computing in simple terms:"
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-
-                            Button("⚡ Apple Silicon") {
-                                promptInput = "The architectural advantages of unified memory on Apple Silicon for LLMs are:"
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-
-                            Button("💻 Swift Async") {
-                                promptInput = "Write a Swift actor that manages thread-safe caching with async/await:"
-                            }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                        }
-                    }
-
-                    // Generation Hyperparameters Bar
-                    HStack(spacing: 16) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack {
-                                Text("Temperature:")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                                Text(String(format: "%.2f", temperature))
-                                    .font(.system(.caption2, design: .monospaced))
-                                    .fontWeight(.bold)
-                            }
-                            Slider(value: $temperature, in: 0.0...2.0, step: 0.05)
-                                .frame(width: 120)
-                        }
-
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack {
-                                Text("Top-P (Nucleus):")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                                Text(String(format: "%.2f", topP))
-                                    .font(.system(.caption2, design: .monospaced))
-                                    .fontWeight(.bold)
-                            }
-                            Slider(value: $topP, in: 0.1...1.0, step: 0.05)
-                                .frame(width: 120)
-                        }
-
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack {
-                                Text("Rep. Penalty:")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                                Text(String(format: "%.2f", repetitionPenalty))
-                                    .font(.system(.caption2, design: .monospaced))
-                                    .fontWeight(.bold)
-                            }
-                            Slider(value: $repetitionPenalty, in: 1.0...1.5, step: 0.05)
-                                .frame(width: 120)
-                        }
-
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack {
-                                Text("Max Tokens:")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                                Text("\(maxNewTokens)")
-                                    .font(.system(.caption2, design: .monospaced))
-                                    .fontWeight(.bold)
-                            }
-                            Stepper("", value: $maxNewTokens, in: 1...512, step: 16)
-                                .labelsHidden()
-                        }
-
-                        Spacer()
-
-                        HStack(spacing: 8) {
-                            if isGeneratingText {
-                                Button(action: stopAutoregressiveGeneration) {
-                                    Label("Stop", systemImage: "stop.fill")
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .tint(.red)
-                            } else {
-                                Button(action: startAutoregressiveGeneration) {
-                                    Label("Generate Text", systemImage: "sparkles")
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .tint(.purple)
-                                .disabled(summary == nil || tokenizer == nil || promptInput.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).isEmpty)
-                            }
-
-                            if !generatedStreamText.isEmpty {
-                                Button(action: {
-                                    generatedStreamText = ""
-                                    generationTotalTokens = 0
-                                    generationStatusText = nil
-                                }) {
-                                    Image(systemName: "trash")
-                                }
-                                .buttonStyle(.bordered)
-                                .help("Clear Generated Text")
-                            }
-                        }
-                    }
-                    .padding(8)
-                    .background(Color(NSColor.controlBackgroundColor))
-                    .cornerRadius(8)
-
-                    // Live Streaming Output Window
-                    if !generatedStreamText.isEmpty || isGeneratingText {
-                        reasoningAndResponseSection
-                    }
-                }
-                .padding(10)
-                .background(Color.purple.opacity(0.06))
-                .cornerRadius(8)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(Color.purple.opacity(0.2), lineWidth: 1)
-                )
-
-                // MARK: - Dynamic SSD Expert Paging & Working Set Controller Card
-                memoryControllerCard
-            }
-            .padding(10)
-            .background(Color(NSColor.controlBackgroundColor))
-            
-            Divider()
-
-            if let err = errorMessage {
-                ContentUnavailableView("Error", systemImage: "exclamationmark.triangle", description: Text(err))
-            } else if summary != nil {
-                VStack(spacing: 0) {
-                    // Search & Category Filter Chips
-                    VStack(spacing: 8) {
-                        HStack {
-                            Image(systemName: "magnifyingglass").foregroundColor(.secondary)
-                            TextField("Filter tensors by name or layer...", text: $searchText).textFieldStyle(.plain)
-                        }
-                        .padding(8)
-                        .background(Color(NSColor.controlBackgroundColor))
-                        .cornerRadius(6)
-
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 8) {
-                                ForEach(categoryFilters, id: \.self) { cat in
-                                    Button(action: { selectedCategory = cat }) {
-                                        Text(cat)
-                                            .font(.caption)
-                                            .padding(.horizontal, 10)
-                                            .padding(.vertical, 4)
-                                            .background(selectedCategory == cat ? Color.accentColor : Color(NSColor.controlColor))
-                                            .foregroundColor(selectedCategory == cat ? .white : .primary)
-                                            .cornerRadius(12)
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                        }
-                    }
-                    .padding(10)
-
-                    // Tensor Table
-                    Table(filteredTensors, selection: $selectedTensorID) {
-                        TableColumn("Tensor Name", value: \.name)
-                        TableColumn("Category") { t in
-                            Text(t.category)
-                                .font(.caption)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(t.category.contains("Expert") ? Color.purple.opacity(0.15) : Color.blue.opacity(0.15))
-                                .foregroundColor(t.category.contains("Expert") ? .purple : .blue)
-                                .cornerRadius(4)
-                        }
-                        TableColumn("Shape") { t in
-                            Text(t.shapeDisplay).font(.system(.body, design: .monospaced))
-                        }
-                        TableColumn("Dtype") { t in
-                            Text(t.dtype).font(.system(.body, design: .monospaced)).foregroundColor(.blue)
-                        }
-                        TableColumn("Shard") { t in
-                            Text("Shard #\(t.shardIndex)").font(.system(.caption, design: .monospaced)).foregroundColor(.secondary)
-                        }
-                        TableColumn("Size") { t in
-                            Text(String(format: "%.2f MB", t.sizeMb)).font(.system(.body, design: .monospaced))
-                        }
-                    }
-                    
-                    // Selected Tensor & GPU Execution Bar
-                    if let tensor = selectedTensor {
-                        Divider()
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Selected: \(tensor.name)")
-                                    .font(.headline)
-                                Text("Category: \(tensor.category) | Shard #\(tensor.shardIndex) | Offset: \(tensor.offsetStart) bytes")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                            }
-                            
-                            Spacer()
-                            
-                            Button("Run Metal Compute Kernel") {
-                                executeGpuShader(on: tensor)
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .tint(.purple)
-                        }
-                        .padding()
-                        .background(Color(NSColor.controlBackgroundColor))
-                        
-                        if let output = gpuComputeOutput {
-                            HStack {
-                                Text(output)
-                                    .font(.system(.caption, design: .monospaced))
-                                    .foregroundColor(.purple)
-                                Spacer()
-                            }
-                            .padding([.horizontal, .bottom])
-                            .background(Color(NSColor.controlBackgroundColor))
-                        }
-                    }
-                }
-            } else {
-                ContentUnavailableView("No Weights Loaded", systemImage: "memorychip", description: Text("Select a .safetensors or index.json file to inspect MoE layer topology."))
-            }
+            )
         }
-        .frame(minWidth: 900, minHeight: 650)
+        .sheet(isPresented: $isSettingsPresented) {
+            SettingsSheetView(
+                summary: summary,
+                tokenizer: tokenizer,
+                metalStatus: metalStatus,
+                detectedArchitecture: detectedArchitecture,
+                onSelectModel: {
+                    #if os(macOS)
+                    selectModelWithOpenPanel()
+                    #else
+                    isWeightImporterPresented = true
+                    #endif
+                },
+                onSelectTokenizer: {
+                    #if os(macOS)
+                    selectTokenizerWithOpenPanel()
+                    #else
+                    isTokenizerImporterPresented = true
+                    #endif
+                },
+                temperature: $temperature,
+                topP: $topP,
+                topK: $topK,
+                repetitionPenalty: $repetitionPenalty,
+                maxNewTokens: $maxNewTokens,
+                systemPrompt: $systemPrompt,
+                targetLayerCount: $targetLayerCount,
+                memoryExecutionMode: $memoryExecutionMode,
+                memoryBudgetMode: $memoryBudgetMode,
+                currentRssGB: currentRssGB,
+                residentExpertCount: residentExpertCount,
+                totalExpertCount: totalExpertCount,
+                cacheHitRate: cacheHitRate,
+                lastPagingLatencyMs: lastPagingLatencyMs,
+                pagingStatusMessage: pagingStatusMessage,
+                onFlushCache: { flushExpertCache() },
+                onPreFaultAll: { preFaultAllWeights() },
+                filteredTensors: filteredTensors,
+                searchText: $searchText,
+                selectedCategory: $selectedCategory,
+                categoryFilters: categoryFilters,
+                selectedTensorID: $selectedTensorID,
+                selectedTensor: selectedTensor,
+                onExecuteMoERouter: { l in executeMoERouter(layerIndex: l) },
+                onExecuteFullLayer: { l in executeFullLayerForward(layerIndex: l) },
+                onExecuteMultiLayer: { n in executeMultiLayerForward(numLayers: n) },
+                isExecutingMlp: isExecutingMlp,
+                isExecutingFullLayer: isExecutingFullLayer,
+                isExecutingMultiLayer: isExecutingMultiLayer
+            )
+        }
         .onAppear {
+            if selectedSessionId == nil {
+                selectedSessionId = sessions.first?.id
+            }
             updatePagingStats()
         }
         .task {
@@ -1181,296 +595,40 @@ struct ContentView: View {
             }
         }
     }
-    
-    // MARK: - Modular UI Subcomponents
-    private var shouldShowBudgetPicker: Bool {
-        if memoryExecutionMode == .dynamicStreaming { return true }
-        if memoryExecutionMode == .autoDetect {
-            let footprint = self.summary?.sizeGb ?? 18.0
-            return memoryExecutionMode.resolveEffectiveMode(modelFootprintGB: footprint) == .dynamicStreaming
+
+    private func handleSendMessage(_ text: String) {
+        guard let currentSessionId = selectedSessionId ?? sessions.first?.id else { return }
+        guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return }
+        
+        let userMsg = ChatMessage(role: .user, content: text)
+        sessions[sessionIdx].messages.append(userMsg)
+        
+        // Auto-title session if it's the first user message
+        if sessions[sessionIdx].messages.filter({ $0.role == .user }).count == 1 {
+            let cleanTitle = text.prefix(28).trimmingCharacters(in: .whitespacesAndNewlines)
+            sessions[sessionIdx].title = cleanTitle.isEmpty ? "Chat" : String(cleanTitle)
         }
-        return false
-    }
-
-    @ViewBuilder
-    private var reasoningAndResponseSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Label("Stream Output", systemImage: "text.bubble.fill")
-                    .font(.caption)
-                    .fontWeight(.semibold)
-                    .foregroundColor(.purple)
-
-                Spacer()
-
-                if generationTotalTokens > 0 {
-                    HStack(spacing: 10) {
-                        Text("⚡ \(String(format: "%.1f", generationSpeedTokPerSec)) tok/s")
-                            .font(.system(.caption2, design: .monospaced))
-                            .fontWeight(.bold)
-                            .foregroundColor(.green)
-
-                        Text("\(generationTotalTokens) tokens")
-                            .font(.system(.caption2, design: .monospaced))
-                            .foregroundColor(.secondary)
-
-                        Text("\(String(format: "%.0f", generationElapsedMs)) ms")
-                            .font(.system(.caption2, design: .monospaced))
-                            .foregroundColor(.secondary)
-                    }
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Color.purple.opacity(0.1))
-                    .cornerRadius(4)
+        
+        let assistantMsgId = UUID()
+        let assistantMsg = ChatMessage(id: assistantMsgId, role: .assistant, content: "", thinkingContent: "", isThinking: true)
+        sessions[sessionIdx].messages.append(assistantMsg)
+        
+        // Build prompt formatted with chat template
+        var promptString = "<|im_start|>system\n\(systemPrompt)<|im_end|>\n"
+        for msg in sessions[sessionIdx].messages.dropLast() {
+            if msg.role == .user {
+                promptString += "<|im_start|>user\n\(msg.content)<|im_end|>\n"
+            } else if msg.role == .assistant {
+                if let think = msg.thinkingContent, !think.isEmpty {
+                    promptString += "<|im_start|>assistant\n<think>\n\(think)\n</think>\n\(msg.content)<|im_end|>\n"
+                } else {
+                    promptString += "<|im_start|>assistant\n\(msg.content)<|im_end|>\n"
                 }
-            }
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    // Collapsible Reasoning Process Block
-                    if !thinkingText.isEmpty {
-                        DisclosureGroup(
-                            isExpanded: $isThinkingExpanded,
-                            content: {
-                                Text(thinkingText)
-                                    .font(.system(.caption, design: .monospaced))
-                                    .foregroundColor(.secondary)
-                                    .textSelection(.enabled)
-                                    .padding(8)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(Color.secondary.opacity(0.08))
-                                    .cornerRadius(6)
-                            },
-                            label: {
-                                HStack(spacing: 6) {
-                                    Image(systemName: isThinking ? "brain.head.profile" : "brain")
-                                        .foregroundColor(.purple)
-                                    Text(isThinking ? "Reasoning in progress..." : "Thought Process")
-                                        .font(.caption)
-                                        .fontWeight(.medium)
-                                        .foregroundColor(.purple)
-                                    if isThinking {
-                                        ProgressView()
-                                            .scaleEffect(0.5)
-                                    }
-                                }
-                            }
-                        )
-                    }
-
-                    // Main Text Response
-                    if !responseText.isEmpty || (!isThinking && !generatedStreamText.isEmpty) || isGeneratingText {
-                        HStack(alignment: .top, spacing: 0) {
-                            let displayText = !responseText.isEmpty ? responseText : (thinkingText.isEmpty ? generatedStreamText : "")
-                            Text(displayText)
-                                .font(.system(.body, design: .default))
-                                .textSelection(.enabled)
-
-                            if isGeneratingText && !isThinking {
-                                Text("▊")
-                                    .foregroundColor(.purple)
-                                    .opacity(0.8)
-                            }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-                .padding(10)
-            }
-            .frame(minHeight: 100, maxHeight: 300)
-            .background(Color(NSColor.textBackgroundColor))
-            .cornerRadius(6)
-            .overlay(
-                RoundedRectangle(cornerRadius: 6)
-                    .stroke(Color.purple.opacity(0.3), lineWidth: 1)
-            )
-        }
-        .padding(8)
-        .background(Color.purple.opacity(0.04))
-        .cornerRadius(8)
-    }
-
-    @ViewBuilder
-    private var memoryControllerCard: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            // Header: Title, Status Message & Action Buttons
-            HStack(spacing: 12) {
-                Label("Dynamic SSD Expert Paging & Memory Controller", systemImage: "memorychip")
-                    .font(.headline)
-                    .foregroundColor(.indigo)
-
-                Spacer()
-
-                if let msg = pagingStatusMessage {
-                    Text(msg)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-
-                HStack(spacing: 8) {
-                    Button(action: flushExpertCache) {
-                        Label("Flush Cache", systemImage: "trash")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .help("Release all resident expert pages using madvise(MADV_DONTNEED) to minimize RAM to baseline")
-
-                    Button(action: preFaultAllWeights) {
-                        Label("Pre-Fault All", systemImage: "bolt.fill")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .help("Pre-fault all model shards into RAM for maximum raw throughput on high-RAM Macs")
-                }
-            }
-
-            // Controls Section: Execution Mode & Budget (if applicable)
-            HStack(alignment: .top, spacing: 20) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Execution Mode")
-                        .font(.caption)
-                        .fontWeight(.semibold)
-                        .foregroundColor(.secondary)
-
-                    Picker("Memory Mode", selection: $memoryExecutionMode) {
-                        ForEach(MemoryExecutionMode.allCases) { mode in
-                            Text(mode.rawValue).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(width: 320)
-                    .onChange(of: memoryExecutionMode) { newMode in
-                        applyMemoryExecutionMode(newMode)
-                    }
-                }
-
-                if shouldShowBudgetPicker {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Working-Set Budget")
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                            .foregroundColor(.secondary)
-
-                        Picker("Budget", selection: $memoryBudgetMode) {
-                            ForEach(MemoryBudgetMode.allCases) { mode in
-                                Text(mode.rawValue).tag(mode)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .frame(width: 240)
-                        .onChange(of: memoryBudgetMode) { newMode in
-                            applyMemoryBudget(newMode)
-                        }
-                    }
-                }
-
-                Spacer()
-            }
-
-            // Mode Description Callout
-            HStack(alignment: .center, spacing: 6) {
-                Image(systemName: memoryExecutionMode.icon)
-                    .font(.caption)
-                    .foregroundColor(.indigo)
-                Text(memoryExecutionMode.description)
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(Color.indigo.opacity(0.05))
-            .cornerRadius(4)
-
-            // Real-Time Memory & Paging Telemetry Grid
-            HStack(spacing: 12) {
-                // Physical RSS
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("PHYSICAL RSS")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundColor(.secondary)
-                    HStack(alignment: .bottom, spacing: 4) {
-                        Text(String(format: "%.2f", currentRssGB))
-                            .font(.system(.title3, design: .monospaced))
-                            .fontWeight(.bold)
-                            .foregroundColor(currentRssGB > memoryBudgetMode.targetMaxRssGB ? .orange : .indigo)
-                        Text("GB / \(String(format: "%.0f", memoryBudgetMode.targetMaxRssGB)) GB")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                    }
-                }
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color(NSColor.controlBackgroundColor))
-                .cornerRadius(6)
-
-                // Resident Experts
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("RESIDENT EXPERTS")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundColor(.secondary)
-                    HStack(alignment: .bottom, spacing: 4) {
-                        Text("\(residentExpertCount)")
-                            .font(.system(.title3, design: .monospaced))
-                            .fontWeight(.bold)
-                            .foregroundColor(.purple)
-                        Text("/ \(totalExpertCount > 0 ? "\(totalExpertCount)" : "10,240")")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                    }
-                }
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color(NSColor.controlBackgroundColor))
-                .cornerRadius(6)
-
-                // Cache Hit Rate
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("PREFETCH HIT RATE")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundColor(.secondary)
-                    HStack(alignment: .bottom, spacing: 4) {
-                        Text(String(format: "%.1f%%", cacheHitRate))
-                            .font(.system(.title3, design: .monospaced))
-                            .fontWeight(.bold)
-                            .foregroundColor(cacheHitRate >= 80.0 ? .green : (cacheHitRate >= 50.0 ? .yellow : .orange))
-                        Text("(\(WorkingSetManager.shared.totalAccesses) reqs)")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                    }
-                }
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color(NSColor.controlBackgroundColor))
-                .cornerRadius(6)
-
-                // SSD Paging Latency
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("PAGING OVERHEAD")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundColor(.secondary)
-                    HStack(alignment: .bottom, spacing: 4) {
-                        Text(String(format: "%.2f", lastPagingLatencyMs))
-                            .font(.system(.title3, design: .monospaced))
-                            .fontWeight(.bold)
-                            .foregroundColor(lastPagingLatencyMs < 2.0 ? .green : .blue)
-                        Text("ms/layer")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                    }
-                }
-                .padding(8)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color(NSColor.controlBackgroundColor))
-                .cornerRadius(6)
             }
         }
-        .padding(10)
-        .background(Color.indigo.opacity(0.06))
-        .cornerRadius(8)
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color.indigo.opacity(0.2), lineWidth: 1)
-        )
+        promptString += "<|im_start|>assistant\n<think>\n"
+        
+        startAutoregressiveGeneration(customPrompt: promptString, sessionId: currentSessionId, messageId: assistantMsgId)
     }
 
     // MARK: - Tokenizer Execution
@@ -3194,19 +2352,26 @@ struct ContentView: View {
         generationStatusText = "⏹ Generation stopped by user."
     }
 
-    private func startAutoregressiveGeneration() {
+    private func startAutoregressiveGeneration(customPrompt: String? = nil, sessionId: UUID? = nil, messageId: UUID? = nil) {
         guard let summary = summary,
               let tokenizer = tokenizer,
               let device = MTLCreateSystemDefaultDevice(),
               let commandQueue = device.makeCommandQueue(),
               let defaultLibrary = device.makeDefaultLibrary() else {
-            let err = "❌ Metal or Tokenizer not ready for text generation."
+            let err = "❌ Metal or Tokenizer not ready for text generation. Please load model and tokenizer in Settings."
+            if let sId = sessionId, let mId = messageId {
+                if let sIdx = sessions.firstIndex(where: { $0.id == sId }),
+                   let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                    sessions[sIdx].messages[mIdx].content = err
+                    sessions[sIdx].messages[mIdx].isThinking = false
+                }
+            }
             gpuComputeOutput = err
             generationStatusText = err
             return
         }
 
-        let prompt = promptInput.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        let prompt = (customPrompt ?? promptInput).trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         guard !prompt.isEmpty else {
             let err = "⚠️ Please enter a prompt to generate text."
             gpuComputeOutput = err
@@ -4740,6 +3905,17 @@ struct ContentView: View {
                         self.totalExpertCount = totalExp
                         self.cacheHitRate = hitRate
                         self.lastPagingLatencyMs = pageLat
+
+                        if let sId = sessionId, let mId = messageId {
+                            if let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                               let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                                self.sessions[sIdx].messages[mIdx].thinkingContent = thinkPart
+                                self.sessions[sIdx].messages[mIdx].content = respPart
+                                self.sessions[sIdx].messages[mIdx].isThinking = activeThink
+                                self.sessions[sIdx].messages[mIdx].tokenCount = tokensGenerated
+                                self.sessions[sIdx].messages[mIdx].tokensPerSec = tokPerSec
+                            }
+                        }
                     }
                 }
             }
@@ -4781,6 +3957,17 @@ struct ContentView: View {
                 self.residentExpertCount = finalResCount
                 self.cacheHitRate = finalHitRate
                 self.lastPagingLatencyMs = finalPageLat
+
+                if let sId = sessionId, let mId = messageId {
+                    if let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                       let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                        self.sessions[sIdx].messages[mIdx].thinkingContent = finalThink
+                        self.sessions[sIdx].messages[mIdx].content = finalResp
+                        self.sessions[sIdx].messages[mIdx].isThinking = false
+                        self.sessions[sIdx].messages[mIdx].tokenCount = tokensGenerated
+                        self.sessions[sIdx].messages[mIdx].tokensPerSec = finalTokPerSec
+                    }
+                }
             }
         }
     }
