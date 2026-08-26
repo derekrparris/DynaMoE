@@ -7,9 +7,49 @@
 
 import SwiftUI
 import SwiftData
+import Combine
+
+final class AppZoomManager: ObservableObject {
+    static let shared = AppZoomManager()
+
+    @Published var zoomScale: CGFloat {
+        didSet {
+            UserDefaults.standard.set(Double(zoomScale), forKey: "dynamoe_ui_zoom_scale")
+        }
+    }
+
+    init() {
+        let saved = UserDefaults.standard.double(forKey: "dynamoe_ui_zoom_scale")
+        self.zoomScale = (saved >= 0.5 && saved <= 3.0) ? CGFloat(saved) : 1.0
+    }
+
+    func zoomIn() {
+        if zoomScale < 2.5 {
+            zoomScale = (zoomScale + 0.1).roundedScale()
+        }
+    }
+
+    func zoomOut() {
+        if zoomScale > 0.6 {
+            zoomScale = (zoomScale - 0.1).roundedScale()
+        }
+    }
+
+    func resetZoom() {
+        zoomScale = 1.0
+    }
+}
+
+private extension CGFloat {
+    func roundedScale() -> CGFloat {
+        return (self * 10.0).rounded() / 10.0
+    }
+}
 
 @main
 struct DynaMoEApp: App {
+    @StateObject private var zoomManager = AppZoomManager.shared
+
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
             Item.self,
@@ -25,8 +65,36 @@ struct DynaMoEApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            GeometryReader { geo in
+                ContentView()
+                    .frame(
+                        width: max(100, geo.size.width / zoomManager.zoomScale),
+                        height: max(100, geo.size.height / zoomManager.zoomScale)
+                    )
+                    .scaleEffect(zoomManager.zoomScale, anchor: .topLeading)
+            }
+            .environmentObject(zoomManager)
         }
         .modelContainer(sharedModelContainer)
+        .commands {
+            SidebarCommands()
+            CommandGroup(after: .sidebar) {
+                Divider()
+                Button("Actual Size") {
+                    zoomManager.resetZoom()
+                }
+                .keyboardShortcut("0", modifiers: .command)
+
+                Button("Zoom In") {
+                    zoomManager.zoomIn()
+                }
+                .keyboardShortcut("+", modifiers: .command)
+
+                Button("Zoom Out") {
+                    zoomManager.zoomOut()
+                }
+                .keyboardShortcut("-", modifiers: .command)
+            }
+        }
     }
 }
