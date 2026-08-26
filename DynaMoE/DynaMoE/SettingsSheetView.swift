@@ -7,7 +7,7 @@ import SwiftUI
 import Metal
 
 enum SettingsTab: String, CaseIterable, Identifiable {
-    case model = "Model"
+    case models = "Models"
     case generation = "Generation"
     case memory = "Memory & SSD"
     case advanced = "Advanced Diagnostics"
@@ -16,7 +16,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
 
     var icon: String {
         switch self {
-        case .model: return "cube.transparent"
+        case .models: return "square.stack.3d.up.fill"
         case .generation: return "slider.horizontal.3"
         case .memory: return "memorychip"
         case .advanced: return "waveform.path.ecg"
@@ -26,16 +26,19 @@ enum SettingsTab: String, CaseIterable, Identifiable {
 
 struct SettingsSheetView: View {
     @Environment(\.dismiss) private var dismiss
-    @State private var selectedTab: SettingsTab = .model
+    @State private var selectedTab: SettingsTab = .models
+    @ObservedObject var localModelManager: LocalModelManager = LocalModelManager.shared
 
     // Model & Tokenizer bindings
     var summary: ModelSummary?
     var modelConfig: ModelConfig? = nil
     var tokenizer: DynaMoeTokenizer?
+    var activeModelPath: String? = nil
     var metalStatus: String
     var detectedArchitecture: ModelArchitectureType
     var onSelectModel: () -> Void
     var onSelectTokenizer: () -> Void
+    var onLoadDiscoveredModel: (DiscoveredModel) -> Void
 
     // Generation Parameters bindings
     @Binding var temperature: Float
@@ -111,8 +114,8 @@ struct SettingsSheetView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     switch selectedTab {
-                    case .model:
-                        modelSettingsSection
+                    case .models:
+                        modelsSettingsSection
                     case .generation:
                         generationSettingsSection
                     case .memory:
@@ -124,65 +127,246 @@ struct SettingsSheetView: View {
                 .padding(20)
             }
         }
-        .frame(minWidth: 640, minHeight: 520)
+        .frame(minWidth: 680, minHeight: 560)
         .background(Color(NSColor.windowBackgroundColor))
     }
 
-    // MARK: - Tab 1: Model & Weights
-    private var modelSettingsSection: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Model & Weights Configuration")
-                .font(.headline)
+    // MARK: - Tab 1: Models & Weights Management
+    private var modelsSettingsSection: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            // Section Header with Refresh Button
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Installed Local Models")
+                        .font(.headline)
+                        .fontWeight(.bold)
+                    Text("Auto-discovered from Hugging Face cache (~/.cache/huggingface/hub)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
 
-            VStack(alignment: .leading, spacing: 12) {
-                // Model Weights Card
-                HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Model Weights (Safetensors)")
-                            .font(.subheadline)
-                            .fontWeight(.semibold)
-                        if let summary = summary {
-                            Text("\(summary.layerCount) Layers • \(summary.tensors.count) Tensors • \(detectedArchitecture.shortName)")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
+                Spacer()
+
+                Button(action: {
+                    localModelManager.scanLocalModels()
+                }) {
+                    HStack(spacing: 5) {
+                        if localModelManager.isScanning {
+                            ProgressView()
+                                .controlSize(.small)
                         } else {
-                            Text("No model weights loaded.")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
+                            Image(systemName: "arrow.clockwise")
                         }
+                        Text(localModelManager.isScanning ? "Scanning..." : "Refresh Cache")
+                            .font(.caption)
+                    }
+                }
+                .buttonStyle(.bordered)
+                .disabled(localModelManager.isScanning)
+            }
+
+            // Discovered Models List
+            if localModelManager.discoveredModels.isEmpty {
+                VStack(spacing: 10) {
+                    Image(systemName: "shippingbox.and.arrow.backward")
+                        .font(.system(size: 32))
+                        .foregroundColor(.secondary.opacity(0.5))
+                    Text("No Hugging Face models found in cache")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                    Text("Download a safetensors model into ~/.cache/huggingface/hub or select a local folder below.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 32)
+                .background(Color.secondary.opacity(0.04))
+                .cornerRadius(12)
+            } else {
+                VStack(spacing: 10) {
+                    ForEach(localModelManager.discoveredModels) { model in
+                        let isDefault = localModelManager.defaultModelId == model.id || localModelManager.defaultModelId == model.repoId
+                        let isCurrentActive = (activeModelPath != nil && (activeModelPath == model.snapshotPath || activeModelPath == model.weightsEntryPath || (summary != nil && (modelConfig?.modelType ?? "").localizedCaseInsensitiveContains(model.displayName))))
+
+                        HStack(alignment: .center, spacing: 14) {
+                            // Leading Model Icon
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 10)
+                                    .fill(isCurrentActive ? Color.purple.opacity(0.15) : Color.secondary.opacity(0.08))
+                                    .frame(width: 44, height: 44)
+                                Image(systemName: model.isMoE ? "circle.hexagongrid.circle.fill" : "cube.fill")
+                                    .font(.system(size: 20))
+                                    .foregroundColor(isCurrentActive ? .purple : .secondary)
+                            }
+
+                            // Model Info
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack(spacing: 6) {
+                                    Text(model.displayName)
+                                        .font(.system(size: 13.5, weight: .semibold))
+                                        .foregroundColor(.primary)
+
+                                    if isDefault {
+                                        Text("★ DEFAULT")
+                                            .font(.system(size: 9.5, weight: .bold))
+                                            .foregroundColor(.purple)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(Color.purple.opacity(0.12))
+                                            .cornerRadius(4)
+                                    }
+
+                                    if isCurrentActive {
+                                        Text("● ACTIVE")
+                                            .font(.system(size: 9.5, weight: .bold))
+                                            .foregroundColor(.green)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(Color.green.opacity(0.12))
+                                            .cornerRadius(4)
+                                    }
+                                }
+
+                                HStack(spacing: 8) {
+                                    Text(model.author)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+
+                                    Text("•")
+                                        .foregroundColor(.secondary.opacity(0.4))
+
+                                    Text(model.architectureName)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+
+                                    if let quant = model.quantization {
+                                        Text("•")
+                                            .foregroundColor(.secondary.opacity(0.4))
+                                        Text(quant)
+                                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                                            .foregroundColor(.indigo)
+                                    }
+
+                                    Text("•")
+                                        .foregroundColor(.secondary.opacity(0.4))
+
+                                    Text(model.formattedSize)
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+
+                            Spacer()
+
+                            // Action Buttons: Default toggle & Load button
+                            HStack(spacing: 8) {
+                                Button(action: {
+                                    if isDefault {
+                                        localModelManager.setDefaultModel(id: nil)
+                                    } else {
+                                        localModelManager.setDefaultModel(id: model.id)
+                                    }
+                                }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: isDefault ? "star.fill" : "star")
+                                            .font(.system(size: 11))
+                                            .foregroundColor(isDefault ? .orange : .secondary)
+                                        Text(isDefault ? "Default" : "Set Default")
+                                            .font(.caption)
+                                    }
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 5)
+                                    .background(isDefault ? Color.orange.opacity(0.1) : Color.secondary.opacity(0.06))
+                                    .cornerRadius(6)
+                                }
+                                .buttonStyle(.plain)
+                                .help("Make this model load by default for all new conversations")
+
+                                if isCurrentActive {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .font(.system(size: 11))
+                                            .foregroundColor(.green)
+                                        Text("Loaded")
+                                            .font(.caption)
+                                            .fontWeight(.semibold)
+                                            .foregroundColor(.green)
+                                    }
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(Color.green.opacity(0.1))
+                                    .cornerRadius(6)
+                                } else {
+                                    Button(action: {
+                                        onLoadDiscoveredModel(model)
+                                    }) {
+                                        Text("Load Model")
+                                            .font(.caption)
+                                            .fontWeight(.semibold)
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                }
+                            }
+                        }
+                        .padding(12)
+                        .background(Color(NSColor.controlBackgroundColor))
+                        .cornerRadius(10)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(isCurrentActive ? Color.purple.opacity(0.3) : Color.primary.opacity(0.06), lineWidth: 1)
+                        )
+                    }
+                }
+            }
+
+            Divider()
+                .padding(.vertical, 4)
+
+            // Other Model Actions / Custom Folder Selector
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Custom Local Paths & Fallbacks")
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Custom Folder or Safetensors File")
+                            .font(.system(size: 13, weight: .medium))
+                        Text("Load a model outside of Hugging Face cache (e.g. external SSD)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                     }
                     Spacer()
-                    Button("Select Model Folder / Index", action: onSelectModel)
-                        .buttonStyle(.borderedProminent)
+                    Button("Browse Folder / Index...", action: onSelectModel)
+                        .buttonStyle(.bordered)
                 }
-                .padding(14)
-                .background(Color.secondary.opacity(0.06))
-                .cornerRadius(10)
+                .padding(12)
+                .background(Color.secondary.opacity(0.04))
+                .cornerRadius(8)
 
                 // Tokenizer Card
                 HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Tokenizer (tokenizer.json)")
-                            .font(.subheadline)
-                            .fontWeight(.semibold)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Custom Tokenizer (tokenizer.json)")
+                            .font(.system(size: 13, weight: .medium))
                         Text(tokenizer != nil ? "Tokenizer Loaded & Ready ✅" : "No tokenizer loaded.")
                             .font(.caption)
-                            .foregroundColor(.secondary)
+                            .foregroundColor(tokenizer != nil ? .green : .secondary)
                     }
                     Spacer()
                     Button(tokenizer == nil ? "Load tokenizer.json" : "Replace Tokenizer", action: onSelectTokenizer)
                         .buttonStyle(.bordered)
                 }
-                .padding(14)
-                .background(Color.secondary.opacity(0.06))
-                .cornerRadius(10)
+                .padding(12)
+                .background(Color.secondary.opacity(0.04))
+                .cornerRadius(8)
 
                 // GPU & Metal Backend Status
                 HStack {
-                    VStack(alignment: .leading, spacing: 4) {
+                    VStack(alignment: .leading, spacing: 3) {
                         Text("Metal GPU Acceleration")
-                            .font(.subheadline)
-                            .fontWeight(.semibold)
+                            .font(.system(size: 13, weight: .medium))
                         Text(metalStatus)
                             .font(.caption)
                             .foregroundColor(metalStatus.contains("✅") ? .green : .secondary)
@@ -198,9 +382,9 @@ struct SettingsSheetView: View {
                             .cornerRadius(6)
                     }
                 }
-                .padding(14)
-                .background(Color.secondary.opacity(0.06))
-                .cornerRadius(10)
+                .padding(12)
+                .background(Color.secondary.opacity(0.04))
+                .cornerRadius(8)
             }
         }
     }

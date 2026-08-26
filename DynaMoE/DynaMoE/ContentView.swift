@@ -444,6 +444,8 @@ struct ContentView: View {
     @State private var pagingStatusMessage: String? = nil
 
     // Multi-Session Chat UI State (Antigravity Style)
+    @ObservedObject var localModelManager: LocalModelManager = LocalModelManager.shared
+    @State private var activeLoadedModelPath: String? = nil
     @State private var sessions: [ChatSession] = [
         ChatSession(title: "New Chat")
     ]
@@ -502,6 +504,18 @@ struct ContentView: View {
         summary?.tensors.first(where: { $0.name == selectedTensorID })
     }
 
+    private func switchModel(to model: DiscoveredModel) {
+        loadAndBridgeToMetal(filePath: model.snapshotPath)
+        activeLoadedModelPath = model.snapshotPath
+        localModelManager.setLastUsedModel(id: model.id)
+        if let sid = selectedSessionId ?? sessions.first?.id,
+           let idx = sessions.firstIndex(where: { $0.id == sid }) {
+            sessions[idx].selectedModelId = model.id
+            sessions[idx].selectedModelName = model.displayName
+            sessions[idx].selectedModelPath = model.snapshotPath
+        }
+    }
+
     var body: some View {
         NavigationSplitView {
             SidebarView(
@@ -513,14 +527,29 @@ struct ContentView: View {
                 currentRssGB: currentRssGB,
                 isGenerating: isGeneratingText,
                 onNewChat: {
-                    let newSession = ChatSession(title: "New Chat")
+                    let defModel = localModelManager.getDefaultOrFirstModel()
+                    let newSession = ChatSession(
+                        title: "New Chat",
+                        selectedModelId: defModel?.id,
+                        selectedModelName: defModel?.displayName,
+                        selectedModelPath: defModel?.snapshotPath
+                    )
                     sessions.insert(newSession, at: 0)
                     selectedSessionId = newSession.id
+                    if let model = defModel, activeLoadedModelPath != model.snapshotPath {
+                        switchModel(to: model)
+                    }
                 },
                 onDeleteSession: { id in
                     sessions.removeAll(where: { $0.id == id })
                     if sessions.isEmpty {
-                        let newSession = ChatSession(title: "New Chat")
+                        let defModel = localModelManager.getDefaultOrFirstModel()
+                        let newSession = ChatSession(
+                            title: "New Chat",
+                            selectedModelId: defModel?.id,
+                            selectedModelName: defModel?.displayName,
+                            selectedModelPath: defModel?.snapshotPath
+                        )
                         sessions.append(newSession)
                         selectedSessionId = newSession.id
                     } else if selectedSessionId == id {
@@ -547,6 +576,12 @@ struct ContentView: View {
                     chatPromptText = starter
                     handleSendMessage(starter)
                     chatPromptText = ""
+                },
+                onSelectDiscoveredModel: { dm in
+                    switchModel(to: dm)
+                },
+                onOpenSettings: {
+                    isSettingsPresented = true
                 }
             )
         }
@@ -555,6 +590,7 @@ struct ContentView: View {
                 summary: summary,
                 modelConfig: modelConfig,
                 tokenizer: tokenizer,
+                activeModelPath: activeLoadedModelPath,
                 metalStatus: metalStatus,
                 detectedArchitecture: detectedArchitecture,
                 onSelectModel: {
@@ -570,6 +606,9 @@ struct ContentView: View {
                     #else
                     isTokenizerImporterPresented = true
                     #endif
+                },
+                onLoadDiscoveredModel: { dm in
+                    switchModel(to: dm)
                 },
                 temperature: $temperature,
                 topP: $topP,
@@ -606,7 +645,23 @@ struct ContentView: View {
             if selectedSessionId == nil {
                 selectedSessionId = sessions.first?.id
             }
+            if summary == nil {
+                if let initialModel = localModelManager.getDefaultOrFirstModel() {
+                    switchModel(to: initialModel)
+                }
+            }
             updatePagingStats()
+        }
+        .onChange(of: selectedSessionId) { newId in
+            guard let newId = newId, let session = sessions.first(where: { $0.id == newId }) else { return }
+            if let targetPath = session.selectedModelPath, !targetPath.isEmpty, activeLoadedModelPath != targetPath {
+                if let model = localModelManager.getModel(byId: targetPath) ?? localModelManager.getModel(byId: session.selectedModelId ?? "") {
+                    switchModel(to: model)
+                } else {
+                    loadAndBridgeToMetal(filePath: targetPath)
+                    activeLoadedModelPath = targetPath
+                }
+            }
         }
         .task {
             while !Task.isCancelled {
@@ -4153,8 +4208,8 @@ struct ContentView: View {
                 WorkingSetManager.shared.initialize(summary: loadedSummary, shardBuffers: buffers, mode: self.memoryBudgetMode)
                 self.pagingStatusMessage = "🌊 Operating in Dynamic SSD Streaming Mode"
             }
+            self.activeLoadedModelPath = filePath
             updatePagingStats()
-            
             metalStatus = "✅ Zero-Copy Active! \(loadedSummary.shards.count) Shards Mapped (\(String(format: "%.2f", mappedGB)) GB)"
             
         } catch {

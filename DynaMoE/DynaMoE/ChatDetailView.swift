@@ -9,6 +9,7 @@ import AppKit
 struct ChatDetailView: View {
     @Binding var session: ChatSession?
     @Binding var promptText: String
+    @ObservedObject var localModelManager: LocalModelManager = LocalModelManager.shared
     
     var isGenerating: Bool
     var isStreamingOffDisk: Bool = false
@@ -18,6 +19,8 @@ struct ChatDetailView: View {
     var onSendMessage: (String) -> Void
     var onStopGeneration: () -> Void
     var onSelectPromptStarter: (String) -> Void
+    var onSelectDiscoveredModel: ((DiscoveredModel) -> Void)? = nil
+    var onOpenSettings: (() -> Void)? = nil
 
     @FocusState private var isInputFocused: Bool
     @State private var isReasoningExpanded: [UUID: Bool] = [:]
@@ -175,20 +178,62 @@ struct ChatDetailView: View {
                         .buttonStyle(.plain)
                         .help("Attach context or files")
 
-                        // Model Selector Pill
-                        HStack(spacing: 4) {
-                            Text(modelName ?? "DynaMoE Model")
-                                .font(.system(size: 11.5, weight: .medium))
-                                .foregroundColor(.secondary)
-                                .lineLimit(1)
-                            Image(systemName: "chevron.up.chevron.down")
-                                .font(.system(size: 7.5, weight: .semibold))
-                                .foregroundColor(.secondary.opacity(0.7))
+                        // Antigravity-Style Model Selector Menu
+                        Menu {
+                            if localModelManager.discoveredModels.isEmpty {
+                                Text("No models found in ~/.cache/huggingface/hub")
+                            } else {
+                                Section("Discovered Hugging Face Models") {
+                                    ForEach(localModelManager.discoveredModels) { dm in
+                                        let isCurrent = (session?.selectedModelId == dm.id) ||
+                                                        (session?.selectedModelPath == dm.snapshotPath) ||
+                                                        (modelName == dm.displayName) ||
+                                                        (session?.selectedModelName == dm.displayName)
+                                        Button(action: {
+                                            onSelectDiscoveredModel?(dm)
+                                        }) {
+                                            HStack {
+                                                if isCurrent {
+                                                    Image(systemName: "checkmark")
+                                                }
+                                                Text(dm.displayName)
+                                                Text("(\(dm.formattedSize))")
+                                                if dm.isMoE {
+                                                    Text("• MoE")
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            Divider()
+
+                            if let onOpenSettings = onOpenSettings {
+                                Button(action: onOpenSettings) {
+                                    Label("Manage Models in Settings...", systemImage: "gearshape")
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: "cube.fill")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.purple)
+                                Text(session?.selectedModelName ?? modelName ?? "Select Model")
+                                    .font(.system(size: 11.5, weight: .medium))
+                                    .foregroundColor(.primary)
+                                    .lineLimit(1)
+                                Image(systemName: "chevron.up.chevron.down")
+                                    .font(.system(size: 7.5, weight: .semibold))
+                                    .foregroundColor(.secondary.opacity(0.7))
+                            }
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4.5)
+                            .background(Color.secondary.opacity(0.08))
+                            .cornerRadius(10)
                         }
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 4.5)
-                        .background(Color.secondary.opacity(0.08))
-                        .cornerRadius(10)
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
 
                         Spacer()
 

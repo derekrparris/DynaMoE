@@ -48,18 +48,27 @@ public struct ChatSession: Identifiable, Codable, Equatable {
     public var messages: [ChatMessage]
     public var createdAt: Date
     public var updatedAt: Date
+    public var selectedModelId: String?
+    public var selectedModelName: String?
+    public var selectedModelPath: String?
 
     public init(
         id: UUID = UUID(),
         title: String = "New Conversation",
         messages: [ChatMessage] = [],
         createdAt: Date = Date(),
-        updatedAt: Date = Date()
+        updatedAt: Date = Date(),
+        selectedModelId: String? = nil,
+        selectedModelName: String? = nil,
+        selectedModelPath: String? = nil
     ) {
         self.id = id
         self.title = title
         self.messages = messages
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.selectedModelId = selectedModelId
+        self.selectedModelName = selectedModelName
+        self.selectedModelPath = selectedModelPath
     }
 }
