@@ -1145,24 +1145,28 @@ kernel void gqa_attention_decode_standard(
 
     float invSqrtHeadDim = rsqrt((float)headDim);
 
-    // Online Softmax Accumulator
-    float acc[256];
-    for (uint32_t d = 0; d < headDim; d++) {
-        acc[d] = 0.0f;
+    // Online Softmax Accumulator (float4 vectorized)
+    float4 acc[64];
+    uint32_t headDimVec = headDim / 4;
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        acc[d] = float4(0.0f);
     }
 
     float m = -1e20f; // running max score
     float l = 0.0f;   // running sum of exponents
 
     uint32_t safeLen = min(seqLen, 2048u);
+    device const float4* qHeadVec = (device const float4*)(qVector + qHeadBase);
 
     for (uint32_t tau = 0; tau < safeLen; tau++) {
         uint32_t kBase = (tau * kvStride) + kvHeadBase;
-        float dot = 0.0f;
-        for (uint32_t d = 0; d < headDim; d++) {
-            dot += qVector[qHeadBase + d] * kCacheBuffer[kBase + d];
+        device const float4* kVec = (device const float4*)(kCacheBuffer + kBase);
+        
+        float dot_val = 0.0f;
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            dot_val += dot(qHeadVec[d], kVec[d]);
         }
-        float score = dot * invSqrtHeadDim;
+        float score = dot_val * invSqrtHeadDim;
 
         float m_prev = m;
         if (score > m) {
@@ -1175,16 +1179,18 @@ kernel void gqa_attention_decode_standard(
         l = (l * alpha) + beta;
 
         uint32_t vBase = (tau * kvStride) + kvHeadBase;
-        for (uint32_t d = 0; d < headDim; d++) {
-            acc[d] = (acc[d] * alpha) + (beta * vCacheBuffer[vBase + d]);
+        device const float4* vVec = (device const float4*)(vCacheBuffer + vBase);
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            acc[d] = (acc[d] * alpha) + (beta * vVec[d]);
         }
     }
 
     float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
     uint32_t outOffset = qHeadIdx * headDim;
+    device float4* outVec = (device float4*)(attnOutBuffer + outOffset);
 
-    for (uint32_t d = 0; d < headDim; d++) {
-        attnOutBuffer[outOffset + d] = acc[d] * invL;
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        outVec[d] = acc[d] * invL;
     }
 }
 
@@ -1357,7 +1363,7 @@ kernel void linear_attention_recurrent_step(
 // SIMDgroup Cooperative Compute Kernels (32 Threads per Row Reduction)
 // ============================================================================
 
-/// MSL Kernel: 32-Thread SIMDgroup Cooperative BF16 SwiGLU Gate & Up Projections
+/// MSL Kernel: 32-Thread SIMDgroup Cooperative BF16 SwiGLU Gate & Up Projections (128-bit Vectorized)
 kernel void bf16_swiglu_gate_up_simd(
     device const ushort* rawGateBuffer [[buffer(0)]],
     device const ushort* rawUpBuffer [[buffer(1)]],
@@ -1375,24 +1381,40 @@ kernel void bf16_swiglu_gate_up_simd(
     uint64_t gateRowStart = (gateWeightOffset / 2) + ((uint64_t)r * hiddenDim);
     uint64_t upRowStart   = (upWeightOffset / 2) + ((uint64_t)r * hiddenDim);
 
+    device const ushort4* g4 = (device const ushort4*)(rawGateBuffer + gateRowStart);
+    device const ushort4* u4 = (device const ushort4*)(rawUpBuffer + upRowStart);
+    device const float4* in4 = (device const float4*)inputVector;
+
     float gate_dot = 0.0f;
     float up_dot   = 0.0f;
 
-    for (uint32_t d = laneId * 4; d < hiddenDim; d += 32 * 4) {
-        float in0 = inputVector[d + 0];
-        float in1 = inputVector[d + 1];
-        float in2 = inputVector[d + 2];
-        float in3 = inputVector[d + 3];
+    uint32_t numChunks = hiddenDim / 8;
+    for (uint32_t c = laneId; c < numChunks; c += 32) {
+        ushort4 g_lo = g4[c * 2 + 0];
+        ushort4 g_hi = g4[c * 2 + 1];
+        ushort4 u_lo = u4[c * 2 + 0];
+        ushort4 u_hi = u4[c * 2 + 1];
 
-        gate_dot += (bf16_to_fp32(rawGateBuffer[gateRowStart + d + 0]) * in0) +
-                    (bf16_to_fp32(rawGateBuffer[gateRowStart + d + 1]) * in1) +
-                    (bf16_to_fp32(rawGateBuffer[gateRowStart + d + 2]) * in2) +
-                    (bf16_to_fp32(rawGateBuffer[gateRowStart + d + 3]) * in3);
+        float4 in_lo = in4[c * 2 + 0];
+        float4 in_hi = in4[c * 2 + 1];
 
-        up_dot   += (bf16_to_fp32(rawUpBuffer[upRowStart + d + 0]) * in0) +
-                    (bf16_to_fp32(rawUpBuffer[upRowStart + d + 1]) * in1) +
-                    (bf16_to_fp32(rawUpBuffer[upRowStart + d + 2]) * in2) +
-                    (bf16_to_fp32(rawUpBuffer[upRowStart + d + 3]) * in3);
+        gate_dot += (bf16_to_fp32(g_lo.x) * in_lo.x) +
+                    (bf16_to_fp32(g_lo.y) * in_lo.y) +
+                    (bf16_to_fp32(g_lo.z) * in_lo.z) +
+                    (bf16_to_fp32(g_lo.w) * in_lo.w) +
+                    (bf16_to_fp32(g_hi.x) * in_hi.x) +
+                    (bf16_to_fp32(g_hi.y) * in_hi.y) +
+                    (bf16_to_fp32(g_hi.z) * in_hi.z) +
+                    (bf16_to_fp32(g_hi.w) * in_hi.w);
+
+        up_dot   += (bf16_to_fp32(u_lo.x) * in_lo.x) +
+                    (bf16_to_fp32(u_lo.y) * in_lo.y) +
+                    (bf16_to_fp32(u_lo.z) * in_lo.z) +
+                    (bf16_to_fp32(u_lo.w) * in_lo.w) +
+                    (bf16_to_fp32(u_hi.x) * in_hi.x) +
+                    (bf16_to_fp32(u_hi.y) * in_hi.y) +
+                    (bf16_to_fp32(u_hi.z) * in_hi.z) +
+                    (bf16_to_fp32(u_hi.w) * in_hi.w);
     }
 
     gate_dot = simd_sum(gate_dot);
@@ -1404,7 +1426,7 @@ kernel void bf16_swiglu_gate_up_simd(
     }
 }
 
-/// MSL Kernel: 32-Thread SIMDgroup Cooperative BF16 Down-Projection with Weighted Accumulation
+/// MSL Kernel: 32-Thread SIMDgroup Cooperative BF16 Down-Projection with Weighted Accumulation (128-bit Vectorized)
 kernel void bf16_down_proj_accumulate_simd(
     device const ushort* rawDownBuffer [[buffer(0)]],
     device const float* intermediateVector [[buffer(1)]],
@@ -1419,13 +1441,26 @@ kernel void bf16_down_proj_accumulate_simd(
     if (d >= hiddenDim) return;
 
     uint64_t downRowStart = (downWeightOffset / 2) + ((uint64_t)d * intermediateDim);
-    float down_dot = 0.0f;
+    device const ushort4* d4 = (device const ushort4*)(rawDownBuffer + downRowStart);
+    device const float4* in4 = (device const float4*)intermediateVector;
 
-    for (uint32_t idx = laneId * 4; idx < intermediateDim; idx += 32 * 4) {
-        down_dot += (bf16_to_fp32(rawDownBuffer[downRowStart + idx + 0]) * intermediateVector[idx + 0]) +
-                    (bf16_to_fp32(rawDownBuffer[downRowStart + idx + 1]) * intermediateVector[idx + 1]) +
-                    (bf16_to_fp32(rawDownBuffer[downRowStart + idx + 2]) * intermediateVector[idx + 2]) +
-                    (bf16_to_fp32(rawDownBuffer[downRowStart + idx + 3]) * intermediateVector[idx + 3]);
+    float down_dot = 0.0f;
+    uint32_t numChunks = intermediateDim / 8;
+
+    for (uint32_t c = laneId; c < numChunks; c += 32) {
+        ushort4 d_lo = d4[c * 2 + 0];
+        ushort4 d_hi = d4[c * 2 + 1];
+        float4 in_lo = in4[c * 2 + 0];
+        float4 in_hi = in4[c * 2 + 1];
+
+        down_dot += (bf16_to_fp32(d_lo.x) * in_lo.x) +
+                    (bf16_to_fp32(d_lo.y) * in_lo.y) +
+                    (bf16_to_fp32(d_lo.z) * in_lo.z) +
+                    (bf16_to_fp32(d_lo.w) * in_lo.w) +
+                    (bf16_to_fp32(d_hi.x) * in_hi.x) +
+                    (bf16_to_fp32(d_hi.y) * in_hi.y) +
+                    (bf16_to_fp32(d_hi.z) * in_hi.z) +
+                    (bf16_to_fp32(d_hi.w) * in_hi.w);
     }
 
     down_dot = simd_sum(down_dot);
@@ -1435,7 +1470,7 @@ kernel void bf16_down_proj_accumulate_simd(
     }
 }
 
-/// MSL Kernel: 32-Thread SIMDgroup Cooperative BF16 GEMV (out = W * x)
+/// MSL Kernel: 32-Thread SIMDgroup Cooperative BF16 GEMV (out = W * x) (128-bit Vectorized)
 kernel void bf16_gemv_simd(
     device const ushort* rawWeightBuffer [[buffer(0)]],
     device const float* inputVector [[buffer(1)]],
@@ -1449,14 +1484,26 @@ kernel void bf16_gemv_simd(
     if (row >= outDim) return;
 
     uint64_t rowWeightStart = (weightOffset / 2) + ((uint64_t)row * inDim);
-    device const ushort* wRow = rawWeightBuffer + rowWeightStart;
+    device const ushort4* w4 = (device const ushort4*)(rawWeightBuffer + rowWeightStart);
+    device const float4* in4 = (device const float4*)inputVector;
 
     float dot = 0.0f;
-    for (uint32_t base = laneId * 4; base < inDim; base += 32 * 4) {
-        dot += (bf16_to_fp32(wRow[base + 0]) * inputVector[base + 0]) +
-               (bf16_to_fp32(wRow[base + 1]) * inputVector[base + 1]) +
-               (bf16_to_fp32(wRow[base + 2]) * inputVector[base + 2]) +
-               (bf16_to_fp32(wRow[base + 3]) * inputVector[base + 3]);
+    uint32_t numChunks = inDim / 8;
+
+    for (uint32_t c = laneId; c < numChunks; c += 32) {
+        ushort4 w_lo = w4[c * 2 + 0];
+        ushort4 w_hi = w4[c * 2 + 1];
+        float4 in_lo = in4[c * 2 + 0];
+        float4 in_hi = in4[c * 2 + 1];
+
+        dot += (bf16_to_fp32(w_lo.x) * in_lo.x) +
+               (bf16_to_fp32(w_lo.y) * in_lo.y) +
+               (bf16_to_fp32(w_lo.z) * in_lo.z) +
+               (bf16_to_fp32(w_lo.w) * in_lo.w) +
+               (bf16_to_fp32(w_hi.x) * in_hi.x) +
+               (bf16_to_fp32(w_hi.y) * in_hi.y) +
+               (bf16_to_fp32(w_hi.z) * in_hi.z) +
+               (bf16_to_fp32(w_hi.w) * in_hi.w);
     }
 
     dot = simd_sum(dot);

@@ -3066,7 +3066,7 @@ struct ContentView: View {
     }
 
     private func sampleNextToken(
-        logits: UnsafePointer<Float>,
+        logits: UnsafeMutablePointer<Float>,
         vocabSize: Int,
         contextTokens: [UInt32],
         temperature: Float,
@@ -3074,41 +3074,53 @@ struct ContentView: View {
         topK: Int,
         repetitionPenalty: Float
     ) -> UInt32 {
-        let recentContextSet = Set(contextTokens.suffix(256))
-        
+        // 1. Direct repetition penalty to recent context tokens (no Set lookup across 166k items)
+        let recent = contextTokens.suffix(256)
+        var origVals: [(Int, Float)] = []
+        if repetitionPenalty > 1.001 {
+            origVals.reserveCapacity(recent.count)
+            for tok in recent {
+                let v = Int(tok)
+                if v < vocabSize {
+                    let l = logits[v]
+                    origVals.append((v, l))
+                    logits[v] = l > 0 ? (l / repetitionPenalty) : (l * repetitionPenalty)
+                }
+            }
+        }
+
         // High-performance greedy fast path (temperature <= 0.01)
         if temperature <= 0.01 {
             var bestIdx = 0
             var bestLogit: Float = -Float.greatestFiniteMagnitude
             for v in 0..<vocabSize {
-                var logit = logits[v]
-                if repetitionPenalty > 1.001 && recentContextSet.contains(UInt32(v)) {
-                    logit = logit > 0 ? (logit / repetitionPenalty) : (logit * repetitionPenalty)
-                }
-                if logit > bestLogit {
-                    bestLogit = logit
+                let l = logits[v]
+                if l > bestLogit {
+                    bestLogit = l
                     bestIdx = v
                 }
+            }
+            // Restore context logits
+            for (v, orig) in origVals {
+                logits[v] = orig
             }
             return UInt32(bestIdx)
         }
 
+        // 2. High-performance top-K selection with min-threshold pruning
         let effectiveTopK = max(1, min(topK, vocabSize))
         var candidates: [(id: Int, logit: Float)] = []
         candidates.reserveCapacity(effectiveTopK)
 
-        for v in 0..<vocabSize {
-            var logit = logits[v]
-            if repetitionPenalty > 1.001 && recentContextSet.contains(UInt32(v)) {
-                logit = logit > 0 ? (logit / repetitionPenalty) : (logit * repetitionPenalty)
-            }
+        for v in 0..<effectiveTopK {
+            candidates.append((id: v, logit: logits[v]))
+        }
+        candidates.sort(by: { $0.logit > $1.logit })
+        var minCandLogit = candidates[effectiveTopK - 1].logit
 
-            if candidates.count < effectiveTopK {
-                candidates.append((id: v, logit: logit))
-                if candidates.count == effectiveTopK {
-                    candidates.sort(by: { $0.logit > $1.logit })
-                }
-            } else if logit > candidates[effectiveTopK - 1].logit {
+        for v in effectiveTopK..<vocabSize {
+            let logit = logits[v]
+            if logit > minCandLogit {
                 var low = 0
                 var high = effectiveTopK - 1
                 while low < high {
@@ -3121,7 +3133,13 @@ struct ContentView: View {
                 }
                 candidates.insert((id: v, logit: logit), at: low)
                 candidates.removeLast()
+                minCandLogit = candidates[effectiveTopK - 1].logit
             }
+        }
+
+        // Restore context logits
+        for (v, orig) in origVals {
+            logits[v] = orig
         }
 
         guard let first = candidates.first else { return 0 }
@@ -3933,7 +3951,7 @@ struct ContentView: View {
             }
 
             // Helper for Single Token Forward Pass
-            func runTokenForward(tokenId: UInt32, step: UInt32, computeLogits: Bool) -> Bool {
+            func runTokenForward(tokenId: UInt32, step: UInt32, computeLogits: Bool, wait: Bool = true) -> Bool {
                 let singleTokenPtr = singleTokenBuffer.contents().bindMemory(to: UInt32.self, capacity: 1)
                 singleTokenPtr[0] = tokenId
                 var hDim = hiddenDim
@@ -4615,20 +4633,27 @@ struct ContentView: View {
 
                 finalEnc.endEncoding()
                 activeCmd.commit()
-                activeCmd.waitUntilCompleted()
+                if wait {
+                    activeCmd.waitUntilCompleted()
+                }
 
                 return true
             }
 
             var generatedTokenIds: [UInt32] = []
+            var lastUIUpdateTime = CFAbsoluteTimeGetCurrent()
 
-            // Ingest prompt tokens into KV-cache and recurrent states
-            for pIdx in 0..<(promptTokenIds.count - 1) {
-                if Task.isCancelled { break }
-                let pTok = promptTokenIds[pIdx]
-                let ok = runTokenForward(tokenId: pTok, step: currentStep, computeLogits: false)
-                if !ok { break }
-                currentStep += 1
+            // Ingest prompt tokens into KV-cache and recurrent states (pipelined async submission)
+            let promptCount = promptTokenIds.count - 1
+            if promptCount > 0 {
+                for pIdx in 0..<promptCount {
+                    if Task.isCancelled { break }
+                    let pTok = promptTokenIds[pIdx]
+                    let isLastPromptToken = (pIdx == promptCount - 1)
+                    let ok = runTokenForward(tokenId: pTok, step: currentStep, computeLogits: false, wait: isLastPromptToken)
+                    if !ok { break }
+                    currentStep += 1
+                }
             }
 
             // Autoregressive generation loop
@@ -4636,7 +4661,7 @@ struct ContentView: View {
                 if Task.isCancelled { break }
                 let currentTokenId = contextTokens.last!
 
-                let ok = runTokenForward(tokenId: currentTokenId, step: currentStep, computeLogits: true)
+                let ok = runTokenForward(tokenId: currentTokenId, step: currentStep, computeLogits: true, wait: true)
                 if !ok { break }
                 currentStep += 1
 
@@ -4695,20 +4720,27 @@ struct ContentView: View {
                     activeThink = false
                 }
 
-                await MainActor.run {
-                    self.generatedStreamText = updatedRaw
-                    self.thinkingText = thinkPart
-                    self.responseText = respPart
-                    self.isThinking = activeThink
-                    self.generationTotalTokens = tokensGenerated
-                    self.generationElapsedMs = elapsedMs
-                    self.generationSpeedTokPerSec = tokPerSec
-                    self.generationStatusText = activeThink ? "🧠 Reasoning: \(tokensGenerated) tokens | \(String(format: "%.1f", tokPerSec)) tok/s" : "⚡ Streaming: \(tokensGenerated) tokens | \(String(format: "%.1f", tokPerSec)) tok/s"
-                    self.currentRssGB = currentRss
-                    self.residentExpertCount = resCount
-                    self.totalExpertCount = totalExp
-                    self.cacheHitRate = hitRate
-                    self.lastPagingLatencyMs = pageLat
+                // Throttle MainActor UI updates to 30/60fps frame cadence or token interval
+                let now = CFAbsoluteTimeGetCurrent()
+                let shouldUpdateUI = (tokensGenerated == 1) || (now - lastUIUpdateTime >= 0.033) || (tokensGenerated % 4 == 0)
+
+                if shouldUpdateUI {
+                    lastUIUpdateTime = now
+                    await MainActor.run {
+                        self.generatedStreamText = updatedRaw
+                        self.thinkingText = thinkPart
+                        self.responseText = respPart
+                        self.isThinking = activeThink
+                        self.generationTotalTokens = tokensGenerated
+                        self.generationElapsedMs = elapsedMs
+                        self.generationSpeedTokPerSec = tokPerSec
+                        self.generationStatusText = activeThink ? "🧠 Reasoning: \(tokensGenerated) tokens | \(String(format: "%.1f", tokPerSec)) tok/s" : "⚡ Streaming: \(tokensGenerated) tokens | \(String(format: "%.1f", tokPerSec)) tok/s"
+                        self.currentRssGB = currentRss
+                        self.residentExpertCount = resCount
+                        self.totalExpertCount = totalExp
+                        self.cacheHitRate = hitRate
+                        self.lastPagingLatencyMs = pageLat
+                    }
                 }
             }
 
@@ -4719,10 +4751,31 @@ struct ContentView: View {
             let finalResCount = WorkingSetManager.shared.residentExperts.count
             let finalHitRate = WorkingSetManager.shared.cacheHitRatePercent
             let finalPageLat = WorkingSetManager.shared.lastPagingLatencyMs
+            let finalDecoded = (try? tokenizer.decode(ids: generatedTokenIds)) ?? ""
+
+            var finalThink = ""
+            var finalResp = ""
+            if finalDecoded.contains("</think>") {
+                let parts = finalDecoded.components(separatedBy: "</think>")
+                finalThink = parts[0].replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                finalResp = parts.dropFirst().joined(separator: "</think>").trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if finalDecoded.contains("<think>") || formattedPrompt.contains("<think>") {
+                finalThink = finalDecoded.replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespaces)
+                finalResp = ""
+            } else {
+                finalResp = finalDecoded
+            }
 
             await MainActor.run {
                 self.isGeneratingText = false
                 self.generationTask = nil
+                self.generatedStreamText = finalDecoded
+                self.thinkingText = finalThink
+                self.responseText = finalResp
+                self.isThinking = false
+                self.generationTotalTokens = tokensGenerated
+                self.generationElapsedMs = finalElapsedMs
+                self.generationSpeedTokPerSec = finalTokPerSec
                 self.generationStatusText = "✨ Generated \(tokensGenerated) tokens in \(String(format: "%.2f", finalElapsedMs)) ms (\(String(format: "%.1f", finalTokPerSec)) tok/s)"
                 self.currentRssGB = finalRss
                 self.residentExpertCount = finalResCount
