@@ -9,6 +9,7 @@ import Foundation
 
 public enum ModelArchitectureType: String, CaseIterable, Identifiable, Codable {
     case hybridSsmMoe = "Hybrid SSM + MoE (Ornith 1.5 / Qwen 3.5 MoE)"
+    case hybridSsmDense = "Hybrid SSM + Dense (Ornith 1.5 9B / Qwen 3.5 Dense)"
     case standardMoe = "Standard MoE (Qwen MoE / Mixtral)"
     case denseTransformer = "Dense Transformer (Qwen Dense / LLaMA / Mistral)"
 
@@ -17,6 +18,7 @@ public enum ModelArchitectureType: String, CaseIterable, Identifiable, Codable {
     public var shortName: String {
         switch self {
         case .hybridSsmMoe: return "Hybrid SSM + MoE"
+        case .hybridSsmDense: return "Hybrid SSM + Dense"
         case .standardMoe: return "Standard MoE"
         case .denseTransformer: return "Dense Transformer"
         }
@@ -25,9 +27,14 @@ public enum ModelArchitectureType: String, CaseIterable, Identifiable, Codable {
     public var icon: String {
         switch self {
         case .hybridSsmMoe: return "cpu.fill"
+        case .hybridSsmDense: return "cpu"
         case .standardMoe: return "square.grid.3x3.fill"
         case .denseTransformer: return "cube.fill"
         }
+    }
+
+    public var isHybridSsm: Bool {
+        return self == .hybridSsmMoe || self == .hybridSsmDense
     }
 }
 
@@ -254,11 +261,13 @@ public struct ModelConfig: Codable {
         let rawType = (textConfig != nil ? "qwen3_5_moe" : (modelType ?? "")).lowercased()
         let archs = architectures?.map { $0.lowercased() } ?? []
 
-        let isSsmModel = rawType.contains("qwen3_5") || rawType.contains("ornith") || rawType.contains("deltanet") || rawType.contains("mamba") || archs.contains(where: { $0.contains("qwen3_5") || $0.contains("deltanet") })
+        let isSsmModel = rawType.contains("qwen3_5") || rawType.contains("ornith") || rawType.contains("deltanet") || rawType.contains("mamba") || archs.contains(where: { $0.contains("qwen3_5") || $0.contains("deltanet") || $0.contains("ornith") })
         let hasMoEExperts = effectiveNumExperts > 1 || (summary != nil && summary!.maxExpertId > 0)
 
         if isSsmModel && hasMoEExperts {
             return .hybridSsmMoe
+        } else if isSsmModel {
+            return .hybridSsmDense
         } else if hasMoEExperts {
             return .standardMoe
         } else {
@@ -281,7 +290,7 @@ public struct ModelConfig: Codable {
 
         // Default Hybrid pattern for Ornith / Qwen 3.5: every 4th layer is full attention (3, 7, 11, ...)
         let arch = resolveArchitectureType(summary: nil)
-        if arch == .hybridSsmMoe {
+        if arch.isHybridSsm {
             return (0..<totalLayers).map { ($0 % 4 == 3) ? .fullAttention : .linearAttention }
         } else {
             return Array(repeating: .fullAttention, count: totalLayers)

@@ -2739,6 +2739,7 @@ struct ContentView: View {
 
         let embedPipeline: MTLComputePipelineState
         let embedQ4Pipeline: MTLComputePipelineState?
+        let embedQ8Pipeline: MTLComputePipelineState?
         let embedMXFP8Pipeline: MTLComputePipelineState?
         let routerPipeline: MTLComputePipelineState
         let routerQ4Pipeline: MTLComputePipelineState?
@@ -2767,6 +2768,8 @@ struct ContentView: View {
         let bf16DownSimdPipeline: MTLComputePipelineState?
         let q4GateUpPipeline: MTLComputePipelineState?
         let q4DownPipeline: MTLComputePipelineState?
+        let q8GateUpPipeline: MTLComputePipelineState?
+        let q8DownPipeline: MTLComputePipelineState?
         let headRmsnormPipeline: MTLComputePipelineState?
         let headRmsnormF16Pipeline: MTLComputePipelineState?
         let headRmsnormOffsetPipeline: MTLComputePipelineState?
@@ -2811,6 +2814,10 @@ struct ContentView: View {
             if let embedQ4Func = defaultLibrary.makeFunction(name: "lookup_embeddings_q4") {
                 embedQ4Pipeline = try device.makeComputePipelineState(function: embedQ4Func)
             } else { embedQ4Pipeline = nil }
+
+            if let embedQ8Func = defaultLibrary.makeFunction(name: "lookup_embeddings_q8") {
+                embedQ8Pipeline = try device.makeComputePipelineState(function: embedQ8Func)
+            } else { embedQ8Pipeline = nil }
 
             if let embedMXFP8Func = defaultLibrary.makeFunction(name: "lookup_embeddings_mxfp8") {
                 embedMXFP8Pipeline = try device.makeComputePipelineState(function: embedMXFP8Func)
@@ -2883,6 +2890,14 @@ struct ContentView: View {
             if let q4DownFunc = defaultLibrary.makeFunction(name: "q4_down_proj_accumulate") {
                 q4DownPipeline = try device.makeComputePipelineState(function: q4DownFunc)
             } else { q4DownPipeline = nil }
+
+            if let q8GateUpFunc = defaultLibrary.makeFunction(name: "q8_swiglu_gate_up") {
+                q8GateUpPipeline = try device.makeComputePipelineState(function: q8GateUpFunc)
+            } else { q8GateUpPipeline = nil }
+
+            if let q8DownFunc = defaultLibrary.makeFunction(name: "q8_down_proj_accumulate") {
+                q8DownPipeline = try device.makeComputePipelineState(function: q8DownFunc)
+            } else { q8DownPipeline = nil }
 
             if let hNormFunc = defaultLibrary.makeFunction(name: "per_head_rmsnorm_bf16") {
                 headRmsnormPipeline = try device.makeComputePipelineState(function: hNormFunc)
@@ -2958,8 +2973,8 @@ struct ContentView: View {
         }
 
         let arch = modelConfig?.resolveArchitectureType(summary: summary) ?? (summary.maxExpertId > 0 ? .hybridSsmMoe : .denseTransformer)
-        let isHybridArch = (arch == .hybridSsmMoe)
-        let isRMSNormOffset = modelConfig?.isRMSNormUnitOffset ?? (isHybridArch || arch == .hybridSsmMoe)
+        let isHybridArch = arch.isHybridSsm
+        let isRMSNormOffset = modelConfig?.isRMSNormUnitOffset ?? arch.isHybridSsm
 
         let qOutDim: UInt32 = isHybridArch ? (numHeads * headDim * 2) : (numHeads * headDim)
         let kvOutDim: UInt32 = numKvHeads * headDim
@@ -3192,8 +3207,8 @@ struct ContentView: View {
                 let hasGateScale = (gateS != nil)
                 let hasGateBias = (gateB != nil)
                 let isMXFP8 = hasGateScale && (gateS!.dtype.contains("U8") || gateS!.dtype.contains("UINT8") || (!hasGateBias && (gateW.dtype.contains("U32") || gateW.dtype.contains("U8") || gateW.dtype.contains("FP8")) && (gateS!.offsetEnd - gateS!.offsetStart) >= UInt64((inDim / 32) * interDim)))
-                let isQ4 = (hasGateBias || gateW.dtype.contains("Q4")) && !isMXFP8
-                let isFP8 = !isMXFP8 && !isQ4 && !gateW.dtype.contains("BF16") && !gateW.dtype.contains("F16") && !gateW.dtype.contains("FLOAT")
+                let isQuantizedAffine = (hasGateBias || gateW.dtype.contains("Q4") || gateW.dtype.contains("Q8")) && !isMXFP8
+                let isFP8 = !isMXFP8 && !isQuantizedAffine && !gateW.dtype.contains("BF16") && !gateW.dtype.contains("F16") && !gateW.dtype.contains("FLOAT")
 
                 if isMXFP8, let mxfp8GatePipe = mxfp8GateUpPipeline, let mxfp8DownPipe = mxfp8DownPipeline {
                     guard let gS = gateS, let gSRaw = buffers[gS.shardIndex],
@@ -3230,7 +3245,7 @@ struct ContentView: View {
                     enc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 7)
                     enc.setBytes(&p_k, length: MemoryLayout<Float>.stride, index: 8)
                     enc.dispatchThreads(MTLSize(width: Int(inDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, mxfp8DownPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
-                } else if isQ4, let q4SwigluPipe = q4GateUpPipeline, let q4DownPipe = q4DownPipeline {
+                } else if isQuantizedAffine {
                     guard let gS = gateS, let gSRaw = buffers[gS.shardIndex],
                           let gB = gateB, let gBRaw = buffers[gB.shardIndex],
                           let uS = upS, let uSRaw = buffers[uS.shardIndex],
@@ -3245,44 +3260,86 @@ struct ContentView: View {
                     var dSOff = dS.offsetStart
                     var dBOff = dB.offsetStart
 
-                    // Step 1: Q4 SwiGLU Gate & Up Proj
-                    enc.setComputePipelineState(q4SwigluPipe)
-                    enc.setBuffer(gRaw, offset: 0, index: 0)
-                    enc.setBuffer(gSRaw, offset: 0, index: 1)
-                    enc.setBuffer(gBRaw, offset: 0, index: 2)
-                    enc.setBuffer(uRaw, offset: 0, index: 3)
-                    enc.setBuffer(uSRaw, offset: 0, index: 4)
-                    enc.setBuffer(uBRaw, offset: 0, index: 5)
-                    enc.setBuffer(inBuf, offset: 0, index: 6)
-                    enc.setBuffer(interBuf, offset: 0, index: 7)
-                    enc.setBytes(&gWOff, length: MemoryLayout<UInt64>.stride, index: 8)
-                    enc.setBytes(&gSOff, length: MemoryLayout<UInt64>.stride, index: 9)
-                    enc.setBytes(&gBOff, length: MemoryLayout<UInt64>.stride, index: 10)
-                    enc.setBytes(&uWOff, length: MemoryLayout<UInt64>.stride, index: 11)
-                    enc.setBytes(&uSOff, length: MemoryLayout<UInt64>.stride, index: 12)
-                    enc.setBytes(&uBOff, length: MemoryLayout<UInt64>.stride, index: 13)
-                    enc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 14)
-                    enc.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 15)
-                    enc.setBytes(&grp, length: MemoryLayout<UInt32>.stride, index: 16)
-                    enc.dispatchThreadgroups(MTLSize(width: Int(interDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-                    enc.memoryBarrier(scope: .buffers)
+                    let is8Bit = (gateW.offsetEnd - gateW.offsetStart) >= UInt64(interDim) * UInt64(inDim)
+                    if is8Bit, let q8SwigluPipe = q8GateUpPipeline, let q8DownPipe = q8DownPipeline {
+                        // Step 1: Q8 SwiGLU Gate & Up Proj
+                        enc.setComputePipelineState(q8SwigluPipe)
+                        enc.setBuffer(gRaw, offset: 0, index: 0)
+                        enc.setBuffer(gSRaw, offset: 0, index: 1)
+                        enc.setBuffer(gBRaw, offset: 0, index: 2)
+                        enc.setBuffer(uRaw, offset: 0, index: 3)
+                        enc.setBuffer(uSRaw, offset: 0, index: 4)
+                        enc.setBuffer(uBRaw, offset: 0, index: 5)
+                        enc.setBuffer(inBuf, offset: 0, index: 6)
+                        enc.setBuffer(interBuf, offset: 0, index: 7)
+                        enc.setBytes(&gWOff, length: MemoryLayout<UInt64>.stride, index: 8)
+                        enc.setBytes(&gSOff, length: MemoryLayout<UInt64>.stride, index: 9)
+                        enc.setBytes(&gBOff, length: MemoryLayout<UInt64>.stride, index: 10)
+                        enc.setBytes(&uWOff, length: MemoryLayout<UInt64>.stride, index: 11)
+                        enc.setBytes(&uSOff, length: MemoryLayout<UInt64>.stride, index: 12)
+                        enc.setBytes(&uBOff, length: MemoryLayout<UInt64>.stride, index: 13)
+                        enc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 14)
+                        enc.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 15)
+                        enc.setBytes(&grp, length: MemoryLayout<UInt32>.stride, index: 16)
+                        enc.dispatchThreadgroups(MTLSize(width: Int(interDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                        enc.memoryBarrier(scope: .buffers)
 
-                    // Step 2: Q4 Down Proj Accumulate
-                    enc.setComputePipelineState(q4DownPipe)
-                    enc.setBuffer(dRaw, offset: 0, index: 0)
-                    enc.setBuffer(dSRaw, offset: 0, index: 1)
-                    enc.setBuffer(dBRaw, offset: 0, index: 2)
-                    enc.setBuffer(interBuf, offset: 0, index: 3)
-                    enc.setBuffer(accumBuf, offset: 0, index: 4)
-                    enc.setBytes(&dWOff, length: MemoryLayout<UInt64>.stride, index: 5)
-                    enc.setBytes(&dSOff, length: MemoryLayout<UInt64>.stride, index: 6)
-                    enc.setBytes(&dBOff, length: MemoryLayout<UInt64>.stride, index: 7)
-                    enc.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 8)
-                    enc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 9)
-                    enc.setBytes(&grp, length: MemoryLayout<UInt32>.stride, index: 10)
-                    enc.setBytes(&p_k, length: MemoryLayout<Float>.stride, index: 11)
-                    enc.dispatchThreadgroups(MTLSize(width: Int(inDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-                    enc.memoryBarrier(scope: .buffers)
+                        // Step 2: Q8 Down Proj Accumulate
+                        enc.setComputePipelineState(q8DownPipe)
+                        enc.setBuffer(dRaw, offset: 0, index: 0)
+                        enc.setBuffer(dSRaw, offset: 0, index: 1)
+                        enc.setBuffer(dBRaw, offset: 0, index: 2)
+                        enc.setBuffer(interBuf, offset: 0, index: 3)
+                        enc.setBuffer(accumBuf, offset: 0, index: 4)
+                        enc.setBytes(&dWOff, length: MemoryLayout<UInt64>.stride, index: 5)
+                        enc.setBytes(&dSOff, length: MemoryLayout<UInt64>.stride, index: 6)
+                        enc.setBytes(&dBOff, length: MemoryLayout<UInt64>.stride, index: 7)
+                        enc.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 8)
+                        enc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 9)
+                        enc.setBytes(&grp, length: MemoryLayout<UInt32>.stride, index: 10)
+                        enc.setBytes(&p_k, length: MemoryLayout<Float>.stride, index: 11)
+                        enc.dispatchThreadgroups(MTLSize(width: Int(inDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                        enc.memoryBarrier(scope: .buffers)
+                    } else if let q4SwigluPipe = q4GateUpPipeline, let q4DownPipe = q4DownPipeline {
+                        // Step 1: Q4 SwiGLU Gate & Up Proj
+                        enc.setComputePipelineState(q4SwigluPipe)
+                        enc.setBuffer(gRaw, offset: 0, index: 0)
+                        enc.setBuffer(gSRaw, offset: 0, index: 1)
+                        enc.setBuffer(gBRaw, offset: 0, index: 2)
+                        enc.setBuffer(uRaw, offset: 0, index: 3)
+                        enc.setBuffer(uSRaw, offset: 0, index: 4)
+                        enc.setBuffer(uBRaw, offset: 0, index: 5)
+                        enc.setBuffer(inBuf, offset: 0, index: 6)
+                        enc.setBuffer(interBuf, offset: 0, index: 7)
+                        enc.setBytes(&gWOff, length: MemoryLayout<UInt64>.stride, index: 8)
+                        enc.setBytes(&gSOff, length: MemoryLayout<UInt64>.stride, index: 9)
+                        enc.setBytes(&gBOff, length: MemoryLayout<UInt64>.stride, index: 10)
+                        enc.setBytes(&uWOff, length: MemoryLayout<UInt64>.stride, index: 11)
+                        enc.setBytes(&uSOff, length: MemoryLayout<UInt64>.stride, index: 12)
+                        enc.setBytes(&uBOff, length: MemoryLayout<UInt64>.stride, index: 13)
+                        enc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 14)
+                        enc.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 15)
+                        enc.setBytes(&grp, length: MemoryLayout<UInt32>.stride, index: 16)
+                        enc.dispatchThreadgroups(MTLSize(width: Int(interDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                        enc.memoryBarrier(scope: .buffers)
+
+                        // Step 2: Q4 Down Proj Accumulate
+                        enc.setComputePipelineState(q4DownPipe)
+                        enc.setBuffer(dRaw, offset: 0, index: 0)
+                        enc.setBuffer(dSRaw, offset: 0, index: 1)
+                        enc.setBuffer(dBRaw, offset: 0, index: 2)
+                        enc.setBuffer(interBuf, offset: 0, index: 3)
+                        enc.setBuffer(accumBuf, offset: 0, index: 4)
+                        enc.setBytes(&dWOff, length: MemoryLayout<UInt64>.stride, index: 5)
+                        enc.setBytes(&dSOff, length: MemoryLayout<UInt64>.stride, index: 6)
+                        enc.setBytes(&dBOff, length: MemoryLayout<UInt64>.stride, index: 7)
+                        enc.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 8)
+                        enc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 9)
+                        enc.setBytes(&grp, length: MemoryLayout<UInt32>.stride, index: 10)
+                        enc.setBytes(&p_k, length: MemoryLayout<Float>.stride, index: 11)
+                        enc.dispatchThreadgroups(MTLSize(width: Int(inDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                        enc.memoryBarrier(scope: .buffers)
+                    }
                 } else if isFP8 {
                     guard let gS = gateS, let gSRaw = buffers[gS.shardIndex],
                           let uS = upS, let uSRaw = buffers[uS.shardIndex],
@@ -3425,7 +3482,7 @@ struct ContentView: View {
                             let hasEmbedScale = (embedScale != nil)
                             let hasEmbedBias = (embedBias != nil)
                             let isEmbedMXFP8 = hasEmbedScale && (embedScale!.dtype.contains("U8") || embedScale!.dtype.contains("UINT8") || (!hasEmbedBias && (embedWeight.dtype.contains("U32") || embedWeight.dtype.contains("U8") || embedWeight.dtype.contains("FP8")) && (embedScale!.offsetEnd - embedScale!.offsetStart) >= UInt64(hiddenDim / 32)))
-                            let isEmbedQ4 = (hasEmbedBias || embedWeight.dtype.contains("Q4")) && !isEmbedMXFP8
+                            let isEmbedAffine = (hasEmbedBias || embedWeight.dtype.contains("Q4") || embedWeight.dtype.contains("Q8") || hasEmbedScale) && !isEmbedMXFP8
 
                             if isEmbedMXFP8, let embedMXFP8Pipe = embedMXFP8Pipeline,
                                let embedScaleRaw = buffers[embedScale!.shardIndex] {
@@ -3441,7 +3498,7 @@ struct ContentView: View {
                                 layerEnc1.setBytes(&sOffset, length: MemoryLayout<UInt64>.stride, index: 5)
                                 layerEnc1.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 6)
                                 layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), embedMXFP8Pipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
-                            } else if isEmbedQ4, let embedQ4Pipe = embedQ4Pipeline,
+                            } else if isEmbedAffine,
                                let embedScaleRaw = (embedScale != nil) ? buffers[embedScale!.shardIndex] : nil,
                                let embedBiasRaw = (embedBias != nil) ? buffers[embedBias!.shardIndex] : nil {
                                 var wOffset = embedOffset
@@ -3449,18 +3506,34 @@ struct ContentView: View {
                                 var bOffset = embedBias!.offsetStart
                                 var tok = tokenId
                                 var grpSize: UInt32 = 64
-                                layerEnc1.setComputePipelineState(embedQ4Pipe)
-                                layerEnc1.setBuffer(embedShardBuffer, offset: 0, index: 0)
-                                layerEnc1.setBuffer(embedScaleRaw, offset: 0, index: 1)
-                                layerEnc1.setBuffer(embedBiasRaw, offset: 0, index: 2)
-                                layerEnc1.setBuffer(currentH, offset: 0, index: 3)
-                                layerEnc1.setBytes(&tok, length: MemoryLayout<UInt32>.stride, index: 4)
-                                layerEnc1.setBytes(&wOffset, length: MemoryLayout<UInt64>.stride, index: 5)
-                                layerEnc1.setBytes(&sOffset, length: MemoryLayout<UInt64>.stride, index: 6)
-                                layerEnc1.setBytes(&bOffset, length: MemoryLayout<UInt64>.stride, index: 7)
-                                layerEnc1.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 8)
-                                layerEnc1.setBytes(&grpSize, length: MemoryLayout<UInt32>.stride, index: 9)
-                                layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), embedQ4Pipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                let is8Bit = (embedWeight.offsetEnd - embedWeight.offsetStart) >= UInt64(hiddenDim)
+                                if is8Bit, let embedQ8Pipe = embedQ8Pipeline {
+                                    layerEnc1.setComputePipelineState(embedQ8Pipe)
+                                    layerEnc1.setBuffer(embedShardBuffer, offset: 0, index: 0)
+                                    layerEnc1.setBuffer(embedScaleRaw, offset: 0, index: 1)
+                                    layerEnc1.setBuffer(embedBiasRaw, offset: 0, index: 2)
+                                    layerEnc1.setBuffer(currentH, offset: 0, index: 3)
+                                    layerEnc1.setBytes(&tok, length: MemoryLayout<UInt32>.stride, index: 4)
+                                    layerEnc1.setBytes(&wOffset, length: MemoryLayout<UInt64>.stride, index: 5)
+                                    layerEnc1.setBytes(&sOffset, length: MemoryLayout<UInt64>.stride, index: 6)
+                                    layerEnc1.setBytes(&bOffset, length: MemoryLayout<UInt64>.stride, index: 7)
+                                    layerEnc1.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 8)
+                                    layerEnc1.setBytes(&grpSize, length: MemoryLayout<UInt32>.stride, index: 9)
+                                    layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), embedQ8Pipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                } else if let embedQ4Pipe = embedQ4Pipeline {
+                                    layerEnc1.setComputePipelineState(embedQ4Pipe)
+                                    layerEnc1.setBuffer(embedShardBuffer, offset: 0, index: 0)
+                                    layerEnc1.setBuffer(embedScaleRaw, offset: 0, index: 1)
+                                    layerEnc1.setBuffer(embedBiasRaw, offset: 0, index: 2)
+                                    layerEnc1.setBuffer(currentH, offset: 0, index: 3)
+                                    layerEnc1.setBytes(&tok, length: MemoryLayout<UInt32>.stride, index: 4)
+                                    layerEnc1.setBytes(&wOffset, length: MemoryLayout<UInt64>.stride, index: 5)
+                                    layerEnc1.setBytes(&sOffset, length: MemoryLayout<UInt64>.stride, index: 6)
+                                    layerEnc1.setBytes(&bOffset, length: MemoryLayout<UInt64>.stride, index: 7)
+                                    layerEnc1.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 8)
+                                    layerEnc1.setBytes(&grpSize, length: MemoryLayout<UInt32>.stride, index: 9)
+                                    layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), embedQ4Pipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                }
                             } else {
                                 var wOffset = embedOffset
                                 var tokCount: UInt32 = 1

@@ -295,7 +295,7 @@ public class LocalModelManager: ObservableObject {
                 isMoE = true
             }
 
-            if archString.localizedCaseInsensitiveContains("qwen3_5") || (rawModelType?.localizedCaseInsensitiveContains("qwen3_5") ?? false) {
+            if archString.localizedCaseInsensitiveContains("qwen3_5") || archString.localizedCaseInsensitiveContains("ornith") || (rawModelType?.localizedCaseInsensitiveContains("qwen3_5") ?? false) || (rawModelType?.localizedCaseInsensitiveContains("ornith") ?? false) {
                 architectureName = isMoE ? "Hybrid SSM-MoE" : "Hybrid SSM-Dense"
             } else if archString.localizedCaseInsensitiveContains("nanbeige") {
                 architectureName = isMoE ? "Dense/MoE Transformer" : "Nanbeige Transformer"
@@ -307,11 +307,19 @@ public class LocalModelManager: ObservableObject {
                 architectureName = "Dense Transformer"
             }
 
-            if let dtype = json["torch_dtype"] as? String {
-                quantization = dtype
-            } else if let quantConfig = json["quantization_config"] as? [String: Any],
-                      let quantMethod = quantConfig["quant_method"] as? String {
+            if let quantConfig = json["quantization_config"] as? [String: Any],
+               let quantMethod = quantConfig["quant_method"] as? String {
                 quantization = quantMethod.uppercased()
+            } else if let quantConfig = json["quantization_config"] as? [String: Any],
+                      let bits = quantConfig["bits"] as? Int {
+                let mode = quantConfig["mode"] as? String ?? "Affine"
+                quantization = "MLX \(bits)-Bit (\(mode.capitalized))"
+            } else if let quant = json["quantization"] as? [String: Any],
+                      let bits = quant["bits"] as? Int {
+                let mode = quant["mode"] as? String ?? "Affine"
+                quantization = "MLX \(bits)-Bit (\(mode.capitalized))"
+            } else if let dtype = json["torch_dtype"] as? String {
+                quantization = dtype
             }
         }
 

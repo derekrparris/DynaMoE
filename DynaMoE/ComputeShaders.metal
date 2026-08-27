@@ -2049,3 +2049,158 @@ kernel void q8_gemv(
     }
 }
 
+/// MSL Kernel: Lookup Embedding Token Vector for Q8 Affine Quantization
+kernel void lookup_embeddings_q8(
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const uchar* rawScaleBuffer [[buffer(1)]],
+    device const uchar* rawBiasBuffer [[buffer(2)]],
+    device float* outputVector [[buffer(3)]],
+    constant uint32_t& tokenId [[buffer(4)]],
+    constant uint64_t& weightOffset [[buffer(5)]],
+    constant uint64_t& scaleOffset [[buffer(6)]],
+    constant uint64_t& biasOffset [[buffer(7)]],
+    constant uint32_t& hiddenDim [[buffer(8)]],
+    constant uint32_t& groupSize [[buffer(9)]],
+    uint id [[thread_position_in_grid]]
+) {
+    if (id >= hiddenDim) return;
+
+    uint32_t gIdx = id / groupSize;
+    uint32_t numGroups = hiddenDim / groupSize;
+
+    device const uchar* wRowStart = rawWeightBuffer + weightOffset + ((uint64_t)tokenId * hiddenDim);
+    device const uchar* sRowStart = rawScaleBuffer + scaleOffset + ((uint64_t)tokenId * numGroups * 2);
+    device const uchar* bRowStart = rawBiasBuffer + biasOffset + ((uint64_t)tokenId * numGroups * 2);
+
+    float w8 = float(wRowStart[id]);
+    float scale = read_bf16_unaligned(sRowStart + gIdx * 2);
+    float bias  = read_bf16_unaligned(bRowStart + gIdx * 2);
+
+    outputVector[id] = scale * w8 + bias;
+}
+
+/// MSL Kernel: SIMDgroup Cooperative Q8 Affine SwiGLU Gate & Up Projections
+kernel void q8_swiglu_gate_up(
+    device const uchar* rawGateWeight [[buffer(0)]],
+    device const uchar* rawGateScales [[buffer(1)]],
+    device const uchar* rawGateBiases [[buffer(2)]],
+    device const uchar* rawUpWeight [[buffer(3)]],
+    device const uchar* rawUpScales [[buffer(4)]],
+    device const uchar* rawUpBiases [[buffer(5)]],
+    device const float* inputVector [[buffer(6)]],
+    device float* intermediateOutput [[buffer(7)]],
+    constant uint64_t& gateWeightOffset [[buffer(8)]],
+    constant uint64_t& gateScaleOffset [[buffer(9)]],
+    constant uint64_t& gateBiasOffset [[buffer(10)]],
+    constant uint64_t& upWeightOffset [[buffer(11)]],
+    constant uint64_t& upScaleOffset [[buffer(12)]],
+    constant uint64_t& upBiasOffset [[buffer(13)]],
+    constant uint32_t& hiddenDim [[buffer(14)]],
+    constant uint32_t& intermediateDim [[buffer(15)]],
+    constant uint32_t& groupSize [[buffer(16)]],
+    uint r [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    if (r >= intermediateDim) return;
+
+    uint32_t numGroups = hiddenDim / groupSize;
+    device const uchar* gWRow = rawGateWeight + gateWeightOffset + ((uint64_t)r * hiddenDim);
+    device const uchar* gSRow = rawGateScales + gateScaleOffset + ((uint64_t)r * numGroups * 2);
+    device const uchar* gBRow = rawGateBiases + gateBiasOffset + ((uint64_t)r * numGroups * 2);
+
+    device const uchar* uWRow = rawUpWeight + upWeightOffset + ((uint64_t)r * hiddenDim);
+    device const uchar* uSRow = rawUpScales + upScaleOffset + ((uint64_t)r * numGroups * 2);
+    device const uchar* uBRow = rawUpBiases + upBiasOffset + ((uint64_t)r * numGroups * 2);
+
+    float gate_sum = 0.0f;
+    float up_sum   = 0.0f;
+
+    for (uint32_t g = laneId; g < numGroups; g += 32) {
+        float gScale = read_bf16_unaligned(gSRow + g * 2);
+        float gBias  = read_bf16_unaligned(gBRow + g * 2);
+        float uScale = read_bf16_unaligned(uSRow + g * 2);
+        float uBias  = read_bf16_unaligned(uBRow + g * 2);
+
+        uint32_t colStart = g * groupSize;
+        float gGroupSum = 0.0f;
+        float uGroupSum = 0.0f;
+        float groupXSum = 0.0f;
+
+        for (uint32_t c = 0; c < groupSize; c++) {
+            uint32_t col = colStart + c;
+            float x = inputVector[col];
+            float gw8 = float(gWRow[col]);
+            float uw8 = float(uWRow[col]);
+
+            gGroupSum += gw8 * x;
+            uGroupSum += uw8 * x;
+            groupXSum += x;
+        }
+
+        gate_sum += gScale * gGroupSum + gBias * groupXSum;
+        up_sum   += uScale * uGroupSum + uBias * groupXSum;
+    }
+
+    gate_sum = simd_sum(gate_sum);
+    up_sum   = simd_sum(up_sum);
+
+    if (laneId == 0) {
+        float silu_gate = gate_sum / (1.0f + exp(-gate_sum));
+        intermediateOutput[r] = silu_gate * up_sum;
+    }
+}
+
+/// MSL Kernel: SIMDgroup Cooperative Q8 Affine Down-Projection with Weighted Accumulation
+kernel void q8_down_proj_accumulate(
+    device const uchar* rawDownWeight [[buffer(0)]],
+    device const uchar* rawDownScales [[buffer(1)]],
+    device const uchar* rawDownBiases [[buffer(2)]],
+    device const float* intermediateVector [[buffer(3)]],
+    device float* outputAccumulator [[buffer(4)]],
+    constant uint64_t& downWeightOffset [[buffer(5)]],
+    constant uint64_t& downScaleOffset [[buffer(6)]],
+    constant uint64_t& downBiasOffset [[buffer(7)]],
+    constant uint32_t& intermediateDim [[buffer(8)]],
+    constant uint32_t& hiddenDim [[buffer(9)]],
+    constant uint32_t& groupSize [[buffer(10)]],
+    constant float& routingWeight [[buffer(11)]],
+    uint d [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    if (d >= hiddenDim) return;
+
+    uint32_t numGroups = intermediateDim / groupSize;
+    device const uchar* dWRow = rawDownWeight + downWeightOffset + ((uint64_t)d * intermediateDim);
+    device const uchar* dSRow = rawDownScales + downScaleOffset + ((uint64_t)d * numGroups * 2);
+    device const uchar* dBRow = rawDownBiases + downBiasOffset + ((uint64_t)d * numGroups * 2);
+
+    float down_sum = 0.0f;
+
+    for (uint32_t g = laneId; g < numGroups; g += 32) {
+        float dScale = read_bf16_unaligned(dSRow + g * 2);
+        float dBias  = read_bf16_unaligned(dBRow + g * 2);
+
+        uint32_t colStart = g * groupSize;
+        float dGroupSum = 0.0f;
+        float groupXSum = 0.0f;
+
+        for (uint32_t c = 0; c < groupSize; c++) {
+            uint32_t col = colStart + c;
+            float x = intermediateVector[col];
+            float dw8 = float(dWRow[col]);
+
+            dGroupSum += dw8 * x;
+            groupXSum += x;
+        }
+
+        down_sum += dScale * dGroupSum + dBias * groupXSum;
+    }
+
+    down_sum = simd_sum(down_sum);
+
+    if (laneId == 0) {
+        outputAccumulator[d] += routingWeight * down_sum;
+    }
+}
+
+

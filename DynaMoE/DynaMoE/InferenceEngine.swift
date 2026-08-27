@@ -149,6 +149,7 @@ public final class InferenceEngine {
     // Compute Pipelines
     public var embedPipeline: MTLComputePipelineState?
     public var embedQ4Pipeline: MTLComputePipelineState?
+    public var embedQ8Pipeline: MTLComputePipelineState?
     public var embedMXFP8Pipeline: MTLComputePipelineState?
     public var rmsnormPipeline: MTLComputePipelineState?
     public var rmsnormF16Pipeline: MTLComputePipelineState?
@@ -174,6 +175,8 @@ public final class InferenceEngine {
     public var mxfp8GemvPipeline: MTLComputePipelineState?
     public var q4GateUpPipeline: MTLComputePipelineState?
     public var q4DownPipeline: MTLComputePipelineState?
+    public var q8GateUpPipeline: MTLComputePipelineState?
+    public var q8DownPipeline: MTLComputePipelineState?
     public var fp8GateUpPipeline: MTLComputePipelineState?
     public var fp8DownPipeline: MTLComputePipelineState?
     public var mxfp8GateUpPipeline: MTLComputePipelineState?
@@ -196,6 +199,9 @@ public final class InferenceEngine {
         }
         if let embedQ4Func = defaultLib.makeFunction(name: "lookup_embeddings_q4") {
             embedQ4Pipeline = try device.makeComputePipelineState(function: embedQ4Func)
+        }
+        if let embedQ8Func = defaultLib.makeFunction(name: "lookup_embeddings_q8") {
+            embedQ8Pipeline = try device.makeComputePipelineState(function: embedQ8Func)
         }
         if let embedMXFP8Func = defaultLib.makeFunction(name: "lookup_embeddings_mxfp8") {
             embedMXFP8Pipeline = try device.makeComputePipelineState(function: embedMXFP8Func)
@@ -269,6 +275,12 @@ public final class InferenceEngine {
         if let q4DownFunc = defaultLib.makeFunction(name: "q4_down_proj_accumulate") {
             q4DownPipeline = try device.makeComputePipelineState(function: q4DownFunc)
         }
+        if let q8GateUpFunc = defaultLib.makeFunction(name: "q8_swiglu_gate_up") {
+            q8GateUpPipeline = try device.makeComputePipelineState(function: q8GateUpFunc)
+        }
+        if let q8DownFunc = defaultLib.makeFunction(name: "q8_down_proj_accumulate") {
+            q8DownPipeline = try device.makeComputePipelineState(function: q8DownFunc)
+        }
         if let fp8GateUpFunc = defaultLib.makeFunction(name: "fp8_swiglu_gate_up") {
             fp8GateUpPipeline = try device.makeComputePipelineState(function: fp8GateUpFunc)
         }
@@ -301,7 +313,7 @@ public final class InferenceEngine {
 
         let numLayers = min(targetLayerCount, Int(summary.layerCount > 0 ? summary.layerCount : 40))
         let arch = config?.resolveArchitectureType(summary: summary) ?? (summary.maxExpertId > 0 ? .hybridSsmMoe : .denseTransformer)
-        let layerAttnTypes = config?.resolveLayerAttentionTypes(totalLayers: numLayers) ?? (arch == .hybridSsmMoe ? (0..<numLayers).map { ($0 % 4 == 3) ? .fullAttention : .linearAttention } : Array(repeating: .fullAttention, count: numLayers))
+        let layerAttnTypes = config?.resolveLayerAttentionTypes(totalLayers: numLayers) ?? (arch.isHybridSsm ? (0..<numLayers).map { ($0 % 4 == 3) ? .fullAttention : .linearAttention } : Array(repeating: .fullAttention, count: numLayers))
 
         var cached: [EngineCachedLayer] = []
         var fullCount = 0
