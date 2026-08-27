@@ -54,6 +54,7 @@ struct SettingsSheetView: View {
     // Memory & Working Set bindings
     @Binding var memoryExecutionMode: MemoryExecutionMode
     @Binding var memoryBudgetMode: MemoryBudgetMode
+    @Binding var kvCachePrecision: KVCachePrecision
     var currentRssGB: Double
     var residentExpertCount: Int
     var totalExpertCount: Int
@@ -630,6 +631,34 @@ struct SettingsSheetView: View {
                         }
                     }
                     .pickerStyle(.segmented)
+                }
+
+                // KV-Cache Precision Picker
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("KV-Cache Precision & Compression")
+                            .font(.subheadline)
+                            .fontWeight(.semibold)
+                        Spacer()
+                        Text(kvCachePrecision == .fp8 ? "75% VRAM Reduction" : (kvCachePrecision == .fp16 ? "50% VRAM Reduction" : "Original"))
+                            .font(.caption2)
+                            .foregroundColor(.indigo)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.indigo.opacity(0.1))
+                            .cornerRadius(4)
+                    }
+
+                    Picker("KV Precision", selection: $kvCachePrecision) {
+                        ForEach(KVCachePrecision.allCases) { prec in
+                            Text(prec.rawValue).tag(prec)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    Text("FP16 (Half) cuts KV-cache memory by 50% with ~2x memory bandwidth during autoregressive GQA decoding. FP8 cuts memory footprint by 75% for ultra-long context windows.")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
                 }
 
                 Divider()

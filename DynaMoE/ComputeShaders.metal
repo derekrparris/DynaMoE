@@ -1180,7 +1180,76 @@ kernel void store_kv_cache(
     vCacheBuffer[cacheOffset] = vVector[id];
 }
 
-///// MSL Kernel: Grouped-Query Attention (GQA) Autoregressive Decoding with Online Softmax & Sigmoid Output Gating
+/// MSL Kernel: Stores current K and V vectors into the Layer's KV-Cache in FP16 (Half Precision)
+kernel void store_kv_cache_f16(
+    device const float* kVector [[buffer(0)]],
+    device const float* vVector [[buffer(1)]],
+    device half* kCacheBuffer [[buffer(2)]],
+    device half* vCacheBuffer [[buffer(3)]],
+    constant uint32_t& tokenPos [[buffer(4)]],
+    constant uint32_t& numKvHeads [[buffer(5)]],
+    constant uint32_t& headDim [[buffer(6)]],
+    uint id [[thread_position_in_grid]]
+) {
+    uint32_t kvStride = numKvHeads * headDim;
+    if (id >= kvStride) return;
+
+    uint32_t cacheOffset = (tokenPos * kvStride) + id;
+    kCacheBuffer[cacheOffset] = half(kVector[id]);
+    vCacheBuffer[cacheOffset] = half(vVector[id]);
+}
+
+/// MSL Kernel: Dynamically quantizes current K and V vectors to INT8 with per-head scaling factors
+kernel void store_kv_cache_fp8(
+    device const float* kVector [[buffer(0)]],
+    device const float* vVector [[buffer(1)]],
+    device char* kCacheBuffer [[buffer(2)]],
+    device char* vCacheBuffer [[buffer(3)]],
+    device half* kScaleBuffer [[buffer(4)]],
+    device half* vScaleBuffer [[buffer(5)]],
+    constant uint32_t& tokenPos [[buffer(6)]],
+    constant uint32_t& numKvHeads [[buffer(7)]],
+    constant uint32_t& headDim [[buffer(8)]],
+    uint kvHeadIdx [[threadgroup_position_in_grid]],
+    uint laneId [[thread_position_in_threadgroup]]
+) {
+    if (kvHeadIdx >= numKvHeads) return;
+
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t cacheHeadBase = (tokenPos * kvStride) + kvHeadBase;
+    uint32_t scaleIdx = tokenPos * numKvHeads + kvHeadIdx;
+
+    float local_max_k = 0.0f;
+    float local_max_v = 0.0f;
+
+    for (uint32_t d = laneId; d < headDim; d += 32) {
+        local_max_k = max(local_max_k, abs(kVector[kvHeadBase + d]));
+        local_max_v = max(local_max_v, abs(vVector[kvHeadBase + d]));
+    }
+
+    float head_max_k = simd_max(local_max_k);
+    float head_max_v = simd_max(local_max_v);
+
+    float scale_k = max(head_max_k, 1e-7f) / 127.0f;
+    float scale_v = max(head_max_v, 1e-7f) / 127.0f;
+    float inv_scale_k = 1.0f / scale_k;
+    float inv_scale_v = 1.0f / scale_v;
+
+    if (laneId == 0) {
+        kScaleBuffer[scaleIdx] = half(scale_k);
+        vScaleBuffer[scaleIdx] = half(scale_v);
+    }
+
+    for (uint32_t d = laneId; d < headDim; d += 32) {
+        float qk = clamp(round(kVector[kvHeadBase + d] * inv_scale_k), -127.0f, 127.0f);
+        float qv = clamp(round(vVector[kvHeadBase + d] * inv_scale_v), -127.0f, 127.0f);
+        kCacheBuffer[cacheHeadBase + d] = char(qk);
+        vCacheBuffer[cacheHeadBase + d] = char(qv);
+    }
+}
+
+///// MSL Kernel: Grouped-Query Attention (GQA) Autoregressive Decoding with Online Softmax & Sigmoid Output Gating (FP32)
 kernel void gqa_attention_decode_fused(
     device const float* qGateVector [[buffer(0)]], // [8192] = 16 heads * (Q[256] + Gate[256])
     device const float* kCacheBuffer [[buffer(1)]],
@@ -1213,9 +1282,7 @@ kernel void gqa_attention_decode_fused(
     float m = -1e20f; // running max score
     float l = 0.0f;   // running sum of exponents
 
-    uint32_t safeLen = min(seqLen, 2048u);
-
-    for (uint32_t tau = 0; tau < safeLen; tau++) {
+    for (uint32_t tau = 0; tau < seqLen; tau++) {
         uint32_t kBase = (tau * kvStride) + kvHeadBase;
         float dot = 0.0f;
         for (uint32_t d = 0; d < headDim; d++) {
@@ -1250,7 +1317,168 @@ kernel void gqa_attention_decode_fused(
     }
 }
 
-/// MSL Kernel: Standard Grouped-Query Attention (GQA) Autoregressive Decoding for LLaMA / Mistral / Nanbeige
+/// MSL Kernel: Grouped-Query Attention (GQA) Autoregressive Decoding with Online Softmax & Sigmoid Output Gating (FP16 KV-Cache)
+kernel void gqa_attention_decode_fused_f16(
+    device const float* qGateVector [[buffer(0)]], // [8192] = 16 heads * (Q[256] + Gate[256])
+    device const half* kCacheBuffer [[buffer(1)]],
+    device const half* vCacheBuffer [[buffer(2)]],
+    device float* attnOutBuffer [[buffer(3)]],     // [4096] = 16 heads * 256
+    constant uint32_t& seqLen [[buffer(4)]],
+    constant uint32_t& numQHeads [[buffer(5)]],
+    constant uint32_t& numKvHeads [[buffer(6)]],
+    constant uint32_t& headDim [[buffer(7)]],
+    uint qHeadIdx [[thread_position_in_grid]]
+) {
+    if (qHeadIdx >= numQHeads) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+
+    uint32_t qHeadBase = qHeadIdx * 512;
+    uint32_t gateBase = qHeadBase + 256;
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    float4 acc[64];
+    uint32_t headDimVec = headDim / 4;
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        acc[d] = float4(0.0f);
+    }
+
+    float m = -1e20f; // running max score
+    float l = 0.0f;   // running sum of exponents
+
+    device const float4* qHeadVec = (device const float4*)(qGateVector + qHeadBase);
+
+    for (uint32_t tau = 0; tau < seqLen; tau++) {
+        uint32_t kBase = (tau * kvStride) + kvHeadBase;
+        device const half4* kVec = (device const half4*)(kCacheBuffer + kBase);
+        
+        float dot_val = 0.0f;
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            dot_val += dot(qHeadVec[d], float4(kVec[d]));
+        }
+        float score = dot_val * invSqrtHeadDim;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+
+        l = (l * alpha) + beta;
+
+        uint32_t vBase = (tau * kvStride) + kvHeadBase;
+        device const half4* vVec = (device const half4*)(vCacheBuffer + vBase);
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            acc[d] = (acc[d] * alpha) + (beta * float4(vVec[d]));
+        }
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    uint32_t outOffset = qHeadIdx * headDim;
+
+    for (uint32_t d = 0; d < headDim; d++) {
+        uint32_t vecIdx = d / 4;
+        uint32_t compIdx = d % 4;
+        float ctx = acc[vecIdx][compIdx] * invL;
+        float g = qGateVector[gateBase + d];
+        float sig_g = 1.0f / (1.0f + exp(-g));
+        attnOutBuffer[outOffset + d] = ctx * sig_g;
+    }
+}
+
+/// MSL Kernel: Grouped-Query Attention (GQA) Autoregressive Decoding with Online Softmax & Sigmoid Output Gating (FP8 Quantized KV-Cache)
+kernel void gqa_attention_decode_fused_fp8(
+    device const float* qGateVector [[buffer(0)]], // [8192] = 16 heads * (Q[256] + Gate[256])
+    device const char* kCacheBuffer [[buffer(1)]],
+    device const char* vCacheBuffer [[buffer(2)]],
+    device const half* kScaleBuffer [[buffer(3)]],
+    device const half* vScaleBuffer [[buffer(4)]],
+    device float* attnOutBuffer [[buffer(5)]],     // [4096] = 16 heads * 256
+    constant uint32_t& seqLen [[buffer(6)]],
+    constant uint32_t& numQHeads [[buffer(7)]],
+    constant uint32_t& numKvHeads [[buffer(8)]],
+    constant uint32_t& headDim [[buffer(9)]],
+    uint qHeadIdx [[thread_position_in_grid]]
+) {
+    if (qHeadIdx >= numQHeads) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+
+    uint32_t qHeadBase = qHeadIdx * 512;
+    uint32_t gateBase = qHeadBase + 256;
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    float4 acc[64];
+    uint32_t headDimVec = headDim / 4;
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        acc[d] = float4(0.0f);
+    }
+
+    float m = -1e20f;
+    float l = 0.0f;
+
+    device const float4* qHeadVec = (device const float4*)(qGateVector + qHeadBase);
+
+    for (uint32_t tau = 0; tau < seqLen; tau++) {
+        uint32_t scaleIdx = (tau * numKvHeads) + kvHeadIdx;
+        float kScale = float(kScaleBuffer[scaleIdx]);
+        float vScale = float(vScaleBuffer[scaleIdx]);
+
+        uint32_t kBase = (tau * kvStride) + kvHeadBase;
+        device const char* kHeadBytes = kCacheBuffer + kBase;
+
+        float dot_raw = 0.0f;
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            uint32_t d4 = d * 4;
+            float4 kVec = float4(float(kHeadBytes[d4]), float(kHeadBytes[d4 + 1]), float(kHeadBytes[d4 + 2]), float(kHeadBytes[d4 + 3]));
+            dot_raw += dot(qHeadVec[d], kVec);
+        }
+        float score = (dot_raw * kScale) * invSqrtHeadDim;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+
+        l = (l * alpha) + beta;
+
+        uint32_t vBase = (tau * kvStride) + kvHeadBase;
+        device const char* vHeadBytes = vCacheBuffer + vBase;
+        float beta_vScale = beta * vScale;
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            uint32_t d4 = d * 4;
+            float4 vVec = float4(float(vHeadBytes[d4]), float(vHeadBytes[d4 + 1]), float(vHeadBytes[d4 + 2]), float(vHeadBytes[d4 + 3]));
+            acc[d] = (acc[d] * alpha) + (beta_vScale * vVec);
+        }
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    uint32_t outOffset = qHeadIdx * headDim;
+
+    for (uint32_t d = 0; d < headDim; d++) {
+        uint32_t vecIdx = d / 4;
+        uint32_t compIdx = d % 4;
+        float ctx = acc[vecIdx][compIdx] * invL;
+        float g = qGateVector[gateBase + d];
+        float sig_g = 1.0f / (1.0f + exp(-g));
+        attnOutBuffer[outOffset + d] = ctx * sig_g;
+    }
+}
+
+/// MSL Kernel: Standard Grouped-Query Attention (GQA) Autoregressive Decoding for LLaMA / Mistral / Nanbeige (FP32)
 kernel void gqa_attention_decode_standard(
     device const float* qVector [[buffer(0)]],     // [numQHeads * headDim]
     device const float* kCacheBuffer [[buffer(1)]],
@@ -1283,10 +1511,9 @@ kernel void gqa_attention_decode_standard(
     float m = -1e20f; // running max score
     float l = 0.0f;   // running sum of exponents
 
-    uint32_t safeLen = min(seqLen, 2048u);
     device const float4* qHeadVec = (device const float4*)(qVector + qHeadBase);
 
-    for (uint32_t tau = 0; tau < safeLen; tau++) {
+    for (uint32_t tau = 0; tau < seqLen; tau++) {
         uint32_t kBase = (tau * kvStride) + kvHeadBase;
         device const float4* kVec = (device const float4*)(kCacheBuffer + kBase);
         
@@ -1310,6 +1537,158 @@ kernel void gqa_attention_decode_standard(
         device const float4* vVec = (device const float4*)(vCacheBuffer + vBase);
         for (uint32_t d = 0; d < headDimVec; d++) {
             acc[d] = (acc[d] * alpha) + (beta * vVec[d]);
+        }
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    uint32_t outOffset = qHeadIdx * headDim;
+    device float4* outVec = (device float4*)(attnOutBuffer + outOffset);
+
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        outVec[d] = acc[d] * invL;
+    }
+}
+
+/// MSL Kernel: Standard Grouped-Query Attention (GQA) Autoregressive Decoding for LLaMA / Mistral / Nanbeige (FP16 KV-Cache)
+kernel void gqa_attention_decode_standard_f16(
+    device const float* qVector [[buffer(0)]],     // [numQHeads * headDim]
+    device const half* kCacheBuffer [[buffer(1)]],
+    device const half* vCacheBuffer [[buffer(2)]],
+    device float* attnOutBuffer [[buffer(3)]],     // [numQHeads * headDim]
+    constant uint32_t& seqLen [[buffer(4)]],
+    constant uint32_t& numQHeads [[buffer(5)]],
+    constant uint32_t& numKvHeads [[buffer(6)]],
+    constant uint32_t& headDim [[buffer(7)]],
+    uint qHeadIdx [[thread_position_in_grid]]
+) {
+    if (qHeadIdx >= numQHeads) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+
+    uint32_t qHeadBase = qHeadIdx * headDim;
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    // Online Softmax Accumulator (float4 vectorized)
+    float4 acc[64];
+    uint32_t headDimVec = headDim / 4;
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        acc[d] = float4(0.0f);
+    }
+
+    float m = -1e20f; // running max score
+    float l = 0.0f;   // running sum of exponents
+
+    device const float4* qHeadVec = (device const float4*)(qVector + qHeadBase);
+
+    for (uint32_t tau = 0; tau < seqLen; tau++) {
+        uint32_t kBase = (tau * kvStride) + kvHeadBase;
+        device const half4* kVec = (device const half4*)(kCacheBuffer + kBase);
+        
+        float dot_val = 0.0f;
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            dot_val += dot(qHeadVec[d], float4(kVec[d]));
+        }
+        float score = dot_val * invSqrtHeadDim;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+
+        l = (l * alpha) + beta;
+
+        uint32_t vBase = (tau * kvStride) + kvHeadBase;
+        device const half4* vVec = (device const half4*)(vCacheBuffer + vBase);
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            acc[d] = (acc[d] * alpha) + (beta * float4(vVec[d]));
+        }
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    uint32_t outOffset = qHeadIdx * headDim;
+    device float4* outVec = (device float4*)(attnOutBuffer + outOffset);
+
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        outVec[d] = acc[d] * invL;
+    }
+}
+
+/// MSL Kernel: Standard Grouped-Query Attention (GQA) Autoregressive Decoding for LLaMA / Mistral / Nanbeige (FP8 Quantized KV-Cache)
+kernel void gqa_attention_decode_standard_fp8(
+    device const float* qVector [[buffer(0)]],     // [numQHeads * headDim]
+    device const char* kCacheBuffer [[buffer(1)]],
+    device const char* vCacheBuffer [[buffer(2)]],
+    device const half* kScaleBuffer [[buffer(3)]],
+    device const half* vScaleBuffer [[buffer(4)]],
+    device float* attnOutBuffer [[buffer(5)]],     // [numQHeads * headDim]
+    constant uint32_t& seqLen [[buffer(6)]],
+    constant uint32_t& numQHeads [[buffer(7)]],
+    constant uint32_t& numKvHeads [[buffer(8)]],
+    constant uint32_t& headDim [[buffer(9)]],
+    uint qHeadIdx [[thread_position_in_grid]]
+) {
+    if (qHeadIdx >= numQHeads) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+
+    uint32_t qHeadBase = qHeadIdx * headDim;
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    float4 acc[64];
+    uint32_t headDimVec = headDim / 4;
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        acc[d] = float4(0.0f);
+    }
+
+    float m = -1e20f;
+    float l = 0.0f;
+
+    device const float4* qHeadVec = (device const float4*)(qVector + qHeadBase);
+
+    for (uint32_t tau = 0; tau < seqLen; tau++) {
+        uint32_t scaleIdx = (tau * numKvHeads) + kvHeadIdx;
+        float kScale = float(kScaleBuffer[scaleIdx]);
+        float vScale = float(vScaleBuffer[scaleIdx]);
+
+        uint32_t kBase = (tau * kvStride) + kvHeadBase;
+        device const char* kHeadBytes = kCacheBuffer + kBase;
+
+        float dot_raw = 0.0f;
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            uint32_t d4 = d * 4;
+            float4 kVec = float4(float(kHeadBytes[d4]), float(kHeadBytes[d4 + 1]), float(kHeadBytes[d4 + 2]), float(kHeadBytes[d4 + 3]));
+            dot_raw += dot(qHeadVec[d], kVec);
+        }
+        float score = (dot_raw * kScale) * invSqrtHeadDim;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+
+        l = (l * alpha) + beta;
+
+        uint32_t vBase = (tau * kvStride) + kvHeadBase;
+        device const char* vHeadBytes = vCacheBuffer + vBase;
+        float beta_vScale = beta * vScale;
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            uint32_t d4 = d * 4;
+            float4 vVec = float4(float(vHeadBytes[d4]), float(vHeadBytes[d4 + 1]), float(vHeadBytes[d4 + 2]), float(vHeadBytes[d4 + 3]));
+            acc[d] = (acc[d] * alpha) + (beta_vScale * vVec);
         }
     }
 

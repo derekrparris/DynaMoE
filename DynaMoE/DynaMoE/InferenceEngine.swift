@@ -159,8 +159,14 @@ public final class InferenceEngine {
     public var clearPipeline: MTLComputePipelineState?
     public var ropePipeline: MTLComputePipelineState?
     public var storeKvCachePipeline: MTLComputePipelineState?
+    public var storeKvCacheF16Pipeline: MTLComputePipelineState?
+    public var storeKvCacheFP8Pipeline: MTLComputePipelineState?
     public var gqaDecodePipeline: MTLComputePipelineState?
+    public var gqaDecodeF16Pipeline: MTLComputePipelineState?
+    public var gqaDecodeFP8Pipeline: MTLComputePipelineState?
     public var gqaStandardPipeline: MTLComputePipelineState?
+    public var gqaStandardF16Pipeline: MTLComputePipelineState?
+    public var gqaStandardFP8Pipeline: MTLComputePipelineState?
     public var causalConv1dPipeline: MTLComputePipelineState?
     public var l2NormQkPipeline: MTLComputePipelineState?
     public var linearAttnStepPipeline: MTLComputePipelineState?
@@ -230,11 +236,29 @@ public final class InferenceEngine {
         if let storeKvFunc = defaultLib.makeFunction(name: "store_kv_cache") {
             storeKvCachePipeline = try device.makeComputePipelineState(function: storeKvFunc)
         }
+        if let storeKvF16Func = defaultLib.makeFunction(name: "store_kv_cache_f16") {
+            storeKvCacheF16Pipeline = try device.makeComputePipelineState(function: storeKvF16Func)
+        }
+        if let storeKvFP8Func = defaultLib.makeFunction(name: "store_kv_cache_fp8") {
+            storeKvCacheFP8Pipeline = try device.makeComputePipelineState(function: storeKvFP8Func)
+        }
         if let gqaFunc = defaultLib.makeFunction(name: "gqa_attention_decode_fused") {
             gqaDecodePipeline = try device.makeComputePipelineState(function: gqaFunc)
         }
+        if let gqaF16Func = defaultLib.makeFunction(name: "gqa_attention_decode_fused_f16") {
+            gqaDecodeF16Pipeline = try device.makeComputePipelineState(function: gqaF16Func)
+        }
+        if let gqaFP8Func = defaultLib.makeFunction(name: "gqa_attention_decode_fused_fp8") {
+            gqaDecodeFP8Pipeline = try device.makeComputePipelineState(function: gqaFP8Func)
+        }
         if let gqaStdFunc = defaultLib.makeFunction(name: "gqa_attention_decode_standard") {
             gqaStandardPipeline = try device.makeComputePipelineState(function: gqaStdFunc)
+        }
+        if let gqaStdF16Func = defaultLib.makeFunction(name: "gqa_attention_decode_standard_f16") {
+            gqaStandardF16Pipeline = try device.makeComputePipelineState(function: gqaStdF16Func)
+        }
+        if let gqaStdFP8Func = defaultLib.makeFunction(name: "gqa_attention_decode_standard_fp8") {
+            gqaStandardFP8Pipeline = try device.makeComputePipelineState(function: gqaStdFP8Func)
         }
         if let convFunc = defaultLib.makeFunction(name: "causal_conv1d_silu") {
             causalConv1dPipeline = try device.makeComputePipelineState(function: convFunc)

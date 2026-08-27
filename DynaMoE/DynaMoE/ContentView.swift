@@ -60,16 +60,35 @@ struct TokenPrediction: Identifiable {
     let probability: Float
 }
 
+enum KVCachePrecision: String, CaseIterable, Identifiable {
+    case fp16 = "FP16 (Half - 50% Memory)"
+    case fp8 = "FP8 (8-Bit Quantized - 75% Memory)"
+    case fp32 = "FP32 (Full Precision)"
+
+    var id: String { rawValue }
+
+    var bytesPerElement: Int {
+        switch self {
+        case .fp16: return 2
+        case .fp8: return 1
+        case .fp32: return 4
+        }
+    }
+}
+
 final class KVCacheManager {
     static let shared = KVCacheManager()
-    
+
     var kCacheBuffer: MTLBuffer?
     var vCacheBuffer: MTLBuffer?
+    var kScaleBuffer: MTLBuffer?
+    var vScaleBuffer: MTLBuffer?
     var linearStateBuffer: MTLBuffer?
     var convStateBuffer: MTLBuffer?
     var allocatedSeqLen: Int = 0
     var allocatedKvBytes: Int = 0
-    
+    var activePrecision: KVCachePrecision = .fp16
+
     func reset(
         device: MTLDevice,
         config: ModelConfig? = nil,
@@ -77,26 +96,40 @@ final class KVCacheManager {
         totalLoops: Int = 1,
         numKvHeads: Int = 8,
         headDim: Int = 128,
-        maxSeqLen: Int = 2048
+        maxSeqLen: Int = 2048,
+        precision: KVCachePrecision = .fp16
     ) {
         self.allocatedSeqLen = maxSeqLen
-        
+        self.activePrecision = precision
+
         let loops = max(totalLoops, config?.effectiveNumLoops ?? 1)
         let kvHeads = max(numKvHeads, config?.effectiveNumKeyValueHeads ?? 8)
         let hDim = max(headDim, config?.effectiveHeadDim ?? 128)
         let totalSlots = actualLayers * loops
         let kvStride = kvHeads * hDim
-        let kvBytes = max(totalSlots, 44) * maxSeqLen * max(kvStride, 1024) * MemoryLayout<Float>.stride
-        
+        let elementBytes = precision.bytesPerElement
+        let kvBytes = max(totalSlots, 44) * maxSeqLen * max(kvStride, 1024) * elementBytes
+
         if kCacheBuffer == nil || allocatedKvBytes < kvBytes {
             self.kCacheBuffer = device.makeBuffer(length: kvBytes, options: .storageModeShared)
             self.vCacheBuffer = device.makeBuffer(length: kvBytes, options: .storageModeShared)
             self.allocatedKvBytes = kvBytes
         }
-        
+
         if let kBuf = kCacheBuffer { memset(kBuf.contents(), 0, min(kvBytes, kBuf.length)) }
         if let vBuf = vCacheBuffer { memset(vBuf.contents(), 0, min(kvBytes, vBuf.length)) }
-        
+
+        if precision == .fp8 {
+            let scaleCount = max(totalSlots, 44) * maxSeqLen * kvHeads
+            let scaleBytes = scaleCount * MemoryLayout<UInt16>.stride // half precision per-head scales
+            if kScaleBuffer == nil || kScaleBuffer!.length < scaleBytes {
+                self.kScaleBuffer = device.makeBuffer(length: scaleBytes, options: .storageModeShared)
+                self.vScaleBuffer = device.makeBuffer(length: scaleBytes, options: .storageModeShared)
+            }
+            if let ksBuf = kScaleBuffer { memset(ksBuf.contents(), 0, scaleBytes) }
+            if let vsBuf = vScaleBuffer { memset(vsBuf.contents(), 0, scaleBytes) }
+        }
+
         let linLayers = actualLayers
         let linStateBytes = max(linLayers, 40) * 32 * 128 * 128 * MemoryLayout<Float>.stride
         if linearStateBuffer == nil || linearStateBuffer!.length < linStateBytes {
@@ -444,6 +477,18 @@ struct ContentView: View {
     // Working Set & Dynamic SSD Expert Paging State
     @State private var memoryExecutionMode: MemoryExecutionMode = .autoDetect
     @State private var memoryBudgetMode: MemoryBudgetMode = .balanced16GB
+    @AppStorage("dynamoe_kv_cache_precision") private var kvCachePrecisionRaw: String = KVCachePrecision.fp16.rawValue
+
+    var kvCachePrecisionBinding: Binding<KVCachePrecision> {
+        Binding(
+            get: { KVCachePrecision(rawValue: kvCachePrecisionRaw) ?? .fp16 },
+            set: { kvCachePrecisionRaw = $0.rawValue }
+        )
+    }
+    var kvCachePrecision: KVCachePrecision {
+        KVCachePrecision(rawValue: kvCachePrecisionRaw) ?? .fp16
+    }
+
     @State private var modelConfig: ModelConfig? = nil
     @State private var detectedArchitecture: ModelArchitectureType = .hybridSsmMoe
     @State private var currentRssGB: Double = 0.0
@@ -672,6 +717,7 @@ struct ContentView: View {
                 targetLayerCount: $targetLayerCount,
                 memoryExecutionMode: $memoryExecutionMode,
                 memoryBudgetMode: $memoryBudgetMode,
+                kvCachePrecision: kvCachePrecisionBinding,
                 currentRssGB: currentRssGB,
                 residentExpertCount: residentExpertCount,
                 totalExpertCount: totalExpertCount,
@@ -2776,8 +2822,14 @@ struct ContentView: View {
         let headRmsnormOffsetF16Pipeline: MTLComputePipelineState?
         let ropePipeline: MTLComputePipelineState?
         let storeKvCachePipeline: MTLComputePipelineState?
+        let storeKvCacheF16Pipeline: MTLComputePipelineState?
+        let storeKvCacheFP8Pipeline: MTLComputePipelineState?
         let gqaDecodePipeline: MTLComputePipelineState?
+        let gqaDecodeF16Pipeline: MTLComputePipelineState?
+        let gqaDecodeFP8Pipeline: MTLComputePipelineState?
         let gqaStandardPipeline: MTLComputePipelineState?
+        let gqaStandardF16Pipeline: MTLComputePipelineState?
+        let gqaStandardFP8Pipeline: MTLComputePipelineState?
         let causalConv1dPipeline: MTLComputePipelineState?
         let l2NormQkPipeline: MTLComputePipelineState?
         let linearAttnStepPipeline: MTLComputePipelineState?
@@ -2923,13 +2975,37 @@ struct ContentView: View {
                 storeKvCachePipeline = try device.makeComputePipelineState(function: storeKvFunc)
             } else { storeKvCachePipeline = nil }
 
+            if let storeKvF16Func = defaultLibrary.makeFunction(name: "store_kv_cache_f16") {
+                storeKvCacheF16Pipeline = try device.makeComputePipelineState(function: storeKvF16Func)
+            } else { storeKvCacheF16Pipeline = nil }
+
+            if let storeKvFP8Func = defaultLibrary.makeFunction(name: "store_kv_cache_fp8") {
+                storeKvCacheFP8Pipeline = try device.makeComputePipelineState(function: storeKvFP8Func)
+            } else { storeKvCacheFP8Pipeline = nil }
+
             if let gqaFunc = defaultLibrary.makeFunction(name: "gqa_attention_decode_fused") {
                 gqaDecodePipeline = try device.makeComputePipelineState(function: gqaFunc)
             } else { gqaDecodePipeline = nil }
 
+            if let gqaF16Func = defaultLibrary.makeFunction(name: "gqa_attention_decode_fused_f16") {
+                gqaDecodeF16Pipeline = try device.makeComputePipelineState(function: gqaF16Func)
+            } else { gqaDecodeF16Pipeline = nil }
+
+            if let gqaFP8Func = defaultLibrary.makeFunction(name: "gqa_attention_decode_fused_fp8") {
+                gqaDecodeFP8Pipeline = try device.makeComputePipelineState(function: gqaFP8Func)
+            } else { gqaDecodeFP8Pipeline = nil }
+
             if let gqaStdFunc = defaultLibrary.makeFunction(name: "gqa_attention_decode_standard") {
                 gqaStandardPipeline = try device.makeComputePipelineState(function: gqaStdFunc)
             } else { gqaStandardPipeline = nil }
+
+            if let gqaStdF16Func = defaultLibrary.makeFunction(name: "gqa_attention_decode_standard_f16") {
+                gqaStandardF16Pipeline = try device.makeComputePipelineState(function: gqaStdF16Func)
+            } else { gqaStandardF16Pipeline = nil }
+
+            if let gqaStdFP8Func = defaultLibrary.makeFunction(name: "gqa_attention_decode_standard_fp8") {
+                gqaStandardFP8Pipeline = try device.makeComputePipelineState(function: gqaStdFP8Func)
+            } else { gqaStandardFP8Pipeline = nil }
 
             if let convFunc = defaultLibrary.makeFunction(name: "causal_conv1d_silu") {
                 causalConv1dPipeline = try device.makeComputePipelineState(function: convFunc)
@@ -3036,6 +3112,7 @@ struct ContentView: View {
         let budgetMode = self.memoryBudgetMode
 
         let neededSeqLen = max(2048, min(32768, promptTokenIds.count + maxTokens + 256))
+        let kvPrec = self.kvCachePrecision
         KVCacheManager.shared.reset(
             device: device,
             config: modelConfig,
@@ -3043,7 +3120,8 @@ struct ContentView: View {
             totalLoops: totalLoops,
             numKvHeads: Int(numKvHeads),
             headDim: Int(headDim),
-            maxSeqLen: neededSeqLen
+            maxSeqLen: neededSeqLen,
+            precision: kvPrec
         )
 
         isGeneratingText = true
@@ -3669,51 +3747,143 @@ struct ContentView: View {
                             }
 
                             // Store KV-Cache and Fused GQA Decode
-                            if let storePipe = storeKvCachePipeline,
-                               let kCache = KVCacheManager.shared.kCacheBuffer,
+                            if let kCache = KVCacheManager.shared.kCacheBuffer,
                                let vCache = KVCacheManager.shared.vCacheBuffer {
                                 let slot = (loopIdx * actualLayers) + layer.fullAttnIndex
-                                let layerByteOffset = slot * 2048 * Int(kvStride) * MemoryLayout<Float>.stride
+                                let maxSeq = KVCacheManager.shared.allocatedSeqLen
+                                let prec = KVCacheManager.shared.activePrecision
+                                let layerByteOffset = slot * maxSeq * Int(kvStride) * prec.bytesPerElement
                                 var pos = step
                                 var nKv = numKvHeads
                                 var hD = headDim
+                                var nQ = numHeads
+                                var seqLen = step + 1
 
-                                layerEnc1.setComputePipelineState(storePipe)
-                                layerEnc1.setBuffer(kVectorBuffer, offset: 0, index: 0)
-                                layerEnc1.setBuffer(vVectorBuffer, offset: 0, index: 1)
-                                layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 2)
-                                layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 3)
-                                layerEnc1.setBytes(&pos, length: MemoryLayout<UInt32>.stride, index: 4)
-                                layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 5)
-                                layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 6)
-                                layerEnc1.dispatchThreads(MTLSize(width: Int(kvStride), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(kvStride), storePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                switch prec {
+                                case .fp16:
+                                    if let storePipe = storeKvCacheF16Pipeline ?? storeKvCachePipeline {
+                                        layerEnc1.setComputePipelineState(storePipe)
+                                        layerEnc1.setBuffer(kVectorBuffer, offset: 0, index: 0)
+                                        layerEnc1.setBuffer(vVectorBuffer, offset: 0, index: 1)
+                                        layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 2)
+                                        layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 3)
+                                        layerEnc1.setBytes(&pos, length: MemoryLayout<UInt32>.stride, index: 4)
+                                        layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 5)
+                                        layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 6)
+                                        layerEnc1.dispatchThreads(MTLSize(width: Int(kvStride), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(kvStride), storePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    }
 
-                                if isStandardGqa, let gqaStdPipe = gqaStandardPipeline {
-                                    var seqLen = step + 1
-                                    var nQ = numHeads
-                                    layerEnc1.setComputePipelineState(gqaStdPipe)
-                                    layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
-                                    layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
-                                    layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
-                                    layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 3)
-                                    layerEnc1.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 4)
-                                    layerEnc1.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 5)
-                                    layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 6)
-                                    layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 7)
-                                    layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), gqaStdPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
-                                } else if let gqaPipe = gqaDecodePipeline {
-                                    var seqLen = step + 1
-                                    var nQ = numHeads
-                                    layerEnc1.setComputePipelineState(gqaPipe)
-                                    layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
-                                    layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
-                                    layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
-                                    layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 3)
-                                    layerEnc1.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 4)
-                                    layerEnc1.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 5)
-                                    layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 6)
-                                    layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 7)
-                                    layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), gqaPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    if isStandardGqa, let gqaStdPipe = gqaStandardF16Pipeline ?? gqaStandardPipeline {
+                                        layerEnc1.setComputePipelineState(gqaStdPipe)
+                                        layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                                        layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                        layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                        layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 3)
+                                        layerEnc1.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 4)
+                                        layerEnc1.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 5)
+                                        layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 6)
+                                        layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 7)
+                                        layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), gqaStdPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    } else if let gqaPipe = gqaDecodeF16Pipeline ?? gqaDecodePipeline {
+                                        layerEnc1.setComputePipelineState(gqaPipe)
+                                        layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                                        layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                        layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                        layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 3)
+                                        layerEnc1.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 4)
+                                        layerEnc1.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 5)
+                                        layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 6)
+                                        layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 7)
+                                        layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), gqaPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    }
+
+                                case .fp8:
+                                    let scaleByteOffset = slot * maxSeq * Int(numKvHeads) * MemoryLayout<UInt16>.stride
+                                    if let storePipe = storeKvCacheFP8Pipeline,
+                                       let kScale = KVCacheManager.shared.kScaleBuffer,
+                                       let vScale = KVCacheManager.shared.vScaleBuffer {
+                                        layerEnc1.setComputePipelineState(storePipe)
+                                        layerEnc1.setBuffer(kVectorBuffer, offset: 0, index: 0)
+                                        layerEnc1.setBuffer(vVectorBuffer, offset: 0, index: 1)
+                                        layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 2)
+                                        layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 3)
+                                        layerEnc1.setBuffer(kScale, offset: scaleByteOffset, index: 4)
+                                        layerEnc1.setBuffer(vScale, offset: scaleByteOffset, index: 5)
+                                        layerEnc1.setBytes(&pos, length: MemoryLayout<UInt32>.stride, index: 6)
+                                        layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 7)
+                                        layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 8)
+                                        let threadgroups = MTLSize(width: Int(numKvHeads), height: 1, depth: 1)
+                                        let threadsPerTG = MTLSize(width: 32, height: 1, depth: 1)
+                                        layerEnc1.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerTG)
+                                    }
+
+                                    if let kScale = KVCacheManager.shared.kScaleBuffer,
+                                       let vScale = KVCacheManager.shared.vScaleBuffer {
+                                        if isStandardGqa, let gqaStdPipe = gqaStandardFP8Pipeline {
+                                            layerEnc1.setComputePipelineState(gqaStdPipe)
+                                            layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                                            layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                            layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                            layerEnc1.setBuffer(kScale, offset: scaleByteOffset, index: 3)
+                                            layerEnc1.setBuffer(vScale, offset: scaleByteOffset, index: 4)
+                                            layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 5)
+                                            layerEnc1.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 6)
+                                            layerEnc1.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 7)
+                                            layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 8)
+                                            layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 9)
+                                            layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), gqaStdPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                        } else if let gqaPipe = gqaDecodeFP8Pipeline {
+                                            layerEnc1.setComputePipelineState(gqaPipe)
+                                            layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                                            layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                            layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                            layerEnc1.setBuffer(kScale, offset: scaleByteOffset, index: 3)
+                                            layerEnc1.setBuffer(vScale, offset: scaleByteOffset, index: 4)
+                                            layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 5)
+                                            layerEnc1.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 6)
+                                            layerEnc1.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 7)
+                                            layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 8)
+                                            layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 9)
+                                            layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), gqaPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                        }
+                                    }
+
+                                case .fp32:
+                                    if let storePipe = storeKvCachePipeline {
+                                        layerEnc1.setComputePipelineState(storePipe)
+                                        layerEnc1.setBuffer(kVectorBuffer, offset: 0, index: 0)
+                                        layerEnc1.setBuffer(vVectorBuffer, offset: 0, index: 1)
+                                        layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 2)
+                                        layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 3)
+                                        layerEnc1.setBytes(&pos, length: MemoryLayout<UInt32>.stride, index: 4)
+                                        layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 5)
+                                        layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 6)
+                                        layerEnc1.dispatchThreads(MTLSize(width: Int(kvStride), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(kvStride), storePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    }
+
+                                    if isStandardGqa, let gqaStdPipe = gqaStandardPipeline {
+                                        layerEnc1.setComputePipelineState(gqaStdPipe)
+                                        layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                                        layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                        layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                        layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 3)
+                                        layerEnc1.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 4)
+                                        layerEnc1.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 5)
+                                        layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 6)
+                                        layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 7)
+                                        layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), gqaStdPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    } else if let gqaPipe = gqaDecodePipeline {
+                                        layerEnc1.setComputePipelineState(gqaPipe)
+                                        layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                                        layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                        layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                        layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 3)
+                                        layerEnc1.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 4)
+                                        layerEnc1.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 5)
+                                        layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 6)
+                                        layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 7)
+                                        layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), gqaPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    }
                                 }
                             }
 
