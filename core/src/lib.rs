@@ -577,8 +577,8 @@ impl DynaMoeEngine {
                         let (category, layer_index, expert_id) = parse_layer_and_expert(name);
 
                         let shape = tensor.shape();
-                        // Stacked 3D expert tensor: e.g. switch_mlp with shape [256, dim0, dim1]
-                        if shape.len() == 3 && shape[0] == 256 && (name.contains("switch_mlp") || name.contains("experts")) && expert_id.is_none() {
+                        // Stacked 3D expert tensor: e.g. switch_mlp with shape [num_experts, dim0, dim1]
+                        if shape.len() == 3 && shape[0] > 1 && (name.contains("switch_mlp") || name.contains("experts")) && expert_id.is_none() {
                             let num_experts = shape[0];
                             let per_expert_bytes = (tensor.data().len() / num_experts) as u64;
                             let per_expert_size_mb = size_mb / (num_experts as f64);

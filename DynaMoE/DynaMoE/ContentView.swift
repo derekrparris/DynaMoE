@@ -3794,7 +3794,7 @@ struct ContentView: View {
                                 var bOffset = embedBias!.offsetStart
                                 var tok = tokenId
                                 var grpSize: UInt32 = 64
-                                let is8Bit = (embedWeight.offsetEnd - embedWeight.offsetStart) >= UInt64(hiddenDim)
+                                let is8Bit = (embedWeight.offsetEnd - embedWeight.offsetStart) >= (UInt64(vocabSize) * UInt64(hiddenDim) * 3) / 4
                                 if is8Bit, let embedQ8Pipe = embedQ8Pipeline {
                                     layerEnc1.setComputePipelineState(embedQ8Pipe)
                                     layerEnc1.setBuffer(embedShardBuffer, offset: 0, index: 0)
@@ -4691,20 +4691,28 @@ struct ContentView: View {
                 let promptTrimmed = formattedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
                 let promptRequestsThinking = promptTrimmed.hasSuffix("<think>") && !promptTrimmed.hasSuffix("</think>")
 
-                let containsThinkOpen = updatedRaw.contains("<think>")
-                let containsThinkClose = updatedRaw.contains("</think>")
+                let containsThinkOpen = updatedRaw.contains("<think>") || updatedRaw.contains("<|thought|>") || updatedRaw.contains("<thought>")
+                let containsThinkClose = updatedRaw.contains("</think>") || updatedRaw.contains("</|thought|>") || updatedRaw.contains("</thought>")
 
                 if containsThinkClose {
                     if thinkingEndTimestamp == nil {
                         thinkingEndTimestamp = CFAbsoluteTimeGetCurrent()
                     }
-                    let parts = updatedRaw.components(separatedBy: "</think>")
-                    if promptRequestsThinking {
-                        thinkPart = parts[0].replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    let delimiter: String
+                    let openTag: String
+                    if updatedRaw.contains("</think>") {
+                        delimiter = "</think>"
+                        openTag = "<think>"
+                    } else if updatedRaw.contains("</|thought|>") {
+                        delimiter = "</|thought|>"
+                        openTag = "<|thought|>"
                     } else {
-                        thinkPart = ""
+                        delimiter = "</thought>"
+                        openTag = "<thought>"
                     }
-                    let rawResp = parts.dropFirst().joined(separator: "</think>")
+                    let parts = updatedRaw.components(separatedBy: delimiter)
+                    thinkPart = parts[0].replacingOccurrences(of: openTag, with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    let rawResp = parts.dropFirst().joined(separator: delimiter)
                     respPart = rawResp
                         .replacingOccurrences(of: "<|im_end|>", with: "")
                         .replacingOccurrences(of: "<|endoftext|>", with: "")
@@ -4713,14 +4721,9 @@ struct ContentView: View {
                     activeThink = false
                 } else if containsThinkOpen || promptRequestsThinking {
                     // Inside the thinking block before </think> arrives
-                    if promptRequestsThinking {
-                        thinkPart = updatedRaw.replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespaces)
-                        activeThink = true
-                    } else {
-                        // Thinking is disabled in the UI: suppress thought tokens so they never flash in the response view
-                        thinkPart = ""
-                        activeThink = false
-                    }
+                    let openTag = updatedRaw.contains("<|thought|>") ? "<|thought|>" : (updatedRaw.contains("<thought>") ? "<thought>" : "<think>")
+                    thinkPart = updatedRaw.replacingOccurrences(of: openTag, with: "").trimmingCharacters(in: .whitespaces)
+                    activeThink = true
                     respPart = ""
                 } else {
                     // Normal direct response without think tags
@@ -4788,38 +4791,37 @@ struct ContentView: View {
             let promptTrimmedFinal = formattedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
             let promptRequestsThinkingFinal = promptTrimmedFinal.hasSuffix("<think>") && !promptTrimmedFinal.hasSuffix("</think>")
 
-            let finalContainsThinkClose = finalDecoded.contains("</think>")
-            let finalContainsThinkOpen = finalDecoded.contains("<think>")
+            let finalContainsThinkClose = finalDecoded.contains("</think>") || finalDecoded.contains("</|thought|>") || finalDecoded.contains("</thought>")
+            let finalContainsThinkOpen = finalDecoded.contains("<think>") || finalDecoded.contains("<|thought|>") || finalDecoded.contains("<thought>")
 
             if finalContainsThinkClose {
                 if thinkingEndTimestamp == nil {
                     thinkingEndTimestamp = CFAbsoluteTimeGetCurrent()
                 }
-                let parts = finalDecoded.components(separatedBy: "</think>")
-                if promptRequestsThinkingFinal {
-                    finalThink = parts[0].replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let delimiter: String
+                let openTag: String
+                if finalDecoded.contains("</think>") {
+                    delimiter = "</think>"
+                    openTag = "<think>"
+                } else if finalDecoded.contains("</|thought|>") {
+                    delimiter = "</|thought|>"
+                    openTag = "<|thought|>"
                 } else {
-                    finalThink = ""
+                    delimiter = "</thought>"
+                    openTag = "<thought>"
                 }
-                let rawFinalResp = parts.dropFirst().joined(separator: "</think>")
+                let parts = finalDecoded.components(separatedBy: delimiter)
+                finalThink = parts[0].replacingOccurrences(of: openTag, with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let rawFinalResp = parts.dropFirst().joined(separator: delimiter)
                 finalResp = rawFinalResp
                     .replacingOccurrences(of: "<|im_end|>", with: "")
                     .replacingOccurrences(of: "<|endoftext|>", with: "")
                     .replacingOccurrences(of: "<|im_start|>", with: "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
             } else if finalContainsThinkOpen || promptRequestsThinkingFinal {
-                if promptRequestsThinkingFinal {
-                    finalThink = finalDecoded.replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespaces)
-                    finalResp = ""
-                } else {
-                    finalThink = ""
-                    finalResp = finalDecoded
-                        .replacingOccurrences(of: "<think>", with: "")
-                        .replacingOccurrences(of: "<|im_end|>", with: "")
-                        .replacingOccurrences(of: "<|endoftext|>", with: "")
-                        .replacingOccurrences(of: "<|im_start|>", with: "")
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
-                }
+                let openTag = finalDecoded.contains("<|thought|>") ? "<|thought|>" : (finalDecoded.contains("<thought>") ? "<thought>" : "<think>")
+                finalThink = finalDecoded.replacingOccurrences(of: openTag, with: "").trimmingCharacters(in: .whitespaces)
+                finalResp = ""
             } else {
                 finalThink = ""
                 finalResp = finalDecoded

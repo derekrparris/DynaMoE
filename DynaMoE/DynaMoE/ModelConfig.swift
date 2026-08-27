@@ -416,14 +416,40 @@ public struct ModelConfig: Codable {
         if nameLower.contains("nanbeige") || typeStr.contains("nanbeige") || archStr.contains("nanbeige") || pathLower.contains("nanbeige") {
             return true
         }
+        if nameLower.contains("ornith") || typeStr.contains("ornith") || archStr.contains("ornith") || pathLower.contains("ornith") {
+            return true
+        }
+        if nameLower.contains("qwen") || typeStr.contains("qwen") || archStr.contains("qwen") || pathLower.contains("qwen") {
+            return true
+        }
         if nameLower.contains("deepseek") || typeStr.contains("deepseek") || archStr.contains("deepseek") || pathLower.contains("deepseek") {
             return true
         }
         if nameLower.contains("r1") || nameLower.contains("reason") || nameLower.contains("qwq") || typeStr.contains("qwq") || archStr.contains("qwq") || pathLower.contains("qwq") {
             return true
         }
+        if nameLower.contains("glm") || typeStr.contains("glm") || archStr.contains("glm") || pathLower.contains("glm") {
+            return true
+        }
+        if nameLower.contains("nemotron") || typeStr.contains("nemotron") || archStr.contains("nemotron") || pathLower.contains("nemotron") {
+            return true
+        }
         if nameLower.contains("think") || pathLower.contains("think") {
             return true
+        }
+        // Inspect model directory files if path provided
+        if let path = modelPath, !path.isEmpty {
+            let fileMgr = FileManager.default
+            let dirUrl = URL(fileURLWithPath: path)
+            let filesToCheck = ["tokenizer_config.json", "chat_template.jinja", "tokenizer.json"]
+            for fName in filesToCheck {
+                let fUrl = dirUrl.appendingPathComponent(fName)
+                if fileMgr.fileExists(atPath: fUrl.path), let content = try? String(contentsOf: fUrl, encoding: .utf8) {
+                    if content.contains("<think>") || content.contains("enable_thinking") || content.contains("<|thought|>") || content.contains("reasoning_content") {
+                        return true
+                    }
+                }
+            }
         }
         if (summary?.layerCount == 22 && summary?.maxExpertId == 0) ||
            (summary?.tensors.contains(where: { $0.name.contains("dense_gate_up_proj") }) == true) ||

@@ -66,11 +66,27 @@ public struct DiscoveredModel: Identifiable, Hashable, Codable, Equatable {
         let type = (rawModelType ?? "").lowercased()
         let arch = architectureName.lowercased()
         let path = snapshotPath.lowercased()
-        return name.contains("nanbeige") || repo.contains("nanbeige") || type.contains("nanbeige") || arch.contains("nanbeige") || path.contains("nanbeige") ||
-               name.contains("deepseek") || repo.contains("deepseek") || type.contains("deepseek") || arch.contains("deepseek") || path.contains("deepseek") ||
-               name.contains("r1") || repo.contains("r1") || name.contains("reason") || repo.contains("reason") ||
-               name.contains("qwq") || repo.contains("qwq") || type.contains("qwq") ||
-               name.contains("think") || repo.contains("think")
+        if name.contains("nanbeige") || repo.contains("nanbeige") || type.contains("nanbeige") || arch.contains("nanbeige") || path.contains("nanbeige") ||
+           name.contains("ornith") || repo.contains("ornith") || type.contains("ornith") || arch.contains("ornith") || path.contains("ornith") ||
+           name.contains("qwen") || repo.contains("qwen") || type.contains("qwen") || arch.contains("qwen") || path.contains("qwen") ||
+           name.contains("deepseek") || repo.contains("deepseek") || type.contains("deepseek") || arch.contains("deepseek") || path.contains("deepseek") ||
+           name.contains("r1") || repo.contains("r1") || name.contains("reason") || repo.contains("reason") ||
+           name.contains("qwq") || repo.contains("qwq") || type.contains("qwq") ||
+           name.contains("glm") || repo.contains("glm") || type.contains("glm") ||
+           name.contains("nemotron") || repo.contains("nemotron") || type.contains("nemotron") ||
+           name.contains("think") || repo.contains("think") {
+            return true
+        }
+        let dirUrl = URL(fileURLWithPath: snapshotPath)
+        for fName in ["tokenizer_config.json", "chat_template.jinja", "tokenizer.json"] {
+            let fUrl = dirUrl.appendingPathComponent(fName)
+            if FileManager.default.fileExists(atPath: fUrl.path), let content = try? String(contentsOf: fUrl, encoding: .utf8) {
+                if content.contains("<think>") || content.contains("enable_thinking") || content.contains("<|thought|>") || content.contains("reasoning_content") {
+                    return true
+                }
+            }
+        }
+        return false
     }
 }
 
