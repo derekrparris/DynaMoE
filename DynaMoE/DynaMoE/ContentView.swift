@@ -2890,6 +2890,7 @@ struct ContentView: View {
         let bf16GemvSimdPipeline: MTLComputePipelineState?
         let fp8GemvPipeline: MTLComputePipelineState?
         let mxfp8GemvPipeline: MTLComputePipelineState?
+        let mxfp8GemvSimdPipeline: MTLComputePipelineState?
         let q4GemvPipeline: MTLComputePipelineState?
         let q8GemvPipeline: MTLComputePipelineState?
         let addPipeline: MTLComputePipelineState
@@ -2900,6 +2901,8 @@ struct ContentView: View {
         let fp8DownSimdPipeline: MTLComputePipelineState?
         let mxfp8GateUpPipeline: MTLComputePipelineState?
         let mxfp8DownPipeline: MTLComputePipelineState?
+        let mxfp8GateUpSimdPipeline: MTLComputePipelineState?
+        let mxfp8DownSimdPipeline: MTLComputePipelineState?
         let bf16GateUpPipeline: MTLComputePipelineState?
         let bf16DownPipeline: MTLComputePipelineState?
         let bf16GateUpSimdPipeline: MTLComputePipelineState?
@@ -2979,6 +2982,10 @@ struct ContentView: View {
                 mxfp8GemvPipeline = try device.makeComputePipelineState(function: mxfp8GemvFunc)
             } else { mxfp8GemvPipeline = nil }
 
+            if let mxfp8GemvSimdFunc = defaultLibrary.makeFunction(name: "mxfp8_gemv_simd") {
+                mxfp8GemvSimdPipeline = try device.makeComputePipelineState(function: mxfp8GemvSimdFunc)
+            } else { mxfp8GemvSimdPipeline = nil }
+
             if let q4GemvFunc = defaultLibrary.makeFunction(name: "q4_gemv") {
                 q4GemvPipeline = try device.makeComputePipelineState(function: q4GemvFunc)
             } else { q4GemvPipeline = nil }
@@ -3010,6 +3017,14 @@ struct ContentView: View {
             if let mxfp8DownFunc = defaultLibrary.makeFunction(name: "mxfp8_down_proj_accumulate") {
                 mxfp8DownPipeline = try device.makeComputePipelineState(function: mxfp8DownFunc)
             } else { mxfp8DownPipeline = nil }
+
+            if let mxfp8GateSimdFunc = defaultLibrary.makeFunction(name: "mxfp8_swiglu_gate_up_simd") {
+                mxfp8GateUpSimdPipeline = try device.makeComputePipelineState(function: mxfp8GateSimdFunc)
+            } else { mxfp8GateUpSimdPipeline = nil }
+
+            if let mxfp8DownSimdFunc = defaultLibrary.makeFunction(name: "mxfp8_down_proj_accumulate_simd") {
+                mxfp8DownSimdPipeline = try device.makeComputePipelineState(function: mxfp8DownSimdFunc)
+            } else { mxfp8DownSimdPipeline = nil }
 
             if let bGateUp = defaultLibrary.makeFunction(name: "bf16_swiglu_gate_up") {
                 bf16GateUpPipeline = try device.makeComputePipelineState(function: bGateUp)
@@ -3259,18 +3274,31 @@ struct ContentView: View {
                 let isQuantizedAffine = (hasBias || w.dtype.contains("Q4")) && !isMXFP8
                 let isFP8 = !isMXFP8 && !isQuantizedAffine && !w.dtype.contains("BF16") && !w.dtype.contains("F16") && !w.dtype.contains("FLOAT")
 
-                if isMXFP8, let mxfp8Pipe = mxfp8GemvPipeline, let sRaw = (scale != nil) ? buffers[scale!.shardIndex] : nil {
+                if isMXFP8, let sRaw = (scale != nil) ? buffers[scale!.shardIndex] : nil {
                     var sOff = scale!.offsetStart
-                    enc.setComputePipelineState(mxfp8Pipe)
-                    enc.setBuffer(wRaw, offset: 0, index: 0)
-                    enc.setBuffer(inBuf, offset: 0, index: 1)
-                    enc.setBuffer(outBuf, offset: 0, index: 2)
-                    enc.setBuffer(sRaw, offset: 0, index: 3)
-                    enc.setBytes(&wOff, length: MemoryLayout<UInt64>.stride, index: 4)
-                    enc.setBytes(&sOff, length: MemoryLayout<UInt64>.stride, index: 5)
-                    enc.setBytes(&inD, length: MemoryLayout<UInt32>.stride, index: 6)
-                    enc.setBytes(&outD, length: MemoryLayout<UInt32>.stride, index: 7)
-                    enc.dispatchThreads(MTLSize(width: Int(outDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, mxfp8Pipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                    if let simdPipe = mxfp8GemvSimdPipeline {
+                        enc.setComputePipelineState(simdPipe)
+                        enc.setBuffer(wRaw, offset: 0, index: 0)
+                        enc.setBuffer(inBuf, offset: 0, index: 1)
+                        enc.setBuffer(outBuf, offset: 0, index: 2)
+                        enc.setBuffer(sRaw, offset: 0, index: 3)
+                        enc.setBytes(&wOff, length: MemoryLayout<UInt64>.stride, index: 4)
+                        enc.setBytes(&sOff, length: MemoryLayout<UInt64>.stride, index: 5)
+                        enc.setBytes(&inD, length: MemoryLayout<UInt32>.stride, index: 6)
+                        enc.setBytes(&outD, length: MemoryLayout<UInt32>.stride, index: 7)
+                        enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                    } else if let mxfp8Pipe = mxfp8GemvPipeline {
+                        enc.setComputePipelineState(mxfp8Pipe)
+                        enc.setBuffer(wRaw, offset: 0, index: 0)
+                        enc.setBuffer(inBuf, offset: 0, index: 1)
+                        enc.setBuffer(outBuf, offset: 0, index: 2)
+                        enc.setBuffer(sRaw, offset: 0, index: 3)
+                        enc.setBytes(&wOff, length: MemoryLayout<UInt64>.stride, index: 4)
+                        enc.setBytes(&sOff, length: MemoryLayout<UInt64>.stride, index: 5)
+                        enc.setBytes(&inD, length: MemoryLayout<UInt32>.stride, index: 6)
+                        enc.setBytes(&outD, length: MemoryLayout<UInt32>.stride, index: 7)
+                        enc.dispatchThreads(MTLSize(width: Int(outDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, mxfp8Pipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                    }
                 } else if isQuantizedAffine {
                     let sRaw = (scale != nil) ? buffers[scale!.shardIndex] : nil
                     let bRaw = (bias != nil) ? buffers[bias!.shardIndex] : nil
@@ -3380,7 +3408,7 @@ struct ContentView: View {
                 let isQuantizedAffine = (hasGateBias || gateW.dtype.contains("Q4") || gateW.dtype.contains("Q8")) && !isMXFP8
                 let isFP8 = !isMXFP8 && !isQuantizedAffine && !gateW.dtype.contains("BF16") && !gateW.dtype.contains("F16") && !gateW.dtype.contains("FLOAT")
 
-                if isMXFP8, let mxfp8GatePipe = mxfp8GateUpPipeline, let mxfp8DownPipe = mxfp8DownPipeline {
+                if isMXFP8 {
                     guard let gS = gateS, let gSRaw = buffers[gS.shardIndex],
                           let uS = upS, let uSRaw = buffers[uS.shardIndex],
                           let dS = downS, let dSRaw = buffers[dS.shardIndex] else { return }
@@ -3389,32 +3417,61 @@ struct ContentView: View {
                     var uSOff = uS.offsetStart
                     var dSOff = dS.offsetStart
 
-                    enc.setComputePipelineState(mxfp8GatePipe)
-                    enc.setBuffer(gRaw, offset: 0, index: 0)
-                    enc.setBuffer(uRaw, offset: 0, index: 1)
-                    enc.setBuffer(inBuf, offset: 0, index: 2)
-                    enc.setBuffer(interBuf, offset: 0, index: 3)
-                    enc.setBuffer(gSRaw, offset: 0, index: 4)
-                    enc.setBuffer(uSRaw, offset: 0, index: 5)
-                    enc.setBytes(&gWOff, length: MemoryLayout<UInt64>.stride, index: 6)
-                    enc.setBytes(&gSOff, length: MemoryLayout<UInt64>.stride, index: 7)
-                    enc.setBytes(&uWOff, length: MemoryLayout<UInt64>.stride, index: 8)
-                    enc.setBytes(&uSOff, length: MemoryLayout<UInt64>.stride, index: 9)
-                    enc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 10)
-                    enc.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 11)
-                    enc.dispatchThreads(MTLSize(width: Int(interDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, mxfp8GatePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                    if let gateSimd = mxfp8GateUpSimdPipeline, let downSimd = mxfp8DownSimdPipeline {
+                        enc.setComputePipelineState(gateSimd)
+                        enc.setBuffer(gRaw, offset: 0, index: 0)
+                        enc.setBuffer(uRaw, offset: 0, index: 1)
+                        enc.setBuffer(inBuf, offset: 0, index: 2)
+                        enc.setBuffer(interBuf, offset: 0, index: 3)
+                        enc.setBuffer(gSRaw, offset: 0, index: 4)
+                        enc.setBuffer(uSRaw, offset: 0, index: 5)
+                        enc.setBytes(&gWOff, length: MemoryLayout<UInt64>.stride, index: 6)
+                        enc.setBytes(&gSOff, length: MemoryLayout<UInt64>.stride, index: 7)
+                        enc.setBytes(&uWOff, length: MemoryLayout<UInt64>.stride, index: 8)
+                        enc.setBytes(&uSOff, length: MemoryLayout<UInt64>.stride, index: 9)
+                        enc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 10)
+                        enc.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 11)
+                        enc.dispatchThreadgroups(MTLSize(width: Int(interDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
 
-                    enc.setComputePipelineState(mxfp8DownPipe)
-                    enc.setBuffer(dRaw, offset: 0, index: 0)
-                    enc.setBuffer(interBuf, offset: 0, index: 1)
-                    enc.setBuffer(accumBuf, offset: 0, index: 2)
-                    enc.setBuffer(dSRaw, offset: 0, index: 3)
-                    enc.setBytes(&dWOff, length: MemoryLayout<UInt64>.stride, index: 4)
-                    enc.setBytes(&dSOff, length: MemoryLayout<UInt64>.stride, index: 5)
-                    enc.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 6)
-                    enc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 7)
-                    enc.setBytes(&p_k, length: MemoryLayout<Float>.stride, index: 8)
-                    enc.dispatchThreads(MTLSize(width: Int(inDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, mxfp8DownPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                        enc.setComputePipelineState(downSimd)
+                        enc.setBuffer(dRaw, offset: 0, index: 0)
+                        enc.setBuffer(interBuf, offset: 0, index: 1)
+                        enc.setBuffer(accumBuf, offset: 0, index: 2)
+                        enc.setBuffer(dSRaw, offset: 0, index: 3)
+                        enc.setBytes(&dWOff, length: MemoryLayout<UInt64>.stride, index: 4)
+                        enc.setBytes(&dSOff, length: MemoryLayout<UInt64>.stride, index: 5)
+                        enc.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 6)
+                        enc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 7)
+                        enc.setBytes(&p_k, length: MemoryLayout<Float>.stride, index: 8)
+                        enc.dispatchThreadgroups(MTLSize(width: Int(inDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                    } else if let mxfp8GatePipe = mxfp8GateUpPipeline, let mxfp8DownPipe = mxfp8DownPipeline {
+                        enc.setComputePipelineState(mxfp8GatePipe)
+                        enc.setBuffer(gRaw, offset: 0, index: 0)
+                        enc.setBuffer(uRaw, offset: 0, index: 1)
+                        enc.setBuffer(inBuf, offset: 0, index: 2)
+                        enc.setBuffer(interBuf, offset: 0, index: 3)
+                        enc.setBuffer(gSRaw, offset: 0, index: 4)
+                        enc.setBuffer(uSRaw, offset: 0, index: 5)
+                        enc.setBytes(&gWOff, length: MemoryLayout<UInt64>.stride, index: 6)
+                        enc.setBytes(&gSOff, length: MemoryLayout<UInt64>.stride, index: 7)
+                        enc.setBytes(&uWOff, length: MemoryLayout<UInt64>.stride, index: 8)
+                        enc.setBytes(&uSOff, length: MemoryLayout<UInt64>.stride, index: 9)
+                        enc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 10)
+                        enc.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 11)
+                        enc.dispatchThreads(MTLSize(width: Int(interDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, mxfp8GatePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+
+                        enc.setComputePipelineState(mxfp8DownPipe)
+                        enc.setBuffer(dRaw, offset: 0, index: 0)
+                        enc.setBuffer(interBuf, offset: 0, index: 1)
+                        enc.setBuffer(accumBuf, offset: 0, index: 2)
+                        enc.setBuffer(dSRaw, offset: 0, index: 3)
+                        enc.setBytes(&dWOff, length: MemoryLayout<UInt64>.stride, index: 4)
+                        enc.setBytes(&dSOff, length: MemoryLayout<UInt64>.stride, index: 5)
+                        enc.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 6)
+                        enc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 7)
+                        enc.setBytes(&p_k, length: MemoryLayout<Float>.stride, index: 8)
+                        enc.dispatchThreads(MTLSize(width: Int(inDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, mxfp8DownPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                    }
                 } else if isQuantizedAffine {
                     guard let gS = gateS, let gSRaw = buffers[gS.shardIndex],
                           let gB = gateB, let gBRaw = buffers[gB.shardIndex],
@@ -3783,7 +3840,7 @@ struct ContentView: View {
                                     layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 4)
                                     layerEnc1.setBytes(&hStride, length: MemoryLayout<UInt32>.stride, index: 5)
                                     layerEnc1.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 6)
-                                    layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), headNormPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                                 }
                             }
 
@@ -3810,7 +3867,7 @@ struct ContentView: View {
                                     layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 4)
                                     layerEnc1.setBytes(&hStride, length: MemoryLayout<UInt32>.stride, index: 5)
                                     layerEnc1.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 6)
-                                    layerEnc1.dispatchThreads(MTLSize(width: Int(numKvHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numKvHeads), headNormPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numKvHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                                 }
                             }
 
@@ -4054,7 +4111,7 @@ struct ContentView: View {
                                 layerEnc1.setBytes(&numKeyHeads, length: MemoryLayout<UInt32>.stride, index: 13)
                                 layerEnc1.setBytes(&headDim, length: MemoryLayout<UInt32>.stride, index: 14)
                                 layerEnc1.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 15)
-                                layerEnc1.dispatchThreads(MTLSize(width: 32, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numValHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                             }
 
                             dispatchLinear(enc: layerEnc1, weight: layer.linearOutProjTensor ?? layer.oProjTensor, scale: layer.linearOutProjScale ?? layer.oScaleTensor, bias: layer.linearOutProjBias ?? layer.oBiasTensor, inBuf: attnCtxBuffer, outBuf: attnOutBuffer, inDim: 4096, outDim: hiddenDim)

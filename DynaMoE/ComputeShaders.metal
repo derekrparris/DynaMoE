@@ -701,7 +701,30 @@ kernel void bf16_down_proj_accumulate(
 // MARK: - RMSNorm, Vector Addition & GEMV Compute Kernels
 // =============================================================================
 
-/// MSL Kernel: RMSNorm with BF16 Scale Factors
+/// Helper: 2-Tier SIMD Reduction across threadgroup for Sum of Squares
+inline float threadgroup_reduce_sum(float localSum, threadgroup float* sharedWarpSums, uint tid, uint tgSize) {
+    float warpSum = simd_sum(localSum);
+    uint warpIdx = tid / 32;
+    uint laneIdx = tid % 32;
+
+    if (laneIdx == 0) {
+        sharedWarpSums[warpIdx] = warpSum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint numWarps = (tgSize + 31) / 32;
+    if (warpIdx == 0) {
+        float myWarpVal = (laneIdx < numWarps) ? sharedWarpSums[laneIdx] : 0.0f;
+        float totalSum = simd_sum(myWarpVal);
+        if (laneIdx == 0) {
+            sharedWarpSums[0] = totalSum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return sharedWarpSums[0];
+}
+
+/// MSL Kernel: RMSNorm with BF16 Scale Factors (128-bit Vectorized & SIMD Warp Reduced)
 /// y_d = (x_d / sqrt( (1/D) * sum(x^2) + eps )) * gamma_d
 kernel void rmsnorm_bf16(
     device const float* inVector [[buffer(0)]],
@@ -710,37 +733,45 @@ kernel void rmsnorm_bf16(
     constant uint64_t& gammaOffset [[buffer(3)]],
     constant uint32_t& dim [[buffer(4)]],
     constant float& eps [[buffer(5)]],
-    threadgroup float* sharedSum [[threadgroup(0)]],
+    threadgroup float* sharedWarpSums [[threadgroup(0)]],
     uint tid [[thread_position_in_threadgroup]],
     uint tgSize [[threads_per_threadgroup]]
 ) {
-    // 1. Parallel threadgroup reduction for sum of squares
+    uint dimVec4 = dim / 4;
+    device const float4* inVec4 = (device const float4*)inVector;
     float localSum = 0.0f;
-    for (uint i = tid; i < dim; i += tgSize) {
+
+    for (uint i = tid; i < dimVec4; i += tgSize) {
+        float4 v = inVec4[i];
+        localSum += dot(v, v);
+    }
+    for (uint i = dimVec4 * 4 + tid; i < dim; i += tgSize) {
         float v = inVector[i];
         localSum += v * v;
     }
-    sharedSum[tid] = localSum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint s = tgSize / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sharedSum[tid] += sharedSum[tid + s];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float meanSquare = sharedSum[0] / (float)dim;
+    float totalSum = threadgroup_reduce_sum(localSum, sharedWarpSums, tid, tgSize);
+    float meanSquare = totalSum / (float)dim;
     float invRms = rsqrt(meanSquare + eps);
 
-    // 2. Normalize and scale by gamma
-    for (uint i = tid; i < dim; i += tgSize) {
+    device float4* outVec4 = (device float4*)outVector;
+    for (uint i = tid; i < dimVec4; i += tgSize) {
+        float4 v = inVec4[i];
+        uint64_t byteOff = gammaOffset + ((uint64_t)i * 4 * 2);
+        float g0 = read_bf16_unaligned(gammaBuffer + byteOff + 0);
+        float g1 = read_bf16_unaligned(gammaBuffer + byteOff + 2);
+        float g2 = read_bf16_unaligned(gammaBuffer + byteOff + 4);
+        float g3 = read_bf16_unaligned(gammaBuffer + byteOff + 6);
+        float4 gamma = float4(g0, g1, g2, g3);
+        outVec4[i] = v * invRms * gamma;
+    }
+    for (uint i = dimVec4 * 4 + tid; i < dim; i += tgSize) {
         float gamma = read_bf16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)i * 2));
         outVector[i] = inVector[i] * invRms * gamma;
     }
 }
 
-/// MSL Kernel: RMSNorm with F16 (IEEE 754 half) Scale Factors
+/// MSL Kernel: RMSNorm with F16 (IEEE 754 half) Scale Factors (128-bit Vectorized & SIMD Warp Reduced)
 kernel void rmsnorm_f16(
     device const float* inVector [[buffer(0)]],
     device const uchar* gammaBuffer [[buffer(1)]],
@@ -748,31 +779,39 @@ kernel void rmsnorm_f16(
     constant uint64_t& gammaOffset [[buffer(3)]],
     constant uint32_t& dim [[buffer(4)]],
     constant float& eps [[buffer(5)]],
-    threadgroup float* sharedSum [[threadgroup(0)]],
+    threadgroup float* sharedWarpSums [[threadgroup(0)]],
     uint tid [[thread_position_in_threadgroup]],
     uint tgSize [[threads_per_threadgroup]]
 ) {
-    // 1. Parallel threadgroup reduction for sum of squares
+    uint dimVec4 = dim / 4;
+    device const float4* inVec4 = (device const float4*)inVector;
     float localSum = 0.0f;
-    for (uint i = tid; i < dim; i += tgSize) {
+
+    for (uint i = tid; i < dimVec4; i += tgSize) {
+        float4 v = inVec4[i];
+        localSum += dot(v, v);
+    }
+    for (uint i = dimVec4 * 4 + tid; i < dim; i += tgSize) {
         float v = inVector[i];
         localSum += v * v;
     }
-    sharedSum[tid] = localSum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint s = tgSize / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sharedSum[tid] += sharedSum[tid + s];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float meanSquare = sharedSum[0] / (float)dim;
+    float totalSum = threadgroup_reduce_sum(localSum, sharedWarpSums, tid, tgSize);
+    float meanSquare = totalSum / (float)dim;
     float invRms = rsqrt(meanSquare + eps);
 
-    // 2. Normalize and scale by gamma
-    for (uint i = tid; i < dim; i += tgSize) {
+    device float4* outVec4 = (device float4*)outVector;
+    for (uint i = tid; i < dimVec4; i += tgSize) {
+        float4 v = inVec4[i];
+        uint64_t byteOff = gammaOffset + ((uint64_t)i * 4 * 2);
+        float g0 = read_f16_unaligned(gammaBuffer + byteOff + 0);
+        float g1 = read_f16_unaligned(gammaBuffer + byteOff + 2);
+        float g2 = read_f16_unaligned(gammaBuffer + byteOff + 4);
+        float g3 = read_f16_unaligned(gammaBuffer + byteOff + 6);
+        float4 gamma = float4(g0, g1, g2, g3);
+        outVec4[i] = v * invRms * gamma;
+    }
+    for (uint i = dimVec4 * 4 + tid; i < dim; i += tgSize) {
         float gamma = read_f16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)i * 2));
         outVector[i] = inVector[i] * invRms * gamma;
     }
@@ -786,29 +825,39 @@ kernel void rmsnorm_offset_bf16(
     constant uint64_t& gammaOffset [[buffer(3)]],
     constant uint32_t& dim [[buffer(4)]],
     constant float& eps [[buffer(5)]],
-    threadgroup float* sharedSum [[threadgroup(0)]],
+    threadgroup float* sharedWarpSums [[threadgroup(0)]],
     uint tid [[thread_position_in_threadgroup]],
     uint tgSize [[threads_per_threadgroup]]
 ) {
+    uint dimVec4 = dim / 4;
+    device const float4* inVec4 = (device const float4*)inVector;
     float localSum = 0.0f;
-    for (uint i = tid; i < dim; i += tgSize) {
+
+    for (uint i = tid; i < dimVec4; i += tgSize) {
+        float4 v = inVec4[i];
+        localSum += dot(v, v);
+    }
+    for (uint i = dimVec4 * 4 + tid; i < dim; i += tgSize) {
         float v = inVector[i];
         localSum += v * v;
     }
-    sharedSum[tid] = localSum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint s = tgSize / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sharedSum[tid] += sharedSum[tid + s];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float meanSquare = sharedSum[0] / (float)dim;
+    float totalSum = threadgroup_reduce_sum(localSum, sharedWarpSums, tid, tgSize);
+    float meanSquare = totalSum / (float)dim;
     float invRms = rsqrt(meanSquare + eps);
 
-    for (uint i = tid; i < dim; i += tgSize) {
+    device float4* outVec4 = (device float4*)outVector;
+    for (uint i = tid; i < dimVec4; i += tgSize) {
+        float4 v = inVec4[i];
+        uint64_t byteOff = gammaOffset + ((uint64_t)i * 4 * 2);
+        float g0 = read_bf16_unaligned(gammaBuffer + byteOff + 0);
+        float g1 = read_bf16_unaligned(gammaBuffer + byteOff + 2);
+        float g2 = read_bf16_unaligned(gammaBuffer + byteOff + 4);
+        float g3 = read_bf16_unaligned(gammaBuffer + byteOff + 6);
+        float4 gamma = float4(g0, g1, g2, g3);
+        outVec4[i] = v * invRms * (1.0f + gamma);
+    }
+    for (uint i = dimVec4 * 4 + tid; i < dim; i += tgSize) {
         float gamma = read_bf16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)i * 2));
         outVector[i] = inVector[i] * invRms * (1.0f + gamma);
     }
@@ -822,29 +871,39 @@ kernel void rmsnorm_offset_f16(
     constant uint64_t& gammaOffset [[buffer(3)]],
     constant uint32_t& dim [[buffer(4)]],
     constant float& eps [[buffer(5)]],
-    threadgroup float* sharedSum [[threadgroup(0)]],
+    threadgroup float* sharedWarpSums [[threadgroup(0)]],
     uint tid [[thread_position_in_threadgroup]],
     uint tgSize [[threads_per_threadgroup]]
 ) {
+    uint dimVec4 = dim / 4;
+    device const float4* inVec4 = (device const float4*)inVector;
     float localSum = 0.0f;
-    for (uint i = tid; i < dim; i += tgSize) {
+
+    for (uint i = tid; i < dimVec4; i += tgSize) {
+        float4 v = inVec4[i];
+        localSum += dot(v, v);
+    }
+    for (uint i = dimVec4 * 4 + tid; i < dim; i += tgSize) {
         float v = inVector[i];
         localSum += v * v;
     }
-    sharedSum[tid] = localSum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint s = tgSize / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            sharedSum[tid] += sharedSum[tid + s];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float meanSquare = sharedSum[0] / (float)dim;
+    float totalSum = threadgroup_reduce_sum(localSum, sharedWarpSums, tid, tgSize);
+    float meanSquare = totalSum / (float)dim;
     float invRms = rsqrt(meanSquare + eps);
 
-    for (uint i = tid; i < dim; i += tgSize) {
+    device float4* outVec4 = (device float4*)outVector;
+    for (uint i = tid; i < dimVec4; i += tgSize) {
+        float4 v = inVec4[i];
+        uint64_t byteOff = gammaOffset + ((uint64_t)i * 4 * 2);
+        float g0 = read_f16_unaligned(gammaBuffer + byteOff + 0);
+        float g1 = read_f16_unaligned(gammaBuffer + byteOff + 2);
+        float g2 = read_f16_unaligned(gammaBuffer + byteOff + 4);
+        float g3 = read_f16_unaligned(gammaBuffer + byteOff + 6);
+        float4 gamma = float4(g0, g1, g2, g3);
+        outVec4[i] = v * invRms * (1.0f + gamma);
+    }
+    for (uint i = dimVec4 * 4 + tid; i < dim; i += tgSize) {
         float gamma = read_f16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)i * 2));
         outVector[i] = inVector[i] * invRms * (1.0f + gamma);
     }
@@ -1015,7 +1074,7 @@ kernel void bf16_gemv(
     outputVector[row] = dot0 + dot1;
 }
 
-/// MSL Kernel: Per-Head RMSNorm for Attention Heads (Q-Norm and K-Norm with custom stride)
+/// MSL Kernel: Per-Head RMSNorm for Attention Heads (32-Thread SIMDgroup Cooperative)
 kernel void per_head_rmsnorm_bf16(
     device float* qkVector [[buffer(0)]],
     device const uchar* gammaBuffer [[buffer(1)]],
@@ -1024,26 +1083,45 @@ kernel void per_head_rmsnorm_bf16(
     constant uint32_t& headDim [[buffer(4)]],
     constant uint32_t& headStride [[buffer(5)]],
     constant float& eps [[buffer(6)]],
-    uint headIdx [[thread_position_in_grid]]
+    uint headIdx [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
 ) {
     if (headIdx >= numHeads) return;
 
     uint32_t offset = headIdx * headStride;
-    float sumSq = 0.0f;
-    for (uint32_t d = 0; d < headDim; d++) {
+    uint32_t headDimVec4 = headDim / 4;
+    device float4* headVec4 = (device float4*)(qkVector + offset);
+    float localSum = 0.0f;
+
+    for (uint32_t d = laneId; d < headDimVec4; d += 32) {
+        float4 v = headVec4[d];
+        localSum += dot(v, v);
+    }
+    for (uint32_t d = headDimVec4 * 4 + laneId; d < headDim; d += 32) {
         float v = qkVector[offset + d];
-        sumSq += v * v;
+        localSum += v * v;
     }
 
+    float sumSq = simd_sum(localSum);
     float invRms = rsqrt((sumSq / (float)headDim) + eps);
 
-    for (uint32_t d = 0; d < headDim; d++) {
+    for (uint32_t d = laneId; d < headDimVec4; d += 32) {
+        float4 v = headVec4[d];
+        uint64_t byteOff = gammaOffset + ((uint64_t)d * 4 * 2);
+        float g0 = read_bf16_unaligned(gammaBuffer + byteOff + 0);
+        float g1 = read_bf16_unaligned(gammaBuffer + byteOff + 2);
+        float g2 = read_bf16_unaligned(gammaBuffer + byteOff + 4);
+        float g3 = read_bf16_unaligned(gammaBuffer + byteOff + 6);
+        float4 gamma = float4(g0, g1, g2, g3);
+        headVec4[d] = v * invRms * gamma;
+    }
+    for (uint32_t d = headDimVec4 * 4 + laneId; d < headDim; d += 32) {
         float gamma = read_bf16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)d * 2));
         qkVector[offset + d] = qkVector[offset + d] * invRms * gamma;
     }
 }
 
-/// MSL Kernel: Per-Head RMSNorm with F16 Scale Factors
+/// MSL Kernel: Per-Head RMSNorm with F16 Scale Factors (32-Thread SIMDgroup Cooperative)
 kernel void per_head_rmsnorm_f16(
     device float* qkVector [[buffer(0)]],
     device const uchar* gammaBuffer [[buffer(1)]],
@@ -1052,26 +1130,45 @@ kernel void per_head_rmsnorm_f16(
     constant uint32_t& headDim [[buffer(4)]],
     constant uint32_t& headStride [[buffer(5)]],
     constant float& eps [[buffer(6)]],
-    uint headIdx [[thread_position_in_grid]]
+    uint headIdx [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
 ) {
     if (headIdx >= numHeads) return;
 
     uint32_t offset = headIdx * headStride;
-    float sumSq = 0.0f;
-    for (uint32_t d = 0; d < headDim; d++) {
+    uint32_t headDimVec4 = headDim / 4;
+    device float4* headVec4 = (device float4*)(qkVector + offset);
+    float localSum = 0.0f;
+
+    for (uint32_t d = laneId; d < headDimVec4; d += 32) {
+        float4 v = headVec4[d];
+        localSum += dot(v, v);
+    }
+    for (uint32_t d = headDimVec4 * 4 + laneId; d < headDim; d += 32) {
         float v = qkVector[offset + d];
-        sumSq += v * v;
+        localSum += v * v;
     }
 
+    float sumSq = simd_sum(localSum);
     float invRms = rsqrt((sumSq / (float)headDim) + eps);
 
-    for (uint32_t d = 0; d < headDim; d++) {
+    for (uint32_t d = laneId; d < headDimVec4; d += 32) {
+        float4 v = headVec4[d];
+        uint64_t byteOff = gammaOffset + ((uint64_t)d * 4 * 2);
+        float g0 = read_f16_unaligned(gammaBuffer + byteOff + 0);
+        float g1 = read_f16_unaligned(gammaBuffer + byteOff + 2);
+        float g2 = read_f16_unaligned(gammaBuffer + byteOff + 4);
+        float g3 = read_f16_unaligned(gammaBuffer + byteOff + 6);
+        float4 gamma = float4(g0, g1, g2, g3);
+        headVec4[d] = v * invRms * gamma;
+    }
+    for (uint32_t d = headDimVec4 * 4 + laneId; d < headDim; d += 32) {
         float gamma = read_f16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)d * 2));
         qkVector[offset + d] = qkVector[offset + d] * invRms * gamma;
     }
 }
 
-/// MSL Kernel: Per-Head RMSNorm with Offset (1.0 + gamma) for Attention Heads (Qwen 3.5 / Ornith / Gemma)
+/// MSL Kernel: Per-Head RMSNorm with Offset (1.0 + gamma) for Attention Heads (32-Thread SIMDgroup Cooperative)
 kernel void per_head_rmsnorm_offset_bf16(
     device float* qkVector [[buffer(0)]],
     device const uchar* gammaBuffer [[buffer(1)]],
@@ -1080,26 +1177,45 @@ kernel void per_head_rmsnorm_offset_bf16(
     constant uint32_t& headDim [[buffer(4)]],
     constant uint32_t& headStride [[buffer(5)]],
     constant float& eps [[buffer(6)]],
-    uint headIdx [[thread_position_in_grid]]
+    uint headIdx [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
 ) {
     if (headIdx >= numHeads) return;
 
     uint32_t offset = headIdx * headStride;
-    float sumSq = 0.0f;
-    for (uint32_t d = 0; d < headDim; d++) {
+    uint32_t headDimVec4 = headDim / 4;
+    device float4* headVec4 = (device float4*)(qkVector + offset);
+    float localSum = 0.0f;
+
+    for (uint32_t d = laneId; d < headDimVec4; d += 32) {
+        float4 v = headVec4[d];
+        localSum += dot(v, v);
+    }
+    for (uint32_t d = headDimVec4 * 4 + laneId; d < headDim; d += 32) {
         float v = qkVector[offset + d];
-        sumSq += v * v;
+        localSum += v * v;
     }
 
+    float sumSq = simd_sum(localSum);
     float invRms = rsqrt((sumSq / (float)headDim) + eps);
 
-    for (uint32_t d = 0; d < headDim; d++) {
+    for (uint32_t d = laneId; d < headDimVec4; d += 32) {
+        float4 v = headVec4[d];
+        uint64_t byteOff = gammaOffset + ((uint64_t)d * 4 * 2);
+        float g0 = read_bf16_unaligned(gammaBuffer + byteOff + 0);
+        float g1 = read_bf16_unaligned(gammaBuffer + byteOff + 2);
+        float g2 = read_bf16_unaligned(gammaBuffer + byteOff + 4);
+        float g3 = read_bf16_unaligned(gammaBuffer + byteOff + 6);
+        float4 gamma = float4(g0, g1, g2, g3);
+        headVec4[d] = v * invRms * (1.0f + gamma);
+    }
+    for (uint32_t d = headDimVec4 * 4 + laneId; d < headDim; d += 32) {
         float gamma = read_bf16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)d * 2));
         qkVector[offset + d] = qkVector[offset + d] * invRms * (1.0f + gamma);
     }
 }
 
-/// MSL Kernel: Per-Head RMSNorm with F16 Scale Factors (1.0 + gamma offset)
+/// MSL Kernel: Per-Head RMSNorm with F16 Scale Factors (1.0 + gamma offset, 32-Thread SIMDgroup Cooperative)
 kernel void per_head_rmsnorm_offset_f16(
     device float* qkVector [[buffer(0)]],
     device const uchar* gammaBuffer [[buffer(1)]],
@@ -1108,20 +1224,39 @@ kernel void per_head_rmsnorm_offset_f16(
     constant uint32_t& headDim [[buffer(4)]],
     constant uint32_t& headStride [[buffer(5)]],
     constant float& eps [[buffer(6)]],
-    uint headIdx [[thread_position_in_grid]]
+    uint headIdx [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
 ) {
     if (headIdx >= numHeads) return;
 
     uint32_t offset = headIdx * headStride;
-    float sumSq = 0.0f;
-    for (uint32_t d = 0; d < headDim; d++) {
+    uint32_t headDimVec4 = headDim / 4;
+    device float4* headVec4 = (device float4*)(qkVector + offset);
+    float localSum = 0.0f;
+
+    for (uint32_t d = laneId; d < headDimVec4; d += 32) {
+        float4 v = headVec4[d];
+        localSum += dot(v, v);
+    }
+    for (uint32_t d = headDimVec4 * 4 + laneId; d < headDim; d += 32) {
         float v = qkVector[offset + d];
-        sumSq += v * v;
+        localSum += v * v;
     }
 
+    float sumSq = simd_sum(localSum);
     float invRms = rsqrt((sumSq / (float)headDim) + eps);
 
-    for (uint32_t d = 0; d < headDim; d++) {
+    for (uint32_t d = laneId; d < headDimVec4; d += 32) {
+        float4 v = headVec4[d];
+        uint64_t byteOff = gammaOffset + ((uint64_t)d * 4 * 2);
+        float g0 = read_f16_unaligned(gammaBuffer + byteOff + 0);
+        float g1 = read_f16_unaligned(gammaBuffer + byteOff + 2);
+        float g2 = read_f16_unaligned(gammaBuffer + byteOff + 4);
+        float g3 = read_f16_unaligned(gammaBuffer + byteOff + 6);
+        float4 gamma = float4(g0, g1, g2, g3);
+        headVec4[d] = v * invRms * (1.0f + gamma);
+    }
+    for (uint32_t d = headDimVec4 * 4 + laneId; d < headDim; d += 32) {
         float gamma = read_f16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)d * 2));
         qkVector[offset + d] = qkVector[offset + d] * invRms * (1.0f + gamma);
     }
@@ -1435,12 +1570,12 @@ kernel void gqa_attention_decode_fused_fp8(
         float vScale = float(vScaleBuffer[scaleIdx]);
 
         uint32_t kBase = (tau * kvStride) + kvHeadBase;
-        device const char* kHeadBytes = kCacheBuffer + kBase;
+        device const char4* kVec4 = (device const char4*)(kCacheBuffer + kBase);
 
         float dot_raw = 0.0f;
         for (uint32_t d = 0; d < headDimVec; d++) {
-            uint32_t d4 = d * 4;
-            float4 kVec = float4(float(kHeadBytes[d4]), float(kHeadBytes[d4 + 1]), float(kHeadBytes[d4 + 2]), float(kHeadBytes[d4 + 3]));
+            char4 k = kVec4[d];
+            float4 kVec = float4(float(k.x), float(k.y), float(k.z), float(k.w));
             dot_raw += dot(qHeadVec[d], kVec);
         }
         float score = (dot_raw * kScale) * invSqrtHeadDim;
@@ -1456,11 +1591,11 @@ kernel void gqa_attention_decode_fused_fp8(
         l = (l * alpha) + beta;
 
         uint32_t vBase = (tau * kvStride) + kvHeadBase;
-        device const char* vHeadBytes = vCacheBuffer + vBase;
+        device const char4* vVec4 = (device const char4*)(vCacheBuffer + vBase);
         float beta_vScale = beta * vScale;
         for (uint32_t d = 0; d < headDimVec; d++) {
-            uint32_t d4 = d * 4;
-            float4 vVec = float4(float(vHeadBytes[d4]), float(vHeadBytes[d4 + 1]), float(vHeadBytes[d4 + 2]), float(vHeadBytes[d4 + 3]));
+            char4 v = vVec4[d];
+            float4 vVec = float4(float(v.x), float(v.y), float(v.z), float(v.w));
             acc[d] = (acc[d] * alpha) + (beta_vScale * vVec);
         }
     }
@@ -1662,12 +1797,12 @@ kernel void gqa_attention_decode_standard_fp8(
         float vScale = float(vScaleBuffer[scaleIdx]);
 
         uint32_t kBase = (tau * kvStride) + kvHeadBase;
-        device const char* kHeadBytes = kCacheBuffer + kBase;
+        device const char4* kVec4 = (device const char4*)(kCacheBuffer + kBase);
 
         float dot_raw = 0.0f;
         for (uint32_t d = 0; d < headDimVec; d++) {
-            uint32_t d4 = d * 4;
-            float4 kVec = float4(float(kHeadBytes[d4]), float(kHeadBytes[d4 + 1]), float(kHeadBytes[d4 + 2]), float(kHeadBytes[d4 + 3]));
+            char4 k = kVec4[d];
+            float4 kVec = float4(float(k.x), float(k.y), float(k.z), float(k.w));
             dot_raw += dot(qHeadVec[d], kVec);
         }
         float score = (dot_raw * kScale) * invSqrtHeadDim;
@@ -1683,11 +1818,11 @@ kernel void gqa_attention_decode_standard_fp8(
         l = (l * alpha) + beta;
 
         uint32_t vBase = (tau * kvStride) + kvHeadBase;
-        device const char* vHeadBytes = vCacheBuffer + vBase;
+        device const char4* vVec4 = (device const char4*)(vCacheBuffer + vBase);
         float beta_vScale = beta * vScale;
         for (uint32_t d = 0; d < headDimVec; d++) {
-            uint32_t d4 = d * 4;
-            float4 vVec = float4(float(vHeadBytes[d4]), float(vHeadBytes[d4 + 1]), float(vHeadBytes[d4 + 2]), float(vHeadBytes[d4 + 3]));
+            char4 v = vVec4[d];
+            float4 vVec = float4(float(v.x), float(v.y), float(v.z), float(v.w));
             acc[d] = (acc[d] * alpha) + (beta_vScale * vVec);
         }
     }
@@ -1770,7 +1905,7 @@ kernel void l2_norm_qk(
     }
 }
 
-/// MSL Kernel: Gated Recurrent Linear Attention (DeltaNet with Gated Delta Rule)
+/// MSL Kernel: Gated Recurrent Linear Attention (DeltaNet with 32-Thread SIMDgroup Parallelization & 128-bit Vector Loads)
 kernel void linear_attention_recurrent_step(
     device const float* qkvVector [[buffer(0)]], // [8192] = normalized Q[2048] + normalized K[2048] + V[4096]
     device const float* zVector [[buffer(1)]],   // [4096] (Gate)
@@ -1788,7 +1923,8 @@ kernel void linear_attention_recurrent_step(
     constant uint32_t& numKeyHeads [[buffer(13)]],// 16
     constant uint32_t& headDim [[buffer(14)]],   // 128
     constant float& eps [[buffer(15)]],          // 1e-6
-    uint headIdx [[thread_position_in_grid]]
+    uint headIdx [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
 ) {
     if (headIdx >= numValHeads) return;
 
@@ -1813,51 +1949,57 @@ kernel void linear_attention_recurrent_step(
     float alpha = exp(-exp(aLogVal) * dt);
     float beta = 1.0f / (1.0f + exp(-bVal));     // sigmoid(b)
 
-    // Delta Rule:
-    // 1. Sk = S_prev * k
-    // 2. u = v - alpha * Sk
-    // 3. S_new = alpha * S_prev + beta * (u * k^T)
-    // 4. y = S_new * q
-    float Sk[128];
-    for (uint32_t i = 0; i < headDim; i++) {
-        float sum = 0.0f;
-        for (uint32_t j = 0; j < headDim; j++) {
-            uint32_t sIdx = stateBase + (i * headDim) + j;
-            sum += stateMatrix[sIdx] * qkvVector[kBase + j];
-        }
-        Sk[i] = sum;
-    }
-
-    float y[128];
-    float sumSq = 0.0f;
+    uint32_t headDimVec4 = headDim / 4;
+    device const float4* kVec4 = (device const float4*)(qkvVector + kBase);
+    device const float4* qVec4 = (device const float4*)(qkvVector + qBase);
     float invSqrtHeadDim = rsqrt((float)headDim);
 
-    for (uint32_t i = 0; i < headDim; i++) {
+    // Each thread in the 32-thread SIMDgroup handles rows i = laneId, laneId + 32, laneId + 64, laneId + 96
+    float y_local[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    uint32_t row_indices[4];
+    uint32_t numLocalRows = 0;
+    float localSumSq = 0.0f;
+
+    for (uint32_t i = laneId; i < headDim; i += 32) {
+        row_indices[numLocalRows] = i;
+        uint32_t sRowBase = stateBase + (i * headDim);
+        device float4* sRowVec4 = (device float4*)(stateMatrix + sRowBase);
+
+        // Step 1: Sk_i = sum_j (S[i, j] * k[j]) using 128-bit float4 loads
+        float Sk_i = 0.0f;
+        for (uint32_t j = 0; j < headDimVec4; j++) {
+            Sk_i += dot(sRowVec4[j], kVec4[j]);
+        }
+
+        // Step 2 & 3: u_i = v_i - alpha * Sk_i, update state and compute y_i
         float vi = qkvVector[vBase + i];
-        float ui = vi - (alpha * Sk[i]);
+        float ui = vi - (alpha * Sk_i);
         float betaUi = beta * ui;
 
         float yi = 0.0f;
-        for (uint32_t j = 0; j < headDim; j++) {
-            uint32_t sIdx = stateBase + (i * headDim) + j;
-            float sOld = stateMatrix[sIdx];
-            float kj = qkvVector[kBase + j];
-            float sNew = (alpha * sOld) + (betaUi * kj);
-            stateMatrix[sIdx] = sNew;
-
-            yi += sNew * (qkvVector[qBase + j] * invSqrtHeadDim);
+        for (uint32_t j = 0; j < headDimVec4; j++) {
+            float4 sOld = sRowVec4[j];
+            float4 kj = kVec4[j];
+            float4 sNew = (alpha * sOld) + (betaUi * kj);
+            sRowVec4[j] = sNew;
+            yi += dot(sNew, qVec4[j]);
         }
-        y[i] = yi;
-        sumSq += yi * yi;
+        yi *= invSqrtHeadDim;
+
+        y_local[numLocalRows] = yi;
+        localSumSq += yi * yi;
+        numLocalRows++;
     }
 
-    // Per-head RMSNorm
-    float invRms = rsqrt((sumSq / (float)headDim) + eps);
+    // Step 4: Per-head RMSNorm across all 128 rows via 1-cycle SIMD reduction
+    float totalSumSq = simd_sum(localSumSq);
+    float invRms = rsqrt((totalSumSq / (float)headDim) + eps);
 
-    // Apply RMSNorm weight and SiLU Gating: y = (y * invRms * norm) * SiLU(z)
-    for (uint32_t i = 0; i < headDim; i++) {
+    // Step 5: Normalization, weight scale, and SiLU gating
+    for (uint32_t r = 0; r < numLocalRows; r++) {
+        uint32_t i = row_indices[r];
         float normW = read_bf16_unaligned(normBuf + normOffset + ((uint64_t)i * 2));
-        float yNorm = y[i] * invRms * normW;
+        float yNorm = y_local[r] * invRms * normW;
 
         float z = zVector[zBase + i];
         float silu_z = z / (1.0f + exp(-z));
@@ -2121,7 +2263,7 @@ kernel void fp8_down_proj_accumulate_simd(
 // Q4 (4-Bit Affine) SIMDgroup Cooperative Compute Kernels
 // ============================================================================
 
-/// MSL Kernel: SIMDgroup Cooperative Q4 Affine SwiGLU Gate & Up Projections
+/// MSL Kernel: SIMDgroup Cooperative Q4 Affine SwiGLU Gate & Up Projections (128-bit Vectorized)
 kernel void q4_swiglu_gate_up(
     device const uchar* rawGateWeight [[buffer(0)]],
     device const uchar* rawGateScales [[buffer(1)]],
@@ -2170,40 +2312,21 @@ kernel void q4_swiglu_gate_up(
         uint32_t gU32 = read_u32_unaligned(gWRow + i * 4);
         uint32_t uU32 = read_u32_unaligned(uWRow + i * 4);
 
-        float x0 = inputVector[col + 0];
-        float x1 = inputVector[col + 1];
-        float x2 = inputVector[col + 2];
-        float x3 = inputVector[col + 3];
-        float x4 = inputVector[col + 4];
-        float x5 = inputVector[col + 5];
-        float x6 = inputVector[col + 6];
-        float x7 = inputVector[col + 7];
+        float4 in4_0 = *(device const float4*)(inputVector + col);
+        float4 in4_1 = *(device const float4*)(inputVector + col + 4);
 
-        float xSum = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+        float4 gw0_3 = float4(float(gU32 & 0x0F), float((gU32 >> 4) & 0x0F), float((gU32 >> 8) & 0x0F), float((gU32 >> 12) & 0x0F));
+        float4 gw4_7 = float4(float((gU32 >> 16) & 0x0F), float((gU32 >> 20) & 0x0F), float((gU32 >> 24) & 0x0F), float((gU32 >> 28) & 0x0F));
 
-        float gw0 = float(gU32 & 0x0F);
-        float gw1 = float((gU32 >> 4) & 0x0F);
-        float gw2 = float((gU32 >> 8) & 0x0F);
-        float gw3 = float((gU32 >> 12) & 0x0F);
-        float gw4 = float((gU32 >> 16) & 0x0F);
-        float gw5 = float((gU32 >> 20) & 0x0F);
-        float gw6 = float((gU32 >> 24) & 0x0F);
-        float gw7 = float((gU32 >> 28) & 0x0F);
+        float4 uw0_3 = float4(float(uU32 & 0x0F), float((uU32 >> 4) & 0x0F), float((uU32 >> 8) & 0x0F), float((uU32 >> 12) & 0x0F));
+        float4 uw4_7 = float4(float((uU32 >> 16) & 0x0F), float((uU32 >> 20) & 0x0F), float((uU32 >> 24) & 0x0F), float((uU32 >> 28) & 0x0F));
 
-        float gDot = gw0*x0 + gw1*x1 + gw2*x2 + gw3*x3 + gw4*x4 + gw5*x5 + gw6*x6 + gw7*x7;
+        float gDot = dot(gw0_3, in4_0) + dot(gw4_7, in4_1);
+        float uDot = dot(uw0_3, in4_0) + dot(uw4_7, in4_1);
+        float xSum = (in4_0.x + in4_0.y + in4_0.z + in4_0.w) + (in4_1.x + in4_1.y + in4_1.z + in4_1.w);
+
         gate_sum += gScale * gDot + gBias * xSum;
-
-        float uw0 = float(uU32 & 0x0F);
-        float uw1 = float((uU32 >> 4) & 0x0F);
-        float uw2 = float((uU32 >> 8) & 0x0F);
-        float uw3 = float((uU32 >> 12) & 0x0F);
-        float uw4 = float((uU32 >> 16) & 0x0F);
-        float uw5 = float((uU32 >> 20) & 0x0F);
-        float uw6 = float((uU32 >> 24) & 0x0F);
-        float uw7 = float((uU32 >> 28) & 0x0F);
-
-        float uDot = uw0*x0 + uw1*x1 + uw2*x2 + uw3*x3 + uw4*x4 + uw5*x5 + uw6*x6 + uw7*x7;
-        up_sum += uScale * uDot + uBias * xSum;
+        up_sum   += uScale * uDot + uBias * xSum;
     }
 
     gate_sum = simd_sum(gate_sum);
@@ -2215,7 +2338,7 @@ kernel void q4_swiglu_gate_up(
     }
 }
 
-/// MSL Kernel: SIMDgroup Cooperative Q4 Affine Down-Projection with Weighted Accumulation
+/// MSL Kernel: SIMDgroup Cooperative Q4 Affine Down-Projection with Weighted Accumulation (128-bit Vectorized)
 kernel void q4_down_proj_accumulate(
     device const uchar* rawDownWeight [[buffer(0)]],
     device const uchar* rawDownScales [[buffer(1)]],
@@ -2251,27 +2374,15 @@ kernel void q4_down_proj_accumulate(
 
         uint32_t dU32 = read_u32_unaligned(dWRow + i * 4);
 
-        float x0 = intermediateVector[col + 0];
-        float x1 = intermediateVector[col + 1];
-        float x2 = intermediateVector[col + 2];
-        float x3 = intermediateVector[col + 3];
-        float x4 = intermediateVector[col + 4];
-        float x5 = intermediateVector[col + 5];
-        float x6 = intermediateVector[col + 6];
-        float x7 = intermediateVector[col + 7];
+        float4 in4_0 = *(device const float4*)(intermediateVector + col);
+        float4 in4_1 = *(device const float4*)(intermediateVector + col + 4);
 
-        float xSum = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+        float4 dw0_3 = float4(float(dU32 & 0x0F), float((dU32 >> 4) & 0x0F), float((dU32 >> 8) & 0x0F), float((dU32 >> 12) & 0x0F));
+        float4 dw4_7 = float4(float((dU32 >> 16) & 0x0F), float((dU32 >> 20) & 0x0F), float((dU32 >> 24) & 0x0F), float((dU32 >> 28) & 0x0F));
 
-        float dw0 = float(dU32 & 0x0F);
-        float dw1 = float((dU32 >> 4) & 0x0F);
-        float dw2 = float((dU32 >> 8) & 0x0F);
-        float dw3 = float((dU32 >> 12) & 0x0F);
-        float dw4 = float((dU32 >> 16) & 0x0F);
-        float dw5 = float((dU32 >> 20) & 0x0F);
-        float dw6 = float((dU32 >> 24) & 0x0F);
-        float dw7 = float((dU32 >> 28) & 0x0F);
+        float dDot = dot(dw0_3, in4_0) + dot(dw4_7, in4_1);
+        float xSum = (in4_0.x + in4_0.y + in4_0.z + in4_0.w) + (in4_1.x + in4_1.y + in4_1.z + in4_1.w);
 
-        float dDot = dw0*x0 + dw1*x1 + dw2*x2 + dw3*x3 + dw4*x4 + dw5*x5 + dw6*x6 + dw7*x7;
         down_sum += dScale * dDot + dBias * xSum;
     }
 
@@ -2282,7 +2393,7 @@ kernel void q4_down_proj_accumulate(
     }
 }
 
-/// MSL Kernel: General Q4 Affine GEMV (out = (W_q4 * in))
+/// MSL Kernel: General Q4 Affine GEMV (out = (W_q4 * in)) (128-bit Vectorized)
 kernel void q4_gemv(
     device const uchar* rawWeightBuffer [[buffer(0)]],
     device const uchar* rawScaleBuffer [[buffer(1)]],
@@ -2317,28 +2428,16 @@ kernel void q4_gemv(
 
         uint32_t u32 = read_u32_unaligned(wRow + i * 4);
 
-        float x0 = inputVector[col + 0];
-        float x1 = inputVector[col + 1];
-        float x2 = inputVector[col + 2];
-        float x3 = inputVector[col + 3];
-        float x4 = inputVector[col + 4];
-        float x5 = inputVector[col + 5];
-        float x6 = inputVector[col + 6];
-        float x7 = inputVector[col + 7];
+        float4 in4_0 = *(device const float4*)(inputVector + col);
+        float4 in4_1 = *(device const float4*)(inputVector + col + 4);
 
-        float xSum = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+        float4 w0_3 = float4(float(u32 & 0x0F), float((u32 >> 4) & 0x0F), float((u32 >> 8) & 0x0F), float((u32 >> 12) & 0x0F));
+        float4 w4_7 = float4(float((u32 >> 16) & 0x0F), float((u32 >> 20) & 0x0F), float((u32 >> 24) & 0x0F), float((u32 >> 28) & 0x0F));
 
-        float w0 = float(u32 & 0x0F);
-        float w1 = float((u32 >> 4) & 0x0F);
-        float w2 = float((u32 >> 8) & 0x0F);
-        float w3 = float((u32 >> 12) & 0x0F);
-        float w4 = float((u32 >> 16) & 0x0F);
-        float w5 = float((u32 >> 20) & 0x0F);
-        float w6 = float((u32 >> 24) & 0x0F);
-        float w7 = float((u32 >> 28) & 0x0F);
+        float dotVal = dot(w0_3, in4_0) + dot(w4_7, in4_1);
+        float xSum = (in4_0.x + in4_0.y + in4_0.z + in4_0.w) + (in4_1.x + in4_1.y + in4_1.z + in4_1.w);
 
-        float dot = w0*x0 + w1*x1 + w2*x2 + w3*x3 + w4*x4 + w5*x5 + w6*x6 + w7*x7;
-        sum += scale * dot + bias * xSum;
+        sum += scale * dotVal + bias * xSum;
     }
 
     sum = simd_sum(sum);
@@ -2382,7 +2481,7 @@ kernel void lookup_embeddings_q4(
     outputVector[id] = scale * w4 + bias;
 }
 
-/// MSL Kernel: Q8 (8-bit affine quantized) Matrix-Vector Multiplication (y = W * x)
+/// MSL Kernel: Q8 (8-bit affine quantized) Matrix-Vector Multiplication (y = W * x) (128-bit Vectorized)
 kernel void q8_gemv(
     device const uchar* rawWeightBuffer [[buffer(0)]],
     device const uchar* rawScaleBuffer [[buffer(1)]],
@@ -2412,7 +2511,19 @@ kernel void q8_gemv(
         uint32_t colStart = g * groupSize;
         float groupSum = 0.0f;
         float groupXSum = 0.0f;
-        for (uint32_t c = 0; c < groupSize; c++) {
+
+        uint32_t numVec4 = groupSize / 4;
+        device const uchar4* wVec4 = (device const uchar4*)(wRow + colStart);
+        device const float4* inVec4 = (device const float4*)(inputVector + colStart);
+
+        for (uint32_t c = 0; c < numVec4; c++) {
+            uchar4 w4 = wVec4[c];
+            float4 x4 = inVec4[c];
+            float4 wf = float4(float(w4.x), float(w4.y), float(w4.z), float(w4.w));
+            groupSum += dot(wf, x4);
+            groupXSum += (x4.x + x4.y + x4.z + x4.w);
+        }
+        for (uint32_t c = numVec4 * 4; c < groupSize; c++) {
             uint32_t col = colStart + c;
             float x = inputVector[col];
             float w8 = float(wRow[col]);
@@ -2458,7 +2569,7 @@ kernel void lookup_embeddings_q8(
     outputVector[id] = scale * w8 + bias;
 }
 
-/// MSL Kernel: SIMDgroup Cooperative Q8 Affine SwiGLU Gate & Up Projections
+/// MSL Kernel: SIMDgroup Cooperative Q8 Affine SwiGLU Gate & Up Projections (128-bit Vectorized)
 kernel void q8_swiglu_gate_up(
     device const uchar* rawGateWeight [[buffer(0)]],
     device const uchar* rawGateScales [[buffer(1)]],
@@ -2505,7 +2616,24 @@ kernel void q8_swiglu_gate_up(
         float uGroupSum = 0.0f;
         float groupXSum = 0.0f;
 
-        for (uint32_t c = 0; c < groupSize; c++) {
+        uint32_t numVec4 = groupSize / 4;
+        device const uchar4* gVec4 = (device const uchar4*)(gWRow + colStart);
+        device const uchar4* uVec4 = (device const uchar4*)(uWRow + colStart);
+        device const float4* inVec4 = (device const float4*)(inputVector + colStart);
+
+        for (uint32_t c = 0; c < numVec4; c++) {
+            uchar4 gw4 = gVec4[c];
+            uchar4 uw4 = uVec4[c];
+            float4 x4 = inVec4[c];
+
+            float4 gwf = float4(float(gw4.x), float(gw4.y), float(gw4.z), float(gw4.w));
+            float4 uwf = float4(float(uw4.x), float(uw4.y), float(uw4.z), float(uw4.w));
+
+            gGroupSum += dot(gwf, x4);
+            uGroupSum += dot(uwf, x4);
+            groupXSum += (x4.x + x4.y + x4.z + x4.w);
+        }
+        for (uint32_t c = numVec4 * 4; c < groupSize; c++) {
             uint32_t col = colStart + c;
             float x = inputVector[col];
             float gw8 = float(gWRow[col]);
@@ -2529,7 +2657,7 @@ kernel void q8_swiglu_gate_up(
     }
 }
 
-/// MSL Kernel: SIMDgroup Cooperative Q8 Affine Down-Projection with Weighted Accumulation
+/// MSL Kernel: SIMDgroup Cooperative Q8 Affine Down-Projection with Weighted Accumulation (128-bit Vectorized)
 kernel void q8_down_proj_accumulate(
     device const uchar* rawDownWeight [[buffer(0)]],
     device const uchar* rawDownScales [[buffer(1)]],
@@ -2563,7 +2691,19 @@ kernel void q8_down_proj_accumulate(
         float dGroupSum = 0.0f;
         float groupXSum = 0.0f;
 
-        for (uint32_t c = 0; c < groupSize; c++) {
+        uint32_t numVec4 = groupSize / 4;
+        device const uchar4* dVec4 = (device const uchar4*)(dWRow + colStart);
+        device const float4* inVec4 = (device const float4*)(intermediateVector + colStart);
+
+        for (uint32_t c = 0; c < numVec4; c++) {
+            uchar4 dw4 = dVec4[c];
+            float4 x4 = inVec4[c];
+            float4 dwf = float4(float(dw4.x), float(dw4.y), float(dw4.z), float(dw4.w));
+
+            dGroupSum += dot(dwf, x4);
+            groupXSum += (x4.x + x4.y + x4.z + x4.w);
+        }
+        for (uint32_t c = numVec4 * 4; c < groupSize; c++) {
             uint32_t col = colStart + c;
             float x = intermediateVector[col];
             float dw8 = float(dWRow[col]);
@@ -2579,6 +2719,164 @@ kernel void q8_down_proj_accumulate(
 
     if (laneId == 0) {
         outputAccumulator[d] += routingWeight * down_sum;
+    }
+}
+
+/// MSL Kernel: 32-Thread SIMDgroup Cooperative MXFP8 GEMV (out = W * x) (128-bit Vectorized)
+kernel void mxfp8_gemv_simd(
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const float* inputVector [[buffer(1)]],
+    device float* outputVector [[buffer(2)]],
+    device const uchar* rawScaleBuffer [[buffer(3)]],
+    constant uint64_t& weightOffset [[buffer(4)]],
+    constant uint64_t& scaleOffset [[buffer(5)]],
+    constant uint32_t& inDim [[buffer(6)]],
+    constant uint32_t& outDim [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    if (row >= outDim) return;
+
+    uint32_t blocksPerRow = inDim / 32;
+    uint64_t rowWeightStart = weightOffset + ((uint64_t)row * inDim);
+    uint64_t rowScaleStart  = scaleOffset  + ((uint64_t)row * blocksPerRow);
+
+    float threadDot = 0.0f;
+
+    for (uint32_t b = laneId; b < blocksPerRow; b += 32) {
+        uint8_t scaleByte = rawScaleBuffer[rowScaleStart + b];
+        int scaleExp = (int)scaleByte - 127;
+        float scale = exp2((float)scaleExp);
+
+        uint64_t blkStart = rowWeightStart + ((uint64_t)b * 32);
+        uint32_t inStart = b * 32;
+
+        device const uchar4* w4 = (device const uchar4*)(rawWeightBuffer + blkStart);
+        device const float4* in4 = (device const float4*)(inputVector + inStart);
+
+        for (uint32_t i = 0; i < 8; i++) {
+            uchar4 bytes = w4[i];
+            float4 x = in4[i];
+            float4 w = float4(unpack_e4m3(bytes.x), unpack_e4m3(bytes.y), unpack_e4m3(bytes.z), unpack_e4m3(bytes.w)) * scale;
+            threadDot += dot(w, x);
+        }
+    }
+
+    float totalDot = simd_sum(threadDot);
+    if (laneId == 0) {
+        outputVector[row] = totalDot;
+    }
+}
+
+/// MSL Kernel: 32-Thread SIMDgroup Cooperative MXFP8 SwiGLU Gate & Up Projections (128-bit Vectorized)
+kernel void mxfp8_swiglu_gate_up_simd(
+    device const uchar* gateWeightBuffer [[buffer(0)]],
+    device const uchar* upWeightBuffer [[buffer(1)]],
+    device const float* inputVector [[buffer(2)]],
+    device float* intermediateState [[buffer(3)]],
+    device const uchar* gateScaleBuffer [[buffer(4)]],
+    device const uchar* upScaleBuffer [[buffer(5)]],
+    constant uint64_t& gateWeightOffset [[buffer(6)]],
+    constant uint64_t& gateScaleOffset [[buffer(7)]],
+    constant uint64_t& upWeightOffset [[buffer(8)]],
+    constant uint64_t& upScaleOffset [[buffer(9)]],
+    constant uint32_t& inDim [[buffer(10)]],
+    constant uint32_t& intermediateDim [[buffer(11)]],
+    uint d [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    if (d >= intermediateDim) return;
+
+    uint32_t blocksPerRow = inDim / 32;
+    uint64_t gRowStart = gateWeightOffset + ((uint64_t)d * inDim);
+    uint64_t gScaleStart = gateScaleOffset + ((uint64_t)d * blocksPerRow);
+    uint64_t uRowStart = upWeightOffset + ((uint64_t)d * inDim);
+    uint64_t uScaleStart = upScaleOffset + ((uint64_t)d * blocksPerRow);
+
+    float gate_dot = 0.0f;
+    float up_dot = 0.0f;
+
+    for (uint32_t b = laneId; b < blocksPerRow; b += 32) {
+        uint8_t gScaleByte = gateScaleBuffer[gScaleStart + b];
+        float gScale = exp2((float)((int)gScaleByte - 127));
+
+        uint8_t uScaleByte = upScaleBuffer[uScaleStart + b];
+        float uScale = exp2((float)((int)uScaleByte - 127));
+
+        uint64_t gBlk = gRowStart + ((uint64_t)b * 32);
+        uint64_t uBlk = uRowStart + ((uint64_t)b * 32);
+        uint32_t inStart = b * 32;
+
+        device const uchar4* gw4 = (device const uchar4*)(gateWeightBuffer + gBlk);
+        device const uchar4* uw4 = (device const uchar4*)(upWeightBuffer + uBlk);
+        device const float4* in4 = (device const float4*)(inputVector + inStart);
+
+        for (uint32_t i = 0; i < 8; i++) {
+            uchar4 gBytes = gw4[i];
+            uchar4 uBytes = uw4[i];
+            float4 x = in4[i];
+
+            float4 gw = float4(unpack_e4m3(gBytes.x), unpack_e4m3(gBytes.y), unpack_e4m3(gBytes.z), unpack_e4m3(gBytes.w)) * gScale;
+            float4 uw = float4(unpack_e4m3(uBytes.x), unpack_e4m3(uBytes.y), unpack_e4m3(uBytes.z), unpack_e4m3(uBytes.w)) * uScale;
+
+            gate_dot += dot(gw, x);
+            up_dot += dot(uw, x);
+        }
+    }
+
+    gate_dot = simd_sum(gate_dot);
+    up_dot = simd_sum(up_dot);
+
+    if (laneId == 0) {
+        float silu_gate = gate_dot / (1.0f + exp(-gate_dot));
+        intermediateState[d] = silu_gate * up_dot;
+    }
+}
+
+/// MSL Kernel: 32-Thread SIMDgroup Cooperative MXFP8 Down-Projection with Weighted Accumulation (128-bit Vectorized)
+kernel void mxfp8_down_proj_accumulate_simd(
+    device const uchar* downWeightBuffer [[buffer(0)]],
+    device const float* intermediateState [[buffer(1)]],
+    device float* outputAccumulator [[buffer(2)]],
+    device const uchar* downScaleBuffer [[buffer(3)]],
+    constant uint64_t& downWeightOffset [[buffer(4)]],
+    constant uint64_t& downScaleOffset [[buffer(5)]],
+    constant uint32_t& intermediateDim [[buffer(6)]],
+    constant uint32_t& inDim [[buffer(7)]],
+    constant float& routingWeight [[buffer(8)]],
+    uint d [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    if (d >= inDim) return;
+
+    uint32_t blocksPerRow = intermediateDim / 32;
+    uint64_t dRowStart = downWeightOffset + ((uint64_t)d * intermediateDim);
+    uint64_t dScaleStart = downScaleOffset + ((uint64_t)d * blocksPerRow);
+
+    float down_dot = 0.0f;
+
+    for (uint32_t b = laneId; b < blocksPerRow; b += 32) {
+        uint8_t dScaleByte = downScaleBuffer[dScaleStart + b];
+        float dScale = exp2((float)((int)dScaleByte - 127));
+
+        uint64_t dBlk = dRowStart + ((uint64_t)b * 32);
+        uint32_t interStart = b * 32;
+
+        device const uchar4* dw4 = (device const uchar4*)(downWeightBuffer + dBlk);
+        device const float4* in4 = (device const float4*)(intermediateState + interStart);
+
+        for (uint32_t i = 0; i < 8; i++) {
+            uchar4 dBytes = dw4[i];
+            float4 x = in4[i];
+            float4 dw = float4(unpack_e4m3(dBytes.x), unpack_e4m3(dBytes.y), unpack_e4m3(dBytes.z), unpack_e4m3(dBytes.w)) * dScale;
+            down_dot += dot(dw, x);
+        }
+    }
+
+    down_dot = simd_sum(down_dot);
+
+    if (laneId == 0) {
+        outputAccumulator[d] += routingWeight * down_dot;
     }
 }
 

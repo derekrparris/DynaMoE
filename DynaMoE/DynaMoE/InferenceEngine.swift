@@ -179,6 +179,7 @@ public final class InferenceEngine {
     public var bf16GemvSimdPipeline: MTLComputePipelineState?
     public var gemvBF16Pipeline: MTLComputePipelineState?
     public var mxfp8GemvPipeline: MTLComputePipelineState?
+    public var mxfp8GemvSimdPipeline: MTLComputePipelineState?
     public var q4GateUpPipeline: MTLComputePipelineState?
     public var q4DownPipeline: MTLComputePipelineState?
     public var q8GateUpPipeline: MTLComputePipelineState?
@@ -187,6 +188,8 @@ public final class InferenceEngine {
     public var fp8DownPipeline: MTLComputePipelineState?
     public var mxfp8GateUpPipeline: MTLComputePipelineState?
     public var mxfp8DownPipeline: MTLComputePipelineState?
+    public var mxfp8GateUpSimdPipeline: MTLComputePipelineState?
+    public var mxfp8DownSimdPipeline: MTLComputePipelineState?
     public var bf16GateUpPipeline: MTLComputePipelineState?
     public var bf16DownPipeline: MTLComputePipelineState?
 
@@ -284,6 +287,12 @@ public final class InferenceEngine {
         if let q8GemvFunc = defaultLib.makeFunction(name: "q8_gemv") {
             q8GemvPipeline = try device.makeComputePipelineState(function: q8GemvFunc)
         }
+        if let mxfp8GemvFunc = defaultLib.makeFunction(name: "mxfp8_gemv") {
+            mxfp8GemvPipeline = try device.makeComputePipelineState(function: mxfp8GemvFunc)
+        }
+        if let mxfp8GemvSimdFunc = defaultLib.makeFunction(name: "mxfp8_gemv_simd") {
+            mxfp8GemvSimdPipeline = try device.makeComputePipelineState(function: mxfp8GemvSimdFunc)
+        }
         if let fp8GemvFunc = defaultLib.makeFunction(name: "mxfp8_gemv") ?? defaultLib.makeFunction(name: "fp8_gemv") {
             fp8GemvPipeline = try device.makeComputePipelineState(function: fp8GemvFunc)
         }
@@ -316,6 +325,12 @@ public final class InferenceEngine {
         }
         if let mxfp8DownFunc = defaultLib.makeFunction(name: "mxfp8_down_proj_accumulate") {
             mxfp8DownPipeline = try device.makeComputePipelineState(function: mxfp8DownFunc)
+        }
+        if let mxfp8GateSimdFunc = defaultLib.makeFunction(name: "mxfp8_swiglu_gate_up_simd") {
+            mxfp8GateUpSimdPipeline = try device.makeComputePipelineState(function: mxfp8GateSimdFunc)
+        }
+        if let mxfp8DownSimdFunc = defaultLib.makeFunction(name: "mxfp8_down_proj_accumulate_simd") {
+            mxfp8DownSimdPipeline = try device.makeComputePipelineState(function: mxfp8DownSimdFunc)
         }
         if let bf16GateUpFunc = defaultLib.makeFunction(name: "bf16_swiglu_gate_up") {
             bf16GateUpPipeline = try device.makeComputePipelineState(function: bf16GateUpFunc)
