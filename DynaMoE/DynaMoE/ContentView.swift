@@ -2446,9 +2446,12 @@ struct ContentView: View {
         guard let lmHeadTensor = summary.tensors.first(where: {
             $0.name == "lm_head.weight" ||
             $0.name == "language_model.lm_head.weight" ||
-            $0.name == "model.lm_head.weight"
+            $0.name == "model.lm_head.weight" ||
+            $0.name == "lm_head"
+        }) ?? summary.tensors.first(where: {
+            $0.name.hasSuffix("embed_tokens.weight") || $0.name == "embed_tokens"
         }), let lmHeadShardBuffer = shardBuffers[lmHeadTensor.shardIndex] else {
-            gpuComputeOutput = "❌ LM Head weight (lm_head.weight) not found."
+            gpuComputeOutput = "❌ LM Head weight not found."
             return
         }
 
@@ -2895,26 +2898,29 @@ struct ContentView: View {
         }
 
         // Find LM Head Weight & Affine Scales/Biases
-        guard let lmHeadTensor = summary.tensors.first(where: {
+        let lmHeadTensorCandidate = summary.tensors.first(where: {
             ($0.name == "lm_head.weight" ||
              $0.name == "language_model.lm_head.weight" ||
              $0.name == "model.lm_head.weight" ||
              $0.name == "lm_head") &&
             !$0.name.contains("scale") && !$0.name.contains("scales") &&
             !$0.name.contains("bias") && !$0.name.contains("biases")
-        }), let lmHeadShardBuffer = shardBuffers[lmHeadTensor.shardIndex] else {
+        }) ?? embedWeight
+
+        guard let lmHeadShardBuffer = shardBuffers[lmHeadTensorCandidate.shardIndex] else {
             let err = "❌ LM Head weight not found."
             gpuComputeOutput = err
             generationStatusText = err
             return
         }
+        let lmHeadTensor = lmHeadTensorCandidate
 
         let lmHeadScale = summary.tensors.first(where: {
             $0.name.contains("lm_head") && ($0.name.contains("scale") || $0.name.contains("scales"))
-        })
+        }) ?? (lmHeadTensor == embedWeight ? embedScale : nil)
         let lmHeadBias = summary.tensors.first(where: {
             $0.name.contains("lm_head") && ($0.name.contains("bias") || $0.name.contains("biases"))
-        })
+        }) ?? (lmHeadTensor == embedWeight ? embedBias : nil)
 
         // Compile Pipelines with correct kernel names
         guard let embedBF16Function = defaultLibrary.makeFunction(name: "lookup_embeddings_bf16"),
@@ -3211,7 +3217,7 @@ struct ContentView: View {
 
         let arch = modelConfig?.resolveArchitectureType(summary: summary) ?? (summary.maxExpertId > 0 ? .hybridSsmMoe : .denseTransformer)
         let isHybridArch = arch.isHybridSsm
-        let isRMSNormOffset = modelConfig?.isRMSNormUnitOffset ?? arch.isHybridSsm
+        let isRMSNormOffset = modelConfig?.isRMSNormUnitOffset ?? false
 
         let qOutDim: UInt32 = isHybridArch ? (numHeads * headDim * 2) : (numHeads * headDim)
         let kvOutDim: UInt32 = numKvHeads * headDim

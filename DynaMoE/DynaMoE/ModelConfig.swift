@@ -76,6 +76,34 @@ public struct RopeParametersConfig: Codable {
     }
 }
 
+public struct TokenIdOrArray: Codable {
+    public var single: Int?
+    public var array: [Int]?
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let singleVal = try? container.decode(Int.self) {
+            self.single = singleVal
+            self.array = [singleVal]
+        } else if let arrayVal = try? container.decode([Int].self) {
+            self.array = arrayVal
+            self.single = arrayVal.first
+        } else {
+            self.single = nil
+            self.array = nil
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        if let single = single {
+            try container.encode(single)
+        } else if let array = array {
+            try container.encode(array)
+        }
+    }
+}
+
 public struct NestedTextConfig: Codable {
     public var hiddenSize: Int?
     public var numHiddenLayers: Int?
@@ -94,8 +122,8 @@ public struct NestedTextConfig: Codable {
     public var ropeScaling: RopeScalingConfig?
     public var ropeTheta: Float?
     public var numLoops: Int?
-    public var eosTokenId: Int?
-    public var bosTokenId: Int?
+    public var eosTokenId: TokenIdOrArray?
+    public var bosTokenId: TokenIdOrArray?
     public var tieWordEmbeddings: Bool?
     public var skipLoopFinalNorm: Bool?
 
@@ -144,8 +172,8 @@ public struct ModelConfig: Codable {
     public var ropeScaling: RopeScalingConfig?
     public var ropeTheta: Float?
     public var numLoops: Int?
-    public var eosTokenId: Int?
-    public var bosTokenId: Int?
+    public var eosTokenId: TokenIdOrArray?
+    public var bosTokenId: TokenIdOrArray?
     public var tieWordEmbeddings: Bool?
     public var skipLoopFinalNorm: Bool?
     public var textConfig: NestedTextConfig?
@@ -238,7 +266,17 @@ public struct ModelConfig: Codable {
     }
 
     public var effectiveEosTokenId: Int {
-        return textConfig?.eosTokenId ?? eosTokenId ?? 248044
+        return textConfig?.eosTokenId?.single ?? eosTokenId?.single ?? 248044
+    }
+
+    public var effectiveEosTokenIds: [Int] {
+        if let textArray = textConfig?.eosTokenId?.array, !textArray.isEmpty {
+            return textArray
+        }
+        if let topArray = eosTokenId?.array, !topArray.isEmpty {
+            return topArray
+        }
+        return [248044, 248046]
     }
 
     public var effectiveRotaryDim: Int {
@@ -314,7 +352,10 @@ public struct ModelConfig: Codable {
     public var isRMSNormUnitOffset: Bool {
         let rawType = (textConfig != nil ? "qwen3_5_moe" : (modelType ?? "")).lowercased()
         let archs = architectures?.map { $0.lowercased() } ?? []
-        return rawType.contains("qwen3_5") || rawType.contains("ornith") || rawType.contains("gemma") || archs.contains(where: { $0.contains("qwen3_5") || $0.contains("gemma") || $0.contains("ornith") })
+        if rawType.contains("ornith") || rawType.contains("qwen") || archs.contains(where: { $0.contains("ornith") || $0.contains("qwen") }) {
+            return false
+        }
+        return rawType.contains("gemma") || archs.contains(where: { $0.contains("gemma") })
     }
 
     public static let userDefaultSystemPromptKey = "dynamoe_user_default_system_prompt"

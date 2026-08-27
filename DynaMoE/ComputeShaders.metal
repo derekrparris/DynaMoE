@@ -2513,13 +2513,17 @@ kernel void q8_gemv(
         float groupXSum = 0.0f;
 
         uint32_t numVec4 = groupSize / 4;
-        device const uchar4* wVec4 = (device const uchar4*)(wRow + colStart);
         device const float4* inVec4 = (device const float4*)(inputVector + colStart);
 
         for (uint32_t c = 0; c < numVec4; c++) {
-            uchar4 w4 = wVec4[c];
+            uint32_t baseCol = colStart + (c * 4);
             float4 x4 = inVec4[c];
-            float4 wf = float4(float(w4.x), float(w4.y), float(w4.z), float(w4.w));
+            float4 wf = float4(
+                float(wRow[baseCol + 0]),
+                float(wRow[baseCol + 1]),
+                float(wRow[baseCol + 2]),
+                float(wRow[baseCol + 3])
+            );
             groupSum += dot(wf, x4);
             groupXSum += (x4.x + x4.y + x4.z + x4.w);
         }
@@ -2616,18 +2620,24 @@ kernel void q8_swiglu_gate_up(
         float uGroupSum = 0.0f;
         float groupXSum = 0.0f;
 
-        uint32_t numVec4 = groupSize / 4;
-        device const uchar4* gVec4 = (device const uchar4*)(gWRow + colStart);
-        device const uchar4* uVec4 = (device const uchar4*)(uWRow + colStart);
         device const float4* inVec4 = (device const float4*)(inputVector + colStart);
+        uint32_t numVec4 = groupSize / 4;
 
         for (uint32_t c = 0; c < numVec4; c++) {
-            uchar4 gw4 = gVec4[c];
-            uchar4 uw4 = uVec4[c];
+            uint32_t baseCol = colStart + (c * 4);
             float4 x4 = inVec4[c];
-
-            float4 gwf = float4(float(gw4.x), float(gw4.y), float(gw4.z), float(gw4.w));
-            float4 uwf = float4(float(uw4.x), float(uw4.y), float(uw4.z), float(uw4.w));
+            float4 gwf = float4(
+                float(gWRow[baseCol + 0]),
+                float(gWRow[baseCol + 1]),
+                float(gWRow[baseCol + 2]),
+                float(gWRow[baseCol + 3])
+            );
+            float4 uwf = float4(
+                float(uWRow[baseCol + 0]),
+                float(uWRow[baseCol + 1]),
+                float(uWRow[baseCol + 2]),
+                float(uWRow[baseCol + 3])
+            );
 
             gGroupSum += dot(gwf, x4);
             uGroupSum += dot(uwf, x4);
@@ -2691,14 +2701,18 @@ kernel void q8_down_proj_accumulate(
         float dGroupSum = 0.0f;
         float groupXSum = 0.0f;
 
-        uint32_t numVec4 = groupSize / 4;
-        device const uchar4* dVec4 = (device const uchar4*)(dWRow + colStart);
         device const float4* inVec4 = (device const float4*)(intermediateVector + colStart);
+        uint32_t numVec4 = groupSize / 4;
 
         for (uint32_t c = 0; c < numVec4; c++) {
-            uchar4 dw4 = dVec4[c];
+            uint32_t baseCol = colStart + (c * 4);
             float4 x4 = inVec4[c];
-            float4 dwf = float4(float(dw4.x), float(dw4.y), float(dw4.z), float(dw4.w));
+            float4 dwf = float4(
+                float(dWRow[baseCol + 0]),
+                float(dWRow[baseCol + 1]),
+                float(dWRow[baseCol + 2]),
+                float(dWRow[baseCol + 3])
+            );
 
             dGroupSum += dot(dwf, x4);
             groupXSum += (x4.x + x4.y + x4.z + x4.w);
