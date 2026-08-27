@@ -2725,6 +2725,7 @@ struct ContentView: View {
         let causalConv1dPipeline: MTLComputePipelineState?
         let l2NormQkPipeline: MTLComputePipelineState?
         let linearAttnStepPipeline: MTLComputePipelineState?
+        let sharedGatePipeline: MTLComputePipelineState?
 
         do {
             embedPipeline = try device.makeComputePipelineState(function: embedBF16Function)
@@ -2873,6 +2874,10 @@ struct ContentView: View {
             if let linStepFunc = defaultLibrary.makeFunction(name: "linear_attention_recurrent_step") {
                 linearAttnStepPipeline = try device.makeComputePipelineState(function: linStepFunc)
             } else { linearAttnStepPipeline = nil }
+
+            if let sgFunc = defaultLibrary.makeFunction(name: "moe_shared_gate_bf16") {
+                sharedGatePipeline = try device.makeComputePipelineState(function: sgFunc)
+            } else { sharedGatePipeline = nil }
         } catch {
             let err = "❌ Failed to create compute pipelines: \(error.localizedDescription)"
             gpuComputeOutput = err
@@ -3795,6 +3800,17 @@ struct ContentView: View {
                                     layerEnc1.setBytes(&kVal, length: MemoryLayout<UInt32>.stride, index: 7)
                                     layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: Int(numExperts), height: 1, depth: 1))
                                 }
+                                if let sg = layer.sharedGateTensor, let sgRaw = buffers[sg.shardIndex],
+                                   layer.sharedGateTensorScale == nil, let sgPipe = sharedGatePipeline {
+                                    var sgOff = sg.offsetStart
+                                    layerEnc1.setComputePipelineState(sgPipe)
+                                    layerEnc1.setBuffer(sgRaw, offset: 0, index: 0)
+                                    layerEnc1.setBuffer(xNorm2Buffer, offset: 0, index: 1)
+                                    layerEnc1.setBuffer(sharedScoreBuffer, offset: 0, index: 2)
+                                    layerEnc1.setBytes(&sgOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                                    layerEnc1.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 4)
+                                    layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                }
                             }
 
                             layerEnc1.endEncoding()
@@ -3814,80 +3830,84 @@ struct ContentView: View {
 
                             var sharedW: Float = 1.0
                             if let sg = layer.sharedGateTensor, let sgRaw = buffers[sg.shardIndex] {
-                                let xPtr = xNorm2Buffer.contents().bindMemory(to: Float.self, capacity: Int(hiddenDim))
-                                var sum: Float = 0.0
-                                if let sgScale = layer.sharedGateTensorScale, let sgBias = layer.sharedGateTensorBias,
-                                   let sgScaleRaw = buffers[sgScale.shardIndex], let sgBiasRaw = buffers[sgBias.shardIndex] {
-                                    let sRaw = sgScaleRaw.contents().advanced(by: Int(sgScale.offsetStart))
-                                    let bRaw = sgBiasRaw.contents().advanced(by: Int(sgBias.offsetStart))
-                                    let wRaw = sgRaw.contents().advanced(by: Int(sg.offsetStart))
-                                    let groupSize = 64
-                                    let numGroups = Int(hiddenDim) / groupSize
-                                    let is8Bit = (sg.offsetEnd - sg.offsetStart) >= UInt64(hiddenDim)
-                                    if is8Bit {
-                                        for g in 0..<numGroups {
-                                            let s0 = UInt16(sRaw.load(fromByteOffset: g * 2, as: UInt8.self))
-                                            let s1 = UInt16(sRaw.load(fromByteOffset: g * 2 + 1, as: UInt8.self))
-                                            let sU16 = s0 | (s1 << 8)
-                                            let b0 = UInt16(bRaw.load(fromByteOffset: g * 2, as: UInt8.self))
-                                            let b1 = UInt16(bRaw.load(fromByteOffset: g * 2 + 1, as: UInt8.self))
-                                            let bU16 = b0 | (b1 << 8)
-                                            let s = Float(bitPattern: UInt32(sU16) << 16)
-                                            let b = Float(bitPattern: UInt32(bU16) << 16)
-                                            let colStart = g * groupSize
-                                            var groupSum: Float = 0.0
-                                            var groupXSum: Float = 0.0
-                                            for c in 0..<groupSize {
-                                                let col = colStart + c
-                                                let x = xPtr[col]
-                                                let w8 = Float(wRaw.load(fromByteOffset: col, as: UInt8.self))
-                                                groupSum += w8 * x
-                                                groupXSum += x
-                                            }
-                                            sum += s * groupSum + b * groupXSum
-                                        }
-                                    } else {
-                                        for g in 0..<numGroups {
-                                            let s0 = UInt16(sRaw.load(fromByteOffset: g * 2, as: UInt8.self))
-                                            let s1 = UInt16(sRaw.load(fromByteOffset: g * 2 + 1, as: UInt8.self))
-                                            let sU16 = s0 | (s1 << 8)
-                                            let b0 = UInt16(bRaw.load(fromByteOffset: g * 2, as: UInt8.self))
-                                            let b1 = UInt16(bRaw.load(fromByteOffset: g * 2 + 1, as: UInt8.self))
-                                            let bU16 = b0 | (b1 << 8)
-                                            let s = Float(bitPattern: UInt32(sU16) << 16)
-                                            let b = Float(bitPattern: UInt32(bU16) << 16)
-                                            let u32Start = (g * groupSize) / 8
-                                            var groupSum: Float = 0.0
-                                            var groupXSum: Float = 0.0
-                                            for u in 0..<(groupSize / 8) {
-                                                let byteIdx = (u32Start + u) * 4
-                                                let u0 = UInt32(wRaw.load(fromByteOffset: byteIdx, as: UInt8.self))
-                                                let u1 = UInt32(wRaw.load(fromByteOffset: byteIdx + 1, as: UInt8.self))
-                                                let u2 = UInt32(wRaw.load(fromByteOffset: byteIdx + 2, as: UInt8.self))
-                                                let u3 = UInt32(wRaw.load(fromByteOffset: byteIdx + 3, as: UInt8.self))
-                                                let u32 = u0 | (u1 << 8) | (u2 << 16) | (u3 << 24)
-                                                let baseCol = (u32Start + u) * 8
-                                                for nib in 0..<8 {
-                                                    let w4 = Float((u32 >> (nib * 4)) & 0x0F)
-                                                    let x = xPtr[baseCol + nib]
-                                                    groupSum += w4 * x
+                                if layer.sharedGateTensorScale == nil && sharedGatePipeline != nil {
+                                    sharedW = sharedScoreBuffer.contents().load(as: Float.self)
+                                } else {
+                                    let xPtr = xNorm2Buffer.contents().bindMemory(to: Float.self, capacity: Int(hiddenDim))
+                                    var sum: Float = 0.0
+                                    if let sgScale = layer.sharedGateTensorScale, let sgBias = layer.sharedGateTensorBias,
+                                       let sgScaleRaw = buffers[sgScale.shardIndex], let sgBiasRaw = buffers[sgBias.shardIndex] {
+                                        let sRaw = sgScaleRaw.contents().advanced(by: Int(sgScale.offsetStart))
+                                        let bRaw = sgBiasRaw.contents().advanced(by: Int(sgBias.offsetStart))
+                                        let wRaw = sgRaw.contents().advanced(by: Int(sg.offsetStart))
+                                        let groupSize = 64
+                                        let numGroups = Int(hiddenDim) / groupSize
+                                        let is8Bit = (sg.offsetEnd - sg.offsetStart) >= UInt64(hiddenDim)
+                                        if is8Bit {
+                                            for g in 0..<numGroups {
+                                                let s0 = UInt16(sRaw.load(fromByteOffset: g * 2, as: UInt8.self))
+                                                let s1 = UInt16(sRaw.load(fromByteOffset: g * 2 + 1, as: UInt8.self))
+                                                let sU16 = s0 | (s1 << 8)
+                                                let b0 = UInt16(bRaw.load(fromByteOffset: g * 2, as: UInt8.self))
+                                                let b1 = UInt16(bRaw.load(fromByteOffset: g * 2 + 1, as: UInt8.self))
+                                                let bU16 = b0 | (b1 << 8)
+                                                let s = Float(bitPattern: UInt32(sU16) << 16)
+                                                let b = Float(bitPattern: UInt32(bU16) << 16)
+                                                let colStart = g * groupSize
+                                                var groupSum: Float = 0.0
+                                                var groupXSum: Float = 0.0
+                                                for c in 0..<groupSize {
+                                                    let col = colStart + c
+                                                    let x = xPtr[col]
+                                                    let w8 = Float(wRaw.load(fromByteOffset: col, as: UInt8.self))
+                                                    groupSum += w8 * x
                                                     groupXSum += x
                                                 }
+                                                sum += s * groupSum + b * groupXSum
                                             }
-                                            sum += s * groupSum + b * groupXSum
+                                        } else {
+                                            for g in 0..<numGroups {
+                                                let s0 = UInt16(sRaw.load(fromByteOffset: g * 2, as: UInt8.self))
+                                                let s1 = UInt16(sRaw.load(fromByteOffset: g * 2 + 1, as: UInt8.self))
+                                                let sU16 = s0 | (s1 << 8)
+                                                let b0 = UInt16(bRaw.load(fromByteOffset: g * 2, as: UInt8.self))
+                                                let b1 = UInt16(bRaw.load(fromByteOffset: g * 2 + 1, as: UInt8.self))
+                                                let bU16 = b0 | (b1 << 8)
+                                                let s = Float(bitPattern: UInt32(sU16) << 16)
+                                                let b = Float(bitPattern: UInt32(bU16) << 16)
+                                                let u32Start = (g * groupSize) / 8
+                                                var groupSum: Float = 0.0
+                                                var groupXSum: Float = 0.0
+                                                for u in 0..<(groupSize / 8) {
+                                                    let byteIdx = (u32Start + u) * 4
+                                                    let u0 = UInt32(wRaw.load(fromByteOffset: byteIdx, as: UInt8.self))
+                                                    let u1 = UInt32(wRaw.load(fromByteOffset: byteIdx + 1, as: UInt8.self))
+                                                    let u2 = UInt32(wRaw.load(fromByteOffset: byteIdx + 2, as: UInt8.self))
+                                                    let u3 = UInt32(wRaw.load(fromByteOffset: byteIdx + 3, as: UInt8.self))
+                                                    let u32 = u0 | (u1 << 8) | (u2 << 16) | (u3 << 24)
+                                                    let baseCol = (u32Start + u) * 8
+                                                    for nib in 0..<8 {
+                                                        let w4 = Float((u32 >> (nib * 4)) & 0x0F)
+                                                        let x = xPtr[baseCol + nib]
+                                                        groupSum += w4 * x
+                                                        groupXSum += x
+                                                    }
+                                                }
+                                                sum += s * groupSum + b * groupXSum
+                                            }
+                                        }
+                                    } else {
+                                        let sgRawPtr = sgRaw.contents().advanced(by: Int(sg.offsetStart))
+                                        for d in 0..<Int(hiddenDim) {
+                                            let w0 = UInt16(sgRawPtr.load(fromByteOffset: d * 2, as: UInt8.self))
+                                            let w1 = UInt16(sgRawPtr.load(fromByteOffset: d * 2 + 1, as: UInt8.self))
+                                            let u = UInt32(w0 | (w1 << 8)) << 16
+                                            let w = Float(bitPattern: u)
+                                            sum += w * xPtr[d]
                                         }
                                     }
-                                } else {
-                                    let sgRawPtr = sgRaw.contents().advanced(by: Int(sg.offsetStart))
-                                    for d in 0..<Int(hiddenDim) {
-                                        let w0 = UInt16(sgRawPtr.load(fromByteOffset: d * 2, as: UInt8.self))
-                                        let w1 = UInt16(sgRawPtr.load(fromByteOffset: d * 2 + 1, as: UInt8.self))
-                                        let u = UInt32(w0 | (w1 << 8)) << 16
-                                        let w = Float(bitPattern: u)
-                                        sum += w * xPtr[d]
-                                    }
+                                    sharedW = 1.0 / (1.0 + exp(-sum))
                                 }
-                                sharedW = 1.0 / (1.0 + exp(-sum))
                             }
 
                             let activeIds = activeExperts.map { $0.id }
@@ -3975,7 +3995,6 @@ struct ContentView: View {
 
                             layerEnc2.endEncoding()
                             moeCmd.commit()
-                            moeCmd.waitUntilCompleted()
 
                             guard let nextCmd = commandQueue.makeCommandBuffer() else { return false }
                             activeCmd = nextCmd
