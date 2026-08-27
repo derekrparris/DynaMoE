@@ -787,16 +787,23 @@ public enum TextAlignmentType {
     }
 }
 
-public struct MarkdownTableData: Identifiable {
-    public let id = UUID()
+public struct MarkdownTableData: Identifiable, Equatable {
+    public let id: String
     public let headers: [String]
     public let alignments: [TextAlignmentType]
     public let rows: [[String]]
+
+    public init(headers: [String], alignments: [TextAlignmentType], rows: [[String]], id: String? = nil) {
+        self.headers = headers
+        self.alignments = alignments
+        self.rows = rows
+        self.id = id ?? "tbl-\(headers.joined(separator: "_"))-\(rows.count)"
+    }
 }
 
 // MARK: - Markdown Block AST
 
-public enum MarkdownBlock: Identifiable {
+public enum MarkdownBlock: Equatable {
     case heading(level: Int, text: String)
     case paragraph(text: String)
     case table(MarkdownTableData)
@@ -804,18 +811,12 @@ public enum MarkdownBlock: Identifiable {
     case blockquote(text: String)
     case listItem(number: Int?, text: String)
     case horizontalRule
+}
 
-    public var id: String {
-        switch self {
-        case .heading(let lvl, let txt): return "h-\(lvl)-\(txt.hashValue)"
-        case .paragraph(let txt): return "p-\(txt.hashValue)"
-        case .table(let data): return "t-\(data.id.uuidString)"
-        case .codeBlock(let lang, let code): return "code-\(lang)-\(code.hashValue)"
-        case .blockquote(let txt): return "quote-\(txt.hashValue)"
-        case .listItem(let num, let txt): return "li-\(num ?? 0)-\(txt.hashValue)"
-        case .horizontalRule: return "hr-\(UUID().uuidString)"
-        }
-    }
+public struct IdentifiableMarkdownBlock: Identifiable, Equatable {
+    public let id: String
+    public let block: MarkdownBlock
+    public let isLast: Bool
 }
 
 // MARK: - Markdown Message View
@@ -825,32 +826,45 @@ struct MarkdownMessageView: View {
     var isStreaming: Bool = false
     var isStreamingOffDisk: Bool = false
 
-    private var blocks: [MarkdownBlock] {
-        parseMarkdownBlocks(content)
+    private var identifiableBlocks: [IdentifiableMarkdownBlock] {
+        let rawBlocks = parseMarkdownBlocks(content)
+        return rawBlocks.enumerated().map { index, block in
+            let isLast = isStreaming && (index == rawBlocks.count - 1)
+            let blockId: String
+            switch block {
+            case .heading(let lvl, _): blockId = "h-\(index)-\(lvl)"
+            case .paragraph: blockId = "p-\(index)"
+            case .table(let tbl): blockId = "tbl-\(index)-\(tbl.headers.count)"
+            case .codeBlock(let lang, _): blockId = "code-\(index)-\(lang)"
+            case .blockquote: blockId = "q-\(index)"
+            case .listItem(let num, _): blockId = "li-\(index)-\(num ?? 0)"
+            case .horizontalRule: blockId = "hr-\(index)"
+            }
+            return IdentifiableMarkdownBlock(id: blockId, block: block, isLast: isLast)
+        }
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            ForEach(Array(blocks.enumerated()), id: \.offset) { index, block in
-                let isLast = isStreaming && index == blocks.count - 1
-                switch block {
+            ForEach(identifiableBlocks) { item in
+                switch item.block {
                 case .heading(let level, let text):
-                    renderHeading(level: level, text: text, isLast: isLast)
+                    renderHeading(level: level, text: text, isLast: item.isLast)
                 case .paragraph(let text):
-                    renderParagraph(text: text, isLast: isLast)
+                    renderParagraph(text: text, isLast: item.isLast)
                 case .table(let table):
-                    MarkdownTableView(table: table, isLast: isLast, isStreamingOffDisk: isStreamingOffDisk)
+                    MarkdownTableView(table: table, isLast: item.isLast, isStreamingOffDisk: isStreamingOffDisk)
                 case .codeBlock(let language, let code):
                     CodeBlockCard(
                         language: language,
                         code: code,
-                        isStreaming: isLast,
+                        isStreaming: item.isLast,
                         isStreamingOffDisk: isStreamingOffDisk
                     )
                 case .blockquote(let text):
-                    renderBlockquote(text: text, isLast: isLast)
+                    renderBlockquote(text: text, isLast: item.isLast)
                 case .listItem(let number, let text):
-                    renderListItem(number: number, text: text, isLast: isLast)
+                    renderListItem(number: number, text: text, isLast: item.isLast)
                 case .horizontalRule:
                     Divider()
                         .padding(.vertical, 6)
@@ -1209,6 +1223,7 @@ struct CodeBlockCard: View {
     var isStreaming: Bool = false
     var isStreamingOffDisk: Bool = false
     @State private var isCopied: Bool = false
+    @State private var highlighted: AttributedString? = nil
 
     private var displayLanguage: String {
         let clean = language.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -1257,9 +1272,9 @@ struct CodeBlockCard: View {
 
             Divider()
 
-            // Code Text Canvas with Native Syntax Highlighting
+            // Code Text Canvas with Native Syntax Highlighting (Cached)
             ScrollView(.horizontal, showsIndicators: true) {
-                Text(NativeSyntaxHighlighter.highlight(code: code, language: language))
+                Text(highlighted ?? NativeSyntaxHighlighter.highlight(code: code, language: language))
                     .font(.system(size: 12.5, design: .monospaced))
                     .lineSpacing(3)
                     .textSelection(.enabled)
@@ -1274,6 +1289,12 @@ struct CodeBlockCard: View {
                 .stroke(Color.primary.opacity(0.08), lineWidth: 1)
         )
         .padding(.vertical, 4)
+        .onAppear {
+            highlighted = NativeSyntaxHighlighter.highlight(code: code, language: language)
+        }
+        .onChange(of: code) { newCode in
+            highlighted = NativeSyntaxHighlighter.highlight(code: newCode, language: language)
+        }
     }
 
     private func copyCode() {
@@ -1323,7 +1344,34 @@ struct StreamingPaceIndicatorView: View {
     }
 }
 
-// MARK: - Markdown Pre-processing Normalizer
+// MARK: - Markdown Pre-processing Normalizer (Pre-compiled Regex Cache)
+
+private enum MarkdownRegexCache {
+    static let br = try? NSRegularExpression(pattern: #"<br\s*/?>"# , options: [.caseInsensitive])
+    static let p = try? NSRegularExpression(pattern: #"</?p\b[^>]*>"#, options: [.caseInsensitive])
+    static let div = try? NSRegularExpression(pattern: #"</?div\b[^>]*>"#, options: [.caseInsensitive])
+    static let b = try? NSRegularExpression(pattern: #"<(?:b|strong)\b[^>]*>(.*?)</(?:b|strong)>"#, options: [.caseInsensitive, .dotMatchesLineSeparators])
+    static let i = try? NSRegularExpression(pattern: #"<(?:i|em)\b[^>]*>(.*?)</(?:i|em)>"#, options: [.caseInsensitive, .dotMatchesLineSeparators])
+    static let code = try? NSRegularExpression(pattern: #"<code\b[^>]*>(.*?)</code>"#, options: [.caseInsensitive, .dotMatchesLineSeparators])
+    static let li = try? NSRegularExpression(pattern: #"<li\b[^>]*>(.*?)(?:</li>|$)"#, options: [.caseInsensitive, .dotMatchesLineSeparators])
+    static let ul = try? NSRegularExpression(pattern: #"</?(?:ul|ol)\b[^>]*>"#, options: [.caseInsensitive])
+    static let span = try? NSRegularExpression(pattern: #"<span\b[^>]*>(.*?)</span>"#, options: [.caseInsensitive, .dotMatchesLineSeparators])
+    static let sup = try? NSRegularExpression(pattern: #"<sup>(.*?)</sup>"#, options: [.caseInsensitive, .dotMatchesLineSeparators])
+    static let sub = try? NSRegularExpression(pattern: #"<sub>(.*?)</sub>"#, options: [.caseInsensitive, .dotMatchesLineSeparators])
+    static let strayHtml = try? NSRegularExpression(pattern: #"</?[a-zA-Z][^>]*>"#, options: [])
+    static let stuckHeading = try? NSRegularExpression(pattern: #"([^\n#])\s*(#{1,6}\s+)"#, options: [])
+    static let headingGlue = try? NSRegularExpression(pattern: #"(#{1,6}\s+[^\n]+?)([a-z])([A-Z]{2,}|\b(?:BF16|FP8|FP16|FP32|INT8|GPU|CPU|NPU|TPU)\b)"#, options: [])
+    static let inlineList = try? NSRegularExpression(pattern: #"([^\n])\s*(?:-\s+|•\s+|\*\s+)([A-Z0-9])"#, options: [])
+    static let inlineNumList = try? NSRegularExpression(pattern: #"([.:;?!])\s*(\d{1,2}\.\s+[A-Z])"#, options: [])
+    static let sentenceGlue = try? NSRegularExpression(pattern: #"([a-z0-9])\.([A-Z])"#, options: [])
+    static let titleTable = try? NSRegularExpression(pattern: #"(?:^|\n)([^|\n#]+?)\s*\|\s*([A-Za-z0-9].*\|[^\n]*)"#, options: [])
+    static let fixSepPipes = try? NSRegularExpression(pattern: #"(?:^|\n)(\|[|:\- ]+[-:])(?=\n|$)"#, options: [])
+    static let multiSep = try? NSRegularExpression(pattern: #"(\|[|:\- ]+\|)\s*\n\s*(\|[|:\- ]+\|)"#, options: [])
+    static let sectionHeader = try? NSRegularExpression(pattern: #"(?:^|\n)\s*--\s*([^-\n]+?)\s*--\s*\|?"#, options: [.anchorsMatchLines])
+    static let hrHeader = try? NSRegularExpression(pattern: #"---+[\t ]*(#{1,6}\s*)"#, options: [])
+    static let stuckBullet = try? NSRegularExpression(pattern: #"([^\n])(•\s+[A-Za-z0-9])"#, options: [])
+    static let multiNl = try? NSRegularExpression(pattern: #"\n{3,}"#, options: [])
+}
 
 public func normalizeMarkdownText(_ raw: String) -> String {
     var text = raw
@@ -1332,46 +1380,46 @@ public func normalizeMarkdownText(_ raw: String) -> String {
     text = text.replacingOccurrences(of: "\\n", with: "\n")
 
     // 1. Convert HTML Line breaks & Paragraphs to newlines
-    if let regexBr = try? NSRegularExpression(pattern: #"<br\s*/?>"# , options: [.caseInsensitive]) {
+    if let regexBr = MarkdownRegexCache.br {
         text = regexBr.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n")
     }
-    if let regexP = try? NSRegularExpression(pattern: #"</?p\b[^>]*>"#, options: [.caseInsensitive]) {
+    if let regexP = MarkdownRegexCache.p {
         text = regexP.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n")
     }
-    if let regexDiv = try? NSRegularExpression(pattern: #"</?div\b[^>]*>"#, options: [.caseInsensitive]) {
+    if let regexDiv = MarkdownRegexCache.div {
         text = regexDiv.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n")
     }
 
     // 2. Convert HTML formatting tags to Markdown
-    if let regexB = try? NSRegularExpression(pattern: #"<(?:b|strong)\b[^>]*>(.*?)</(?:b|strong)>"#, options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+    if let regexB = MarkdownRegexCache.b {
         text = regexB.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "**$1**")
     }
-    if let regexI = try? NSRegularExpression(pattern: #"<(?:i|em)\b[^>]*>(.*?)</(?:i|em)>"#, options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+    if let regexI = MarkdownRegexCache.i {
         text = regexI.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "*$1*")
     }
-    if let regexCode = try? NSRegularExpression(pattern: #"<code\b[^>]*>(.*?)</code>"#, options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+    if let regexCode = MarkdownRegexCache.code {
         text = regexCode.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "`$1`")
     }
 
     // 3. Convert HTML Lists
-    if let regexLi = try? NSRegularExpression(pattern: #"<li\b[^>]*>(.*?)(?:</li>|$)"#, options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+    if let regexLi = MarkdownRegexCache.li {
         text = regexLi.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n- $1\n")
     }
-    if let regexUl = try? NSRegularExpression(pattern: #"</?(?:ul|ol)\b[^>]*>"#, options: [.caseInsensitive]) {
+    if let regexUl = MarkdownRegexCache.ul {
         text = regexUl.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n")
     }
 
     // 4. Strip span and convert sup/sub tags
-    if let regexSpan = try? NSRegularExpression(pattern: #"<span\b[^>]*>(.*?)</span>"#, options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+    if let regexSpan = MarkdownRegexCache.span {
         text = regexSpan.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1")
     }
-    if let regexSup = try? NSRegularExpression(pattern: #"<sup>(.*?)</sup>"#, options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+    if let regexSup = MarkdownRegexCache.sup {
         text = regexSup.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "^($1)")
     }
-    if let regexSub = try? NSRegularExpression(pattern: #"<sub>(.*?)</sub>"#, options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+    if let regexSub = MarkdownRegexCache.sub {
         text = regexSub.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "_($1)")
     }
-    if let regexStrayHtml = try? NSRegularExpression(pattern: #"</?[a-zA-Z][^>]*>"#, options: []) {
+    if let regexStrayHtml = MarkdownRegexCache.strayHtml {
         text = regexStrayHtml.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "")
     }
 
@@ -1381,63 +1429,62 @@ public func normalizeMarkdownText(_ raw: String) -> String {
     }
 
     // 6. Fix heading embedded in paragraph or missing space: "text. #### 1. Heading" -> "text.\n\n#### 1. Heading"
-    if let regexStuckHeading = try? NSRegularExpression(pattern: #"([^\n#])\s*(#{1,6}\s+)"#, options: []) {
+    if let regexStuckHeading = MarkdownRegexCache.stuckHeading {
         text = regexStuckHeading.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1\n\n$2")
     }
 
     // 7. Fix heading title glued to paragraph text:
-    // e.g. "#### 1. Technical Definitions & RepresentationBF16 (bfloat)" -> "#### 1. Technical Definitions & Representation\n\nBF16 (bfloat)"
-    if let regexHeadingGlue = try? NSRegularExpression(pattern: #"(#{1,6}\s+[^\n]+?)([a-z])([A-Z]{2,}|\b(?:BF16|FP8|FP16|FP32|INT8|GPU|CPU|NPU|TPU)\b)"#, options: []) {
+    if let regexHeadingGlue = MarkdownRegexCache.headingGlue {
         text = regexHeadingGlue.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1$2\n\n$3")
     }
 
     // 8. Fix inline list glued inside paragraph: "formats: - Total 16 bits" -> "formats:\n\n- Total 16 bits"
-    if let regexInlineList = try? NSRegularExpression(pattern: #"([^\n])\s*(?:-\s+|•\s+|\*\s+)([A-Z0-9])"#, options: []) {
+    if let regexInlineList = MarkdownRegexCache.inlineList {
         text = regexInlineList.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1\n\n- $2")
     }
 
     // 9. Fix inline numbered list glued inside paragraph: "computing. 1. Technical" -> "computing.\n\n1. Technical"
-    if let regexInlineNumList = try? NSRegularExpression(pattern: #"([.:;?!])\s*(\d{1,2}\.\s+[A-Z])"#, options: []) {
+    if let regexInlineNumList = MarkdownRegexCache.inlineNumList {
         text = regexInlineNumList.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1\n\n$2")
     }
 
     // 10. Fix sentence glued to next sentence without space: "quantization.This" -> "quantization. This"
-    if let regexSentenceGlue = try? NSRegularExpression(pattern: #"([a-z0-9])\.([A-Z])"#, options: []) {
+    if let regexSentenceGlue = MarkdownRegexCache.sentenceGlue {
         text = regexSentenceGlue.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1. $2")
     }
 
-    // 11. Fix title stuck before table header on same line: e.g. "Title | Col 1 | Col 2 | Col 3" -> "### Title\n| Col 1 | Col 2 | Col 3"
-    if let regexTitleTable = try? NSRegularExpression(pattern: #"(?:^|\n)([^|\n#]+?)\s*\|\s*([A-Za-z0-9].*\|[^\n]*)"#, options: []) {
+    // 11. Fix title stuck before table header on same line
+    if let regexTitleTable = MarkdownRegexCache.titleTable {
         text = regexTitleTable.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n### $1\n| $2")
     }
 
-    // 12. Fix unclosed table separator line (missing trailing pipe): e.g. "|---|---|:---" -> "|---|---|:---|"
-    if let regexFixSepPipes = try? NSRegularExpression(pattern: #"(?:^|\n)(\|[|:\- ]+[-:])(?=\n|$)"#, options: []) {
+    // 12. Fix unclosed table separator line (missing trailing pipe)
+    if let regexFixSepPipes = MarkdownRegexCache.fixSepPipes {
         text = regexFixSepPipes.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n$1|")
     }
 
     // 13. Fix multiple table separator lines
-    if let regexMultiSep = try? NSRegularExpression(pattern: #"(\|[|:\- ]+\|)\s*\n\s*(\|[|:\- ]+\|)"#, options: []) {
+    if let regexMultiSep = MarkdownRegexCache.multiSep {
         text = regexMultiSep.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1")
     }
 
-    // 14. Fix table section headers like "-- Section Name -- |" -> "\n\n#### Section Name\n"
-    if let regexSectionHeader = try? NSRegularExpression(pattern: #"(?:^|\n)\s*--\s*([^-\n]+?)\s*--\s*\|?"#, options: [.anchorsMatchLines]) {
+    // 14. Fix table section headers like "-- Section Name -- |"
+    if let regexSectionHeader = MarkdownRegexCache.sectionHeader {
         text = regexSectionHeader.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n#### $1\n")
     }
 
     // 15. Fix concatenated horizontal rules + headers: "---##" -> "\n\n---\n\n## "
-    if let regexHrHeader = try? NSRegularExpression(pattern: #"---+[\t ]*(#{1,6}\s*)"#, options: []) {
+    if let regexHrHeader = MarkdownRegexCache.hrHeader {
         text = regexHrHeader.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n---\n\n$1")
     }
 
     // 16. Fix bullet points stuck to preceding text: "text• Bullet" -> "text\n• Bullet"
-    if let regexStuckBullet = try? NSRegularExpression(pattern: #"([^\n])(•\s+[A-Za-z0-9])"#, options: []) {
+    if let regexStuckBullet = MarkdownRegexCache.stuckBullet {
         text = regexStuckBullet.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1\n$2")
     }
 
     // 17. Collapse 3+ newlines to 2
-    if let regexMultiNl = try? NSRegularExpression(pattern: #"\n{3,}"#, options: []) {
+    if let regexMultiNl = MarkdownRegexCache.multiNl {
         text = regexMultiNl.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n")
     }
 

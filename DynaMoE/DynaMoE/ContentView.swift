@@ -4240,9 +4240,9 @@ struct ContentView: View {
                 let liveTtft = firstTokenTimestamp.map { $0 - startTime }
                 let liveThinkDuration = thinkingEndTimestamp.map { $0 - startTime }
 
-                // Throttle MainActor UI updates to 30/60fps frame cadence or token interval
+                // Throttle MainActor UI updates to 60fps ProMotion frame cadence (16ms) or token interval
                 let now = CFAbsoluteTimeGetCurrent()
-                let shouldUpdateUI = (tokensGenerated == 1) || (now - lastUIUpdateTime >= 0.033) || (tokensGenerated % 4 == 0)
+                let shouldUpdateUI = (tokensGenerated == 1) || (now - lastUIUpdateTime >= 0.016) || (tokensGenerated % 4 == 0)
 
                 if shouldUpdateUI {
                     lastUIUpdateTime = now
