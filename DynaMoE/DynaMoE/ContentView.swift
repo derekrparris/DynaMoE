@@ -2437,33 +2437,63 @@ struct ContentView: View {
             return UInt32(bestIdx)
         }
 
-        // 2. High-performance top-K selection with min-threshold pruning
+        // 2. High-performance top-K selection using Min-Heap (O(log K) per candidate without array shifting)
         let effectiveTopK = max(1, min(topK, vocabSize))
-        var candidates: [(id: Int, logit: Float)] = []
-        candidates.reserveCapacity(effectiveTopK)
+        var heap: [(id: Int, logit: Float)] = []
+        heap.reserveCapacity(effectiveTopK)
 
         for v in 0..<effectiveTopK {
-            candidates.append((id: v, logit: logits[v]))
+            heap.append((id: v, logit: logits[v]))
         }
-        candidates.sort(by: { $0.logit > $1.logit })
-        var minCandLogit = candidates[effectiveTopK - 1].logit
-
-        for v in effectiveTopK..<vocabSize {
-            let logit = logits[v]
-            if logit > minCandLogit {
-                var low = 0
-                var high = effectiveTopK - 1
-                while low < high {
-                    let mid = (low + high) / 2
-                    if candidates[mid].logit < logit {
-                        high = mid
+        // Build min-heap (root at index 0 is minimum element)
+        if effectiveTopK > 1 {
+            for i in stride(from: (effectiveTopK / 2) - 1, through: 0, by: -1) {
+                var parent = i
+                while true {
+                    let left = 2 * parent + 1
+                    let right = left + 1
+                    var smallest = parent
+                    if left < effectiveTopK && heap[left].logit < heap[smallest].logit {
+                        smallest = left
+                    }
+                    if right < effectiveTopK && heap[right].logit < heap[smallest].logit {
+                        smallest = right
+                    }
+                    if smallest != parent {
+                        heap.swapAt(parent, smallest)
+                        parent = smallest
                     } else {
-                        low = mid + 1
+                        break
                     }
                 }
-                candidates.insert((id: v, logit: logit), at: low)
-                candidates.removeLast()
-                minCandLogit = candidates[effectiveTopK - 1].logit
+            }
+        }
+
+        // Stream through remaining logits, updating min-heap in O(log K) without array shifting
+        var minLogit = heap[0].logit
+        for v in effectiveTopK..<vocabSize {
+            let logit = logits[v]
+            if logit > minLogit {
+                heap[0] = (id: v, logit: logit)
+                var parent = 0
+                while true {
+                    let left = 2 * parent + 1
+                    let right = left + 1
+                    var smallest = parent
+                    if left < effectiveTopK && heap[left].logit < heap[smallest].logit {
+                        smallest = left
+                    }
+                    if right < effectiveTopK && heap[right].logit < heap[smallest].logit {
+                        smallest = right
+                    }
+                    if smallest != parent {
+                        heap.swapAt(parent, smallest)
+                        parent = smallest
+                    } else {
+                        break
+                    }
+                }
+                minLogit = heap[0].logit
             }
         }
 
@@ -2472,6 +2502,7 @@ struct ContentView: View {
             logits[v] = orig
         }
 
+        let candidates = heap.sorted(by: { $0.logit > $1.logit })
         guard let first = candidates.first else { return 0 }
 
         let invTemp = 1.0 / max(temperature, 0.01)
@@ -4077,15 +4108,18 @@ struct ContentView: View {
 
             var generatedTokenIds: [UInt32] = []
             var lastUIUpdateTime = CFAbsoluteTimeGetCurrent()
+            var accumulatedDecodedText = ""
 
-            // Ingest prompt tokens into KV-cache and recurrent states (pipelined async submission)
+            // Ingest prompt tokens into KV-cache and recurrent states (pipelined chunked async submission)
             let promptCount = promptTokenIds.count - 1
             if promptCount > 0 {
+                let chunkSize = 16
                 for pIdx in 0..<promptCount {
                     if Task.isCancelled { break }
                     let pTok = promptTokenIds[pIdx]
                     let isLastPromptToken = (pIdx == promptCount - 1)
-                    let ok = runTokenForward(tokenId: pTok, step: currentStep, computeLogits: false, wait: isLastPromptToken)
+                    let isBarrier = isLastPromptToken || ((pIdx + 1) % chunkSize == 0)
+                    let ok = runTokenForward(tokenId: pTok, step: currentStep, computeLogits: false, wait: isBarrier)
                     if !ok { break }
                     currentStep += 1
                 }
@@ -4125,9 +4159,23 @@ struct ContentView: View {
                     firstTokenTimestamp = CFAbsoluteTimeGetCurrent()
                 }
 
-                // 6. Decode Cumulative Tokens
-                let fullDecoded = (try? tokenizer.decode(ids: generatedTokenIds)) ?? ""
-                if fullDecoded.contains("<|im_end|>") || fullDecoded.contains("<|endoftext|>") || fullDecoded.contains("<|im_start|>") {
+                // 6. Incremental Stream Token Decoding (O(1) per step)
+                let deltaText: String
+                if generatedTokenIds.count > 1 {
+                    let slice = Array(generatedTokenIds.suffix(2))
+                    let sliceText = (try? tokenizer.decode(ids: slice)) ?? ""
+                    let prev1 = (try? tokenizer.decode(ids: [generatedTokenIds[generatedTokenIds.count - 2]])) ?? ""
+                    if sliceText.hasPrefix(prev1) {
+                        deltaText = String(sliceText.dropFirst(prev1.count))
+                    } else {
+                        deltaText = (try? tokenizer.decode(ids: [nextToken])) ?? ""
+                    }
+                } else {
+                    deltaText = (try? tokenizer.decode(ids: [nextToken])) ?? ""
+                }
+                accumulatedDecodedText += deltaText
+
+                if deltaText.contains("<|im_end|>") || deltaText.contains("<|endoftext|>") || deltaText.contains("<|im_start|>") {
                     break
                 }
 
@@ -4140,7 +4188,7 @@ struct ContentView: View {
                 let hitRate = WorkingSetManager.shared.cacheHitRatePercent
                 let pageLat = WorkingSetManager.shared.lastPagingLatencyMs
 
-                var updatedRaw = fullDecoded
+                var updatedRaw = accumulatedDecodedText
                 var thinkPart = ""
                 var respPart = ""
                 var activeThink = false
@@ -4236,7 +4284,7 @@ struct ContentView: View {
             let finalResCount = WorkingSetManager.shared.residentExperts.count
             let finalHitRate = WorkingSetManager.shared.cacheHitRatePercent
             let finalPageLat = WorkingSetManager.shared.lastPagingLatencyMs
-            let finalDecoded = (try? tokenizer.decode(ids: generatedTokenIds)) ?? ""
+            let finalDecoded = accumulatedDecodedText.isEmpty ? ((try? tokenizer.decode(ids: generatedTokenIds)) ?? "") : accumulatedDecodedText
 
             var finalThink = ""
             var finalResp = ""
