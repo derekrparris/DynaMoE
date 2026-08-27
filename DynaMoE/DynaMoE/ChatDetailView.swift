@@ -981,7 +981,7 @@ struct MarkdownMessageView: View {
     }
 }
 
-// MARK: - Native Markdown Table Card View
+// MARK: - Native Markdown Table Card View (SwiftUI Grid)
 
 struct MarkdownTableView: View {
     let table: MarkdownTableData
@@ -990,59 +990,70 @@ struct MarkdownTableView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                VStack(alignment: .leading, spacing: 0) {
+            ScrollView(.horizontal, showsIndicators: true) {
+                Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
                     // Header Row
-                    HStack(spacing: 0) {
+                    GridRow {
                         ForEach(0..<table.headers.count, id: \.self) { colIdx in
                             let header = table.headers[colIdx]
                             let align = table.alignments.indices.contains(colIdx) ? table.alignments[colIdx] : .leading
-                            Text(LocalizedStringKey(header))
-                                .font(.system(size: 13, weight: .bold))
-                                .foregroundColor(.secondary)
-                                .frame(minWidth: 100, maxWidth: .infinity, alignment: align.alignment)
-                                .multilineTextAlignment(align.textAlignment)
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 9)
-                                .textSelection(.enabled)
-
-                            if colIdx < table.headers.count - 1 {
-                                Divider()
-                                    .opacity(0.4)
-                            }
-                        }
-                    }
-                    .background(Color.secondary.opacity(0.06))
-
-                    Divider()
-
-                    // Data Rows
-                    ForEach(0..<table.rows.count, id: \.self) { rowIdx in
-                        let row = table.rows[rowIdx]
-                        HStack(spacing: 0) {
-                            ForEach(0..<table.headers.count, id: \.self) { colIdx in
-                                let cell = colIdx < row.count ? row[colIdx] : ""
-                                let align = table.alignments.indices.contains(colIdx) ? table.alignments[colIdx] : .leading
-                                Text(LocalizedStringKey(cell))
-                                    .font(.system(size: 13))
-                                    .foregroundColor(.primary)
-                                    .frame(minWidth: 100, maxWidth: .infinity, alignment: align.alignment)
+                            HStack(spacing: 0) {
+                                Text(LocalizedStringKey(header))
+                                    .font(.system(size: 13, weight: .bold))
+                                    .foregroundColor(.secondary)
                                     .multilineTextAlignment(align.textAlignment)
                                     .padding(.horizontal, 14)
-                                    .padding(.vertical, 8)
+                                    .padding(.vertical, 9)
+                                    .frame(minWidth: 90, alignment: align.alignment)
                                     .textSelection(.enabled)
 
                                 if colIdx < table.headers.count - 1 {
                                     Divider()
-                                        .opacity(0.3)
+                                        .opacity(0.35)
                                 }
                             }
                         }
-                        .background(rowIdx % 2 == 1 ? Color.secondary.opacity(0.025) : Color.clear)
+                    }
+                    .background(Color.secondary.opacity(0.08))
+
+                    // Header Divider
+                    GridRow {
+                        Divider()
+                            .gridCellColumns(max(1, table.headers.count))
+                    }
+
+                    // Data Rows
+                    ForEach(0..<table.rows.count, id: \.self) { rowIdx in
+                        let row = table.rows[rowIdx]
+                        GridRow {
+                            ForEach(0..<table.headers.count, id: \.self) { colIdx in
+                                let cell = colIdx < row.count ? row[colIdx] : ""
+                                let align = table.alignments.indices.contains(colIdx) ? table.alignments[colIdx] : .leading
+                                HStack(spacing: 0) {
+                                    Text(LocalizedStringKey(cell))
+                                        .font(.system(size: 13))
+                                        .foregroundColor(.primary)
+                                        .multilineTextAlignment(align.textAlignment)
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 8)
+                                        .frame(minWidth: 90, alignment: align.alignment)
+                                        .textSelection(.enabled)
+
+                                    if colIdx < table.headers.count - 1 {
+                                        Divider()
+                                            .opacity(0.25)
+                                    }
+                                }
+                            }
+                        }
+                        .background(rowIdx % 2 == 1 ? Color.secondary.opacity(0.03) : Color.clear)
 
                         if rowIdx < table.rows.count - 1 {
-                            Divider()
-                                .opacity(0.3)
+                            GridRow {
+                                Divider()
+                                    .opacity(0.25)
+                                    .gridCellColumns(max(1, table.headers.count))
+                            }
                         }
                     }
                 }
@@ -1070,7 +1081,127 @@ struct MarkdownTableView: View {
     }
 }
 
-// MARK: - Dedicated Code Block Card with Header & Copy Button
+// MARK: - Native Multi-Language Syntax Highlighter (Pure Swift AST / Token Engine)
+
+public struct NativeSyntaxHighlighter {
+    public static func highlight(code: String, language: String) -> AttributedString {
+        let lang = language.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        let kwList: Set<String>
+        let isPythonLike = (lang == "python" || lang == "py" || lang == "sh" || lang == "bash" || lang == "yaml" || lang == "yml")
+        
+        switch lang {
+        case "swift":
+            kwList = ["func", "var", "let", "struct", "class", "enum", "protocol", "extension", "guard", "if", "else", "for", "in", "while", "return", "import", "public", "private", "fileprivate", "internal", "open", "static", "final", "override", "mutating", "async", "await", "throws", "try", "catch", "throw", "switch", "case", "default", "break", "continue", "where", "init", "deinit", "some", "any", "typealias", "nil", "true", "false", "self", "Self"]
+        case "python", "py":
+            kwList = ["def", "class", "import", "from", "as", "return", "if", "elif", "else", "for", "while", "in", "try", "except", "finally", "with", "raise", "pass", "break", "continue", "lambda", "yield", "async", "await", "assert", "global", "nonlocal", "True", "False", "None", "self"]
+        case "rust", "rs":
+            kwList = ["fn", "let", "mut", "struct", "enum", "impl", "trait", "pub", "use", "mod", "crate", "return", "if", "else", "match", "for", "in", "while", "loop", "break", "continue", "async", "await", "move", "ref", "type", "const", "static", "where", "true", "false", "unsafe"]
+        case "javascript", "js", "typescript", "ts":
+            kwList = ["function", "const", "let", "var", "class", "interface", "type", "import", "export", "from", "return", "if", "else", "for", "while", "switch", "case", "default", "break", "continue", "async", "await", "try", "catch", "throw", "new", "this", "typeof", "instanceof", "true", "false", "null", "undefined"]
+        case "c", "cpp", "c++", "metal":
+            kwList = ["kernel", "device", "constant", "threadgroup", "thread", "void", "int", "float", "double", "char", "bool", "struct", "class", "return", "if", "else", "for", "while", "switch", "case", "break", "continue", "template", "typename", "namespace", "include", "typedef"]
+        default:
+            kwList = ["func", "def", "fn", "function", "var", "let", "const", "struct", "class", "return", "import", "if", "else", "for", "while", "true", "false", "null", "nil", "None"]
+        }
+        
+        let typeList: Set<String> = ["Int", "String", "Bool", "Float", "Double", "UInt32", "UInt64", "Int32", "Int64", "Data", "URL", "View", "Text", "Color", "Array", "Dictionary", "Set", "Optional", "Result", "Task", "MainActor", "MTLDevice", "MTLBuffer", "MTLCommandQueue"]
+        
+        var result = AttributedString()
+        let lines = code.components(separatedBy: "\n")
+        
+        for (lineIdx, line) in lines.enumerated() {
+            var lineAttr = AttributedString()
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            let isCommentLine = isPythonLike ? trimmed.hasPrefix("#") : (trimmed.hasPrefix("//") || trimmed.hasPrefix("/*") || trimmed.hasPrefix("*"))
+            
+            if isCommentLine {
+                var commentAttr = AttributedString(line)
+                commentAttr.foregroundColor = Color.secondary.opacity(0.8)
+                lineAttr.append(commentAttr)
+            } else {
+                var idx = line.startIndex
+                while idx < line.endIndex {
+                    let remaining = String(line[idx...])
+                    
+                    // 1. Comment till end of line
+                    if (!isPythonLike && remaining.hasPrefix("//")) || (isPythonLike && remaining.hasPrefix("#")) {
+                        var cAttr = AttributedString(remaining)
+                        cAttr.foregroundColor = Color.secondary.opacity(0.8)
+                        lineAttr.append(cAttr)
+                        break
+                    }
+                    
+                    // 2. String literal ("..." or '...' or `...`)
+                    if remaining.hasPrefix("\"") || remaining.hasPrefix("'") || remaining.hasPrefix("`") {
+                        let quote = remaining.first!
+                        var endIdx = line.index(after: idx)
+                        var escaped = false
+                        while endIdx < line.endIndex {
+                            let ch = line[endIdx]
+                            if escaped {
+                                escaped = false
+                            } else if ch == "\\" {
+                                escaped = true
+                            } else if ch == quote {
+                                endIdx = line.index(after: endIdx)
+                                break
+                            }
+                            endIdx = line.index(after: endIdx)
+                        }
+                        let strContent = String(line[idx..<endIdx])
+                        var strAttr = AttributedString(strContent)
+                        strAttr.foregroundColor = Color.green
+                        lineAttr.append(strAttr)
+                        idx = endIdx
+                        continue
+                    }
+                    
+                    // 3. Word / Identifier
+                    if let wordMatch = remaining.range(of: #"^[a-zA-Z_][a-zA-Z0-9_]*"#, options: .regularExpression) {
+                        let word = String(remaining[wordMatch])
+                        var wAttr = AttributedString(word)
+                        if kwList.contains(word) {
+                            wAttr.foregroundColor = Color.purple
+                            wAttr.font = .system(size: 12.5, weight: .bold, design: .monospaced)
+                        } else if typeList.contains(word) {
+                            wAttr.foregroundColor = Color.teal
+                            wAttr.font = .system(size: 12.5, weight: .semibold, design: .monospaced)
+                        }
+                        lineAttr.append(wAttr)
+                        idx = line.index(idx, offsetBy: word.count)
+                        continue
+                    }
+                    
+                    // 4. Number
+                    if let numMatch = remaining.range(of: #"^(0x[0-9a-fA-F]+|\d+(\.\d+)?)"#, options: .regularExpression) {
+                        let num = String(remaining[numMatch])
+                        var nAttr = AttributedString(num)
+                        nAttr.foregroundColor = Color.orange
+                        lineAttr.append(nAttr)
+                        idx = line.index(idx, offsetBy: num.count)
+                        continue
+                    }
+                    
+                    // 5. Plain character
+                    let char = remaining.first!
+                    let charAttr = AttributedString(String(char))
+                    lineAttr.append(charAttr)
+                    idx = line.index(after: idx)
+                }
+            }
+            
+            result.append(lineAttr)
+            if lineIdx < lines.count - 1 {
+                result.append(AttributedString("\n"))
+            }
+        }
+        
+        return result
+    }
+}
+
+// MARK: - Dedicated Code Block Card with Header, Syntax Highlighting & Copy Button
 
 struct CodeBlockCard: View {
     let language: String
@@ -1126,12 +1257,11 @@ struct CodeBlockCard: View {
 
             Divider()
 
-            // Code Text Canvas
+            // Code Text Canvas with Native Syntax Highlighting
             ScrollView(.horizontal, showsIndicators: true) {
-                Text(code)
+                Text(NativeSyntaxHighlighter.highlight(code: code, language: language))
                     .font(.system(size: 12.5, design: .monospaced))
                     .lineSpacing(3)
-                    .foregroundColor(.primary)
                     .textSelection(.enabled)
                     .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)

@@ -753,7 +753,7 @@ struct ContentView: View {
 
         if modelSupportsThinking && !thinkingEnabled {
             // When thinking is explicitly turned OFF for a reasoning model, instruct it to reply directly
-            let noThinkInstruction = "Respond directly and concisely without any <think> or internal reasoning process."
+            let noThinkInstruction = "Respond directly and concisely. Do not output <think> or any reasoning process. 直接给出最终回答，不要输出<think>思考过程。"
             if !effectiveSystem.isEmpty {
                 effectiveSystem += "\n\n" + noThinkInstruction
             } else {
@@ -765,22 +765,37 @@ struct ContentView: View {
             promptString += "<|im_start|>system\n\(effectiveSystem)<|im_end|>\n"
         }
         for msg in sessions[sessionIdx].messages.dropLast() {
+            let cleanMsg = msg.content
+                .replacingOccurrences(of: "<|im_end|>", with: "")
+                .replacingOccurrences(of: "<|im_start|>", with: "")
+                .replacingOccurrences(of: "<|endoftext|>", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !cleanMsg.isEmpty || (msg.thinkingContent != nil && !msg.thinkingContent!.isEmpty) else { continue }
+
             if msg.role == .user {
-                promptString += "<|im_start|>user\n\(msg.content)<|im_end|>\n"
+                promptString += "<|im_start|>user\n\(cleanMsg)<|im_end|>\n"
             } else if msg.role == .assistant {
-                if let think = msg.thinkingContent, !think.isEmpty, thinkingEnabled {
-                    promptString += "<|im_start|>assistant\n<think>\n\(think)\n</think>\n\(msg.content)<|im_end|>\n"
+                if modelSupportsThinking {
+                    if let think = msg.thinkingContent, !think.isEmpty {
+                        let cleanThink = think
+                            .replacingOccurrences(of: "<think>", with: "")
+                            .replacingOccurrences(of: "</think>", with: "")
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        promptString += "<|im_start|>assistant\n<think>\n\(cleanThink)\n</think>\n\n\(cleanMsg)<|im_end|>\n"
+                    } else {
+                        promptString += "<|im_start|>assistant\n<think>\n\n</think>\n\n\(cleanMsg)<|im_end|>\n"
+                    }
                 } else {
-                    promptString += "<|im_start|>assistant\n\(msg.content)<|im_end|>\n"
+                    promptString += "<|im_start|>assistant\n\(cleanMsg)<|im_end|>\n"
                 }
             }
         }
         if thinkingEnabled {
             promptString += "<|im_start|>assistant\n<think>\n"
         } else if modelSupportsThinking {
-            // Prefill an empty closed <think>\n</think>\n block to guarantee reasoning models
+            // Prefill an empty closed <think>\n\n</think>\n\n block to guarantee reasoning models
             // (Nanbeige, DeepSeek-R1, QwQ) bypass reasoning entirely and output the direct answer!
-            promptString += "<|im_start|>assistant\n<think>\n</think>\n"
+            promptString += "<|im_start|>assistant\n<think>\n\n</think>\n\n"
         } else {
             promptString += "<|im_start|>assistant\n"
         }
@@ -2528,8 +2543,13 @@ struct ContentView: View {
             return
         }
 
-        let prompt = (customPrompt ?? promptInput).trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-        guard !prompt.isEmpty else {
+        let prompt: String
+        if let custom = customPrompt {
+            prompt = custom
+        } else {
+            prompt = promptInput.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        }
+        guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             let err = "⚠️ Please enter a prompt to generate text."
             gpuComputeOutput = err
             generationStatusText = err
@@ -2557,7 +2577,7 @@ struct ContentView: View {
         if thinkingEnabled {
             thinkSuffix = "<think>\n"
         } else if modelSupportsThinking {
-            thinkSuffix = "<think>\n</think>\n"
+            thinkSuffix = "<think>\n\n</think>\n\n"
         } else {
             thinkSuffix = ""
         }
@@ -4109,30 +4129,45 @@ struct ContentView: View {
                 let promptTrimmed = formattedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
                 let promptRequestsThinking = promptTrimmed.hasSuffix("<think>") && !promptTrimmed.hasSuffix("</think>")
 
-                if promptRequestsThinking {
-                    if updatedRaw.contains("</think>") {
-                        if thinkingEndTimestamp == nil {
-                            thinkingEndTimestamp = CFAbsoluteTimeGetCurrent()
-                        }
-                        let parts = updatedRaw.components(separatedBy: "</think>")
-                        thinkPart = parts[0].replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
-                        respPart = parts.dropFirst().joined(separator: "</think>").trimmingCharacters(in: .whitespacesAndNewlines)
-                        activeThink = false
-                    } else {
-                        thinkPart = updatedRaw.replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespaces)
-                        respPart = ""
-                        activeThink = true
+                let containsThinkOpen = updatedRaw.contains("<think>")
+                let containsThinkClose = updatedRaw.contains("</think>")
+
+                if containsThinkClose {
+                    if thinkingEndTimestamp == nil {
+                        thinkingEndTimestamp = CFAbsoluteTimeGetCurrent()
                     }
+                    let parts = updatedRaw.components(separatedBy: "</think>")
+                    if promptRequestsThinking {
+                        thinkPart = parts[0].replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    } else {
+                        thinkPart = ""
+                    }
+                    let rawResp = parts.dropFirst().joined(separator: "</think>")
+                    respPart = rawResp
+                        .replacingOccurrences(of: "<|im_end|>", with: "")
+                        .replacingOccurrences(of: "<|endoftext|>", with: "")
+                        .replacingOccurrences(of: "<|im_start|>", with: "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    activeThink = false
+                } else if containsThinkOpen || promptRequestsThinking {
+                    // Inside the thinking block before </think> arrives
+                    if promptRequestsThinking {
+                        thinkPart = updatedRaw.replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespaces)
+                        activeThink = true
+                    } else {
+                        // Thinking is disabled in the UI: suppress thought tokens so they never flash in the response view
+                        thinkPart = ""
+                        activeThink = false
+                    }
+                    respPart = ""
                 } else {
-                    // Thinking is disabled: strip any rogue think tags and stream directly to response
+                    // Normal direct response without think tags
                     thinkPart = ""
                     activeThink = false
-                    if updatedRaw.contains("</think>") {
-                        let parts = updatedRaw.components(separatedBy: "</think>")
-                        respPart = parts.dropFirst().joined(separator: "</think>").trimmingCharacters(in: .whitespacesAndNewlines)
-                    } else {
-                        respPart = updatedRaw.replacingOccurrences(of: "<think>", with: "")
-                    }
+                    respPart = updatedRaw
+                        .replacingOccurrences(of: "<|im_end|>", with: "")
+                        .replacingOccurrences(of: "<|endoftext|>", with: "")
+                        .replacingOccurrences(of: "<|im_start|>", with: "")
                 }
 
                 let liveTtft = firstTokenTimestamp.map { $0 - startTime }
@@ -4189,26 +4224,46 @@ struct ContentView: View {
             let promptTrimmedFinal = formattedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
             let promptRequestsThinkingFinal = promptTrimmedFinal.hasSuffix("<think>") && !promptTrimmedFinal.hasSuffix("</think>")
 
-            if promptRequestsThinkingFinal {
-                if finalDecoded.contains("</think>") {
-                    if thinkingEndTimestamp == nil {
-                        thinkingEndTimestamp = CFAbsoluteTimeGetCurrent()
-                    }
-                    let parts = finalDecoded.components(separatedBy: "</think>")
+            let finalContainsThinkClose = finalDecoded.contains("</think>")
+            let finalContainsThinkOpen = finalDecoded.contains("<think>")
+
+            if finalContainsThinkClose {
+                if thinkingEndTimestamp == nil {
+                    thinkingEndTimestamp = CFAbsoluteTimeGetCurrent()
+                }
+                let parts = finalDecoded.components(separatedBy: "</think>")
+                if promptRequestsThinkingFinal {
                     finalThink = parts[0].replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
-                    finalResp = parts.dropFirst().joined(separator: "</think>").trimmingCharacters(in: .whitespacesAndNewlines)
                 } else {
+                    finalThink = ""
+                }
+                let rawFinalResp = parts.dropFirst().joined(separator: "</think>")
+                finalResp = rawFinalResp
+                    .replacingOccurrences(of: "<|im_end|>", with: "")
+                    .replacingOccurrences(of: "<|endoftext|>", with: "")
+                    .replacingOccurrences(of: "<|im_start|>", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if finalContainsThinkOpen || promptRequestsThinkingFinal {
+                if promptRequestsThinkingFinal {
                     finalThink = finalDecoded.replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespaces)
                     finalResp = ""
+                } else {
+                    finalThink = ""
+                    finalResp = finalDecoded
+                        .replacingOccurrences(of: "<think>", with: "")
+                        .replacingOccurrences(of: "<|im_end|>", with: "")
+                        .replacingOccurrences(of: "<|endoftext|>", with: "")
+                        .replacingOccurrences(of: "<|im_start|>", with: "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
                 }
             } else {
                 finalThink = ""
-                if finalDecoded.contains("</think>") {
-                    let parts = finalDecoded.components(separatedBy: "</think>")
-                    finalResp = parts.dropFirst().joined(separator: "</think>").trimmingCharacters(in: .whitespacesAndNewlines)
-                } else {
-                    finalResp = finalDecoded.replacingOccurrences(of: "<think>", with: "")
-                }
+                finalResp = finalDecoded
+                    .replacingOccurrences(of: "<think>", with: "")
+                    .replacingOccurrences(of: "<|im_end|>", with: "")
+                    .replacingOccurrences(of: "<|endoftext|>", with: "")
+                    .replacingOccurrences(of: "<|im_start|>", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
             }
 
             let finalTtft = firstTokenTimestamp.map { $0 - startTime }
