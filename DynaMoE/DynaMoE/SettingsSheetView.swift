@@ -44,6 +44,7 @@ struct SettingsSheetView: View {
     // Generation Parameters bindings
     @Binding var temperature: Float
     @Binding var topP: Float
+    @Binding var minP: Float
     @Binding var topK: Int
     @Binding var repetitionPenalty: Float
     @Binding var maxNewTokens: Int
@@ -421,6 +422,19 @@ struct SettingsSheetView: View {
                             .foregroundColor(.purple)
                     }
                     Slider(value: $topP, in: 0.0...1.0, step: 0.05)
+                }
+
+                // Min-P (Dynamic Truncation)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Min-P (Confidence Truncation)")
+                            .font(.subheadline)
+                        Spacer()
+                        Text(String(format: "%.2f", minP))
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.purple)
+                    }
+                    Slider(value: $minP, in: 0.0...0.5, step: 0.01)
                 }
 
                 // Top-K Filtering

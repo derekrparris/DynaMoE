@@ -2,6 +2,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 import Metal
 import Foundation
+import Accelerate
 
 struct ExpertRoutingBadgeView: View {
     let rank: Int
@@ -424,6 +425,7 @@ struct ContentView: View {
     // Autoregressive Text Generation State
     @State private var temperature: Float = 0.7
     @State private var topP: Float = 0.9
+    @State private var minP: Float = 0.05
     @State private var topK: Int = 50
     @State private var repetitionPenalty: Float = 1.1
     @AppStorage("dynamoe_max_tokens") private var maxNewTokens: Int = 8192
@@ -662,6 +664,7 @@ struct ContentView: View {
                 },
                 temperature: $temperature,
                 topP: $topP,
+                minP: $minP,
                 topK: $topK,
                 repetitionPenalty: $repetitionPenalty,
                 maxNewTokens: $maxNewTokens,
@@ -2401,6 +2404,7 @@ struct ContentView: View {
         contextTokens: [UInt32],
         temperature: Float,
         topP: Float,
+        minP: Float,
         topK: Int,
         repetitionPenalty: Float
     ) -> UInt32 {
@@ -2419,17 +2423,11 @@ struct ContentView: View {
             }
         }
 
-        // High-performance greedy fast path (temperature <= 0.01)
+        // Hardware-Vectorized Greedy Fast Path (temperature <= 0.01) using vDSP_maxvi
         if temperature <= 0.01 {
-            var bestIdx = 0
-            var bestLogit: Float = -Float.greatestFiniteMagnitude
-            for v in 0..<vocabSize {
-                let l = logits[v]
-                if l > bestLogit {
-                    bestLogit = l
-                    bestIdx = v
-                }
-            }
+            var bestIdx: vDSP_Length = 0
+            var bestVal: Float = 0
+            vDSP_maxvi(logits, 1, &bestVal, &bestIdx, vDSP_Length(vocabSize))
             // Restore context logits
             for (v, orig) in origVals {
                 logits[v] = orig
@@ -2505,37 +2503,61 @@ struct ContentView: View {
         let candidates = heap.sorted(by: { $0.logit > $1.logit })
         guard let first = candidates.first else { return 0 }
 
+        let count = candidates.count
+        var logitVec = candidates.map { $0.logit }
+        var scaledLogits = [Float](repeating: 0, count: count)
+        var probs = [Float](repeating: 0, count: count)
+
         let invTemp = 1.0 / max(temperature, 0.01)
         let maxLogit = first.logit
-        var expSum: Float = 0.0
-        var probs: [Float] = []
-        probs.reserveCapacity(candidates.count)
 
-        for c in candidates {
-            let p = Darwin.exp((c.logit - maxLogit) * invTemp)
-            probs.append(p)
-            expSum += p
-        }
+        // Vectorized: (logits - maxLogit) * invTemp using Accelerate vDSP
+        var negMaxLogit = -maxLogit
+        var tempScale = invTemp
+        vDSP_vsadd(logitVec, 1, &negMaxLogit, &scaledLogits, 1, vDSP_Length(count))
+        vDSP_vsmul(scaledLogits, 1, &tempScale, &scaledLogits, 1, vDSP_Length(count))
+
+        // Vectorized exponential: probs = exp(scaledLogits)
+        var n = Int32(count)
+        vvexpf(&probs, scaledLogits, &n)
+
+        // Vectorized sum of exponents
+        var expSum: Float = 0
+        vDSP_sve(probs, 1, &expSum, vDSP_Length(count))
 
         if expSum <= 0.0 {
             return UInt32(first.id)
         }
 
-        for i in 0..<probs.count {
-            probs[i] /= expSum
+        // Vectorized normalization: probs = probs / expSum
+        var invExpSum = 1.0 / expSum
+        vDSP_vsmul(probs, 1, &invExpSum, &probs, 1, vDSP_Length(count))
+
+        // 3. Adaptive Min-P Dynamic Truncation
+        // Retain only tokens whose probability is >= max_prob * minP
+        let maxProb = probs[0]
+        let minPThreshold = maxProb * max(0.0, min(minP, 1.0))
+        var minPFilteredCount = count
+        for i in 0..<count {
+            if probs[i] < minPThreshold {
+                minPFilteredCount = max(1, i)
+                break
+            }
         }
 
+        // 4. Top-P (Nucleus) Truncation on top of Min-P
         var cumulativeProb: Float = 0.0
-        var cutoffIndex = candidates.count - 1
-        for (i, p) in probs.enumerated() {
-            cumulativeProb += p
+        var cutoffIndex = minPFilteredCount - 1
+        for i in 0..<minPFilteredCount {
+            cumulativeProb += probs[i]
             if cumulativeProb >= topP {
                 cutoffIndex = i
                 break
             }
         }
 
-        let nucleusSum = probs[0...cutoffIndex].reduce(0, +)
+        var nucleusSum: Float = 0
+        vDSP_sve(probs, 1, &nucleusSum, vDSP_Length(cutoffIndex + 1))
         let randomVal = Float.random(in: 0..<1.0) * nucleusSum
         var runningSum: Float = 0.0
         for i in 0...cutoffIndex {
@@ -2991,6 +3013,7 @@ struct ContentView: View {
 
         let temp = self.temperature
         let topPVal = self.topP
+        let minPVal = self.minP
         let topKVal = self.topK
         let repPen = self.repetitionPenalty
         let maxTokens = self.maxNewTokens
@@ -4142,6 +4165,7 @@ struct ContentView: View {
                     contextTokens: contextTokens,
                     temperature: temp,
                     topP: topPVal,
+                    minP: minPVal,
                     topK: topKVal,
                     repetitionPenalty: repPen
                 )
