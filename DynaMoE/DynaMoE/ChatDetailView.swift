@@ -16,11 +16,14 @@ struct ChatDetailView: View {
     var generationSpeed: Double
     var generationTokens: Int
     var modelName: String?
+    var supportsThinking: Bool = false
+    var isThinkingEnabled: Bool = true
     var onSendMessage: (String) -> Void
     var onStopGeneration: () -> Void
     var onSelectPromptStarter: (String) -> Void
     var onSelectDiscoveredModel: ((DiscoveredModel) -> Void)? = nil
     var onOpenSettings: (() -> Void)? = nil
+    var onToggleThinking: ((Bool) -> Void)? = nil
 
     @FocusState private var isInputFocused: Bool
     @State private var isReasoningExpanded: [UUID: Bool] = [:]
@@ -105,7 +108,7 @@ struct ChatDetailView: View {
                                 ForEach(session.messages) { message in
                                     ChatMessageView(
                                         message: message,
-                                        isGenerating: isGenerating,
+                                        isGenerating: isGenerating && message.id == session.messages.last?.id,
                                         isStreamingOffDisk: isStreamingOffDisk,
                                         isExpanded: Binding(
                                             get: { isReasoningExpanded[message.id] ?? true },
@@ -201,6 +204,9 @@ struct ChatDetailView: View {
                                                 if dm.isMoE {
                                                     Text("• MoE")
                                                 }
+                                                if dm.supportsThinking {
+                                                    Text("• 🧠 Thinking")
+                                                }
                                             }
                                         }
                                     }
@@ -234,6 +240,57 @@ struct ChatDetailView: View {
                         }
                         .menuStyle(.borderlessButton)
                         .fixedSize()
+
+                        // Thinking On/Off Dropdown beside Model Selector (shown only if loaded model supports thinking)
+                        if supportsThinking {
+                            Menu {
+                                Button(action: {
+                                    onToggleThinking?(true)
+                                }) {
+                                    HStack {
+                                        if isThinkingEnabled {
+                                            Image(systemName: "checkmark")
+                                        }
+                                        Label("Thinking On (Reasoning Process)", systemImage: "brain.head.profile")
+                                    }
+                                }
+
+                                Button(action: {
+                                    onToggleThinking?(false)
+                                }) {
+                                    HStack {
+                                        if !isThinkingEnabled {
+                                            Image(systemName: "checkmark")
+                                        }
+                                        Label("Thinking Off (Direct Response)", systemImage: "bolt.slash")
+                                    }
+                                }
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Image(systemName: isThinkingEnabled ? "brain.head.profile" : "bolt.slash")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(isThinkingEnabled ? .purple : .secondary)
+                                    Text(isThinkingEnabled ? "Thinking On" : "Thinking Off")
+                                        .font(.system(size: 11.5, weight: .medium))
+                                        .foregroundColor(isThinkingEnabled ? .primary : .secondary)
+                                    Image(systemName: "chevron.up.chevron.down")
+                                        .font(.system(size: 7.5, weight: .semibold))
+                                        .foregroundColor(.secondary.opacity(0.7))
+                                }
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 4.5)
+                                .background(isThinkingEnabled ? Color.purple.opacity(0.12) : Color.secondary.opacity(0.08))
+                                .cornerRadius(10)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10)
+                                        .stroke(isThinkingEnabled ? Color.purple.opacity(0.3) : Color.clear, lineWidth: 1)
+                                )
+                            }
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                            .help(isThinkingEnabled ? "Thinking / Reasoning is enabled for this model" : "Direct response without thinking is enabled")
+                            .transition(.opacity.combined(with: .scale))
+                        }
 
                         Spacer()
 
@@ -396,140 +453,230 @@ struct ChatMessageView: View {
                             .textSelection(.enabled)
                     }
                 } else {
-                    // Assistant Thinking / Reasoning Accordion
-                    if let thinking = message.thinkingContent, !thinking.isEmpty {
-                        VStack(alignment: .leading, spacing: 6) {
+                    // Assistant Thinking / Reasoning Accordion (Osaurus Style)
+                    let hasThinkingContent = message.thinkingContent != nil && !message.thinkingContent!.isEmpty
+                    if (message.isThinking && isGenerating) || hasThinkingContent {
+                        let thinking = message.thinkingContent ?? ""
+                        VStack(alignment: .leading, spacing: 8) {
                             Button(action: {
                                 withAnimation(.easeInOut(duration: 0.2)) {
                                     isExpanded.toggle()
                                 }
                             }) {
-                                HStack(spacing: 6) {
+                                HStack(spacing: 8) {
+                                    Image(systemName: "brain.head.profile")
+                                        .font(.system(size: 12, weight: .semibold))
+                                        .foregroundStyle(
+                                            LinearGradient(
+                                                colors: [.purple, .indigo],
+                                                startPoint: .topLeading,
+                                                endPoint: .bottomTrailing
+                                            )
+                                        )
+
+                                    if message.isThinking && isGenerating {
+                                        Text("Thinking...")
+                                            .font(.system(size: 12, weight: .medium))
+                                            .foregroundColor(.primary)
+                                        StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
+                                    } else if let tTime = message.thinkingTimeSeconds {
+                                        Text(String(format: "Thought for %.1fs", tTime))
+                                            .font(.system(size: 12, weight: .medium))
+                                            .foregroundColor(.secondary)
+                                    } else {
+                                        Text("Thought Process")
+                                            .font(.system(size: 12, weight: .medium))
+                                            .foregroundColor(.secondary)
+                                    }
+
+                                    Spacer()
+
+                                    let charCount = thinking.count
+                                    let charCountStr = charCount >= 1000 ? String(format: "%.1fk chars", Double(charCount) / 1000.0) : "\(charCount) chars"
+                                    Text(charCountStr)
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .foregroundColor(.secondary.opacity(0.7))
+
                                     Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                                         .font(.system(size: 10, weight: .bold))
-                                        .foregroundColor(.secondary)
-                                    
-                                    Image(systemName: "brain.head.profile")
-                                        .font(.system(size: 12))
-                                        .foregroundColor(.purple)
-                                    
-                                    Text(message.isThinking ? "Thinking..." : "Thought Process")
-                                        .font(.system(size: 12, weight: .medium))
-                                        .foregroundColor(.secondary)
-                                    
-                                    if message.isThinking {
-                                        StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
-                                    }
-                                    
-                                    Spacer()
+                                        .foregroundColor(.secondary.opacity(0.8))
                                 }
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .background(Color.secondary.opacity(0.06))
-                                .cornerRadius(6)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 7)
+                                .background(Color(NSColor.controlBackgroundColor).opacity(0.7))
+                                .cornerRadius(8)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+                                )
                             }
                             .buttonStyle(.plain)
 
                             if isExpanded {
-                                Text(thinking)
-                                    .font(.system(size: 12.5, design: .monospaced))
-                                    .foregroundColor(.secondary)
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 8)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(Color.secondary.opacity(0.04))
-                                    .cornerRadius(8)
-                                    .textSelection(.enabled)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    if !thinking.isEmpty {
+                                        Text(thinking)
+                                            .font(.system(size: 12, design: .monospaced))
+                                            .foregroundColor(.secondary)
+                                            .lineSpacing(3)
+                                            .padding(.horizontal, 14)
+                                            .padding(.vertical, 10)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .background(Color.secondary.opacity(0.035))
+                                            .cornerRadius(8)
+                                            .overlay(
+                                                RoundedRectangle(cornerRadius: 8)
+                                                    .stroke(Color.primary.opacity(0.05), lineWidth: 1)
+                                            )
+                                            .textSelection(.enabled)
+                                    } else if message.isThinking && isGenerating {
+                                        HStack(spacing: 8) {
+                                            StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
+                                            Text(isStreamingOffDisk ? "Streaming MoE experts off SSD disk..." : "Generating thought process...")
+                                                .font(.system(size: 12, design: .monospaced))
+                                                .foregroundColor(.secondary.opacity(0.8))
+                                        }
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 10)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .background(Color.secondary.opacity(0.035))
+                                        .cornerRadius(8)
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 8)
+                                                .stroke(Color.primary.opacity(0.05), lineWidth: 1)
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
 
-                    // Main Response Text rendered via Markdown Engine
+                    // Main Response Text rendered via Rich Markdown Engine
                     if !message.content.isEmpty {
                         MarkdownMessageView(
                             content: message.content,
                             isStreaming: isGenerating && message.isThinking == false,
                             isStreamingOffDisk: isStreamingOffDisk
                         )
-                    } else if message.isThinking {
-                        // Empty placeholder while purely thinking
+                    } else if isGenerating && !message.isThinking && !hasThinkingContent {
+                        // Only for active generation while initial pre-fill occurs
                         HStack(spacing: 8) {
                             StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
-                            Text(isStreamingOffDisk ? "Streaming MoE experts off SSD disk..." : "Thinking & generating response...")
+                            Text(isStreamingOffDisk ? "Streaming MoE experts off SSD disk..." : "Generating response...")
                                 .font(.system(size: 13))
                                 .foregroundColor(.secondary)
                         }
                         .padding(.vertical, 4)
                     }
 
-                    // Action & Metrics Footer (Antigravity Reactions + Metrics)
-                    if !message.isThinking && !message.content.isEmpty {
+                    // Action & Metrics Footer (Osaurus Style Telemetry & Actions)
+                    if (!message.isThinking || !isGenerating) && !message.content.isEmpty {
                         HStack(spacing: 12) {
-                            // Copy button
-                            Button(action: {
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(message.content, forType: .string)
-                                isCopied = true
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                                    isCopied = false
+                            // Telemetry
+                            HStack(spacing: 6) {
+                                if let ttft = message.timeToFirstTokenSeconds {
+                                    Text(String(format: "TTFT %.2fs", ttft))
+                                        .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                        .foregroundColor(.secondary.opacity(0.8))
+
+                                    Text("•")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(.secondary.opacity(0.4))
                                 }
-                            }) {
-                                HStack(spacing: 4) {
-                                    Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
-                                        .font(.system(size: 11))
-                                    if isCopied {
-                                        Text("Copied")
-                                            .font(.system(size: 11))
+
+                                if message.tokensPerSec > 0 {
+                                    HStack(spacing: 3) {
+                                        Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")
+                                            .font(.system(size: 9, weight: .bold))
+                                            .foregroundColor(isStreamingOffDisk ? .orange : .purple)
+                                        Text(String(format: "%.1f tok/s", message.tokensPerSec))
+                                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                            .foregroundColor(isStreamingOffDisk ? .orange : .purple)
                                     }
+
+                                    Text("•")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(.secondary.opacity(0.4))
                                 }
-                                .foregroundColor(isCopied ? .green : .secondary)
-                            }
-                            .buttonStyle(.plain)
-                            .help("Copy full response")
 
-                            // Thumbs up / down
-                            Button(action: {
-                                feedback = feedback == "up" ? nil : "up"
-                            }) {
-                                Image(systemName: feedback == "up" ? "hand.thumbsup.fill" : "hand.thumbsup")
-                                    .font(.system(size: 11))
-                                    .foregroundColor(feedback == "up" ? .purple : .secondary)
-                            }
-                            .buttonStyle(.plain)
-                            .help("Good response")
-
-                            Button(action: {
-                                feedback = feedback == "down" ? nil : "down"
-                            }) {
-                                Image(systemName: feedback == "down" ? "hand.thumbsdown.fill" : "hand.thumbsdown")
-                                    .font(.system(size: 11))
-                                    .foregroundColor(feedback == "down" ? .purple : .secondary)
-                            }
-                            .buttonStyle(.plain)
-                            .help("Bad response")
-
-                            if message.tokenCount > 0 {
-                                Text("•")
-                                    .foregroundColor(.secondary.opacity(0.4))
-                                Text("\(message.tokenCount) tokens")
-                                    .font(.system(size: 11))
-                                    .foregroundColor(.secondary)
-                            }
-
-                            if message.tokensPerSec > 0 {
-                                Text("•")
-                                    .foregroundColor(.secondary.opacity(0.4))
-                                HStack(spacing: 3) {
-                                    Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")
-                                        .font(.system(size: 10, weight: .bold))
-                                        .foregroundColor(isStreamingOffDisk ? .orange : .purple)
-                                    Text(String(format: "%.1f tok/s", message.tokensPerSec))
+                                if message.tokenCount > 0 {
+                                    Text("\(message.tokenCount.formatted()) tokens")
                                         .font(.system(size: 11, design: .monospaced))
-                                        .foregroundColor(isStreamingOffDisk ? .orange : .purple)
+                                        .foregroundColor(.secondary.opacity(0.8))
                                 }
                             }
 
                             Spacer()
+
+                            // Action Buttons
+                            HStack(spacing: 8) {
+                                // Copy button
+                                Button(action: {
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString(message.content, forType: .string)
+                                    isCopied = true
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                        isCopied = false
+                                    }
+                                }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
+                                            .font(.system(size: 11))
+                                        if isCopied {
+                                            Text("Copied")
+                                                .font(.system(size: 11))
+                                        }
+                                    }
+                                    .foregroundColor(isCopied ? .green : .secondary)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 3)
+                                    .background(Color.secondary.opacity(0.06))
+                                    .cornerRadius(4)
+                                }
+                                .buttonStyle(.plain)
+                                .help("Copy full response")
+
+                                // Thumbs up / down
+                                Button(action: {
+                                    feedback = feedback == "up" ? nil : "up"
+                                }) {
+                                    Image(systemName: feedback == "up" ? "hand.thumbsup.fill" : "hand.thumbsup")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(feedback == "up" ? .purple : .secondary)
+                                        .padding(4)
+                                        .background(Color.secondary.opacity(0.06))
+                                        .cornerRadius(4)
+                                }
+                                .buttonStyle(.plain)
+                                .help("Good response")
+
+                                Button(action: {
+                                    feedback = feedback == "down" ? nil : "down"
+                                }) {
+                                    Image(systemName: feedback == "down" ? "hand.thumbsdown.fill" : "hand.thumbsdown")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(feedback == "down" ? .purple : .secondary)
+                                        .padding(4)
+                                        .background(Color.secondary.opacity(0.06))
+                                        .cornerRadius(4)
+                                }
+                                .buttonStyle(.plain)
+                                .help("Bad response")
+
+                                // Audio speak
+                                Button(action: {
+                                    NSSpeechSynthesizer().startSpeaking(message.content)
+                                }) {
+                                    Image(systemName: "speaker.wave.2")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.secondary)
+                                        .padding(4)
+                                        .background(Color.secondary.opacity(0.06))
+                                        .cornerRadius(4)
+                                }
+                                .buttonStyle(.plain)
+                                .help("Read response aloud")
+                            }
                         }
                         .padding(.top, 4)
                     }
@@ -616,20 +763,53 @@ struct EmptyWelcomeView: View {
     }
 }
 
-// MARK: - Markdown Rendering Engine (Osaurus Style)
+// MARK: - Markdown Table & Typography Models
 
-enum MarkdownBlock: Identifiable {
+public enum TextAlignmentType {
+    case leading
+    case center
+    case trailing
+
+    public var alignment: Alignment {
+        switch self {
+        case .leading: return .leading
+        case .center: return .center
+        case .trailing: return .trailing
+        }
+    }
+
+    public var textAlignment: TextAlignment {
+        switch self {
+        case .leading: return .leading
+        case .center: return .center
+        case .trailing: return .trailing
+        }
+    }
+}
+
+public struct MarkdownTableData: Identifiable {
+    public let id = UUID()
+    public let headers: [String]
+    public let alignments: [TextAlignmentType]
+    public let rows: [[String]]
+}
+
+// MARK: - Markdown Block AST
+
+public enum MarkdownBlock: Identifiable {
     case heading(level: Int, text: String)
     case paragraph(text: String)
+    case table(MarkdownTableData)
     case codeBlock(language: String, code: String)
     case blockquote(text: String)
     case listItem(number: Int?, text: String)
     case horizontalRule
 
-    var id: String {
+    public var id: String {
         switch self {
         case .heading(let lvl, let txt): return "h-\(lvl)-\(txt.hashValue)"
         case .paragraph(let txt): return "p-\(txt.hashValue)"
+        case .table(let data): return "t-\(data.id.uuidString)"
         case .codeBlock(let lang, let code): return "code-\(lang)-\(code.hashValue)"
         case .blockquote(let txt): return "quote-\(txt.hashValue)"
         case .listItem(let num, let txt): return "li-\(num ?? 0)-\(txt.hashValue)"
@@ -637,6 +817,8 @@ enum MarkdownBlock: Identifiable {
         }
     }
 }
+
+// MARK: - Markdown Message View
 
 struct MarkdownMessageView: View {
     let content: String
@@ -650,25 +832,28 @@ struct MarkdownMessageView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             ForEach(Array(blocks.enumerated()), id: \.offset) { index, block in
+                let isLast = isStreaming && index == blocks.count - 1
                 switch block {
                 case .heading(let level, let text):
-                    renderHeading(level: level, text: text)
+                    renderHeading(level: level, text: text, isLast: isLast)
                 case .paragraph(let text):
-                    renderParagraph(text: text, isLast: isStreaming && index == blocks.count - 1)
+                    renderParagraph(text: text, isLast: isLast)
+                case .table(let table):
+                    MarkdownTableView(table: table, isLast: isLast, isStreamingOffDisk: isStreamingOffDisk)
                 case .codeBlock(let language, let code):
                     CodeBlockCard(
                         language: language,
                         code: code,
-                        isStreaming: isStreaming && index == blocks.count - 1,
+                        isStreaming: isLast,
                         isStreamingOffDisk: isStreamingOffDisk
                     )
                 case .blockquote(let text):
-                    renderBlockquote(text: text)
+                    renderBlockquote(text: text, isLast: isLast)
                 case .listItem(let number, let text):
-                    renderListItem(number: number, text: text, isLast: isStreaming && index == blocks.count - 1)
+                    renderListItem(number: number, text: text, isLast: isLast)
                 case .horizontalRule:
                     Divider()
-                        .padding(.vertical, 4)
+                        .padding(.vertical, 6)
                 }
             }
         }
@@ -678,35 +863,57 @@ struct MarkdownMessageView: View {
     // MARK: - Block Renderers
 
     @ViewBuilder
-    private func renderHeading(level: Int, text: String) -> some View {
-        let size: CGFloat = level == 1 ? 18 : (level == 2 ? 16 : 14.5)
+    private func renderHeading(level: Int, text: String, isLast: Bool) -> some View {
+        let size: CGFloat = {
+            switch level {
+            case 1: return 19
+            case 2: return 16.5
+            case 3: return 15
+            default: return 14
+            }
+        }()
         let weight: Font.Weight = level <= 2 ? .bold : .semibold
+        let topPad: CGFloat = level == 1 ? 12 : (level == 2 ? 10 : 6)
+        let botPad: CGFloat = level == 1 ? 4 : 2
 
-        Text(LocalizedStringKey(text))
-            .font(.system(size: size, weight: weight))
-            .foregroundColor(.primary)
-            .padding(.top, level == 1 ? 8 : 4)
-            .padding(.bottom, 2)
-            .textSelection(.enabled)
+        if isLast {
+            (Text(LocalizedStringKey(text)) + Text(" ") + Text(Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")).foregroundColor(isStreamingOffDisk ? .orange : .purple).font(.system(size: 11, weight: .bold)))
+                .font(.system(size: size, weight: weight))
+                .foregroundColor(.primary)
+                .padding(.top, topPad)
+                .padding(.bottom, botPad)
+                .textSelection(.enabled)
+        } else {
+            Text(LocalizedStringKey(text))
+                .font(.system(size: size, weight: weight))
+                .foregroundColor(.primary)
+                .padding(.top, topPad)
+                .padding(.bottom, botPad)
+                .textSelection(.enabled)
+        }
     }
 
     @ViewBuilder
     private func renderParagraph(text: String, isLast: Bool) -> some View {
-        HStack(alignment: .top, spacing: 0) {
+        if isLast {
+            (Text(LocalizedStringKey(text)) + Text(" ") + Text(Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")).foregroundColor(isStreamingOffDisk ? .orange : .purple).font(.system(size: 11, weight: .bold)))
+                .font(.system(size: 14))
+                .lineSpacing(4)
+                .foregroundColor(.primary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
             Text(LocalizedStringKey(text))
                 .font(.system(size: 14))
                 .lineSpacing(4)
                 .foregroundColor(.primary)
                 .textSelection(.enabled)
-
-            if isLast {
-                StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
-            }
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
     @ViewBuilder
-    private func renderBlockquote(text: String) -> some View {
+    private func renderBlockquote(text: String, isLast: Bool) -> some View {
         HStack(alignment: .top, spacing: 10) {
             RoundedRectangle(cornerRadius: 1.5)
                 .fill(
@@ -716,25 +923,36 @@ struct MarkdownMessageView: View {
                         endPoint: .bottom
                     )
                 )
-                .frame(width: 3)
+                .frame(width: 3.5)
 
-            Text(LocalizedStringKey(text))
-                .font(.system(size: 13.5))
-                .italic()
-                .foregroundColor(.secondary)
-                .lineSpacing(3)
-                .textSelection(.enabled)
+            if isLast {
+                (Text(LocalizedStringKey(text)) + Text(" ") + Text(Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")).foregroundColor(isStreamingOffDisk ? .orange : .purple).font(.system(size: 11, weight: .bold)))
+                    .font(.system(size: 13.5))
+                    .italic()
+                    .foregroundColor(.secondary)
+                    .lineSpacing(3.5)
+                    .textSelection(.enabled)
+            } else {
+                Text(LocalizedStringKey(text))
+                    .font(.system(size: 13.5))
+                    .italic()
+                    .foregroundColor(.secondary)
+                    .lineSpacing(3.5)
+                    .textSelection(.enabled)
+            }
         }
-        .padding(.vertical, 4)
-        .padding(.horizontal, 4)
+        .padding(.vertical, 6)
+        .padding(.horizontal, 10)
+        .background(Color.purple.opacity(0.04))
+        .cornerRadius(6)
     }
 
     @ViewBuilder
-    private func renderListItem(number: Int?, text: String, isLast: Bool = false) -> some View {
+    private func renderListItem(number: Int?, text: String, isLast: Bool) -> some View {
         HStack(alignment: .top, spacing: 8) {
             if let num = number {
                 Text("\(num).")
-                    .font(.system(size: 13, design: .monospaced))
+                    .font(.system(size: 13, weight: .semibold, design: .monospaced))
                     .foregroundColor(.secondary)
                     .frame(minWidth: 20, alignment: .trailing)
             } else {
@@ -744,17 +962,111 @@ struct MarkdownMessageView: View {
                     .frame(width: 14, alignment: .center)
             }
 
-            Text(LocalizedStringKey(text))
-                .font(.system(size: 14))
-                .lineSpacing(3)
-                .foregroundColor(.primary)
-                .textSelection(.enabled)
-
             if isLast {
-                StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
+                (Text(LocalizedStringKey(text)) + Text(" ") + Text(Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")).foregroundColor(isStreamingOffDisk ? .orange : .purple).font(.system(size: 11, weight: .bold)))
+                    .font(.system(size: 14))
+                    .lineSpacing(3)
+                    .foregroundColor(.primary)
+                    .textSelection(.enabled)
+            } else {
+                Text(LocalizedStringKey(text))
+                    .font(.system(size: 14))
+                    .lineSpacing(3)
+                    .foregroundColor(.primary)
+                    .textSelection(.enabled)
             }
         }
-        .padding(.vertical, 1)
+        .padding(.vertical, 1.5)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+// MARK: - Native Markdown Table Card View
+
+struct MarkdownTableView: View {
+    let table: MarkdownTableData
+    var isLast: Bool = false
+    var isStreamingOffDisk: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 0) {
+                    // Header Row
+                    HStack(spacing: 0) {
+                        ForEach(0..<table.headers.count, id: \.self) { colIdx in
+                            let header = table.headers[colIdx]
+                            let align = table.alignments.indices.contains(colIdx) ? table.alignments[colIdx] : .leading
+                            Text(LocalizedStringKey(header))
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundColor(.secondary)
+                                .frame(minWidth: 100, maxWidth: .infinity, alignment: align.alignment)
+                                .multilineTextAlignment(align.textAlignment)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 9)
+                                .textSelection(.enabled)
+
+                            if colIdx < table.headers.count - 1 {
+                                Divider()
+                                    .opacity(0.4)
+                            }
+                        }
+                    }
+                    .background(Color.secondary.opacity(0.06))
+
+                    Divider()
+
+                    // Data Rows
+                    ForEach(0..<table.rows.count, id: \.self) { rowIdx in
+                        let row = table.rows[rowIdx]
+                        HStack(spacing: 0) {
+                            ForEach(0..<table.headers.count, id: \.self) { colIdx in
+                                let cell = colIdx < row.count ? row[colIdx] : ""
+                                let align = table.alignments.indices.contains(colIdx) ? table.alignments[colIdx] : .leading
+                                Text(LocalizedStringKey(cell))
+                                    .font(.system(size: 13))
+                                    .foregroundColor(.primary)
+                                    .frame(minWidth: 100, maxWidth: .infinity, alignment: align.alignment)
+                                    .multilineTextAlignment(align.textAlignment)
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 8)
+                                    .textSelection(.enabled)
+
+                                if colIdx < table.headers.count - 1 {
+                                    Divider()
+                                        .opacity(0.3)
+                                }
+                            }
+                        }
+                        .background(rowIdx % 2 == 1 ? Color.secondary.opacity(0.025) : Color.clear)
+
+                        if rowIdx < table.rows.count - 1 {
+                            Divider()
+                                .opacity(0.3)
+                        }
+                    }
+                }
+                .background(Color(NSColor.controlBackgroundColor).opacity(0.5))
+                .cornerRadius(10)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+                )
+            }
+
+            if isLast {
+                HStack(spacing: 6) {
+                    StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
+                    if isStreamingOffDisk {
+                        Text("Streaming MoE experts off NVMe disk...")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(.orange)
+                    }
+                }
+                .padding(.top, 2)
+            }
+        }
+        .padding(.vertical, 6)
     }
 }
 
@@ -881,11 +1193,196 @@ struct StreamingPaceIndicatorView: View {
     }
 }
 
-// MARK: - Markdown Block Parsing Engine
+// MARK: - Markdown Pre-processing Normalizer
 
-func parseMarkdownBlocks(_ raw: String) -> [MarkdownBlock] {
+public func normalizeMarkdownText(_ raw: String) -> String {
+    var text = raw
+    text = text.replacingOccurrences(of: "\r\n", with: "\n")
+    text = text.replacingOccurrences(of: "\r", with: "\n")
+    text = text.replacingOccurrences(of: "\\n", with: "\n")
+
+    // 1. Convert HTML Line breaks & Paragraphs to newlines
+    if let regexBr = try? NSRegularExpression(pattern: #"<br\s*/?>"# , options: [.caseInsensitive]) {
+        text = regexBr.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n")
+    }
+    if let regexP = try? NSRegularExpression(pattern: #"</?p\b[^>]*>"#, options: [.caseInsensitive]) {
+        text = regexP.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n")
+    }
+    if let regexDiv = try? NSRegularExpression(pattern: #"</?div\b[^>]*>"#, options: [.caseInsensitive]) {
+        text = regexDiv.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n")
+    }
+
+    // 2. Convert HTML formatting tags to Markdown
+    if let regexB = try? NSRegularExpression(pattern: #"<(?:b|strong)\b[^>]*>(.*?)</(?:b|strong)>"#, options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+        text = regexB.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "**$1**")
+    }
+    if let regexI = try? NSRegularExpression(pattern: #"<(?:i|em)\b[^>]*>(.*?)</(?:i|em)>"#, options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+        text = regexI.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "*$1*")
+    }
+    if let regexCode = try? NSRegularExpression(pattern: #"<code\b[^>]*>(.*?)</code>"#, options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+        text = regexCode.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "`$1`")
+    }
+
+    // 3. Convert HTML Lists
+    if let regexLi = try? NSRegularExpression(pattern: #"<li\b[^>]*>(.*?)(?:</li>|$)"#, options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+        text = regexLi.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n- $1\n")
+    }
+    if let regexUl = try? NSRegularExpression(pattern: #"</?(?:ul|ol)\b[^>]*>"#, options: [.caseInsensitive]) {
+        text = regexUl.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n")
+    }
+
+    // 4. Strip span and convert sup/sub tags
+    if let regexSpan = try? NSRegularExpression(pattern: #"<span\b[^>]*>(.*?)</span>"#, options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+        text = regexSpan.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1")
+    }
+    if let regexSup = try? NSRegularExpression(pattern: #"<sup>(.*?)</sup>"#, options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+        text = regexSup.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "^($1)")
+    }
+    if let regexSub = try? NSRegularExpression(pattern: #"<sub>(.*?)</sub>"#, options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+        text = regexSub.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "_($1)")
+    }
+    if let regexStrayHtml = try? NSRegularExpression(pattern: #"</?[a-zA-Z][^>]*>"#, options: []) {
+        text = regexStrayHtml.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "")
+    }
+
+    // 5. Clean double pipes || -> |
+    while text.contains("||") {
+        text = text.replacingOccurrences(of: "||", with: "|")
+    }
+
+    // 6. Fix heading embedded in paragraph or missing space: "text. #### 1. Heading" -> "text.\n\n#### 1. Heading"
+    if let regexStuckHeading = try? NSRegularExpression(pattern: #"([^\n#])\s*(#{1,6}\s+)"#, options: []) {
+        text = regexStuckHeading.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1\n\n$2")
+    }
+
+    // 7. Fix heading title glued to paragraph text:
+    // e.g. "#### 1. Technical Definitions & RepresentationBF16 (bfloat)" -> "#### 1. Technical Definitions & Representation\n\nBF16 (bfloat)"
+    if let regexHeadingGlue = try? NSRegularExpression(pattern: #"(#{1,6}\s+[^\n]+?)([a-z])([A-Z]{2,}|\b(?:BF16|FP8|FP16|FP32|INT8|GPU|CPU|NPU|TPU)\b)"#, options: []) {
+        text = regexHeadingGlue.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1$2\n\n$3")
+    }
+
+    // 8. Fix inline list glued inside paragraph: "formats: - Total 16 bits" -> "formats:\n\n- Total 16 bits"
+    if let regexInlineList = try? NSRegularExpression(pattern: #"([^\n])\s*(?:-\s+|•\s+|\*\s+)([A-Z0-9])"#, options: []) {
+        text = regexInlineList.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1\n\n- $2")
+    }
+
+    // 9. Fix inline numbered list glued inside paragraph: "computing. 1. Technical" -> "computing.\n\n1. Technical"
+    if let regexInlineNumList = try? NSRegularExpression(pattern: #"([.:;?!])\s*(\d{1,2}\.\s+[A-Z])"#, options: []) {
+        text = regexInlineNumList.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1\n\n$2")
+    }
+
+    // 10. Fix sentence glued to next sentence without space: "quantization.This" -> "quantization. This"
+    if let regexSentenceGlue = try? NSRegularExpression(pattern: #"([a-z0-9])\.([A-Z])"#, options: []) {
+        text = regexSentenceGlue.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1. $2")
+    }
+
+    // 11. Fix title stuck before table header on same line: e.g. "Title | Col 1 | Col 2 | Col 3" -> "### Title\n| Col 1 | Col 2 | Col 3"
+    if let regexTitleTable = try? NSRegularExpression(pattern: #"(?:^|\n)([^|\n#]+?)\s*\|\s*([A-Za-z0-9].*\|[^\n]*)"#, options: []) {
+        text = regexTitleTable.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n### $1\n| $2")
+    }
+
+    // 12. Fix unclosed table separator line (missing trailing pipe): e.g. "|---|---|:---" -> "|---|---|:---|"
+    if let regexFixSepPipes = try? NSRegularExpression(pattern: #"(?:^|\n)(\|[|:\- ]+[-:])(?=\n|$)"#, options: []) {
+        text = regexFixSepPipes.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n$1|")
+    }
+
+    // 13. Fix multiple table separator lines
+    if let regexMultiSep = try? NSRegularExpression(pattern: #"(\|[|:\- ]+\|)\s*\n\s*(\|[|:\- ]+\|)"#, options: []) {
+        text = regexMultiSep.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1")
+    }
+
+    // 14. Fix table section headers like "-- Section Name -- |" -> "\n\n#### Section Name\n"
+    if let regexSectionHeader = try? NSRegularExpression(pattern: #"(?:^|\n)\s*--\s*([^-\n]+?)\s*--\s*\|?"#, options: [.anchorsMatchLines]) {
+        text = regexSectionHeader.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n#### $1\n")
+    }
+
+    // 15. Fix concatenated horizontal rules + headers: "---##" -> "\n\n---\n\n## "
+    if let regexHrHeader = try? NSRegularExpression(pattern: #"---+[\t ]*(#{1,6}\s*)"#, options: []) {
+        text = regexHrHeader.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n---\n\n$1")
+    }
+
+    // 16. Fix bullet points stuck to preceding text: "text• Bullet" -> "text\n• Bullet"
+    if let regexStuckBullet = try? NSRegularExpression(pattern: #"([^\n])(•\s+[A-Za-z0-9])"#, options: []) {
+        text = regexStuckBullet.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1\n$2")
+    }
+
+    // 17. Collapse 3+ newlines to 2
+    if let regexMultiNl = try? NSRegularExpression(pattern: #"\n{3,}"#, options: []) {
+        text = regexMultiNl.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n")
+    }
+
+    return text
+}
+
+// MARK: - Table Line Parser
+
+private func parseMarkdownTable(lines: [String], startIndex: Int) -> (table: MarkdownTableData, nextIndex: Int)? {
+    guard startIndex + 1 < lines.count else { return nil }
+    let headerLine = lines[startIndex].trimmingCharacters(in: .whitespaces)
+    let separatorLine = lines[startIndex + 1].trimmingCharacters(in: .whitespaces)
+
+    guard headerLine.contains("|") else { return nil }
+
+    let separatorChars = CharacterSet(charactersIn: "|- :—–â")
+    guard separatorLine.contains("|") && separatorLine.contains("-") && separatorLine.unicodeScalars.allSatisfy({ separatorChars.contains($0) }) else {
+        return nil
+    }
+
+    func splitCells(_ line: String) -> [String] {
+        var trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("|") { trimmed.removeFirst() }
+        if trimmed.hasSuffix("|") { trimmed.removeLast() }
+        return trimmed.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    let headers = splitCells(headerLine)
+    guard headers.count >= 2 else { return nil }
+    let separatorCells = splitCells(separatorLine)
+
+    var alignments: [TextAlignmentType] = []
+    for colIdx in 0..<headers.count {
+        if colIdx < separatorCells.count {
+            let cell = separatorCells[colIdx]
+            let hasLeadingColon = cell.hasPrefix(":")
+            let hasTrailingColon = cell.hasSuffix(":")
+            if hasLeadingColon && hasTrailingColon {
+                alignments.append(.center)
+            } else if hasTrailingColon {
+                alignments.append(.trailing)
+            } else {
+                alignments.append(.leading)
+            }
+        } else {
+            alignments.append(.leading)
+        }
+    }
+
+    var rows: [[String]] = []
+    var curIdx = startIndex + 2
+    while curIdx < lines.count {
+        let line = lines[curIdx].trimmingCharacters(in: .whitespaces)
+        if line.isEmpty || !line.contains("|") {
+            break
+        }
+        var cells = splitCells(line)
+        if cells.count < headers.count {
+            cells.append(contentsOf: Array(repeating: "", count: headers.count - cells.count))
+        } else if cells.count > headers.count {
+            cells = Array(cells.prefix(headers.count))
+        }
+        rows.append(cells)
+        curIdx += 1
+    }
+
+    return (MarkdownTableData(headers: headers, alignments: alignments, rows: rows), curIdx)
+}
+
+// MARK: - Full Markdown Block Parsing Engine
+
+public func parseMarkdownBlocks(_ raw: String) -> [MarkdownBlock] {
+    let normalized = normalizeMarkdownText(raw)
     var blocks: [MarkdownBlock] = []
-    let lines = raw.components(separatedBy: "\n")
+    let lines = normalized.components(separatedBy: "\n")
 
     var inCodeBlock = false
     var codeLang = ""
@@ -903,78 +1400,117 @@ func parseMarkdownBlocks(_ raw: String) -> [MarkdownBlock] {
         }
     }
 
-    for line in lines {
+    var i = 0
+    while i < lines.count {
+        let line = lines[i]
         let trimmed = line.trimmingCharacters(in: .whitespaces)
 
+        // 1. Code Block Fence
         if trimmed.hasPrefix("```") {
             if inCodeBlock {
-                // Close code block
                 blocks.append(.codeBlock(language: codeLang, code: codeLines.joined(separator: "\n")))
                 inCodeBlock = false
                 codeLang = ""
                 codeLines.removeAll()
             } else {
-                // Open code block
                 flushParagraph()
                 inCodeBlock = true
                 codeLang = String(trimmed.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
                 codeLines.removeAll()
             }
+            i += 1
             continue
         }
 
         if inCodeBlock {
             codeLines.append(line)
+            i += 1
             continue
         }
 
+        // 2. Table detection
+        if !inCodeBlock && trimmed.contains("|") {
+            if let tableResult = parseMarkdownTable(lines: lines, startIndex: i) {
+                flushParagraph()
+                blocks.append(.table(tableResult.table))
+                i = tableResult.nextIndex
+                continue
+            }
+        }
+
+        // 3. Headings (#, ##, ###, etc.)
         if trimmed.hasPrefix("#") {
             flushParagraph()
             let hashCount = trimmed.prefix(while: { $0 == "#" }).count
             let headerText = String(trimmed.dropFirst(hashCount)).trimmingCharacters(in: .whitespaces)
             blocks.append(.heading(level: hashCount, text: headerText))
+            i += 1
             continue
         }
 
+        // 4. Blockquotes
         if trimmed.hasPrefix("> ") || trimmed == ">" {
             flushParagraph()
-            let quoteText = trimmed.hasPrefix("> ") ? String(trimmed.dropFirst(2)) : ""
-            blocks.append(.blockquote(text: quoteText))
+            var quoteLines: [String] = []
+            while i < lines.count {
+                let qLine = lines[i].trimmingCharacters(in: .whitespaces)
+                if qLine.hasPrefix("> ") {
+                    quoteLines.append(String(qLine.dropFirst(2)))
+                    i += 1
+                } else if qLine == ">" {
+                    quoteLines.append("")
+                    i += 1
+                } else {
+                    break
+                }
+            }
+            blocks.append(.blockquote(text: quoteLines.joined(separator: "\n")))
             continue
         }
 
+        // 5. Horizontal Rule
         if trimmed == "---" || trimmed == "***" || trimmed == "___" {
             flushParagraph()
             blocks.append(.horizontalRule)
+            i += 1
             continue
         }
 
-        // Bullet list item
-        if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") || trimmed.hasPrefix("+ ") {
+        // 6. Bullet list item
+        if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") || trimmed.hasPrefix("+ ") || trimmed.hasPrefix("• ") {
             flushParagraph()
-            let itemText = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+            let itemText: String
+            if trimmed.hasPrefix("• ") {
+                itemText = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+            } else {
+                itemText = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+            }
             blocks.append(.listItem(number: nil, text: itemText))
+            i += 1
             continue
         }
 
-        // Numbered list item
+        // 7. Numbered list item
         if let match = trimmed.range(of: #"^\d+\.\s+"#, options: .regularExpression) {
             flushParagraph()
             let itemText = String(trimmed[match.upperBound...]).trimmingCharacters(in: .whitespaces)
             let numStr = String(trimmed[..<match.upperBound]).trimmingCharacters(in: .whitespaces.union(CharacterSet(charactersIn: ".")))
             blocks.append(.listItem(number: Int(numStr), text: itemText))
+            i += 1
             continue
         }
 
+        // 8. Empty line
         if trimmed.isEmpty {
             flushParagraph()
+            i += 1
             continue
         }
 
         paragraphLines.append(line)
+        i += 1
     }
 
-    // Handle unclosed code block during active streaming
     if inCodeBlock {
         blocks.append(.codeBlock(language: codeLang, code: codeLines.joined(separator: "\n")))
     } else {

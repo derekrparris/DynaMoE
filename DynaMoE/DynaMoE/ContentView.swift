@@ -66,7 +66,8 @@ final class KVCacheManager {
     var vCacheBuffer: MTLBuffer?
     var linearStateBuffer: MTLBuffer?
     var convStateBuffer: MTLBuffer?
-    var allocatedSeqLen: Int = 2048
+    var allocatedSeqLen: Int = 0
+    var allocatedKvBytes: Int = 0
     
     func reset(
         device: MTLDevice,
@@ -86,19 +87,26 @@ final class KVCacheManager {
         let kvStride = kvHeads * hDim
         let kvBytes = max(totalSlots, 44) * maxSeqLen * max(kvStride, 1024) * MemoryLayout<Float>.stride
         
-        self.kCacheBuffer = device.makeBuffer(length: kvBytes, options: .storageModeShared)
-        self.vCacheBuffer = device.makeBuffer(length: kvBytes, options: .storageModeShared)
+        if kCacheBuffer == nil || allocatedKvBytes < kvBytes {
+            self.kCacheBuffer = device.makeBuffer(length: kvBytes, options: .storageModeShared)
+            self.vCacheBuffer = device.makeBuffer(length: kvBytes, options: .storageModeShared)
+            self.allocatedKvBytes = kvBytes
+        }
         
-        if let kBuf = kCacheBuffer { memset(kBuf.contents(), 0, kvBytes) }
-        if let vBuf = vCacheBuffer { memset(vBuf.contents(), 0, kvBytes) }
+        if let kBuf = kCacheBuffer { memset(kBuf.contents(), 0, min(kvBytes, kBuf.length)) }
+        if let vBuf = vCacheBuffer { memset(vBuf.contents(), 0, min(kvBytes, vBuf.length)) }
         
         let linLayers = actualLayers
         let linStateBytes = max(linLayers, 40) * 32 * 128 * 128 * MemoryLayout<Float>.stride
-        self.linearStateBuffer = device.makeBuffer(length: linStateBytes, options: .storageModeShared)
+        if linearStateBuffer == nil || linearStateBuffer!.length < linStateBytes {
+            self.linearStateBuffer = device.makeBuffer(length: linStateBytes, options: .storageModeShared)
+        }
         if let sBuf = linearStateBuffer { memset(sBuf.contents(), 0, linStateBytes) }
 
         let convBytes = max(linLayers, 40) * 8192 * 4 * MemoryLayout<Float>.stride
-        self.convStateBuffer = device.makeBuffer(length: convBytes, options: .storageModeShared)
+        if convStateBuffer == nil || convStateBuffer!.length < convBytes {
+            self.convStateBuffer = device.makeBuffer(length: convBytes, options: .storageModeShared)
+        }
         if let cBuf = convStateBuffer { memset(cBuf.contents(), 0, convBytes) }
     }
 }
@@ -418,7 +426,7 @@ struct ContentView: View {
     @State private var topP: Float = 0.9
     @State private var topK: Int = 50
     @State private var repetitionPenalty: Float = 1.1
-    @State private var maxNewTokens: Int = 256
+    @AppStorage("dynamoe_max_tokens") private var maxNewTokens: Int = 8192
     @State private var isGeneratingText: Bool = false
     @State private var generatedStreamText: String = ""
     @State private var thinkingText: String = ""
@@ -453,6 +461,7 @@ struct ContentView: View {
     @State private var isSettingsPresented: Bool = false
     @State private var chatPromptText: String = ""
     @State private var systemPrompt: String = ModelConfig.getUserDefaultSystemPrompt()
+    @AppStorage("dynamoe_thinking_enabled") private var defaultThinkingEnabled: Bool = true
 
     var isStreamingOffDisk: Bool {
         guard let summary = summary else { return false }
@@ -470,6 +479,38 @@ struct ContentView: View {
             return false
         }
         return true
+    }
+
+    var activeModelSupportsThinking: Bool {
+        // 1. Check loaded model config / summary / detected architecture
+        if ModelConfig.supportsThinking(
+            config: modelConfig,
+            summary: summary,
+            modelName: summary != nil ? (modelConfig?.modelType ?? detectedArchitecture.shortName) : nil,
+            modelPath: activeLoadedModelPath
+        ) {
+            return true
+        }
+        // 2. Check active session selected model
+        if let session = activeSessionBinding.wrappedValue {
+            if let model = localModelManager.discoveredModels.first(where: { $0.id == (session.selectedModelId ?? "") || $0.snapshotPath == (session.selectedModelPath ?? "") }) {
+                if model.supportsThinking { return true }
+            }
+            if ModelConfig.supportsThinking(
+                modelName: session.selectedModelName,
+                modelPath: session.selectedModelPath
+            ) {
+                return true
+            }
+        }
+        return false
+    }
+
+    var isThinkingEnabledForActiveSession: Bool {
+        if let session = activeSessionBinding.wrappedValue, let enabled = session.isThinkingEnabled {
+            return enabled
+        }
+        return defaultThinkingEnabled
     }
 
     var activeSessionBinding: Binding<ChatSession?> {
@@ -566,6 +607,8 @@ struct ContentView: View {
                 generationSpeed: generationSpeedTokPerSec,
                 generationTokens: generationTotalTokens,
                 modelName: summary != nil ? (modelConfig?.modelType ?? detectedArchitecture.shortName) : nil,
+                supportsThinking: activeModelSupportsThinking,
+                isThinkingEnabled: isThinkingEnabledForActiveSession,
                 onSendMessage: { prompt in
                     handleSendMessage(prompt)
                 },
@@ -582,6 +625,13 @@ struct ContentView: View {
                 },
                 onOpenSettings: {
                     isSettingsPresented = true
+                },
+                onToggleThinking: { enabled in
+                    defaultThinkingEnabled = enabled
+                    if let sid = selectedSessionId ?? sessions.first?.id,
+                       let idx = sessions.firstIndex(where: { $0.id == sid }) {
+                        sessions[idx].isThinkingEnabled = enabled
+                    }
                 }
             )
         }
@@ -684,19 +734,32 @@ struct ContentView: View {
             sessions[sessionIdx].title = cleanTitle.isEmpty ? "Chat" : String(cleanTitle)
         }
         
+        let modelSupportsThinking = activeModelSupportsThinking
+        let thinkingEnabled = (sessions[sessionIdx].isThinkingEnabled ?? defaultThinkingEnabled) && modelSupportsThinking
+
         let assistantMsgId = UUID()
-        let assistantMsg = ChatMessage(id: assistantMsgId, role: .assistant, content: "", thinkingContent: "", isThinking: true)
+        let assistantMsg = ChatMessage(id: assistantMsgId, role: .assistant, content: "", thinkingContent: nil, isThinking: thinkingEnabled)
         sessions[sessionIdx].messages.append(assistantMsg)
         
         // Build prompt formatted with chat template
         var promptString = ""
         let modelShort = summary != nil ? (modelConfig?.modelType ?? detectedArchitecture.shortName) : nil
-        let effectiveSystem = ModelConfig.buildEffectiveSystemPrompt(
+        var effectiveSystem = ModelConfig.buildEffectiveSystemPrompt(
             userPrompt: systemPrompt,
             config: modelConfig,
             summary: summary,
             modelName: modelShort
         ).trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if modelSupportsThinking && !thinkingEnabled {
+            // When thinking is explicitly turned OFF for a reasoning model, instruct it to reply directly
+            let noThinkInstruction = "Respond directly and concisely without any <think> or internal reasoning process."
+            if !effectiveSystem.isEmpty {
+                effectiveSystem += "\n\n" + noThinkInstruction
+            } else {
+                effectiveSystem = noThinkInstruction
+            }
+        }
 
         if !effectiveSystem.isEmpty {
             promptString += "<|im_start|>system\n\(effectiveSystem)<|im_end|>\n"
@@ -705,14 +768,22 @@ struct ContentView: View {
             if msg.role == .user {
                 promptString += "<|im_start|>user\n\(msg.content)<|im_end|>\n"
             } else if msg.role == .assistant {
-                if let think = msg.thinkingContent, !think.isEmpty {
+                if let think = msg.thinkingContent, !think.isEmpty, thinkingEnabled {
                     promptString += "<|im_start|>assistant\n<think>\n\(think)\n</think>\n\(msg.content)<|im_end|>\n"
                 } else {
                     promptString += "<|im_start|>assistant\n\(msg.content)<|im_end|>\n"
                 }
             }
         }
-        promptString += "<|im_start|>assistant\n<think>\n"
+        if thinkingEnabled {
+            promptString += "<|im_start|>assistant\n<think>\n"
+        } else if modelSupportsThinking {
+            // Prefill an empty closed <think>\n</think>\n block to guarantee reasoning models
+            // (Nanbeige, DeepSeek-R1, QwQ) bypass reasoning entirely and output the direct answer!
+            promptString += "<|im_start|>assistant\n<think>\n</think>\n"
+        } else {
+            promptString += "<|im_start|>assistant\n"
+        }
         
         startAutoregressiveGeneration(customPrompt: promptString, sessionId: currentSessionId, messageId: assistantMsgId)
     }
@@ -2479,6 +2550,18 @@ struct ContentView: View {
             modelName: modelShort
         ).trimmingCharacters(in: .whitespacesAndNewlines)
 
+        let modelSupportsThinking = activeModelSupportsThinking
+        let thinkingEnabled = isThinkingEnabledForActiveSession && modelSupportsThinking
+
+        let thinkSuffix: String
+        if thinkingEnabled {
+            thinkSuffix = "<think>\n"
+        } else if modelSupportsThinking {
+            thinkSuffix = "<think>\n</think>\n"
+        } else {
+            thinkSuffix = ""
+        }
+
         let formattedPrompt: String
         if prompt.contains("<|im_start|>") {
             if !cleanSystem.isEmpty && !prompt.contains("<|im_start|>system") {
@@ -2487,9 +2570,9 @@ struct ContentView: View {
                 formattedPrompt = prompt
             }
         } else if !cleanSystem.isEmpty {
-            formattedPrompt = "<|im_start|>system\n\(cleanSystem)<|im_end|>\n<|im_start|>user\n\(prompt)<|im_end|>\n<|im_start|>assistant\n<think>\n"
+            formattedPrompt = "<|im_start|>system\n\(cleanSystem)<|im_end|>\n<|im_start|>user\n\(prompt)<|im_end|>\n<|im_start|>assistant\n\(thinkSuffix)"
         } else {
-            formattedPrompt = "<|im_start|>user\n\(prompt)<|im_end|>\n<|im_start|>assistant\n<think>\n"
+            formattedPrompt = "<|im_start|>user\n\(prompt)<|im_end|>\n<|im_start|>assistant\n\(thinkSuffix)"
         }
 
         let promptTokenIds: [UInt32]
@@ -2883,6 +2966,8 @@ struct ContentView: View {
         generationTask = Task.detached(priority: .userInitiated) {
             var contextTokens = promptTokenIds
             let startTime = CFAbsoluteTimeGetCurrent()
+            var firstTokenTimestamp: Double? = nil
+            var thinkingEndTimestamp: Double? = nil
             var tokensGenerated = 0
             var currentStep: UInt32 = 0
 
@@ -3997,6 +4082,10 @@ struct ContentView: View {
                 contextTokens.append(nextToken)
                 tokensGenerated += 1
 
+                if tokensGenerated == 1 {
+                    firstTokenTimestamp = CFAbsoluteTimeGetCurrent()
+                }
+
                 // 6. Decode Cumulative Tokens
                 let fullDecoded = (try? tokenizer.decode(ids: generatedTokenIds)) ?? ""
                 if fullDecoded.contains("<|im_end|>") || fullDecoded.contains("<|endoftext|>") || fullDecoded.contains("<|im_start|>") {
@@ -4017,19 +4106,37 @@ struct ContentView: View {
                 var respPart = ""
                 var activeThink = false
 
-                if updatedRaw.contains("</think>") {
-                    let parts = updatedRaw.components(separatedBy: "</think>")
-                    thinkPart = parts[0].replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
-                    respPart = parts.dropFirst().joined(separator: "</think>").trimmingCharacters(in: .whitespacesAndNewlines)
-                    activeThink = false
-                } else if updatedRaw.contains("<think>") || formattedPrompt.contains("<think>") {
-                    thinkPart = updatedRaw.replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespaces)
-                    respPart = ""
-                    activeThink = true
+                let promptTrimmed = formattedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                let promptRequestsThinking = promptTrimmed.hasSuffix("<think>") && !promptTrimmed.hasSuffix("</think>")
+
+                if promptRequestsThinking {
+                    if updatedRaw.contains("</think>") {
+                        if thinkingEndTimestamp == nil {
+                            thinkingEndTimestamp = CFAbsoluteTimeGetCurrent()
+                        }
+                        let parts = updatedRaw.components(separatedBy: "</think>")
+                        thinkPart = parts[0].replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                        respPart = parts.dropFirst().joined(separator: "</think>").trimmingCharacters(in: .whitespacesAndNewlines)
+                        activeThink = false
+                    } else {
+                        thinkPart = updatedRaw.replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespaces)
+                        respPart = ""
+                        activeThink = true
+                    }
                 } else {
-                    respPart = updatedRaw
+                    // Thinking is disabled: strip any rogue think tags and stream directly to response
+                    thinkPart = ""
                     activeThink = false
+                    if updatedRaw.contains("</think>") {
+                        let parts = updatedRaw.components(separatedBy: "</think>")
+                        respPart = parts.dropFirst().joined(separator: "</think>").trimmingCharacters(in: .whitespacesAndNewlines)
+                    } else {
+                        respPart = updatedRaw.replacingOccurrences(of: "<think>", with: "")
+                    }
                 }
+
+                let liveTtft = firstTokenTimestamp.map { $0 - startTime }
+                let liveThinkDuration = thinkingEndTimestamp.map { $0 - startTime }
 
                 // Throttle MainActor UI updates to 30/60fps frame cadence or token interval
                 let now = CFAbsoluteTimeGetCurrent()
@@ -4054,12 +4161,14 @@ struct ContentView: View {
 
                         if let sId = sessionId, let mId = messageId {
                             if let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
-                               let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
-                                self.sessions[sIdx].messages[mIdx].thinkingContent = thinkPart
+                                let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                                self.sessions[sIdx].messages[mIdx].thinkingContent = thinkPart.isEmpty ? nil : thinkPart
                                 self.sessions[sIdx].messages[mIdx].content = respPart
                                 self.sessions[sIdx].messages[mIdx].isThinking = activeThink
                                 self.sessions[sIdx].messages[mIdx].tokenCount = tokensGenerated
                                 self.sessions[sIdx].messages[mIdx].tokensPerSec = tokPerSec
+                                self.sessions[sIdx].messages[mIdx].timeToFirstTokenSeconds = liveTtft
+                                self.sessions[sIdx].messages[mIdx].thinkingTimeSeconds = liveThinkDuration
                             }
                         }
                     }
@@ -4077,16 +4186,33 @@ struct ContentView: View {
 
             var finalThink = ""
             var finalResp = ""
-            if finalDecoded.contains("</think>") {
-                let parts = finalDecoded.components(separatedBy: "</think>")
-                finalThink = parts[0].replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
-                finalResp = parts.dropFirst().joined(separator: "</think>").trimmingCharacters(in: .whitespacesAndNewlines)
-            } else if finalDecoded.contains("<think>") || formattedPrompt.contains("<think>") {
-                finalThink = finalDecoded.replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespaces)
-                finalResp = ""
+            let promptTrimmedFinal = formattedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+            let promptRequestsThinkingFinal = promptTrimmedFinal.hasSuffix("<think>") && !promptTrimmedFinal.hasSuffix("</think>")
+
+            if promptRequestsThinkingFinal {
+                if finalDecoded.contains("</think>") {
+                    if thinkingEndTimestamp == nil {
+                        thinkingEndTimestamp = CFAbsoluteTimeGetCurrent()
+                    }
+                    let parts = finalDecoded.components(separatedBy: "</think>")
+                    finalThink = parts[0].replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    finalResp = parts.dropFirst().joined(separator: "</think>").trimmingCharacters(in: .whitespacesAndNewlines)
+                } else {
+                    finalThink = finalDecoded.replacingOccurrences(of: "<think>", with: "").trimmingCharacters(in: .whitespaces)
+                    finalResp = ""
+                }
             } else {
-                finalResp = finalDecoded
+                finalThink = ""
+                if finalDecoded.contains("</think>") {
+                    let parts = finalDecoded.components(separatedBy: "</think>")
+                    finalResp = parts.dropFirst().joined(separator: "</think>").trimmingCharacters(in: .whitespacesAndNewlines)
+                } else {
+                    finalResp = finalDecoded.replacingOccurrences(of: "<think>", with: "")
+                }
             }
+
+            let finalTtft = firstTokenTimestamp.map { $0 - startTime }
+            let finalThinkDuration = thinkingEndTimestamp.map { $0 - startTime }
 
             await MainActor.run {
                 self.isGeneratingText = false
@@ -4107,11 +4233,13 @@ struct ContentView: View {
                 if let sId = sessionId, let mId = messageId {
                     if let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
                        let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
-                        self.sessions[sIdx].messages[mIdx].thinkingContent = finalThink
+                        self.sessions[sIdx].messages[mIdx].thinkingContent = finalThink.isEmpty ? nil : finalThink
                         self.sessions[sIdx].messages[mIdx].content = finalResp
                         self.sessions[sIdx].messages[mIdx].isThinking = false
                         self.sessions[sIdx].messages[mIdx].tokenCount = tokensGenerated
                         self.sessions[sIdx].messages[mIdx].tokensPerSec = finalTokPerSec
+                        self.sessions[sIdx].messages[mIdx].timeToFirstTokenSeconds = finalTtft
+                        self.sessions[sIdx].messages[mIdx].thinkingTimeSeconds = finalThinkDuration
                     }
                 }
             }

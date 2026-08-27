@@ -391,4 +391,36 @@ public struct ModelConfig: Codable {
             return user
         }
     }
+
+    /// Determines whether a given model architecture/configuration supports native thinking / reasoning tokens
+    public static func supportsThinking(
+        config: ModelConfig? = nil,
+        summary: ModelSummary? = nil,
+        modelName: String? = nil,
+        modelPath: String? = nil
+    ) -> Bool {
+        let nameLower = (modelName ?? "").lowercased()
+        let pathLower = (modelPath ?? "").lowercased()
+        let typeStr = (config?.modelType ?? "").lowercased()
+        let archStr = config?.architectures?.joined(separator: " ").lowercased() ?? ""
+
+        if nameLower.contains("nanbeige") || typeStr.contains("nanbeige") || archStr.contains("nanbeige") || pathLower.contains("nanbeige") {
+            return true
+        }
+        if nameLower.contains("deepseek") || typeStr.contains("deepseek") || archStr.contains("deepseek") || pathLower.contains("deepseek") {
+            return true
+        }
+        if nameLower.contains("r1") || nameLower.contains("reason") || nameLower.contains("qwq") || typeStr.contains("qwq") || archStr.contains("qwq") || pathLower.contains("qwq") {
+            return true
+        }
+        if nameLower.contains("think") || pathLower.contains("think") {
+            return true
+        }
+        if (summary?.layerCount == 22 && summary?.maxExpertId == 0) ||
+           (summary?.tensors.contains(where: { $0.name.contains("dense_gate_up_proj") }) == true) ||
+           (summary?.tensors.contains(where: { $0.name.hasPrefix("model.layers.0.mlp.gate_proj") }) == true && summary?.layerCount == 22) {
+            return true
+        }
+        return false
+    }
 }

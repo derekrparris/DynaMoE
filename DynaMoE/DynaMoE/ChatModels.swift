@@ -20,6 +20,8 @@ public struct ChatMessage: Identifiable, Codable, Equatable {
     public var timestamp: Date
     public var tokenCount: Int
     public var tokensPerSec: Double
+    public var timeToFirstTokenSeconds: Double?
+    public var thinkingTimeSeconds: Double?
 
     public init(
         id: UUID = UUID(),
@@ -29,7 +31,9 @@ public struct ChatMessage: Identifiable, Codable, Equatable {
         isThinking: Bool = false,
         timestamp: Date = Date(),
         tokenCount: Int = 0,
-        tokensPerSec: Double = 0.0
+        tokensPerSec: Double = 0.0,
+        timeToFirstTokenSeconds: Double? = nil,
+        thinkingTimeSeconds: Double? = nil
     ) {
         self.id = id
         self.role = role
@@ -39,6 +43,8 @@ public struct ChatMessage: Identifiable, Codable, Equatable {
         self.timestamp = timestamp
         self.tokenCount = tokenCount
         self.tokensPerSec = tokensPerSec
+        self.timeToFirstTokenSeconds = timeToFirstTokenSeconds
+        self.thinkingTimeSeconds = thinkingTimeSeconds
     }
 }
 
@@ -51,6 +57,7 @@ public struct ChatSession: Identifiable, Codable, Equatable {
     public var selectedModelId: String?
     public var selectedModelName: String?
     public var selectedModelPath: String?
+    public var isThinkingEnabled: Bool?
 
     public init(
         id: UUID = UUID(),
@@ -60,7 +67,8 @@ public struct ChatSession: Identifiable, Codable, Equatable {
         updatedAt: Date = Date(),
         selectedModelId: String? = nil,
         selectedModelName: String? = nil,
-        selectedModelPath: String? = nil
+        selectedModelPath: String? = nil,
+        isThinkingEnabled: Bool? = nil
     ) {
         self.id = id
         self.title = title
@@ -70,5 +78,6 @@ public struct ChatSession: Identifiable, Codable, Equatable {
         self.selectedModelId = selectedModelId
         self.selectedModelName = selectedModelName
         self.selectedModelPath = selectedModelPath
+        self.isThinkingEnabled = isThinkingEnabled
     }
 }

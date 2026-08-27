@@ -59,6 +59,19 @@ public struct DiscoveredModel: Identifiable, Hashable, Codable, Equatable {
         self.quantization = quantization
         self.rawModelType = rawModelType
     }
+
+    public var supportsThinking: Bool {
+        let name = displayName.lowercased()
+        let repo = repoId.lowercased()
+        let type = (rawModelType ?? "").lowercased()
+        let arch = architectureName.lowercased()
+        let path = snapshotPath.lowercased()
+        return name.contains("nanbeige") || repo.contains("nanbeige") || type.contains("nanbeige") || arch.contains("nanbeige") || path.contains("nanbeige") ||
+               name.contains("deepseek") || repo.contains("deepseek") || type.contains("deepseek") || arch.contains("deepseek") || path.contains("deepseek") ||
+               name.contains("r1") || repo.contains("r1") || name.contains("reason") || repo.contains("reason") ||
+               name.contains("qwq") || repo.contains("qwq") || type.contains("qwq") ||
+               name.contains("think") || repo.contains("think")
+    }
 }
 
 public class LocalModelManager: ObservableObject {
