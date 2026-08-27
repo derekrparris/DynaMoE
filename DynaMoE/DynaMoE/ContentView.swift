@@ -244,36 +244,56 @@ final class ExpertTransitionTracker {
 final class WorkingSetManager {
     static let shared = WorkingSetManager()
 
-    private(set) var expertSlices: [ExpertKey: [ExpertSlice]] = [:]
-    private(set) var denseSlices: [ExpertSlice] = []
-    private(set) var residentExperts: Set<ExpertKey> = []
-    private(set) var prefetchedKeys: Set<ExpertKey> = []
+    private let lock = NSRecursiveLock()
+    private var expertSlices: [ExpertKey: [ExpertSlice]] = [:]
+    private var denseSlices: [ExpertSlice] = []
+    private var residentExperts: Set<ExpertKey> = []
+    private var prefetchedKeys: Set<ExpertKey> = []
     private var lruList: [ExpertKey] = []
     private let prefetchQueue = DispatchQueue(label: "com.dynamoe.prefetch", qos: .userInitiated)
     public let transitionTracker = ExpertTransitionTracker()
 
-    private(set) var totalAccesses: Int = 0
-    private(set) var cacheHits: Int = 0
-    private(set) var cacheMisses: Int = 0
-    private(set) var prefetchCount: Int = 0
-    private(set) var prefetchHits: Int = 0
-    private(set) var lastPagingLatencyMs: Double = 0.0
+    private var totalAccesses: Int = 0
+    private var cacheHits: Int = 0
+    private var cacheMisses: Int = 0
+    private var prefetchCount: Int = 0
+    private var prefetchHits: Int = 0
+    private var lastPagingLatencyMs: Double = 0.0
 
     var totalExpertKeysCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
         return expertSlices.count
     }
 
+    var residentExpertsCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return residentExperts.count
+    }
+
     var cacheHitRatePercent: Double {
+        lock.lock()
+        defer { lock.unlock() }
         guard totalAccesses > 0 else { return 100.0 }
         return (Double(cacheHits) / Double(totalAccesses)) * 100.0
     }
 
     var prefetchEfficiencyPercent: Double {
+        lock.lock()
+        defer { lock.unlock() }
         guard prefetchCount > 0 else { return 100.0 }
         return (Double(prefetchHits) / Double(prefetchCount)) * 100.0
     }
 
+    var currentPagingLatencyMs: Double {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastPagingLatencyMs
+    }
+
     func initialize(summary: ModelSummary, shardBuffers: [UInt32: MTLBuffer], mode: MemoryBudgetMode) {
+        lock.lock()
         expertSlices.removeAll()
         denseSlices.removeAll()
         residentExperts.removeAll()
@@ -301,6 +321,7 @@ final class WorkingSetManager {
                 denseSlices.append(slice)
             }
         }
+        lock.unlock()
 
         // Pin dense backbone immediately (Embeddings, Attn/QKV, RMSNorms, Routers, Shared Experts, LM Head)
         pinDenseBackbone(shardBuffers: shardBuffers)
@@ -311,7 +332,11 @@ final class WorkingSetManager {
     }
 
     func pinDenseBackbone(shardBuffers: [UInt32: MTLBuffer]) {
-        for slice in denseSlices {
+        lock.lock()
+        let slices = denseSlices
+        lock.unlock()
+
+        for slice in slices {
             if let buf = shardBuffers[slice.shardIndex] {
                 let ptr = buf.contents().advanced(by: Int(slice.offset))
                 madvise(ptr, Int(slice.length), MADV_WILLNEED)
@@ -325,9 +350,11 @@ final class WorkingSetManager {
                 madvise(buf.contents(), Int(shard.length), MADV_WILLNEED)
             }
         }
+        lock.lock()
         for key in expertSlices.keys {
             residentExperts.insert(key)
         }
+        lock.unlock()
     }
 
     func prefetchLayerBackbone(layer: CachedLayer, shardBuffers: [UInt32: MTLBuffer]) {
@@ -346,21 +373,27 @@ final class WorkingSetManager {
 
     func prefetchLayerExperts(layer: Int, expertIds: [Int], shardBuffers: [UInt32: MTLBuffer]) {
         guard !expertIds.isEmpty else { return }
-        prefetchQueue.async { [weak self] in
-            guard let self = self else { return }
-            for expId in expertIds {
-                let key = ExpertKey(layer: layer, expertId: expId)
-                if !self.residentExperts.contains(key) {
-                    self.prefetchedKeys.insert(key)
-                    self.prefetchCount += 1
-                }
-                if let slices = self.expertSlices[key] {
-                    for slice in slices {
-                        if let buf = shardBuffers[slice.shardIndex] {
-                            let ptr = buf.contents().advanced(by: Int(slice.offset))
-                            posix_madvise(ptr, Int(slice.length), POSIX_MADV_WILLNEED)
-                        }
-                    }
+        var slicesToPrefetch: [ExpertSlice] = []
+
+        lock.lock()
+        for expId in expertIds {
+            let key = ExpertKey(layer: layer, expertId: expId)
+            if !residentExperts.contains(key) {
+                prefetchedKeys.insert(key)
+                prefetchCount += 1
+            }
+            if let slices = expertSlices[key] {
+                slicesToPrefetch.append(contentsOf: slices)
+            }
+        }
+        lock.unlock()
+
+        guard !slicesToPrefetch.isEmpty else { return }
+        prefetchQueue.async {
+            for slice in slicesToPrefetch {
+                if let buf = shardBuffers[slice.shardIndex] {
+                    let ptr = buf.contents().advanced(by: Int(slice.offset))
+                    posix_madvise(ptr, Int(slice.length), POSIX_MADV_WILLNEED)
                 }
             }
         }
@@ -373,7 +406,10 @@ final class WorkingSetManager {
     func touchAndEvict(layer: Int, activeExpertIds: [Int], mode: MemoryBudgetMode, shardBuffers: [UInt32: MTLBuffer]) {
         let t0 = CFAbsoluteTimeGetCurrent()
         var pageFaulted = false
+        var demandSlices: [ExpertSlice] = []
+        var evictSlices: [ExpertSlice] = []
 
+        lock.lock()
         for expId in activeExpertIds {
             let key = ExpertKey(layer: layer, expertId: expId)
             totalAccesses += 1
@@ -395,12 +431,7 @@ final class WorkingSetManager {
 
                 // Demand page-in from SSD
                 if let slices = expertSlices[key] {
-                    for slice in slices {
-                        if let buf = shardBuffers[slice.shardIndex] {
-                            let ptr = buf.contents().advanced(by: Int(slice.offset))
-                            madvise(ptr, Int(slice.length), MADV_WILLNEED)
-                        }
-                    }
+                    demandSlices.append(contentsOf: slices)
                 }
             }
         }
@@ -417,18 +448,31 @@ final class WorkingSetManager {
                 residentExperts.remove(evictKey)
                 prefetchedKeys.remove(evictKey)
                 if let slices = expertSlices[evictKey] {
-                    for slice in slices {
-                        if let buf = shardBuffers[slice.shardIndex] {
-                            let ptr = buf.contents().advanced(by: Int(slice.offset))
-                            madvise(ptr, Int(slice.length), MADV_DONTNEED)
-                        }
-                    }
+                    evictSlices.append(contentsOf: slices)
                 }
+            }
+        }
+        lock.unlock()
+
+        for slice in demandSlices {
+            if let buf = shardBuffers[slice.shardIndex] {
+                let ptr = buf.contents().advanced(by: Int(slice.offset))
+                madvise(ptr, Int(slice.length), MADV_WILLNEED)
+            }
+        }
+
+        for slice in evictSlices {
+            if let buf = shardBuffers[slice.shardIndex] {
+                let ptr = buf.contents().advanced(by: Int(slice.offset))
+                madvise(ptr, Int(slice.length), MADV_DONTNEED)
             }
         }
 
         if pageFaulted {
-            lastPagingLatencyMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+            let lat = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+            lock.lock()
+            lastPagingLatencyMs = lat
+            lock.unlock()
         }
     }
 
@@ -436,32 +480,34 @@ final class WorkingSetManager {
         if mode == .unrestricted {
             preFaultAll(shardBuffers: shardBuffers, summary: summary)
         } else {
+            var evictSlices: [ExpertSlice] = []
+            lock.lock()
             let maxAllowed = mode.maxResidentExperts
             while residentExperts.count > maxAllowed, !lruList.isEmpty {
                 let evictKey = lruList.removeFirst()
                 residentExperts.remove(evictKey)
                 prefetchedKeys.remove(evictKey)
                 if let slices = expertSlices[evictKey] {
-                    for slice in slices {
-                        if let buf = shardBuffers[slice.shardIndex] {
-                            let ptr = buf.contents().advanced(by: Int(slice.offset))
-                            madvise(ptr, Int(slice.length), MADV_DONTNEED)
-                        }
-                    }
+                    evictSlices.append(contentsOf: slices)
+                }
+            }
+            lock.unlock()
+
+            for slice in evictSlices {
+                if let buf = shardBuffers[slice.shardIndex] {
+                    let ptr = buf.contents().advanced(by: Int(slice.offset))
+                    madvise(ptr, Int(slice.length), MADV_DONTNEED)
                 }
             }
         }
     }
 
     func flushAllExperts(shardBuffers: [UInt32: MTLBuffer]) {
+        var evictSlices: [ExpertSlice] = []
+        lock.lock()
         for key in residentExperts {
             if let slices = expertSlices[key] {
-                for slice in slices {
-                    if let buf = shardBuffers[slice.shardIndex] {
-                        let ptr = buf.contents().advanced(by: Int(slice.offset))
-                        madvise(ptr, Int(slice.length), MADV_DONTNEED)
-                    }
-                }
+                evictSlices.append(contentsOf: slices)
             }
         }
         residentExperts.removeAll()
@@ -474,6 +520,14 @@ final class WorkingSetManager {
         prefetchHits = 0
         totalAccesses = 0
         lastPagingLatencyMs = 0.0
+        lock.unlock()
+
+        for slice in evictSlices {
+            if let buf = shardBuffers[slice.shardIndex] {
+                let ptr = buf.contents().advanced(by: Int(slice.offset))
+                madvise(ptr, Int(slice.length), MADV_DONTNEED)
+            }
+        }
     }
 }
 
@@ -4623,11 +4677,11 @@ struct ContentView: View {
                 let tokPerSec = Double(tokensGenerated) / max(elapsedSec, 0.001)
                 let elapsedMs = elapsedSec * 1000.0
                 let currentRss = getProcessResidentMemoryGB()
-                let resCount = WorkingSetManager.shared.residentExperts.count
+                let resCount = WorkingSetManager.shared.residentExpertsCount
                 let totalExp = WorkingSetManager.shared.totalExpertKeysCount
                 let hitRate = WorkingSetManager.shared.cacheHitRatePercent
                 let prefetchEff = WorkingSetManager.shared.prefetchEfficiencyPercent
-                let pageLat = WorkingSetManager.shared.lastPagingLatencyMs
+                let pageLat = WorkingSetManager.shared.currentPagingLatencyMs
 
                 var updatedRaw = accumulatedDecodedText
                 var thinkPart = ""
@@ -4723,10 +4777,10 @@ struct ContentView: View {
             let finalTokPerSec = Double(tokensGenerated) / max(finalElapsedSec, 0.001)
             let finalElapsedMs = finalElapsedSec * 1000.0
             let finalRss = getProcessResidentMemoryGB()
-            let finalResCount = WorkingSetManager.shared.residentExperts.count
+            let finalResCount = WorkingSetManager.shared.residentExpertsCount
             let finalHitRate = WorkingSetManager.shared.cacheHitRatePercent
             let finalPrefetchEff = WorkingSetManager.shared.prefetchEfficiencyPercent
-            let finalPageLat = WorkingSetManager.shared.lastPagingLatencyMs
+            let finalPageLat = WorkingSetManager.shared.currentPagingLatencyMs
             let finalDecoded = accumulatedDecodedText.isEmpty ? ((try? tokenizer.decode(ids: generatedTokenIds)) ?? "") : accumulatedDecodedText
 
             var finalThink = ""
@@ -4814,10 +4868,10 @@ struct ContentView: View {
 
     private func updatePagingStats() {
         self.currentRssGB = getProcessResidentMemoryGB()
-        self.residentExpertCount = WorkingSetManager.shared.residentExperts.count
+        self.residentExpertCount = WorkingSetManager.shared.residentExpertsCount
         self.totalExpertCount = WorkingSetManager.shared.totalExpertKeysCount
         self.cacheHitRate = WorkingSetManager.shared.cacheHitRatePercent
-        self.lastPagingLatencyMs = WorkingSetManager.shared.lastPagingLatencyMs
+        self.lastPagingLatencyMs = WorkingSetManager.shared.currentPagingLatencyMs
     }
 
     private func applyMemoryBudget(_ mode: MemoryBudgetMode) {
