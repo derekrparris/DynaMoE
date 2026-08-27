@@ -55,10 +55,13 @@ struct SettingsSheetView: View {
     @Binding var memoryExecutionMode: MemoryExecutionMode
     @Binding var memoryBudgetMode: MemoryBudgetMode
     @Binding var kvCachePrecision: KVCachePrecision
+    @Binding var speculativePrefetchEnabled: Bool
+    @Binding var prefetchLookaheadDepth: Int
     var currentRssGB: Double
     var residentExpertCount: Int
     var totalExpertCount: Int
     var cacheHitRate: Double
+    var prefetchEfficiency: Double
     var lastPagingLatencyMs: Double
     var pagingStatusMessage: String?
     var onFlushCache: () -> Void
@@ -661,16 +664,47 @@ struct SettingsSheetView: View {
                         .foregroundColor(.secondary)
                 }
 
+                // Speculative Prefetching & Layer Lookahead
+                VStack(alignment: .leading, spacing: 8) {
+                    Toggle(isOn: $speculativePrefetchEnabled) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Speculative MoE Expert & Layer Prefetching")
+                                .font(.subheadline)
+                                .fontWeight(.semibold)
+                            Text("Asynchronously warms next-layer backbone weights and predicted expert slices in background before GPU execution.")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .toggleStyle(.switch)
+
+                    if speculativePrefetchEnabled {
+                        HStack {
+                            Text("Prefetch Lookahead Depth:")
+                                .font(.caption)
+                                .fontWeight(.medium)
+                            Spacer()
+                            Picker("Lookahead", selection: $prefetchLookaheadDepth) {
+                                Text("1 Layer").tag(1)
+                                Text("2 Layers").tag(2)
+                            }
+                            .pickerStyle(.segmented)
+                            .frame(maxWidth: 180)
+                        }
+                        .padding(.top, 2)
+                    }
+                }
+
                 Divider()
 
                 // Telemetry Metrics Grid
-                HStack(spacing: 16) {
+                HStack(spacing: 14) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("PHYSICAL RSS")
                             .font(.system(size: 9, weight: .bold))
                             .foregroundColor(.secondary)
                         Text(String(format: "%.2f GB", currentRssGB))
-                            .font(.system(.title3, design: .monospaced))
+                            .font(.system(.subheadline, design: .monospaced))
                             .fontWeight(.bold)
                             .foregroundColor(.indigo)
                     }
@@ -680,7 +714,7 @@ struct SettingsSheetView: View {
                             .font(.system(size: 9, weight: .bold))
                             .foregroundColor(.secondary)
                         Text("\(residentExpertCount) / \(totalExpertCount)")
-                            .font(.system(.title3, design: .monospaced))
+                            .font(.system(.subheadline, design: .monospaced))
                             .fontWeight(.bold)
                     }
 
@@ -689,9 +723,19 @@ struct SettingsSheetView: View {
                             .font(.system(size: 9, weight: .bold))
                             .foregroundColor(.secondary)
                         Text(String(format: "%.1f%%", cacheHitRate))
-                            .font(.system(.title3, design: .monospaced))
+                            .font(.system(.subheadline, design: .monospaced))
                             .fontWeight(.bold)
                             .foregroundColor(.green)
+                    }
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("PREFETCH EFFICIENCY")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundColor(.secondary)
+                        Text(String(format: "%.1f%%", prefetchEfficiency))
+                            .font(.system(.subheadline, design: .monospaced))
+                            .fontWeight(.bold)
+                            .foregroundColor(.purple)
                     }
                 }
 

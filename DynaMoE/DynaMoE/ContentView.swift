@@ -202,18 +202,61 @@ struct ExpertKey: Hashable {
     let expertId: Int
 }
 
+final class ExpertTransitionTracker {
+    // [sourceLayer: [sourceExpertId: [targetExpertId: count]]]
+    private var transitions: [Int: [Int: [Int: Int]]] = [:]
+    private let lock = NSLock()
+
+    func recordTransition(fromLayer: Int, fromExperts: [Int], toLayer: Int, toExperts: [Int]) {
+        guard !fromExperts.isEmpty && !toExperts.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        for src in fromExperts {
+            for dst in toExperts {
+                transitions[fromLayer, default: [:]][src, default: [:]][dst, default: 0] += 1
+            }
+        }
+    }
+
+    func predictNextExperts(currentLayer: Int, currentExperts: [Int], topN: Int) -> [Int] {
+        guard !currentExperts.isEmpty else { return [] }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let layerMap = transitions[currentLayer] else { return [] }
+        var scoreMap: [Int: Int] = [:]
+        for exp in currentExperts {
+            if let dstCounts = layerMap[exp] {
+                for (dst, count) in dstCounts {
+                    scoreMap[dst, default: 0] += count
+                }
+            }
+        }
+        return scoreMap.sorted(by: { $0.value > $1.value }).prefix(topN).map { $0.key }
+    }
+
+    func reset() {
+        lock.lock()
+        transitions.removeAll()
+        lock.unlock()
+    }
+}
+
 final class WorkingSetManager {
     static let shared = WorkingSetManager()
 
     private(set) var expertSlices: [ExpertKey: [ExpertSlice]] = [:]
     private(set) var denseSlices: [ExpertSlice] = []
     private(set) var residentExperts: Set<ExpertKey> = []
+    private(set) var prefetchedKeys: Set<ExpertKey> = []
     private var lruList: [ExpertKey] = []
     private let prefetchQueue = DispatchQueue(label: "com.dynamoe.prefetch", qos: .userInitiated)
+    public let transitionTracker = ExpertTransitionTracker()
 
     private(set) var totalAccesses: Int = 0
     private(set) var cacheHits: Int = 0
     private(set) var cacheMisses: Int = 0
+    private(set) var prefetchCount: Int = 0
+    private(set) var prefetchHits: Int = 0
     private(set) var lastPagingLatencyMs: Double = 0.0
 
     var totalExpertKeysCount: Int {
@@ -225,14 +268,23 @@ final class WorkingSetManager {
         return (Double(cacheHits) / Double(totalAccesses)) * 100.0
     }
 
+    var prefetchEfficiencyPercent: Double {
+        guard prefetchCount > 0 else { return 100.0 }
+        return (Double(prefetchHits) / Double(prefetchCount)) * 100.0
+    }
+
     func initialize(summary: ModelSummary, shardBuffers: [UInt32: MTLBuffer], mode: MemoryBudgetMode) {
         expertSlices.removeAll()
         denseSlices.removeAll()
         residentExperts.removeAll()
+        prefetchedKeys.removeAll()
         lruList.removeAll()
+        transitionTracker.reset()
         totalAccesses = 0
         cacheHits = 0
         cacheMisses = 0
+        prefetchCount = 0
+        prefetchHits = 0
         lastPagingLatencyMs = 0.0
 
         for tensor in summary.tensors {
@@ -278,31 +330,30 @@ final class WorkingSetManager {
         }
     }
 
-    func setBudgetMode(mode: MemoryBudgetMode, shardBuffers: [UInt32: MTLBuffer], summary: ModelSummary) {
-        if mode == .unrestricted {
-            preFaultAll(shardBuffers: shardBuffers, summary: summary)
-        } else {
-            let maxAllowed = mode.maxResidentExperts
-            while residentExperts.count > maxAllowed, !lruList.isEmpty {
-                let evictKey = lruList.removeFirst()
-                residentExperts.remove(evictKey)
-                if let slices = expertSlices[evictKey] {
-                    for slice in slices {
-                        if let buf = shardBuffers[slice.shardIndex] {
-                            let ptr = buf.contents().advanced(by: Int(slice.offset))
-                            madvise(ptr, Int(slice.length), MADV_DONTNEED)
-                        }
-                    }
+    func prefetchLayerBackbone(layer: CachedLayer, shardBuffers: [UInt32: MTLBuffer]) {
+        let tensors = layer.backboneTensors
+        guard !tensors.isEmpty else { return }
+        prefetchQueue.async {
+            for t in tensors {
+                if let buf = shardBuffers[t.shardIndex] {
+                    let ptr = buf.contents().advanced(by: Int(t.offsetStart))
+                    let len = Int(t.offsetEnd - t.offsetStart)
+                    posix_madvise(ptr, len, POSIX_MADV_WILLNEED)
                 }
             }
         }
     }
 
     func prefetchLayerExperts(layer: Int, expertIds: [Int], shardBuffers: [UInt32: MTLBuffer]) {
+        guard !expertIds.isEmpty else { return }
         prefetchQueue.async { [weak self] in
             guard let self = self else { return }
             for expId in expertIds {
                 let key = ExpertKey(layer: layer, expertId: expId)
+                if !self.residentExperts.contains(key) {
+                    self.prefetchedKeys.insert(key)
+                    self.prefetchCount += 1
+                }
                 if let slices = self.expertSlices[key] {
                     for slice in slices {
                         if let buf = shardBuffers[slice.shardIndex] {
@@ -313,6 +364,10 @@ final class WorkingSetManager {
                 }
             }
         }
+    }
+
+    func predictNextLayerExperts(currentLayer: Int, currentActiveExperts: [Int], topN: Int = 4) -> [Int] {
+        return transitionTracker.predictNextExperts(currentLayer: currentLayer, currentExperts: currentActiveExperts, topN: topN)
     }
 
     func touchAndEvict(layer: Int, activeExpertIds: [Int], mode: MemoryBudgetMode, shardBuffers: [UInt32: MTLBuffer]) {
@@ -330,6 +385,9 @@ final class WorkingSetManager {
                 }
                 lruList.append(key)
             } else {
+                if prefetchedKeys.contains(key) {
+                    prefetchHits += 1
+                }
                 cacheMisses += 1
                 pageFaulted = true
                 residentExperts.insert(key)
@@ -357,6 +415,7 @@ final class WorkingSetManager {
                     break
                 }
                 residentExperts.remove(evictKey)
+                prefetchedKeys.remove(evictKey)
                 if let slices = expertSlices[evictKey] {
                     for slice in slices {
                         if let buf = shardBuffers[slice.shardIndex] {
@@ -373,6 +432,27 @@ final class WorkingSetManager {
         }
     }
 
+    func setBudgetMode(mode: MemoryBudgetMode, shardBuffers: [UInt32: MTLBuffer], summary: ModelSummary) {
+        if mode == .unrestricted {
+            preFaultAll(shardBuffers: shardBuffers, summary: summary)
+        } else {
+            let maxAllowed = mode.maxResidentExperts
+            while residentExperts.count > maxAllowed, !lruList.isEmpty {
+                let evictKey = lruList.removeFirst()
+                residentExperts.remove(evictKey)
+                prefetchedKeys.remove(evictKey)
+                if let slices = expertSlices[evictKey] {
+                    for slice in slices {
+                        if let buf = shardBuffers[slice.shardIndex] {
+                            let ptr = buf.contents().advanced(by: Int(slice.offset))
+                            madvise(ptr, Int(slice.length), MADV_DONTNEED)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     func flushAllExperts(shardBuffers: [UInt32: MTLBuffer]) {
         for key in residentExperts {
             if let slices = expertSlices[key] {
@@ -385,9 +465,13 @@ final class WorkingSetManager {
             }
         }
         residentExperts.removeAll()
+        prefetchedKeys.removeAll()
         lruList.removeAll()
+        transitionTracker.reset()
         cacheHits = 0
         cacheMisses = 0
+        prefetchCount = 0
+        prefetchHits = 0
         totalAccesses = 0
         lastPagingLatencyMs = 0.0
     }
@@ -478,6 +562,8 @@ struct ContentView: View {
     @State private var memoryExecutionMode: MemoryExecutionMode = .autoDetect
     @State private var memoryBudgetMode: MemoryBudgetMode = .balanced16GB
     @AppStorage("dynamoe_kv_cache_precision") private var kvCachePrecisionRaw: String = KVCachePrecision.fp16.rawValue
+    @AppStorage("dynamoe_speculative_prefetch_enabled") private var speculativePrefetchEnabled: Bool = true
+    @AppStorage("dynamoe_prefetch_lookahead_depth") private var prefetchLookaheadDepth: Int = 1
 
     var kvCachePrecisionBinding: Binding<KVCachePrecision> {
         Binding(
@@ -495,6 +581,7 @@ struct ContentView: View {
     @State private var residentExpertCount: Int = 0
     @State private var totalExpertCount: Int = 0
     @State private var cacheHitRate: Double = 100.0
+    @State private var prefetchEfficiency: Double = 100.0
     @State private var lastPagingLatencyMs: Double = 0.0
     @State private var pagingStatusMessage: String? = nil
 
@@ -718,10 +805,13 @@ struct ContentView: View {
                 memoryExecutionMode: $memoryExecutionMode,
                 memoryBudgetMode: $memoryBudgetMode,
                 kvCachePrecision: kvCachePrecisionBinding,
+                speculativePrefetchEnabled: $speculativePrefetchEnabled,
+                prefetchLookaheadDepth: $prefetchLookaheadDepth,
                 currentRssGB: currentRssGB,
                 residentExpertCount: residentExpertCount,
                 totalExpertCount: totalExpertCount,
                 cacheHitRate: cacheHitRate,
+                prefetchEfficiency: prefetchEfficiency,
                 lastPagingLatencyMs: lastPagingLatencyMs,
                 pagingStatusMessage: pagingStatusMessage,
                 onFlushCache: { flushExpertCache() },
@@ -2053,9 +2143,11 @@ struct ContentView: View {
                 let activeIds = activeExperts.map { $0.id }
                 WorkingSetManager.shared.touchAndEvict(layer: l, activeExpertIds: activeIds, mode: memoryBudgetMode, shardBuffers: shardBuffers)
 
-                // Async Lookahead Prefetching for layer l + 1
+                // Async Lookahead Speculative Prefetching for layer l + 1
                 if l + 1 < actualLayers {
-                    WorkingSetManager.shared.prefetchLayerExperts(layer: l + 1, expertIds: [0, 1, 2, 3, 4, 5, 6, 7], shardBuffers: shardBuffers)
+                    let predicted = WorkingSetManager.shared.predictNextLayerExperts(currentLayer: l, currentActiveExperts: activeIds, topN: 8)
+                    let prefetchIds = predicted.isEmpty ? [0, 1, 2, 3, 4, 5, 6, 7] : predicted
+                    WorkingSetManager.shared.prefetchLayerExperts(layer: l + 1, expertIds: prefetchIds, shardBuffers: shardBuffers)
                 }
 
                 for expert in activeExperts {
@@ -3531,6 +3623,7 @@ struct ContentView: View {
             }
 
             // Helper for Single Token Forward Pass
+            var previousLayerActiveExperts: [Int: [Int]] = [:]
             func runTokenForward(tokenId: UInt32, step: UInt32, computeLogits: Bool, wait: Bool = true) -> Bool {
                 let singleTokenPtr = singleTokenBuffer.contents().bindMemory(to: UInt32.self, capacity: 1)
                 singleTokenPtr[0] = tokenId
@@ -3548,8 +3641,14 @@ struct ContentView: View {
                         if Task.isCancelled { return false }
                         let layer = cachedLayers[l]
 
-                        if l + 1 < actualLayers {
-                            WorkingSetManager.shared.prefetchLayerExperts(layer: l + 1, expertIds: [0, 1, 2, 3, 4, 5, 6, 7], shardBuffers: buffers)
+                        // Asynchronous Layer Lookahead Backbone Prefetching
+                        if speculativePrefetchEnabled {
+                            let nextL = (l + 1) < actualLayers ? (l + 1) : 0
+                            WorkingSetManager.shared.prefetchLayerBackbone(layer: cachedLayers[nextL], shardBuffers: buffers)
+                            if prefetchLookaheadDepth >= 2 {
+                                let nextNextL = (l + 2) < actualLayers ? (l + 2) : ((l + 2) % actualLayers)
+                                WorkingSetManager.shared.prefetchLayerBackbone(layer: cachedLayers[nextNextL], shardBuffers: buffers)
+                            }
                         }
 
                         // --- Phase A: Attention & Routing Sub-Block ---
@@ -4208,6 +4307,23 @@ struct ContentView: View {
                             }
 
                             let activeIds = activeExperts.map { $0.id }
+                            if speculativePrefetchEnabled {
+                                // 1. Early prefetch for current active experts
+                                WorkingSetManager.shared.prefetchLayerExperts(layer: l, expertIds: activeIds, shardBuffers: buffers)
+
+                                // 2. Transition correlation tracking
+                                if l > 0, let prevIds = previousLayerActiveExperts[l - 1] {
+                                    WorkingSetManager.shared.transitionTracker.recordTransition(fromLayer: l - 1, fromExperts: prevIds, toLayer: l, toExperts: activeIds)
+                                }
+                                previousLayerActiveExperts[l] = activeIds
+
+                                // 3. Speculatively prefetch layer l + 1 experts based on Markov transition prediction
+                                if l + 1 < actualLayers {
+                                    let predicted = WorkingSetManager.shared.predictNextLayerExperts(currentLayer: l, currentActiveExperts: activeIds, topN: 8)
+                                    let prefetchIds = predicted.isEmpty ? [0, 1, 2, 3, 4, 5, 6, 7] : predicted
+                                    WorkingSetManager.shared.prefetchLayerExperts(layer: l + 1, expertIds: prefetchIds, shardBuffers: buffers)
+                                }
+                            }
                             WorkingSetManager.shared.touchAndEvict(layer: l, activeExpertIds: activeIds, mode: budgetMode, shardBuffers: buffers)
 
                             guard let moeCmd = commandQueue.makeCommandBuffer(),
@@ -4453,6 +4569,7 @@ struct ContentView: View {
                 let resCount = WorkingSetManager.shared.residentExperts.count
                 let totalExp = WorkingSetManager.shared.totalExpertKeysCount
                 let hitRate = WorkingSetManager.shared.cacheHitRatePercent
+                let prefetchEff = WorkingSetManager.shared.prefetchEfficiencyPercent
                 let pageLat = WorkingSetManager.shared.lastPagingLatencyMs
 
                 var updatedRaw = accumulatedDecodedText
@@ -4526,6 +4643,7 @@ struct ContentView: View {
                         self.residentExpertCount = resCount
                         self.totalExpertCount = totalExp
                         self.cacheHitRate = hitRate
+                        self.prefetchEfficiency = prefetchEff
                         self.lastPagingLatencyMs = pageLat
 
                         if let sId = sessionId, let mId = messageId {
@@ -4550,6 +4668,7 @@ struct ContentView: View {
             let finalRss = getProcessResidentMemoryGB()
             let finalResCount = WorkingSetManager.shared.residentExperts.count
             let finalHitRate = WorkingSetManager.shared.cacheHitRatePercent
+            let finalPrefetchEff = WorkingSetManager.shared.prefetchEfficiencyPercent
             let finalPageLat = WorkingSetManager.shared.lastPagingLatencyMs
             let finalDecoded = accumulatedDecodedText.isEmpty ? ((try? tokenizer.decode(ids: generatedTokenIds)) ?? "") : accumulatedDecodedText
 
@@ -4617,6 +4736,7 @@ struct ContentView: View {
                 self.currentRssGB = finalRss
                 self.residentExpertCount = finalResCount
                 self.cacheHitRate = finalHitRate
+                self.prefetchEfficiency = finalPrefetchEff
                 self.lastPagingLatencyMs = finalPageLat
 
                 if let sId = sessionId, let mId = messageId {

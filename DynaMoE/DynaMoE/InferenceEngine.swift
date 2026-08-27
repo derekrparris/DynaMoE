@@ -568,6 +568,40 @@ extension EngineCachedLayer {
     public var isFullAttention: Bool {
         return attentionType == .fullAttention
     }
+
+    public var backboneTensors: [TensorMetadata] {
+        var list: [TensorMetadata] = []
+        let candidates: [TensorMetadata?] = [
+            norm1Tensor, norm2Tensor,
+            denseGateWeight, denseGateScale, denseGateBias,
+            denseUpWeight, denseUpScale, denseUpBias,
+            denseDownWeight, denseDownScale, denseDownBias,
+            routerTensor, routerScale, routerBias,
+            sharedGateTensor, sharedGateTensorScale, sharedGateTensorBias,
+            qProjTensor, qScaleTensor, qBiasTensor,
+            kProjTensor, kScaleTensor, kBiasTensor,
+            vProjTensor, vScaleTensor, vBiasTensor,
+            qNormTensor, kNormTensor,
+            oProjTensor, oScaleTensor, oBiasTensor,
+            inProjQKV, inProjQKVScale, inProjQKVBias,
+            conv1dTensor,
+            inProjZ, inProjZScale, inProjZBias,
+            inProjA, inProjAScale, inProjABias,
+            inProjB, inProjBScale, inProjBBias,
+            aLogTensor, dtBiasTensor, linearNormTensor,
+            linearOutProjTensor, linearOutProjScale, linearOutProjBias,
+            sharedGateWeight, sharedGateScale, sharedGateBias,
+            sharedUpWeight, sharedUpScale, sharedUpBias,
+            sharedDownWeight, sharedDownScale, sharedDownBias
+        ]
+        for c in candidates {
+            if let t = c {
+                list.append(t)
+            }
+        }
+        return list
+    }
 }
 
 public typealias CachedLayer = EngineCachedLayer
+
