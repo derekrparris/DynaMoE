@@ -594,7 +594,7 @@ struct ContentView: View {
     @State private var isExecutingLMHead: Bool = false
 
     // Autoregressive Text Generation State
-    @State private var temperature: Float = 0.7
+    @State private var temperature: Float = 0.0
     @State private var topP: Float = 0.9
     @State private var minP: Float = 0.05
     @State private var topK: Int = 50

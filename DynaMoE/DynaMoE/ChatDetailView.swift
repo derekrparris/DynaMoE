@@ -155,16 +155,27 @@ struct ChatDetailView: View {
                     .padding(.horizontal, 24)
                     .frame(maxWidth: .infinity)
                 }
-                .onChange(of: session?.messages.last?.content) { _ in
+                .onChange(of: session?.id) { _ in
                     if let lastId = session?.messages.last?.id {
-                        withAnimation(.easeOut(duration: 0.15)) {
+                        DispatchQueue.main.async {
                             proxy.scrollTo(lastId, anchor: .bottom)
                         }
                     }
                 }
-                .onChange(of: session?.messages.last?.thinkingContent) { _ in
+                .onChange(of: session?.messages.count) { _ in
                     if let lastId = session?.messages.last?.id {
-                        proxy.scrollTo(lastId, anchor: .bottom)
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            proxy.scrollTo(lastId, anchor: .bottom)
+                        }
+                    }
+                }
+                .onChange(of: isGenerating) { generating in
+                    if !generating {
+                        if let lastId = session?.messages.last?.id {
+                            withAnimation(.easeOut(duration: 0.25)) {
+                                proxy.scrollTo(lastId, anchor: .bottom)
+                            }
+                        }
                     }
                 }
             }
