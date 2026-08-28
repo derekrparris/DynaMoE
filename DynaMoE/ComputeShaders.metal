@@ -491,6 +491,103 @@ kernel void moe_shared_gate_bf16(
     outSharedWeight[tokenIdx] = sig;
 }
 
+/// MSL Kernel: Computes Sigmoid activation for the Shared Expert Gate with Q4 weights
+kernel void moe_shared_gate_q4(
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const uchar* rawScaleBuffer [[buffer(1)]],
+    device const uchar* rawBiasBuffer [[buffer(2)]],
+    device const float* inputHiddenState [[buffer(3)]],
+    device float* outSharedWeight [[buffer(4)]],
+    constant uint64_t& gateWeightOffset [[buffer(5)]],
+    constant uint64_t& scaleOffset [[buffer(6)]],
+    constant uint64_t& biasOffset [[buffer(7)]],
+    constant uint32_t& hiddenDim [[buffer(8)]],
+    constant uint32_t& groupSize [[buffer(9)]],
+    uint tokenIdx [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (tid != 0) return;
+    
+    device const uchar* wRow = rawWeightBuffer + gateWeightOffset;
+    device const uchar* sRow = rawScaleBuffer + scaleOffset;
+    device const uchar* bRow = rawBiasBuffer + biasOffset;
+    device const float* tokenH = inputHiddenState + (tokenIdx * hiddenDim);
+    
+    float sum = 0.0f;
+    uint32_t numU32 = hiddenDim / 8;
+    for (uint32_t i = 0; i < numU32; i++) {
+        uint32_t col = i * 8;
+        uint32_t gIdx = col / groupSize;
+        float scale = read_bf16_unaligned(sRow + gIdx * 2);
+        float bias = read_bf16_unaligned(bRow + gIdx * 2);
+        uint32_t u32 = read_u32_unaligned(wRow + i * 4);
+        
+        float x0 = tokenH[col + 0]; float x1 = tokenH[col + 1];
+        float x2 = tokenH[col + 2]; float x3 = tokenH[col + 3];
+        float x4 = tokenH[col + 4]; float x5 = tokenH[col + 5];
+        float x6 = tokenH[col + 6]; float x7 = tokenH[col + 7];
+        float xSum = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
+        
+        float w0 = float(u32 & 0x0F);
+        float w1 = float((u32 >> 4) & 0x0F);
+        float w2 = float((u32 >> 8) & 0x0F);
+        float w3 = float((u32 >> 12) & 0x0F);
+        float w4 = float((u32 >> 16) & 0x0F);
+        float w5 = float((u32 >> 20) & 0x0F);
+        float w6 = float((u32 >> 24) & 0x0F);
+        float w7 = float((u32 >> 28) & 0x0F);
+        
+        float dot = (w0 * x0) + (w1 * x1) + (w2 * x2) + (w3 * x3) +
+                    (w4 * x4) + (w5 * x5) + (w6 * x6) + (w7 * x7);
+        sum += (scale * dot) + (bias * xSum);
+    }
+    
+    outSharedWeight[tokenIdx] = 1.0f / (1.0f + exp(-sum));
+}
+
+/// MSL Kernel: Computes Sigmoid activation for the Shared Expert Gate with Q8 weights
+kernel void moe_shared_gate_q8(
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const uchar* rawScaleBuffer [[buffer(1)]],
+    device const uchar* rawBiasBuffer [[buffer(2)]],
+    device const float* inputHiddenState [[buffer(3)]],
+    device float* outSharedWeight [[buffer(4)]],
+    constant uint64_t& gateWeightOffset [[buffer(5)]],
+    constant uint64_t& scaleOffset [[buffer(6)]],
+    constant uint64_t& biasOffset [[buffer(7)]],
+    constant uint32_t& hiddenDim [[buffer(8)]],
+    constant uint32_t& groupSize [[buffer(9)]],
+    uint tokenIdx [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (tid != 0) return;
+    
+    device const uchar* wRow = rawWeightBuffer + gateWeightOffset;
+    device const uchar* sRow = rawScaleBuffer + scaleOffset;
+    device const uchar* bRow = rawBiasBuffer + biasOffset;
+    device const float* tokenH = inputHiddenState + (tokenIdx * hiddenDim);
+    
+    float sum = 0.0f;
+    uint32_t numGroups = hiddenDim / groupSize;
+    for (uint32_t g = 0; g < numGroups; g++) {
+        float scale = read_bf16_unaligned(sRow + g * 2);
+        float bias = read_bf16_unaligned(bRow + g * 2);
+        uint32_t colStart = g * groupSize;
+        float groupSum = 0.0f;
+        float groupXSum = 0.0f;
+        for (uint32_t c = 0; c < groupSize; c++) {
+            uint32_t col = colStart + c;
+            float x = tokenH[col];
+            float w8 = float(wRow[col]);
+            groupSum += w8 * x;
+            groupXSum += x;
+        }
+        sum += (scale * groupSum) + (bias * groupXSum);
+    }
+    
+    outSharedWeight[tokenIdx] = 1.0f / (1.0f + exp(-sum));
+}
+
 /// MSL Kernel: Zeros a float buffer in GPU memory
 kernel void clear_vector_f32(
     device float* buffer [[buffer(0)]],
