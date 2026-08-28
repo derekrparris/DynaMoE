@@ -68,10 +68,28 @@ struct SettingsSheetView: View {
     var onPreFaultAll: () -> Void
 
     // Advanced Diagnostics bindings & callbacks
-    var filteredTensors: [TensorMetadata]
     @Binding var searchText: String
     @Binding var selectedCategory: String
     var categoryFilters: [String]
+
+    private var filteredTensors: [TensorMetadata] {
+        guard let tensors = summary?.tensors else { return [] }
+        if searchText.isEmpty && selectedCategory == "All" {
+            return Array(tensors.prefix(100))
+        }
+        var matches: [TensorMetadata] = []
+        for tensor in tensors {
+            let matchesSearch = searchText.isEmpty || tensor.name.localizedCaseInsensitiveContains(searchText)
+            let matchesCategory = (selectedCategory == "All") || tensor.category.contains(selectedCategory)
+            if matchesSearch && matchesCategory {
+                matches.append(tensor)
+                if matches.count >= 100 {
+                    break
+                }
+            }
+        }
+        return matches
+    }
     @Binding var selectedTensorID: String?
     var selectedTensor: TensorMetadata?
     var onExecuteMoERouter: (Int) -> Void

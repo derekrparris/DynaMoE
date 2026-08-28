@@ -653,7 +653,9 @@ impl DynaMoeEngine {
             }
         }
 
-        tensor_list.sort_by(|a, b| a.name.cmp(&b.name));
+        if tensor_list.len() <= 2000 {
+            tensor_list.sort_by(|a, b| a.name.cmp(&b.name));
+        }
 
         let layer_summaries: Vec<LayerSummary> = layer_map
             .into_iter()

@@ -618,5 +618,39 @@ extension EngineCachedLayer {
     }
 }
 
+// MARK: - Expert Staging Buffers & Memory Pinning
+extension InferenceEngine {
+    public struct ExpertStagingBuffers {
+        public let bufferA: MTLBuffer
+        public let bufferB: MTLBuffer
+        public let maxK: Int
+        public let expertSizeBytes: Int
+
+        public func bufferForSlot(_ slot: Int) -> MTLBuffer {
+            return (slot % 2 == 0) ? bufferA : bufferB
+        }
+    }
+
+    /// Allocates pre-allocated Metal shared memory staging pools for double-buffered expert streaming
+    public func allocateStagingBuffers(device: MTLDevice, maxK: Int = 8, expertSizeBytes: Int = 2 * 1024 * 1024) -> ExpertStagingBuffers? {
+        let totalBytes = maxK * expertSizeBytes
+        guard let bufA = device.makeBuffer(length: totalBytes, options: .storageModeShared),
+              let bufB = device.makeBuffer(length: totalBytes, options: .storageModeShared) else {
+            return nil
+        }
+        return ExpertStagingBuffers(bufferA: bufA, bufferB: bufB, maxK: maxK, expertSizeBytes: expertSizeBytes)
+    }
+
+    /// Advises kernel to lock/keep non-expert backbone buffer resident in RAM
+    public func pinBackboneBuffer(_ buffer: MTLBuffer) {
+        let ptr = buffer.contents()
+        let len = buffer.length
+        #if os(macOS)
+        _ = posix_madvise(ptr, len, POSIX_MADV_WILLNEED)
+        #endif
+    }
+}
+
 public typealias CachedLayer = EngineCachedLayer
+
 

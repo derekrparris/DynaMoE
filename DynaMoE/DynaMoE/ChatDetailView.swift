@@ -456,11 +456,20 @@ struct MacTextEditor: NSViewRepresentable {
         textView.isRichText = false
         textView.drawsBackground = false
         textView.allowsUndo = true
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainerInset = NSSize(width: 0, height: 4)
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
 
         scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
         scrollView.drawsBackground = false
+        scrollView.autohidesScrollers = true
         return scrollView
     }
 

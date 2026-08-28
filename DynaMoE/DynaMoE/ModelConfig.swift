@@ -383,9 +383,11 @@ public struct ModelConfig: Codable {
         let isNanbeige = nameLower.contains("nanbeige") ||
                          typeStr.contains("nanbeige") ||
                          archStr.contains("nanbeige") ||
-                         (summary?.layerCount == 22 && summary?.maxExpertId == 0) ||
-                         (summary?.tensors.contains(where: { $0.name.contains("dense_gate_up_proj") }) == true) ||
-                         (summary?.tensors.contains(where: { $0.name.hasPrefix("model.layers.0.mlp.gate_proj") }) == true && summary?.layerCount == 22)
+                         (summary?.maxExpertId == 0 && (
+                            summary?.layerCount == 22 ||
+                            (summary?.tensors.contains(where: { $0.name.contains("dense_gate_up_proj") }) == true) ||
+                            (summary?.tensors.contains(where: { $0.name.hasPrefix("model.layers.0.mlp.gate_proj") }) == true && summary?.layerCount == 22)
+                         ))
 
         if isNanbeige {
             return "你是南北阁，一款由BOSS直聘自主研发并训练的专业大语言模型。"
@@ -478,12 +480,11 @@ public struct ModelConfig: Codable {
         if nameLower.contains("think") || pathLower.contains("think") {
             return true
         }
-        // Inspect model directory files if path provided
+        // Inspect small config files if path provided
         if let path = modelPath, !path.isEmpty {
             let fileMgr = FileManager.default
             let dirUrl = URL(fileURLWithPath: path)
-            let filesToCheck = ["tokenizer_config.json", "chat_template.jinja", "tokenizer.json"]
-            for fName in filesToCheck {
+            for fName in ["chat_template.jinja", "tokenizer_config.json"] {
                 let fUrl = dirUrl.appendingPathComponent(fName)
                 if fileMgr.fileExists(atPath: fUrl.path), let content = try? String(contentsOf: fUrl, encoding: .utf8) {
                     if content.contains("<think>") || content.contains("enable_thinking") || content.contains("<|thought|>") || content.contains("reasoning_content") {
@@ -492,9 +493,11 @@ public struct ModelConfig: Codable {
                 }
             }
         }
-        if (summary?.layerCount == 22 && summary?.maxExpertId == 0) ||
-           (summary?.tensors.contains(where: { $0.name.contains("dense_gate_up_proj") }) == true) ||
-           (summary?.tensors.contains(where: { $0.name.hasPrefix("model.layers.0.mlp.gate_proj") }) == true && summary?.layerCount == 22) {
+        if summary?.maxExpertId == 0 && (
+            summary?.layerCount == 22 ||
+            (summary?.tensors.contains(where: { $0.name.contains("dense_gate_up_proj") }) == true) ||
+            (summary?.tensors.contains(where: { $0.name.hasPrefix("model.layers.0.mlp.gate_proj") }) == true && summary?.layerCount == 22)
+        ) {
             return true
         }
         return false

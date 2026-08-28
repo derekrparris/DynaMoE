@@ -649,6 +649,11 @@ final class DynaMoETests: XCTestCase {
         let intermediateDim = 512
         let vocabSize = 248320
 
+        let expertSize = 1769472
+        let pool = ExpertIOThreadPool.shared
+        pool.initialize(numThreads: 8)
+        let packedExpertsDir = URL(fileURLWithPath: snapshotDir).appendingPathComponent("packed_experts")
+
         guard let hStateBufA = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared),
               let hStateBufB = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared),
               let xNorm0Buf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared),
@@ -656,7 +661,8 @@ final class DynaMoETests: XCTestCase {
               let rIdxBuf = device.makeBuffer(length: 8 * MemoryLayout<UInt32>.stride, options: .storageModeShared),
               let rWBuf = device.makeBuffer(length: 8 * MemoryLayout<Float>.stride, options: .storageModeShared),
               let interBuf = device.makeBuffer(length: intermediateDim * MemoryLayout<Float>.stride, options: .storageModeShared),
-              let hMlpBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+              let hMlpBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let stagingBuf = device.makeBuffer(length: 8 * expertSize, options: .storageModeShared) else {
             XCTFail("Failed to allocate scratch buffers")
             return
         }
@@ -673,6 +679,7 @@ final class DynaMoETests: XCTestCase {
             var totalAttnMs: Double = 0
             var totalRouterWaitMs: Double = 0
             var totalMoEMs: Double = 0
+            var totalIoMs: Double = 0
 
             for l in 0..<cachedLayers.count {
                 let layer = cachedLayers[l]
@@ -769,68 +776,75 @@ final class DynaMoETests: XCTestCase {
                     activeExp.append((id: Int(indPtr[i]), w: wPtr[i]))
                 }
 
+                // 1. Parallel pread the 8 active experts into staging buffer
+                guard let fd = pool.getOrOpenLayerFD(layerIndex: l, packedExpertsDir: packedExpertsDir) else {
+                    continue
+                }
+                var tasks: [ExpertPreadTask] = []
+                let rawStagingPtr = stagingBuf.contents()
+                for (slot, exp) in activeExp.enumerated() {
+                    let offset = off_t(exp.id * expertSize)
+                    let dst = rawStagingPtr.advanced(by: slot * expertSize)
+                    tasks.append(ExpertPreadTask(fd: fd, dst: dst, offset: offset, size: expertSize))
+                }
+                let tIo0 = CFAbsoluteTimeGetCurrent()
+                pool.dispatchSync(tasks: &tasks)
+                let tIoElapsed = (CFAbsoluteTimeGetCurrent() - tIo0) * 1000.0
+                totalIoMs += tIoElapsed
+
+                // 2. GPU Compute on Staged Expert Buffers
                 guard let cmdB = cmdQueue.makeCommandBuffer(), let encB = cmdB.makeComputeCommandEncoder() else { break }
 
                 if let clearPipe = inference.clearPipeline {
-                    var hDimU: UInt32 = UInt32(hiddenDim)
                     encB.setComputePipelineState(clearPipe)
                     encB.setBuffer(hMlpBuf, offset: 0, index: 0)
                     encB.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, clearPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                 }
 
-                for exp in activeExp {
-                    let expId = exp.id
+                for (slot, exp) in activeExp.enumerated() {
                     let pk = exp.w
-                    if let gateW = layer.expertGateWeights[expId],
-                       let upW = layer.expertUpWeights[expId],
-                       let downW = layer.expertDownWeights[expId],
-                       let gRaw = buffers[gateW.shardIndex],
-                       let uRaw = buffers[upW.shardIndex],
-                       let dRaw = buffers[downW.shardIndex],
-                       let gateS = layer.expertGateScales[expId],
-                       let gateB = layer.expertGateBiases[expId],
-                       let upS = layer.expertUpScales[expId],
-                       let upB = layer.expertUpBiases[expId],
-                       let downS = layer.expertDownScales[expId],
-                       let downB = layer.expertDownBiases[expId],
-                       let gSRaw = buffers[gateS.shardIndex],
-                       let gBRaw = buffers[gateB.shardIndex],
-                       let uSRaw = buffers[upS.shardIndex],
-                       let uBRaw = buffers[upB.shardIndex],
-                       let dSRaw = buffers[downS.shardIndex],
-                       let dBRaw = buffers[downB.shardIndex],
-                       let q4GatePipe = inference.q4GateUpPipeline,
-                       let q4DownPipe = inference.q4DownPipeline {
+                    let slotOffset = UInt64(slot * expertSize)
+                    let gWOff = slotOffset + 0
+                    let gSOff = slotOffset + 524288
+                    let gBOff = slotOffset + 557056
+                    let uWOff = slotOffset + 589824
+                    let uSOff = slotOffset + 1114112
+                    let uBOff = slotOffset + 1146880
+                    let dWOff = slotOffset + 1179648
+                    let dSOff = slotOffset + 1703936
+                    let dBOff = slotOffset + 1736704
 
-                        var gWOff = gateW.offsetStart
-                        var gSOff = gateS.offsetStart
-                        var gBOff = gateB.offsetStart
-                        var uWOff = upW.offsetStart
-                        var uSOff = upS.offsetStart
-                        var uBOff = upB.offsetStart
-                        var dWOff = downW.offsetStart
-                        var dSOff = downS.offsetStart
-                        var dBOff = downB.offsetStart
+                    if let q4GatePipe = inference.q4GateUpPipeline,
+                       let q4DownPipe = inference.q4DownPipeline {
+                        var gWOffU = gWOff
+                        var gSOffU = gSOff
+                        var gBOffU = gBOff
+                        var uWOffU = uWOff
+                        var uSOffU = uSOff
+                        var uBOffU = uBOff
+                        var dWOffU = dWOff
+                        var dSOffU = dSOff
+                        var dBOffU = dBOff
                         var hDimVal: UInt32 = UInt32(hiddenDim)
                         var interDimVal: UInt32 = UInt32(intermediateDim)
                         var grp: UInt32 = 64
                         var pkVal = pk
 
                         encB.setComputePipelineState(q4GatePipe)
-                        encB.setBuffer(gRaw, offset: 0, index: 0)
-                        encB.setBuffer(gSRaw, offset: 0, index: 1)
-                        encB.setBuffer(gBRaw, offset: 0, index: 2)
-                        encB.setBuffer(uRaw, offset: 0, index: 3)
-                        encB.setBuffer(uSRaw, offset: 0, index: 4)
-                        encB.setBuffer(uBRaw, offset: 0, index: 5)
+                        encB.setBuffer(stagingBuf, offset: 0, index: 0)
+                        encB.setBuffer(stagingBuf, offset: 0, index: 1)
+                        encB.setBuffer(stagingBuf, offset: 0, index: 2)
+                        encB.setBuffer(stagingBuf, offset: 0, index: 3)
+                        encB.setBuffer(stagingBuf, offset: 0, index: 4)
+                        encB.setBuffer(stagingBuf, offset: 0, index: 5)
                         encB.setBuffer(xNorm1Buf, offset: 0, index: 6)
                         encB.setBuffer(interBuf, offset: 0, index: 7)
-                        encB.setBytes(&gWOff, length: 8, index: 8)
-                        encB.setBytes(&gSOff, length: 8, index: 9)
-                        encB.setBytes(&gBOff, length: 8, index: 10)
-                        encB.setBytes(&uWOff, length: 8, index: 11)
-                        encB.setBytes(&uSOff, length: 8, index: 12)
-                        encB.setBytes(&uBOff, length: 8, index: 13)
+                        encB.setBytes(&gWOffU, length: 8, index: 8)
+                        encB.setBytes(&gSOffU, length: 8, index: 9)
+                        encB.setBytes(&gBOffU, length: 8, index: 10)
+                        encB.setBytes(&uWOffU, length: 8, index: 11)
+                        encB.setBytes(&uSOffU, length: 8, index: 12)
+                        encB.setBytes(&uBOffU, length: 8, index: 13)
                         encB.setBytes(&hDimVal, length: 4, index: 14)
                         encB.setBytes(&interDimVal, length: 4, index: 15)
                         encB.setBytes(&grp, length: 4, index: 16)
@@ -838,14 +852,14 @@ final class DynaMoETests: XCTestCase {
                         encB.memoryBarrier(scope: .buffers)
 
                         encB.setComputePipelineState(q4DownPipe)
-                        encB.setBuffer(dRaw, offset: 0, index: 0)
-                        encB.setBuffer(dSRaw, offset: 0, index: 1)
-                        encB.setBuffer(dBRaw, offset: 0, index: 2)
+                        encB.setBuffer(stagingBuf, offset: 0, index: 0)
+                        encB.setBuffer(stagingBuf, offset: 0, index: 1)
+                        encB.setBuffer(stagingBuf, offset: 0, index: 2)
                         encB.setBuffer(interBuf, offset: 0, index: 3)
                         encB.setBuffer(hMlpBuf, offset: 0, index: 4)
-                        encB.setBytes(&dWOff, length: 8, index: 5)
-                        encB.setBytes(&dSOff, length: 8, index: 6)
-                        encB.setBytes(&dBOff, length: 8, index: 7)
+                        encB.setBytes(&dWOffU, length: 8, index: 5)
+                        encB.setBytes(&dSOffU, length: 8, index: 6)
+                        encB.setBytes(&dBOffU, length: 8, index: 7)
                         encB.setBytes(&interDimVal, length: 4, index: 8)
                         encB.setBytes(&hDimVal, length: 4, index: 9)
                         encB.setBytes(&grp, length: 4, index: 10)
@@ -863,7 +877,7 @@ final class DynaMoETests: XCTestCase {
                 totalMoEMs += tMoeElapsed
 
                 if tokenIdx == 0 && (l == 0 || l == 1 || l == 2 || l == 39) {
-                    let logLine = String(format: "  Layer %2d: RouterWait=%.2f ms, MoEWait=%.2f ms, ActiveExp=%@\n", l, tWaitElapsed, tMoeElapsed, activeExp.map { "\($0.id)" }.joined(separator: ","))
+                    let logLine = String(format: "  Layer %2d: IO(pread 8 exps)=%.2f ms, RouterWait=%.2f ms, MoEGPU=%.2f ms, ActiveExp=%@\n", l, tIoElapsed, tWaitElapsed, tMoeElapsed, activeExp.map { "\($0.id)" }.joined(separator: ","))
                     logOutput += logLine
                     print(logLine)
                 }
@@ -875,7 +889,7 @@ final class DynaMoETests: XCTestCase {
 
             let tTotalToken = (CFAbsoluteTimeGetCurrent() - tTokenStart) * 1000.0
             let tps = 1000.0 / tTotalToken
-            let line = String(format: "Token %d: Total=%.2f ms (%.1f tok/s) | Attn=%.2f ms, RouterWait=%.2f ms, MoE=%.2f ms\n", tokenIdx + 1, tTotalToken, tps, totalAttnMs, totalRouterWaitMs, totalMoEMs)
+            let line = String(format: "Token %d: Total=%.2f ms (%.1f tok/s) | Attn=%.2f ms, RouterWait=%.2f ms, IO(pread)=%.2f ms, MoEGPU=%.2f ms\n", tokenIdx + 1, tTotalToken, tps, totalAttnMs, totalRouterWaitMs, totalIoMs, totalMoEMs)
             logOutput += line
             print(line)
         }
@@ -883,6 +897,109 @@ final class DynaMoETests: XCTestCase {
         try? logOutput.write(toFile: "/tmp/dynamoe_flashmoe_benchmark.log", atomically: true, encoding: .utf8)
         print("🎉 [DIAGNOSTIC] FlashMoE diagnostic run complete. Report saved to /tmp/dynamoe_flashmoe_benchmark.log")
     }
+
+    func testExpertIOThreadPool() throws {
+        let pool = ExpertIOThreadPool.shared
+        pool.initialize(numThreads: 8)
+
+        let packedDir = URL(fileURLWithPath: "/Users/derekparris/.cache/huggingface/hub/models--alexintosh--Qwen3.5-35B-A3B-Q4-FlashMoE/snapshots/cd9f9ef2b17f080aaa7710394f8a38002ba5ce9b/packed_experts")
+        guard FileManager.default.fileExists(atPath: packedDir.path) else {
+            print("Packed experts directory not found, skipping.")
+            return
+        }
+
+        guard let fd = pool.getOrOpenLayerFD(layerIndex: 0, packedExpertsDir: packedDir) else {
+            XCTFail("Failed to open layer_00.bin")
+            return
+        }
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal device")
+            return
+        }
+
+        let expertSize = 1769472 // 1.6875 MB
+        let k = 8
+        guard let stagingBuf = device.makeBuffer(length: k * expertSize, options: .storageModeShared) else {
+            XCTFail("Failed to allocate staging buffer")
+            return
+        }
+
+        var tasks: [ExpertPreadTask] = []
+        let rawPtr = stagingBuf.contents()
+        let activeExperts = [3, 14, 52, 99, 120, 184, 201, 245]
+
+        for (idx, expId) in activeExperts.enumerated() {
+            let offset = off_t(expId * expertSize)
+            let dst = rawPtr.advanced(by: idx * expertSize)
+            tasks.append(ExpertPreadTask(fd: fd, dst: dst, offset: offset, size: expertSize))
+        }
+
+        let t0 = CFAbsoluteTimeGetCurrent()
+        pool.dispatchSync(tasks: &tasks)
+        let tElapsedMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+
+        for t in tasks {
+            XCTAssertEqual(t.result, expertSize, "Expected to read \(expertSize) bytes")
+        }
+
+        let totalMB = Double(k * expertSize) / (1024.0 * 1024.0)
+        let throughputGBps = (totalMB / 1024.0) / (tElapsedMs / 1000.0)
+        print(String(format: "🚀 [IO BENCHMARK] Parallel pread: read %.2f MB across 8 threads in %.2f ms (%.2f GB/s)", totalMB, tElapsedMs, throughputGBps))
+        XCTAssertLessThan(tElapsedMs, 50.0, "Parallel pread should complete within 50ms for 13.5MB")
+    }
+
+    func testAgentHarnessToolCalling() throws {
+        let harness = AgentHarness.shared
+        XCTAssertEqual(harness.availableTools.count, 2)
+
+        // 1. Prompt formatting
+        let formatted = harness.formatInitialChatML(userMessage: "List files in directory")
+        XCTAssertTrue(formatted.contains("<|im_start|>system"))
+        XCTAssertTrue(formatted.contains("# Tools"))
+        XCTAssertTrue(formatted.contains("shell_run"))
+        XCTAssertTrue(formatted.contains("<|im_start|>user\nList files in directory<|im_end|>"))
+        XCTAssertTrue(formatted.hasSuffix("<|im_start|>assistant\n"))
+
+        // 2. Parse Tool Calls
+        let modelOutput = """
+        Let me list the files in the directory.
+        <tool_call>
+        {"name": "shell_run", "arguments": {"command": "echo 'hello world'"}}
+        </tool_call>
+        """
+        let parsed = harness.parseToolCalls(from: modelOutput)
+        XCTAssertEqual(parsed.count, 1)
+        XCTAssertEqual(parsed[0].name, "shell_run")
+        XCTAssertEqual(parsed[0].arguments["command"] as? String, "echo 'hello world'")
+
+        // 3. Tool Execution
+        let result = harness.executeToolCall(parsed[0])
+        XCTAssertTrue(result.contains("hello world"))
+
+        // 4. Continuation turn formatting
+        let nextTurn = harness.formatToolResponseTurn(toolName: "shell_run", response: result.trimmingCharacters(in: .whitespacesAndNewlines))
+        XCTAssertTrue(nextTurn.contains("<tool_response>"))
+        XCTAssertTrue(nextTurn.contains("hello world"))
+        XCTAssertTrue(nextTurn.hasSuffix("<|im_start|>assistant\n"))
+    }
+
+    func testRepackOrnith4Bit() throws {
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--ornith-ai--Ornith-1.5-35B-A3B-MLX-4bit/snapshots/19504d912fa8fc7622bf6b1de3db5d5d890b1f02"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            print("Ornith snapshot not found, skipping repack test.")
+            return
+        }
+        let srcUrl = URL(fileURLWithPath: snapshotDir)
+        let repacker = ExpertRepacker.shared
+        print("Starting ExpertRepacker on Ornith 1.5 35B A3B MLX 4bit...")
+        try repacker.repackSafetensors(sourceDir: srcUrl, outputDir: srcUrl) { p, msg in
+            print(String(format: "[REPACK PROGRESS] %.0f%%: %@", p * 100, msg))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: srcUrl.appendingPathComponent("model_weights.bin").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: srcUrl.appendingPathComponent("packed_experts/layout.json").path))
+    }
 }
+
 
 

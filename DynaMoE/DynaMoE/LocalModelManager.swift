@@ -25,6 +25,7 @@ public struct DiscoveredModel: Identifiable, Hashable, Codable, Equatable {
     public var lastModified: Date
     public var quantization: String?
     public var rawModelType: String?
+    public var supportsThinking: Bool
 
     public init(
         id: String,
@@ -41,7 +42,8 @@ public struct DiscoveredModel: Identifiable, Hashable, Codable, Equatable {
         hasTokenizer: Bool = true,
         lastModified: Date = Date(),
         quantization: String? = nil,
-        rawModelType: String? = nil
+        rawModelType: String? = nil,
+        supportsThinking: Bool = false
     ) {
         self.id = id
         self.displayName = displayName
@@ -58,35 +60,7 @@ public struct DiscoveredModel: Identifiable, Hashable, Codable, Equatable {
         self.lastModified = lastModified
         self.quantization = quantization
         self.rawModelType = rawModelType
-    }
-
-    public var supportsThinking: Bool {
-        let name = displayName.lowercased()
-        let repo = repoId.lowercased()
-        let type = (rawModelType ?? "").lowercased()
-        let arch = architectureName.lowercased()
-        let path = snapshotPath.lowercased()
-        if name.contains("nanbeige") || repo.contains("nanbeige") || type.contains("nanbeige") || arch.contains("nanbeige") || path.contains("nanbeige") ||
-           name.contains("ornith") || repo.contains("ornith") || type.contains("ornith") || arch.contains("ornith") || path.contains("ornith") ||
-           name.contains("qwen") || repo.contains("qwen") || type.contains("qwen") || arch.contains("qwen") || path.contains("qwen") ||
-           name.contains("deepseek") || repo.contains("deepseek") || type.contains("deepseek") || arch.contains("deepseek") || path.contains("deepseek") ||
-           name.contains("r1") || repo.contains("r1") || name.contains("reason") || repo.contains("reason") ||
-           name.contains("qwq") || repo.contains("qwq") || type.contains("qwq") ||
-           name.contains("glm") || repo.contains("glm") || type.contains("glm") ||
-           name.contains("nemotron") || repo.contains("nemotron") || type.contains("nemotron") ||
-           name.contains("think") || repo.contains("think") {
-            return true
-        }
-        let dirUrl = URL(fileURLWithPath: snapshotPath)
-        for fName in ["tokenizer_config.json", "chat_template.jinja", "tokenizer.json"] {
-            let fUrl = dirUrl.appendingPathComponent(fName)
-            if FileManager.default.fileExists(atPath: fUrl.path), let content = try? String(contentsOf: fUrl, encoding: .utf8) {
-                if content.contains("<think>") || content.contains("enable_thinking") || content.contains("<|thought|>") || content.contains("reasoning_content") {
-                    return true
-                }
-            }
-        }
-        return false
+        self.supportsThinking = supportsThinking
     }
 }
 
@@ -265,14 +239,14 @@ public class LocalModelManager: ObservableObject {
 
         var weightsEntryPath: String? = nil
 
-        if fileManager.fileExists(atPath: indexPath) {
-            weightsEntryPath = indexPath
-        } else if fileManager.fileExists(atPath: singleSafetensors) {
-            weightsEntryPath = singleSafetensors
-        } else if fileManager.fileExists(atPath: flashMoeJson) {
+        if fileManager.fileExists(atPath: flashMoeJson) {
             weightsEntryPath = flashMoeJson
         } else if fileManager.fileExists(atPath: flashMoeBin) {
             weightsEntryPath = flashMoeBin
+        } else if fileManager.fileExists(atPath: indexPath) {
+            weightsEntryPath = indexPath
+        } else if fileManager.fileExists(atPath: singleSafetensors) {
+            weightsEntryPath = singleSafetensors
         } else {
             // Check if there are any .safetensors files in directory
             if let files = try? fileManager.contentsOfDirectory(atPath: dirPath) {
@@ -343,6 +317,7 @@ public class LocalModelManager: ObservableObject {
         let hasTokenizer = fileManager.fileExists(atPath: tokPath)
 
         // Compute total size of snapshot files
+        // Compute total size of snapshot files
         let (totalBytes, modDate) = calculateDirectorySizeAndModDate(dirUrl: dirUrl)
 
         // Generate clean display name and repo identifier
@@ -351,6 +326,37 @@ public class LocalModelManager: ObservableObject {
         let author = repoId.contains("/") ? repoId.components(separatedBy: "/")[0] : "Local"
 
         let formattedSize = ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
+
+        // Check if model supports thinking / reasoning (pre-computed on background scanning thread)
+        var supportsThinking = false
+        let nameLower = displayName.lowercased()
+        let repoLower = repoId.lowercased()
+        let typeLower = (rawModelType ?? "").lowercased()
+        let archLower = architectureName.lowercased()
+        let pathLower = dirPath.lowercased()
+
+        if nameLower.contains("nanbeige") || repoLower.contains("nanbeige") || typeLower.contains("nanbeige") || archLower.contains("nanbeige") || pathLower.contains("nanbeige") ||
+           nameLower.contains("ornith") || repoLower.contains("ornith") || typeLower.contains("ornith") || archLower.contains("ornith") || pathLower.contains("ornith") ||
+           nameLower.contains("qwen") || repoLower.contains("qwen") || typeLower.contains("qwen") || archLower.contains("qwen") || pathLower.contains("qwen") ||
+           nameLower.contains("deepseek") || repoLower.contains("deepseek") || typeLower.contains("deepseek") || archLower.contains("deepseek") || pathLower.contains("deepseek") ||
+           nameLower.contains("r1") || repoLower.contains("r1") || nameLower.contains("reason") || repoLower.contains("reason") ||
+           nameLower.contains("qwq") || repoLower.contains("qwq") || typeLower.contains("qwq") ||
+           nameLower.contains("glm") || repoLower.contains("glm") || typeLower.contains("glm") ||
+           nameLower.contains("nemotron") || repoLower.contains("nemotron") || typeLower.contains("nemotron") ||
+           nameLower.contains("think") || repoLower.contains("think") {
+            supportsThinking = true
+        } else {
+            // Check only lightweight config templates (never huge tokenizer.json)
+            for fName in ["tokenizer_config.json", "chat_template.jinja"] {
+                let fUrl = dirUrl.appendingPathComponent(fName)
+                if fileManager.fileExists(atPath: fUrl.path), let content = try? String(contentsOf: fUrl, encoding: .utf8) {
+                    if content.contains("<think>") || content.contains("enable_thinking") || content.contains("<|thought|>") || content.contains("reasoning_content") {
+                        supportsThinking = true
+                        break
+                    }
+                }
+            }
+        }
 
         return DiscoveredModel(
             id: repoId,
@@ -367,7 +373,8 @@ public class LocalModelManager: ObservableObject {
             hasTokenizer: hasTokenizer,
             lastModified: modDate,
             quantization: quantization,
-            rawModelType: rawModelType
+            rawModelType: rawModelType,
+            supportsThinking: supportsThinking
         )
     }
 
