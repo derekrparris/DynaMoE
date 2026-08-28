@@ -22,6 +22,7 @@ public struct ChatMessage: Identifiable, Codable, Equatable {
     public var tokensPerSec: Double
     public var timeToFirstTokenSeconds: Double?
     public var thinkingTimeSeconds: Double?
+    public var prefillStatus: String?
 
     public init(
         id: UUID = UUID(),
@@ -33,7 +34,8 @@ public struct ChatMessage: Identifiable, Codable, Equatable {
         tokenCount: Int = 0,
         tokensPerSec: Double = 0.0,
         timeToFirstTokenSeconds: Double? = nil,
-        thinkingTimeSeconds: Double? = nil
+        thinkingTimeSeconds: Double? = nil,
+        prefillStatus: String? = nil
     ) {
         self.id = id
         self.role = role
@@ -45,6 +47,7 @@ public struct ChatMessage: Identifiable, Codable, Equatable {
         self.tokensPerSec = tokensPerSec
         self.timeToFirstTokenSeconds = timeToFirstTokenSeconds
         self.thinkingTimeSeconds = thinkingTimeSeconds
+        self.prefillStatus = prefillStatus
     }
 }
 

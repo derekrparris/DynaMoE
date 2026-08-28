@@ -564,9 +564,15 @@ struct ChatMessageView: View {
                                         )
 
                                     if message.isThinking && isGenerating {
-                                        Text("Thinking...")
-                                            .font(.system(size: 12, weight: .medium))
-                                            .foregroundColor(.primary)
+                                        if let prefill = message.prefillStatus {
+                                            Text("Ingesting Prompt...")
+                                                .font(.system(size: 12, weight: .medium))
+                                                .foregroundColor(.primary)
+                                        } else {
+                                            Text("Thinking...")
+                                                .font(.system(size: 12, weight: .medium))
+                                                .foregroundColor(.primary)
+                                        }
                                         StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
                                     } else if let tTime = message.thinkingTimeSeconds {
                                         Text(String(format: "Thought for %.1fs", tTime))
@@ -621,9 +627,15 @@ struct ChatMessageView: View {
                                     } else if message.isThinking && isGenerating {
                                         HStack(spacing: 8) {
                                             StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
-                                            Text(isStreamingOffDisk ? "Streaming MoE experts off SSD disk..." : "Generating thought process...")
-                                                .font(.system(size: 12, design: .monospaced))
-                                                .foregroundColor(.secondary.opacity(0.8))
+                                            if let prefill = message.prefillStatus {
+                                                Text(prefill)
+                                                    .font(.system(size: 12, design: .monospaced))
+                                                    .foregroundColor(.purple)
+                                            } else {
+                                                Text(isStreamingOffDisk ? "Streaming MoE experts off SSD disk..." : "Generating thought process...")
+                                                    .font(.system(size: 12, design: .monospaced))
+                                                    .foregroundColor(.secondary.opacity(0.8))
+                                            }
                                         }
                                         .padding(.horizontal, 14)
                                         .padding(.vertical, 10)
@@ -651,9 +663,15 @@ struct ChatMessageView: View {
                         // Only for active generation while initial pre-fill occurs
                         HStack(spacing: 8) {
                             StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
-                            Text(isStreamingOffDisk ? "Streaming MoE experts off SSD disk..." : "Generating response...")
-                                .font(.system(size: 13))
-                                .foregroundColor(.secondary)
+                            if let prefill = message.prefillStatus {
+                                Text(prefill)
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundColor(.purple)
+                            } else {
+                                Text(isStreamingOffDisk ? "Streaming MoE experts off SSD disk..." : "Generating response...")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(.secondary)
+                            }
                         }
                         .padding(.vertical, 4)
                     }

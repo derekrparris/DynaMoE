@@ -4620,6 +4620,7 @@ struct ContentView: View {
             // Ingest prompt tokens into KV-cache and recurrent states (pipelined chunked async submission)
             let promptCount = promptTokenIds.count - 1
             if promptCount > 0 {
+                let prefillStartTime = CFAbsoluteTimeGetCurrent()
                 let chunkSize = 16
                 for pIdx in 0..<promptCount {
                     if Task.isCancelled { break }
@@ -4629,6 +4630,37 @@ struct ContentView: View {
                     let ok = runTokenForward(tokenId: pTok, step: currentStep, computeLogits: false, wait: isBarrier)
                     if !ok { break }
                     currentStep += 1
+
+                    let now = CFAbsoluteTimeGetCurrent()
+                    if isBarrier || (now - lastUIUpdateTime >= 0.25) {
+                        lastUIUpdateTime = now
+                        let elapsed = max(0.001, now - prefillStartTime)
+                        let speed = Double(pIdx + 1) / elapsed
+                        let pct = Int((Double(pIdx + 1) / Double(promptCount)) * 100)
+                        let remainingToks = promptCount - (pIdx + 1)
+                        let etaSec = speed > 0 ? Double(remainingToks) / speed : 0
+                        let etaStr = etaSec >= 60 ? String(format: "%dm %02ds", Int(etaSec) / 60, Int(etaSec) % 60) : String(format: "%.0fs", etaSec)
+                        let prefillStr = "Ingesting prompt: \(pIdx + 1)/\(promptCount) tokens (\(pct)%) • \(String(format: "%.1f", speed)) tok/s • ETA: \(etaStr)"
+
+                        await MainActor.run {
+                            self.generationSpeedTokPerSec = speed
+                            self.generationStatusText = "📥 " + prefillStr
+                            if let sId = sessionId, let mId = messageId,
+                               let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                               let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                                self.sessions[sIdx].messages[mIdx].prefillStatus = prefillStr
+                            }
+                        }
+                    }
+                }
+
+                // Clear prefill status once prefill completes
+                await MainActor.run {
+                    if let sId = sessionId, let mId = messageId,
+                       let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                       let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                        self.sessions[sIdx].messages[mIdx].prefillStatus = nil
+                    }
                 }
             }
 
