@@ -16,6 +16,7 @@ struct ChatDetailView: View {
     var generationSpeed: Double
     var generationTokens: Int
     var modelName: String?
+    var tokenizer: DynaMoeTokenizer? = nil
     var supportsThinking: Bool = false
     var isThinkingEnabled: Bool = true
     var onSendMessage: (String) -> Void
@@ -24,14 +25,34 @@ struct ChatDetailView: View {
     var onSelectDiscoveredModel: ((DiscoveredModel) -> Void)? = nil
     var onOpenSettings: (() -> Void)? = nil
     var onToggleThinking: ((Bool) -> Void)? = nil
+    var onToggleSidebar: (() -> Void)? = nil
 
     @FocusState private var isInputFocused: Bool
     @State private var isReasoningExpanded: [UUID: Bool] = [:]
+    @State private var promptTokenCount: Int = 0
+    @State private var tokenCountTask: Task<Void, Never>? = nil
 
     var body: some View {
         VStack(spacing: 0) {
             // Header Bar (Antigravity breadcrumb style)
             HStack(spacing: 8) {
+                Button(action: {
+                    if let onToggleSidebar = onToggleSidebar {
+                        onToggleSidebar()
+                    } else {
+                        NSApp.keyWindow?.firstResponder?.tryToPerform(#selector(NSSplitViewController.toggleSidebar(_:)), with: nil)
+                    }
+                }) {
+                    Image(systemName: "sidebar.leading")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(.secondary)
+                        .frame(width: 26, height: 26)
+                        .background(Color.secondary.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+                .buttonStyle(.plain)
+                .help("Toggle Sidebar (⌘S)")
+
                 Text("DynaMoE")
                     .font(.system(size: 13, weight: .regular))
                     .foregroundColor(.secondary)
@@ -292,6 +313,24 @@ struct ChatDetailView: View {
                             .transition(.opacity.combined(with: .scale))
                         }
 
+                        // Real-time Prompt Token Counter (to the right of Thinking toggle or Model selector)
+                        if promptTokenCount > 0 {
+                            HStack(spacing: 3.5) {
+                                Image(systemName: "number.circle.fill")
+                                    .font(.system(size: 9.5, weight: .semibold))
+                                    .foregroundColor(.secondary)
+                                Text("\(promptTokenCount.formatted()) \(promptTokenCount == 1 ? "token" : "tokens")")
+                                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                            }
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 4.5)
+                            .background(Color.secondary.opacity(0.06))
+                            .cornerRadius(8)
+                            .help("Real-time token count of current prompt input")
+                            .transition(.opacity.combined(with: .scale(scale: 0.95)))
+                        }
+
                         Spacer()
 
                         // Mic Button
@@ -344,6 +383,45 @@ struct ChatDetailView: View {
                 .frame(maxWidth: .infinity)
             }
             .background(Color(NSColor.windowBackgroundColor))
+        }
+        .onAppear {
+            updateTokenCount(for: promptText)
+        }
+        .onChange(of: promptText) { newText in
+            updateTokenCount(for: newText)
+        }
+        .onChange(of: tokenizer != nil) { _ in
+            updateTokenCount(for: promptText)
+        }
+    }
+
+    private func updateTokenCount(for text: String) {
+        tokenCountTask?.cancel()
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                self.promptTokenCount = 0
+            }
+            return
+        }
+
+        let currentTokenizer = self.tokenizer
+        tokenCountTask = Task { @MainActor in
+            // 40ms debounce for 120Hz smooth typing
+            try? await Task.sleep(nanoseconds: 40_000_000)
+            if Task.isCancelled { return }
+
+            let count: Int
+            if let tok = currentTokenizer {
+                count = (try? tok.encode(text: trimmed).count) ?? max(1, trimmed.count / 4)
+            } else {
+                count = max(1, trimmed.count / 4)
+            }
+
+            if Task.isCancelled { return }
+            withAnimation(.easeInOut(duration: 0.15)) {
+                self.promptTokenCount = count
+            }
         }
     }
 }

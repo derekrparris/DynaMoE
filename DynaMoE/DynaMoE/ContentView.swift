@@ -642,6 +642,7 @@ struct ContentView: View {
     // Multi-Session Chat UI State (Antigravity Style)
     @ObservedObject var localModelManager: LocalModelManager = LocalModelManager.shared
     @State private var activeLoadedModelPath: String? = nil
+    @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var sessions: [ChatSession] = [
         ChatSession(title: "New Chat")
     ]
@@ -746,7 +747,7 @@ struct ContentView: View {
     }
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             SidebarView(
                 sessions: $sessions,
                 selectedSessionId: $selectedSessionId,
@@ -786,6 +787,7 @@ struct ContentView: View {
                     }
                 }
             )
+            .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 320)
         } detail: {
             ChatDetailView(
                 session: activeSessionBinding,
@@ -795,6 +797,7 @@ struct ContentView: View {
                 generationSpeed: generationSpeedTokPerSec,
                 generationTokens: generationTotalTokens,
                 modelName: summary != nil ? (modelConfig?.modelType ?? detectedArchitecture.shortName) : nil,
+                tokenizer: tokenizer,
                 supportsThinking: activeModelSupportsThinking,
                 isThinkingEnabled: isThinkingEnabledForActiveSession,
                 onSendMessage: { prompt in
@@ -819,6 +822,11 @@ struct ContentView: View {
                     if let sid = selectedSessionId ?? sessions.first?.id,
                        let idx = sessions.firstIndex(where: { $0.id == sid }) {
                         sessions[idx].isThinkingEnabled = enabled
+                    }
+                },
+                onToggleSidebar: {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        columnVisibility = (columnVisibility == .detailOnly) ? .all : .detailOnly
                     }
                 }
             )
