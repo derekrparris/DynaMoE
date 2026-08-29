@@ -186,6 +186,8 @@ public final class InferenceEngine {
     public var q8DownPipeline: MTLComputePipelineState?
     public var fp8GateUpPipeline: MTLComputePipelineState?
     public var fp8DownPipeline: MTLComputePipelineState?
+    public var fp8GateUpSimdPipeline: MTLComputePipelineState?
+    public var fp8DownSimdPipeline: MTLComputePipelineState?
     public var mxfp8GateUpPipeline: MTLComputePipelineState?
     public var mxfp8DownPipeline: MTLComputePipelineState?
     public var mxfp8GateUpSimdPipeline: MTLComputePipelineState?
@@ -319,6 +321,12 @@ public final class InferenceEngine {
         }
         if let fp8DownFunc = defaultLib.makeFunction(name: "fp8_down_proj_accumulate") {
             fp8DownPipeline = try device.makeComputePipelineState(function: fp8DownFunc)
+        }
+        if let fp8GateSimdFunc = defaultLib.makeFunction(name: "fp8_swiglu_gate_up_simd") {
+            fp8GateUpSimdPipeline = try device.makeComputePipelineState(function: fp8GateSimdFunc)
+        }
+        if let fp8DownSimdFunc = defaultLib.makeFunction(name: "fp8_down_proj_accumulate_simd") {
+            fp8DownSimdPipeline = try device.makeComputePipelineState(function: fp8DownSimdFunc)
         }
         if let mxfp8GateUpFunc = defaultLib.makeFunction(name: "mxfp8_swiglu_gate_up") {
             mxfp8GateUpPipeline = try device.makeComputePipelineState(function: mxfp8GateUpFunc)

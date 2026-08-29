@@ -6,13 +6,13 @@ DynaMoE is a high-performance native macOS application, local inference engine, 
 
 ---
 
-## Inspiration
+## Inspiration & Acknowledgements
 
 This project was undertaken purely for the joy of exploration by someone who is not a software engineer or even a "real" developer. Just someone who is enjoying learning with the help of AI. I'm steering the ship, and Gemini 3.6 and 3.7 are largely implementing the ideas and pointing me in the right direction.
 
-The projects that originally inspired this exploration were:
-* **Colibri** https://github.com/JustVugg/colibri
-* **Flash-MoE** https://github.com/danveloper/flash-moe
+Special thanks and acknowledgement to the open-source projects that inspired and influenced this architecture:
+* **Flash-MoE** (https://github.com/danveloper/flash-moe) by Dan Woods: A huge shoutout and credit to Flash-MoE for pioneering the MoE expert repackaging format and contiguous binary layer storage layout (`packed_experts/layer_XX.bin`). DynaMoE adopts and builds upon Flash-MoE's expert restructuring concepts to enable high-throughput asynchronous POSIX `pread` file streaming directly into shared Metal GPU buffers.
+* **Colibri** (https://github.com/JustVugg/colibri): Pioneering work on high-speed off-disk model execution.
 
 ---
 
@@ -40,6 +40,7 @@ DynaMoE supports both sparse Mixture-of-Experts and dense autoregressive transfo
 
 * **Zero-Copy Apple Silicon Unified Memory Bridge:** Memory-maps multi-gigabyte SafeTensors weight shards via `memmap2` in Rust and wraps raw memory addresses directly into Metal GPU buffers (`MTLBuffer(bytesNoCopy:length:options:deallocator:)` with `.storageModeShared`), eliminating redundant CPU-to-GPU copies.
 * **SIMD-Coalesced Metal Compute Kernels:** Custom Metal Shading Language (MSL) compute shaders featuring SIMD-coalesced memory access and threadgroup shared memory caching for packed 4-bit/8-bit affine matrix-vector operations, FP8 (`E4M3`/`E5M2`) with block scales (MXFP8), SwiGLU expert projections (`gate_proj`, `up_proj`, `down_proj`), dynamic Top-8 routing, and token embedding lookups.
+* **FlashMoE Contiguous Expert Repackaging & Multi-Threaded Direct I/O:** Inspired by and adapted from Dan Woods' Flash-MoE project, DynaMoE supports restructuring sparse MoE model layers into contiguous per-layer expert binaries (`packed_experts/layer_XX.bin` + `layout.json`). A dedicated 8-thread background POSIX `pread` I/O pool (`ExpertIOThreadPool`) streams selected expert slices directly into shared Metal staging buffers, eliminating file fragmentation and maximizing NVMe read bandwidth during token generation.
 * **Quantized FP8 & FP16 KV Cache:** Dynamically configurable KV cache precision (**FP32**, **FP16**, and **FP8 E4M3/E5M2**), reducing attention cache memory footprints by up to 75% and enabling long-context inference (32k+ tokens) on memory-constrained Macs.
 * **Speculative MoE Expert Prefetching (`WorkingSetManager`):** Thread-safe background speculative lookahead prefetching pipeline using `posix_madvise(POSIX_MADV_WILLNEED)` to warm upcoming layer experts asynchronously before routing execution, alongside LRU page eviction (`POSIX_MADV_DONTNEED`) to keep RSS within strict hardware thresholds.
 * **Hardware-Vectorized Accelerate Sampling:** Apple Accelerate framework integration using `vDSP_maxvi` for zero-overhead greedy sampling, $O(\log K)$ min-heap Top-$K$ candidate tracking, vectorized softmax normalization (`vvexpf`, `vDSP_vsmul`), and dynamic **Min-$P$** and **Top-$P$ (Nucleus)** probability truncation.

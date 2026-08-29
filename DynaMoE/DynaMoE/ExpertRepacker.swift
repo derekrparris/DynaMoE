@@ -161,12 +161,40 @@ public final class ExpertRepacker {
         // 2. Repack Per-Layer Experts -> packed_experts/layer_XX.bin
         progress(0.20, "Repacking 40 layers of expert weights...")
 
-        // Identify component order from Layer 0 Expert 0
-        let componentSuffixes = [
-            "gate_proj.weight", "gate_proj.scales", "gate_proj.biases",
-            "up_proj.weight", "up_proj.scales", "up_proj.biases",
-            "down_proj.weight", "down_proj.scales", "down_proj.biases"
-        ]
+        // Dynamically discover component suffixes from Layer 0 Expert 0
+        let l0e0Tensors = summary.tensors.filter { $0.layerIndex == 0 && $0.expertId == 0 }
+        var componentSuffixes: [String] = []
+
+        let projPrefixes = ["gate_proj", "up_proj", "down_proj"]
+        for prefix in projPrefixes {
+            let matching = l0e0Tensors.filter { $0.name.contains(prefix) }
+            // Sort: weight first, then scales/scale/weight_scale, then biases/bias
+            let sorted = matching.sorted { t1, t2 in
+                func priority(_ name: String) -> Int {
+                    if name.hasSuffix(".weight") { return 0 }
+                    if name.contains("scale") { return 1 }
+                    if name.contains("bias") { return 2 }
+                    return 3
+                }
+                return priority(t1.name) < priority(t2.name)
+            }
+            for t in sorted {
+                if let range = t.name.range(of: prefix) {
+                    let suffix = String(t.name[range.lowerBound...])
+                    if !componentSuffixes.contains(suffix) {
+                        componentSuffixes.append(suffix)
+                    }
+                }
+            }
+        }
+
+        if componentSuffixes.isEmpty {
+            componentSuffixes = [
+                "gate_proj.weight", "gate_proj.weight_scale", "gate_proj.scales", "gate_proj.biases",
+                "up_proj.weight", "up_proj.weight_scale", "up_proj.scales", "up_proj.biases",
+                "down_proj.weight", "down_proj.weight_scale", "down_proj.scales", "down_proj.biases"
+            ]
+        }
 
         var expertTensorMap: [String: TensorMetadata] = [:]
         expertTensorMap.reserveCapacity(numLayers * numExperts * componentSuffixes.count)

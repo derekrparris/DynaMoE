@@ -32,6 +32,22 @@ struct ChatDetailView: View {
     @State private var promptTokenCount: Int = 0
     @State private var tokenCountTask: Task<Void, Never>? = nil
 
+    private func modelIconName(for name: String?) -> String {
+        let lower = (name ?? "").lowercased()
+        if lower.contains("ornith") || lower.contains("bird") {
+            return "bird.fill"
+        } else if lower.contains("nanbeige") {
+            return "building.columns.fill"
+        } else if lower.contains("deepseek") {
+            return "sparkles"
+        } else if lower.contains("qwen") {
+            return "cpu.fill"
+        } else if lower.contains("llama") {
+            return "flame.fill"
+        }
+        return "cube.fill"
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             // Header Bar (Antigravity breadcrumb style)
@@ -70,9 +86,9 @@ struct ChatDetailView: View {
                 
                 if let model = modelName {
                     HStack(spacing: 6) {
-                        Circle()
-                            .fill(isGenerating ? (isStreamingOffDisk ? Color.orange : Color.green) : Color.purple)
-                            .frame(width: 6, height: 6)
+                        Image(systemName: modelIconName(for: model))
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(isGenerating ? (isStreamingOffDisk ? Color.orange : Color.green) : Color.purple)
                         Text(model)
                             .font(.caption)
                             .foregroundColor(.secondary)
@@ -254,7 +270,7 @@ struct ChatDetailView: View {
                             }
                         } label: {
                             HStack(spacing: 5) {
-                                Image(systemName: "cube.fill")
+                                Image(systemName: modelIconName(for: session?.selectedModelName ?? modelName))
                                     .font(.system(size: 10))
                                     .foregroundColor(.purple)
                                 Text(session?.selectedModelName ?? modelName ?? "Select Model")

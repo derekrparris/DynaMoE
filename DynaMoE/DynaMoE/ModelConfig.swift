@@ -375,12 +375,19 @@ public struct ModelConfig: Codable {
     }
 
     /// Returns the required system prompt mandatory for specific models to function properly (e.g. Nanbeige instruct tuning)
-    public static func resolveRequiredSystemPrompt(config: ModelConfig?, summary: ModelSummary?, modelName: String? = nil) -> String {
+    public static func resolveRequiredSystemPrompt(
+        config: ModelConfig?,
+        summary: ModelSummary?,
+        modelName: String? = nil,
+        modelPath: String? = nil
+    ) -> String {
         let nameLower = (modelName ?? "").lowercased()
+        let pathLower = (modelPath ?? "").lowercased()
         let typeStr = (config?.modelType ?? "").lowercased()
         let archStr = config?.architectures?.joined(separator: " ").lowercased() ?? ""
 
         let isNanbeige = nameLower.contains("nanbeige") ||
+                         pathLower.contains("nanbeige") ||
                          typeStr.contains("nanbeige") ||
                          archStr.contains("nanbeige") ||
                          (summary?.maxExpertId == 0 && (
@@ -393,20 +400,21 @@ public struct ModelConfig: Codable {
             return "你是南北阁，一款由BOSS直聘自主研发并训练的专业大语言模型。"
         }
 
-        if nameLower.contains("ornith") || typeStr.contains("ornith") || archStr.contains("ornith") {
+        // Ornith models MUST be checked before Qwen fallback since Ornith configs inherit "qwen3_5_moe"
+        if nameLower.contains("ornith") || pathLower.contains("ornith") || typeStr.contains("ornith") || archStr.contains("ornith") {
             // Ornith chat template defaults to clean instruct without mandatory prefix
             return ""
         }
 
-        if nameLower.contains("qwen") || typeStr.contains("qwen") || archStr.contains("qwen") {
+        if nameLower.contains("qwen") || pathLower.contains("qwen") || typeStr.contains("qwen") || archStr.contains("qwen") {
             return "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
         }
 
-        if nameLower.contains("deepseek") || typeStr.contains("deepseek") || archStr.contains("deepseek") {
+        if nameLower.contains("deepseek") || pathLower.contains("deepseek") || typeStr.contains("deepseek") || archStr.contains("deepseek") {
             return "You are a helpful and harmless AI assistant."
         }
 
-        if nameLower.contains("llama") || typeStr.contains("llama") || archStr.contains("llama") {
+        if nameLower.contains("llama") || pathLower.contains("llama") || typeStr.contains("llama") || archStr.contains("llama") {
             return "You are a helpful, respectful and honest assistant."
         }
 
@@ -414,8 +422,13 @@ public struct ModelConfig: Codable {
     }
 
     /// Dynamically determines the suggested default system prompt for the active model architecture
-    public static func resolveDefaultSystemPrompt(config: ModelConfig?, summary: ModelSummary?, modelName: String? = nil) -> String {
-        let required = resolveRequiredSystemPrompt(config: config, summary: summary, modelName: modelName)
+    public static func resolveDefaultSystemPrompt(
+        config: ModelConfig?,
+        summary: ModelSummary?,
+        modelName: String? = nil,
+        modelPath: String? = nil
+    ) -> String {
+        let required = resolveRequiredSystemPrompt(config: config, summary: summary, modelName: modelName, modelPath: modelPath)
         if !required.isEmpty {
             return required
         }
@@ -427,9 +440,10 @@ public struct ModelConfig: Codable {
         userPrompt: String,
         config: ModelConfig?,
         summary: ModelSummary?,
-        modelName: String? = nil
+        modelName: String? = nil,
+        modelPath: String? = nil
     ) -> String {
-        let required = resolveRequiredSystemPrompt(config: config, summary: summary, modelName: modelName).trimmingCharacters(in: .whitespacesAndNewlines)
+        let required = resolveRequiredSystemPrompt(config: config, summary: summary, modelName: modelName, modelPath: modelPath).trimmingCharacters(in: .whitespacesAndNewlines)
         let user = userPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if !required.isEmpty && !user.isEmpty {

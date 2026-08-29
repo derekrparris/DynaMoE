@@ -28,6 +28,10 @@ struct SettingsSheetView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var selectedTab: SettingsTab = .models
     @State private var isPromptSavedFeedback: Bool = false
+    @State private var repackingModelId: String? = nil
+    @State private var repackProgress: Double = 0.0
+    @State private var repackStatus: String = ""
+    @State private var repackError: String? = nil
     @ObservedObject var localModelManager: LocalModelManager = LocalModelManager.shared
 
     // Model & Tokenizer bindings
@@ -250,6 +254,22 @@ struct SettingsSheetView: View {
                                             .background(Color.green.opacity(0.12))
                                             .cornerRadius(4)
                                     }
+
+                                    let isFlashMoEPacked = ExpertRepacker.isPackedFormat(dir: URL(fileURLWithPath: model.snapshotPath))
+                                    if model.isMoE && isFlashMoEPacked {
+                                        HStack(spacing: 3) {
+                                            Image(systemName: "bolt.fill")
+                                                .font(.system(size: 8))
+                                                .foregroundColor(.green)
+                                            Text("⚡ FlashMoE")
+                                                .font(.system(size: 9.5, weight: .bold))
+                                                .foregroundColor(.green)
+                                        }
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(Color.green.opacity(0.12))
+                                        .cornerRadius(4)
+                                    }
                                 }
 
                                 HStack(spacing: 8) {
@@ -283,8 +303,42 @@ struct SettingsSheetView: View {
 
                             Spacer()
 
-                            // Action Buttons: Default toggle & Load button
+                            // Action Buttons: FlashMoE Repack, Default toggle & Load button
                             HStack(spacing: 8) {
+                                let isFlashMoEPacked = ExpertRepacker.isPackedFormat(dir: URL(fileURLWithPath: model.snapshotPath))
+                                if model.isMoE && !isFlashMoEPacked {
+                                    if repackingModelId == model.id {
+                                        VStack(alignment: .trailing, spacing: 2) {
+                                            ProgressView(value: repackProgress)
+                                                .progressViewStyle(.linear)
+                                                .frame(width: 80)
+                                            Text(repackStatus)
+                                                .font(.system(size: 8))
+                                                .foregroundColor(.secondary)
+                                                .lineLimit(1)
+                                        }
+                                    } else {
+                                        Button(action: {
+                                            repackModel(model)
+                                        }) {
+                                            HStack(spacing: 4) {
+                                                Image(systemName: "bolt.badge.automatic.fill")
+                                                    .font(.system(size: 10))
+                                                    .foregroundColor(.yellow)
+                                                Text("FlashMoE Repack")
+                                                    .font(.caption2)
+                                                    .fontWeight(.medium)
+                                            }
+                                            .padding(.horizontal, 8)
+                                            .padding(.vertical, 5)
+                                            .background(Color.yellow.opacity(0.12))
+                                            .cornerRadius(6)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .help("Losslessly repack weights into FlashMoE layout for ~100x faster generation")
+                                    }
+                                }
+
                                 Button(action: {
                                     if isDefault {
                                         localModelManager.setDefaultModel(id: nil)
@@ -580,7 +634,12 @@ struct SettingsSheetView: View {
                         )
 
                     // Active Model Required Instruct Prompt Callout
-                    let requiredPrompt = ModelConfig.resolveRequiredSystemPrompt(config: modelConfig, summary: summary, modelName: summary != nil ? (modelConfig?.modelType ?? detectedArchitecture.shortName) : nil)
+                    let requiredPrompt = ModelConfig.resolveRequiredSystemPrompt(
+                        config: modelConfig,
+                        summary: summary,
+                        modelName: summary != nil ? (modelConfig?.modelType ?? detectedArchitecture.shortName) : nil,
+                        modelPath: activeModelPath
+                    )
                     if !requiredPrompt.isEmpty {
                         VStack(alignment: .leading, spacing: 5) {
                             HStack(spacing: 5) {
@@ -864,6 +923,34 @@ struct SettingsSheetView: View {
             .padding(14)
             .background(Color.secondary.opacity(0.06))
             .cornerRadius(10)
+        }
+    }
+
+    private func repackModel(_ model: DiscoveredModel) {
+        repackingModelId = model.id
+        repackProgress = 0.0
+        repackStatus = "Starting repacking..."
+        repackError = nil
+
+        Task.detached(priority: .userInitiated) {
+            do {
+                let dir = URL(fileURLWithPath: model.snapshotPath)
+                try ExpertRepacker.shared.repackSafetensors(sourceDir: dir, outputDir: dir) { prog, msg in
+                    Task { @MainActor in
+                        self.repackProgress = prog
+                        self.repackStatus = msg
+                    }
+                }
+                Task { @MainActor in
+                    self.repackingModelId = nil
+                    self.localModelManager.scanLocalModels()
+                }
+            } catch {
+                Task { @MainActor in
+                    self.repackingModelId = nil
+                    self.repackError = error.localizedDescription
+                }
+            }
         }
     }
 }

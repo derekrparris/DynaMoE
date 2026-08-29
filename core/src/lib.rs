@@ -400,7 +400,9 @@ fn try_load_flash_moe(search_path: &Path) -> Option<(Vec<ShardHandle>, Vec<Tenso
                 }
             }
 
-            tensor_list.sort_by(|a, b| a.name.cmp(&b.name));
+            if tensor_list.len() <= 2000 {
+                tensor_list.sort_by(|a, b| a.name.cmp(&b.name));
+            }
             return Some((shard_handles, tensor_list));
         }
     }

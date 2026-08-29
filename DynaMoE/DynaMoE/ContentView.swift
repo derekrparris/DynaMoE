@@ -712,12 +712,33 @@ struct ContentView: View {
         return true
     }
 
+    var activeModelDisplayName: String? {
+        if let session = activeSessionBinding.wrappedValue,
+           let name = session.selectedModelName, !name.isEmpty {
+            return name
+        }
+        if let activePath = activeLoadedModelPath,
+           let dm = localModelManager.discoveredModels.first(where: { $0.snapshotPath == activePath }) {
+            return dm.displayName
+        }
+        if let summary = summary {
+            if let type = modelConfig?.modelType, !type.isEmpty {
+                if type.lowercased().contains("ornith") {
+                    return "Ornith 1.5 35B A3B FP8"
+                }
+                return type
+            }
+            return detectedArchitecture.shortName
+        }
+        return nil
+    }
+
     var activeModelSupportsThinking: Bool {
         // 1. Check loaded model config / summary / detected architecture
         if ModelConfig.supportsThinking(
             config: modelConfig,
             summary: summary,
-            modelName: summary != nil ? (modelConfig?.modelType ?? detectedArchitecture.shortName) : nil,
+            modelName: activeModelDisplayName,
             modelPath: activeLoadedModelPath
         ) {
             return true
@@ -785,7 +806,7 @@ struct ContentView: View {
                 sessions: $sessions,
                 selectedSessionId: $selectedSessionId,
                 isSettingsPresented: $isSettingsPresented,
-                modelName: summary != nil ? (modelConfig?.modelType ?? detectedArchitecture.shortName) : nil,
+                modelName: activeModelDisplayName,
                 metalStatus: metalStatus,
                 currentRssGB: currentRssGB,
                 isGenerating: isGeneratingText,
@@ -829,7 +850,7 @@ struct ContentView: View {
                 isStreamingOffDisk: isStreamingOffDisk,
                 generationSpeed: generationSpeedTokPerSec,
                 generationTokens: generationTotalTokens,
-                modelName: summary != nil ? (modelConfig?.modelType ?? detectedArchitecture.shortName) : nil,
+                modelName: activeModelDisplayName,
                 tokenizer: tokenizer,
                 supportsThinking: activeModelSupportsThinking,
                 isThinkingEnabled: isThinkingEnabledForActiveSession,
@@ -976,12 +997,12 @@ struct ContentView: View {
         
         // Build prompt formatted with chat template
         var promptString = ""
-        let modelShort = summary != nil ? (modelConfig?.modelType ?? detectedArchitecture.shortName) : nil
         var effectiveSystem = ModelConfig.buildEffectiveSystemPrompt(
             userPrompt: systemPrompt,
             config: modelConfig,
             summary: summary,
-            modelName: modelShort
+            modelName: activeModelDisplayName,
+            modelPath: activeLoadedModelPath
         ).trimmingCharacters(in: .whitespacesAndNewlines)
 
         if modelSupportsThinking && !thinkingEnabled {
@@ -2850,12 +2871,12 @@ struct ContentView: View {
                          (summary.tensors.contains(where: { $0.name.contains("dense_gate_up_proj") })) ||
                          (summary.tensors.contains(where: { $0.name.hasPrefix("model.layers.0.mlp.gate_proj") }) && summary.layerCount == 22)
 
-        let modelShort = modelConfig?.modelType ?? detectedArchitecture.shortName
         let cleanSystem = ModelConfig.buildEffectiveSystemPrompt(
             userPrompt: systemPrompt,
             config: modelConfig,
             summary: summary,
-            modelName: modelShort
+            modelName: activeModelDisplayName,
+            modelPath: activeLoadedModelPath
         ).trimmingCharacters(in: .whitespacesAndNewlines)
 
         let modelSupportsThinking = activeModelSupportsThinking
@@ -3311,7 +3332,7 @@ struct ContentView: View {
               let routerWeightsBuffer = device.makeBuffer(length: 8 * MemoryLayout<Float>.stride, options: .storageModeShared),
               let sharedScoreBuffer = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared),
               let interBuffer = device.makeBuffer(length: max(Int(maxInterDim), 512) * MemoryLayout<Float>.stride, options: .storageModeShared),
-              let expertStagingBuffer = device.makeBuffer(length: 8 * 1769472, options: .storageModeShared),
+              let expertStagingBuffer = device.makeBuffer(length: 8 * 4194304, options: .storageModeShared),
               let xFinalBuffer = device.makeBuffer(length: Int(hiddenDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let logitsBuffer = device.makeBuffer(length: Int(vocabSize) * MemoryLayout<Float>.stride, options: .storageModeShared) else {
             let err = "❌ Failed to allocate GPU scratch buffers."
@@ -3355,14 +3376,19 @@ struct ContentView: View {
         generationElapsedMs = 0.0
         generationStatusText = "⚡ Initializing Autoregressive Generation..."
 
+        var loadedLayout: FlashMoELayout? = nil
         let packedExpertsDir: URL?
         if let modelPath = activeLoadedModelPath {
             var isDir: ObjCBool = false
             FileManager.default.fileExists(atPath: modelPath, isDirectory: &isDir)
             let baseDir = isDir.boolValue ? URL(fileURLWithPath: modelPath) : URL(fileURLWithPath: modelPath).deletingLastPathComponent()
             let pDir = baseDir.appendingPathComponent("packed_experts")
-            if FileManager.default.fileExists(atPath: pDir.appendingPathComponent("layout.json").path) {
+            let layoutFile = pDir.appendingPathComponent("layout.json")
+            if FileManager.default.fileExists(atPath: layoutFile.path),
+               let lData = try? Data(contentsOf: layoutFile),
+               let lay = try? JSONDecoder().decode(FlashMoELayout.self, from: lData) {
                 packedExpertsDir = pDir
+                loadedLayout = lay
                 ExpertIOThreadPool.shared.initialize(numThreads: 8)
             } else {
                 packedExpertsDir = nil
@@ -4474,10 +4500,25 @@ struct ContentView: View {
 
                             if let packedDir = packedExpertsDir,
                                let fd = ExpertIOThreadPool.shared.getOrOpenLayerFD(layerIndex: l, packedExpertsDir: packedDir) {
+                                let expertSize = Int(loadedLayout?.expert_size ?? 1769472)
+                                let isFP8Layout = loadedLayout?.components.contains { $0.dtype.contains("F8") || $0.name.contains("weight_scale") } ?? false
+
+                                // Dynamic component offset discovery from layout
+                                let compGateW = loadedLayout?.components.first(where: { $0.name.contains("gate_proj") && $0.name.contains("weight") && !$0.name.contains("scale") && !$0.name.contains("bias") })
+                                let compGateS = loadedLayout?.components.first(where: { $0.name.contains("gate_proj") && ($0.name.contains("scale") || $0.name.contains("scales")) })
+                                let compGateB = loadedLayout?.components.first(where: { $0.name.contains("gate_proj") && ($0.name.contains("bias") || $0.name.contains("biases")) })
+
+                                let compUpW = loadedLayout?.components.first(where: { $0.name.contains("up_proj") && $0.name.contains("weight") && !$0.name.contains("scale") && !$0.name.contains("bias") })
+                                let compUpS = loadedLayout?.components.first(where: { $0.name.contains("up_proj") && ($0.name.contains("scale") || $0.name.contains("scales")) })
+                                let compUpB = loadedLayout?.components.first(where: { $0.name.contains("up_proj") && ($0.name.contains("bias") || $0.name.contains("biases")) })
+
+                                let compDownW = loadedLayout?.components.first(where: { $0.name.contains("down_proj") && $0.name.contains("weight") && !$0.name.contains("scale") && !$0.name.contains("bias") })
+                                let compDownS = loadedLayout?.components.first(where: { $0.name.contains("down_proj") && ($0.name.contains("scale") || $0.name.contains("scales")) })
+                                let compDownB = loadedLayout?.components.first(where: { $0.name.contains("down_proj") && ($0.name.contains("bias") || $0.name.contains("biases")) })
+
                                 // 1. Fast parallel pread the 8 active experts directly into unified staging MTLBuffer
                                 var tasks: [ExpertPreadTask] = []
                                 let rawStagingPtr = expertStagingBuffer.contents()
-                                let expertSize = 1769472
                                 for (slot, exp) in activeExperts.enumerated() {
                                     let offset = off_t(exp.id * expertSize)
                                     let dst = rawStagingPtr.advanced(by: slot * expertSize)
@@ -4496,18 +4537,60 @@ struct ContentView: View {
                                     let pk = expert.weight
                                     if pk <= 0.00001 { continue }
                                     let slotOffset = UInt64(slot * expertSize)
-                                    let gWOff = slotOffset + 0
-                                    let gSOff = slotOffset + 524288
-                                    let gBOff = slotOffset + 557056
-                                    let uWOff = slotOffset + 589824
-                                    let uSOff = slotOffset + 1114112
-                                    let uBOff = slotOffset + 1146880
-                                    let dWOff = slotOffset + 1179648
-                                    let dSOff = slotOffset + 1703936
-                                    let dBOff = slotOffset + 1736704
+                                    let gWOff = slotOffset + (compGateW?.offset ?? 0)
+                                    let gSOff = slotOffset + (compGateS?.offset ?? 524288)
+                                    let gBOff = slotOffset + (compGateB?.offset ?? 557056)
+                                    let uWOff = slotOffset + (compUpW?.offset ?? 589824)
+                                    let uSOff = slotOffset + (compUpS?.offset ?? 1114112)
+                                    let uBOff = slotOffset + (compUpB?.offset ?? 1146880)
+                                    let dWOff = slotOffset + (compDownW?.offset ?? 1179648)
+                                    let dSOff = slotOffset + (compDownS?.offset ?? 1703936)
+                                    let dBOff = slotOffset + (compDownB?.offset ?? 1736704)
 
-                                    if let q4GatePipe = q4GateUpPipeline,
-                                       let q4DownPipe = q4DownPipeline {
+                                    if isFP8Layout {
+                                        if let gateSimd = fp8GateUpSimdPipeline ?? fp8GateUpPipeline,
+                                           let downSimd = fp8DownSimdPipeline ?? fp8DownPipeline {
+                                            var gWOffU = gWOff
+                                            var gSOffU = gSOff
+                                            var uWOffU = uWOff
+                                            var uSOffU = uSOff
+                                            var dWOffU = dWOff
+                                            var dSOffU = dSOff
+                                            var hDimVal: UInt32 = UInt32(hiddenDim)
+                                            var interDimVal: UInt32 = UInt32(intermediateDim)
+                                            var pkVal = pk
+
+                                            layerEnc2.setComputePipelineState(gateSimd)
+                                            layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 0)
+                                            layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 1)
+                                            layerEnc2.setBuffer(xNorm2Buffer, offset: 0, index: 2)
+                                            layerEnc2.setBuffer(interBuffer, offset: 0, index: 3)
+                                            layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 4)
+                                            layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 5)
+                                            layerEnc2.setBytes(&gWOffU, length: 8, index: 6)
+                                            layerEnc2.setBytes(&gSOffU, length: 8, index: 7)
+                                            layerEnc2.setBytes(&uWOffU, length: 8, index: 8)
+                                            layerEnc2.setBytes(&uSOffU, length: 8, index: 9)
+                                            layerEnc2.setBytes(&hDimVal, length: 4, index: 10)
+                                            layerEnc2.setBytes(&interDimVal, length: 4, index: 11)
+                                            layerEnc2.dispatchThreadgroups(MTLSize(width: Int(intermediateDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                            layerEnc2.memoryBarrier(scope: .buffers)
+
+                                            layerEnc2.setComputePipelineState(downSimd)
+                                            layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 0)
+                                            layerEnc2.setBuffer(interBuffer, offset: 0, index: 1)
+                                            layerEnc2.setBuffer(hMlpBuffer, offset: 0, index: 2)
+                                            layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 3)
+                                            layerEnc2.setBytes(&dWOffU, length: 8, index: 4)
+                                            layerEnc2.setBytes(&dSOffU, length: 8, index: 5)
+                                            layerEnc2.setBytes(&interDimVal, length: 4, index: 6)
+                                            layerEnc2.setBytes(&hDimVal, length: 4, index: 7)
+                                            layerEnc2.setBytes(&pkVal, length: 4, index: 8)
+                                            layerEnc2.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                            layerEnc2.memoryBarrier(scope: .buffers)
+                                        }
+                                    } else if let q4GatePipe = q4GateUpPipeline,
+                                               let q4DownPipe = q4DownPipeline {
                                         var gWOffU = gWOff
                                         var gSOffU = gSOff
                                         var gBOffU = gBOff
@@ -5413,103 +5496,251 @@ struct ContentView: View {
                         activeCmd.commit()
                         activeCmd.waitUntilCompleted()
 
-                        // Phase B: Expert MLPs for MoE layers (batched across all P tokens in ONE encoder)
+                        // Phase B: Expert MLPs for MoE layers
                         if layer.mlpType != .denseMlp && layer.routerTensor != nil {
-                            guard let moeCmd = commandQueue.makeCommandBuffer(),
-                                  let layerEnc2 = moeCmd.makeComputeCommandEncoder() else { return false }
-
                             let indAllPtr = routerIndicesBuffer_all.contents().bindMemory(to: UInt32.self, capacity: P * 8)
                             let wAllPtr = routerWeightsBuffer_all.contents().bindMemory(to: Float.self, capacity: P * 8)
                             let hasSharedGate = (layer.sharedGateTensor != nil)
                             let sharedScorePtr = sharedScoreBuffer_all.contents().bindMemory(to: Float.self, capacity: P)
 
-                            for p in 0..<P {
-                                let tokenOffset = p * Int(hiddenDim) * MemoryLayout<Float>.stride
+                            if let packedDir = packedExpertsDir,
+                               let fd = ExpertIOThreadPool.shared.getOrOpenLayerFD(layerIndex: l, packedExpertsDir: packedDir) {
+                                let expertSize = Int(loadedLayout?.expert_size ?? 3151872)
+                                let isFP8Layout = loadedLayout?.components.contains { $0.dtype.contains("F8") || $0.name.contains("weight_scale") } ?? false
 
-                                layerEnc2.setComputePipelineState(clearPipeline)
-                                layerEnc2.setBuffer(hMlpBuffer, offset: 0, index: 0)
-                                layerEnc2.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                let compGateW = loadedLayout?.components.first(where: { $0.name.contains("gate_proj") && $0.name.contains("weight") && !$0.name.contains("scale") && !$0.name.contains("bias") })
+                                let compGateS = loadedLayout?.components.first(where: { $0.name.contains("gate_proj") && ($0.name.contains("scale") || $0.name.contains("scales")) })
+                                let compGateB = loadedLayout?.components.first(where: { $0.name.contains("gate_proj") && ($0.name.contains("bias") || $0.name.contains("biases")) })
 
-                                let rBase = p * 8
-                                for i in 0..<8 {
-                                    let expId = Int(indAllPtr[rBase + i])
-                                    let p_k = wAllPtr[rBase + i]
-                                    if p_k <= 0.00001 { continue }
-                                    guard let gateW = layer.expertGateWeights[expId],
-                                          let upW = layer.expertUpWeights[expId],
-                                          let downW = layer.expertDownWeights[expId] else { continue }
+                                let compUpW = loadedLayout?.components.first(where: { $0.name.contains("up_proj") && $0.name.contains("weight") && !$0.name.contains("scale") && !$0.name.contains("bias") })
+                                let compUpS = loadedLayout?.components.first(where: { $0.name.contains("up_proj") && ($0.name.contains("scale") || $0.name.contains("scales")) })
+                                let compUpB = loadedLayout?.components.first(where: { $0.name.contains("up_proj") && ($0.name.contains("bias") || $0.name.contains("biases")) })
 
-                                    let gateS = layer.expertGateScales[expId]
-                                    let gateB = layer.expertGateBiases[expId]
-                                    let upS = layer.expertUpScales[expId]
-                                    let upB = layer.expertUpBiases[expId]
-                                    let downS = layer.expertDownScales[expId]
-                                    let downB = layer.expertDownBiases[expId]
+                                let compDownW = loadedLayout?.components.first(where: { $0.name.contains("down_proj") && $0.name.contains("weight") && !$0.name.contains("scale") && !$0.name.contains("bias") })
+                                let compDownS = loadedLayout?.components.first(where: { $0.name.contains("down_proj") && ($0.name.contains("scale") || $0.name.contains("scales")) })
+                                let compDownB = loadedLayout?.components.first(where: { $0.name.contains("down_proj") && ($0.name.contains("bias") || $0.name.contains("biases")) })
 
-                                    dispatchExpertMlp(
-                                        enc: layerEnc2,
-                                        gateW: gateW,
-                                        gateS: gateS,
-                                        gateB: gateB,
-                                        upW: upW,
-                                        upS: upS,
-                                        upB: upB,
-                                        downW: downW,
-                                        downS: downS,
-                                        downB: downB,
-                                        inBuf: xNorm2Buffer_all,
-                                        interBuf: interBuffer,
-                                        accumBuf: hMlpBuffer,
-                                        inDim: hiddenDim,
-                                        interDim: intermediateDim,
-                                        routingWeight: p_k,
-                                        inOffset: tokenOffset
-                                    )
+                                for p in 0..<P {
+                                    let tokenOffset = p * Int(hiddenDim) * MemoryLayout<Float>.stride
+                                    let rBase = p * 8
+                                    var activeExperts: [(id: Int, weight: Float)] = []
+                                    for i in 0..<8 {
+                                        let expId = Int(indAllPtr[rBase + i])
+                                        let p_k = wAllPtr[rBase + i]
+                                        if p_k > 0.00001 {
+                                            activeExperts.append((id: expId, weight: p_k))
+                                        }
+                                    }
+
+                                    var tasks: [ExpertPreadTask] = []
+                                    let rawStagingPtr = expertStagingBuffer.contents()
+                                    for (slot, exp) in activeExperts.enumerated() {
+                                        let offset = off_t(exp.id * expertSize)
+                                        let dst = rawStagingPtr.advanced(by: slot * expertSize)
+                                        tasks.append(ExpertPreadTask(fd: fd, dst: dst, offset: offset, size: expertSize))
+                                    }
+                                    ExpertIOThreadPool.shared.dispatchSync(tasks: &tasks)
+
+                                    guard let tokenMoeCmd = commandQueue.makeCommandBuffer(),
+                                          let tokenEnc = tokenMoeCmd.makeComputeCommandEncoder() else { continue }
+
+                                    tokenEnc.setComputePipelineState(clearPipeline)
+                                    tokenEnc.setBuffer(hMlpBuffer, offset: 0, index: 0)
+                                    tokenEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+
+                                    for (slot, expert) in activeExperts.enumerated() {
+                                        let pk = expert.weight
+                                        let slotOffset = UInt64(slot * expertSize)
+                                        let gWOff = slotOffset + (compGateW?.offset ?? 0)
+                                        let gSOff = slotOffset + (compGateS?.offset ?? 1048576)
+                                        let gBOff = slotOffset + (compGateB?.offset ?? 0)
+                                        let uWOff = slotOffset + (compUpW?.offset ?? 1049600)
+                                        let uSOff = slotOffset + (compUpS?.offset ?? 2098176)
+                                        let uBOff = slotOffset + (compUpB?.offset ?? 0)
+                                        let dWOff = slotOffset + (compDownW?.offset ?? 2099200)
+                                        let dSOff = slotOffset + (compDownS?.offset ?? 3147776)
+                                        let dBOff = slotOffset + (compDownB?.offset ?? 0)
+
+                                        if isFP8Layout {
+                                            if let gateSimd = fp8GateUpSimdPipeline ?? fp8GateUpPipeline,
+                                               let downSimd = fp8DownSimdPipeline ?? fp8DownPipeline {
+                                                var gWOffU = gWOff
+                                                var gSOffU = gSOff
+                                                var uWOffU = uWOff
+                                                var uSOffU = uSOff
+                                                var dWOffU = dWOff
+                                                var dSOffU = dSOff
+                                                var hDimVal: UInt32 = UInt32(hiddenDim)
+                                                var interDimVal: UInt32 = UInt32(intermediateDim)
+                                                var pkVal = pk
+
+                                                tokenEnc.setComputePipelineState(gateSimd)
+                                                tokenEnc.setBuffer(expertStagingBuffer, offset: 0, index: 0)
+                                                tokenEnc.setBuffer(expertStagingBuffer, offset: 0, index: 1)
+                                                tokenEnc.setBuffer(xNorm2Buffer_all, offset: tokenOffset, index: 2)
+                                                tokenEnc.setBuffer(interBuffer, offset: 0, index: 3)
+                                                tokenEnc.setBuffer(expertStagingBuffer, offset: 0, index: 4)
+                                                tokenEnc.setBuffer(expertStagingBuffer, offset: 0, index: 5)
+                                                tokenEnc.setBytes(&gWOffU, length: 8, index: 6)
+                                                tokenEnc.setBytes(&gSOffU, length: 8, index: 7)
+                                                tokenEnc.setBytes(&uWOffU, length: 8, index: 8)
+                                                tokenEnc.setBytes(&uSOffU, length: 8, index: 9)
+                                                tokenEnc.setBytes(&hDimVal, length: 4, index: 10)
+                                                tokenEnc.setBytes(&interDimVal, length: 4, index: 11)
+                                                tokenEnc.dispatchThreadgroups(MTLSize(width: Int(intermediateDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                                tokenEnc.memoryBarrier(scope: .buffers)
+
+                                                tokenEnc.setComputePipelineState(downSimd)
+                                                tokenEnc.setBuffer(expertStagingBuffer, offset: 0, index: 0)
+                                                tokenEnc.setBuffer(interBuffer, offset: 0, index: 1)
+                                                tokenEnc.setBuffer(hMlpBuffer, offset: 0, index: 2)
+                                                tokenEnc.setBuffer(expertStagingBuffer, offset: 0, index: 3)
+                                                tokenEnc.setBytes(&dWOffU, length: 8, index: 4)
+                                                tokenEnc.setBytes(&dSOffU, length: 8, index: 5)
+                                                tokenEnc.setBytes(&interDimVal, length: 4, index: 6)
+                                                tokenEnc.setBytes(&hDimVal, length: 4, index: 7)
+                                                tokenEnc.setBytes(&pkVal, length: 4, index: 8)
+                                                tokenEnc.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                                tokenEnc.memoryBarrier(scope: .buffers)
+                                            }
+                                        }
+                                    }
+
+                                    if let gateW = layer.sharedGateWeight,
+                                       let upW = layer.sharedUpWeight,
+                                       let downW = layer.sharedDownWeight {
+                                        let sharedW = hasSharedGate ? sharedScorePtr[p] : 1.0
+                                        let gateS = layer.sharedGateScale
+                                        let gateB = layer.sharedGateBias
+                                        let upS = layer.sharedUpScale
+                                        let upB = layer.sharedUpBias
+                                        let downS = layer.sharedDownScale
+                                        let downB = layer.sharedDownBias
+
+                                        dispatchExpertMlp(
+                                            enc: tokenEnc,
+                                            gateW: gateW,
+                                            gateS: gateS,
+                                            gateB: gateB,
+                                            upW: upW,
+                                            upS: upS,
+                                            upB: upB,
+                                            downW: downW,
+                                            downS: downS,
+                                            downB: downB,
+                                            inBuf: xNorm2Buffer_all,
+                                            interBuf: interBuffer,
+                                            accumBuf: hMlpBuffer,
+                                            inDim: hiddenDim,
+                                            interDim: intermediateDim,
+                                            routingWeight: sharedW,
+                                            inOffset: tokenOffset
+                                        )
+                                    }
+
+                                    tokenEnc.setComputePipelineState(addPipeline)
+                                    tokenEnc.setBuffer(hMidBuffer_all, offset: tokenOffset, index: 0)
+                                    tokenEnc.setBuffer(hMlpBuffer, offset: 0, index: 1)
+                                    tokenEnc.setBuffer(nextHBuf, offset: tokenOffset, index: 2)
+                                    tokenEnc.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 3)
+                                    tokenEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), addPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+
+                                    tokenEnc.endEncoding()
+                                    tokenMoeCmd.commit()
+                                    tokenMoeCmd.waitUntilCompleted()
+                                }
+                            } else {
+                                guard let moeCmd = commandQueue.makeCommandBuffer(),
+                                      let layerEnc2 = moeCmd.makeComputeCommandEncoder() else { return false }
+
+                                for p in 0..<P {
+                                    let tokenOffset = p * Int(hiddenDim) * MemoryLayout<Float>.stride
+
+                                    layerEnc2.setComputePipelineState(clearPipeline)
+                                    layerEnc2.setBuffer(hMlpBuffer, offset: 0, index: 0)
+                                    layerEnc2.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+
+                                    let rBase = p * 8
+                                    for i in 0..<8 {
+                                        let expId = Int(indAllPtr[rBase + i])
+                                        let p_k = wAllPtr[rBase + i]
+                                        if p_k <= 0.00001 { continue }
+                                        guard let gateW = layer.expertGateWeights[expId],
+                                              let upW = layer.expertUpWeights[expId],
+                                              let downW = layer.expertDownWeights[expId] else { continue }
+
+                                        let gateS = layer.expertGateScales[expId]
+                                        let gateB = layer.expertGateBiases[expId]
+                                        let upS = layer.expertUpScales[expId]
+                                        let upB = layer.expertUpBiases[expId]
+                                        let downS = layer.expertDownScales[expId]
+                                        let downB = layer.expertDownBiases[expId]
+
+                                        dispatchExpertMlp(
+                                            enc: layerEnc2,
+                                            gateW: gateW,
+                                            gateS: gateS,
+                                            gateB: gateB,
+                                            upW: upW,
+                                            upS: upS,
+                                            upB: upB,
+                                            downW: downW,
+                                            downS: downS,
+                                            downB: downB,
+                                            inBuf: xNorm2Buffer_all,
+                                            interBuf: interBuffer,
+                                            accumBuf: hMlpBuffer,
+                                            inDim: hiddenDim,
+                                            interDim: intermediateDim,
+                                            routingWeight: p_k,
+                                            inOffset: tokenOffset
+                                        )
+                                    }
+
+                                    if let gateW = layer.sharedGateWeight,
+                                       let upW = layer.sharedUpWeight,
+                                       let downW = layer.sharedDownWeight {
+                                        let sharedW = hasSharedGate ? sharedScorePtr[p] : 1.0
+                                        let gateS = layer.sharedGateScale
+                                        let gateB = layer.sharedGateBias
+                                        let upS = layer.sharedUpScale
+                                        let upB = layer.sharedUpBias
+                                        let downS = layer.sharedDownScale
+                                        let downB = layer.sharedDownBias
+
+                                        dispatchExpertMlp(
+                                            enc: layerEnc2,
+                                            gateW: gateW,
+                                            gateS: gateS,
+                                            gateB: gateB,
+                                            upW: upW,
+                                            upS: upS,
+                                            upB: upB,
+                                            downW: downW,
+                                            downS: downS,
+                                            downB: downB,
+                                            inBuf: xNorm2Buffer_all,
+                                            interBuf: interBuffer,
+                                            accumBuf: hMlpBuffer,
+                                            inDim: hiddenDim,
+                                            interDim: intermediateDim,
+                                            routingWeight: sharedW,
+                                            inOffset: tokenOffset
+                                        )
+                                    }
+
+                                    layerEnc2.setComputePipelineState(addPipeline)
+                                    layerEnc2.setBuffer(hMidBuffer_all, offset: tokenOffset, index: 0)
+                                    layerEnc2.setBuffer(hMlpBuffer, offset: 0, index: 1)
+                                    layerEnc2.setBuffer(nextHBuf, offset: tokenOffset, index: 2)
+                                    layerEnc2.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 3)
+                                    layerEnc2.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), addPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                                 }
 
-                                if let gateW = layer.sharedGateWeight,
-                                   let upW = layer.sharedUpWeight,
-                                   let downW = layer.sharedDownWeight {
-                                    let sharedW = hasSharedGate ? sharedScorePtr[p] : 1.0
-                                    let gateS = layer.sharedGateScale
-                                    let gateB = layer.sharedGateBias
-                                    let upS = layer.sharedUpScale
-                                    let upB = layer.sharedUpBias
-                                    let downS = layer.sharedDownScale
-                                    let downB = layer.sharedDownBias
-
-                                    dispatchExpertMlp(
-                                        enc: layerEnc2,
-                                        gateW: gateW,
-                                        gateS: gateS,
-                                        gateB: gateB,
-                                        upW: upW,
-                                        upS: upS,
-                                        upB: upB,
-                                        downW: downW,
-                                        downS: downS,
-                                        downB: downB,
-                                        inBuf: xNorm2Buffer_all,
-                                        interBuf: interBuffer,
-                                        accumBuf: hMlpBuffer,
-                                        inDim: hiddenDim,
-                                        interDim: intermediateDim,
-                                        routingWeight: sharedW,
-                                        inOffset: tokenOffset
-                                    )
-                                }
-
-                                layerEnc2.setComputePipelineState(addPipeline)
-                                layerEnc2.setBuffer(hMidBuffer_all, offset: tokenOffset, index: 0)
-                                layerEnc2.setBuffer(hMlpBuffer, offset: 0, index: 1)
-                                layerEnc2.setBuffer(nextHBuf, offset: tokenOffset, index: 2)
-                                layerEnc2.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 3)
-                                layerEnc2.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), addPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                layerEnc2.endEncoding()
+                                moeCmd.commit()
+                                moeCmd.waitUntilCompleted()
                             }
-
-                            layerEnc2.endEncoding()
-                            moeCmd.commit()
-                            moeCmd.waitUntilCompleted()
                         } // end loop over tokens p
 
                         // Swap ping-pong hidden buffers for next layer
@@ -5597,13 +5828,24 @@ struct ContentView: View {
             var accumulatedDecodedText = ""
             var lastUIUpdateTime = CFAbsoluteTimeGetCurrent()
 
-            // Ingest prompt tokens into KV-cache and recurrent states via Layer-Wise streaming prefill
+            // Ingest prompt tokens into KV-cache and recurrent states
             let promptCount = promptTokenIds.count - 1
             if promptCount > 0 {
-                let prefillTokens = Array(promptTokenIds.prefix(promptCount))
-                let ok = runLayerWisePrefill(promptTokens: prefillTokens)
-                if !ok { return }
-                currentStep = UInt32(promptCount)
+                if packedExpertsDir != nil {
+                    // FlashMoE mode: sequential token ingestion to execute POSIX pread expert loads and accurate recurrent states
+                    for p in 0..<promptCount {
+                        if Task.isCancelled { return }
+                        let tok = promptTokenIds[p]
+                        let ok = runTokenForward(tokenId: tok, step: currentStep, computeLogits: false, wait: true)
+                        if !ok { return }
+                        currentStep += 1
+                    }
+                } else {
+                    let prefillTokens = Array(promptTokenIds.prefix(promptCount))
+                    let ok = runLayerWisePrefill(promptTokens: prefillTokens)
+                    if !ok { return }
+                    currentStep = UInt32(promptCount)
+                }
 
                 // Flush prefill expert working set and re-pin dense backbone so autoregressive decoding starts with clean RAM
                 if budgetMode != .unrestricted {

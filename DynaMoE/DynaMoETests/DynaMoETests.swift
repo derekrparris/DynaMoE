@@ -984,20 +984,318 @@ final class DynaMoETests: XCTestCase {
         XCTAssertTrue(nextTurn.hasSuffix("<|im_start|>assistant\n"))
     }
 
-    func testRepackOrnith4Bit() throws {
-        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--ornith-ai--Ornith-1.5-35B-A3B-MLX-4bit/snapshots/19504d912fa8fc7622bf6b1de3db5d5d890b1f02"
+    func testRepackOrnithFP8() throws {
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--ornith-ai--Ornith-1.5-35B-A3B-FP8/snapshots/0e048080ccd0ccf4296bfea5638036c196dccc0c"
         guard FileManager.default.fileExists(atPath: snapshotDir) else {
-            print("Ornith snapshot not found, skipping repack test.")
+            print("Ornith FP8 snapshot not found, skipping repack test.")
             return
         }
         let srcUrl = URL(fileURLWithPath: snapshotDir)
         let repacker = ExpertRepacker.shared
-        print("Starting ExpertRepacker on Ornith 1.5 35B A3B MLX 4bit...")
+        print("🚀 Starting ExpertRepacker on Ornith 1.5 35B A3B FP8...")
+        let t0 = CFAbsoluteTimeGetCurrent()
         try repacker.repackSafetensors(sourceDir: srcUrl, outputDir: srcUrl) { p, msg in
             print(String(format: "[REPACK PROGRESS] %.0f%%: %@", p * 100, msg))
         }
+        let elapsed = CFAbsoluteTimeGetCurrent() - t0
+        print(String(format: "🎉 Repacking completed in %.2f s!", elapsed))
         XCTAssertTrue(FileManager.default.fileExists(atPath: srcUrl.appendingPathComponent("model_weights.bin").path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: srcUrl.appendingPathComponent("packed_experts/layout.json").path))
+    }
+
+    func testOrnithFlashMoEFP8Forward() throws {
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--ornith-ai--Ornith-1.5-35B-A3B-FP8/snapshots/0e048080ccd0ccf4296bfea5638036c196dccc0c"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            print("Snapshot not found, skipping.")
+            return
+        }
+        let packedDir = URL(fileURLWithPath: snapshotDir).appendingPathComponent("packed_experts")
+        guard FileManager.default.fileExists(atPath: packedDir.appendingPathComponent("layout.json").path) else {
+            print("Ornith FP8 is not yet repacked. Running testRepackOrnithFP8 first...")
+            try testRepackOrnithFP8()
+            return
+        }
+
+        print("🔍 [DIAGNOSTIC] Loading Ornith 1.5 35B FlashMoE FP8 from \(snapshotDir)...")
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let engine = try DynaMoeEngine(filePath: snapshotDir)
+        let summary = try engine.getSummary()
+        let tLoad = CFAbsoluteTimeGetCurrent() - t0
+        print(String(format: "✅ [DIAGNOSTIC] Model parsed in %.3f s. Found %d shards, %d tensors, maxExpertId=%d", tLoad, summary.shards.count, summary.tensors.count, summary.maxExpertId))
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+
+        var buffers: [UInt32: MTLBuffer] = [:]
+        var totalMappedBytes: Int = 0
+        for shard in summary.shards {
+            let address = UInt(shard.baseAddress)
+            guard let ptr = UnsafeMutableRawPointer(bitPattern: address) else { continue }
+            let len = Int(shard.length)
+            if let buf = device.makeBuffer(bytesNoCopy: ptr, length: len, options: .storageModeShared, deallocator: nil) {
+                buffers[shard.index] = buf
+                totalMappedBytes += len
+            }
+        }
+        print(String(format: "✅ [DIAGNOSTIC] Mapped %.2f GB across %d shards into Metal buffers.", Double(totalMappedBytes) / (1024*1024*1024), summary.shards.count))
+
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+        print("✅ [DIAGNOSTIC] Metal compute pipelines initialized.")
+
+        guard let cmdQueue = device.makeCommandQueue() else {
+            XCTFail("No Metal command queue")
+            return
+        }
+
+        let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir))
+        let cachedLayers = inference.buildCachedLayers(summary: summary, config: config, targetLayerCount: 40)
+        print("✅ [DIAGNOSTIC] Built \(cachedLayers.count) cached layers.")
+
+        let hiddenDim = 2048
+        let intermediateDim = 512
+        let vocabSize = 248320
+
+        // Parse layout.json
+        let layoutData = try Data(contentsOf: packedDir.appendingPathComponent("layout.json"))
+        let layout = try JSONDecoder().decode(FlashMoELayout.self, from: layoutData)
+        let expertSize = Int(layout.expert_size)
+        print(String(format: "✅ [DIAGNOSTIC] Layout loaded: %d layers, %d experts/layer, expert_size=%d bytes", layout.num_layers, layout.num_experts, expertSize))
+
+        // Find component offsets
+        let compGateW = layout.components.first(where: { $0.name.contains("gate_proj") && $0.name.contains("weight") })?.offset ?? 0
+        let compGateS = layout.components.first(where: { $0.name.contains("gate_proj") && $0.name.contains("scale") })?.offset ?? 1048576
+        let compUpW = layout.components.first(where: { $0.name.contains("up_proj") && $0.name.contains("weight") })?.offset ?? 1049600
+        let compUpS = layout.components.first(where: { $0.name.contains("up_proj") && $0.name.contains("scale") })?.offset ?? 2098176
+        let compDownW = layout.components.first(where: { $0.name.contains("down_proj") && $0.name.contains("weight") })?.offset ?? 2099200
+        let compDownS = layout.components.first(where: { $0.name.contains("down_proj") && $0.name.contains("scale") })?.offset ?? 3147776
+
+        // Allocate scratch buffers
+        guard let h0Buf = device.makeBuffer(length: hiddenDim * 4, options: .storageModeShared),
+              let h1Buf = device.makeBuffer(length: hiddenDim * 4, options: .storageModeShared),
+              let xNorm1Buf = device.makeBuffer(length: hiddenDim * 4, options: .storageModeShared),
+              let rIdxBuf = device.makeBuffer(length: 8 * 4, options: .storageModeShared),
+              let rWBuf = device.makeBuffer(length: 8 * 4, options: .storageModeShared),
+              let interBuf = device.makeBuffer(length: intermediateDim * 4, options: .storageModeShared),
+              let stagingBuf = device.makeBuffer(length: 8 * expertSize, options: .storageModeShared),
+              let hMlpBuf = device.makeBuffer(length: hiddenDim * 4, options: .storageModeShared) else {
+            XCTFail("Scratch buffer alloc failed")
+            return
+        }
+
+        let pool = ExpertIOThreadPool.shared
+        pool.initialize(numThreads: 8)
+
+        // Initialize input
+        let h0Ptr = h0Buf.contents().bindMemory(to: Float.self, capacity: hiddenDim)
+        for i in 0..<hiddenDim { h0Ptr[i] = Float.random(in: -0.1...0.1) }
+
+        var hCurr = h0Buf
+        var hNext = h1Buf
+
+        let numTokensToBenchmark = 5
+        var logOutput = "=== Ornith 1.5 35B FlashMoE FP8 Forward Benchmark ===\n"
+
+        for tokenIdx in 0..<numTokensToBenchmark {
+            let tTokenStart = CFAbsoluteTimeGetCurrent()
+            var totalAttnMs: Double = 0
+            var totalRouterWaitMs: Double = 0
+            var totalIoMs: Double = 0
+            var totalMoEMs: Double = 0
+
+            for l in 0..<cachedLayers.count {
+                let layer = cachedLayers[l]
+                let tLayerStart = CFAbsoluteTimeGetCurrent()
+
+                // Phase A: Layernorm + Attention + Router
+                guard let cmdA = cmdQueue.makeCommandBuffer(),
+                      let encA = cmdA.makeComputeCommandEncoder() else { break }
+
+                if let rmsPipe = inference.rmsnormPipeline,
+                   let norm1 = layer.norm1Tensor,
+                   let norm1Raw = buffers[norm1.shardIndex] {
+                    var n1Off = norm1.offsetStart
+                    var hDimU: UInt32 = UInt32(hiddenDim)
+                    var eps: Float = 1e-6
+                    encA.setComputePipelineState(rmsPipe)
+                    encA.setBuffer(hCurr, offset: 0, index: 0)
+                    encA.setBuffer(xNorm1Buf, offset: 0, index: 1)
+                    encA.setBuffer(norm1Raw, offset: 0, index: 2)
+                    encA.setBytes(&n1Off, length: 8, index: 3)
+                    encA.setBytes(&hDimU, length: 4, index: 4)
+                    encA.setBytes(&eps, length: 4, index: 5)
+                    encA.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, rmsPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                }
+
+                if let router = layer.routerTensor,
+                   let routerRaw = buffers[router.shardIndex] {
+                    if let routerScale = layer.routerScale,
+                       let rScaleRaw = buffers[routerScale.shardIndex],
+                       let q8RouterPipe = inference.routerQ8Pipeline {
+                        var rOff = router.offsetStart
+                        var sOff = routerScale.offsetStart
+                        var bOff: UInt64 = layer.routerBias?.offsetStart ?? 0
+                        let bRaw = (layer.routerBias != nil) ? buffers[layer.routerBias!.shardIndex] : rScaleRaw
+                        var hDimU: UInt32 = UInt32(hiddenDim)
+                        var nExp: UInt32 = 256
+                        var kVal: UInt32 = 8
+                        var grp: UInt32 = 64
+                        encA.setComputePipelineState(q8RouterPipe)
+                        encA.setBuffer(routerRaw, offset: 0, index: 0)
+                        encA.setBuffer(rScaleRaw, offset: 0, index: 1)
+                        encA.setBuffer(bRaw, offset: 0, index: 2)
+                        encA.setBuffer(xNorm1Buf, offset: 0, index: 3)
+                        encA.setBuffer(rIdxBuf, offset: 0, index: 4)
+                        encA.setBuffer(rWBuf, offset: 0, index: 5)
+                        encA.setBytes(&rOff, length: 8, index: 6)
+                        encA.setBytes(&sOff, length: 8, index: 7)
+                        encA.setBytes(&bOff, length: 8, index: 8)
+                        encA.setBytes(&hDimU, length: 4, index: 9)
+                        encA.setBytes(&nExp, length: 4, index: 10)
+                        encA.setBytes(&kVal, length: 4, index: 11)
+                        encA.setBytes(&grp, length: 4, index: 12)
+                        encA.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                    } else if let routerPipe = inference.routerPipeline {
+                        var rOff = router.offsetStart
+                        var hDimU: UInt32 = UInt32(hiddenDim)
+                        var nExp: UInt32 = 256
+                        var kVal: UInt32 = 8
+                        encA.setComputePipelineState(routerPipe)
+                        encA.setBuffer(routerRaw, offset: 0, index: 0)
+                        encA.setBuffer(xNorm1Buf, offset: 0, index: 1)
+                        encA.setBuffer(rIdxBuf, offset: 0, index: 2)
+                        encA.setBuffer(rWBuf, offset: 0, index: 3)
+                        encA.setBytes(&rOff, length: 8, index: 4)
+                        encA.setBytes(&hDimU, length: 4, index: 5)
+                        encA.setBytes(&nExp, length: 4, index: 6)
+                        encA.setBytes(&kVal, length: 4, index: 7)
+                        encA.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                    }
+                }
+
+                encA.endEncoding()
+                cmdA.commit()
+
+                let tWait0 = CFAbsoluteTimeGetCurrent()
+                cmdA.waitUntilCompleted()
+                let tWaitElapsed = (CFAbsoluteTimeGetCurrent() - tWait0) * 1000.0
+                totalRouterWaitMs += tWaitElapsed
+                totalAttnMs += (CFAbsoluteTimeGetCurrent() - tLayerStart) * 1000.0 - tWaitElapsed
+
+                let indPtr = rIdxBuf.contents().bindMemory(to: UInt32.self, capacity: 8)
+                let wPtr = rWBuf.contents().bindMemory(to: Float.self, capacity: 8)
+                var activeExp: [(id: Int, w: Float)] = []
+                for i in 0..<8 {
+                    activeExp.append((id: Int(indPtr[i]), w: wPtr[i]))
+                }
+
+                // Phase B: 8-Thread Parallel POSIX Pread
+                guard let fd = pool.getOrOpenLayerFD(layerIndex: l, packedExpertsDir: packedDir) else {
+                    continue
+                }
+                var tasks: [ExpertPreadTask] = []
+                let rawStagingPtr = stagingBuf.contents()
+                for (slot, exp) in activeExp.enumerated() {
+                    let offset = off_t(exp.id * expertSize)
+                    let dst = rawStagingPtr.advanced(by: slot * expertSize)
+                    tasks.append(ExpertPreadTask(fd: fd, dst: dst, offset: offset, size: expertSize))
+                }
+                let tIo0 = CFAbsoluteTimeGetCurrent()
+                pool.dispatchSync(tasks: &tasks)
+                let tIoElapsed = (CFAbsoluteTimeGetCurrent() - tIo0) * 1000.0
+                totalIoMs += tIoElapsed
+
+                // Phase C: SIMD FP8 GPU Compute
+                guard let cmdB = cmdQueue.makeCommandBuffer(), let encB = cmdB.makeComputeCommandEncoder() else { break }
+
+                if let clearPipe = inference.clearPipeline {
+                    encB.setComputePipelineState(clearPipe)
+                    encB.setBuffer(hMlpBuf, offset: 0, index: 0)
+                    encB.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, clearPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                }
+
+                for (slot, exp) in activeExp.enumerated() {
+                    let pk = exp.w
+                    let slotOffset = UInt64(slot * expertSize)
+                    let gWOff = slotOffset + compGateW
+                    let gSOff = slotOffset + compGateS
+                    let uWOff = slotOffset + compUpW
+                    let uSOff = slotOffset + compUpS
+                    let dWOff = slotOffset + compDownW
+                    let dSOff = slotOffset + compDownS
+
+                    if let fp8GatePipe = inference.fp8GateUpSimdPipeline ?? inference.fp8GateUpPipeline,
+                       let fp8DownPipe = inference.fp8DownSimdPipeline ?? inference.fp8DownPipeline {
+                        var gWOffU = gWOff
+                        var gSOffU = gSOff
+                        var uWOffU = uWOff
+                        var uSOffU = uSOff
+                        var dWOffU = dWOff
+                        var dSOffU = dSOff
+                        var hDimVal: UInt32 = UInt32(hiddenDim)
+                        var interDimVal: UInt32 = UInt32(intermediateDim)
+                        var pkVal = pk
+
+                        encB.setComputePipelineState(fp8GatePipe)
+                        encB.setBuffer(stagingBuf, offset: 0, index: 0)
+                        encB.setBuffer(stagingBuf, offset: 0, index: 1)
+                        encB.setBuffer(xNorm1Buf, offset: 0, index: 2)
+                        encB.setBuffer(interBuf, offset: 0, index: 3)
+                        encB.setBuffer(stagingBuf, offset: 0, index: 4)
+                        encB.setBuffer(stagingBuf, offset: 0, index: 5)
+                        encB.setBytes(&gWOffU, length: 8, index: 6)
+                        encB.setBytes(&gSOffU, length: 8, index: 7)
+                        encB.setBytes(&uWOffU, length: 8, index: 8)
+                        encB.setBytes(&uSOffU, length: 8, index: 9)
+                        encB.setBytes(&hDimVal, length: 4, index: 10)
+                        encB.setBytes(&interDimVal, length: 4, index: 11)
+                        encB.dispatchThreadgroups(MTLSize(width: intermediateDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                        encB.memoryBarrier(scope: .buffers)
+
+                        encB.setComputePipelineState(fp8DownPipe)
+                        encB.setBuffer(stagingBuf, offset: 0, index: 0)
+                        encB.setBuffer(interBuf, offset: 0, index: 1)
+                        encB.setBuffer(hMlpBuf, offset: 0, index: 2)
+                        encB.setBuffer(stagingBuf, offset: 0, index: 3)
+                        encB.setBytes(&dWOffU, length: 8, index: 4)
+                        encB.setBytes(&dSOffU, length: 8, index: 5)
+                        encB.setBytes(&interDimVal, length: 4, index: 6)
+                        encB.setBytes(&hDimVal, length: 4, index: 7)
+                        encB.setBytes(&pkVal, length: 4, index: 8)
+                        encB.dispatchThreadgroups(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                        encB.memoryBarrier(scope: .buffers)
+                    }
+                }
+
+                encB.endEncoding()
+                cmdB.commit()
+                let tMoeWait0 = CFAbsoluteTimeGetCurrent()
+                cmdB.waitUntilCompleted()
+                let tMoeElapsed = (CFAbsoluteTimeGetCurrent() - tMoeWait0) * 1000.0
+                totalMoEMs += tMoeElapsed
+
+                if tokenIdx == 0 && (l == 0 || l == 1 || l == 2 || l == 39) {
+                    let logLine = String(format: "  Layer %2d: IO(pread 8 exps)=%.2f ms, RouterWait=%.2f ms, MoEGPU=%.2f ms, ActiveExp=%@\n", l, tIoElapsed, tWaitElapsed, tMoeElapsed, activeExp.map { "\($0.id)" }.joined(separator: ","))
+                    logOutput += logLine
+                    print(logLine)
+                }
+
+                let tmp = hCurr
+                hCurr = hNext
+                hNext = tmp
+            }
+
+            let tTotalToken = (CFAbsoluteTimeGetCurrent() - tTokenStart) * 1000.0
+            let tps = 1000.0 / tTotalToken
+            let line = String(format: "Token %d: Total=%.2f ms (%.1f tok/s) | Attn=%.2f ms, RouterWait=%.2f ms, IO(pread)=%.2f ms, MoEGPU=%.2f ms\n", tokenIdx + 1, tTotalToken, tps, totalAttnMs, totalRouterWaitMs, totalIoMs, totalMoEMs)
+            logOutput += line
+            print(line)
+        }
+
+        try? logOutput.write(toFile: "/tmp/dynamoe_ornith_flashmoe_benchmark.log", atomically: true, encoding: .utf8)
+        print("🎉 [DIAGNOSTIC] Ornith FlashMoE FP8 diagnostic run complete. Report saved to /tmp/dynamoe_ornith_flashmoe_benchmark.log")
     }
 }
 
