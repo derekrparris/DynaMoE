@@ -681,6 +681,7 @@ struct ContentView: View {
     @State private var pagingStatusMessage: String? = nil
 
     // Multi-Session Chat UI State (Antigravity Style)
+    @ObservedObject private var zoomManager = AppZoomManager.shared
     @ObservedObject var localModelManager: LocalModelManager = LocalModelManager.shared
     @State private var activeLoadedModelPath: String? = nil
     @State private var isLoadingModel: Bool = false
@@ -812,32 +813,17 @@ struct ContentView: View {
     }
 
     var body: some View {
-        NavigationSplitView(columnVisibility: $columnVisibility) {
-            SidebarView(
-                sessions: $sessions,
-                selectedSessionId: $selectedSessionId,
-                isSettingsPresented: $isSettingsPresented,
-                modelName: activeModelDisplayName,
-                metalStatus: metalStatus,
-                currentRssGB: currentRssGB,
-                isGenerating: isGeneratingText,
-                onNewChat: {
-                    let defModel = localModelManager.getDefaultOrFirstModel()
-                    let newSession = ChatSession(
-                        title: "New Chat",
-                        selectedModelId: defModel?.id,
-                        selectedModelName: defModel?.displayName,
-                        selectedModelPath: defModel?.snapshotPath
-                    )
-                    sessions.insert(newSession, at: 0)
-                    selectedSessionId = newSession.id
-                    if let model = defModel, activeLoadedModelPath != model.snapshotPath {
-                        switchModel(to: model)
-                    }
-                },
-                onDeleteSession: { id in
-                    sessions.removeAll(where: { $0.id == id })
-                    if sessions.isEmpty {
+        ZStack {
+            NavigationSplitView(columnVisibility: $columnVisibility) {
+                SidebarView(
+                    sessions: $sessions,
+                    selectedSessionId: $selectedSessionId,
+                    isSettingsPresented: $isSettingsPresented,
+                    modelName: activeModelDisplayName,
+                    metalStatus: metalStatus,
+                    currentRssGB: currentRssGB,
+                    isGenerating: isGeneratingText,
+                    onNewChat: {
                         let defModel = localModelManager.getDefaultOrFirstModel()
                         let newSession = ChatSession(
                             title: "New Chat",
@@ -845,64 +831,102 @@ struct ContentView: View {
                             selectedModelName: defModel?.displayName,
                             selectedModelPath: defModel?.snapshotPath
                         )
-                        sessions.append(newSession)
+                        sessions.insert(newSession, at: 0)
                         selectedSessionId = newSession.id
-                    } else if selectedSessionId == id {
-                        selectedSessionId = sessions.first?.id
+                        if let model = defModel, activeLoadedModelPath != model.snapshotPath {
+                            switchModel(to: model)
+                        }
+                    },
+                    onDeleteSession: { id in
+                        sessions.removeAll(where: { $0.id == id })
+                        if sessions.isEmpty {
+                            let defModel = localModelManager.getDefaultOrFirstModel()
+                            let newSession = ChatSession(
+                                title: "New Chat",
+                                selectedModelId: defModel?.id,
+                                selectedModelName: defModel?.displayName,
+                                selectedModelPath: defModel?.snapshotPath
+                            )
+                            sessions.append(newSession)
+                            selectedSessionId = newSession.id
+                        } else if selectedSessionId == id {
+                            selectedSessionId = sessions.first?.id
+                        }
+                    }
+                )
+                .navigationSplitViewColumnWidth(min: max(180, 220 * zoomManager.zoomScale), ideal: max(210, 260 * zoomManager.zoomScale), max: max(260, 320 * zoomManager.zoomScale))
+            } detail: {
+                ChatDetailView(
+                    session: activeSessionBinding,
+                    promptText: $chatPromptText,
+                    isGenerating: isGeneratingText,
+                    isStreamingOffDisk: isStreamingOffDisk,
+                    generationSpeed: generationSpeedTokPerSec,
+                    generationTokens: generationTotalTokens,
+                    modelName: activeModelDisplayName,
+                    tokenizer: tokenizer,
+                    supportsThinking: activeModelSupportsThinking,
+                    isThinkingEnabled: isThinkingEnabledForActiveSession,
+                    isAgentToolsEnabled: isAgentToolsEnabledForActiveSession,
+                    onSendMessage: { prompt in
+                        handleSendMessage(prompt)
+                    },
+                    onStopGeneration: {
+                        stopAutoregressiveGeneration()
+                    },
+                    onSelectPromptStarter: { starter in
+                        chatPromptText = starter
+                        handleSendMessage(starter)
+                        chatPromptText = ""
+                    },
+                    onSelectDiscoveredModel: { dm in
+                        switchModel(to: dm)
+                    },
+                    onOpenSettings: {
+                        openSettingsWindow()
+                    },
+                    onToggleThinking: { enabled in
+                        defaultThinkingEnabled = enabled
+                        if let sid = selectedSessionId ?? sessions.first?.id,
+                           let idx = sessions.firstIndex(where: { $0.id == sid }) {
+                            sessions[idx].isThinkingEnabled = enabled
+                        }
+                    },
+                    onToggleAgentTools: { enabled in
+                        defaultAgentToolsEnabled = enabled
+                        if let sid = selectedSessionId ?? sessions.first?.id,
+                           let idx = sessions.firstIndex(where: { $0.id == sid }) {
+                            sessions[idx].isAgentToolsEnabled = enabled
+                        }
+                    },
+                    onToggleSidebar: {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            columnVisibility = (columnVisibility == .detailOnly) ? .all : .detailOnly
+                        }
+                    }
+                )
+            }
+
+            if let hud = zoomManager.hudText {
+                VStack {
+                    Spacer()
+                    HStack {
+                        Spacer()
+                        Text("Zoom: \(hud)")
+                            .font(.system(size: 13, weight: .semibold, design: .rounded))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 7)
+                            .background(Color.black.opacity(0.8))
+                            .clipShape(Capsule())
+                            .shadow(color: Color.black.opacity(0.2), radius: 6, x: 0, y: 3)
+                            .padding(20)
+                            .transition(.opacity.combined(with: .scale(scale: 0.9)))
                     }
                 }
-            )
-            .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 320)
-        } detail: {
-            ChatDetailView(
-                session: activeSessionBinding,
-                promptText: $chatPromptText,
-                isGenerating: isGeneratingText,
-                isStreamingOffDisk: isStreamingOffDisk,
-                generationSpeed: generationSpeedTokPerSec,
-                generationTokens: generationTotalTokens,
-                modelName: activeModelDisplayName,
-                tokenizer: tokenizer,
-                supportsThinking: activeModelSupportsThinking,
-                isThinkingEnabled: isThinkingEnabledForActiveSession,
-                isAgentToolsEnabled: isAgentToolsEnabledForActiveSession,
-                onSendMessage: { prompt in
-                    handleSendMessage(prompt)
-                },
-                onStopGeneration: {
-                    stopAutoregressiveGeneration()
-                },
-                onSelectPromptStarter: { starter in
-                    chatPromptText = starter
-                    handleSendMessage(starter)
-                    chatPromptText = ""
-                },
-                onSelectDiscoveredModel: { dm in
-                    switchModel(to: dm)
-                },
-                onOpenSettings: {
-                    openSettingsWindow()
-                },
-                onToggleThinking: { enabled in
-                    defaultThinkingEnabled = enabled
-                    if let sid = selectedSessionId ?? sessions.first?.id,
-                       let idx = sessions.firstIndex(where: { $0.id == sid }) {
-                        sessions[idx].isThinkingEnabled = enabled
-                    }
-                },
-                onToggleAgentTools: { enabled in
-                    defaultAgentToolsEnabled = enabled
-                    if let sid = selectedSessionId ?? sessions.first?.id,
-                       let idx = sessions.firstIndex(where: { $0.id == sid }) {
-                        sessions[idx].isAgentToolsEnabled = enabled
-                    }
-                },
-                onToggleSidebar: {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        columnVisibility = (columnVisibility == .detailOnly) ? .all : .detailOnly
-                    }
-                }
-            )
+                .allowsHitTesting(false)
+                .animation(.easeInOut(duration: 0.2), value: zoomManager.hudText)
+            }
         }
         .onChange(of: isSettingsPresented) { isPresented in
             if isPresented {

@@ -6,6 +6,7 @@
 import SwiftUI
 
 struct SidebarView: View {
+    @ObservedObject private var zoomManager = AppZoomManager.shared
     @Binding var sessions: [ChatSession]
     @Binding var selectedSessionId: UUID?
     @Binding var isSettingsPresented: Bool
@@ -23,7 +24,7 @@ struct SidebarView: View {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 8) {
                     Image(systemName: "circle.hexagongrid.circle.fill")
-                        .font(.title2)
+                        .font(.system(size: max(15, 20 * zoomManager.zoomScale)))
                         .foregroundStyle(
                             LinearGradient(
                                 colors: [.purple, .indigo, .blue],
@@ -33,8 +34,7 @@ struct SidebarView: View {
                         )
                     
                     Text("DynaMoE")
-                        .font(.headline)
-                        .fontWeight(.bold)
+                        .font(.system(size: max(13, 16 * zoomManager.zoomScale), weight: .bold))
                     
                     Spacer()
                 }
@@ -45,9 +45,9 @@ struct SidebarView: View {
                 Button(action: onNewChat) {
                     HStack(spacing: 8) {
                         Image(systemName: "square.and.pencil")
-                            .font(.system(size: 13, weight: .semibold))
+                            .font(.system(size: max(10, 13 * zoomManager.zoomScale), weight: .semibold))
                         Text("New Chat")
-                            .font(.system(size: 13, weight: .medium))
+                            .font(.system(size: max(10, 13 * zoomManager.zoomScale), weight: .medium))
                         Spacer()
                     }
                     .padding(.horizontal, 10)
@@ -69,10 +69,10 @@ struct SidebarView: View {
                     if sessions.isEmpty {
                         VStack(spacing: 8) {
                             Image(systemName: "bubble.left.and.bubble.right")
-                                .font(.title3)
+                                .font(.system(size: max(14, 18 * zoomManager.zoomScale)))
                                 .foregroundColor(.secondary.opacity(0.6))
                             Text("No Conversations Yet")
-                                .font(.caption)
+                                .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
                                 .foregroundColor(.secondary)
                         }
                         .frame(maxWidth: .infinity)
@@ -82,6 +82,7 @@ struct SidebarView: View {
                             SidebarSessionRow(
                                 session: session,
                                 isSelected: session.id == selectedSessionId,
+                                zoomScale: zoomManager.zoomScale,
                                 onSelect: {
                                     selectedSessionId = session.id
                                 },
@@ -108,15 +109,15 @@ struct SidebarView: View {
                     HStack(spacing: 6) {
                         Circle()
                             .fill(isGenerating ? Color.green : Color.purple)
-                            .frame(width: 7, height: 7)
+                            .frame(width: max(5, 7 * zoomManager.zoomScale), height: max(5, 7 * zoomManager.zoomScale))
                         Text(model)
-                            .font(.system(size: 11, weight: .medium))
+                            .font(.system(size: max(9, 11 * zoomManager.zoomScale), weight: .medium))
                             .lineLimit(1)
                             .foregroundColor(.secondary)
                         Spacer()
                         if currentRssGB > 0 {
                             Text(String(format: "%.1f GB", currentRssGB))
-                                .font(.system(size: 10, design: .monospaced))
+                                .font(.system(size: max(8, 10 * zoomManager.zoomScale), design: .monospaced))
                                 .foregroundColor(.secondary.opacity(0.8))
                         }
                     }
@@ -127,19 +128,20 @@ struct SidebarView: View {
                 }
 
                 // Settings Button
-                SidebarSettingsButton {
+                SidebarSettingsButton(zoomScale: zoomManager.zoomScale) {
                     isSettingsPresented = true
                 }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 10)
         }
-        .frame(minWidth: 220, idealWidth: 250, maxWidth: 300)
+        .frame(minWidth: max(180, 220 * zoomManager.zoomScale), idealWidth: max(210, 250 * zoomManager.zoomScale), maxWidth: max(260, 320 * zoomManager.zoomScale))
         .background(Color(NSColor.windowBackgroundColor))
     }
 }
 
 struct SidebarSettingsButton: View {
+    var zoomScale: CGFloat = 1.0
     let action: () -> Void
     @State private var isHovered: Bool = false
 
@@ -147,10 +149,10 @@ struct SidebarSettingsButton: View {
         Button(action: action) {
             HStack(spacing: 8) {
                 Image(systemName: "gearshape.fill")
-                    .font(.system(size: 14))
+                    .font(.system(size: max(11, 14 * zoomScale)))
                     .foregroundColor(isHovered ? .primary : .secondary)
                 Text("Settings")
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.system(size: max(10, 13 * zoomScale), weight: .medium))
                     .foregroundColor(isHovered ? .primary : .secondary)
                 Spacer()
             }
@@ -170,6 +172,7 @@ struct SidebarSettingsButton: View {
 struct SidebarSessionRow: View {
     let session: ChatSession
     let isSelected: Bool
+    var zoomScale: CGFloat = 1.0
     let onSelect: () -> Void
     let onDelete: () -> Void
     @State private var isHovered = false
@@ -177,11 +180,11 @@ struct SidebarSessionRow: View {
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: "bubble.left")
-                .font(.system(size: 12))
+                .font(.system(size: max(9.5, 12 * zoomScale)))
                 .foregroundColor(isSelected ? .purple : .secondary)
 
             Text(session.title)
-                .font(.system(size: 13))
+                .font(.system(size: max(10, 13 * zoomScale)))
                 .foregroundColor(isSelected ? .primary : .secondary)
                 .lineLimit(1)
                 .truncationMode(.tail)
@@ -191,7 +194,7 @@ struct SidebarSessionRow: View {
             if isHovered || isSelected {
                 Button(action: onDelete) {
                     Image(systemName: "trash")
-                        .font(.system(size: 11))
+                        .font(.system(size: max(8.5, 11 * zoomScale)))
                         .foregroundColor(.secondary.opacity(0.8))
                 }
                 .buttonStyle(.plain)

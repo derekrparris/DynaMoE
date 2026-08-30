@@ -7,6 +7,7 @@ import SwiftUI
 import AppKit
 
 struct ChatDetailView: View {
+    @ObservedObject private var zoomManager = AppZoomManager.shared
     @Binding var session: ChatSession?
     @Binding var promptText: String
     @ObservedObject var localModelManager: LocalModelManager = LocalModelManager.shared
@@ -62,9 +63,9 @@ struct ChatDetailView: View {
                     }
                 }) {
                     Image(systemName: "sidebar.leading")
-                        .font(.system(size: 13, weight: .medium))
+                        .font(.system(size: max(11, 13 * zoomManager.zoomScale), weight: .medium))
                         .foregroundColor(.secondary)
-                        .frame(width: 26, height: 26)
+                        .frame(width: max(22, 26 * zoomManager.zoomScale), height: max(22, 26 * zoomManager.zoomScale))
                         .background(Color.secondary.opacity(0.08))
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
@@ -72,15 +73,15 @@ struct ChatDetailView: View {
                 .help("Toggle Sidebar (⌘S)")
 
                 Text("DynaMoE")
-                    .font(.system(size: 13, weight: .regular))
+                    .font(.system(size: max(10, 13 * zoomManager.zoomScale), weight: .regular))
                     .foregroundColor(.secondary)
                 
                 Text("/")
-                    .font(.system(size: 13, weight: .regular))
+                    .font(.system(size: max(10, 13 * zoomManager.zoomScale), weight: .regular))
                     .foregroundColor(.secondary.opacity(0.4))
                 
                 Text(session?.title ?? "App")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: max(10, 13 * zoomManager.zoomScale), weight: .semibold))
                     .foregroundColor(.primary)
                     .lineLimit(1)
                 
@@ -89,20 +90,20 @@ struct ChatDetailView: View {
                 if let model = modelName {
                     HStack(spacing: 6) {
                         Image(systemName: modelIconName(for: model))
-                            .font(.system(size: 10, weight: .semibold))
+                            .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .semibold))
                             .foregroundColor(isGenerating ? (isStreamingOffDisk ? Color.orange : Color.green) : Color.purple)
                         Text(model)
-                            .font(.caption)
+                            .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
                             .foregroundColor(.secondary)
                         if isGenerating {
                             Text("•")
                                 .foregroundColor(.secondary)
                             HStack(spacing: 3) {
                                 Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")
-                                    .font(.system(size: 10, weight: .bold))
+                                    .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .bold))
                                     .foregroundColor(isStreamingOffDisk ? .orange : .purple)
                                 Text(String(format: "%.1f tok/s", generationSpeed))
-                                    .font(.caption)
+                                    .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
                                     .fontWeight(.bold)
                                     .foregroundColor(isStreamingOffDisk ? .orange : .purple)
                             }
@@ -118,9 +119,9 @@ struct ChatDetailView: View {
                     Button(action: onStopGeneration) {
                         HStack(spacing: 4) {
                             Image(systemName: "stop.fill")
-                                .font(.system(size: 10))
+                                .font(.system(size: max(8, 10 * zoomManager.zoomScale)))
                             Text("Stop")
-                                .font(.caption)
+                                .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
                                 .fontWeight(.semibold)
                         }
                         .padding(.horizontal, 10)
@@ -169,7 +170,7 @@ struct ChatDetailView: View {
                             .padding(.bottom, 32)
                         }
                     }
-                    .frame(maxWidth: 800)
+                    .frame(maxWidth: max(600, 800 * zoomManager.zoomScale))
                     .padding(.horizontal, 24)
                     .frame(maxWidth: .infinity)
                 }
@@ -205,6 +206,7 @@ struct ChatDetailView: View {
                     MacTextEditor(
                         text: $promptText,
                         placeholder: "Ask DynaMoE anything... (Enter to send, Shift+Enter for newline)",
+                        zoomScale: zoomManager.zoomScale,
                         onCommit: {
                             let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
                             if !trimmed.isEmpty && !isGenerating {
@@ -213,7 +215,7 @@ struct ChatDetailView: View {
                             }
                         }
                     )
-                    .frame(minHeight: 38, maxHeight: 130)
+                    .frame(minHeight: max(32, 38 * zoomManager.zoomScale), maxHeight: max(100, 140 * zoomManager.zoomScale))
                     .padding(.horizontal, 4)
                     .padding(.top, 2)
                     
@@ -222,9 +224,9 @@ struct ChatDetailView: View {
                         // Attachment / Plus Button
                         Button(action: {}) {
                             Image(systemName: "plus")
-                                .font(.system(size: 12, weight: .medium))
+                                .font(.system(size: max(10, 12 * zoomManager.zoomScale), weight: .medium))
                                 .foregroundColor(.secondary)
-                                .frame(width: 24, height: 24)
+                                .frame(width: max(20, 24 * zoomManager.zoomScale), height: max(20, 24 * zoomManager.zoomScale))
                                 .background(Color.secondary.opacity(0.08))
                                 .clipShape(Circle())
                         }
@@ -273,14 +275,14 @@ struct ChatDetailView: View {
                         } label: {
                             HStack(spacing: 5) {
                                 Image(systemName: modelIconName(for: session?.selectedModelName ?? modelName))
-                                    .font(.system(size: 10))
+                                    .font(.system(size: max(8.5, 10 * zoomManager.zoomScale)))
                                     .foregroundColor(.purple)
                                 Text(session?.selectedModelName ?? modelName ?? "Select Model")
-                                    .font(.system(size: 11.5, weight: .medium))
+                                    .font(.system(size: max(9.5, 11.5 * zoomManager.zoomScale), weight: .medium))
                                     .foregroundColor(.primary)
                                     .lineLimit(1)
                                 Image(systemName: "chevron.up.chevron.down")
-                                    .font(.system(size: 7.5, weight: .semibold))
+                                    .font(.system(size: max(6.5, 7.5 * zoomManager.zoomScale), weight: .semibold))
                                     .foregroundColor(.secondary.opacity(0.7))
                             }
                             .padding(.horizontal, 9)
@@ -318,13 +320,13 @@ struct ChatDetailView: View {
                             } label: {
                                 HStack(spacing: 5) {
                                     Image(systemName: isThinkingEnabled ? "brain.head.profile" : "bolt.slash")
-                                        .font(.system(size: 10))
+                                        .font(.system(size: max(8.5, 10 * zoomManager.zoomScale)))
                                         .foregroundColor(isThinkingEnabled ? .purple : .secondary)
                                     Text(isThinkingEnabled ? "Thinking On" : "Thinking Off")
-                                        .font(.system(size: 11.5, weight: .medium))
+                                        .font(.system(size: max(9.5, 11.5 * zoomManager.zoomScale), weight: .medium))
                                         .foregroundColor(isThinkingEnabled ? .primary : .secondary)
                                     Image(systemName: "chevron.up.chevron.down")
-                                        .font(.system(size: 7.5, weight: .semibold))
+                                        .font(.system(size: max(6.5, 7.5 * zoomManager.zoomScale), weight: .semibold))
                                         .foregroundColor(.secondary.opacity(0.7))
                                 }
                                 .padding(.horizontal, 9)
@@ -368,13 +370,13 @@ struct ChatDetailView: View {
                         } label: {
                             HStack(spacing: 5) {
                                 Image(systemName: isAgentToolsEnabled ? "wrench.and.screwdriver.fill" : "wrench.slash")
-                                    .font(.system(size: 10))
+                                    .font(.system(size: max(8.5, 10 * zoomManager.zoomScale)))
                                     .foregroundColor(isAgentToolsEnabled ? .indigo : .secondary)
                                 Text(isAgentToolsEnabled ? "Tools On" : "Tools Off")
-                                    .font(.system(size: 11.5, weight: .medium))
+                                    .font(.system(size: max(9.5, 11.5 * zoomManager.zoomScale), weight: .medium))
                                     .foregroundColor(isAgentToolsEnabled ? .primary : .secondary)
                                 Image(systemName: "chevron.up.chevron.down")
-                                    .font(.system(size: 7.5, weight: .semibold))
+                                    .font(.system(size: max(6.5, 7.5 * zoomManager.zoomScale), weight: .semibold))
                                     .foregroundColor(.secondary.opacity(0.7))
                             }
                             .padding(.horizontal, 9)
@@ -395,10 +397,10 @@ struct ChatDetailView: View {
                         if promptTokenCount > 0 {
                             HStack(spacing: 3.5) {
                                 Image(systemName: "number.circle.fill")
-                                    .font(.system(size: 9.5, weight: .semibold))
+                                    .font(.system(size: max(8, 9.5 * zoomManager.zoomScale), weight: .semibold))
                                     .foregroundColor(.secondary)
                                 Text("\(promptTokenCount.formatted()) \(promptTokenCount == 1 ? "token" : "tokens")")
-                                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+                                    .font(.system(size: max(9, 11 * zoomManager.zoomScale), weight: .medium, design: .monospaced))
                                     .foregroundColor(.secondary)
                             }
                             .padding(.horizontal, 7)
@@ -414,9 +416,9 @@ struct ChatDetailView: View {
                         // Mic Button
                         Button(action: {}) {
                             Image(systemName: "mic")
-                                .font(.system(size: 13))
+                                .font(.system(size: max(10, 13 * zoomManager.zoomScale)))
                                 .foregroundColor(.secondary)
-                                .frame(width: 24, height: 24)
+                                .frame(width: max(20, 24 * zoomManager.zoomScale), height: max(20, 24 * zoomManager.zoomScale))
                         }
                         .buttonStyle(.plain)
 
@@ -424,7 +426,7 @@ struct ChatDetailView: View {
                         if isGenerating {
                             Button(action: onStopGeneration) {
                                 Image(systemName: "stop.circle.fill")
-                                    .font(.system(size: 26))
+                                    .font(.system(size: max(20, 26 * zoomManager.zoomScale)))
                                     .foregroundColor(.red)
                             }
                             .buttonStyle(.plain)
@@ -438,7 +440,7 @@ struct ChatDetailView: View {
                                 }
                             }) {
                                 Image(systemName: "arrow.right.circle.fill")
-                                    .font(.system(size: 26))
+                                    .font(.system(size: max(20, 26 * zoomManager.zoomScale)))
                                     .foregroundColor(promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .secondary.opacity(0.3) : .purple)
                             }
                             .buttonStyle(.plain)
@@ -455,7 +457,7 @@ struct ChatDetailView: View {
                         .stroke(Color.primary.opacity(0.09), lineWidth: 1)
                 )
                 .shadow(color: Color.black.opacity(0.06), radius: 10, x: 0, y: 4)
-                .frame(maxWidth: 800)
+                .frame(maxWidth: max(600, 800 * zoomManager.zoomScale))
                 .padding(.horizontal, 24)
                 .padding(.vertical, 14)
                 .frame(maxWidth: .infinity)
@@ -508,6 +510,7 @@ struct ChatDetailView: View {
 struct MacTextEditor: NSViewRepresentable {
     @Binding var text: String
     var placeholder: String
+    var zoomScale: CGFloat = 1.0
     var onCommit: () -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -519,7 +522,7 @@ struct MacTextEditor: NSViewRepresentable {
         guard let textView = scrollView.documentView as? NSTextView else { return scrollView }
 
         textView.delegate = context.coordinator
-        textView.font = .systemFont(ofSize: 13.5)
+        textView.font = .systemFont(ofSize: max(10, 13.5 * zoomScale))
         textView.isRichText = false
         textView.drawsBackground = false
         textView.allowsUndo = true
@@ -544,6 +547,10 @@ struct MacTextEditor: NSViewRepresentable {
         guard let textView = nsView.documentView as? NSTextView else { return }
         if textView.string != text {
             textView.string = text
+        }
+        let targetFont = NSFont.systemFont(ofSize: max(10, 13.5 * zoomScale))
+        if abs((textView.font?.pointSize ?? 13.5) - targetFont.pointSize) > 0.1 {
+            textView.font = targetFont
         }
     }
 
@@ -576,6 +583,7 @@ struct MacTextEditor: NSViewRepresentable {
 
 // MARK: - Single Message Bubble View
 struct ChatMessageView: View {
+    @EnvironmentObject private var zoomManager: AppZoomManager
     let message: ChatMessage
     var isGenerating: Bool = false
     var isStreamingOffDisk: Bool = false
@@ -616,7 +624,7 @@ struct ChatMessageView: View {
                     HStack {
                         Spacer(minLength: 40)
                         Text(message.content)
-                            .font(.system(size: 14))
+                            .font(.system(size: max(9, 14 * zoomManager.zoomScale)))
                             .lineSpacing(3)
                             .padding(.horizontal, 16)
                             .padding(.vertical, 10)
@@ -695,7 +703,7 @@ struct ChatMessageView: View {
                                 VStack(alignment: .leading, spacing: 4) {
                                     if !thinking.isEmpty {
                                         Text(thinking)
-                                            .font(.system(size: 12, design: .monospaced))
+                                            .font(.system(size: max(8, 12 * zoomManager.zoomScale), design: .monospaced))
                                             .foregroundColor(.secondary)
                                             .lineSpacing(3)
                                             .padding(.horizontal, 14)
@@ -798,7 +806,7 @@ struct ChatMessageView: View {
 
                                 if message.tokenCount > 0 {
                                     Text("\(message.tokenCount.formatted()) tokens")
-                                        .font(.system(size: 11, design: .monospaced))
+                                        .font(.system(size: max(8.5, 11 * zoomManager.zoomScale), design: .monospaced))
                                         .foregroundColor(.secondary.opacity(0.8))
                                 }
                             }
@@ -818,10 +826,10 @@ struct ChatMessageView: View {
                                 }) {
                                     HStack(spacing: 4) {
                                         Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
-                                            .font(.system(size: 11))
+                                            .font(.system(size: max(8.5, 11 * zoomManager.zoomScale)))
                                         if isCopied {
                                             Text("Copied")
-                                                .font(.system(size: 11))
+                                                .font(.system(size: max(8.5, 11 * zoomManager.zoomScale)))
                                         }
                                     }
                                     .foregroundColor(isCopied ? .green : .secondary)
@@ -838,7 +846,7 @@ struct ChatMessageView: View {
                                     feedback = feedback == "up" ? nil : "up"
                                 }) {
                                     Image(systemName: feedback == "up" ? "hand.thumbsup.fill" : "hand.thumbsup")
-                                        .font(.system(size: 11))
+                                        .font(.system(size: max(8.5, 11 * zoomManager.zoomScale)))
                                         .foregroundColor(feedback == "up" ? .purple : .secondary)
                                         .padding(4)
                                         .background(Color.secondary.opacity(0.06))
@@ -851,7 +859,7 @@ struct ChatMessageView: View {
                                     feedback = feedback == "down" ? nil : "down"
                                 }) {
                                     Image(systemName: feedback == "down" ? "hand.thumbsdown.fill" : "hand.thumbsdown")
-                                        .font(.system(size: 11))
+                                        .font(.system(size: max(8.5, 11 * zoomManager.zoomScale)))
                                         .foregroundColor(feedback == "down" ? .purple : .secondary)
                                         .padding(4)
                                         .background(Color.secondary.opacity(0.06))
@@ -865,7 +873,7 @@ struct ChatMessageView: View {
                                     NSSpeechSynthesizer().startSpeaking(message.content)
                                 }) {
                                     Image(systemName: "speaker.wave.2")
-                                        .font(.system(size: 11))
+                                        .font(.system(size: max(8.5, 11 * zoomManager.zoomScale)))
                                         .foregroundColor(.secondary)
                                         .padding(4)
                                         .background(Color.secondary.opacity(0.06))
@@ -886,6 +894,7 @@ struct ChatMessageView: View {
 
 // MARK: - Welcome / Empty State View
 struct EmptyWelcomeView: View {
+    @ObservedObject private var zoomManager = AppZoomManager.shared
     var modelName: String?
     var isStreamingOffDisk: Bool = false
     var onSelectStarter: (String) -> Void
@@ -898,10 +907,10 @@ struct EmptyWelcomeView: View {
     ]
 
     var body: some View {
-        VStack(spacing: 28) {
-            VStack(spacing: 12) {
+        VStack(spacing: max(20, 28 * zoomManager.zoomScale)) {
+            VStack(spacing: max(8, 12 * zoomManager.zoomScale)) {
                 Image(systemName: "circle.hexagongrid.circle.fill")
-                    .font(.system(size: 52))
+                    .font(.system(size: max(36, 52 * zoomManager.zoomScale)))
                     .foregroundStyle(
                         LinearGradient(
                             colors: [.purple, .indigo, .blue],
@@ -911,47 +920,46 @@ struct EmptyWelcomeView: View {
                     )
 
                 Text("How can I help you today?")
-                    .font(.title2)
-                    .fontWeight(.bold)
+                    .font(.system(size: max(16, 22 * zoomManager.zoomScale), weight: .bold))
 
                 if let model = modelName {
                     HStack(spacing: 6) {
                         Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")
-                            .font(.system(size: 12))
+                            .font(.system(size: max(9, 12 * zoomManager.zoomScale)))
                             .foregroundColor(isStreamingOffDisk ? .orange : .purple)
                         Text("Powered by \(model) • \(isStreamingOffDisk ? "Dynamic SSD Streaming" : "Fast Unified RAM Engine")")
-                            .font(.subheadline)
+                            .font(.system(size: max(10, 13 * zoomManager.zoomScale)))
                             .foregroundColor(.secondary)
                     }
                 } else {
                     Text("Load model weights in Settings (bottom left) to start generating.")
-                        .font(.subheadline)
+                        .font(.system(size: max(10, 13 * zoomManager.zoomScale)))
                         .foregroundColor(.secondary)
                 }
             }
 
             // Starter Prompt Chips
-            VStack(spacing: 10) {
+            VStack(spacing: max(7, 10 * zoomManager.zoomScale)) {
                 ForEach(promptStarters, id: \.self) { starter in
                     Button(action: {
                         onSelectStarter(starter)
                     }) {
                         HStack {
                             Text(starter)
-                                .font(.system(size: 13.5))
+                                .font(.system(size: max(10.5, 13.5 * zoomManager.zoomScale)))
                                 .foregroundColor(.primary)
                             Spacer()
                             Image(systemName: "arrow.up.right")
-                                .font(.system(size: 11))
+                                .font(.system(size: max(8.5, 11 * zoomManager.zoomScale)))
                                 .foregroundColor(.secondary)
                         }
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 12)
+                        .padding(.horizontal, max(12, 16 * zoomManager.zoomScale))
+                        .padding(.vertical, max(9, 12 * zoomManager.zoomScale))
                         .background(Color.secondary.opacity(0.06))
                         .cornerRadius(12)
                     }
                     .buttonStyle(.plain)
-                    .frame(maxWidth: 520)
+                    .frame(maxWidth: max(400, 520 * zoomManager.zoomScale))
                 }
             }
             .padding(.top, 4)
@@ -1019,6 +1027,7 @@ public struct IdentifiableMarkdownBlock: Identifiable, Equatable {
 // MARK: - Markdown Message View
 
 struct MarkdownMessageView: View {
+    @EnvironmentObject private var zoomManager: AppZoomManager
     let content: String
     var isStreaming: Bool = false
     var isStreamingOffDisk: Bool = false
@@ -1075,28 +1084,22 @@ struct MarkdownMessageView: View {
 
     @ViewBuilder
     private func renderHeading(level: Int, text: String, isLast: Bool) -> some View {
-        let size: CGFloat = {
-            switch level {
-            case 1: return 19
-            case 2: return 16.5
-            case 3: return 15
-            default: return 14
-            }
-        }()
+        let baseSize: CGFloat = (level == 1 ? 19 : (level == 2 ? 16.5 : (level == 3 ? 15 : 14)))
+        let size: CGFloat = baseSize * zoomManager.zoomScale
         let weight: Font.Weight = level <= 2 ? .bold : .semibold
         let topPad: CGFloat = level == 1 ? 12 : (level == 2 ? 10 : 6)
         let botPad: CGFloat = level == 1 ? 4 : 2
 
         if isLast {
-            (Text(LocalizedStringKey(text)) + Text(" ") + Text(Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")).foregroundColor(isStreamingOffDisk ? .orange : .purple).font(.system(size: 11, weight: .bold)))
-                .font(.system(size: size, weight: weight))
+            (Text(LocalizedStringKey(text)) + Text(" ") + Text(Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")).foregroundColor(isStreamingOffDisk ? .orange : .purple).font(.system(size: max(8, 11 * zoomManager.zoomScale), weight: .bold)))
+                .font(.system(size: max(9, size), weight: weight))
                 .foregroundColor(.primary)
                 .padding(.top, topPad)
                 .padding(.bottom, botPad)
                 .textSelection(.enabled)
         } else {
             Text(LocalizedStringKey(text))
-                .font(.system(size: size, weight: weight))
+                .font(.system(size: max(9, size), weight: weight))
                 .foregroundColor(.primary)
                 .padding(.top, topPad)
                 .padding(.bottom, botPad)
@@ -1106,16 +1109,17 @@ struct MarkdownMessageView: View {
 
     @ViewBuilder
     private func renderParagraph(text: String, isLast: Bool) -> some View {
+        let fontSize = max(9, 14 * zoomManager.zoomScale)
         if isLast {
-            (Text(LocalizedStringKey(text)) + Text(" ") + Text(Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")).foregroundColor(isStreamingOffDisk ? .orange : .purple).font(.system(size: 11, weight: .bold)))
-                .font(.system(size: 14))
+            (Text(LocalizedStringKey(text)) + Text(" ") + Text(Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")).foregroundColor(isStreamingOffDisk ? .orange : .purple).font(.system(size: max(8, 11 * zoomManager.zoomScale), weight: .bold)))
+                .font(.system(size: fontSize))
                 .lineSpacing(4)
                 .foregroundColor(.primary)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else {
             Text(LocalizedStringKey(text))
-                .font(.system(size: 14))
+                .font(.system(size: fontSize))
                 .lineSpacing(4)
                 .foregroundColor(.primary)
                 .textSelection(.enabled)
@@ -1125,6 +1129,7 @@ struct MarkdownMessageView: View {
 
     @ViewBuilder
     private func renderBlockquote(text: String, isLast: Bool) -> some View {
+        let fontSize = max(8.5, 13.5 * zoomManager.zoomScale)
         HStack(alignment: .top, spacing: 10) {
             RoundedRectangle(cornerRadius: 1.5)
                 .fill(
@@ -1137,15 +1142,15 @@ struct MarkdownMessageView: View {
                 .frame(width: 3.5)
 
             if isLast {
-                (Text(LocalizedStringKey(text)) + Text(" ") + Text(Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")).foregroundColor(isStreamingOffDisk ? .orange : .purple).font(.system(size: 11, weight: .bold)))
-                    .font(.system(size: 13.5))
+                (Text(LocalizedStringKey(text)) + Text(" ") + Text(Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")).foregroundColor(isStreamingOffDisk ? .orange : .purple).font(.system(size: max(8, 11 * zoomManager.zoomScale), weight: .bold)))
+                    .font(.system(size: fontSize))
                     .italic()
                     .foregroundColor(.secondary)
                     .lineSpacing(3.5)
                     .textSelection(.enabled)
             } else {
                 Text(LocalizedStringKey(text))
-                    .font(.system(size: 13.5))
+                    .font(.system(size: fontSize))
                     .italic()
                     .foregroundColor(.secondary)
                     .lineSpacing(3.5)
@@ -1160,28 +1165,29 @@ struct MarkdownMessageView: View {
 
     @ViewBuilder
     private func renderListItem(number: Int?, text: String, isLast: Bool) -> some View {
+        let fontSize = max(9, 14 * zoomManager.zoomScale)
         HStack(alignment: .top, spacing: 8) {
             if let num = number {
                 Text("\(num).")
-                    .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                    .font(.system(size: max(8.5, 13 * zoomManager.zoomScale), weight: .semibold, design: .monospaced))
                     .foregroundColor(.secondary)
                     .frame(minWidth: 20, alignment: .trailing)
             } else {
                 Text("•")
-                    .font(.system(size: 15, weight: .bold))
+                    .font(.system(size: max(10, 15 * zoomManager.zoomScale), weight: .bold))
                     .foregroundColor(.purple)
                     .frame(width: 14, alignment: .center)
             }
 
             if isLast {
-                (Text(LocalizedStringKey(text)) + Text(" ") + Text(Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")).foregroundColor(isStreamingOffDisk ? .orange : .purple).font(.system(size: 11, weight: .bold)))
-                    .font(.system(size: 14))
+                (Text(LocalizedStringKey(text)) + Text(" ") + Text(Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")).foregroundColor(isStreamingOffDisk ? .orange : .purple).font(.system(size: max(8, 11 * zoomManager.zoomScale), weight: .bold)))
+                    .font(.system(size: fontSize))
                     .lineSpacing(3)
                     .foregroundColor(.primary)
                     .textSelection(.enabled)
             } else {
                 Text(LocalizedStringKey(text))
-                    .font(.system(size: 14))
+                    .font(.system(size: fontSize))
                     .lineSpacing(3)
                     .foregroundColor(.primary)
                     .textSelection(.enabled)
@@ -1195,6 +1201,7 @@ struct MarkdownMessageView: View {
 // MARK: - Native Markdown Table Card View (SwiftUI Grid)
 
 struct MarkdownTableView: View {
+    @EnvironmentObject private var zoomManager: AppZoomManager
     let table: MarkdownTableData
     var isLast: Bool = false
     var isStreamingOffDisk: Bool = false
@@ -1210,7 +1217,7 @@ struct MarkdownTableView: View {
                             let align = table.alignments.indices.contains(colIdx) ? table.alignments[colIdx] : .leading
                             HStack(spacing: 0) {
                                 Text(LocalizedStringKey(header))
-                                    .font(.system(size: 13, weight: .bold))
+                                    .font(.system(size: max(8.5, 13 * zoomManager.zoomScale), weight: .bold))
                                     .foregroundColor(.secondary)
                                     .multilineTextAlignment(align.textAlignment)
                                     .padding(.horizontal, 14)
@@ -1242,7 +1249,7 @@ struct MarkdownTableView: View {
                                 let align = table.alignments.indices.contains(colIdx) ? table.alignments[colIdx] : .leading
                                 HStack(spacing: 0) {
                                     Text(LocalizedStringKey(cell))
-                                        .font(.system(size: 13))
+                                        .font(.system(size: max(8.5, 13 * zoomManager.zoomScale)))
                                         .foregroundColor(.primary)
                                         .multilineTextAlignment(align.textAlignment)
                                         .padding(.horizontal, 14)
@@ -1415,6 +1422,7 @@ public struct NativeSyntaxHighlighter {
 // MARK: - Dedicated Code Block Card with Header, Syntax Highlighting & Copy Button
 
 struct CodeBlockCard: View {
+    @EnvironmentObject private var zoomManager: AppZoomManager
     let language: String
     let code: String
     var isStreaming: Bool = false
@@ -1438,7 +1446,7 @@ struct CodeBlockCard: View {
                         .foregroundColor(.purple)
 
                     Text(displayLanguage)
-                        .font(.system(size: 11, weight: .bold, design: .monospaced))
+                        .font(.system(size: max(8.5, 11 * zoomManager.zoomScale), weight: .bold, design: .monospaced))
                         .foregroundColor(.secondary)
 
                     if isStreaming {
@@ -1472,7 +1480,7 @@ struct CodeBlockCard: View {
             // Code Text Canvas with Native Syntax Highlighting (Cached)
             ScrollView(.horizontal, showsIndicators: true) {
                 Text(highlighted ?? NativeSyntaxHighlighter.highlight(code: code, language: language))
-                    .font(.system(size: 12.5, design: .monospaced))
+                    .font(.system(size: max(8.5, 12.5 * zoomManager.zoomScale), design: .monospaced))
                     .lineSpacing(3)
                     .textSelection(.enabled)
                     .padding(12)

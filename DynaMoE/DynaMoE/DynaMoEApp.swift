@@ -15,8 +15,12 @@ final class AppZoomManager: ObservableObject {
     @Published var zoomScale: CGFloat {
         didSet {
             UserDefaults.standard.set(Double(zoomScale), forKey: "dynamoe_ui_zoom_scale")
+            showZoomHUD()
         }
     }
+
+    @Published var hudText: String? = nil
+    private var hudDismissTask: Task<Void, Never>? = nil
 
     init() {
         let saved = UserDefaults.standard.double(forKey: "dynamoe_ui_zoom_scale")
@@ -25,84 +29,56 @@ final class AppZoomManager: ObservableObject {
 
     func zoomIn() {
         if zoomScale < 2.5 {
-            zoomScale = (zoomScale + 0.1).roundedScale()
+            zoomScale = min(2.5, (zoomScale + 0.15).roundedScale())
         }
     }
 
     func zoomOut() {
         if zoomScale > 0.6 {
-            zoomScale = (zoomScale - 0.1).roundedScale()
+            zoomScale = max(0.6, (zoomScale - 0.15).roundedScale())
         }
     }
 
     func resetZoom() {
         zoomScale = 1.0
     }
-}
 
-private extension CGFloat {
-    func roundedScale() -> CGFloat {
-        return (self * 10.0).rounded() / 10.0
-    }
-}
-
-final class WindowZoomView: NSView {
-    var zoomScale: CGFloat = 1.0 {
-        didSet {
-            applyZoom()
-        }
-    }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        if let window = window {
-            NotificationCenter.default.removeObserver(self, name: NSWindow.didResizeNotification, object: nil)
-            NotificationCenter.default.addObserver(self, selector: #selector(windowDidResize), name: NSWindow.didResizeNotification, object: window)
-            DispatchQueue.main.async { [weak self] in
-                self?.applyZoom()
+    private func showZoomHUD() {
+        let percent = Int(round(zoomScale * 100))
+        hudText = "\(percent)%"
+        hudDismissTask?.cancel()
+        hudDismissTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            if !Task.isCancelled {
+                self.hudText = nil
             }
         }
     }
 
-    @objc private func windowDidResize() {
-        applyZoom()
-    }
-
-    private func applyZoom() {
-        guard let cv = window?.contentView else { return }
-        let fSize = cv.frame.size
-        guard fSize.width > 0, fSize.height > 0, zoomScale > 0 else { return }
-
-        let targetBounds = NSSize(width: fSize.width / zoomScale, height: fSize.height / zoomScale)
-        if cv.bounds.size != targetBounds {
-            cv.setBoundsSize(targetBounds)
-            cv.needsLayout = true
-            cv.needsDisplay = true
-        }
-    }
-
-    deinit {
-        NotificationCenter.default.removeObserver(self)
+    var dynamicTypeSize: DynamicTypeSize {
+        if zoomScale <= 0.75 { return .xSmall }
+        if zoomScale <= 0.85 { return .small }
+        if zoomScale <= 0.95 { return .medium }
+        if zoomScale <= 1.05 { return .large }
+        if zoomScale <= 1.15 { return .xLarge }
+        if zoomScale <= 1.25 { return .xxLarge }
+        if zoomScale <= 1.45 { return .xxxLarge }
+        if zoomScale <= 1.75 { return .accessibility1 }
+        if zoomScale <= 2.05 { return .accessibility2 }
+        if zoomScale <= 2.35 { return .accessibility3 }
+        return .accessibility4
     }
 }
 
-struct WindowZoomHelper: NSViewRepresentable {
-    let zoomScale: CGFloat
-
-    func makeNSView(context: Context) -> WindowZoomView {
-        let v = WindowZoomView()
-        v.zoomScale = zoomScale
-        return v
-    }
-
-    func updateNSView(_ nsView: WindowZoomView, context: Context) {
-        nsView.zoomScale = zoomScale
+private extension CGFloat {
+    func roundedScale() -> CGFloat {
+        return (self * 100.0).rounded() / 100.0
     }
 }
 
 @main
 struct DynaMoEApp: App {
-    @StateObject private var zoomManager = AppZoomManager.shared
+    @ObservedObject private var zoomManager = AppZoomManager.shared
     @Environment(\.openWindow) private var openWindow
 
     var sharedModelContainer: ModelContainer = {
@@ -121,8 +97,8 @@ struct DynaMoEApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .background(WindowZoomHelper(zoomScale: zoomManager.zoomScale))
                 .environmentObject(zoomManager)
+                .dynamicTypeSize(zoomManager.dynamicTypeSize)
         }
         .modelContainer(sharedModelContainer)
         .commands {
@@ -141,17 +117,17 @@ struct DynaMoEApp: App {
             CommandGroup(after: .sidebar) {
                 Divider()
                 Button("Actual Size") {
-                    zoomManager.resetZoom()
+                    AppZoomManager.shared.resetZoom()
                 }
                 .keyboardShortcut("0", modifiers: .command)
 
                 Button("Zoom In") {
-                    zoomManager.zoomIn()
+                    AppZoomManager.shared.zoomIn()
                 }
-                .keyboardShortcut("+", modifiers: .command)
+                .keyboardShortcut("=", modifiers: .command)
 
                 Button("Zoom Out") {
-                    zoomManager.zoomOut()
+                    AppZoomManager.shared.zoomOut()
                 }
                 .keyboardShortcut("-", modifiers: .command)
             }
