@@ -10,6 +10,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     case models = "Models"
     case generation = "Generation"
     case memory = "Memory & SSD"
+    case agent = "Agent & Tools"
     case advanced = "Advanced Diagnostics"
 
     var id: String { rawValue }
@@ -19,6 +20,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .models: return "square.stack.3d.up.fill"
         case .generation: return "slider.horizontal.3"
         case .memory: return "memorychip"
+        case .agent: return "wrench.and.screwdriver.fill"
         case .advanced: return "waveform.path.ecg"
         }
     }
@@ -33,6 +35,10 @@ struct SettingsSheetView: View {
     @State private var repackStatus: String = ""
     @State private var repackError: String? = nil
     @ObservedObject var localModelManager: LocalModelManager = LocalModelManager.shared
+    @AppStorage("dynamoe_agent_tools_enabled") private var isAgentToolsGloballyEnabled: Bool = true
+    @AppStorage("dynamoe_agent_working_directory") private var agentWorkingDirectory: String = ""
+    @AppStorage("dynamoe_max_tool_output_length") private var maxToolOutputLength: Int = 4000
+    @AppStorage("dynamoe_max_agent_steps") private var maxAgentSteps: Int = 15
 
     // Model & Tokenizer bindings
     var summary: ModelSummary?
@@ -148,6 +154,8 @@ struct SettingsSheetView: View {
                         generationSettingsSection
                     case .memory:
                         memorySettingsSection
+                    case .agent:
+                        agentSettingsSection
                     case .advanced:
                         advancedDiagnosticsSection
                     }
@@ -837,7 +845,171 @@ struct SettingsSheetView: View {
         }
     }
 
-    // MARK: - Tab 4: Advanced Diagnostics & Inspector
+    // MARK: - Tab 4: Agent & Tool Execution Suite
+    private var agentSettingsSection: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Agent Mode & Tool Calling Configuration")
+                .font(.headline)
+
+            VStack(alignment: .leading, spacing: 14) {
+                // Enable Agent Tools Toggle
+                Toggle(isOn: $isAgentToolsGloballyEnabled) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Enable Agent Tools by Default")
+                            .font(.system(size: 13, weight: .medium))
+                        Text("Equips models with shell execution, file reading/writing, and semantic search via ChatML <tool_call> tags.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+
+                Divider()
+
+                // Working Directory Picker
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Agent Working Directory (CWD)")
+                        .font(.system(size: 13, weight: .medium))
+                    Text("Commands like zsh, find, and ripgrep run relative to this base directory.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+
+                    HStack(spacing: 8) {
+                        Image(systemName: "folder.fill")
+                            .foregroundColor(.secondary)
+                        Text(agentWorkingDirectory.isEmpty ? FileManager.default.currentDirectoryPath : agentWorkingDirectory)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundColor(.primary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 6)
+                            .background(Color.secondary.opacity(0.06))
+                            .cornerRadius(6)
+
+                        Button("Browse...") {
+                            let panel = NSOpenPanel()
+                            panel.canChooseFiles = false
+                            panel.canChooseDirectories = true
+                            panel.allowsMultipleSelection = false
+                            panel.canCreateDirectories = true
+                            if panel.runModal() == .OK, let url = panel.url {
+                                agentWorkingDirectory = url.path
+                            }
+                        }
+                        .buttonStyle(.bordered)
+
+                        if !agentWorkingDirectory.isEmpty {
+                            Button("Reset") {
+                                agentWorkingDirectory = ""
+                            }
+                            .buttonStyle(.borderless)
+                            .foregroundColor(.secondary)
+                        }
+                    }
+                }
+
+                Divider()
+
+                // Output Length Slider
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Max Tool Output Length")
+                                .font(.system(size: 13, weight: .medium))
+                            Text("Protects context window from large outputs via intelligent head/tail truncation.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        Text("\(maxToolOutputLength) chars")
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.purple)
+                    }
+                    Slider(value: Binding(
+                        get: { Double(maxToolOutputLength) },
+                        set: { maxToolOutputLength = Int($0) }
+                    ), in: 1000...16000, step: 500)
+                }
+
+                Divider()
+
+                // Max Agent Iteration Steps
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Max Multi-Step Agent Iterations")
+                                .font(.system(size: 13, weight: .medium))
+                            Text("Maximum number of reasoning and tool execution turns per user prompt.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        Text("\(maxAgentSteps) steps")
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.purple)
+                    }
+                    Slider(value: Binding(
+                        get: { Double(maxAgentSteps) },
+                        set: { maxAgentSteps = Int($0) }
+                    ), in: 1...30, step: 1)
+                }
+            }
+            .padding(14)
+            .background(Color.secondary.opacity(0.04))
+            .cornerRadius(10)
+
+            // Available Built-in Tools List
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Installed Tool Suite (\(AgentHarness.shared.availableToolDefinitions.count) Tools)")
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+                    toolSummaryCard(name: "shell_run", icon: "terminal.fill", desc: "Runs native /bin/zsh shell commands with timeout, stdout/stderr capture, and exit codes.")
+                    toolSummaryCard(name: "file_read", icon: "doc.text.fill", desc: "Reads text files with optional 1-indexed line ranges (start_line, end_line).")
+                    toolSummaryCard(name: "file_write", icon: "doc.badge.plus", desc: "Creates or overwrites files with automatic parent directory creation.")
+                    toolSummaryCard(name: "file_edit", icon: "square.and.pencil", desc: "Performs precise anchor string search-and-replace edits.")
+                    toolSummaryCard(name: "find_files", icon: "folder.badge.gearshape", desc: "Discovers files and directories using glob matching and max depth.")
+                    toolSummaryCard(name: "grep_search", icon: "magnifyingglass", desc: "Fast regex and literal text pattern search across files using ripgrep or grep.")
+                    toolSummaryCard(name: "complete", icon: "checkmark.seal.fill", desc: "Signals task completion with final structured summary.")
+                }
+            }
+        }
+    }
+
+    private func toolSummaryCard(name: String, icon: String, desc: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundColor(.indigo)
+                .frame(width: 24, height: 24)
+                .background(Color.indigo.opacity(0.1))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(name)
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .foregroundColor(.primary)
+                Text(desc)
+                    .font(.system(size: 10.5))
+                    .foregroundColor(.secondary)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(NSColor.controlBackgroundColor).opacity(0.7))
+        .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+        )
+    }
+
+    // MARK: - Tab 5: Advanced Diagnostics & Inspector
     private var advancedDiagnosticsSection: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Advanced Tensor Diagnostics & Inspector")

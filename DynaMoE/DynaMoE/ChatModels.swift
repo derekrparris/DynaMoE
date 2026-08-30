@@ -11,6 +11,46 @@ public enum MessageRole: String, Codable, Equatable {
     case system
 }
 
+public enum ToolExecutionStatus: String, Codable, Equatable {
+    case running
+    case success
+    case error
+}
+
+public struct ToolCallRecord: Identifiable, Codable, Equatable {
+    public var id: UUID
+    public var name: String
+    public var arguments: [String: String]
+    public var rawArguments: String
+    public var status: ToolExecutionStatus
+    public var output: String?
+    public var error: String?
+    public var executionDurationSeconds: Double?
+    public var timestamp: Date
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        arguments: [String: String] = [:],
+        rawArguments: String = "",
+        status: ToolExecutionStatus = .running,
+        output: String? = nil,
+        error: String? = nil,
+        executionDurationSeconds: Double? = nil,
+        timestamp: Date = Date()
+    ) {
+        self.id = id
+        self.name = name
+        self.arguments = arguments
+        self.rawArguments = rawArguments
+        self.status = status
+        self.output = output
+        self.error = error
+        self.executionDurationSeconds = executionDurationSeconds
+        self.timestamp = timestamp
+    }
+}
+
 public struct ChatMessage: Identifiable, Codable, Equatable {
     public var id: UUID
     public var role: MessageRole
@@ -23,6 +63,7 @@ public struct ChatMessage: Identifiable, Codable, Equatable {
     public var timeToFirstTokenSeconds: Double?
     public var thinkingTimeSeconds: Double?
     public var prefillStatus: String?
+    public var toolCalls: [ToolCallRecord]?
 
     public init(
         id: UUID = UUID(),
@@ -35,7 +76,8 @@ public struct ChatMessage: Identifiable, Codable, Equatable {
         tokensPerSec: Double = 0.0,
         timeToFirstTokenSeconds: Double? = nil,
         thinkingTimeSeconds: Double? = nil,
-        prefillStatus: String? = nil
+        prefillStatus: String? = nil,
+        toolCalls: [ToolCallRecord]? = nil
     ) {
         self.id = id
         self.role = role
@@ -48,6 +90,7 @@ public struct ChatMessage: Identifiable, Codable, Equatable {
         self.timeToFirstTokenSeconds = timeToFirstTokenSeconds
         self.thinkingTimeSeconds = thinkingTimeSeconds
         self.prefillStatus = prefillStatus
+        self.toolCalls = toolCalls
     }
 }
 
@@ -61,6 +104,7 @@ public struct ChatSession: Identifiable, Codable, Equatable {
     public var selectedModelName: String?
     public var selectedModelPath: String?
     public var isThinkingEnabled: Bool?
+    public var isAgentToolsEnabled: Bool?
 
     public init(
         id: UUID = UUID(),
@@ -71,7 +115,8 @@ public struct ChatSession: Identifiable, Codable, Equatable {
         selectedModelId: String? = nil,
         selectedModelName: String? = nil,
         selectedModelPath: String? = nil,
-        isThinkingEnabled: Bool? = nil
+        isThinkingEnabled: Bool? = nil,
+        isAgentToolsEnabled: Bool? = nil
     ) {
         self.id = id
         self.title = title
@@ -82,5 +127,6 @@ public struct ChatSession: Identifiable, Codable, Equatable {
         self.selectedModelName = selectedModelName
         self.selectedModelPath = selectedModelPath
         self.isThinkingEnabled = isThinkingEnabled
+        self.isAgentToolsEnabled = isAgentToolsEnabled
     }
 }

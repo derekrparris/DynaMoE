@@ -693,6 +693,17 @@ struct ContentView: View {
     @State private var chatPromptText: String = ""
     @State private var systemPrompt: String = ModelConfig.getUserDefaultSystemPrompt()
     @AppStorage("dynamoe_thinking_enabled") private var defaultThinkingEnabled: Bool = true
+    @AppStorage("dynamoe_agent_tools_enabled") private var defaultAgentToolsEnabled: Bool = true
+    @AppStorage("dynamoe_agent_working_directory") private var agentWorkingDirectory: String = ""
+    @AppStorage("dynamoe_max_tool_output_length") private var maxToolOutputLength: Int = 4000
+    @AppStorage("dynamoe_max_agent_steps") private var maxAgentSteps: Int = 15
+
+    var isAgentToolsEnabledForActiveSession: Bool {
+        if let active = activeSessionBinding.wrappedValue, let enabled = active.isAgentToolsEnabled {
+            return enabled
+        }
+        return defaultAgentToolsEnabled
+    }
 
     var isStreamingOffDisk: Bool {
         guard let summary = summary else { return false }
@@ -854,6 +865,7 @@ struct ContentView: View {
                 tokenizer: tokenizer,
                 supportsThinking: activeModelSupportsThinking,
                 isThinkingEnabled: isThinkingEnabledForActiveSession,
+                isAgentToolsEnabled: isAgentToolsEnabledForActiveSession,
                 onSendMessage: { prompt in
                     handleSendMessage(prompt)
                 },
@@ -876,6 +888,13 @@ struct ContentView: View {
                     if let sid = selectedSessionId ?? sessions.first?.id,
                        let idx = sessions.firstIndex(where: { $0.id == sid }) {
                         sessions[idx].isThinkingEnabled = enabled
+                    }
+                },
+                onToggleAgentTools: { enabled in
+                    defaultAgentToolsEnabled = enabled
+                    if let sid = selectedSessionId ?? sessions.first?.id,
+                       let idx = sessions.firstIndex(where: { $0.id == sid }) {
+                        sessions[idx].isAgentToolsEnabled = enabled
                     }
                 },
                 onToggleSidebar: {
@@ -1005,14 +1024,12 @@ struct ContentView: View {
             modelPath: activeLoadedModelPath
         ).trimmingCharacters(in: .whitespacesAndNewlines)
 
-        if modelSupportsThinking && !thinkingEnabled {
-            // When thinking is explicitly turned OFF for a reasoning model, instruct it to reply directly
-            let noThinkInstruction = "Respond directly and concisely. Do not output <think> or any reasoning process. 直接给出最终回答，不要输出<think>思考过程。"
-            if !effectiveSystem.isEmpty {
-                effectiveSystem += "\n\n" + noThinkInstruction
-            } else {
-                effectiveSystem = noThinkInstruction
-            }
+        let agentToolsEnabled = (sessions[sessionIdx].isAgentToolsEnabled ?? defaultAgentToolsEnabled)
+        if agentToolsEnabled {
+            effectiveSystem = AgentHarness.shared.buildSystemPrompt(
+                baseSystem: effectiveSystem,
+                modelName: activeModelDisplayName
+            )
         }
 
         if !effectiveSystem.isEmpty {
@@ -2833,7 +2850,7 @@ struct ContentView: View {
         generationStatusText = "⏹ Generation stopped by user."
     }
 
-    private func startAutoregressiveGeneration(customPrompt: String? = nil, sessionId: UUID? = nil, messageId: UUID? = nil) {
+    private func startAutoregressiveGeneration(customPrompt: String? = nil, sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0) {
         guard let summary = summary,
               let tokenizer = tokenizer,
               let device = MTLCreateSystemDefaultDevice(),
@@ -5845,11 +5862,12 @@ struct ContentView: View {
                         let now = CFAbsoluteTimeGetCurrent()
                         if now - lastPrefillUIUpdateTime >= 0.08 || p == promptCount - 1 {
                             lastPrefillUIUpdateTime = now
-                            let elapsed = now - prefillStartTime
-                            let tokSpeed = elapsed > 0 ? Double(p + 1) / elapsed : 0.0
-                            let pct = Int((Double(p + 1) / Double(promptCount)) * 100)
-                            let remaining = promptCount - (p + 1)
-                            let eta = tokSpeed > 0 ? Double(remaining) / tokSpeed : 0.0
+                            let elapsed: Double = now - prefillStartTime
+                            let tokSpeed: Double = elapsed > 0 ? Double(p + 1) / elapsed : 0.0
+                            let progressRatio: Double = Double(p + 1) / Double(max(promptCount, 1))
+                            let pct: Int = Int(progressRatio * 100.0)
+                            let remaining: Int = promptCount - (p + 1)
+                            let eta: Double = tokSpeed > 0 ? Double(remaining) / tokSpeed : 0.0
                             let etaStr = eta >= 60 ? String(format: "%dm %02ds", Int(eta) / 60, Int(eta) % 60) : String(format: "%.0fs", eta)
                             let prefillStr = "Ingesting prompt: \(p + 1)/\(promptCount) tokens (\(pct)%) • \(String(format: "%.0f", tokSpeed)) tok/s • ETA: \(etaStr)"
 
@@ -6133,6 +6151,87 @@ struct ContentView: View {
                         self.sessions[sIdx].messages[mIdx].tokensPerSec = finalTokPerSec
                         self.sessions[sIdx].messages[mIdx].timeToFirstTokenSeconds = finalTtft
                         self.sessions[sIdx].messages[mIdx].thinkingTimeSeconds = finalThinkDuration
+                    }
+                }
+            }
+
+            // Agent Harness Multi-Step Tool Execution
+            let isAgentEnabled = (sessionId != nil) ? (self.sessions.first(where: { $0.id == sessionId })?.isAgentToolsEnabled ?? self.defaultAgentToolsEnabled) : self.defaultAgentToolsEnabled
+
+            if isAgentEnabled && finalDecoded.contains("<tool_call>") {
+                let parsedResult = AgentHarness.shared.parseToolCalls(from: finalDecoded)
+                if !parsedResult.calls.isEmpty {
+                    var initialRecords: [ToolCallRecord] = []
+                    for call in parsedResult.calls {
+                        var stringArgs: [String: String] = [:]
+                        for (k, v) in call.arguments {
+                            stringArgs[k] = "\(v)"
+                        }
+                        initialRecords.append(ToolCallRecord(
+                            name: call.name,
+                            arguments: stringArgs,
+                            rawArguments: call.rawArguments,
+                            status: .running
+                        ))
+                    }
+
+                    // Attach initial records to ChatMessage
+                    await MainActor.run {
+                        if let sId = sessionId, let mId = messageId,
+                           let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                           let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                            var currentCalls = self.sessions[sIdx].messages[mIdx].toolCalls ?? []
+                            currentCalls.append(contentsOf: initialRecords)
+                            self.sessions[sIdx].messages[mIdx].toolCalls = currentCalls
+                            self.generationStatusText = "⚙️ Executing \(initialRecords.count) tool call(s)..."
+                        }
+                    }
+
+                    let baseWdURL = self.agentWorkingDirectory.isEmpty ? nil : URL(fileURLWithPath: self.agentWorkingDirectory)
+                    var toolResponses: [String] = []
+                    var anyCompleted = false
+
+                    for (idx, call) in parsedResult.calls.enumerated() {
+                        let recordId = initialRecords[idx].id
+                        let execResult = await AgentHarness.shared.executeTool(
+                            call: call,
+                            workingDirectory: baseWdURL,
+                            maxOutputLength: self.maxToolOutputLength
+                        )
+                        toolResponses.append(execResult.resultJSON)
+                        if execResult.isCompleted {
+                            anyCompleted = true
+                        }
+
+                        // Update ToolCallRecord in ChatMessage
+                        await MainActor.run {
+                            if let sId = sessionId, let mId = messageId,
+                               let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                               let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }),
+                               var currentCalls = self.sessions[sIdx].messages[mIdx].toolCalls,
+                               let callIdx = currentCalls.firstIndex(where: { $0.id == recordId }) {
+                                currentCalls[callIdx].status = execResult.record.status
+                                currentCalls[callIdx].output = execResult.record.output
+                                currentCalls[callIdx].error = execResult.record.error
+                                currentCalls[callIdx].executionDurationSeconds = execResult.record.executionDurationSeconds
+                                self.sessions[sIdx].messages[mIdx].toolCalls = currentCalls
+                            }
+                        }
+                    }
+
+                    // If not finished and steps remaining, invoke next step
+                    if !anyCompleted && (agentStep + 1 < self.maxAgentSteps) {
+                        let toolResponseTurn = AgentHarness.shared.formatToolResponseTurn(responses: toolResponses)
+                        let nextPrompt = formattedPrompt + finalDecoded + "\n" + toolResponseTurn
+                        await MainActor.run {
+                            self.startAutoregressiveGeneration(
+                                customPrompt: nextPrompt,
+                                sessionId: sessionId,
+                                messageId: messageId,
+                                agentStep: agentStep + 1
+                            )
+                        }
+                        return
                     }
                 }
             }

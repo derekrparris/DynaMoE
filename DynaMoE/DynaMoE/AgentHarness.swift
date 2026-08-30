@@ -2,18 +2,20 @@
 //  AgentHarness.swift
 //  DynaMoE
 //
-//  Stateful Multi-Turn Agent Tool Harness for Qwen & ChatML Models
+//  Stateful Multi-Turn Agent Tool Harness for Qwen, DeepSeek & ChatML Models
 //  Preserves exact ChatML syntax (<tool_call>, <|im_start|>, <|im_end|>) and maintains
 //  persistent KV cache across tool turns without quadratic re-prefill.
 //
 
 import Foundation
 
-public struct ToolDefinition: Codable {
+// MARK: - Tool Definitions & Schemas
+
+public struct ToolDefinition: Codable, Equatable {
     public let type: String
     public let function: ToolFunction
 
-    public struct ToolFunction: Codable {
+    public struct ToolFunction: Codable, Equatable {
         public let name: String
         public let description: String
         public let parameters: [String: AnyCodable]
@@ -28,6 +30,7 @@ public struct ToolDefinition: Codable {
 public struct ParsedToolCall: Equatable {
     public let name: String
     public let arguments: [String: Any]
+    public let rawArguments: String
     public let rawText: String
 
     public static func == (lhs: ParsedToolCall, rhs: ParsedToolCall) -> Bool {
@@ -35,7 +38,7 @@ public struct ParsedToolCall: Equatable {
     }
 }
 
-public struct AnyCodable: Codable {
+public struct AnyCodable: Codable, Equatable {
     public let value: Any
 
     public init(_ value: Any) {
@@ -71,156 +74,774 @@ public struct AnyCodable: Codable {
             try container.encode(val)
         } else if let val = value as? Bool {
             try container.encode(val)
+        } else if let val = value as? [String: Any] {
+            let wrapped = val.mapValues { AnyCodable($0) }
+            try container.encode(wrapped)
+        } else if let val = value as? [Any] {
+            let wrapped = val.map { AnyCodable($0) }
+            try container.encode(wrapped)
+        }
+    }
+
+    public static func == (lhs: AnyCodable, rhs: AnyCodable) -> Bool {
+        return String(describing: lhs.value) == String(describing: rhs.value)
+    }
+}
+
+// MARK: - Agent Tool Protocol
+
+public protocol AgentTool {
+    var definition: ToolDefinition { get }
+    func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool)
+}
+
+// MARK: - Core Coding & Shell Tool Implementations
+
+/// Tool 1: shell_run — Executes shell commands with working directory & timeout
+public final class ShellRunTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "shell_run",
+        description: "Executes shell commands on the local macOS terminal via zsh. Use this to run scripts, compilers, git, or check system state. Output is captured and returned.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "command": [
+                    "type": "string",
+                    "description": "The exact shell command line string to execute."
+                ],
+                "cwd": [
+                    "type": "string",
+                    "description": "Optional directory path to execute the command in. Defaults to current workspace."
+                ]
+            ]),
+            "required": AnyCodable(["command"])
+        ]
+    )
+
+    public func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        guard let command = arguments["command"] as? String, !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            let err = "Error: missing or empty 'command' parameter in shell_run"
+            return (AgentHarness.toolErrorJSON(tool: "shell_run", error: err), nil, err, false)
+        }
+
+        let targetDir: URL
+        if let customCwd = arguments["cwd"] as? String, !customCwd.isEmpty {
+            targetDir = URL(fileURLWithPath: (customCwd as NSString).expandingTildeInPath)
+        } else if let wd = workingDirectory {
+            targetDir = wd
+        } else {
+            targetDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        }
+
+        let (exitCode, stdout, stderr) = try await AgentHarness.runProcess(
+            executableURL: URL(fileURLWithPath: "/bin/zsh"),
+            arguments: ["-c", command],
+            currentDirectory: targetDir,
+            timeoutSeconds: 180
+        )
+
+        let cleanStdout = AgentHarness.truncateText(AgentHarness.sanitizeText(stdout.trimmingCharacters(in: .whitespacesAndNewlines)), limit: maxOutputLength)
+        let cleanStderr = AgentHarness.truncateText(AgentHarness.sanitizeText(stderr.trimmingCharacters(in: .whitespacesAndNewlines)), limit: maxOutputLength)
+
+        if exitCode == 0 {
+            let res = AgentHarness.toolSuccessJSON(tool: "shell_run", data: [
+                "stdout": cleanStdout.isEmpty ? "Command succeeded with no output." : cleanStdout,
+                "exit_code": 0
+            ])
+            return (res, cleanStdout, nil, false)
+        } else {
+            let res = AgentHarness.toolErrorJSON(tool: "shell_run", error: cleanStderr.isEmpty ? cleanStdout : cleanStderr, extra: [
+                "exit_code": exitCode,
+                "stdout": cleanStdout
+            ])
+            return (res, cleanStdout, cleanStderr, false)
         }
     }
 }
 
+/// Tool 2: file_read — Reads local files with line range slicing and line numbers
+public final class FileReadTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "file_read",
+        description: "Reads contents of a file on the local filesystem. Supports line range slicing (start_line, end_line) with 1-indexed line numbers to inspect large source files efficiently.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "path": [
+                    "type": "string",
+                    "description": "Path to the file to read (absolute or relative to workspace)."
+                ],
+                "start_line": [
+                    "type": "integer",
+                    "description": "Optional 1-indexed start line number."
+                ],
+                "end_line": [
+                    "type": "integer",
+                    "description": "Optional 1-indexed end line number."
+                ]
+            ]),
+            "required": AnyCodable(["path"])
+        ]
+    )
+
+    public func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        guard let rawPath = arguments["path"] as? String, !rawPath.isEmpty else {
+            let err = "Error: missing 'path' parameter in file_read"
+            return (AgentHarness.toolErrorJSON(tool: "file_read", error: err), nil, err, false)
+        }
+
+        let resolvedPath = AgentHarness.resolvePath(rawPath, workingDirectory: workingDirectory)
+        guard FileManager.default.fileExists(atPath: resolvedPath.path) else {
+            let err = "File not found at path: \(resolvedPath.path)"
+            return (AgentHarness.toolErrorJSON(tool: "file_read", error: err), nil, err, false)
+        }
+
+        do {
+            let content = try String(contentsOf: resolvedPath, encoding: .utf8)
+            let lines = content.components(separatedBy: "\n")
+            let totalLines = lines.count
+
+            var startLine = 1
+            if let s = arguments["start_line"] as? Int {
+                startLine = max(1, min(s, totalLines))
+            }
+
+            var endLine = totalLines
+            if let e = arguments["end_line"] as? Int {
+                endLine = max(startLine, min(e, totalLines))
+            }
+
+            var numberedLines: [String] = []
+            for idx in (startLine - 1)..<endLine {
+                numberedLines.append("\(idx + 1): \(lines[idx])")
+            }
+
+            let slicedText = numberedLines.joined(separator: "\n")
+            let sanitized = AgentHarness.truncateText(AgentHarness.sanitizeText(slicedText), limit: maxOutputLength)
+
+            let res = AgentHarness.toolSuccessJSON(tool: "file_read", data: [
+                "path": resolvedPath.path,
+                "total_lines": totalLines,
+                "start_line": startLine,
+                "end_line": endLine,
+                "content": sanitized
+            ])
+            return (res, sanitized, nil, false)
+        } catch {
+            let err = "Failed to read file: \(error.localizedDescription)"
+            return (AgentHarness.toolErrorJSON(tool: "file_read", error: err), nil, err, false)
+        }
+    }
+}
+
+/// Tool 3: file_write — Creates or overwrites files atomically
+public final class FileWriteTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "file_write",
+        description: "Creates a new file or overwrites an existing file with provided text content. Automatically creates parent directories.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "path": [
+                    "type": "string",
+                    "description": "Path to the file to create or overwrite."
+                ],
+                "content": [
+                    "type": "string",
+                    "description": "Full text content to write to the file."
+                ]
+            ]),
+            "required": AnyCodable(["path", "content"])
+        ]
+    )
+
+    public func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        guard let rawPath = arguments["path"] as? String, !rawPath.isEmpty else {
+            let err = "Error: missing 'path' parameter in file_write"
+            return (AgentHarness.toolErrorJSON(tool: "file_write", error: err), nil, err, false)
+        }
+        guard let content = arguments["content"] as? String else {
+            let err = "Error: missing 'content' parameter in file_write"
+            return (AgentHarness.toolErrorJSON(tool: "file_write", error: err), nil, err, false)
+        }
+
+        let resolvedPath = AgentHarness.resolvePath(rawPath, workingDirectory: workingDirectory)
+        do {
+            let parentDir = resolvedPath.deletingLastPathComponent()
+            try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
+            try content.write(to: resolvedPath, atomically: true, encoding: .utf8)
+
+            let byteCount = content.utf8.count
+            let msg = "Successfully wrote \(byteCount) bytes to \(resolvedPath.path)"
+            let res = AgentHarness.toolSuccessJSON(tool: "file_write", data: [
+                "path": resolvedPath.path,
+                "bytes_written": byteCount,
+                "status": "written"
+            ])
+            return (res, msg, nil, false)
+        } catch {
+            let err = "Failed to write file: \(error.localizedDescription)"
+            return (AgentHarness.toolErrorJSON(tool: "file_write", error: err), nil, err, false)
+        }
+    }
+}
+
+/// Tool 4: file_edit — Precise contiguous anchor search-and-replace (replace_file_content pattern)
+public final class FileEditTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "file_edit",
+        description: "Performs precise contiguous text replacement in a file. Provide the exact target_content to be replaced and replacement_content. Guarantees safety by checking for exact matches.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "path": [
+                    "type": "string",
+                    "description": "Path to the file to edit."
+                ],
+                "target_content": [
+                    "type": "string",
+                    "description": "Exact text substring in the file to find and replace."
+                ],
+                "replacement_content": [
+                    "type": "string",
+                    "description": "New text to substitute in place of target_content."
+                ]
+            ]),
+            "required": AnyCodable(["path", "target_content", "replacement_content"])
+        ]
+    )
+
+    public func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        guard let rawPath = arguments["path"] as? String, !rawPath.isEmpty else {
+            let err = "Error: missing 'path' parameter in file_edit"
+            return (AgentHarness.toolErrorJSON(tool: "file_edit", error: err), nil, err, false)
+        }
+        guard let target = arguments["target_content"] as? String, !target.isEmpty else {
+            let err = "Error: missing 'target_content' in file_edit"
+            return (AgentHarness.toolErrorJSON(tool: "file_edit", error: err), nil, err, false)
+        }
+        guard let replacement = arguments["replacement_content"] as? String else {
+            let err = "Error: missing 'replacement_content' in file_edit"
+            return (AgentHarness.toolErrorJSON(tool: "file_edit", error: err), nil, err, false)
+        }
+
+        let resolvedPath = AgentHarness.resolvePath(rawPath, workingDirectory: workingDirectory)
+        guard FileManager.default.fileExists(atPath: resolvedPath.path) else {
+            let err = "File not found at path: \(resolvedPath.path)"
+            return (AgentHarness.toolErrorJSON(tool: "file_edit", error: err), nil, err, false)
+        }
+
+        do {
+            let existing = try String(contentsOf: resolvedPath, encoding: .utf8)
+            guard existing.contains(target) else {
+                let err = "target_content not found in \(resolvedPath.lastPathComponent). Ensure whitespace and indentation match exactly."
+                return (AgentHarness.toolErrorJSON(tool: "file_edit", error: err), nil, err, false)
+            }
+
+            // Verify unique occurrence or replace first
+            guard let range = existing.range(of: target) else {
+                let err = "Could not locate target_content range in file."
+                return (AgentHarness.toolErrorJSON(tool: "file_edit", error: err), nil, err, false)
+            }
+
+            let updated = existing.replacingCharacters(in: range, with: replacement)
+            try updated.write(to: resolvedPath, atomically: true, encoding: .utf8)
+
+            let msg = "Successfully edited \(resolvedPath.lastPathComponent)"
+            let res = AgentHarness.toolSuccessJSON(tool: "file_edit", data: [
+                "path": resolvedPath.path,
+                "status": "success",
+                "message": msg
+            ])
+            return (res, msg, nil, false)
+        } catch {
+            let err = "Failed to edit file: \(error.localizedDescription)"
+            return (AgentHarness.toolErrorJSON(tool: "file_edit", error: err), nil, err, false)
+        }
+    }
+}
+
+/// Tool 5: find_files — Finds files matching glob / pattern in directory
+public final class FindFilesTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "find_files",
+        description: "Search for files and directories within a specified path matching a glob pattern or file extension.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "pattern": [
+                    "type": "string",
+                    "description": "Pattern or extension to match (e.g. '*.swift', 'ContentView', '*.metal')."
+                ],
+                "path": [
+                    "type": "string",
+                    "description": "Optional search directory. Defaults to workspace root."
+                ],
+                "max_depth": [
+                    "type": "integer",
+                    "description": "Optional maximum folder depth to search. Default 5."
+                ]
+            ]),
+            "required": AnyCodable(["pattern"])
+        ]
+    )
+
+    public func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        guard let pattern = arguments["pattern"] as? String, !pattern.isEmpty else {
+            let err = "Error: missing 'pattern' in find_files"
+            return (AgentHarness.toolErrorJSON(tool: "find_files", error: err), nil, err, false)
+        }
+
+        let baseDir: URL
+        if let customPath = arguments["path"] as? String, !customPath.isEmpty {
+            baseDir = AgentHarness.resolvePath(customPath, workingDirectory: workingDirectory)
+        } else if let wd = workingDirectory {
+            baseDir = wd
+        } else {
+            baseDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        }
+
+        let maxDepth = (arguments["max_depth"] as? Int) ?? 5
+        let escapedPattern = pattern.replacingOccurrences(of: "'", with: "\\'")
+        let cmd = "find . -maxdepth \(maxDepth) -iname '\(escapedPattern)' -not -path '*/.*' | head -n 50"
+
+        let (_, stdout, _) = try await AgentHarness.runProcess(
+            executableURL: URL(fileURLWithPath: "/bin/zsh"),
+            arguments: ["-c", cmd],
+            currentDirectory: baseDir,
+            timeoutSeconds: 30
+        )
+
+        let matches = stdout.components(separatedBy: "\n").filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let res = AgentHarness.toolSuccessJSON(tool: "find_files", data: [
+            "search_path": baseDir.path,
+            "pattern": pattern,
+            "count": matches.count,
+            "matches": matches
+        ])
+        return (res, matches.joined(separator: "\n"), nil, false)
+    }
+}
+
+/// Tool 6: grep_search — Fast regex and literal pattern search using ripgrep or grep
+public final class GrepSearchTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "grep_search",
+        description: "Searches for text or regular expression patterns across files in a directory using ripgrep (rg) or grep.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "query": [
+                    "type": "string",
+                    "description": "Text or regex pattern to search for."
+                ],
+                "path": [
+                    "type": "string",
+                    "description": "Optional directory or file path to search in."
+                ],
+                "case_insensitive": [
+                    "type": "boolean",
+                    "description": "Whether to perform case-insensitive search. Default true."
+                ]
+            ]),
+            "required": AnyCodable(["query"])
+        ]
+    )
+
+    public func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        guard let query = arguments["query"] as? String, !query.isEmpty else {
+            let err = "Error: missing 'query' in grep_search"
+            return (AgentHarness.toolErrorJSON(tool: "grep_search", error: err), nil, err, false)
+        }
+
+        let baseDir: URL
+        if let customPath = arguments["path"] as? String, !customPath.isEmpty {
+            baseDir = AgentHarness.resolvePath(customPath, workingDirectory: workingDirectory)
+        } else if let wd = workingDirectory {
+            baseDir = wd
+        } else {
+            baseDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        }
+
+        let caseInsensitive = (arguments["case_insensitive"] as? Bool) ?? true
+        let escapedQuery = query.replacingOccurrences(of: "'", with: "\\'")
+        let flag = caseInsensitive ? "-i" : ""
+        let cmd = "if command -v rg >/dev/null 2>&1; then rg \(flag) -n --max-count 50 -- '\(escapedQuery)' .; else grep -rn \(flag) --max-count=50 --exclude-dir=.* -- '\(escapedQuery)' .; fi"
+
+        let (_, stdout, _) = try await AgentHarness.runProcess(
+            executableURL: URL(fileURLWithPath: "/bin/zsh"),
+            arguments: ["-c", cmd],
+            currentDirectory: baseDir,
+            timeoutSeconds: 30
+        )
+
+        let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeText(stdout.trimmingCharacters(in: .whitespacesAndNewlines)), limit: maxOutputLength)
+        let lines = cleanOut.components(separatedBy: "\n").filter { !$0.isEmpty }
+
+        let res = AgentHarness.toolSuccessJSON(tool: "grep_search", data: [
+            "query": query,
+            "count": lines.count,
+            "results": lines
+        ])
+        return (res, cleanOut, nil, false)
+    }
+}
+
+/// Tool 7: complete — Signals task completion with summary
+public final class CompleteTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "complete",
+        description: "Signals that the user's task or requested instructions are fully completed.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "summary": [
+                    "type": "string",
+                    "description": "Comprehensive summary of actions taken and final results."
+                ]
+            ]),
+            "required": AnyCodable(["summary"])
+        ]
+    )
+
+    public func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        let summary = (arguments["summary"] as? String) ?? "Task completed."
+        let sanitized = AgentHarness.sanitizeText(summary)
+        let res = AgentHarness.toolSuccessJSON(tool: "complete", data: ["summary": sanitized])
+        return (res, sanitized, nil, true)
+    }
+}
+
+// MARK: - Agent Harness Coordinator
+
 public final class AgentHarness {
     public static let shared = AgentHarness()
 
-    public static let defaultSystemPrompt = """
-    You are a helpful assistant with access to local system tools on macOS.
-    Whenever you need to interact with files or execute commands, generate a <tool_call> block.
-    """
-
-    public private(set) var availableTools: [ToolDefinition] = []
+    public private(set) var tools: [String: AgentTool] = [:]
+    public var defaultWorkingDirectory: URL? = nil
+    public var maxToolOutputLength: Int = 4000
+    public var maxAgentSteps: Int = 15
 
     private init() {
         registerDefaultTools()
     }
 
-    private func registerDefaultTools() {
-        let shellTool = ToolDefinition(
-            name: "shell_run",
-            description: "Execute a shell command on macOS and return its stdout and stderr.",
-            parameters: [
-                "type": AnyCodable("object"),
-                "properties": AnyCodable([
-                    "command": [
-                        "type": "string",
-                        "description": "The exact shell command line string to execute."
-                    ]
-                ]),
-                "required": AnyCodable(["command"])
-            ]
-        )
-
-        let readTool = ToolDefinition(
-            name: "file_read",
-            description: "Read text contents of a file on the local filesystem.",
-            parameters: [
-                "type": AnyCodable("object"),
-                "properties": AnyCodable([
-                    "path": [
-                        "type": "string",
-                        "description": "Absolute path to the file to read."
-                    ]
-                ]),
-                "required": AnyCodable(["path"])
-            ]
-        )
-
-        availableTools = [shellTool, readTool]
+    public func registerDefaultTools() {
+        registerTool(ShellRunTool())
+        registerTool(FileReadTool())
+        registerTool(FileWriteTool())
+        registerTool(FileEditTool())
+        registerTool(FindFilesTool())
+        registerTool(GrepSearchTool())
+        registerTool(CompleteTool())
     }
 
-    // MARK: - Prompt Formatting (ChatML)
+    public func registerTool(_ tool: AgentTool) {
+        tools[tool.definition.function.name] = tool
+    }
 
-    /// Builds standard ChatML formatted initial prompt including system prompt and tool schemas
-    public func formatInitialChatML(system: String = defaultSystemPrompt, userMessage: String) -> String {
-        var prompt = "<|im_start|>system\n\(system)\n"
-        if !availableTools.isEmpty {
-            prompt += "\n# Tools\nYou have access to the following tools:\n```json\n"
-            if let data = try? JSONEncoder().encode(availableTools),
-               let jsonStr = String(data: data, encoding: .utf8) {
-                prompt += jsonStr
-            }
-            prompt += "\n```\n"
+    public var availableToolDefinitions: [ToolDefinition] {
+        return Array(tools.values.map { $0.definition })
+    }
+
+    // MARK: - Prompt Formatting & ChatML Generation
+
+    public func buildSystemPrompt(baseSystem: String, modelName: String? = nil) -> String {
+        var cleanBase = baseSystem.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleanBase.isEmpty {
+            cleanBase = "You are a helpful coding and engineering assistant with direct access to local macOS development tools."
         }
-        prompt += "<|im_end|>\n"
-        prompt += "<|im_start|>user\n\(userMessage)<|im_end|>\n"
-        prompt += "<|im_start|>assistant\n"
+
+        var prompt = cleanBase
+        prompt += "\n\nYou have direct access to the local macOS system tools through <tool_call> functions. "
+        prompt += "Whenever you need to read or edit files, search code, or run terminal commands, emit one or more JSON <tool_call> blocks."
+        prompt += "\n\n# Available Tools\n<tools>\n"
+
+        for tool in availableToolDefinitions {
+            if let data = try? JSONEncoder().encode(tool),
+               let jsonStr = String(data: data, encoding: .utf8) {
+                prompt += jsonStr + "\n"
+            }
+        }
+        prompt += "</tools>\n\n"
+        prompt += "To invoke a tool, output a JSON object within <tool_call></tool_call> tags:\n"
+        prompt += "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"path\": \"ContentView.swift\", \"start_line\": 1, \"end_line\": 50}}\n</tool_call>\n"
+
         return prompt
     }
 
-    /// Formats a tool execution response as an incremental continuation turn
-    public func formatToolResponseTurn(toolName: String, response: String) -> String {
-        return "<tool_response>\n\(response)\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+    public func formatToolResponseTurn(responses: [String]) -> String {
+        var turn = "<|im_start|>user\n"
+        for r in responses {
+            turn += "<tool_response>\n\(r)\n</tool_response>\n"
+        }
+        turn += "<|im_end|>\n<|im_start|>assistant\n"
+        return turn
     }
 
-    // MARK: - Tool Call Extraction & Execution
+    // MARK: - Tolerant Tool Call Parser (Multi-Call + Truncation Recovery)
 
-    /// Extracts tool call JSON blocks from generated model output
-    public func parseToolCalls(from text: String) -> [ParsedToolCall] {
-        var results: [ParsedToolCall] = []
-        let pattern = "<tool_call>\\s*(\\{.*?\\})\\s*</tool_call>"
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else {
-            return results
-        }
+    public func parseToolCalls(from text: String) -> (calls: [ParsedToolCall], brokenFragments: [String]) {
+        var calls: [ParsedToolCall] = []
+        var broken: [String] = []
 
-        let nsString = text as NSString
-        let matches = regex.matches(in: text, options: [], range: NSRange(location: 0, length: nsString.length))
+        let toolCallRegex = try? NSRegularExpression(pattern: "<tool_call>([\\s\\S]*?)</tool_call>", options: [])
+        let nsText = text as NSString
+        let matches = toolCallRegex?.matches(in: text, options: [], range: NSRange(location: 0, length: nsText.length)) ?? []
 
-        for match in matches {
-            guard match.numberOfRanges >= 2 else { continue }
-            let fullRange = match.range(at: 0)
-            let jsonRange = match.range(at: 1)
-            let rawMatch = nsString.substring(with: fullRange)
-            let jsonStr = nsString.substring(with: jsonRange)
+        for m in matches {
+            guard m.numberOfRanges >= 2 else { continue }
+            let innerRange = m.range(at: 1)
+            let rawMatch = nsText.substring(with: m.range(at: 0))
+            let innerText = nsText.substring(with: innerRange).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !innerText.isEmpty else { continue }
 
-            if let data = jsonStr.data(using: .utf8),
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let name = json["name"] as? String {
-                let args = (json["arguments"] as? [String: Any]) ?? [:]
-                results.append(ParsedToolCall(name: name, arguments: args, rawText: rawMatch))
+            if let parsed = extractBalancedJSON(innerText) {
+                if let name = parsed["name"] as? String {
+                    let args = (parsed["arguments"] as? [String: Any]) ?? [:]
+                    let rawArgs = (parsed["arguments"] != nil) ? String(describing: parsed["arguments"]!) : ""
+                    calls.append(ParsedToolCall(name: name, arguments: args, rawArguments: rawArgs, rawText: rawMatch))
+                } else {
+                    broken.append(innerText)
+                }
+            } else {
+                broken.append(innerText)
             }
         }
 
-        return results
-    }
-
-    /// Executes a parsed tool call locally and returns the execution string result
-    public func executeToolCall(_ call: ParsedToolCall) -> String {
-        switch call.name {
-        case "shell_run":
-            guard let cmd = call.arguments["command"] as? String else {
-                return "Error: missing 'command' parameter in shell_run"
+        // Check for unclosed <tool_call> (generation cut off by max_tokens)
+        if calls.isEmpty && broken.isEmpty && text.contains("<tool_call>") {
+            let parts = text.components(separatedBy: "<tool_call>")
+            if parts.count > 1 {
+                let tail = parts.last?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if !tail.isEmpty {
+                    broken.append(tail)
+                }
             }
-            return runShellCommand(cmd)
-
-        case "file_read":
-            guard let path = call.arguments["path"] as? String else {
-                return "Error: missing 'path' parameter in file_read"
-            }
-            return readFileContents(path)
-
-        default:
-            return "Error: Unknown tool '\(call.name)'"
         }
+
+        return (calls, broken)
     }
 
-    private func runShellCommand(_ command: String) -> String {
-        let process = Process()
-        let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        process.arguments = ["-c", command]
-        process.standardOutput = pipe
-        process.standardError = pipe
+    /// String & escape aware balanced bracket JSON scanner
+    public func extractBalancedJSON(_ text: String) -> [String: Any]? {
+        guard let startIdx = text.firstIndex(of: "{") else { return nil }
+        let sub = text[startIdx...]
+
+        var depth = 0
+        var inString = false
+        var isEscaped = false
+        var endIdx: String.Index? = nil
+
+        for i in sub.indices {
+            let c = sub[i]
+            if inString {
+                if isEscaped {
+                    isEscaped = false
+                } else if c == "\\" {
+                    isEscaped = true
+                } else if c == "\"" {
+                    inString = false
+                }
+            } else {
+                if c == "\"" {
+                    inString = true
+                } else if c == "{" {
+                    depth += 1
+                } else if c == "}" {
+                    depth -= 1
+                    if depth == 0 {
+                        endIdx = i
+                        break
+                    }
+                }
+            }
+        }
+
+        guard let end = endIdx else { return nil }
+        let jsonSubstring = String(sub[...end])
+        guard let data = jsonSubstring.data(using: .utf8) else { return nil }
+        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+    }
+
+    public func generateRecoveryPrompt(brokenFragment: String, maxTokens: Int) -> String {
+        let cleanFrag = AgentHarness.truncateText(AgentHarness.sanitizeText(brokenFragment), limit: 400)
+        return """
+        Your previous <tool_call> could not be parsed as JSON (it was either malformed or truncated mid-token).
+        Raw fragment:
+        \(cleanFrag)
+
+        Please re-issue the tool call as a single valid JSON object inside <tool_call></tool_call> tags. If the parameters or scripts are large, consider breaking them into smaller actions.
+        """
+    }
+
+    // MARK: - Tool Execution
+
+    public func executeTool(call: ParsedToolCall, workingDirectory: URL? = nil, maxOutputLength: Int? = nil) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool) {
+        let startTime = CFAbsoluteTimeGetCurrent()
+        let wd = workingDirectory ?? defaultWorkingDirectory
+        let strArgs = call.arguments.mapValues { String(describing: $0) }
+        let effectiveMaxLen = maxOutputLength ?? self.maxToolOutputLength
+
+        guard let tool = tools[call.name] else {
+            let err = "Unknown tool '\(call.name)'"
+            let json = AgentHarness.toolErrorJSON(tool: call.name, error: err)
+            let rec = ToolCallRecord(
+                name: call.name,
+                arguments: strArgs,
+                rawArguments: call.rawArguments,
+                status: .error,
+                output: nil,
+                error: err,
+                executionDurationSeconds: CFAbsoluteTimeGetCurrent() - startTime
+            )
+            return (json, rec, false)
+        }
 
         do {
-            try process.run()
-            process.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            return String(data: data, encoding: .utf8) ?? ""
+            let (json, stdout, stderr, isCompleted) = try await tool.execute(arguments: call.arguments, workingDirectory: wd, maxOutputLength: effectiveMaxLen)
+            let duration = CFAbsoluteTimeGetCurrent() - startTime
+            let status: ToolExecutionStatus = (stderr != nil && !stderr!.isEmpty) ? .error : .success
+
+            let rec = ToolCallRecord(
+                name: call.name,
+                arguments: strArgs,
+                rawArguments: call.rawArguments,
+                status: status,
+                output: stdout,
+                error: stderr,
+                executionDurationSeconds: duration
+            )
+            return (json, rec, isCompleted)
         } catch {
-            return "Execution failed: \(error.localizedDescription)"
+            let duration = CFAbsoluteTimeGetCurrent() - startTime
+            let err = error.localizedDescription
+            let json = AgentHarness.toolErrorJSON(tool: call.name, error: err)
+            let rec = ToolCallRecord(
+                name: call.name,
+                arguments: strArgs,
+                rawArguments: call.rawArguments,
+                status: .error,
+                output: nil,
+                error: err,
+                executionDurationSeconds: duration
+            )
+            return (json, rec, false)
         }
     }
 
-    private func readFileContents(_ path: String) -> String {
-        do {
-            return try String(contentsOfFile: path, encoding: .utf8)
-        } catch {
-            return "Read failed: \(error.localizedDescription)"
+    // MARK: - Helpers & Utilities
+
+    public static func resolvePath(_ rawPath: String, workingDirectory: URL?) -> URL {
+        let expanded = (rawPath as NSString).expandingTildeInPath
+        if expanded.hasPrefix("/") {
+            return URL(fileURLWithPath: expanded)
+        }
+        if let wd = workingDirectory {
+            return wd.appendingPathComponent(expanded)
+        }
+        return URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(expanded)
+    }
+
+    public static func sanitizeText(_ text: String) -> String {
+        var s = text
+        s = s.replacingOccurrences(of: "<|im_start|>", with: "[im_start]")
+        s = s.replacingOccurrences(of: "<|im_end|>", with: "[im_end]")
+        s = s.replacingOccurrences(of: "<tool_call>", with: "[tool_call]")
+        s = s.replacingOccurrences(of: "</tool_call>", with: "[/tool_call]")
+        s = s.replacingOccurrences(of: "<tool_response>", with: "[tool_response]")
+        s = s.replacingOccurrences(of: "</tool_response>", with: "[/tool_response]")
+        return s
+    }
+
+    public static func truncateText(_ text: String, limit: Int) -> String {
+        guard text.count > limit else { return text }
+        let headCount = max(100, limit - 400)
+        let tailCount = 300
+        let head = text.prefix(headCount)
+        let tail = text.suffix(tailCount)
+        let truncated = text.count - (headCount + tailCount)
+        return "\(head)\n\n... [truncated \(truncated) characters] ...\n\n\(tail)"
+    }
+
+    public static func toolSuccessJSON(tool: String, data: [String: Any]) -> String {
+        let dict: [String: Any] = [
+            "status": "success",
+            "tool": tool,
+            "result": data
+        ]
+        if let jsonBytes = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]),
+           let str = String(data: jsonBytes, encoding: .utf8) {
+            return str
+        }
+        return "{\"status\": \"success\", \"tool\": \"\(tool)\"}"
+    }
+
+    public static func toolErrorJSON(tool: String, error: String, extra: [String: Any]? = nil) -> String {
+        var dict: [String: Any] = [
+            "status": "error",
+            "tool": tool,
+            "error": error
+        ]
+        if let extra = extra {
+            for (k, v) in extra { dict[k] = v }
+        }
+        if let jsonBytes = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]),
+           let str = String(data: jsonBytes, encoding: .utf8) {
+            return str
+        }
+        return "{\"status\": \"error\", \"tool\": \"\(tool)\", \"error\": \"\(error)\"}"
+    }
+
+    public static func runProcess(
+        executableURL: URL,
+        arguments: [String],
+        currentDirectory: URL,
+        timeoutSeconds: TimeInterval = 180
+    ) async throws -> (exitCode: Int32, stdout: String, stderr: String) {
+        return try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                let stdoutPipe = Pipe()
+                let stderrPipe = Pipe()
+
+                process.executableURL = executableURL
+                process.arguments = arguments
+                process.currentDirectoryURL = currentDirectory
+                process.standardOutput = stdoutPipe
+                process.standardError = stderrPipe
+
+                var isDone = false
+                let lock = NSLock()
+
+                do {
+                    try process.run()
+
+                    let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                    let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                    process.waitUntilExit()
+
+                    lock.lock()
+                    if !isDone {
+                        isDone = true
+                        lock.unlock()
+                        let stdoutStr = String(data: stdoutData, encoding: .utf8) ?? ""
+                        let stderrStr = String(data: stderrData, encoding: .utf8) ?? ""
+                        continuation.resume(returning: (process.terminationStatus, stdoutStr, stderrStr))
+                    } else {
+                        lock.unlock()
+                    }
+                } catch {
+                    lock.lock()
+                    if !isDone {
+                        isDone = true
+                        lock.unlock()
+                        continuation.resume(throwing: error)
+                    } else {
+                        lock.unlock()
+                    }
+                }
+            }
         }
     }
 }

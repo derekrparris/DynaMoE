@@ -19,12 +19,14 @@ struct ChatDetailView: View {
     var tokenizer: DynaMoeTokenizer? = nil
     var supportsThinking: Bool = false
     var isThinkingEnabled: Bool = true
+    var isAgentToolsEnabled: Bool = true
     var onSendMessage: (String) -> Void
     var onStopGeneration: () -> Void
     var onSelectPromptStarter: (String) -> Void
     var onSelectDiscoveredModel: ((DiscoveredModel) -> Void)? = nil
     var onOpenSettings: (() -> Void)? = nil
     var onToggleThinking: ((Bool) -> Void)? = nil
+    var onToggleAgentTools: ((Bool) -> Void)? = nil
     var onToggleSidebar: (() -> Void)? = nil
 
     @FocusState private var isInputFocused: Bool
@@ -340,6 +342,55 @@ struct ChatDetailView: View {
                             .transition(.opacity.combined(with: .scale))
                         }
 
+                        // Agent Tools On/Off Dropdown
+                        Menu {
+                            Button(action: {
+                                onToggleAgentTools?(true)
+                            }) {
+                                HStack {
+                                    if isAgentToolsEnabled {
+                                        Image(systemName: "checkmark")
+                                    }
+                                    Label("Agent Tools On (Shell & File Execution)", systemImage: "wrench.and.screwdriver.fill")
+                                }
+                            }
+
+                            Button(action: {
+                                onToggleAgentTools?(false)
+                            }) {
+                                HStack {
+                                    if !isAgentToolsEnabled {
+                                        Image(systemName: "checkmark")
+                                    }
+                                    Label("Agent Tools Off", systemImage: "wrench.slash")
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: isAgentToolsEnabled ? "wrench.and.screwdriver.fill" : "wrench.slash")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(isAgentToolsEnabled ? .indigo : .secondary)
+                                Text(isAgentToolsEnabled ? "Tools On" : "Tools Off")
+                                    .font(.system(size: 11.5, weight: .medium))
+                                    .foregroundColor(isAgentToolsEnabled ? .primary : .secondary)
+                                Image(systemName: "chevron.up.chevron.down")
+                                    .font(.system(size: 7.5, weight: .semibold))
+                                    .foregroundColor(.secondary.opacity(0.7))
+                            }
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4.5)
+                            .background(isAgentToolsEnabled ? Color.indigo.opacity(0.12) : Color.secondary.opacity(0.08))
+                            .cornerRadius(10)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .stroke(isAgentToolsEnabled ? Color.indigo.opacity(0.3) : Color.clear, lineWidth: 1)
+                            )
+                        }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                        .help(isAgentToolsEnabled ? "Agent mode is enabled: Model can run shell commands, inspect, and edit files" : "Agent mode is disabled")
+                        .transition(.opacity.combined(with: .scale))
+
                         // Real-time Prompt Token Counter (to the right of Thinking toggle or Model selector)
                         if promptTokenCount > 0 {
                             HStack(spacing: 3.5) {
@@ -532,6 +583,14 @@ struct ChatMessageView: View {
     @State private var isCopied = false
     @State private var feedback: String? = nil
 
+    private var displayMarkdownContent: String {
+        let clean = message.content
+            .replacingOccurrences(of: "<tool_call>[\\s\\S]*?</tool_call>", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "<tool_response>[\\s\\S]*?</tool_response>", with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return clean
+    }
+
     var body: some View {
         HStack(alignment: .top, spacing: 14) {
             if message.role == .assistant {
@@ -677,10 +736,16 @@ struct ChatMessageView: View {
                         }
                     }
 
+                    // Tool Calls Execution Cards (if any tool calls were issued)
+                    if let toolCalls = message.toolCalls, !toolCalls.isEmpty {
+                        ToolCallListView(toolCalls: toolCalls)
+                    }
+
                     // Main Response Text rendered via Rich Markdown Engine
-                    if !message.content.isEmpty {
+                    let displayContent = displayMarkdownContent
+                    if !displayContent.isEmpty {
                         MarkdownMessageView(
-                            content: message.content,
+                            content: displayContent,
                             isStreaming: isGenerating && message.isThinking == false,
                             isStreamingOffDisk: isStreamingOffDisk
                         )
@@ -1828,3 +1893,229 @@ public func parseMarkdownBlocks(_ raw: String) -> [MarkdownBlock] {
 
     return blocks
 }
+
+// MARK: - Tool Calls Visual Cards (Agent Mode)
+struct ToolCallListView: View {
+    let toolCalls: [ToolCallRecord]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(toolCalls) { call in
+                ToolCallCardView(call: call)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+struct ToolCallCardView: View {
+    let call: ToolCallRecord
+    @State private var isExpanded: Bool = false
+    @State private var isCopied: Bool = false
+
+    private var iconName: String {
+        switch call.name {
+        case "shell_run": return "terminal.fill"
+        case "file_read": return "doc.text.fill"
+        case "file_write": return "doc.badge.plus"
+        case "file_edit": return "square.and.pencil"
+        case "find_files": return "folder.badge.gearshape"
+        case "grep_search": return "magnifyingglass"
+        case "complete": return "checkmark.seal.fill"
+        default: return "wrench.and.screwdriver.fill"
+        }
+    }
+
+    private var primarySummary: String {
+        switch call.name {
+        case "shell_run":
+            return call.arguments["command"] ?? call.rawArguments
+        case "file_read", "file_write", "file_edit":
+            if let path = call.arguments["path"] {
+                return (path as NSString).lastPathComponent
+            }
+            return call.rawArguments
+        case "find_files":
+            return call.arguments["pattern"] ?? call.rawArguments
+        case "grep_search":
+            return "\"\(call.arguments["query"] ?? "")\""
+        case "complete":
+            return call.arguments["summary"] ?? "Completed"
+        default:
+            return call.rawArguments
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    isExpanded.toggle()
+                }
+            }) {
+                HStack(spacing: 8) {
+                    // Tool Icon
+                    Image(systemName: iconName)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(statusColor)
+
+                    // Tool Name Badge
+                    Text(call.name)
+                        .font(.system(size: 11.5, weight: .bold, design: .monospaced))
+                        .foregroundColor(.primary)
+
+                    // Primary Argument / Target
+                    Text(primarySummary)
+                        .font(.system(size: 11.5, weight: .regular, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+
+                    Spacer()
+
+                    // Status Indicator
+                    switch call.status {
+                    case .running:
+                        HStack(spacing: 4) {
+                            ProgressView()
+                                .controlSize(.mini)
+                            Text("Running")
+                                .font(.system(size: 10.5, weight: .medium))
+                                .foregroundColor(.indigo)
+                        }
+                    case .success:
+                        HStack(spacing: 4) {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 11))
+                                .foregroundColor(.green)
+                            if let dur = call.executionDurationSeconds {
+                                Text(String(format: "%.2fs", dur))
+                                    .font(.system(size: 10, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    case .error:
+                        HStack(spacing: 4) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 11))
+                                .foregroundColor(.red)
+                            Text("Failed")
+                                .font(.system(size: 10.5, weight: .medium))
+                                .foregroundColor(.red)
+                        }
+                    }
+
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .foregroundColor(.secondary.opacity(0.7))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color(NSColor.controlBackgroundColor).opacity(0.85))
+                .cornerRadius(7)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 7)
+                        .stroke(call.status == .running ? Color.indigo.opacity(0.3) : Color.primary.opacity(0.06), lineWidth: 1)
+                )
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 6) {
+                    // Full Arguments
+                    if !call.arguments.isEmpty {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Arguments:")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundColor(.secondary)
+                            ForEach(call.arguments.sorted(by: { $0.key < $1.key }), id: \.key) { k, v in
+                                HStack(alignment: .top, spacing: 4) {
+                                    Text("\(k):")
+                                        .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                                        .foregroundColor(.secondary)
+                                    Text(v)
+                                        .font(.system(size: 10.5, design: .monospaced))
+                                        .foregroundColor(.primary)
+                                        .textSelection(.enabled)
+                                }
+                            }
+                        }
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.secondary.opacity(0.04))
+                        .cornerRadius(6)
+                    }
+
+                    // Stdout / Output
+                    if let out = call.output, !out.isEmpty {
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack {
+                                Text("Output:")
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Button(action: {
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString(out, forType: .string)
+                                    isCopied = true
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                        isCopied = false
+                                    }
+                                }) {
+                                    HStack(spacing: 3) {
+                                        Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
+                                            .font(.system(size: 9))
+                                        Text(isCopied ? "Copied" : "Copy")
+                                            .font(.system(size: 9))
+                                    }
+                                    .foregroundColor(.secondary)
+                                }
+                                .buttonStyle(.plain)
+                            }
+
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                Text(out)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundColor(.primary.opacity(0.9))
+                                    .lineSpacing(2)
+                                    .textSelection(.enabled)
+                            }
+                            .frame(maxHeight: 200)
+                            .padding(8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.black.opacity(0.2))
+                            .cornerRadius(6)
+                        }
+                    }
+
+                    // Stderr / Error
+                    if let err = call.error, !err.isEmpty {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Error Details:")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundColor(.red)
+                            Text(err)
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundColor(.red.opacity(0.9))
+                                .padding(8)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(Color.red.opacity(0.08))
+                                .cornerRadius(6)
+                                .textSelection(.enabled)
+                        }
+                    }
+                }
+                .padding(.leading, 8)
+            }
+        }
+    }
+
+    private var statusColor: Color {
+        switch call.status {
+        case .running: return .indigo
+        case .success: return .green
+        case .error: return .red
+        }
+    }
+}
+
