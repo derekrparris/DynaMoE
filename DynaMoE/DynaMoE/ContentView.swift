@@ -1103,23 +1103,48 @@ struct ContentView: View {
                 .replacingOccurrences(of: "<|im_start|>", with: "")
                 .replacingOccurrences(of: "<|endoftext|>", with: "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !cleanMsg.isEmpty || (msg.thinkingContent != nil && !msg.thinkingContent!.isEmpty) else { continue }
+            let hasTools = (msg.toolCalls != nil && !msg.toolCalls!.isEmpty)
+            guard !cleanMsg.isEmpty || (msg.thinkingContent != nil && !msg.thinkingContent!.isEmpty) || hasTools else { continue }
 
             if msg.role == .user {
                 promptString += "<|im_start|>user\n\(cleanMsg)<|im_end|>\n"
             } else if msg.role == .assistant {
+                var assistantBody = ""
                 if modelSupportsThinking {
                     if let think = msg.thinkingContent, !think.isEmpty {
                         let cleanThink = think
                             .replacingOccurrences(of: "<think>", with: "")
                             .replacingOccurrences(of: "</think>", with: "")
                             .trimmingCharacters(in: .whitespacesAndNewlines)
-                        promptString += "<|im_start|>assistant\n<think>\n\(cleanThink)\n</think>\n\n\(cleanMsg)<|im_end|>\n"
+                        assistantBody += "<think>\n\(cleanThink)\n</think>\n\n"
                     } else {
-                        promptString += "<|im_start|>assistant\n<think>\n\n</think>\n\n\(cleanMsg)<|im_end|>\n"
+                        assistantBody += "<think>\n\n</think>\n\n"
                     }
-                } else {
-                    promptString += "<|im_start|>assistant\n\(cleanMsg)<|im_end|>\n"
+                }
+                if !cleanMsg.isEmpty {
+                    assistantBody += cleanMsg + "\n"
+                }
+                if let calls = msg.toolCalls, !calls.isEmpty {
+                    for call in calls {
+                        assistantBody += "<tool_call>\n<function=\(call.name)>\n"
+                        for (k, v) in call.arguments {
+                            assistantBody += "<parameter=\(k)>\n\(v)\n</parameter>\n"
+                        }
+                        assistantBody += "</function>\n</tool_call>\n"
+                    }
+                }
+                promptString += "<|im_start|>assistant\n\(assistantBody.trimmingCharacters(in: .whitespacesAndNewlines))<|im_end|>\n"
+
+                if let calls = msg.toolCalls, !calls.isEmpty {
+                    var outputs: [String] = []
+                    for call in calls {
+                        if let out = call.output ?? call.error {
+                            outputs.append(out)
+                        }
+                    }
+                    if !outputs.isEmpty {
+                        promptString += AgentHarness.shared.formatToolResponseTurn(responses: outputs, includeThinkSuffix: false)
+                    }
                 }
             }
         }
@@ -6351,10 +6376,25 @@ struct ContentView: View {
                         }
                         let nextPrompt = formattedPrompt + assistantTurnText + "\n" + toolResponseTurn
                         await MainActor.run {
+                            let nextAssistantMsgId = UUID()
+                            if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
+                                if let mId = messageId, let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                                    self.sessions[sIdx].messages[mIdx].isThinking = false
+                                    self.sessions[sIdx].messages[mIdx].prefillStatus = nil
+                                }
+                                let nextMsg = ChatMessage(
+                                    id: nextAssistantMsgId,
+                                    role: .assistant,
+                                    content: "",
+                                    thinkingContent: nil,
+                                    isThinking: thinkingEnabled
+                                )
+                                self.sessions[sIdx].messages.append(nextMsg)
+                            }
                             self.startAutoregressiveGeneration(
                                 customPrompt: nextPrompt,
                                 sessionId: sessionId,
-                                messageId: messageId,
+                                messageId: nextAssistantMsgId,
                                 agentStep: agentStep + 1
                             )
                         }
@@ -6370,10 +6410,25 @@ struct ContentView: View {
                     }
                     let nextPrompt = formattedPrompt + assistantTurnText + "\n" + continuationTurn
                     await MainActor.run {
+                        let nextAssistantMsgId = UUID()
+                        if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
+                            if let mId = messageId, let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                                self.sessions[sIdx].messages[mIdx].isThinking = false
+                                self.sessions[sIdx].messages[mIdx].prefillStatus = nil
+                            }
+                            let nextMsg = ChatMessage(
+                                id: nextAssistantMsgId,
+                                role: .assistant,
+                                content: "",
+                                thinkingContent: nil,
+                                isThinking: thinkingEnabled
+                            )
+                            self.sessions[sIdx].messages.append(nextMsg)
+                        }
                         self.startAutoregressiveGeneration(
                             customPrompt: nextPrompt,
                             sessionId: sessionId,
-                            messageId: messageId,
+                            messageId: nextAssistantMsgId,
                             agentStep: agentStep + 1
                         )
                     }

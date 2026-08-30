@@ -98,14 +98,25 @@ struct ChatDetailView: View {
                         if isGenerating {
                             Text("•")
                                 .foregroundColor(.secondary)
-                            HStack(spacing: 3) {
-                                Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")
-                                    .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .bold))
-                                    .foregroundColor(isStreamingOffDisk ? .orange : .purple)
-                                Text(String(format: "%.1f tok/s", generationSpeed))
-                                    .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
-                                    .fontWeight(.bold)
-                                    .foregroundColor(isStreamingOffDisk ? .orange : .purple)
+                            if let activePrefill = session?.messages.last?.prefillStatus {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "arrow.down.circle.fill")
+                                        .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .bold))
+                                        .foregroundColor(.purple)
+                                    Text(activePrefill)
+                                        .font(.system(size: max(9, 11 * zoomManager.zoomScale), weight: .semibold, design: .monospaced))
+                                        .foregroundColor(.purple)
+                                }
+                            } else {
+                                HStack(spacing: 3) {
+                                    Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")
+                                        .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .bold))
+                                        .foregroundColor(isStreamingOffDisk ? .orange : .purple)
+                                    Text(String(format: "%.1f tok/s", generationSpeed))
+                                        .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
+                                        .fontWeight(.bold)
+                                        .foregroundColor(isStreamingOffDisk ? .orange : .purple)
+                                }
                             }
                         }
                     }
@@ -592,11 +603,13 @@ struct ChatMessageView: View {
     @State private var feedback: String? = nil
 
     private var displayMarkdownContent: String {
-        let clean = message.content
+        var clean = message.content
             .replacingOccurrences(of: "<tool_call>[\\s\\S]*?</tool_call>", with: "", options: .regularExpression)
             .replacingOccurrences(of: "<tool_response>[\\s\\S]*?</tool_response>", with: "", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return clean
+        if let toolCallRange = clean.range(of: "<tool_call>") {
+            clean = String(clean[..<toolCallRange.lowerBound])
+        }
+        return clean.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     var body: some View {
@@ -656,7 +669,7 @@ struct ChatMessageView: View {
                                         )
 
                                     if message.isThinking && isGenerating {
-                                        if let prefill = message.prefillStatus {
+                                        if message.prefillStatus != nil {
                                             Text("Ingesting Prompt...")
                                                 .font(.system(size: 12, weight: .medium))
                                                 .foregroundColor(.primary)
@@ -700,7 +713,22 @@ struct ChatMessageView: View {
                             .buttonStyle(.plain)
 
                             if isExpanded {
-                                VStack(alignment: .leading, spacing: 4) {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    if let prefill = message.prefillStatus, isGenerating {
+                                        HStack(spacing: 8) {
+                                            ProgressView()
+                                                .controlSize(.small)
+                                            Text(prefill)
+                                                .font(.system(size: 11.5, weight: .medium, design: .monospaced))
+                                                .foregroundColor(.purple)
+                                        }
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 7)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .background(Color.purple.opacity(0.08))
+                                        .cornerRadius(6)
+                                    }
+
                                     if !thinking.isEmpty {
                                         Text(thinking)
                                             .font(.system(size: max(8, 12 * zoomManager.zoomScale), design: .monospaced))
@@ -716,18 +744,12 @@ struct ChatMessageView: View {
                                                     .stroke(Color.primary.opacity(0.05), lineWidth: 1)
                                             )
                                             .textSelection(.enabled)
-                                    } else if message.isThinking && isGenerating {
+                                    } else if message.isThinking && isGenerating && message.prefillStatus == nil {
                                         HStack(spacing: 8) {
                                             StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
-                                            if let prefill = message.prefillStatus {
-                                                Text(prefill)
-                                                    .font(.system(size: 12, design: .monospaced))
-                                                    .foregroundColor(.purple)
-                                            } else {
-                                                Text(isStreamingOffDisk ? "Streaming MoE experts off SSD disk..." : "Generating thought process...")
-                                                    .font(.system(size: 12, design: .monospaced))
-                                                    .foregroundColor(.secondary.opacity(0.8))
-                                            }
+                                            Text(isStreamingOffDisk ? "Streaming MoE experts off SSD disk..." : "Generating thought process...")
+                                                .font(.system(size: 12, design: .monospaced))
+                                                .foregroundColor(.secondary.opacity(0.8))
                                         }
                                         .padding(.horizontal, 14)
                                         .padding(.vertical, 10)
@@ -757,21 +779,29 @@ struct ChatMessageView: View {
                             isStreaming: isGenerating && message.isThinking == false,
                             isStreamingOffDisk: isStreamingOffDisk
                         )
-                    } else if isGenerating && !message.isThinking && !hasThinkingContent {
-                        // Only for active generation while initial pre-fill occurs
-                        HStack(spacing: 8) {
-                            StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
-                            if let prefill = message.prefillStatus {
+                    } else if isGenerating && !message.isThinking && !hasThinkingContent && (message.toolCalls == nil || message.toolCalls!.isEmpty) {
+                        // Only for non-thinking models during initial prefill / generation
+                        if let prefill = message.prefillStatus {
+                            HStack(spacing: 8) {
+                                ProgressView()
+                                    .controlSize(.small)
                                 Text(prefill)
-                                    .font(.system(size: 12, design: .monospaced))
+                                    .font(.system(size: 11.5, weight: .medium, design: .monospaced))
                                     .foregroundColor(.purple)
-                            } else {
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .background(Color.purple.opacity(0.08))
+                            .cornerRadius(8)
+                        } else {
+                            HStack(spacing: 8) {
+                                StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
                                 Text(isStreamingOffDisk ? "Streaming MoE experts off SSD disk..." : "Generating response...")
                                     .font(.system(size: 13))
                                     .foregroundColor(.secondary)
                             }
+                            .padding(.vertical, 4)
                         }
-                        .padding(.vertical, 4)
                     }
 
                     // Action & Metrics Footer (Osaurus Style Telemetry & Actions)

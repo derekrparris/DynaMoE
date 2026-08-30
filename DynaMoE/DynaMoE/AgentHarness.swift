@@ -867,12 +867,7 @@ public final class AgentHarness {
             cleanBase = "You are an expert AI software engineering and reasoning assistant with direct access to local macOS development tools."
         }
 
-        var prompt = cleanBase
-        prompt += "\n\n# Tools\n\n"
-        prompt += "You may call one or more functions to assist with the user query.\n\n"
-        prompt += "You are provided with function signatures within <tools></tools> XML tags:\n"
-        prompt += "<tools>\n"
-
+        var prompt = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
         for tool in availableToolDefinitions {
             if let data = try? JSONEncoder().encode(tool),
                let jsonStr = String(data: data, encoding: .utf8) {
@@ -880,13 +875,35 @@ public final class AgentHarness {
             }
         }
         prompt += "</tools>\n\n"
-        prompt += "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
-        prompt += "<tool_call>\n{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}\n</tool_call>\n\n"
-        prompt += "## Operating Directives:\n"
-        prompt += "1. **Immediate Tool Invocation**: When the user asks to inspect, read, edit, or modify a file, search directories or the web, or run commands, you MUST output the <tool_call> block immediately. DO NOT output conversational text announcing what you will do without emitting the <tool_call> in the same turn.\n"
-        prompt += "2. **Reasoning Models**: If thinking is enabled with <think>, place all analysis inside <think>...</think>, and immediately output your <tool_call> upon closing </think>.\n"
-        prompt += "3. **Multi-Turn Continuity**: When a tool completes and returns <tool_response>, inspect the results. If further edits, actions, or verification are needed, emit the next <tool_call> immediately.\n"
-        prompt += "4. **Completion**: Only provide your final conversational message to the user once all necessary tool operations and file edits are completely finished.\n"
+        prompt += """
+        If you choose to call a function ONLY reply in the following format with NO suffix:
+
+        <tool_call>
+        <function=example_function_name>
+        <parameter=example_parameter_1>
+        value_1
+        </parameter>
+        <parameter=example_parameter_2>
+        This is the value for the second parameter
+        that can span
+        multiple lines
+        </parameter>
+        </function>
+        </tool_call>
+
+        <IMPORTANT>
+        Reminder:
+        - Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+        - Required parameters MUST be specified
+        - You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+        - When the user asks to inspect, read, edit, modify, or process a file, or run terminal commands, you MUST call the function immediately without conversational promises
+        - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+        </IMPORTANT>
+        """
+
+        if !cleanBase.isEmpty {
+            prompt += "\n\n" + cleanBase
+        }
 
         return prompt
     }
@@ -896,7 +913,6 @@ public final class AgentHarness {
         for r in responses {
             turn += "<tool_response>\n\(r)\n</tool_response>\n"
         }
-        turn += "Tool execution completed. Inspect the results above and continue fulfilling the request. If further actions or file edits are needed, output the next <tool_call> block immediately. If finished, provide your final response.\n"
         turn += "<|im_end|>\n<|im_start|>assistant\n"
         if includeThinkSuffix {
             turn += "<think>\n"
@@ -964,7 +980,7 @@ public final class AgentHarness {
 
     public func formatActionContinuationTurn(includeThinkSuffix: Bool = false) -> String {
         var turn = "<|im_start|>user\n"
-        turn += "Please proceed immediately with your planned action and emit the <tool_call> block now to inspect the file or perform the operation.\n"
+        turn += "Please call the function now using <tool_call><function=...><parameter=...>...</parameter></function></tool_call> to execute your action.\n"
         turn += "<|im_end|>\n<|im_start|>assistant\n"
         if includeThinkSuffix {
             turn += "<think>\n"
@@ -972,12 +988,19 @@ public final class AgentHarness {
         return turn
     }
 
-    // MARK: - Tolerant Tool Call Parser (Multi-Call + Truncation Recovery)
+    // MARK: - Tolerant Tool Call Parser (XML + JSON + Multi-Call + Truncation Recovery)
 
     public func parseToolCalls(from text: String) -> (calls: [ParsedToolCall], brokenFragments: [String]) {
         var calls: [ParsedToolCall] = []
         var broken: [String] = []
 
+        // 1. Native XML function calls (<function=name>...<parameter=k>v</parameter>...)
+        let xmlCalls = parseAllXMLFunctionCalls(text)
+        if !xmlCalls.isEmpty {
+            return (xmlCalls, [])
+        }
+
+        // 2. Standard <tool_call>...</tool_call> tags (supporting both XML and JSON payloads)
         let toolCallRegex = try? NSRegularExpression(pattern: "<tool_call>([\\s\\S]*?)</tool_call>", options: [])
         let nsText = text as NSString
         let matches = toolCallRegex?.matches(in: text, options: [], range: NSRange(location: 0, length: nsText.length)) ?? []
@@ -989,7 +1012,10 @@ public final class AgentHarness {
             let innerText = nsText.substring(with: innerRange).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !innerText.isEmpty else { continue }
 
-            if let parsed = extractBalancedJSON(innerText) {
+            let innerXml = parseAllXMLFunctionCalls(innerText)
+            if !innerXml.isEmpty {
+                calls.append(contentsOf: innerXml)
+            } else if let parsed = extractBalancedJSON(innerText) {
                 if let name = parsed["name"] as? String {
                     let args = (parsed["arguments"] as? [String: Any]) ?? [:]
                     let rawArgs = (parsed["arguments"] != nil) ? String(describing: parsed["arguments"]!) : ""
@@ -1002,12 +1028,15 @@ public final class AgentHarness {
             }
         }
 
-        // Check for unclosed or truncated <tool_call>
+        // 3. Check for unclosed or truncated <tool_call>
         if calls.isEmpty && text.contains("<tool_call>") {
             let parts = text.components(separatedBy: "<tool_call>")
             for part in parts.dropFirst() {
                 let candidate = part.replacingOccurrences(of: "</tool_call>", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
-                if let parsed = extractBalancedJSON(candidate), let name = parsed["name"] as? String {
+                let candXml = parseAllXMLFunctionCalls(candidate)
+                if !candXml.isEmpty {
+                    calls.append(contentsOf: candXml)
+                } else if let parsed = extractBalancedJSON(candidate), let name = parsed["name"] as? String {
                     let args = (parsed["arguments"] as? [String: Any]) ?? [:]
                     let rawArgs = (parsed["arguments"] != nil) ? String(describing: parsed["arguments"]!) : ""
                     calls.append(ParsedToolCall(name: name, arguments: args, rawArguments: rawArgs, rawText: candidate))
@@ -1017,10 +1046,10 @@ public final class AgentHarness {
             }
         }
 
-        // Fallback: Check if output contains raw JSON with a recognized tool name
+        // 4. Fallback: Check if output contains raw JSON with a recognized tool name
         if calls.isEmpty {
+            let knownToolNames = Set(availableToolDefinitions.map { $0.function.name })
             if let parsed = extractBalancedJSON(text), let name = parsed["name"] as? String {
-                let knownToolNames = Set(availableToolDefinitions.map { $0.function.name })
                 if knownToolNames.contains(name) {
                     let args = (parsed["arguments"] as? [String: Any]) ?? [:]
                     let rawArgs = (parsed["arguments"] != nil) ? String(describing: parsed["arguments"]!) : ""
@@ -1032,45 +1061,93 @@ public final class AgentHarness {
         return (calls, broken)
     }
 
+    public func parseAllXMLFunctionCalls(_ text: String) -> [ParsedToolCall] {
+        var calls: [ParsedToolCall] = []
+        let fnRegex = try? NSRegularExpression(pattern: "<function=([^>]+)>([\\s\\S]*?)(?:</function>|(?=<function=)|$)", options: [])
+        let nsText = text as NSString
+        let matches = fnRegex?.matches(in: text, options: [], range: NSRange(location: 0, length: nsText.length)) ?? []
+
+        for m in matches {
+            guard m.numberOfRanges >= 3 else { continue }
+            let fnName = nsText.substring(with: m.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let body = nsText.substring(with: m.range(at: 2))
+            let rawMatch = nsText.substring(with: m.range(at: 0))
+            guard !fnName.isEmpty else { continue }
+
+            var args: [String: Any] = [:]
+            let paramRegex = try? NSRegularExpression(pattern: "<parameter=([^>]+)>([\\s\\S]*?)(?:</parameter>|$)", options: [])
+            let nsBody = body as NSString
+            let pMatches = paramRegex?.matches(in: body, options: [], range: NSRange(location: 0, length: nsBody.length)) ?? []
+
+            for pm in pMatches {
+                guard pm.numberOfRanges >= 3 else { continue }
+                let pName = nsBody.substring(with: pm.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+                let pValStr = nsBody.substring(with: pm.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+
+                if let data = pValStr.data(using: .utf8),
+                   let jsonVal = try? JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed),
+                   (jsonVal is [String: Any] || jsonVal is [Any] || jsonVal is NSNumber) {
+                    args[pName] = jsonVal
+                } else {
+                    args[pName] = pValStr
+                }
+            }
+
+            let rawArgsData = try? JSONSerialization.data(withJSONObject: args, options: [.prettyPrinted])
+            let rawArgsStr = rawArgsData.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            calls.append(ParsedToolCall(name: fnName, arguments: args, rawArguments: rawArgsStr, rawText: rawMatch))
+        }
+
+        return calls
+    }
+
     /// String & escape aware balanced bracket JSON scanner
     public func extractBalancedJSON(_ text: String) -> [String: Any]? {
-        guard let startIdx = text.firstIndex(of: "{") else { return nil }
-        let sub = text[startIdx...]
+        var currentIndex = text.startIndex
+        while currentIndex < text.endIndex, let startIdx = text[currentIndex...].firstIndex(of: "{") {
+            let sub = text[startIdx...]
+            var depth = 0
+            var inString = false
+            var isEscaped = false
+            var endIdx: String.Index? = nil
 
-        var depth = 0
-        var inString = false
-        var isEscaped = false
-        var endIdx: String.Index? = nil
-
-        for i in sub.indices {
-            let c = sub[i]
-            if inString {
-                if isEscaped {
-                    isEscaped = false
-                } else if c == "\\" {
-                    isEscaped = true
-                } else if c == "\"" {
-                    inString = false
-                }
-            } else {
-                if c == "\"" {
-                    inString = true
-                } else if c == "{" {
-                    depth += 1
-                } else if c == "}" {
-                    depth -= 1
-                    if depth == 0 {
-                        endIdx = i
-                        break
+            for i in sub.indices {
+                let c = sub[i]
+                if inString {
+                    if isEscaped {
+                        isEscaped = false
+                    } else if c == "\\" {
+                        isEscaped = true
+                    } else if c == "\"" {
+                        inString = false
+                    }
+                } else {
+                    if c == "\"" {
+                        inString = true
+                    } else if c == "{" {
+                        depth += 1
+                    } else if c == "}" {
+                        depth -= 1
+                        if depth == 0 {
+                            endIdx = i
+                            break
+                        }
                     }
                 }
             }
-        }
 
-        guard let end = endIdx else { return nil }
-        let jsonSubstring = String(sub[...end])
-        guard let data = jsonSubstring.data(using: .utf8) else { return nil }
-        return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            if let end = endIdx {
+                let jsonSubstring = String(sub[...end])
+                if let data = jsonSubstring.data(using: .utf8),
+                   let dict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                   dict["name"] != nil {
+                    return dict
+                }
+            }
+
+            currentIndex = text.index(after: startIdx)
+        }
+        return nil
     }
 
     public func generateRecoveryPrompt(brokenFragment: String, maxTokens: Int) -> String {
