@@ -487,7 +487,320 @@ public final class GrepSearchTool: AgentTool {
     }
 }
 
-/// Tool 7: complete — Signals task completion with summary
+/// Tool 7: web_search — Performs live web search using DuckDuckGo / Brave
+public final class WebSearchTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "web_search",
+        description: "Performs live web search for real-time information, documentation, libraries, news, and technical answers. Returns structured list of titles, URLs, and snippets.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "query": [
+                    "type": "string",
+                    "description": "The search query string to look up."
+                ],
+                "max_results": [
+                    "type": "integer",
+                    "description": "Optional maximum number of search results to return (1-10, default 5)."
+                ]
+            ]),
+            "required": AnyCodable(["query"])
+        ]
+    )
+
+    public func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        guard let query = arguments["query"] as? String, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            let err = "Missing or empty 'query' parameter."
+            return (AgentHarness.toolErrorJSON(tool: "web_search", error: err), nil, err, false)
+        }
+
+        let maxResults = min(10, max(1, (arguments["max_results"] as? Int) ?? 5))
+        let cleanQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        do {
+            // Check for optional custom Brave Search API key
+            let braveKey = UserDefaults.standard.string(forKey: "dynamoe_brave_search_api_key")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            var results: [[String: String]] = []
+
+            if !braveKey.isEmpty {
+                results = try await searchBrave(query: cleanQuery, apiKey: braveKey, maxResults: maxResults)
+            }
+
+            if results.isEmpty {
+                results = try await searchDuckDuckGo(query: cleanQuery, maxResults: maxResults)
+            }
+
+            if results.isEmpty {
+                results = try await searchWikipedia(query: cleanQuery, maxResults: maxResults)
+            }
+
+            if results.isEmpty {
+                let msg = "No web search results found for query: \"\(cleanQuery)\""
+                let res = AgentHarness.toolSuccessJSON(tool: "web_search", data: ["query": cleanQuery, "count": 0, "results": []])
+                return (res, msg, nil, false)
+            }
+
+            var readableOutput = "Found \(results.count) web search results for \"\(cleanQuery)\":\n\n"
+            for (idx, item) in results.enumerated() {
+                readableOutput += "\(idx + 1). \(item["title"] ?? "Untitled")\n"
+                readableOutput += "   URL: \(item["url"] ?? "")\n"
+                if let snippet = item["snippet"], !snippet.isEmpty {
+                    readableOutput += "   Snippet: \(snippet)\n"
+                }
+                readableOutput += "\n"
+            }
+
+            let cleanStdout = AgentHarness.truncateText(AgentHarness.sanitizeText(readableOutput.trimmingCharacters(in: .whitespacesAndNewlines)), limit: maxOutputLength)
+            let res = AgentHarness.toolSuccessJSON(tool: "web_search", data: [
+                "query": cleanQuery,
+                "count": results.count,
+                "results": results
+            ])
+            return (res, cleanStdout, nil, false)
+        } catch {
+            let err = "Web search failed: \(error.localizedDescription)"
+            return (AgentHarness.toolErrorJSON(tool: "web_search", error: err), nil, err, false)
+        }
+    }
+
+    private func searchDuckDuckGo(query: String, maxResults: Int) async throws -> [[String: String]] {
+        guard let encodedQuery = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "https://html.duckduckgo.com/html/?q=\(encodedQuery)") else {
+            return []
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 10
+        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+        request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        request.setValue("en-US,en;q=0.5", forHTTPHeaderField: "Accept-Language")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200,
+              let html = String(data: data, encoding: .utf8) else {
+            return []
+        }
+
+        var results: [[String: String]] = []
+        let titlePattern = try NSRegularExpression(pattern: "<a[^>]+class=[\"']result__a[\"'][^>]+href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", options: [.dotMatchesLineSeparators])
+        let snippetPattern = try NSRegularExpression(pattern: "<a[^>]+class=[\"']result__snippet[\"'][^>]*>(.*?)</a>", options: [.dotMatchesLineSeparators])
+
+        let nsHtml = html as NSString
+        let titleMatches = titlePattern.matches(in: html, range: NSRange(location: 0, length: nsHtml.length))
+        let snippetMatches = snippetPattern.matches(in: html, range: NSRange(location: 0, length: nsHtml.length))
+
+        let count = min(titleMatches.count, snippetMatches.count, maxResults)
+        for i in 0..<count {
+            let tMatch = titleMatches[i]
+            let sMatch = snippetMatches[i]
+
+            let rawUrl = nsHtml.substring(with: tMatch.range(at: 1))
+            let rawTitle = nsHtml.substring(with: tMatch.range(at: 2))
+            let rawSnippet = nsHtml.substring(with: sMatch.range(at: 1))
+
+            var cleanUrl = rawUrl
+            if let uddgRange = cleanUrl.range(of: "uddg=") {
+                let substr = String(cleanUrl[uddgRange.upperBound...])
+                let endIdx = substr.firstIndex(of: "&") ?? substr.endIndex
+                let encoded = String(substr[..<endIdx])
+                if let decoded = encoded.removingPercentEncoding {
+                    cleanUrl = decoded
+                }
+            } else if cleanUrl.hasPrefix("//") {
+                cleanUrl = "https:" + cleanUrl
+            }
+
+            let cleanTitle = stripHTML(rawTitle)
+            let cleanSnippet = stripHTML(rawSnippet)
+
+            if !cleanUrl.isEmpty && !cleanTitle.isEmpty {
+                results.append([
+                    "title": cleanTitle,
+                    "url": cleanUrl,
+                    "snippet": cleanSnippet
+                ])
+            }
+        }
+        return results
+    }
+
+    private func searchBrave(query: String, apiKey: String, maxResults: Int) async throws -> [[String: String]] {
+        guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "https://api.search.brave.com/res/v1/web/search?q=\(encoded)&count=\(maxResults)") else {
+            return []
+        }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+        request.setValue(apiKey, forHTTPHeaderField: "X-Subscription-Token")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else { return [] }
+
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let web = json["web"] as? [String: Any],
+              let items = web["results"] as? [[String: Any]] else { return [] }
+
+        var results: [[String: String]] = []
+        for item in items.prefix(maxResults) {
+            let title = (item["title"] as? String) ?? ""
+            let url = (item["url"] as? String) ?? ""
+            let desc = (item["description"] as? String) ?? ""
+            if !url.isEmpty {
+                results.append([
+                    "title": stripHTML(title),
+                    "url": url,
+                    "snippet": stripHTML(desc)
+                ])
+            }
+        }
+        return results
+    }
+
+    private func searchWikipedia(query: String, maxResults: Int) async throws -> [[String: String]] {
+        guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=\(encoded)&utf8=&format=json") else {
+            return []
+        }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 10
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else { return [] }
+
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let q = json["query"] as? [String: Any],
+              let search = q["search"] as? [[String: Any]] else { return [] }
+
+        var results: [[String: String]] = []
+        for item in search.prefix(maxResults) {
+            let title = (item["title"] as? String) ?? ""
+            let snippet = (item["snippet"] as? String) ?? ""
+            let pageId = item["pageid"] as? Int ?? 0
+            let pageUrl = "https://en.wikipedia.org/?curid=\(pageId)"
+            if !title.isEmpty {
+                results.append([
+                    "title": title,
+                    "url": pageUrl,
+                    "snippet": stripHTML(snippet)
+                ])
+            }
+        }
+        return results
+    }
+
+    private func stripHTML(_ input: String) -> String {
+        let withoutTags = input.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+        return withoutTags
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&#x27;", with: "'")
+            .replacingOccurrences(of: "&nbsp;", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+/// Tool 8: web_fetch — Reads content from a web URL
+public final class WebFetchTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "web_fetch",
+        description: "Fetches and reads the textual content of a web page given a public URL. Automatically strips HTML markup, scripts, and navigation clutter into readable text/markdown.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "url": [
+                    "type": "string",
+                    "description": "The absolute HTTP or HTTPS URL to fetch."
+                ],
+                "max_length": [
+                    "type": "integer",
+                    "description": "Optional maximum character length of returned content (defaults to maxToolOutputLength)."
+                ]
+            ]),
+            "required": AnyCodable(["url"])
+        ]
+    )
+
+    public func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        guard let urlStr = arguments["url"] as? String,
+              let url = URL(string: urlStr.trimmingCharacters(in: .whitespacesAndNewlines)),
+              url.scheme == "http" || url.scheme == "https" else {
+            let err = "Invalid URL: please provide an absolute http:// or https:// URL."
+            return (AgentHarness.toolErrorJSON(tool: "web_fetch", error: err), nil, err, false)
+        }
+
+        let customMax = arguments["max_length"] as? Int
+        let limit = customMax ?? maxOutputLength
+
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 15
+            request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+            request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode),
+                  var html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else {
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                let err = "Failed to fetch webpage (HTTP status \(status))."
+                return (AgentHarness.toolErrorJSON(tool: "web_fetch", error: err), nil, err, false)
+            }
+
+            var pageTitle = url.host ?? "Web Page"
+            if let titleRange = html.range(of: "<title[^>]*>(.*?)</title>", options: [.regularExpression, .caseInsensitive]) {
+                let rawTitle = String(html[titleRange])
+                pageTitle = stripHTML(rawTitle)
+            }
+
+            // Strip comments
+            html = html.replacingOccurrences(of: "(?s)<!--.*?-->", with: "", options: .regularExpression)
+            // Strip script, style, nav, header, footer, svg, noscript
+            html = html.replacingOccurrences(of: "(?s)<(script|style|nav|header|footer|svg|noscript)[^>]*>.*?</\\1>", with: "", options: .regularExpression)
+            // Replace block tags with newline
+            html = html.replacingOccurrences(of: "(?i)</?(p|div|h1|h2|h3|h4|h5|h6|li|tr|article|section|blockquote|pre|code)[^>]*>", with: "\n", options: .regularExpression)
+            html = html.replacingOccurrences(of: "(?i)<br\\s*/?>", with: "\n", options: .regularExpression)
+
+            let text = stripHTML(html)
+            let lines = text.components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            var cleaned = lines.joined(separator: "\n")
+
+            if cleaned.count > limit {
+                cleaned = String(cleaned.prefix(limit)) + "\n\n... [Content truncated at \(limit) characters]"
+            }
+
+            let res = AgentHarness.toolSuccessJSON(tool: "web_fetch", data: [
+                "url": url.absoluteString,
+                "title": pageTitle,
+                "length": cleaned.count,
+                "content": cleaned
+            ])
+            return (res, cleaned, nil, false)
+        } catch {
+            let err = "Failed to fetch web content: \(error.localizedDescription)"
+            return (AgentHarness.toolErrorJSON(tool: "web_fetch", error: err), nil, err, false)
+        }
+    }
+
+    private func stripHTML(_ input: String) -> String {
+        let withoutTags = input.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+        return withoutTags
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&#x27;", with: "'")
+            .replacingOccurrences(of: "&nbsp;", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+/// Tool 9: complete — Signals task completion with summary
 public final class CompleteTool: AgentTool {
     public let definition = ToolDefinition(
         name: "complete",
@@ -533,6 +846,8 @@ public final class AgentHarness {
         registerTool(FileEditTool())
         registerTool(FindFilesTool())
         registerTool(GrepSearchTool())
+        registerTool(WebSearchTool())
+        registerTool(WebFetchTool())
         registerTool(CompleteTool())
     }
 

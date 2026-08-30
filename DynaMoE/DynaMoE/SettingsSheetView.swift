@@ -41,6 +41,7 @@ struct SettingsSheetView: View {
     @AppStorage("dynamoe_agent_working_directory") private var agentWorkingDirectory: String = ""
     @AppStorage("dynamoe_max_tool_output_length") private var maxToolOutputLength: Int = 4000
     @AppStorage("dynamoe_max_agent_steps") private var maxAgentSteps: Int = 15
+    @AppStorage("dynamoe_brave_search_api_key") private var braveApiKey: String = ""
 
     // Model & Tokenizer bindings
     var summary: ModelSummary?
@@ -969,6 +970,41 @@ struct SettingsSheetView: View {
             .background(Color.secondary.opacity(0.04))
             .cornerRadius(10)
 
+            // Web Search Engine Configuration
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Image(systemName: "globe")
+                        .foregroundColor(.blue)
+                    Text("Web Search Engine")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                    Spacer()
+                    Text(braveApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "DuckDuckGo (Free & Built-in)" : "Brave Search API")
+                        .font(.caption)
+                        .fontWeight(.medium)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(braveApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.green.opacity(0.12) : Color.orange.opacity(0.12))
+                        .foregroundColor(braveApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .green : .orange)
+                        .cornerRadius(6)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Brave Search API Key (Optional)")
+                        .font(.system(size: 12, weight: .medium))
+                    SecureField("Paste Brave Search API token (e.g. BSA...)", text: $braveApiKey)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 11, design: .monospaced))
+
+                    Text("DuckDuckGo HTML search is active by default with zero configuration or API keys needed. You can optionally paste a Brave Search API key for dedicated high-speed JSON queries.")
+                        .font(.system(size: 10.5))
+                        .foregroundColor(.secondary)
+                }
+            }
+            .padding(14)
+            .background(Color.secondary.opacity(0.04))
+            .cornerRadius(10)
+
             // Available Built-in Tools List
             VStack(alignment: .leading, spacing: 10) {
                 Text("Installed Tool Suite (\(AgentHarness.shared.availableToolDefinitions.count) Tools)")
@@ -982,6 +1018,8 @@ struct SettingsSheetView: View {
                     toolSummaryCard(name: "file_edit", icon: "square.and.pencil", desc: "Performs precise anchor string search-and-replace edits.")
                     toolSummaryCard(name: "find_files", icon: "folder.badge.gearshape", desc: "Discovers files and directories using glob matching and max depth.")
                     toolSummaryCard(name: "grep_search", icon: "magnifyingglass", desc: "Fast regex and literal text pattern search across files using ripgrep or grep.")
+                    toolSummaryCard(name: "web_search", icon: "globe", desc: "Live web search via DuckDuckGo / Brave. Returns titles, URLs, and real-time snippets.")
+                    toolSummaryCard(name: "web_fetch", icon: "arrow.down.doc.fill", desc: "Fetches and reads web pages with automatic HTML stripping and markdown extraction.")
                     toolSummaryCard(name: "complete", icon: "checkmark.seal.fill", desc: "Signals task completion with final structured summary.")
                 }
             }

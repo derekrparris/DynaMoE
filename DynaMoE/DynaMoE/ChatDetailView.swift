@@ -1921,6 +1921,8 @@ struct ToolCallCardView: View {
         case "file_edit": return "square.and.pencil"
         case "find_files": return "folder.badge.gearshape"
         case "grep_search": return "magnifyingglass"
+        case "web_search": return "globe"
+        case "web_fetch": return "arrow.down.doc.fill"
         case "complete": return "checkmark.seal.fill"
         default: return "wrench.and.screwdriver.fill"
         }
@@ -1939,6 +1941,13 @@ struct ToolCallCardView: View {
             return call.arguments["pattern"] ?? call.rawArguments
         case "grep_search":
             return "\"\(call.arguments["query"] ?? "")\""
+        case "web_search":
+            return "\"\(call.arguments["query"] ?? "")\""
+        case "web_fetch":
+            if let url = call.arguments["url"] {
+                return (URL(string: url)?.host ?? url)
+            }
+            return call.rawArguments
         case "complete":
             return call.arguments["summary"] ?? "Completed"
         default:
