@@ -49,6 +49,7 @@ private extension CGFloat {
 @main
 struct DynaMoEApp: App {
     @StateObject private var zoomManager = AppZoomManager.shared
+    @Environment(\.openWindow) private var openWindow
 
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
@@ -77,6 +78,11 @@ struct DynaMoEApp: App {
         }
         .modelContainer(sharedModelContainer)
         .commands {
+            CommandGroup(replacing: .appInfo) {
+                Button("About DynaMoE") {
+                    openWindow(id: "about-dynamoe")
+                }
+            }
             SidebarCommands()
             CommandGroup(after: .sidebar) {
                 Divider()
@@ -96,5 +102,10 @@ struct DynaMoEApp: App {
                 .keyboardShortcut("-", modifiers: .command)
             }
         }
+
+        Window("About DynaMoE", id: "about-dynamoe") {
+            AboutDynaMoEView()
+        }
+        .windowResizability(.contentSize)
     }
 }

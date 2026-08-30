@@ -12,6 +12,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     case memory = "Memory & SSD"
     case agent = "Agent & Tools"
     case advanced = "Advanced Diagnostics"
+    case about = "About"
 
     var id: String { rawValue }
 
@@ -22,6 +23,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .memory: return "memorychip"
         case .agent: return "wrench.and.screwdriver.fill"
         case .advanced: return "waveform.path.ecg"
+        case .about: return "info.circle.fill"
         }
     }
 }
@@ -145,22 +147,28 @@ struct SettingsSheetView: View {
             Divider()
 
             // Tab Content
-            ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    switch selectedTab {
-                    case .models:
-                        modelsSettingsSection
-                    case .generation:
-                        generationSettingsSection
-                    case .memory:
-                        memorySettingsSection
-                    case .agent:
-                        agentSettingsSection
-                    case .advanced:
-                        advancedDiagnosticsSection
+            if selectedTab == .about {
+                AboutDynaMoEView()
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 20) {
+                        switch selectedTab {
+                        case .models:
+                            modelsSettingsSection
+                        case .generation:
+                            generationSettingsSection
+                        case .memory:
+                            memorySettingsSection
+                        case .agent:
+                            agentSettingsSection
+                        case .advanced:
+                            advancedDiagnosticsSection
+                        case .about:
+                            EmptyView()
+                        }
                     }
+                    .padding(20)
                 }
-                .padding(20)
             }
         }
         .frame(minWidth: 680, minHeight: 560)
