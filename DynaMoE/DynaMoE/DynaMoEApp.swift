@@ -73,6 +73,8 @@ struct DynaMoEApp: App {
                         height: max(100, geo.size.height / zoomManager.zoomScale)
                     )
                     .scaleEffect(zoomManager.zoomScale, anchor: .topLeading)
+                    .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
+                    .clipped()
             }
             .environmentObject(zoomManager)
         }

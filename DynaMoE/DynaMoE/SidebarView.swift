@@ -127,30 +127,43 @@ struct SidebarView: View {
                 }
 
                 // Settings Button
-                Button(action: {
+                SidebarSettingsButton {
                     isSettingsPresented = true
-                }) {
-                    HStack(spacing: 8) {
-                        Image(systemName: "gearshape.fill")
-                            .font(.system(size: 14))
-                            .foregroundColor(.secondary)
-                        Text("Settings")
-                            .font(.system(size: 13, weight: .medium))
-                        Spacer()
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 7)
-                    .background(Color.clear)
-                    .contentShape(Rectangle())
-                    .cornerRadius(6)
                 }
-                .buttonStyle(.plain)
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 10)
         }
         .frame(minWidth: 220, idealWidth: 250, maxWidth: 300)
         .background(Color(NSColor.windowBackgroundColor))
+    }
+}
+
+struct SidebarSettingsButton: View {
+    let action: () -> Void
+    @State private var isHovered: Bool = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: "gearshape.fill")
+                    .font(.system(size: 14))
+                    .foregroundColor(isHovered ? .primary : .secondary)
+                Text("Settings")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(isHovered ? .primary : .secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 7)
+            .background(isHovered ? Color.primary.opacity(0.06) : Color.clear)
+            .contentShape(Rectangle())
+            .cornerRadius(6)
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering in
+            isHovered = hovering
+        }
     }
 }
 
