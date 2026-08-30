@@ -6336,6 +6336,24 @@ struct ContentView: View {
                         }
                         return
                     }
+                } else if (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink) {
+                    let continuationTurn = AgentHarness.shared.formatActionContinuationTurn(
+                        includeThinkSuffix: thinkingEnabled
+                    )
+                    var assistantTurnText = finalDecoded
+                    if !assistantTurnText.contains("<|im_end|>") {
+                        assistantTurnText += "<|im_end|>"
+                    }
+                    let nextPrompt = formattedPrompt + assistantTurnText + "\n" + continuationTurn
+                    await MainActor.run {
+                        self.startAutoregressiveGeneration(
+                            customPrompt: nextPrompt,
+                            sessionId: sessionId,
+                            messageId: messageId,
+                            agentStep: agentStep + 1
+                        )
+                    }
+                    return
                 }
             }
         }

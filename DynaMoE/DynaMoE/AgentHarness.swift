@@ -868,15 +868,10 @@ public final class AgentHarness {
         }
 
         var prompt = cleanBase
-        prompt += "\n\n# Tool Calling Protocol & Instructions\n"
-        prompt += "You have direct access to native tools on the local macOS system to inspect files, edit code, execute terminal commands, and perform web searches.\n\n"
-        prompt += "## Operating Rules:\n"
-        prompt += "1. **Action-Oriented Execution**: When you need to read a file, create or modify code, search directories, or run commands, ALWAYS emit a `<tool_call>` block. Never merely describe what you intend to do in prose without issuing the actual tool call.\n"
-        prompt += "2. **Multi-Turn Continuity**: When a tool completes and returns a `<tool_response>`, evaluate the output. If additional steps are required (such as modifying a file after reading it, or verifying changes), emit the next `<tool_call>` immediately.\n"
-        prompt += "3. **Completion**: Only provide your final conversational answer to the user once all necessary file edits, commands, and operations are complete.\n"
-        prompt += "4. **Format**: To invoke a tool, output a JSON object within `<tool_call></tool_call>` tags:\n"
-        prompt += "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"path\": \"ContentView.swift\", \"start_line\": 1, \"end_line\": 50}}\n</tool_call>\n\n"
-        prompt += "# Available Tools\n<tools>\n"
+        prompt += "\n\n# Tools\n\n"
+        prompt += "You may call one or more functions to assist with the user query.\n\n"
+        prompt += "You are provided with function signatures within <tools></tools> XML tags:\n"
+        prompt += "<tools>\n"
 
         for tool in availableToolDefinitions {
             if let data = try? JSONEncoder().encode(tool),
@@ -884,7 +879,14 @@ public final class AgentHarness {
                 prompt += jsonStr + "\n"
             }
         }
-        prompt += "</tools>\n"
+        prompt += "</tools>\n\n"
+        prompt += "For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n"
+        prompt += "<tool_call>\n{\"name\": \"<function-name>\", \"arguments\": <args-json-object>}\n</tool_call>\n\n"
+        prompt += "## Operating Directives:\n"
+        prompt += "1. **Immediate Tool Invocation**: When the user asks to inspect, read, edit, or modify a file, search directories or the web, or run commands, you MUST output the <tool_call> block immediately. DO NOT output conversational text announcing what you will do without emitting the <tool_call> in the same turn.\n"
+        prompt += "2. **Reasoning Models**: If thinking is enabled with <think>, place all analysis inside <think>...</think>, and immediately output your <tool_call> upon closing </think>.\n"
+        prompt += "3. **Multi-Turn Continuity**: When a tool completes and returns <tool_response>, inspect the results. If further edits, actions, or verification are needed, emit the next <tool_call> immediately.\n"
+        prompt += "4. **Completion**: Only provide your final conversational message to the user once all necessary tool operations and file edits are completely finished.\n"
 
         return prompt
     }
@@ -895,6 +897,74 @@ public final class AgentHarness {
             turn += "<tool_response>\n\(r)\n</tool_response>\n"
         }
         turn += "Tool execution completed. Inspect the results above and continue fulfilling the request. If further actions or file edits are needed, output the next <tool_call> block immediately. If finished, provide your final response.\n"
+        turn += "<|im_end|>\n<|im_start|>assistant\n"
+        if includeThinkSuffix {
+            turn += "<think>\n"
+        }
+        return turn
+    }
+
+    public func detectUncalledActionIntent(content: String, thinking: String?) -> Bool {
+        let contentLower = content.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        let thinkingLower = (thinking ?? "").lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if contentLower.count > 400 {
+            return false
+        }
+
+        let actionPatterns = [
+            "take a look at",
+            "look at the",
+            "look at this",
+            "look into",
+            "read the",
+            "reading the",
+            "start by reading",
+            "read this",
+            "inspect the",
+            "inspecting the",
+            "check the",
+            "checking the",
+            "examine the",
+            "add a column",
+            "add the column",
+            "add column",
+            "edit the",
+            "modifying the",
+            "modify the",
+            "update the",
+            "change the",
+            "search for",
+            "search the web",
+            "look up",
+            "run the",
+            "execute the",
+            "create the",
+            "write to",
+            "write the",
+            "i'll start by",
+            "let me start by",
+            "i will start by",
+            "let me first",
+            "first, i will",
+            "first, let me",
+            "first i'll",
+            "to begin, i will",
+            "to begin, let me"
+        ]
+
+        for p in actionPatterns {
+            if contentLower.contains(p) || thinkingLower.contains(p) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    public func formatActionContinuationTurn(includeThinkSuffix: Bool = false) -> String {
+        var turn = "<|im_start|>user\n"
+        turn += "Please proceed immediately with your planned action and emit the <tool_call> block now to inspect the file or perform the operation.\n"
         turn += "<|im_end|>\n<|im_start|>assistant\n"
         if includeThinkSuffix {
             turn += "<think>\n"
