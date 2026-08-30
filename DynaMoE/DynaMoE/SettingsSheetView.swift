@@ -122,6 +122,7 @@ struct SettingsSheetView: View {
                 Spacer()
 
                 Button("Done") {
+                    SettingsWindowManager.shared.close()
                     dismiss()
                 }
                 .keyboardShortcut(.defaultAction)

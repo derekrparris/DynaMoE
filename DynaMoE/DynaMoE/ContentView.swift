@@ -881,7 +881,7 @@ struct ContentView: View {
                     switchModel(to: dm)
                 },
                 onOpenSettings: {
-                    isSettingsPresented = true
+                    openSettingsWindow()
                 },
                 onToggleThinking: { enabled in
                     defaultThinkingEnabled = enabled
@@ -904,65 +904,26 @@ struct ContentView: View {
                 }
             )
         }
-        .sheet(isPresented: $isSettingsPresented) {
-            SettingsSheetView(
-                summary: summary,
-                modelConfig: modelConfig,
-                tokenizer: tokenizer,
-                activeModelPath: activeLoadedModelPath,
-                metalStatus: metalStatus,
-                detectedArchitecture: detectedArchitecture,
-                onSelectModel: {
-                    #if os(macOS)
-                    selectModelWithOpenPanel()
-                    #else
-                    isWeightImporterPresented = true
-                    #endif
-                },
-                onSelectTokenizer: {
-                    #if os(macOS)
-                    selectTokenizerWithOpenPanel()
-                    #else
-                    isTokenizerImporterPresented = true
-                    #endif
-                },
-                onLoadDiscoveredModel: { dm in
-                    switchModel(to: dm)
-                },
-                temperature: $temperature,
-                topP: $topP,
-                minP: $minP,
-                topK: $topK,
-                repetitionPenalty: $repetitionPenalty,
-                maxNewTokens: $maxNewTokens,
-                systemPrompt: $systemPrompt,
-                targetLayerCount: $targetLayerCount,
-                memoryExecutionMode: $memoryExecutionMode,
-                memoryBudgetMode: $memoryBudgetMode,
-                kvCachePrecision: kvCachePrecisionBinding,
-                speculativePrefetchEnabled: $speculativePrefetchEnabled,
-                prefetchLookaheadDepth: $prefetchLookaheadDepth,
-                currentRssGB: currentRssGB,
-                residentExpertCount: residentExpertCount,
-                totalExpertCount: totalExpertCount,
-                cacheHitRate: cacheHitRate,
-                prefetchEfficiency: prefetchEfficiency,
-                lastPagingLatencyMs: lastPagingLatencyMs,
-                pagingStatusMessage: pagingStatusMessage,
-                onFlushCache: { flushExpertCache() },
-                onPreFaultAll: { preFaultAllWeights() },
-                searchText: $searchText,
-                selectedCategory: $selectedCategory,
-                categoryFilters: categoryFilters,
-                selectedTensorID: $selectedTensorID,
-                selectedTensor: selectedTensor,
-                onExecuteMoERouter: { l in executeMoERouter(layerIndex: l) },
-                onExecuteFullLayer: { l in executeFullLayerForward(layerIndex: l) },
-                onExecuteMultiLayer: { n in executeMultiLayerForward(numLayers: n) },
-                isExecutingMlp: isExecutingMlp,
-                isExecutingFullLayer: isExecutingFullLayer,
-                isExecutingMultiLayer: isExecutingMultiLayer
-            )
+        .onChange(of: isSettingsPresented) { isPresented in
+            if isPresented {
+                openSettingsWindow()
+                isSettingsPresented = false
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openDynaMoESettings)) { _ in
+            openSettingsWindow()
+        }
+        .onChange(of: currentRssGB) { _ in
+            syncSettingsWindowIfNeeded()
+        }
+        .onChange(of: residentExpertCount) { _ in
+            syncSettingsWindowIfNeeded()
+        }
+        .onChange(of: cacheHitRate) { _ in
+            syncSettingsWindowIfNeeded()
+        }
+        .onChange(of: activeLoadedModelPath) { _ in
+            syncSettingsWindowIfNeeded()
         }
         .onAppear {
             if selectedSessionId == nil {
@@ -990,6 +951,83 @@ struct ContentView: View {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 updatePagingStats()
+            }
+        }
+    }
+
+    // MARK: - Independent Settings Window Management
+    @ViewBuilder
+    private func buildSettingsSheetView() -> some View {
+        SettingsSheetView(
+            summary: summary,
+            modelConfig: modelConfig,
+            tokenizer: tokenizer,
+            activeModelPath: activeLoadedModelPath,
+            metalStatus: metalStatus,
+            detectedArchitecture: detectedArchitecture,
+            onSelectModel: {
+                #if os(macOS)
+                selectModelWithOpenPanel()
+                #else
+                isWeightImporterPresented = true
+                #endif
+            },
+            onSelectTokenizer: {
+                #if os(macOS)
+                selectTokenizerWithOpenPanel()
+                #else
+                isTokenizerImporterPresented = true
+                #endif
+            },
+            onLoadDiscoveredModel: { dm in
+                switchModel(to: dm)
+            },
+            temperature: $temperature,
+            topP: $topP,
+            minP: $minP,
+            topK: $topK,
+            repetitionPenalty: $repetitionPenalty,
+            maxNewTokens: $maxNewTokens,
+            systemPrompt: $systemPrompt,
+            targetLayerCount: $targetLayerCount,
+            memoryExecutionMode: $memoryExecutionMode,
+            memoryBudgetMode: $memoryBudgetMode,
+            kvCachePrecision: kvCachePrecisionBinding,
+            speculativePrefetchEnabled: $speculativePrefetchEnabled,
+            prefetchLookaheadDepth: $prefetchLookaheadDepth,
+            currentRssGB: currentRssGB,
+            residentExpertCount: residentExpertCount,
+            totalExpertCount: totalExpertCount,
+            cacheHitRate: cacheHitRate,
+            prefetchEfficiency: prefetchEfficiency,
+            lastPagingLatencyMs: lastPagingLatencyMs,
+            pagingStatusMessage: pagingStatusMessage,
+            onFlushCache: { flushExpertCache() },
+            onPreFaultAll: { preFaultAllWeights() },
+            searchText: $searchText,
+            selectedCategory: $selectedCategory,
+            categoryFilters: categoryFilters,
+            selectedTensorID: $selectedTensorID,
+            selectedTensor: selectedTensor,
+            onExecuteMoERouter: { l in executeMoERouter(layerIndex: l) },
+            onExecuteFullLayer: { l in executeFullLayerForward(layerIndex: l) },
+            onExecuteMultiLayer: { n in executeMultiLayerForward(numLayers: n) },
+            isExecutingMlp: isExecutingMlp,
+            isExecutingFullLayer: isExecutingFullLayer,
+            isExecutingMultiLayer: isExecutingMultiLayer
+        )
+    }
+
+    private func openSettingsWindow() {
+        SettingsWindowManager.shared.show(title: "Settings & Diagnostics") {
+            buildSettingsSheetView()
+        }
+    }
+
+    private func syncSettingsWindowIfNeeded() {
+        if SettingsWindowManager.shared.isWindowOpen {
+            SettingsWindowManager.shared.update {
+                buildSettingsSheetView()
             }
         }
     }

@@ -83,6 +83,12 @@ struct DynaMoEApp: App {
                     openWindow(id: "about-dynamoe")
                 }
             }
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings…") {
+                    NotificationCenter.default.post(name: .openDynaMoESettings, object: nil)
+                }
+                .keyboardShortcut(",", modifiers: .command)
+            }
             SidebarCommands()
             CommandGroup(after: .sidebar) {
                 Divider()
