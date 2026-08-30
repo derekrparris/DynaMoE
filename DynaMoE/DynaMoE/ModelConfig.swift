@@ -352,9 +352,22 @@ public struct ModelConfig: Codable {
     public var isRMSNormUnitOffset: Bool {
         let rawType = (textConfig != nil ? "qwen3_5_moe" : (modelType ?? "")).lowercased()
         let archs = architectures?.map { $0.lowercased() } ?? []
-        if rawType.contains("ornith") || rawType.contains("qwen") || archs.contains(where: { $0.contains("ornith") || $0.contains("qwen") }) {
+        let modelTypeLower = (modelType ?? "").lowercased()
+
+        // Qwen 3.5 / Qwen 3.5 MoE / Ornith models use 0-mean unit-offset RMSNorm weights (1.0 + weight)
+        if rawType.contains("qwen3_5") || rawType.contains("qwen3.5") ||
+           modelTypeLower.contains("qwen3_5") || modelTypeLower.contains("qwen3.5") ||
+           archs.contains(where: { $0.contains("qwen3_5") || $0.contains("qwen3.5") }) ||
+           rawType.contains("ornith") || modelTypeLower.contains("ornith") ||
+           archs.contains(where: { $0.contains("ornith") }) {
+            return true
+        }
+
+        // Older Qwen 2 / 2.5 models use standard (1-mean) RMSNorm without unit-offset
+        if rawType.contains("qwen") || archs.contains(where: { $0.contains("qwen") }) {
             return false
         }
+
         return rawType.contains("gemma") || archs.contains(where: { $0.contains("gemma") })
     }
 
