@@ -5833,12 +5833,36 @@ struct ContentView: View {
             if promptCount > 0 {
                 if packedExpertsDir != nil {
                     // FlashMoE mode: sequential token ingestion to execute POSIX pread expert loads and accurate recurrent states
+                    let prefillStartTime = CFAbsoluteTimeGetCurrent()
+                    var lastPrefillUIUpdateTime = CFAbsoluteTimeGetCurrent()
                     for p in 0..<promptCount {
                         if Task.isCancelled { return }
                         let tok = promptTokenIds[p]
                         let ok = runTokenForward(tokenId: tok, step: currentStep, computeLogits: false, wait: true)
                         if !ok { return }
                         currentStep += 1
+
+                        let now = CFAbsoluteTimeGetCurrent()
+                        if now - lastPrefillUIUpdateTime >= 0.08 || p == promptCount - 1 {
+                            lastPrefillUIUpdateTime = now
+                            let elapsed = now - prefillStartTime
+                            let tokSpeed = elapsed > 0 ? Double(p + 1) / elapsed : 0.0
+                            let pct = Int((Double(p + 1) / Double(promptCount)) * 100)
+                            let remaining = promptCount - (p + 1)
+                            let eta = tokSpeed > 0 ? Double(remaining) / tokSpeed : 0.0
+                            let etaStr = eta >= 60 ? String(format: "%dm %02ds", Int(eta) / 60, Int(eta) % 60) : String(format: "%.0fs", eta)
+                            let prefillStr = "Ingesting prompt: \(p + 1)/\(promptCount) tokens (\(pct)%) • \(String(format: "%.0f", tokSpeed)) tok/s • ETA: \(etaStr)"
+
+                            Task { @MainActor in
+                                self.generationSpeedTokPerSec = tokSpeed
+                                self.generationStatusText = "📥 " + prefillStr
+                                if let sId = sessionId, let mId = messageId,
+                                   let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                                   let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                                    self.sessions[sIdx].messages[mIdx].prefillStatus = prefillStr
+                                }
+                            }
+                        }
                     }
                 } else {
                     let prefillTokens = Array(promptTokenIds.prefix(promptCount))
