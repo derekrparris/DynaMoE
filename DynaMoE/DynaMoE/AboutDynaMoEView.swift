@@ -133,6 +133,18 @@ struct AboutDynaMoEView: View {
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
             """
+        ),
+        ThirdPartyLicenseItem(
+            name: "DuckDuckGo Web Search Integration",
+            category: "Privacy Search & Information Retrieval",
+            licenseType: "Public Search API / Privacy Policy",
+            copyrightNotice: "Copyright © 2008-2026 DuckDuckGo, Inc. All rights reserved.",
+            url: "https://duckduckgo.com",
+            fullLicenseText: """
+            The DuckDuckGo web search plugin in DynaMoE provides on-demand, privacy-preserving web search directly from your device without user tracking, query profiling, or search history logging.
+
+            DuckDuckGo is a registered trademark of DuckDuckGo, Inc. DynaMoE connects to DuckDuckGo in compliance with DuckDuckGo's public search and privacy standards.
+            """
         )
     ]
 
@@ -366,7 +378,11 @@ struct AboutDynaMoEView: View {
                                 .font(.system(size: 11))
                                 .foregroundColor(.secondary)
 
-                            Text("• DynaMoE is an independent open-source inference engine and is not affiliated with or endorsed by Apple Inc., Hugging Face, or the model creators.")
+                            Text("• DynaMoE is an independent open-source inference engine and is not affiliated with or endorsed by Apple Inc., Hugging Face, DuckDuckGo, or the model creators.")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+
+                            Text("• DuckDuckGo is a registered trademark of DuckDuckGo, Inc. DynaMoE's web search capability provides private, zero-tracking web queries via DuckDuckGo.")
                                 .font(.system(size: 11))
                                 .foregroundColor(.secondary)
                         }

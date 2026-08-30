@@ -864,13 +864,19 @@ public final class AgentHarness {
     public func buildSystemPrompt(baseSystem: String, modelName: String? = nil) -> String {
         var cleanBase = baseSystem.trimmingCharacters(in: .whitespacesAndNewlines)
         if cleanBase.isEmpty {
-            cleanBase = "You are a helpful coding and engineering assistant with direct access to local macOS development tools."
+            cleanBase = "You are an expert AI software engineering and reasoning assistant with direct access to local macOS development tools."
         }
 
         var prompt = cleanBase
-        prompt += "\n\nYou have direct access to the local macOS system tools through <tool_call> functions. "
-        prompt += "Whenever you need to read or edit files, search code, or run terminal commands, emit one or more JSON <tool_call> blocks."
-        prompt += "\n\n# Available Tools\n<tools>\n"
+        prompt += "\n\n# Tool Calling Protocol & Instructions\n"
+        prompt += "You have direct access to native tools on the local macOS system to inspect files, edit code, execute terminal commands, and perform web searches.\n\n"
+        prompt += "## Operating Rules:\n"
+        prompt += "1. **Action-Oriented Execution**: When you need to read a file, create or modify code, search directories, or run commands, ALWAYS emit a `<tool_call>` block. Never merely describe what you intend to do in prose without issuing the actual tool call.\n"
+        prompt += "2. **Multi-Turn Continuity**: When a tool completes and returns a `<tool_response>`, evaluate the output. If additional steps are required (such as modifying a file after reading it, or verifying changes), emit the next `<tool_call>` immediately.\n"
+        prompt += "3. **Completion**: Only provide your final conversational answer to the user once all necessary file edits, commands, and operations are complete.\n"
+        prompt += "4. **Format**: To invoke a tool, output a JSON object within `<tool_call></tool_call>` tags:\n"
+        prompt += "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"path\": \"ContentView.swift\", \"start_line\": 1, \"end_line\": 50}}\n</tool_call>\n\n"
+        prompt += "# Available Tools\n<tools>\n"
 
         for tool in availableToolDefinitions {
             if let data = try? JSONEncoder().encode(tool),
@@ -878,19 +884,21 @@ public final class AgentHarness {
                 prompt += jsonStr + "\n"
             }
         }
-        prompt += "</tools>\n\n"
-        prompt += "To invoke a tool, output a JSON object within <tool_call></tool_call> tags:\n"
-        prompt += "<tool_call>\n{\"name\": \"file_read\", \"arguments\": {\"path\": \"ContentView.swift\", \"start_line\": 1, \"end_line\": 50}}\n</tool_call>\n"
+        prompt += "</tools>\n"
 
         return prompt
     }
 
-    public func formatToolResponseTurn(responses: [String]) -> String {
+    public func formatToolResponseTurn(responses: [String], includeThinkSuffix: Bool = false) -> String {
         var turn = "<|im_start|>user\n"
         for r in responses {
             turn += "<tool_response>\n\(r)\n</tool_response>\n"
         }
+        turn += "Tool execution completed. Inspect the results above and continue fulfilling the request. If further actions or file edits are needed, output the next <tool_call> block immediately. If finished, provide your final response.\n"
         turn += "<|im_end|>\n<|im_start|>assistant\n"
+        if includeThinkSuffix {
+            turn += "<think>\n"
+        }
         return turn
     }
 
@@ -924,13 +932,29 @@ public final class AgentHarness {
             }
         }
 
-        // Check for unclosed <tool_call> (generation cut off by max_tokens)
-        if calls.isEmpty && broken.isEmpty && text.contains("<tool_call>") {
+        // Check for unclosed or truncated <tool_call>
+        if calls.isEmpty && text.contains("<tool_call>") {
             let parts = text.components(separatedBy: "<tool_call>")
-            if parts.count > 1 {
-                let tail = parts.last?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                if !tail.isEmpty {
-                    broken.append(tail)
+            for part in parts.dropFirst() {
+                let candidate = part.replacingOccurrences(of: "</tool_call>", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if let parsed = extractBalancedJSON(candidate), let name = parsed["name"] as? String {
+                    let args = (parsed["arguments"] as? [String: Any]) ?? [:]
+                    let rawArgs = (parsed["arguments"] != nil) ? String(describing: parsed["arguments"]!) : ""
+                    calls.append(ParsedToolCall(name: name, arguments: args, rawArguments: rawArgs, rawText: candidate))
+                } else if !candidate.isEmpty {
+                    broken.append(candidate)
+                }
+            }
+        }
+
+        // Fallback: Check if output contains raw JSON with a recognized tool name
+        if calls.isEmpty {
+            if let parsed = extractBalancedJSON(text), let name = parsed["name"] as? String {
+                let knownToolNames = Set(availableToolDefinitions.map { $0.function.name })
+                if knownToolNames.contains(name) {
+                    let args = (parsed["arguments"] as? [String: Any]) ?? [:]
+                    let rawArgs = (parsed["arguments"] != nil) ? String(describing: parsed["arguments"]!) : ""
+                    calls.append(ParsedToolCall(name: name, arguments: args, rawArguments: rawArgs, rawText: text))
                 }
             }
         }

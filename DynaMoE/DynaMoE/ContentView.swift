@@ -2948,11 +2948,14 @@ struct ContentView: View {
 
         let formattedPrompt: String
         if prompt.contains("<|im_start|>") {
+            var p = prompt
             if !cleanSystem.isEmpty && !prompt.contains("<|im_start|>system") {
-                formattedPrompt = "<|im_start|>system\n\(cleanSystem)<|im_end|>\n" + prompt
-            } else {
-                formattedPrompt = prompt
+                p = "<|im_start|>system\n\(cleanSystem)<|im_end|>\n" + p
             }
+            if thinkingEnabled && p.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("<|im_start|>assistant") {
+                p = p.trimmingCharacters(in: .whitespacesAndNewlines) + "\n<think>\n"
+            }
+            formattedPrompt = p
         } else if !cleanSystem.isEmpty {
             formattedPrompt = "<|im_start|>system\n\(cleanSystem)<|im_end|>\n<|im_start|>user\n\(prompt)<|im_end|>\n<|im_start|>assistant\n\(thinkSuffix)"
         } else {
@@ -3424,12 +3427,23 @@ struct ContentView: View {
         generatedStreamText = ""
         thinkingText = ""
         responseText = ""
-        isThinking = false
+        isThinking = thinkingEnabled
         isThinkingExpanded = true
         generationTotalTokens = 0
         generationSpeedTokPerSec = 0.0
         generationElapsedMs = 0.0
-        generationStatusText = "⚡ Initializing Autoregressive Generation..."
+        generationStatusText = thinkingEnabled ? "🧠 Reasoning..." : "⚡ Initializing Autoregressive Generation..."
+
+        var priorThinking: String? = nil
+        var priorContent: String? = nil
+        if let sId = sessionId, let mId = messageId {
+            if let sIdx = sessions.firstIndex(where: { $0.id == sId }),
+               let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                priorThinking = sessions[sIdx].messages[mIdx].thinkingContent
+                priorContent = sessions[sIdx].messages[mIdx].content
+                sessions[sIdx].messages[mIdx].isThinking = thinkingEnabled
+            }
+        }
 
         var loadedLayout: FlashMoELayout? = nil
         let packedExpertsDir: URL?
@@ -6090,8 +6104,30 @@ struct ContentView: View {
                         if let sId = sessionId, let mId = messageId {
                             if let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
                                 let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
-                                self.sessions[sIdx].messages[mIdx].thinkingContent = thinkPart.isEmpty ? nil : thinkPart
-                                self.sessions[sIdx].messages[mIdx].content = respPart
+                                let combinedThinking: String?
+                                if let prior = priorThinking, !prior.isEmpty {
+                                    if !thinkPart.isEmpty {
+                                        combinedThinking = prior + "\n\n---\n\n" + thinkPart
+                                    } else {
+                                        combinedThinking = prior
+                                    }
+                                } else {
+                                    combinedThinking = thinkPart.isEmpty ? nil : thinkPart
+                                }
+
+                                let combinedContent: String
+                                if let prior = priorContent, !prior.isEmpty {
+                                    if !respPart.isEmpty {
+                                        combinedContent = prior + "\n\n" + respPart
+                                    } else {
+                                        combinedContent = prior
+                                    }
+                                } else {
+                                    combinedContent = respPart
+                                }
+
+                                self.sessions[sIdx].messages[mIdx].thinkingContent = combinedThinking
+                                self.sessions[sIdx].messages[mIdx].content = combinedContent
                                 self.sessions[sIdx].messages[mIdx].isThinking = activeThink
                                 self.sessions[sIdx].messages[mIdx].tokenCount = tokensGenerated
                                 self.sessions[sIdx].messages[mIdx].tokensPerSec = tokPerSec
@@ -6182,8 +6218,30 @@ struct ContentView: View {
                 if let sId = sessionId, let mId = messageId {
                     if let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
                        let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
-                        self.sessions[sIdx].messages[mIdx].thinkingContent = finalThink.isEmpty ? nil : finalThink
-                        self.sessions[sIdx].messages[mIdx].content = finalResp
+                        let combinedFinalThinking: String?
+                        if let prior = priorThinking, !prior.isEmpty {
+                            if !finalThink.isEmpty {
+                                combinedFinalThinking = prior + "\n\n---\n\n" + finalThink
+                            } else {
+                                combinedFinalThinking = prior
+                            }
+                        } else {
+                            combinedFinalThinking = finalThink.isEmpty ? nil : finalThink
+                        }
+
+                        let combinedFinalContent: String
+                        if let prior = priorContent, !prior.isEmpty {
+                            if !finalResp.isEmpty {
+                                combinedFinalContent = prior + "\n\n" + finalResp
+                            } else {
+                                combinedFinalContent = prior
+                            }
+                        } else {
+                            combinedFinalContent = finalResp
+                        }
+
+                        self.sessions[sIdx].messages[mIdx].thinkingContent = combinedFinalThinking
+                        self.sessions[sIdx].messages[mIdx].content = combinedFinalContent
                         self.sessions[sIdx].messages[mIdx].isThinking = false
                         self.sessions[sIdx].messages[mIdx].tokenCount = tokensGenerated
                         self.sessions[sIdx].messages[mIdx].tokensPerSec = finalTokPerSec
@@ -6196,7 +6254,7 @@ struct ContentView: View {
             // Agent Harness Multi-Step Tool Execution
             let isAgentEnabled = (sessionId != nil) ? (self.sessions.first(where: { $0.id == sessionId })?.isAgentToolsEnabled ?? self.defaultAgentToolsEnabled) : self.defaultAgentToolsEnabled
 
-            if isAgentEnabled && finalDecoded.contains("<tool_call>") {
+            if isAgentEnabled {
                 let parsedResult = AgentHarness.shared.parseToolCalls(from: finalDecoded)
                 if !parsedResult.calls.isEmpty {
                     var initialRecords: [ToolCallRecord] = []
@@ -6259,8 +6317,15 @@ struct ContentView: View {
 
                     // If not finished and steps remaining, invoke next step
                     if !anyCompleted && (agentStep + 1 < self.maxAgentSteps) {
-                        let toolResponseTurn = AgentHarness.shared.formatToolResponseTurn(responses: toolResponses)
-                        let nextPrompt = formattedPrompt + finalDecoded + "\n" + toolResponseTurn
+                        let toolResponseTurn = AgentHarness.shared.formatToolResponseTurn(
+                            responses: toolResponses,
+                            includeThinkSuffix: thinkingEnabled
+                        )
+                        var assistantTurnText = finalDecoded
+                        if !assistantTurnText.contains("<|im_end|>") {
+                            assistantTurnText += "<|im_end|>"
+                        }
+                        let nextPrompt = formattedPrompt + assistantTurnText + "\n" + toolResponseTurn
                         await MainActor.run {
                             self.startAutoregressiveGeneration(
                                 customPrompt: nextPrompt,
