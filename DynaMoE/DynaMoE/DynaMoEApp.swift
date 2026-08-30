@@ -46,6 +46,60 @@ private extension CGFloat {
     }
 }
 
+final class WindowZoomView: NSView {
+    var zoomScale: CGFloat = 1.0 {
+        didSet {
+            applyZoom()
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let window = window {
+            NotificationCenter.default.removeObserver(self, name: NSWindow.didResizeNotification, object: nil)
+            NotificationCenter.default.addObserver(self, selector: #selector(windowDidResize), name: NSWindow.didResizeNotification, object: window)
+            DispatchQueue.main.async { [weak self] in
+                self?.applyZoom()
+            }
+        }
+    }
+
+    @objc private func windowDidResize() {
+        applyZoom()
+    }
+
+    private func applyZoom() {
+        guard let cv = window?.contentView else { return }
+        let fSize = cv.frame.size
+        guard fSize.width > 0, fSize.height > 0, zoomScale > 0 else { return }
+
+        let targetBounds = NSSize(width: fSize.width / zoomScale, height: fSize.height / zoomScale)
+        if cv.bounds.size != targetBounds {
+            cv.setBoundsSize(targetBounds)
+            cv.needsLayout = true
+            cv.needsDisplay = true
+        }
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+}
+
+struct WindowZoomHelper: NSViewRepresentable {
+    let zoomScale: CGFloat
+
+    func makeNSView(context: Context) -> WindowZoomView {
+        let v = WindowZoomView()
+        v.zoomScale = zoomScale
+        return v
+    }
+
+    func updateNSView(_ nsView: WindowZoomView, context: Context) {
+        nsView.zoomScale = zoomScale
+    }
+}
+
 @main
 struct DynaMoEApp: App {
     @StateObject private var zoomManager = AppZoomManager.shared
@@ -66,17 +120,9 @@ struct DynaMoEApp: App {
 
     var body: some Scene {
         WindowGroup {
-            GeometryReader { geo in
-                ContentView()
-                    .frame(
-                        width: max(100, geo.size.width / zoomManager.zoomScale),
-                        height: max(100, geo.size.height / zoomManager.zoomScale)
-                    )
-                    .scaleEffect(zoomManager.zoomScale, anchor: .topLeading)
-                    .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
-                    .clipped()
-            }
-            .environmentObject(zoomManager)
+            ContentView()
+                .background(WindowZoomHelper(zoomScale: zoomManager.zoomScale))
+                .environmentObject(zoomManager)
         }
         .modelContainer(sharedModelContainer)
         .commands {
