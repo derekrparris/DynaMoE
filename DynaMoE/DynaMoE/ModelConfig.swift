@@ -8,6 +8,7 @@
 import Foundation
 
 public enum ModelArchitectureType: String, CaseIterable, Identifiable, Codable {
+    case qwen38FlashNext = "Hybrid GDN + QSA MoE (Qwen 3.8 Flash Next)"
     case hybridSsmMoe = "Hybrid SSM + MoE (Ornith 1.5 / Qwen 3.5 MoE)"
     case hybridSsmDense = "Hybrid SSM + Dense (Ornith 1.5 9B / Qwen 3.5 Dense)"
     case standardMoe = "Standard MoE (Qwen MoE / Mixtral)"
@@ -17,6 +18,7 @@ public enum ModelArchitectureType: String, CaseIterable, Identifiable, Codable {
 
     public var shortName: String {
         switch self {
+        case .qwen38FlashNext: return "Qwen 3.8 Flash Next"
         case .hybridSsmMoe: return "Hybrid SSM + MoE"
         case .hybridSsmDense: return "Hybrid SSM + Dense"
         case .standardMoe: return "Standard MoE"
@@ -26,6 +28,7 @@ public enum ModelArchitectureType: String, CaseIterable, Identifiable, Codable {
 
     public var icon: String {
         switch self {
+        case .qwen38FlashNext: return "bolt.horizontal.fill"
         case .hybridSsmMoe: return "cpu.fill"
         case .hybridSsmDense: return "cpu"
         case .standardMoe: return "square.grid.3x3.fill"
@@ -34,7 +37,11 @@ public enum ModelArchitectureType: String, CaseIterable, Identifiable, Codable {
     }
 
     public var isHybridSsm: Bool {
-        return self == .hybridSsmMoe || self == .hybridSsmDense
+        return self == .qwen38FlashNext || self == .hybridSsmMoe || self == .hybridSsmDense
+    }
+
+    public var isQwen38: Bool {
+        return self == .qwen38FlashNext
     }
 }
 
@@ -247,7 +254,13 @@ public struct ModelConfig: Codable {
     }
 
     public var effectiveNumExpertsPerTok: Int {
-        return textConfig?.numExpertsPerTok ?? numExpertsPerTok ?? (effectiveNumExperts > 0 ? 8 : 0)
+        if let topK = textConfig?.numExpertsPerTok ?? numExpertsPerTok {
+            return topK
+        }
+        if effectiveNumExperts >= 512 {
+            return 10
+        }
+        return effectiveNumExperts > 0 ? 8 : 0
     }
 
     public var effectiveRmsNormEps: Float {
@@ -298,6 +311,11 @@ public struct ModelConfig: Codable {
     public func resolveArchitectureType(summary: ModelSummary?) -> ModelArchitectureType {
         let rawType = (textConfig != nil ? "qwen3_5_moe" : (modelType ?? "")).lowercased()
         let archs = architectures?.map { $0.lowercased() } ?? []
+
+        let isQwen38Model = rawType.contains("qwen3_8") || rawType.contains("qwen38") || rawType.contains("flash_next") || archs.contains(where: { $0.contains("qwen3_8") || $0.contains("flash_next") }) || effectiveNumExperts >= 512 || (summary != nil && summary!.maxExpertId >= 500)
+        if isQwen38Model {
+            return .qwen38FlashNext
+        }
 
         let isSsmModel = rawType.contains("qwen3_5") || rawType.contains("ornith") || rawType.contains("deltanet") || rawType.contains("mamba") || archs.contains(where: { $0.contains("qwen3_5") || $0.contains("deltanet") || $0.contains("ornith") })
         let hasMoEExperts = effectiveNumExperts > 1 || (summary != nil && summary!.maxExpertId > 0)

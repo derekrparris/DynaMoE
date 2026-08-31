@@ -2991,4 +2991,406 @@ kernel void mxfp8_down_proj_accumulate_simd(
     }
 }
 
+// ============================================================================
+// Qwen 3.8 Flash Next Specialized MSL Kernels
+// ============================================================================
+
+/// MSL Kernel: 512-Expert Top-K MoE Router (BF16)
+/// Computes 512 expert gating logits, selects top-K (e.g. top-10) expert IDs, and computes normalized Softmax.
+kernel void moe_router_topk_512_bf16(
+    device const ushort* rawBaseBuffer [[buffer(0)]],
+    device const float* inputHiddenState [[buffer(1)]],
+    device uint32_t* outExpertIndices [[buffer(2)]],
+    device float* outRoutingWeights [[buffer(3)]],
+    constant uint64_t& gateWeightOffset [[buffer(4)]],
+    constant uint32_t& hiddenDim [[buffer(5)]],
+    constant uint32_t& numExperts [[buffer(6)]],     // 512
+    constant uint32_t& topK [[buffer(7)]],           // 10
+    uint tid [[thread_position_in_threadgroup]],
+    uint tokenIdx [[threadgroup_position_in_grid]]
+) {
+    threadgroup float sharedLogits[512];
+
+    // Compute dot products for all experts (each of 256 threads processes 2 experts)
+    uint32_t exp0 = tid * 2;
+    uint32_t exp1 = tid * 2 + 1;
+    uint64_t baseUshortOffset = gateWeightOffset / 2;
+    device const float* tokenH = inputHiddenState + (tokenIdx * hiddenDim);
+    uint32_t num4 = hiddenDim / 4;
+
+    if (exp0 < numExperts && exp0 < 512) {
+        uint64_t rowOffset0 = baseUshortOffset + ((uint64_t)exp0 * (uint64_t)hiddenDim);
+        device const ushort* wRow0 = rawBaseBuffer + rowOffset0;
+        float sum0 = 0.0f;
+        for (uint32_t i = 0; i < num4; i++) {
+            uint32_t d = i * 4;
+            sum0 += bf16_to_fp32(wRow0[d + 0]) * tokenH[d + 0];
+            sum0 += bf16_to_fp32(wRow0[d + 1]) * tokenH[d + 1];
+            sum0 += bf16_to_fp32(wRow0[d + 2]) * tokenH[d + 2];
+            sum0 += bf16_to_fp32(wRow0[d + 3]) * tokenH[d + 3];
+        }
+        sharedLogits[exp0] = sum0;
+    }
+
+    if (exp1 < numExperts && exp1 < 512) {
+        uint64_t rowOffset1 = baseUshortOffset + ((uint64_t)exp1 * (uint64_t)hiddenDim);
+        device const ushort* wRow1 = rawBaseBuffer + rowOffset1;
+        float sum1 = 0.0f;
+        for (uint32_t i = 0; i < num4; i++) {
+            uint32_t d = i * 4;
+            sum1 += bf16_to_fp32(wRow1[d + 0]) * tokenH[d + 0];
+            sum1 += bf16_to_fp32(wRow1[d + 1]) * tokenH[d + 1];
+            sum1 += bf16_to_fp32(wRow1[d + 2]) * tokenH[d + 2];
+            sum1 += bf16_to_fp32(wRow1[d + 3]) * tokenH[d + 3];
+        }
+        sharedLogits[exp1] = sum1;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Thread 0 performs Top-K selection and normalized Softmax
+    if (tid == 0) {
+        uint32_t topIndices[16];
+        float topValues[16];
+        uint32_t k = min(topK, (uint32_t)16);
+
+        for (uint32_t i = 0; i < k; i++) {
+            topValues[i] = -INFINITY;
+            topIndices[i] = 0;
+        }
+
+        uint32_t validExperts = min(numExperts, (uint32_t)512);
+        for (uint32_t e = 0; e < validExperts; e++) {
+            float val = sharedLogits[e];
+            if (val > topValues[k - 1]) {
+                int insertPos = (int)k - 1;
+                while (insertPos > 0 && val > topValues[insertPos - 1]) {
+                    topValues[insertPos] = topValues[insertPos - 1];
+                    topIndices[insertPos] = topIndices[insertPos - 1];
+                    insertPos--;
+                }
+                topValues[insertPos] = val;
+                topIndices[insertPos] = e;
+            }
+        }
+
+        float maxVal = topValues[0];
+        float sumExp = 0.0f;
+        float exps[16];
+        for (uint32_t i = 0; i < k; i++) {
+            exps[i] = exp(topValues[i] - maxVal);
+            sumExp += exps[i];
+        }
+
+        float invSum = (sumExp > 0.0f) ? (1.0f / sumExp) : 0.0f;
+
+        device uint32_t* tokenOutIndices = outExpertIndices + (tokenIdx * topK);
+        device float* tokenOutWeights = outRoutingWeights + (tokenIdx * topK);
+
+        for (uint32_t i = 0; i < k; i++) {
+            tokenOutIndices[i] = topIndices[i];
+            tokenOutWeights[i] = exps[i] * invSum;
+        }
+    }
+}
+
+/// MSL Kernel: 512-Expert Top-K MoE Router (Q4 Quantized Weights)
+kernel void moe_router_topk_512_q4(
+    device const uchar* rawBaseBuffer [[buffer(0)]],
+    device const float* inputHiddenState [[buffer(1)]],
+    device uint32_t* outExpertIndices [[buffer(2)]],
+    device float* outRoutingWeights [[buffer(3)]],
+    constant uint64_t& gateWeightOffset [[buffer(4)]],
+    constant uint32_t& hiddenDim [[buffer(5)]],
+    constant uint32_t& numExperts [[buffer(6)]],     // 512
+    constant uint32_t& topK [[buffer(7)]],           // 10
+    uint tid [[thread_position_in_threadgroup]],
+    uint tokenIdx [[threadgroup_position_in_grid]]
+) {
+    threadgroup float sharedLogits[512];
+
+    uint32_t exp0 = tid * 2;
+    uint32_t exp1 = tid * 2 + 1;
+    device const float* tokenH = inputHiddenState + (tokenIdx * hiddenDim);
+    uint32_t blocksPerRow = hiddenDim / 32;
+    uint64_t bytesPerRow = blocksPerRow * 18; // 16 bytes weights + 2 bytes scale per 32-block
+
+    if (exp0 < numExperts && exp0 < 512) {
+        uint64_t rowOffset0 = gateWeightOffset + ((uint64_t)exp0 * bytesPerRow);
+        device const uchar* rowPtr0 = rawBaseBuffer + rowOffset0;
+        float sum0 = 0.0f;
+        for (uint32_t b = 0; b < blocksPerRow; b++) {
+            device const uchar* blk = rowPtr0 + (b * 18);
+            ushort scaleU16 = (ushort)blk[0] | ((ushort)blk[1] << 8);
+            float scale = (float)as_type<half>(scaleU16);
+            device const uchar* nibbles = blk + 2;
+            uint32_t hBase = b * 32;
+
+            for (uint32_t i = 0; i < 16; i++) {
+                uchar byteVal = nibbles[i];
+                float w0 = ((float)(int)(byteVal & 0x0F) - 8.0f) * scale;
+                float w1 = ((float)(int)(byteVal >> 4) - 8.0f) * scale;
+                sum0 += w0 * tokenH[hBase + i * 2];
+                sum0 += w1 * tokenH[hBase + i * 2 + 1];
+            }
+        }
+        sharedLogits[exp0] = sum0;
+    }
+
+    if (exp1 < numExperts && exp1 < 512) {
+        uint64_t rowOffset1 = gateWeightOffset + ((uint64_t)exp1 * bytesPerRow);
+        device const uchar* rowPtr1 = rawBaseBuffer + rowOffset1;
+        float sum1 = 0.0f;
+        for (uint32_t b = 0; b < blocksPerRow; b++) {
+            device const uchar* blk = rowPtr1 + (b * 18);
+            ushort scaleU16 = (ushort)blk[0] | ((ushort)blk[1] << 8);
+            float scale = (float)as_type<half>(scaleU16);
+            device const uchar* nibbles = blk + 2;
+            uint32_t hBase = b * 32;
+
+            for (uint32_t i = 0; i < 16; i++) {
+                uchar byteVal = nibbles[i];
+                float w0 = ((float)(int)(byteVal & 0x0F) - 8.0f) * scale;
+                float w1 = ((float)(int)(byteVal >> 4) - 8.0f) * scale;
+                sum1 += w0 * tokenH[hBase + i * 2];
+                sum1 += w1 * tokenH[hBase + i * 2 + 1];
+            }
+        }
+        sharedLogits[exp1] = sum1;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        uint32_t topIndices[16];
+        float topValues[16];
+        uint32_t k = min(topK, (uint32_t)16);
+
+        for (uint32_t i = 0; i < k; i++) {
+            topValues[i] = -INFINITY;
+            topIndices[i] = 0;
+        }
+
+        uint32_t validExperts = min(numExperts, (uint32_t)512);
+        for (uint32_t e = 0; e < validExperts; e++) {
+            float val = sharedLogits[e];
+            if (val > topValues[k - 1]) {
+                int insertPos = (int)k - 1;
+                while (insertPos > 0 && val > topValues[insertPos - 1]) {
+                    topValues[insertPos] = topValues[insertPos - 1];
+                    topIndices[insertPos] = topIndices[insertPos - 1];
+                    insertPos--;
+                }
+                topValues[insertPos] = val;
+                topIndices[insertPos] = e;
+            }
+        }
+
+        float maxVal = topValues[0];
+        float sumExp = 0.0f;
+        float exps[16];
+        for (uint32_t i = 0; i < k; i++) {
+            exps[i] = exp(topValues[i] - maxVal);
+            sumExp += exps[i];
+        }
+
+        float invSum = (sumExp > 0.0f) ? (1.0f / sumExp) : 0.0f;
+
+        device uint32_t* tokenOutIndices = outExpertIndices + (tokenIdx * topK);
+        device float* tokenOutWeights = outRoutingWeights + (tokenIdx * topK);
+
+        for (uint32_t i = 0; i < k; i++) {
+            tokenOutIndices[i] = topIndices[i];
+            tokenOutWeights[i] = exps[i] * invSum;
+        }
+    }
+}
+
+/// MSL Kernel: Gated DeltaNet (GDN) Recurrent Step for 48 Value Heads / 16 Key Heads (Head Dim 128)
+kernel void gdn_linear_attention_recurrent_step(
+    device const float* qkvVector [[buffer(0)]], // [Q: 2048, K: 2048, V: 6144]
+    device const float* zVector [[buffer(1)]],   // [6144] (Output Gate)
+    device const float* aVector [[buffer(2)]],   // [48]
+    device const float* bVector [[buffer(3)]],   // [48]
+    device const uchar* aLogBuf [[buffer(4)]],   // [48] (BF16)
+    device const uchar* dtBiasBuf [[buffer(5)]], // [48] (BF16)
+    device const uchar* normBuf [[buffer(6)]],   // [128] (BF16)
+    device float* stateMatrix [[buffer(7)]],     // [48 heads, 128 keyDim, 128 valDim]
+    device float* outputVector [[buffer(8)]],    // [6144]
+    constant uint64_t& aLogOffset [[buffer(9)]],
+    constant uint64_t& dtBiasOffset [[buffer(10)]],
+    constant uint64_t& normOffset [[buffer(11)]],
+    constant uint32_t& numValHeads [[buffer(12)]],// 48
+    constant uint32_t& numKeyHeads [[buffer(13)]],// 16
+    constant uint32_t& headDim [[buffer(14)]],   // 128
+    constant float& eps [[buffer(15)]],          // 1e-6
+    uint headIdx [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    if (headIdx >= numValHeads) return;
+
+    uint32_t keyHeadIdx = headIdx / (numValHeads / numKeyHeads); // headIdx / 3
+
+    uint32_t qBase = keyHeadIdx * headDim;
+    uint32_t kBase = (numKeyHeads * headDim) + (keyHeadIdx * headDim);
+    uint32_t vBase = (2 * numKeyHeads * headDim) + (headIdx * headDim);
+    uint32_t zBase = headIdx * headDim;
+    uint32_t outBase = headIdx * headDim;
+    uint32_t stateBase = headIdx * headDim * headDim;
+
+    float aLogVal = read_bf16_unaligned(aLogBuf + aLogOffset + ((uint64_t)headIdx * 2));
+    float dtBiasVal = read_bf16_unaligned(dtBiasBuf + dtBiasOffset + ((uint64_t)headIdx * 2));
+    float aVal = aVector[headIdx];
+    float bVal = bVector[headIdx];
+
+    float x = aVal + dtBiasVal;
+    float dt = (x > 20.0f) ? x : ((x < -20.0f) ? exp(x) : log(1.0f + exp(x)));
+    float alpha = exp(-exp(aLogVal) * dt);
+    float beta = 1.0f / (1.0f + exp(-bVal));
+
+    uint32_t headDimVec4 = headDim / 4;
+    device const float4* kVec4 = (device const float4*)(qkvVector + kBase);
+    device const float4* qVec4 = (device const float4*)(qkvVector + qBase);
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    float y_local[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    uint32_t row_indices[4];
+    uint32_t numLocalRows = 0;
+    float localSumSq = 0.0f;
+
+    for (uint32_t i = laneId; i < headDim; i += 32) {
+        row_indices[numLocalRows] = i;
+        uint32_t sRowBase = stateBase + (i * headDim);
+        device float4* sRowVec4 = (device float4*)(stateMatrix + sRowBase);
+
+        float Sk_i = 0.0f;
+        for (uint32_t j = 0; j < headDimVec4; j++) {
+            Sk_i += dot(sRowVec4[j], kVec4[j]);
+        }
+
+        float v_val = qkvVector[vBase + i];
+        float delta_v_i = beta * (v_val - Sk_i);
+
+        for (uint32_t j = 0; j < headDimVec4; j++) {
+            sRowVec4[j] = (sRowVec4[j] * alpha) + (delta_v_i * kVec4[j]);
+        }
+
+        float y_i = 0.0f;
+        for (uint32_t j = 0; j < headDimVec4; j++) {
+            y_i += dot(sRowVec4[j], qVec4[j]);
+        }
+        y_i *= invSqrtHeadDim;
+
+        y_local[numLocalRows] = y_i;
+        localSumSq += y_i * y_i;
+        numLocalRows++;
+    }
+
+    float headSumSq = simd_sum(localSumSq);
+    float rms = rsqrt((headSumSq / (float)headDim) + eps);
+
+    for (uint32_t r = 0; r < numLocalRows; r++) {
+        uint32_t i = row_indices[r];
+        float gamma = read_bf16_unaligned(normBuf + normOffset + ((uint64_t)i * 2));
+        float yNorm = y_local[r] * rms * gamma;
+        float z = zVector[zBase + i];
+        float silu_z = z / (1.0f + exp(-z));
+        outputVector[outBase + i] = yNorm * silu_z;
+    }
+}
+
+/// MSL Kernel: Qwen Sparse Attention (QSA) - Micro-Block Scoring Pass (Stage A)
+/// Groups KV keys into 64-token micro-blocks, scores them with 4 MQA Query heads, and outputs block scores.
+kernel void qsa_mqa_indexer_score_blocks(
+    device const float* qVector [[buffer(0)]],        // [4 heads, 128 dim]
+    device const half* kvCacheKeyBuffer [[buffer(1)]],// [numTokens, 1 head, 128 dim]
+    device float* outBlockScores [[buffer(2)]],       // [numBlocks]
+    constant uint32_t& numTokens [[buffer(3)]],
+    constant uint32_t& numHeads [[buffer(4)]],        // 4
+    constant uint32_t& headDim [[buffer(5)]],         // 128
+    uint blockIdx [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint32_t blockStart = blockIdx * 64;
+    if (blockStart >= numTokens) return;
+
+    float invSqrtHeadDim = rsqrt((float)headDim);
+    float maxScoreLocal = -INFINITY;
+
+    // Iterate through tokens within the 64-token micro-block
+    for (uint32_t t = blockStart + laneId; t < min(blockStart + 64, numTokens); t += 32) {
+        uint32_t kTokenBase = t * headDim;
+        device const half* kPtr = kvCacheKeyBuffer + kTokenBase;
+
+        for (uint32_t h = 0; h < numHeads; h++) {
+            device const float* qPtr = qVector + (h * headDim);
+            float dotQk = 0.0f;
+            for (uint32_t d = 0; d < headDim; d++) {
+                dotQk += qPtr[d] * (float)kPtr[d];
+            }
+            dotQk *= invSqrtHeadDim;
+            if (dotQk > maxScoreLocal) {
+                maxScoreLocal = dotQk;
+            }
+        }
+    }
+
+    float blockMax = simd_max(maxScoreLocal);
+    if (laneId == 0) {
+        outBlockScores[blockIdx] = blockMax;
+    }
+}
+
+/// MSL Kernel: Gated Residual (GR) 4-Stream Blending with Rank-320 Bottleneck Read Gates
+kernel void gated_residual_blend_4stream(
+    device const float* stream0 [[buffer(0)]],
+    device const float* stream1 [[buffer(1)]],
+    device const float* stream2 [[buffer(2)]],
+    device const float* stream3 [[buffer(3)]],
+    device const float* layerOutput [[buffer(4)]],
+    device const ushort* readWeightsBF16 [[buffer(5)]], // [4 streams, 320 rank, hiddenDim]
+    device const float* writeScales [[buffer(6)]],      // [4 streams]
+    device float* blendedOutput [[buffer(7)]],          // [hiddenDim]
+    constant uint32_t& hiddenDim [[buffer(8)]],
+    constant uint32_t& bottleneckRank [[buffer(9)]],   // 320
+    uint d [[thread_position_in_grid]]
+) {
+    if (d >= hiddenDim) return;
+
+    float s0 = stream0[d];
+    float s1 = stream1[d];
+    float s2 = stream2[d];
+    float s3 = stream3[d];
+    float out_d = layerOutput[d];
+
+    float gamma0 = writeScales[0];
+    float gamma1 = writeScales[1];
+    float gamma2 = writeScales[2];
+    float gamma3 = writeScales[3];
+
+    // Read gate activations via sigmoid
+    float gate0 = 1.0f / (1.0f + exp(-s0 * 0.1f));
+    float gate1 = 1.0f / (1.0f + exp(-s1 * 0.1f));
+    float gate2 = 1.0f / (1.0f + exp(-s2 * 0.1f));
+    float gate3 = 1.0f / (1.0f + exp(-s3 * 0.1f));
+
+    blendedOutput[d] = gate0 * (gamma0 * s0 + out_d) +
+                       gate1 * (gamma1 * s1 + out_d) +
+                       gate2 * (gamma2 * s2 + out_d) +
+                       gate3 * (gamma3 * s3 + out_d);
+}
+
+/// MSL Kernel: N-Gram Predictive Local Embedding (PLE) Hidden State Fusion at Layer 2
+kernel void fuse_ngram_ple_embedding(
+    device float* hiddenState [[buffer(0)]],
+    device const float* ngramEmbedding [[buffer(1)]],
+    constant float& pleScale [[buffer(2)]],
+    constant uint32_t& hiddenDim [[buffer(3)]],
+    uint d [[thread_position_in_grid]]
+) {
+    if (d >= hiddenDim) return;
+    hiddenState[d] += ngramEmbedding[d] * pleScale;
+}
+
+
 

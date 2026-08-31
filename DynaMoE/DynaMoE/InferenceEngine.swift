@@ -138,6 +138,11 @@ public struct EngineCachedLayer {
     public let expertUpBiases: [Int: TensorMetadata]
     public let expertDownBiases: [Int: TensorMetadata]
     public let intermediateDim: UInt32
+
+    // Gated Residuals & QSA Indexer (Qwen 3.8 Flash Next)
+    public let grReadWeight: TensorMetadata?
+    public let grWriteScale: TensorMetadata?
+    public let qsaMqaIndexerWeight: TensorMetadata?
 }
 
 public final class InferenceEngine {
@@ -194,6 +199,14 @@ public final class InferenceEngine {
     public var mxfp8DownSimdPipeline: MTLComputePipelineState?
     public var bf16GateUpPipeline: MTLComputePipelineState?
     public var bf16DownPipeline: MTLComputePipelineState?
+
+    // Qwen 3.8 Flash Next Specialized Pipelines
+    public var router512Pipeline: MTLComputePipelineState?
+    public var router512Q4Pipeline: MTLComputePipelineState?
+    public var gdnLinearAttnStepPipeline: MTLComputePipelineState?
+    public var qsaMqaIndexerPipeline: MTLComputePipelineState?
+    public var gatedResidualBlendPipeline: MTLComputePipelineState?
+    public var fuseNgramPlePipeline: MTLComputePipelineState?
 
     private init() {}
 
@@ -345,6 +358,26 @@ public final class InferenceEngine {
         }
         if let bf16DownFunc = defaultLib.makeFunction(name: "bf16_down_proj_accumulate") {
             bf16DownPipeline = try device.makeComputePipelineState(function: bf16DownFunc)
+        }
+
+        // Qwen 3.8 Flash Next Pipelines
+        if let r512Func = defaultLib.makeFunction(name: "moe_router_topk_512_bf16") {
+            router512Pipeline = try device.makeComputePipelineState(function: r512Func)
+        }
+        if let r512Q4Func = defaultLib.makeFunction(name: "moe_router_topk_512_q4") {
+            router512Q4Pipeline = try device.makeComputePipelineState(function: r512Q4Func)
+        }
+        if let gdnStepFunc = defaultLib.makeFunction(name: "gdn_linear_attention_recurrent_step") {
+            gdnLinearAttnStepPipeline = try device.makeComputePipelineState(function: gdnStepFunc)
+        }
+        if let qsaIdxFunc = defaultLib.makeFunction(name: "qsa_mqa_indexer_score_blocks") {
+            qsaMqaIndexerPipeline = try device.makeComputePipelineState(function: qsaIdxFunc)
+        }
+        if let grBlendFunc = defaultLib.makeFunction(name: "gated_residual_blend_4stream") {
+            gatedResidualBlendPipeline = try device.makeComputePipelineState(function: grBlendFunc)
+        }
+        if let pleFunc = defaultLib.makeFunction(name: "fuse_ngram_ple_embedding") {
+            fuseNgramPlePipeline = try device.makeComputePipelineState(function: pleFunc)
         }
     }
 
@@ -505,6 +538,10 @@ public final class InferenceEngine {
 
             let mlpType: LayerMlpType = (arch == .denseTransformer || expGW.isEmpty) ? .denseMlp : .moeExperts
 
+            let grRead = layerTensors.first(where: { $0.name.contains("gated_residual.read") || $0.name.contains("residual_gate.read") })
+            let grWrite = layerTensors.first(where: { $0.name.contains("gated_residual.write") || $0.name.contains("residual_gate.write") })
+            let qsaMqaIdx = layerTensors.first(where: { $0.name.contains("qsa.indexer") || $0.name.contains("self_attn.indexer") })
+
             cached.append(EngineCachedLayer(
                 layerIndex: UInt32(l),
                 attentionType: attnType,
@@ -579,7 +616,10 @@ public final class InferenceEngine {
                 expertGateBiases: expGB,
                 expertUpBiases: expUB,
                 expertDownBiases: expDB,
-                intermediateDim: interDim
+                intermediateDim: interDim,
+                grReadWeight: grRead,
+                grWriteScale: grWrite,
+                qsaMqaIndexerWeight: qsaMqaIdx
             ))
         }
 

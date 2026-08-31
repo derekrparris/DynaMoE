@@ -490,6 +490,16 @@ fileprivate struct FfiConverterString: FfiConverter {
 
 public protocol DynaMoeEngineProtocol : AnyObject {
     
+    /**
+     * Asynchronously advises kernel page cache for prefetching (willneed) or proactive eviction (dontneed)
+     */
+    func adviseShardRange(shardIndex: UInt32, offset: UInt64, length: UInt64, advice: String) throws 
+    
+    /**
+     * Resolves sparse N-Gram Predictive Local Embedding (PLE) row offset and length without loading table into RAM
+     */
+    func getNgramRowDescriptor(ngramHash: UInt32, hiddenDim: UInt32, bytesPerElem: UInt32) throws  -> NgramRowDescriptor?
+    
     func getSummary() throws  -> ModelSummary
     
 }
@@ -551,6 +561,32 @@ public convenience init(filePath: String)throws  {
 
     
 
+    
+    /**
+     * Asynchronously advises kernel page cache for prefetching (willneed) or proactive eviction (dontneed)
+     */
+open func adviseShardRange(shardIndex: UInt32, offset: UInt64, length: UInt64, advice: String)throws  {try rustCallWithError(FfiConverterTypeEngineError.lift) {
+    uniffi_dynamoe_core_fn_method_dynamoeengine_advise_shard_range(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(shardIndex),
+        FfiConverterUInt64.lower(offset),
+        FfiConverterUInt64.lower(length),
+        FfiConverterString.lower(advice),$0
+    )
+}
+}
+    
+    /**
+     * Resolves sparse N-Gram Predictive Local Embedding (PLE) row offset and length without loading table into RAM
+     */
+open func getNgramRowDescriptor(ngramHash: UInt32, hiddenDim: UInt32, bytesPerElem: UInt32)throws  -> NgramRowDescriptor? {
+    return try  FfiConverterOptionTypeNgramRowDescriptor.lift(try rustCallWithError(FfiConverterTypeEngineError.lift) {
+    uniffi_dynamoe_core_fn_method_dynamoeengine_get_ngram_row_descriptor(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(ngramHash),
+        FfiConverterUInt32.lower(hiddenDim),
+        FfiConverterUInt32.lower(bytesPerElem),$0
+    )
+})
+}
     
 open func getSummary()throws  -> ModelSummary {
     return try  FfiConverterTypeModelSummary.lift(try rustCallWithError(FfiConverterTypeEngineError.lift) {
@@ -941,6 +977,80 @@ public func FfiConverterTypeModelSummary_lower(_ value: ModelSummary) -> RustBuf
 }
 
 
+public struct NgramRowDescriptor {
+    public var shardIndex: UInt32
+    public var rowOffsetBytes: UInt64
+    public var rowLengthBytes: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(shardIndex: UInt32, rowOffsetBytes: UInt64, rowLengthBytes: UInt64) {
+        self.shardIndex = shardIndex
+        self.rowOffsetBytes = rowOffsetBytes
+        self.rowLengthBytes = rowLengthBytes
+    }
+}
+
+
+
+extension NgramRowDescriptor: Equatable, Hashable {
+    public static func ==(lhs: NgramRowDescriptor, rhs: NgramRowDescriptor) -> Bool {
+        if lhs.shardIndex != rhs.shardIndex {
+            return false
+        }
+        if lhs.rowOffsetBytes != rhs.rowOffsetBytes {
+            return false
+        }
+        if lhs.rowLengthBytes != rhs.rowLengthBytes {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(shardIndex)
+        hasher.combine(rowOffsetBytes)
+        hasher.combine(rowLengthBytes)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNgramRowDescriptor: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NgramRowDescriptor {
+        return
+            try NgramRowDescriptor(
+                shardIndex: FfiConverterUInt32.read(from: &buf), 
+                rowOffsetBytes: FfiConverterUInt64.read(from: &buf), 
+                rowLengthBytes: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: NgramRowDescriptor, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.shardIndex, into: &buf)
+        FfiConverterUInt64.write(value.rowOffsetBytes, into: &buf)
+        FfiConverterUInt64.write(value.rowLengthBytes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNgramRowDescriptor_lift(_ buf: RustBuffer) throws -> NgramRowDescriptor {
+    return try FfiConverterTypeNgramRowDescriptor.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNgramRowDescriptor_lower(_ value: NgramRowDescriptor) -> RustBuffer {
+    return FfiConverterTypeNgramRowDescriptor.lower(value)
+}
+
+
 public struct ShardMetadata {
     public var index: UInt32
     public var filename: String
@@ -1264,6 +1374,30 @@ fileprivate struct FfiConverterOptionUInt32: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeNgramRowDescriptor: FfiConverterRustBuffer {
+    typealias SwiftType = NgramRowDescriptor?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeNgramRowDescriptor.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeNgramRowDescriptor.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
     typealias SwiftType = [UInt32]
 
@@ -1375,6 +1509,12 @@ private var initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_dynamoe_core_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_dynamoe_core_checksum_method_dynamoeengine_advise_shard_range() != 7519) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_dynamoe_core_checksum_method_dynamoeengine_get_ngram_row_descriptor() != 11448) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_dynamoe_core_checksum_method_dynamoeengine_get_summary() != 2314) {
         return InitializationResult.apiChecksumMismatch

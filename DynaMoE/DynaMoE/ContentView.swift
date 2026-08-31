@@ -4609,9 +4609,19 @@ struct ContentView: View {
 
                                 // 3. Speculatively prefetch layer l + 1 experts based on Markov transition prediction
                                 if l + 1 < actualLayers {
-                                    let predicted = WorkingSetManager.shared.predictNextLayerExperts(currentLayer: l, currentActiveExperts: activeIds, topN: 8)
-                                    let prefetchIds = predicted.isEmpty ? [0, 1, 2, 3, 4, 5, 6, 7] : predicted
+                                    let prefetchCount = min(10, max(8, activeIds.count))
+                                    let predicted = WorkingSetManager.shared.predictNextLayerExperts(currentLayer: l, currentActiveExperts: activeIds, topN: prefetchCount)
+                                    let fallbackIds = Array(0..<prefetchCount)
+                                    let prefetchIds = predicted.isEmpty ? fallbackIds : predicted
                                     WorkingSetManager.shared.prefetchLayerExperts(layer: l + 1, expertIds: prefetchIds, shardBuffers: buffers)
+                                }
+
+                                // 4. Lookahead prefetch layer l + 2 dense backbone
+                                if l + 2 < actualLayers {
+                                    let nextNextL = l + 2
+                                    if nextNextL < cachedLayers.count {
+                                        WorkingSetManager.shared.prefetchLayerBackbone(layer: cachedLayers[nextNextL], shardBuffers: buffers)
+                                    }
                                 }
                             }
                             WorkingSetManager.shared.touchAndEvict(layer: l, activeExpertIds: activeIds, mode: budgetMode, shardBuffers: buffers, isPrefill: !computeLogits)

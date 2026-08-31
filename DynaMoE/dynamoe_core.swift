@@ -399,6 +399,54 @@ fileprivate class UniffiHandleMap<T> {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
+    typealias FfiType = UInt32
+    typealias SwiftType = UInt32
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt32 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
+    typealias FfiType = UInt64
+    typealias SwiftType = UInt64
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt64 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterDouble: FfiConverterPrimitive {
+    typealias FfiType = Double
+    typealias SwiftType = Double
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Double {
+        return try lift(readDouble(&buf))
+    }
+
+    public static func write(_ value: Double, into buf: inout [UInt8]) {
+        writeDouble(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterString: FfiConverter {
     typealias SwiftType = String
     typealias FfiType = RustBuffer
@@ -436,22 +484,1015 @@ fileprivate struct FfiConverterString: FfiConverter {
         writeBytes(&buf, value.utf8)
     }
 }
-public func helloFromDynamoe(name: String) -> String {
-    return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_dynamoe_core_fn_func_hello_from_dynamoe(
-        FfiConverterString.lower(name),$0
+
+
+
+
+public protocol DynaMoeEngineProtocol : AnyObject {
+    
+    /**
+     * Asynchronously advises kernel page cache for prefetching (willneed) or proactive eviction (dontneed)
+     */
+    func adviseShardRange(shardIndex: UInt32, offset: UInt64, length: UInt64, advice: String) throws 
+    
+    /**
+     * Resolves sparse N-Gram Predictive Local Embedding (PLE) row offset and length without loading table into RAM
+     */
+    func getNgramRowDescriptor(ngramHash: UInt32, hiddenDim: UInt32, bytesPerElem: UInt32) throws  -> NgramRowDescriptor?
+    
+    func getSummary() throws  -> ModelSummary
+    
+}
+
+open class DynaMoeEngine:
+    DynaMoeEngineProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_dynamoe_core_fn_clone_dynamoeengine(self.pointer, $0) }
+    }
+public convenience init(filePath: String)throws  {
+    let pointer =
+        try rustCallWithError(FfiConverterTypeEngineError.lift) {
+    uniffi_dynamoe_core_fn_constructor_dynamoeengine_new(
+        FfiConverterString.lower(filePath),$0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_dynamoe_core_fn_free_dynamoeengine(pointer, $0) }
+    }
+
+    
+
+    
+    /**
+     * Asynchronously advises kernel page cache for prefetching (willneed) or proactive eviction (dontneed)
+     */
+open func adviseShardRange(shardIndex: UInt32, offset: UInt64, length: UInt64, advice: String)throws  {try rustCallWithError(FfiConverterTypeEngineError.lift) {
+    uniffi_dynamoe_core_fn_method_dynamoeengine_advise_shard_range(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(shardIndex),
+        FfiConverterUInt64.lower(offset),
+        FfiConverterUInt64.lower(length),
+        FfiConverterString.lower(advice),$0
+    )
+}
+}
+    
+    /**
+     * Resolves sparse N-Gram Predictive Local Embedding (PLE) row offset and length without loading table into RAM
+     */
+open func getNgramRowDescriptor(ngramHash: UInt32, hiddenDim: UInt32, bytesPerElem: UInt32)throws  -> NgramRowDescriptor? {
+    return try  FfiConverterOptionTypeNgramRowDescriptor.lift(try rustCallWithError(FfiConverterTypeEngineError.lift) {
+    uniffi_dynamoe_core_fn_method_dynamoeengine_get_ngram_row_descriptor(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(ngramHash),
+        FfiConverterUInt32.lower(hiddenDim),
+        FfiConverterUInt32.lower(bytesPerElem),$0
     )
 })
 }
-/**
- * Memory-maps a Safetensors file and reads its metadata structure
- */
-public func inspectModelWeights(filePath: String) -> String {
-    return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_dynamoe_core_fn_func_inspect_model_weights(
-        FfiConverterString.lower(filePath),$0
+    
+open func getSummary()throws  -> ModelSummary {
+    return try  FfiConverterTypeModelSummary.lift(try rustCallWithError(FfiConverterTypeEngineError.lift) {
+    uniffi_dynamoe_core_fn_method_dynamoeengine_get_summary(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDynaMoeEngine: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = DynaMoeEngine
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> DynaMoeEngine {
+        return DynaMoeEngine(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: DynaMoeEngine) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DynaMoeEngine {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: DynaMoeEngine, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDynaMoeEngine_lift(_ pointer: UnsafeMutableRawPointer) throws -> DynaMoeEngine {
+    return try FfiConverterTypeDynaMoeEngine.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDynaMoeEngine_lower(_ value: DynaMoeEngine) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeDynaMoeEngine.lower(value)
+}
+
+
+
+
+public protocol DynaMoeTokenizerProtocol : AnyObject {
+    
+    func decode(ids: [UInt32]) throws  -> String
+    
+    func encode(text: String) throws  -> [UInt32]
+    
+}
+
+open class DynaMoeTokenizer:
+    DynaMoeTokenizerProtocol {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_dynamoe_core_fn_clone_dynamoetokenizer(self.pointer, $0) }
+    }
+public convenience init(tokenizerPath: String)throws  {
+    let pointer =
+        try rustCallWithError(FfiConverterTypeEngineError.lift) {
+    uniffi_dynamoe_core_fn_constructor_dynamoetokenizer_new(
+        FfiConverterString.lower(tokenizerPath),$0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_dynamoe_core_fn_free_dynamoetokenizer(pointer, $0) }
+    }
+
+    
+
+    
+open func decode(ids: [UInt32])throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeEngineError.lift) {
+    uniffi_dynamoe_core_fn_method_dynamoetokenizer_decode(self.uniffiClonePointer(),
+        FfiConverterSequenceUInt32.lower(ids),$0
+    )
+})
+}
+    
+open func encode(text: String)throws  -> [UInt32] {
+    return try  FfiConverterSequenceUInt32.lift(try rustCallWithError(FfiConverterTypeEngineError.lift) {
+    uniffi_dynamoe_core_fn_method_dynamoetokenizer_encode(self.uniffiClonePointer(),
+        FfiConverterString.lower(text),$0
+    )
+})
+}
+    
+
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDynaMoeTokenizer: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = DynaMoeTokenizer
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> DynaMoeTokenizer {
+        return DynaMoeTokenizer(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: DynaMoeTokenizer) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DynaMoeTokenizer {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: DynaMoeTokenizer, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDynaMoeTokenizer_lift(_ pointer: UnsafeMutableRawPointer) throws -> DynaMoeTokenizer {
+    return try FfiConverterTypeDynaMoeTokenizer.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDynaMoeTokenizer_lower(_ value: DynaMoeTokenizer) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeDynaMoeTokenizer.lower(value)
+}
+
+
+public struct LayerSummary {
+    public var layerIndex: UInt32
+    public var totalTensors: UInt32
+    public var routedExpertCount: UInt32
+    public var totalSizeMb: Double
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(layerIndex: UInt32, totalTensors: UInt32, routedExpertCount: UInt32, totalSizeMb: Double) {
+        self.layerIndex = layerIndex
+        self.totalTensors = totalTensors
+        self.routedExpertCount = routedExpertCount
+        self.totalSizeMb = totalSizeMb
+    }
+}
+
+
+
+extension LayerSummary: Equatable, Hashable {
+    public static func ==(lhs: LayerSummary, rhs: LayerSummary) -> Bool {
+        if lhs.layerIndex != rhs.layerIndex {
+            return false
+        }
+        if lhs.totalTensors != rhs.totalTensors {
+            return false
+        }
+        if lhs.routedExpertCount != rhs.routedExpertCount {
+            return false
+        }
+        if lhs.totalSizeMb != rhs.totalSizeMb {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(layerIndex)
+        hasher.combine(totalTensors)
+        hasher.combine(routedExpertCount)
+        hasher.combine(totalSizeMb)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLayerSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LayerSummary {
+        return
+            try LayerSummary(
+                layerIndex: FfiConverterUInt32.read(from: &buf), 
+                totalTensors: FfiConverterUInt32.read(from: &buf), 
+                routedExpertCount: FfiConverterUInt32.read(from: &buf), 
+                totalSizeMb: FfiConverterDouble.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LayerSummary, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.layerIndex, into: &buf)
+        FfiConverterUInt32.write(value.totalTensors, into: &buf)
+        FfiConverterUInt32.write(value.routedExpertCount, into: &buf)
+        FfiConverterDouble.write(value.totalSizeMb, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLayerSummary_lift(_ buf: RustBuffer) throws -> LayerSummary {
+    return try FfiConverterTypeLayerSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLayerSummary_lower(_ value: LayerSummary) -> RustBuffer {
+    return FfiConverterTypeLayerSummary.lower(value)
+}
+
+
+public struct ModelSummary {
+    public var sizeGb: Double
+    public var tensorCount: UInt32
+    public var layerCount: UInt32
+    public var maxExpertId: UInt32
+    public var shards: [ShardMetadata]
+    public var tensors: [TensorMetadata]
+    public var layers: [LayerSummary]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(sizeGb: Double, tensorCount: UInt32, layerCount: UInt32, maxExpertId: UInt32, shards: [ShardMetadata], tensors: [TensorMetadata], layers: [LayerSummary]) {
+        self.sizeGb = sizeGb
+        self.tensorCount = tensorCount
+        self.layerCount = layerCount
+        self.maxExpertId = maxExpertId
+        self.shards = shards
+        self.tensors = tensors
+        self.layers = layers
+    }
+}
+
+
+
+extension ModelSummary: Equatable, Hashable {
+    public static func ==(lhs: ModelSummary, rhs: ModelSummary) -> Bool {
+        if lhs.sizeGb != rhs.sizeGb {
+            return false
+        }
+        if lhs.tensorCount != rhs.tensorCount {
+            return false
+        }
+        if lhs.layerCount != rhs.layerCount {
+            return false
+        }
+        if lhs.maxExpertId != rhs.maxExpertId {
+            return false
+        }
+        if lhs.shards != rhs.shards {
+            return false
+        }
+        if lhs.tensors != rhs.tensors {
+            return false
+        }
+        if lhs.layers != rhs.layers {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(sizeGb)
+        hasher.combine(tensorCount)
+        hasher.combine(layerCount)
+        hasher.combine(maxExpertId)
+        hasher.combine(shards)
+        hasher.combine(tensors)
+        hasher.combine(layers)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeModelSummary: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ModelSummary {
+        return
+            try ModelSummary(
+                sizeGb: FfiConverterDouble.read(from: &buf), 
+                tensorCount: FfiConverterUInt32.read(from: &buf), 
+                layerCount: FfiConverterUInt32.read(from: &buf), 
+                maxExpertId: FfiConverterUInt32.read(from: &buf), 
+                shards: FfiConverterSequenceTypeShardMetadata.read(from: &buf), 
+                tensors: FfiConverterSequenceTypeTensorMetadata.read(from: &buf), 
+                layers: FfiConverterSequenceTypeLayerSummary.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ModelSummary, into buf: inout [UInt8]) {
+        FfiConverterDouble.write(value.sizeGb, into: &buf)
+        FfiConverterUInt32.write(value.tensorCount, into: &buf)
+        FfiConverterUInt32.write(value.layerCount, into: &buf)
+        FfiConverterUInt32.write(value.maxExpertId, into: &buf)
+        FfiConverterSequenceTypeShardMetadata.write(value.shards, into: &buf)
+        FfiConverterSequenceTypeTensorMetadata.write(value.tensors, into: &buf)
+        FfiConverterSequenceTypeLayerSummary.write(value.layers, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelSummary_lift(_ buf: RustBuffer) throws -> ModelSummary {
+    return try FfiConverterTypeModelSummary.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeModelSummary_lower(_ value: ModelSummary) -> RustBuffer {
+    return FfiConverterTypeModelSummary.lower(value)
+}
+
+
+public struct NgramRowDescriptor {
+    public var shardIndex: UInt32
+    public var rowOffsetBytes: UInt64
+    public var rowLengthBytes: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(shardIndex: UInt32, rowOffsetBytes: UInt64, rowLengthBytes: UInt64) {
+        self.shardIndex = shardIndex
+        self.rowOffsetBytes = rowOffsetBytes
+        self.rowLengthBytes = rowLengthBytes
+    }
+}
+
+
+
+extension NgramRowDescriptor: Equatable, Hashable {
+    public static func ==(lhs: NgramRowDescriptor, rhs: NgramRowDescriptor) -> Bool {
+        if lhs.shardIndex != rhs.shardIndex {
+            return false
+        }
+        if lhs.rowOffsetBytes != rhs.rowOffsetBytes {
+            return false
+        }
+        if lhs.rowLengthBytes != rhs.rowLengthBytes {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(shardIndex)
+        hasher.combine(rowOffsetBytes)
+        hasher.combine(rowLengthBytes)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeNgramRowDescriptor: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> NgramRowDescriptor {
+        return
+            try NgramRowDescriptor(
+                shardIndex: FfiConverterUInt32.read(from: &buf), 
+                rowOffsetBytes: FfiConverterUInt64.read(from: &buf), 
+                rowLengthBytes: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: NgramRowDescriptor, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.shardIndex, into: &buf)
+        FfiConverterUInt64.write(value.rowOffsetBytes, into: &buf)
+        FfiConverterUInt64.write(value.rowLengthBytes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNgramRowDescriptor_lift(_ buf: RustBuffer) throws -> NgramRowDescriptor {
+    return try FfiConverterTypeNgramRowDescriptor.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeNgramRowDescriptor_lower(_ value: NgramRowDescriptor) -> RustBuffer {
+    return FfiConverterTypeNgramRowDescriptor.lower(value)
+}
+
+
+public struct ShardMetadata {
+    public var index: UInt32
+    public var filename: String
+    public var baseAddress: UInt64
+    public var length: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(index: UInt32, filename: String, baseAddress: UInt64, length: UInt64) {
+        self.index = index
+        self.filename = filename
+        self.baseAddress = baseAddress
+        self.length = length
+    }
+}
+
+
+
+extension ShardMetadata: Equatable, Hashable {
+    public static func ==(lhs: ShardMetadata, rhs: ShardMetadata) -> Bool {
+        if lhs.index != rhs.index {
+            return false
+        }
+        if lhs.filename != rhs.filename {
+            return false
+        }
+        if lhs.baseAddress != rhs.baseAddress {
+            return false
+        }
+        if lhs.length != rhs.length {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(index)
+        hasher.combine(filename)
+        hasher.combine(baseAddress)
+        hasher.combine(length)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeShardMetadata: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ShardMetadata {
+        return
+            try ShardMetadata(
+                index: FfiConverterUInt32.read(from: &buf), 
+                filename: FfiConverterString.read(from: &buf), 
+                baseAddress: FfiConverterUInt64.read(from: &buf), 
+                length: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ShardMetadata, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.index, into: &buf)
+        FfiConverterString.write(value.filename, into: &buf)
+        FfiConverterUInt64.write(value.baseAddress, into: &buf)
+        FfiConverterUInt64.write(value.length, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShardMetadata_lift(_ buf: RustBuffer) throws -> ShardMetadata {
+    return try FfiConverterTypeShardMetadata.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeShardMetadata_lower(_ value: ShardMetadata) -> RustBuffer {
+    return FfiConverterTypeShardMetadata.lower(value)
+}
+
+
+public struct TensorMetadata {
+    public var name: String
+    public var shapeDisplay: String
+    public var dtype: String
+    public var sizeMb: Double
+    public var shardIndex: UInt32
+    public var offsetStart: UInt64
+    public var offsetEnd: UInt64
+    public var category: String
+    public var layerIndex: UInt32?
+    public var expertId: UInt32?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(name: String, shapeDisplay: String, dtype: String, sizeMb: Double, shardIndex: UInt32, offsetStart: UInt64, offsetEnd: UInt64, category: String, layerIndex: UInt32?, expertId: UInt32?) {
+        self.name = name
+        self.shapeDisplay = shapeDisplay
+        self.dtype = dtype
+        self.sizeMb = sizeMb
+        self.shardIndex = shardIndex
+        self.offsetStart = offsetStart
+        self.offsetEnd = offsetEnd
+        self.category = category
+        self.layerIndex = layerIndex
+        self.expertId = expertId
+    }
+}
+
+
+
+extension TensorMetadata: Equatable, Hashable {
+    public static func ==(lhs: TensorMetadata, rhs: TensorMetadata) -> Bool {
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.shapeDisplay != rhs.shapeDisplay {
+            return false
+        }
+        if lhs.dtype != rhs.dtype {
+            return false
+        }
+        if lhs.sizeMb != rhs.sizeMb {
+            return false
+        }
+        if lhs.shardIndex != rhs.shardIndex {
+            return false
+        }
+        if lhs.offsetStart != rhs.offsetStart {
+            return false
+        }
+        if lhs.offsetEnd != rhs.offsetEnd {
+            return false
+        }
+        if lhs.category != rhs.category {
+            return false
+        }
+        if lhs.layerIndex != rhs.layerIndex {
+            return false
+        }
+        if lhs.expertId != rhs.expertId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(name)
+        hasher.combine(shapeDisplay)
+        hasher.combine(dtype)
+        hasher.combine(sizeMb)
+        hasher.combine(shardIndex)
+        hasher.combine(offsetStart)
+        hasher.combine(offsetEnd)
+        hasher.combine(category)
+        hasher.combine(layerIndex)
+        hasher.combine(expertId)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTensorMetadata: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TensorMetadata {
+        return
+            try TensorMetadata(
+                name: FfiConverterString.read(from: &buf), 
+                shapeDisplay: FfiConverterString.read(from: &buf), 
+                dtype: FfiConverterString.read(from: &buf), 
+                sizeMb: FfiConverterDouble.read(from: &buf), 
+                shardIndex: FfiConverterUInt32.read(from: &buf), 
+                offsetStart: FfiConverterUInt64.read(from: &buf), 
+                offsetEnd: FfiConverterUInt64.read(from: &buf), 
+                category: FfiConverterString.read(from: &buf), 
+                layerIndex: FfiConverterOptionUInt32.read(from: &buf), 
+                expertId: FfiConverterOptionUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TensorMetadata, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.shapeDisplay, into: &buf)
+        FfiConverterString.write(value.dtype, into: &buf)
+        FfiConverterDouble.write(value.sizeMb, into: &buf)
+        FfiConverterUInt32.write(value.shardIndex, into: &buf)
+        FfiConverterUInt64.write(value.offsetStart, into: &buf)
+        FfiConverterUInt64.write(value.offsetEnd, into: &buf)
+        FfiConverterString.write(value.category, into: &buf)
+        FfiConverterOptionUInt32.write(value.layerIndex, into: &buf)
+        FfiConverterOptionUInt32.write(value.expertId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTensorMetadata_lift(_ buf: RustBuffer) throws -> TensorMetadata {
+    return try FfiConverterTypeTensorMetadata.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTensorMetadata_lower(_ value: TensorMetadata) -> RustBuffer {
+    return FfiConverterTypeTensorMetadata.lower(value)
+}
+
+
+public enum EngineError {
+
+    
+    
+    case FileError(details: String
+    )
+    case MmapError(details: String
+    )
+    case ParseError(details: String
+    )
+    case TokenizerError(details: String
+    )
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEngineError: FfiConverterRustBuffer {
+    typealias SwiftType = EngineError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EngineError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        
+
+        
+        case 1: return .FileError(
+            details: try FfiConverterString.read(from: &buf)
+            )
+        case 2: return .MmapError(
+            details: try FfiConverterString.read(from: &buf)
+            )
+        case 3: return .ParseError(
+            details: try FfiConverterString.read(from: &buf)
+            )
+        case 4: return .TokenizerError(
+            details: try FfiConverterString.read(from: &buf)
+            )
+
+         default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: EngineError, into buf: inout [UInt8]) {
+        switch value {
+
+        
+
+        
+        
+        case let .FileError(details):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(details, into: &buf)
+            
+        
+        case let .MmapError(details):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(details, into: &buf)
+            
+        
+        case let .ParseError(details):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(details, into: &buf)
+            
+        
+        case let .TokenizerError(details):
+            writeInt(&buf, Int32(4))
+            FfiConverterString.write(details, into: &buf)
+            
+        }
+    }
+}
+
+
+extension EngineError: Equatable, Hashable {}
+
+extension EngineError: Foundation.LocalizedError {
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionUInt32: FfiConverterRustBuffer {
+    typealias SwiftType = UInt32?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterUInt32.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterUInt32.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeNgramRowDescriptor: FfiConverterRustBuffer {
+    typealias SwiftType = NgramRowDescriptor?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeNgramRowDescriptor.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeNgramRowDescriptor.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
+    typealias SwiftType = [UInt32]
+
+    public static func write(_ value: [UInt32], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterUInt32.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [UInt32] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [UInt32]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterUInt32.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeLayerSummary: FfiConverterRustBuffer {
+    typealias SwiftType = [LayerSummary]
+
+    public static func write(_ value: [LayerSummary], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeLayerSummary.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [LayerSummary] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [LayerSummary]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeLayerSummary.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeShardMetadata: FfiConverterRustBuffer {
+    typealias SwiftType = [ShardMetadata]
+
+    public static func write(_ value: [ShardMetadata], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeShardMetadata.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ShardMetadata] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ShardMetadata]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeShardMetadata.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeTensorMetadata: FfiConverterRustBuffer {
+    typealias SwiftType = [TensorMetadata]
+
+    public static func write(_ value: [TensorMetadata], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeTensorMetadata.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [TensorMetadata] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [TensorMetadata]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeTensorMetadata.read(from: &buf))
+        }
+        return seq
+    }
 }
 
 private enum InitializationResult {
@@ -469,10 +1510,25 @@ private var initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_dynamoe_core_checksum_func_hello_from_dynamoe() != 37281) {
+    if (uniffi_dynamoe_core_checksum_method_dynamoeengine_advise_shard_range() != 7519) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_dynamoe_core_checksum_func_inspect_model_weights() != 29074) {
+    if (uniffi_dynamoe_core_checksum_method_dynamoeengine_get_ngram_row_descriptor() != 11448) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_dynamoe_core_checksum_method_dynamoeengine_get_summary() != 2314) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_dynamoe_core_checksum_method_dynamoetokenizer_decode() != 8328) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_dynamoe_core_checksum_method_dynamoetokenizer_encode() != 14674) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_dynamoe_core_checksum_constructor_dynamoeengine_new() != 45198) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_dynamoe_core_checksum_constructor_dynamoetokenizer_new() != 5615) {
         return InitializationResult.apiChecksumMismatch
     }
 
