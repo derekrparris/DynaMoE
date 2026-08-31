@@ -162,7 +162,7 @@ struct ChatDetailView: View {
                                         isGenerating: isGenerating && message.id == session.messages.last?.id,
                                         isStreamingOffDisk: isStreamingOffDisk,
                                         isExpanded: Binding(
-                                            get: { isReasoningExpanded[message.id] ?? true },
+                                            get: { isReasoningExpanded[message.id] ?? false },
                                             set: { isReasoningExpanded[message.id] = $0 }
                                         )
                                     )
