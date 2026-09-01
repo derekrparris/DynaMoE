@@ -250,8 +250,8 @@ fn parse_layer_and_expert(name: &str) -> (String, Option<u32>, Option<u32>) {
         "N-Gram Predictive Local Embedding".to_string()
     } else if name.contains("lm_head") {
         "LM Head".to_string()
-    } else if name.contains("gated_residual") || name.contains("residual_gate") {
-        "Gated Residual Stream".to_string()
+    } else if name.contains("gated_residual") || name.contains("residual_gate") || name.contains("hyper_connection") {
+        "Hyper-Connection Residual".to_string()
     } else if name.contains("linear_attn") {
         "Linear Attention (GDN)".to_string()
     } else if name.contains("self_attn") || name.contains("attention") || name.contains("qsa") || name.contains("sparse_attn") {
@@ -1790,8 +1790,8 @@ mod tests {
         assert_eq!(cat_qsa, "Self-Attention (QSA)");
         assert_eq!(layer_qsa, Some(3));
 
-        let (cat_gr, layer_gr, _) = parse_layer_and_expert("model.layers.0.gated_residual.read_proj.weight");
-        assert_eq!(cat_gr, "Gated Residual Stream");
+        let (cat_gr, layer_gr, _) = parse_layer_and_expert("model.layers.0.attn_hyper_connection.input_mix_weight_down.weight");
+        assert_eq!(cat_gr, "Hyper-Connection Residual");
         assert_eq!(layer_gr, Some(0));
 
         let (cat_exp511, layer_exp, exp_id) = parse_layer_and_expert("model.layers.12.mlp.experts.511.down_proj.weight");

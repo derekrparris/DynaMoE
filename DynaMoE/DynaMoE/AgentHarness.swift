@@ -1298,7 +1298,7 @@ public final class AgentHarness {
                 process.standardError = stderrPipe
 
                 var isDone = false
-                let lock = NSLock()
+                let lock = NSRecursiveLock()
 
                 do {
                     try process.run()

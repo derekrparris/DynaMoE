@@ -588,12 +588,14 @@ kernel void moe_shared_gate_q8(
     outSharedWeight[tokenIdx] = 1.0f / (1.0f + exp(-sum));
 }
 
-/// MSL Kernel: Zeros a float buffer in GPU memory
+/// MSL Kernel: Zeros a float buffer in GPU memory (supports 1D and 2D grids)
 kernel void clear_vector_f32(
     device float* buffer [[buffer(0)]],
-    uint id [[thread_position_in_grid]]
+    uint2 id [[thread_position_in_grid]],
+    uint2 grid_dim [[threads_per_grid]]
 ) {
-    buffer[id] = 0.0f;
+    uint64_t idx = (uint64_t)id.y * (uint64_t)grid_dim.x + (uint64_t)id.x;
+    buffer[idx] = 0.0f;
 }
 
 /// MSL Kernel: Fused Per-Channel FP8 (E4M3FN with BF16 row scale) SwiGLU Gate & Up Projections
@@ -698,6 +700,7 @@ kernel void fp8_down_proj_accumulate(
 }
 
 /// MSL Kernel: General Per-Channel FP8 GEMV (out = (W_fp8 * in) * scale_bf16)
+/// Supports 2D batched grid (outDim, batchSize, 1)
 kernel void fp8_gemv(
     device const uchar* rawWeightBuffer [[buffer(0)]],
     device const float* inputVector [[buffer(1)]],
@@ -707,12 +710,15 @@ kernel void fp8_gemv(
     constant uint64_t& scaleOffset [[buffer(5)]],
     constant uint32_t& inDim [[buffer(6)]],
     constant uint32_t& outDim [[buffer(7)]],
-    uint row [[thread_position_in_grid]]
+    uint2 pos [[thread_position_in_grid]]
 ) {
+    uint row = pos.x;
+    uint tokenIdx = pos.y;
     if (row >= outDim) return;
 
     float rowScale = bf16_to_fp32(rawScaleBuffer[(scaleOffset / 2) + row]);
     device const uchar* rPtr = rawWeightBuffer + weightOffset + ((uint64_t)row * inDim);
+    device const float* inPtr = inputVector + ((uint64_t)tokenIdx * inDim);
 
     float dot0 = 0.0f;
     float dot1 = 0.0f;
@@ -720,12 +726,146 @@ kernel void fp8_gemv(
     for (uint32_t i = 0; i < num4; i++) {
         uint32_t base = i * 4;
         uchar4 w4 = *(device const uchar4*)(rPtr + base);
-        float4 in4 = *(device const float4*)(inputVector + base);
+        float4 in4 = *(device const float4*)(inPtr + base);
         dot0 += (unpack_e4m3(w4.x) * in4.x) + (unpack_e4m3(w4.y) * in4.y);
         dot1 += (unpack_e4m3(w4.z) * in4.z) + (unpack_e4m3(w4.w) * in4.w);
     }
 
-    outputVector[row] = (dot0 + dot1) * rowScale;
+    outputVector[((uint64_t)tokenIdx * outDim) + row] = (dot0 + dot1) * rowScale;
+}
+
+/// MSL Kernel: 32-Thread SIMDgroup Cooperative FP8 GEMV (out = (W_fp8 * in) * scale_bf16)
+/// Supports 2D batched grid (outDim, batchSize, 1) with threadgroup (32, 1, 1)
+kernel void fp8_gemv_simd(
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const float* inputVector [[buffer(1)]],
+    device float* outputVector [[buffer(2)]],
+    device const ushort* rawScaleBuffer [[buffer(3)]],
+    constant uint64_t& weightOffset [[buffer(4)]],
+    constant uint64_t& scaleOffset [[buffer(5)]],
+    constant uint32_t& inDim [[buffer(6)]],
+    constant uint32_t& outDim [[buffer(7)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint row = tgPos.x;
+    uint tokenIdx = tgPos.y;
+    if (row >= outDim) return;
+
+    float rowScale = bf16_to_fp32(rawScaleBuffer[(scaleOffset / 2) + row]);
+    device const uchar* rPtr = rawWeightBuffer + weightOffset + ((uint64_t)row * inDim);
+    device const float* inPtr = inputVector + ((uint64_t)tokenIdx * inDim);
+
+    float threadDot = 0.0f;
+    uint32_t num8 = inDim / 8;
+
+    for (uint32_t c = laneId; c < num8; c += 32) {
+        uint32_t base = c * 8;
+        uchar4 w4_0 = *(device const uchar4*)(rPtr + base);
+        uchar4 w4_1 = *(device const uchar4*)(rPtr + base + 4);
+        float4 in4_0 = *(device const float4*)(inPtr + base);
+        float4 in4_1 = *(device const float4*)(inPtr + base + 4);
+
+        threadDot += (unpack_e4m3(w4_0.x) * in4_0.x) + (unpack_e4m3(w4_0.y) * in4_0.y) +
+                     (unpack_e4m3(w4_1.x) * in4_1.x) + (unpack_e4m3(w4_1.y) * in4_1.y) +
+                     (unpack_e4m3(w4_0.z) * in4_0.z) + (unpack_e4m3(w4_0.w) * in4_0.w) +
+                     (unpack_e4m3(w4_1.z) * in4_1.z) + (unpack_e4m3(w4_1.w) * in4_1.w);
+    }
+
+    float totalDot = simd_sum(threadDot);
+    if (laneId == 0) {
+        outputVector[((uint64_t)tokenIdx * outDim) + row] = totalDot * rowScale;
+    }
+}
+
+/// MSL Kernel: 2D 128x128 Block-Scaled FP8 GEMV (out = (W_fp8 * in) * scale_bf16)
+/// Supports 2D batched grid (outDim, batchSize, 1)
+kernel void fp8_block_gemv(
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const float* inputVector [[buffer(1)]],
+    device float* outputVector [[buffer(2)]],
+    device const ushort* rawScaleBuffer [[buffer(3)]],
+    constant uint64_t& weightOffset [[buffer(4)]],
+    constant uint64_t& scaleOffset [[buffer(5)]],
+    constant uint32_t& inDim [[buffer(6)]],
+    constant uint32_t& outDim [[buffer(7)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint row = pos.x;
+    uint tokenIdx = pos.y;
+    if (row >= outDim) return;
+
+    uint32_t numBlocksK = inDim / 128;
+    uint32_t blockR = row / 128;
+    uint32_t scaleRowBase = blockR * numBlocksK;
+
+    device const uchar* rPtr = rawWeightBuffer + weightOffset + ((uint64_t)row * inDim);
+    device const float* inPtr = inputVector + ((uint64_t)tokenIdx * inDim);
+
+    float total = 0.0f;
+    for (uint32_t bk = 0; bk < numBlocksK; bk++) {
+        float bScale = bf16_to_fp32(rawScaleBuffer[(scaleOffset / 2) + scaleRowBase + bk]);
+        float blockDot = 0.0f;
+        uint32_t baseK = bk * 128;
+        for (uint32_t i = 0; i < 32; i++) {
+            uint32_t base = baseK + (i * 4);
+            uchar4 w4 = *(device const uchar4*)(rPtr + base);
+            float4 in4 = *(device const float4*)(inPtr + base);
+            blockDot += (unpack_e4m3(w4.x) * in4.x) + (unpack_e4m3(w4.y) * in4.y) +
+                        (unpack_e4m3(w4.z) * in4.z) + (unpack_e4m3(w4.w) * in4.w);
+        }
+        total += blockDot * bScale;
+    }
+
+    outputVector[((uint64_t)tokenIdx * outDim) + row] = total;
+}
+
+/// MSL Kernel: 32-Thread SIMDgroup Cooperative 2D 128x128 Block-Scaled FP8 GEMV
+kernel void fp8_block_gemv_simd(
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const float* inputVector [[buffer(1)]],
+    device float* outputVector [[buffer(2)]],
+    device const ushort* rawScaleBuffer [[buffer(3)]],
+    constant uint64_t& weightOffset [[buffer(4)]],
+    constant uint64_t& scaleOffset [[buffer(5)]],
+    constant uint32_t& inDim [[buffer(6)]],
+    constant uint32_t& outDim [[buffer(7)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint row = tgPos.x;
+    uint tokenIdx = tgPos.y;
+    if (row >= outDim) return;
+
+    uint32_t numBlocksK = inDim / 128;
+    uint32_t blockR = row / 128;
+    uint32_t scaleRowBase = blockR * numBlocksK;
+
+    device const uchar* rPtr = rawWeightBuffer + weightOffset + ((uint64_t)row * inDim);
+    device const float* inPtr = inputVector + ((uint64_t)tokenIdx * inDim);
+
+    float threadDot = 0.0f;
+    for (uint32_t baseD = laneId * 8; baseD < inDim; baseD += 32 * 8) {
+        uint32_t bk = baseD / 128;
+        float bScale = bf16_to_fp32(rawScaleBuffer[(scaleOffset / 2) + scaleRowBase + bk]);
+
+        uchar4 w4_0 = *(device const uchar4*)(rPtr + baseD);
+        uchar4 w4_1 = *(device const uchar4*)(rPtr + baseD + 4);
+        float4 in4_0 = *(device const float4*)(inPtr + baseD);
+        float4 in4_1 = *(device const float4*)(inPtr + baseD + 4);
+
+        float chunk = (unpack_e4m3(w4_0.x) * in4_0.x) + (unpack_e4m3(w4_0.y) * in4_0.y) +
+                      (unpack_e4m3(w4_1.x) * in4_1.x) + (unpack_e4m3(w4_1.y) * in4_1.y) +
+                      (unpack_e4m3(w4_0.z) * in4_0.z) + (unpack_e4m3(w4_0.w) * in4_0.w) +
+                      (unpack_e4m3(w4_1.z) * in4_1.z) + (unpack_e4m3(w4_1.w) * in4_1.w);
+
+        threadDot += chunk * bScale;
+    }
+
+    float totalDot = simd_sum(threadDot);
+    if (laneId == 0) {
+        outputVector[((uint64_t)tokenIdx * outDim) + row] = totalDot;
+    }
 }
 
 /// MSL Kernel: Fused BF16 SwiGLU Gate & Up Projections
@@ -822,7 +962,7 @@ inline float threadgroup_reduce_sum(float localSum, threadgroup float* sharedWar
 }
 
 /// MSL Kernel: RMSNorm with BF16 Scale Factors (128-bit Vectorized & SIMD Warp Reduced)
-/// y_d = (x_d / sqrt( (1/D) * sum(x^2) + eps )) * gamma_d
+/// Supports batched grid (P, 1, 1) threadgroups
 kernel void rmsnorm_bf16(
     device const float* inVector [[buffer(0)]],
     device const uchar* gammaBuffer [[buffer(1)]],
@@ -832,10 +972,12 @@ kernel void rmsnorm_bf16(
     constant float& eps [[buffer(5)]],
     threadgroup float* sharedWarpSums [[threadgroup(0)]],
     uint tid [[thread_position_in_threadgroup]],
-    uint tgSize [[threads_per_threadgroup]]
+    uint tgSize [[threads_per_threadgroup]],
+    uint tgIdx [[threadgroup_position_in_grid]]
 ) {
     uint dimVec4 = dim / 4;
-    device const float4* inVec4 = (device const float4*)inVector;
+    device const float4* inVec4 = (device const float4*)(inVector + ((uint64_t)tgIdx * dim));
+    device const float* inVec = inVector + ((uint64_t)tgIdx * dim);
     float localSum = 0.0f;
 
     for (uint i = tid; i < dimVec4; i += tgSize) {
@@ -843,7 +985,7 @@ kernel void rmsnorm_bf16(
         localSum += dot(v, v);
     }
     for (uint i = dimVec4 * 4 + tid; i < dim; i += tgSize) {
-        float v = inVector[i];
+        float v = inVec[i];
         localSum += v * v;
     }
 
@@ -851,7 +993,9 @@ kernel void rmsnorm_bf16(
     float meanSquare = totalSum / (float)dim;
     float invRms = rsqrt(meanSquare + eps);
 
-    device float4* outVec4 = (device float4*)outVector;
+    device float4* outVec4 = (device float4*)(outVector + ((uint64_t)tgIdx * dim));
+    device float* outVec = outVector + ((uint64_t)tgIdx * dim);
+
     for (uint i = tid; i < dimVec4; i += tgSize) {
         float4 v = inVec4[i];
         uint64_t byteOff = gammaOffset + ((uint64_t)i * 4 * 2);
@@ -864,7 +1008,7 @@ kernel void rmsnorm_bf16(
     }
     for (uint i = dimVec4 * 4 + tid; i < dim; i += tgSize) {
         float gamma = read_bf16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)i * 2));
-        outVector[i] = inVector[i] * invRms * gamma;
+        outVec[i] = inVec[i] * invRms * gamma;
     }
 }
 
@@ -878,10 +1022,12 @@ kernel void rmsnorm_f16(
     constant float& eps [[buffer(5)]],
     threadgroup float* sharedWarpSums [[threadgroup(0)]],
     uint tid [[thread_position_in_threadgroup]],
-    uint tgSize [[threads_per_threadgroup]]
+    uint tgSize [[threads_per_threadgroup]],
+    uint tgIdx [[threadgroup_position_in_grid]]
 ) {
     uint dimVec4 = dim / 4;
-    device const float4* inVec4 = (device const float4*)inVector;
+    device const float4* inVec4 = (device const float4*)(inVector + ((uint64_t)tgIdx * dim));
+    device const float* inVec = inVector + ((uint64_t)tgIdx * dim);
     float localSum = 0.0f;
 
     for (uint i = tid; i < dimVec4; i += tgSize) {
@@ -889,7 +1035,7 @@ kernel void rmsnorm_f16(
         localSum += dot(v, v);
     }
     for (uint i = dimVec4 * 4 + tid; i < dim; i += tgSize) {
-        float v = inVector[i];
+        float v = inVec[i];
         localSum += v * v;
     }
 
@@ -897,7 +1043,9 @@ kernel void rmsnorm_f16(
     float meanSquare = totalSum / (float)dim;
     float invRms = rsqrt(meanSquare + eps);
 
-    device float4* outVec4 = (device float4*)outVector;
+    device float4* outVec4 = (device float4*)(outVector + ((uint64_t)tgIdx * dim));
+    device float* outVec = outVector + ((uint64_t)tgIdx * dim);
+
     for (uint i = tid; i < dimVec4; i += tgSize) {
         float4 v = inVec4[i];
         uint64_t byteOff = gammaOffset + ((uint64_t)i * 4 * 2);
@@ -910,7 +1058,7 @@ kernel void rmsnorm_f16(
     }
     for (uint i = dimVec4 * 4 + tid; i < dim; i += tgSize) {
         float gamma = read_f16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)i * 2));
-        outVector[i] = inVector[i] * invRms * gamma;
+        outVec[i] = inVec[i] * invRms * gamma;
     }
 }
 
@@ -924,10 +1072,12 @@ kernel void rmsnorm_offset_bf16(
     constant float& eps [[buffer(5)]],
     threadgroup float* sharedWarpSums [[threadgroup(0)]],
     uint tid [[thread_position_in_threadgroup]],
-    uint tgSize [[threads_per_threadgroup]]
+    uint tgSize [[threads_per_threadgroup]],
+    uint tgIdx [[threadgroup_position_in_grid]]
 ) {
     uint dimVec4 = dim / 4;
-    device const float4* inVec4 = (device const float4*)inVector;
+    device const float4* inVec4 = (device const float4*)(inVector + ((uint64_t)tgIdx * dim));
+    device const float* inVec = inVector + ((uint64_t)tgIdx * dim);
     float localSum = 0.0f;
 
     for (uint i = tid; i < dimVec4; i += tgSize) {
@@ -935,7 +1085,7 @@ kernel void rmsnorm_offset_bf16(
         localSum += dot(v, v);
     }
     for (uint i = dimVec4 * 4 + tid; i < dim; i += tgSize) {
-        float v = inVector[i];
+        float v = inVec[i];
         localSum += v * v;
     }
 
@@ -943,7 +1093,9 @@ kernel void rmsnorm_offset_bf16(
     float meanSquare = totalSum / (float)dim;
     float invRms = rsqrt(meanSquare + eps);
 
-    device float4* outVec4 = (device float4*)outVector;
+    device float4* outVec4 = (device float4*)(outVector + ((uint64_t)tgIdx * dim));
+    device float* outVec = outVector + ((uint64_t)tgIdx * dim);
+
     for (uint i = tid; i < dimVec4; i += tgSize) {
         float4 v = inVec4[i];
         uint64_t byteOff = gammaOffset + ((uint64_t)i * 4 * 2);
@@ -956,7 +1108,7 @@ kernel void rmsnorm_offset_bf16(
     }
     for (uint i = dimVec4 * 4 + tid; i < dim; i += tgSize) {
         float gamma = read_bf16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)i * 2));
-        outVector[i] = inVector[i] * invRms * (1.0f + gamma);
+        outVec[i] = inVec[i] * invRms * (1.0f + gamma);
     }
 }
 
@@ -970,10 +1122,12 @@ kernel void rmsnorm_offset_f16(
     constant float& eps [[buffer(5)]],
     threadgroup float* sharedWarpSums [[threadgroup(0)]],
     uint tid [[thread_position_in_threadgroup]],
-    uint tgSize [[threads_per_threadgroup]]
+    uint tgSize [[threads_per_threadgroup]],
+    uint tgIdx [[threadgroup_position_in_grid]]
 ) {
     uint dimVec4 = dim / 4;
-    device const float4* inVec4 = (device const float4*)inVector;
+    device const float4* inVec4 = (device const float4*)(inVector + ((uint64_t)tgIdx * dim));
+    device const float* inVec = inVector + ((uint64_t)tgIdx * dim);
     float localSum = 0.0f;
 
     for (uint i = tid; i < dimVec4; i += tgSize) {
@@ -981,7 +1135,7 @@ kernel void rmsnorm_offset_f16(
         localSum += dot(v, v);
     }
     for (uint i = dimVec4 * 4 + tid; i < dim; i += tgSize) {
-        float v = inVector[i];
+        float v = inVec[i];
         localSum += v * v;
     }
 
@@ -989,7 +1143,9 @@ kernel void rmsnorm_offset_f16(
     float meanSquare = totalSum / (float)dim;
     float invRms = rsqrt(meanSquare + eps);
 
-    device float4* outVec4 = (device float4*)outVector;
+    device float4* outVec4 = (device float4*)(outVector + ((uint64_t)tgIdx * dim));
+    device float* outVec = outVector + ((uint64_t)tgIdx * dim);
+
     for (uint i = tid; i < dimVec4; i += tgSize) {
         float4 v = inVec4[i];
         uint64_t byteOff = gammaOffset + ((uint64_t)i * 4 * 2);
@@ -1002,24 +1158,27 @@ kernel void rmsnorm_offset_f16(
     }
     for (uint i = dimVec4 * 4 + tid; i < dim; i += tgSize) {
         float gamma = read_f16_unaligned(gammaBuffer + gammaOffset + ((uint64_t)i * 2));
-        outVector[i] = inVector[i] * invRms * (1.0f + gamma);
+        outVec[i] = inVec[i] * invRms * (1.0f + gamma);
     }
 }
 
 /// MSL Kernel: Parallel Element-Wise Vector Addition (Residual Connection)
-/// out[d] = a[d] + b[d]
+/// Supports 2D batched grid (dim, batchSize, 1)
 kernel void vector_add_f32(
     device const float* aVector [[buffer(0)]],
     device const float* bVector [[buffer(1)]],
     device float* outVector [[buffer(2)]],
     constant uint32_t& dim [[buffer(3)]],
-    uint d [[thread_position_in_grid]]
+    uint2 pos [[thread_position_in_grid]]
 ) {
+    uint d = pos.x;
+    uint tokenIdx = pos.y;
     if (d >= dim) return;
-    outVector[d] = aVector[d] + bVector[d];
+    outVector[((uint64_t)tokenIdx * dim) + d] = aVector[((uint64_t)tokenIdx * dim) + d] + bVector[((uint64_t)tokenIdx * dim) + d];
 }
 
 /// MSL Kernel: General MXFP8 Matrix-Vector GEMV (out = W * x)
+/// Supports 2D batched grid (outDim, batchSize, 1)
 kernel void mxfp8_gemv(
     device const uchar* rawWeightBuffer [[buffer(0)]],
     device const float* inputVector [[buffer(1)]],
@@ -1029,16 +1188,18 @@ kernel void mxfp8_gemv(
     constant uint64_t& scaleOffset [[buffer(5)]],
     constant uint32_t& inDim [[buffer(6)]],
     constant uint32_t& outDim [[buffer(7)]],
-    uint row [[thread_position_in_grid]]
+    uint2 pos [[thread_position_in_grid]]
 ) {
+    uint row = pos.x;
+    uint tokenIdx = pos.y;
     if (row >= outDim) return;
 
     uint32_t blocksPerRow = inDim / 32;
     uint64_t rowWeightStart = weightOffset + ((uint64_t)row * inDim);
     uint64_t rowScaleStart  = scaleOffset  + ((uint64_t)row * blocksPerRow);
+    device const float* inPtr = inputVector + ((uint64_t)tokenIdx * inDim);
 
-    float dot = 0.0f;
-
+    float sum = 0.0f;
     for (uint32_t b = 0; b < blocksPerRow; b++) {
         uint8_t scaleByte = rawScaleBuffer[rowScaleStart + b];
         int scaleExp = (int)scaleByte - 127;
@@ -1050,11 +1211,11 @@ kernel void mxfp8_gemv(
         for (uint32_t i = 0; i < 32; i++) {
             uint8_t byteVal = rawWeightBuffer[blkStart + i];
             float w = unpack_e4m3(byteVal) * scale;
-            dot += w * inputVector[inStart + i];
+            sum += w * inPtr[inStart + i];
         }
     }
 
-    outputVector[row] = dot;
+    outputVector[((uint64_t)tokenIdx * outDim) + row] = sum;
 }
 
 /// MSL Kernel: Fused MXFP8 SwiGLU Gate & Up Projections
@@ -1171,7 +1332,7 @@ kernel void bf16_gemv(
     outputVector[row] = dot0 + dot1;
 }
 
-/// MSL Kernel: Per-Head RMSNorm for Attention Heads (32-Thread SIMDgroup Cooperative)
+/// MSL Kernel: Per-Head RMSNorm for Attention Heads (32-Thread SIMDgroup Cooperative, 2D Grid Aware)
 kernel void per_head_rmsnorm_bf16(
     device float* qkVector [[buffer(0)]],
     device const uchar* gammaBuffer [[buffer(1)]],
@@ -1180,12 +1341,14 @@ kernel void per_head_rmsnorm_bf16(
     constant uint32_t& headDim [[buffer(4)]],
     constant uint32_t& headStride [[buffer(5)]],
     constant float& eps [[buffer(6)]],
-    uint headIdx [[threadgroup_position_in_grid]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
     uint laneId [[thread_index_in_simdgroup]]
 ) {
+    uint headIdx = tgPos.x;
+    uint tokenIdx = tgPos.y;
     if (headIdx >= numHeads) return;
 
-    uint32_t offset = headIdx * headStride;
+    uint64_t offset = (uint64_t)tokenIdx * ((uint64_t)numHeads * headStride) + ((uint64_t)headIdx * headStride);
     uint32_t headDimVec4 = headDim / 4;
     device float4* headVec4 = (device float4*)(qkVector + offset);
     float localSum = 0.0f;
@@ -1218,7 +1381,7 @@ kernel void per_head_rmsnorm_bf16(
     }
 }
 
-/// MSL Kernel: Per-Head RMSNorm with F16 Scale Factors (32-Thread SIMDgroup Cooperative)
+/// MSL Kernel: Per-Head RMSNorm with F16 Scale Factors (32-Thread SIMDgroup Cooperative, 2D Grid Aware)
 kernel void per_head_rmsnorm_f16(
     device float* qkVector [[buffer(0)]],
     device const uchar* gammaBuffer [[buffer(1)]],
@@ -1227,12 +1390,14 @@ kernel void per_head_rmsnorm_f16(
     constant uint32_t& headDim [[buffer(4)]],
     constant uint32_t& headStride [[buffer(5)]],
     constant float& eps [[buffer(6)]],
-    uint headIdx [[threadgroup_position_in_grid]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
     uint laneId [[thread_index_in_simdgroup]]
 ) {
+    uint headIdx = tgPos.x;
+    uint tokenIdx = tgPos.y;
     if (headIdx >= numHeads) return;
 
-    uint32_t offset = headIdx * headStride;
+    uint64_t offset = (uint64_t)tokenIdx * ((uint64_t)numHeads * headStride) + ((uint64_t)headIdx * headStride);
     uint32_t headDimVec4 = headDim / 4;
     device float4* headVec4 = (device float4*)(qkVector + offset);
     float localSum = 0.0f;
@@ -1265,7 +1430,7 @@ kernel void per_head_rmsnorm_f16(
     }
 }
 
-/// MSL Kernel: Per-Head RMSNorm with Offset (1.0 + gamma) for Attention Heads (32-Thread SIMDgroup Cooperative)
+/// MSL Kernel: Per-Head RMSNorm with Offset (1.0 + gamma) for Attention Heads (32-Thread SIMDgroup Cooperative, 2D Grid Aware)
 kernel void per_head_rmsnorm_offset_bf16(
     device float* qkVector [[buffer(0)]],
     device const uchar* gammaBuffer [[buffer(1)]],
@@ -1274,12 +1439,14 @@ kernel void per_head_rmsnorm_offset_bf16(
     constant uint32_t& headDim [[buffer(4)]],
     constant uint32_t& headStride [[buffer(5)]],
     constant float& eps [[buffer(6)]],
-    uint headIdx [[threadgroup_position_in_grid]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
     uint laneId [[thread_index_in_simdgroup]]
 ) {
+    uint headIdx = tgPos.x;
+    uint tokenIdx = tgPos.y;
     if (headIdx >= numHeads) return;
 
-    uint32_t offset = headIdx * headStride;
+    uint64_t offset = (uint64_t)tokenIdx * ((uint64_t)numHeads * headStride) + ((uint64_t)headIdx * headStride);
     uint32_t headDimVec4 = headDim / 4;
     device float4* headVec4 = (device float4*)(qkVector + offset);
     float localSum = 0.0f;
@@ -1312,7 +1479,7 @@ kernel void per_head_rmsnorm_offset_bf16(
     }
 }
 
-/// MSL Kernel: Per-Head RMSNorm with F16 Scale Factors (1.0 + gamma offset, 32-Thread SIMDgroup Cooperative)
+/// MSL Kernel: Per-Head RMSNorm with F16 Scale Factors (1.0 + gamma offset, 32-Thread SIMDgroup Cooperative, 2D Grid Aware)
 kernel void per_head_rmsnorm_offset_f16(
     device float* qkVector [[buffer(0)]],
     device const uchar* gammaBuffer [[buffer(1)]],
@@ -1321,12 +1488,14 @@ kernel void per_head_rmsnorm_offset_f16(
     constant uint32_t& headDim [[buffer(4)]],
     constant uint32_t& headStride [[buffer(5)]],
     constant float& eps [[buffer(6)]],
-    uint headIdx [[threadgroup_position_in_grid]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
     uint laneId [[thread_index_in_simdgroup]]
 ) {
+    uint headIdx = tgPos.x;
+    uint tokenIdx = tgPos.y;
     if (headIdx >= numHeads) return;
 
-    uint32_t offset = headIdx * headStride;
+    uint64_t offset = (uint64_t)tokenIdx * ((uint64_t)numHeads * headStride) + ((uint64_t)headIdx * headStride);
     uint32_t headDimVec4 = headDim / 4;
     device float4* headVec4 = (device float4*)(qkVector + offset);
     float localSum = 0.0f;
@@ -1359,7 +1528,7 @@ kernel void per_head_rmsnorm_offset_f16(
     }
 }
 
-/// MSL Kernel: Fused Rotary Position Embeddings (RoPE) for Qwen 3.5 / Ornith 1.5 with custom stride
+/// MSL Kernel: Fused Rotary Position Embeddings (RoPE) for Qwen 3.5 / Ornith 1.5 with custom stride (2D Grid Aware)
 kernel void apply_rope_qwen(
     device float* qkVector [[buffer(0)]],
     constant uint32_t& tokenPos [[buffer(1)]],
@@ -1368,22 +1537,25 @@ kernel void apply_rope_qwen(
     constant uint32_t& rotaryDim [[buffer(4)]],
     constant uint32_t& headStride [[buffer(5)]],
     constant float& ropeTheta [[buffer(6)]],
-    uint headIdx [[thread_position_in_grid]]
+    uint2 pos [[thread_position_in_grid]]
 ) {
+    uint headIdx = pos.x;
+    uint tokenIdx = pos.y;
     if (headIdx >= numHeads) return;
 
-    uint32_t headBase = headIdx * headStride;
+    uint32_t effectivePos = tokenPos + tokenIdx;
+    uint64_t headBase = (uint64_t)tokenIdx * ((uint64_t)numHeads * headStride) + ((uint64_t)headIdx * headStride);
     uint32_t halfRotary = rotaryDim / 2;
 
     for (uint32_t i = 0; i < halfRotary; i++) {
         float exponent = (2.0f * (float)i) / (float)rotaryDim;
         float freq = 1.0f / pow(ropeTheta, exponent);
-        float angle = (float)tokenPos * freq;
+        float angle = (float)effectivePos * freq;
         float cosVal = cos(angle);
         float sinVal = sin(angle);
 
-        uint32_t idx0 = headBase + i;
-        uint32_t idx1 = headBase + i + halfRotary;
+        uint64_t idx0 = headBase + i;
+        uint64_t idx1 = headBase + i + halfRotary;
 
         float v0 = qkVector[idx0];
         float v1 = qkVector[idx1];
@@ -1393,7 +1565,7 @@ kernel void apply_rope_qwen(
     }
 }
 
-/// MSL Kernel: Stores current K and V vectors into the Layer's KV-Cache
+/// MSL Kernel: Stores current K and V vectors into the Layer's KV-Cache (2D Grid Aware)
 kernel void store_kv_cache(
     device const float* kVector [[buffer(0)]],
     device const float* vVector [[buffer(1)]],
@@ -1402,17 +1574,21 @@ kernel void store_kv_cache(
     constant uint32_t& tokenPos [[buffer(4)]],
     constant uint32_t& numKvHeads [[buffer(5)]],
     constant uint32_t& headDim [[buffer(6)]],
-    uint id [[thread_position_in_grid]]
+    uint2 pos [[thread_position_in_grid]]
 ) {
+    uint elemIdx = pos.x;
+    uint tokenIdx = pos.y;
     uint32_t kvStride = numKvHeads * headDim;
-    if (id >= kvStride) return;
+    if (elemIdx >= kvStride) return;
 
-    uint32_t cacheOffset = (tokenPos * kvStride) + id;
-    kCacheBuffer[cacheOffset] = kVector[id];
-    vCacheBuffer[cacheOffset] = vVector[id];
+    uint32_t effectivePos = tokenPos + tokenIdx;
+    uint32_t inOffset = (tokenIdx * kvStride) + elemIdx;
+    uint32_t cacheOffset = (effectivePos * kvStride) + elemIdx;
+    kCacheBuffer[cacheOffset] = kVector[inOffset];
+    vCacheBuffer[cacheOffset] = vVector[inOffset];
 }
 
-/// MSL Kernel: Stores current K and V vectors into the Layer's KV-Cache in FP16 (Half Precision)
+/// MSL Kernel: Stores current K and V vectors into the Layer's KV-Cache in FP16 (Half Precision, 2D Grid Aware)
 kernel void store_kv_cache_f16(
     device const float* kVector [[buffer(0)]],
     device const float* vVector [[buffer(1)]],
@@ -1421,17 +1597,21 @@ kernel void store_kv_cache_f16(
     constant uint32_t& tokenPos [[buffer(4)]],
     constant uint32_t& numKvHeads [[buffer(5)]],
     constant uint32_t& headDim [[buffer(6)]],
-    uint id [[thread_position_in_grid]]
+    uint2 pos [[thread_position_in_grid]]
 ) {
+    uint elemIdx = pos.x;
+    uint tokenIdx = pos.y;
     uint32_t kvStride = numKvHeads * headDim;
-    if (id >= kvStride) return;
+    if (elemIdx >= kvStride) return;
 
-    uint32_t cacheOffset = (tokenPos * kvStride) + id;
-    kCacheBuffer[cacheOffset] = half(kVector[id]);
-    vCacheBuffer[cacheOffset] = half(vVector[id]);
+    uint32_t effectivePos = tokenPos + tokenIdx;
+    uint32_t inOffset = (tokenIdx * kvStride) + elemIdx;
+    uint32_t cacheOffset = (effectivePos * kvStride) + elemIdx;
+    kCacheBuffer[cacheOffset] = half(kVector[inOffset]);
+    vCacheBuffer[cacheOffset] = half(vVector[inOffset]);
 }
 
-/// MSL Kernel: Dynamically quantizes current K and V vectors to INT8 with per-head scaling factors
+/// MSL Kernel: Dynamically quantizes current K and V vectors to INT8 with per-head scaling factors (2D Grid Aware)
 kernel void store_kv_cache_fp8(
     device const float* kVector [[buffer(0)]],
     device const float* vVector [[buffer(1)]],
@@ -1442,22 +1622,26 @@ kernel void store_kv_cache_fp8(
     constant uint32_t& tokenPos [[buffer(6)]],
     constant uint32_t& numKvHeads [[buffer(7)]],
     constant uint32_t& headDim [[buffer(8)]],
-    uint kvHeadIdx [[threadgroup_position_in_grid]],
-    uint laneId [[thread_position_in_threadgroup]]
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]]
 ) {
+    uint kvHeadIdx = tgPos.x;
+    uint tokenIdx = tgPos.y;
+    uint laneId = tid.x;
     if (kvHeadIdx >= numKvHeads) return;
 
-    uint32_t kvHeadBase = kvHeadIdx * headDim;
+    uint32_t effectivePos = tokenPos + tokenIdx;
     uint32_t kvStride = numKvHeads * headDim;
-    uint32_t cacheHeadBase = (tokenPos * kvStride) + kvHeadBase;
-    uint32_t scaleIdx = tokenPos * numKvHeads + kvHeadIdx;
+    uint32_t inVectorBase = (uint32_t)tokenIdx * kvStride + kvHeadIdx * headDim;
+    uint32_t cacheHeadBase = (effectivePos * kvStride) + kvHeadIdx * headDim;
+    uint32_t scaleIdx = effectivePos * numKvHeads + kvHeadIdx;
 
     float local_max_k = 0.0f;
     float local_max_v = 0.0f;
 
     for (uint32_t d = laneId; d < headDim; d += 32) {
-        local_max_k = max(local_max_k, abs(kVector[kvHeadBase + d]));
-        local_max_v = max(local_max_v, abs(vVector[kvHeadBase + d]));
+        local_max_k = max(local_max_k, abs(kVector[inVectorBase + d]));
+        local_max_v = max(local_max_v, abs(vVector[inVectorBase + d]));
     }
 
     float head_max_k = simd_max(local_max_k);
@@ -1474,14 +1658,14 @@ kernel void store_kv_cache_fp8(
     }
 
     for (uint32_t d = laneId; d < headDim; d += 32) {
-        float qk = clamp(round(kVector[kvHeadBase + d] * inv_scale_k), -127.0f, 127.0f);
-        float qv = clamp(round(vVector[kvHeadBase + d] * inv_scale_v), -127.0f, 127.0f);
+        float qk = clamp(round(kVector[inVectorBase + d] * inv_scale_k), -127.0f, 127.0f);
+        float qv = clamp(round(vVector[inVectorBase + d] * inv_scale_v), -127.0f, 127.0f);
         kCacheBuffer[cacheHeadBase + d] = char(qk);
         vCacheBuffer[cacheHeadBase + d] = char(qv);
     }
 }
 
-///// MSL Kernel: Grouped-Query Attention (GQA) Autoregressive Decoding with Online Softmax & Sigmoid Output Gating (FP32)
+///// MSL Kernel: Grouped-Query Attention (GQA) Autoregressive Decoding with Online Softmax & Sigmoid Output Gating (FP32, 2D Grid Aware)
 kernel void gqa_attention_decode_fused(
     device const float* qGateVector [[buffer(0)]], // [8192] = 16 heads * (Q[256] + Gate[256])
     device const float* kCacheBuffer [[buffer(1)]],
@@ -1491,14 +1675,16 @@ kernel void gqa_attention_decode_fused(
     constant uint32_t& numQHeads [[buffer(5)]],
     constant uint32_t& numKvHeads [[buffer(6)]],
     constant uint32_t& headDim [[buffer(7)]],
-    uint qHeadIdx [[thread_position_in_grid]]
+    uint2 pos [[thread_position_in_grid]]
 ) {
+    uint qHeadIdx = pos.x;
+    uint tokenIdx = pos.y;
     if (qHeadIdx >= numQHeads) return;
 
     uint32_t headsPerKv = numQHeads / numKvHeads;
     uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
 
-    uint32_t qHeadBase = qHeadIdx * 512;
+    uint32_t qHeadBase = (tokenIdx * numQHeads * 512) + (qHeadIdx * 512);
     uint32_t gateBase = qHeadBase + 256;
     uint32_t kvStride = numKvHeads * headDim;
     uint32_t kvHeadBase = kvHeadIdx * headDim;
@@ -1514,7 +1700,9 @@ kernel void gqa_attention_decode_fused(
     float m = -1e20f; // running max score
     float l = 0.0f;   // running sum of exponents
 
-    for (uint32_t tau = 0; tau < seqLen; tau++) {
+    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : seqLen;
+
+    for (uint32_t tau = 0; tau < currentSeqLen; tau++) {
         uint32_t kBase = (tau * kvStride) + kvHeadBase;
         float dot = 0.0f;
         for (uint32_t d = 0; d < headDim; d++) {
@@ -1539,7 +1727,7 @@ kernel void gqa_attention_decode_fused(
     }
 
     float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
-    uint32_t outOffset = qHeadIdx * headDim;
+    uint32_t outOffset = (tokenIdx * numQHeads * headDim) + (qHeadIdx * headDim);
 
     for (uint32_t d = 0; d < headDim; d++) {
         float ctx = acc[d] * invL;
@@ -1549,7 +1737,7 @@ kernel void gqa_attention_decode_fused(
     }
 }
 
-/// MSL Kernel: Grouped-Query Attention (GQA) Autoregressive Decoding with Online Softmax & Sigmoid Output Gating (FP16 KV-Cache)
+/// MSL Kernel: Grouped-Query Attention (GQA) Autoregressive Decoding with Online Softmax & Sigmoid Output Gating (FP16 KV-Cache, 2D Grid Aware)
 kernel void gqa_attention_decode_fused_f16(
     device const float* qGateVector [[buffer(0)]], // [8192] = 16 heads * (Q[256] + Gate[256])
     device const half* kCacheBuffer [[buffer(1)]],
@@ -1559,14 +1747,16 @@ kernel void gqa_attention_decode_fused_f16(
     constant uint32_t& numQHeads [[buffer(5)]],
     constant uint32_t& numKvHeads [[buffer(6)]],
     constant uint32_t& headDim [[buffer(7)]],
-    uint qHeadIdx [[thread_position_in_grid]]
+    uint2 pos [[thread_position_in_grid]]
 ) {
+    uint qHeadIdx = pos.x;
+    uint tokenIdx = pos.y;
     if (qHeadIdx >= numQHeads) return;
 
     uint32_t headsPerKv = numQHeads / numKvHeads;
     uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
 
-    uint32_t qHeadBase = qHeadIdx * 512;
+    uint32_t qHeadBase = (tokenIdx * numQHeads * 512) + (qHeadIdx * 512);
     uint32_t gateBase = qHeadBase + 256;
     uint32_t kvStride = numKvHeads * headDim;
     uint32_t kvHeadBase = kvHeadIdx * headDim;
@@ -1583,8 +1773,9 @@ kernel void gqa_attention_decode_fused_f16(
     float l = 0.0f;   // running sum of exponents
 
     device const float4* qHeadVec = (device const float4*)(qGateVector + qHeadBase);
+    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : seqLen;
 
-    for (uint32_t tau = 0; tau < seqLen; tau++) {
+    for (uint32_t tau = 0; tau < currentSeqLen; tau++) {
         uint32_t kBase = (tau * kvStride) + kvHeadBase;
         device const half4* kVec = (device const half4*)(kCacheBuffer + kBase);
         
@@ -1612,7 +1803,7 @@ kernel void gqa_attention_decode_fused_f16(
     }
 
     float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
-    uint32_t outOffset = qHeadIdx * headDim;
+    uint32_t outOffset = (tokenIdx * numQHeads * headDim) + (qHeadIdx * headDim);
 
     for (uint32_t d = 0; d < headDim; d++) {
         uint32_t vecIdx = d / 4;
@@ -1624,7 +1815,7 @@ kernel void gqa_attention_decode_fused_f16(
     }
 }
 
-/// MSL Kernel: Grouped-Query Attention (GQA) Autoregressive Decoding with Online Softmax & Sigmoid Output Gating (FP8 Quantized KV-Cache)
+/// MSL Kernel: Grouped-Query Attention (GQA) Autoregressive Decoding with Online Softmax & Sigmoid Output Gating (FP8 Quantized KV-Cache, 2D Grid Aware)
 kernel void gqa_attention_decode_fused_fp8(
     device const float* qGateVector [[buffer(0)]], // [8192] = 16 heads * (Q[256] + Gate[256])
     device const char* kCacheBuffer [[buffer(1)]],
@@ -1636,14 +1827,16 @@ kernel void gqa_attention_decode_fused_fp8(
     constant uint32_t& numQHeads [[buffer(7)]],
     constant uint32_t& numKvHeads [[buffer(8)]],
     constant uint32_t& headDim [[buffer(9)]],
-    uint qHeadIdx [[thread_position_in_grid]]
+    uint2 pos [[thread_position_in_grid]]
 ) {
+    uint qHeadIdx = pos.x;
+    uint tokenIdx = pos.y;
     if (qHeadIdx >= numQHeads) return;
 
     uint32_t headsPerKv = numQHeads / numKvHeads;
     uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
 
-    uint32_t qHeadBase = qHeadIdx * 512;
+    uint32_t qHeadBase = (tokenIdx * numQHeads * 512) + (qHeadIdx * 512);
     uint32_t gateBase = qHeadBase + 256;
     uint32_t kvStride = numKvHeads * headDim;
     uint32_t kvHeadBase = kvHeadIdx * headDim;
@@ -1660,8 +1853,9 @@ kernel void gqa_attention_decode_fused_fp8(
     float l = 0.0f;
 
     device const float4* qHeadVec = (device const float4*)(qGateVector + qHeadBase);
+    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : seqLen;
 
-    for (uint32_t tau = 0; tau < seqLen; tau++) {
+    for (uint32_t tau = 0; tau < currentSeqLen; tau++) {
         uint32_t scaleIdx = (tau * numKvHeads) + kvHeadIdx;
         float kScale = float(kScaleBuffer[scaleIdx]);
         float vScale = float(vScaleBuffer[scaleIdx]);
@@ -1698,7 +1892,7 @@ kernel void gqa_attention_decode_fused_fp8(
     }
 
     float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
-    uint32_t outOffset = qHeadIdx * headDim;
+    uint32_t outOffset = (tokenIdx * numQHeads * headDim) + (qHeadIdx * headDim);
 
     for (uint32_t d = 0; d < headDim; d++) {
         uint32_t vecIdx = d / 4;
@@ -1710,7 +1904,7 @@ kernel void gqa_attention_decode_fused_fp8(
     }
 }
 
-/// MSL Kernel: Standard Grouped-Query Attention (GQA) Autoregressive Decoding for LLaMA / Mistral / Nanbeige (FP32)
+/// MSL Kernel: Standard Grouped-Query Attention (GQA) Autoregressive Decoding for LLaMA / Mistral / Nanbeige (FP32, 2D Grid Aware)
 kernel void gqa_attention_decode_standard(
     device const float* qVector [[buffer(0)]],     // [numQHeads * headDim]
     device const float* kCacheBuffer [[buffer(1)]],
@@ -1720,14 +1914,16 @@ kernel void gqa_attention_decode_standard(
     constant uint32_t& numQHeads [[buffer(5)]],
     constant uint32_t& numKvHeads [[buffer(6)]],
     constant uint32_t& headDim [[buffer(7)]],
-    uint qHeadIdx [[thread_position_in_grid]]
+    uint2 pos [[thread_position_in_grid]]
 ) {
+    uint qHeadIdx = pos.x;
+    uint tokenIdx = pos.y;
     if (qHeadIdx >= numQHeads) return;
 
     uint32_t headsPerKv = numQHeads / numKvHeads;
     uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
 
-    uint32_t qHeadBase = qHeadIdx * headDim;
+    uint32_t qHeadBase = (tokenIdx * numQHeads * headDim) + (qHeadIdx * headDim);
     uint32_t kvStride = numKvHeads * headDim;
     uint32_t kvHeadBase = kvHeadIdx * headDim;
 
@@ -1744,8 +1940,9 @@ kernel void gqa_attention_decode_standard(
     float l = 0.0f;   // running sum of exponents
 
     device const float4* qHeadVec = (device const float4*)(qVector + qHeadBase);
+    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : seqLen;
 
-    for (uint32_t tau = 0; tau < seqLen; tau++) {
+    for (uint32_t tau = 0; tau < currentSeqLen; tau++) {
         uint32_t kBase = (tau * kvStride) + kvHeadBase;
         device const float4* kVec = (device const float4*)(kCacheBuffer + kBase);
         
@@ -1773,7 +1970,7 @@ kernel void gqa_attention_decode_standard(
     }
 
     float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
-    uint32_t outOffset = qHeadIdx * headDim;
+    uint32_t outOffset = (tokenIdx * numQHeads * headDim) + (qHeadIdx * headDim);
     device float4* outVec = (device float4*)(attnOutBuffer + outOffset);
 
     for (uint32_t d = 0; d < headDimVec; d++) {
@@ -1781,7 +1978,7 @@ kernel void gqa_attention_decode_standard(
     }
 }
 
-/// MSL Kernel: Standard Grouped-Query Attention (GQA) Autoregressive Decoding for LLaMA / Mistral / Nanbeige (FP16 KV-Cache)
+/// MSL Kernel: Standard Grouped-Query Attention (GQA) Autoregressive Decoding for LLaMA / Mistral / Nanbeige (FP16 KV-Cache, 2D Grid Aware)
 kernel void gqa_attention_decode_standard_f16(
     device const float* qVector [[buffer(0)]],     // [numQHeads * headDim]
     device const half* kCacheBuffer [[buffer(1)]],
@@ -1791,14 +1988,16 @@ kernel void gqa_attention_decode_standard_f16(
     constant uint32_t& numQHeads [[buffer(5)]],
     constant uint32_t& numKvHeads [[buffer(6)]],
     constant uint32_t& headDim [[buffer(7)]],
-    uint qHeadIdx [[thread_position_in_grid]]
+    uint2 pos [[thread_position_in_grid]]
 ) {
+    uint qHeadIdx = pos.x;
+    uint tokenIdx = pos.y;
     if (qHeadIdx >= numQHeads) return;
 
     uint32_t headsPerKv = numQHeads / numKvHeads;
     uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
 
-    uint32_t qHeadBase = qHeadIdx * headDim;
+    uint32_t qHeadBase = (tokenIdx * numQHeads * headDim) + (qHeadIdx * headDim);
     uint32_t kvStride = numKvHeads * headDim;
     uint32_t kvHeadBase = kvHeadIdx * headDim;
 
@@ -1815,8 +2014,9 @@ kernel void gqa_attention_decode_standard_f16(
     float l = 0.0f;   // running sum of exponents
 
     device const float4* qHeadVec = (device const float4*)(qVector + qHeadBase);
+    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : seqLen;
 
-    for (uint32_t tau = 0; tau < seqLen; tau++) {
+    for (uint32_t tau = 0; tau < currentSeqLen; tau++) {
         uint32_t kBase = (tau * kvStride) + kvHeadBase;
         device const half4* kVec = (device const half4*)(kCacheBuffer + kBase);
         
@@ -1844,7 +2044,7 @@ kernel void gqa_attention_decode_standard_f16(
     }
 
     float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
-    uint32_t outOffset = qHeadIdx * headDim;
+    uint32_t outOffset = (tokenIdx * numQHeads * headDim) + (qHeadIdx * headDim);
     device float4* outVec = (device float4*)(attnOutBuffer + outOffset);
 
     for (uint32_t d = 0; d < headDimVec; d++) {
@@ -1852,7 +2052,7 @@ kernel void gqa_attention_decode_standard_f16(
     }
 }
 
-/// MSL Kernel: Standard Grouped-Query Attention (GQA) Autoregressive Decoding for LLaMA / Mistral / Nanbeige (FP8 Quantized KV-Cache)
+/// MSL Kernel: Standard Grouped-Query Attention (GQA) Autoregressive Decoding for LLaMA / Mistral / Nanbeige (FP8 Quantized KV-Cache, 2D Grid Aware)
 kernel void gqa_attention_decode_standard_fp8(
     device const float* qVector [[buffer(0)]],     // [numQHeads * headDim]
     device const char* kCacheBuffer [[buffer(1)]],
@@ -1864,14 +2064,16 @@ kernel void gqa_attention_decode_standard_fp8(
     constant uint32_t& numQHeads [[buffer(7)]],
     constant uint32_t& numKvHeads [[buffer(8)]],
     constant uint32_t& headDim [[buffer(9)]],
-    uint qHeadIdx [[thread_position_in_grid]]
+    uint2 pos [[thread_position_in_grid]]
 ) {
+    uint qHeadIdx = pos.x;
+    uint tokenIdx = pos.y;
     if (qHeadIdx >= numQHeads) return;
 
     uint32_t headsPerKv = numQHeads / numKvHeads;
     uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
 
-    uint32_t qHeadBase = qHeadIdx * headDim;
+    uint32_t qHeadBase = (tokenIdx * numQHeads * headDim) + (qHeadIdx * headDim);
     uint32_t kvStride = numKvHeads * headDim;
     uint32_t kvHeadBase = kvHeadIdx * headDim;
 
@@ -1887,8 +2089,9 @@ kernel void gqa_attention_decode_standard_fp8(
     float l = 0.0f;
 
     device const float4* qHeadVec = (device const float4*)(qVector + qHeadBase);
+    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : seqLen;
 
-    for (uint32_t tau = 0; tau < seqLen; tau++) {
+    for (uint32_t tau = 0; tau < currentSeqLen; tau++) {
         uint32_t scaleIdx = (tau * numKvHeads) + kvHeadIdx;
         float kScale = float(kScaleBuffer[scaleIdx]);
         float vScale = float(vScaleBuffer[scaleIdx]);
@@ -1925,7 +2128,7 @@ kernel void gqa_attention_decode_standard_fp8(
     }
 
     float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
-    uint32_t outOffset = qHeadIdx * headDim;
+    uint32_t outOffset = (tokenIdx * numQHeads * headDim) + (qHeadIdx * headDim);
     device float4* outVec = (device float4*)(attnOutBuffer + outOffset);
 
     for (uint32_t d = 0; d < headDimVec; d++) {
@@ -1989,8 +2192,8 @@ kernel void l2_norm_qk(
         qkvVector[qBase + i] *= invQNorm;
     }
 
-    // K head at 2048 + headIdx * 128
-    uint32_t kBase = 2048 + (headIdx * headDim);
+    // K head at (numHeads * headDim) + headIdx * headDim
+    uint32_t kBase = (numHeads * headDim) + (headIdx * headDim);
     float kSumSq = 0.0f;
     for (uint32_t i = 0; i < headDim; i++) {
         float v = qkvVector[kBase + i];
@@ -2105,6 +2308,210 @@ kernel void linear_attention_recurrent_step(
     }
 }
 
+/// MSL Kernel: Causal 1D Convolution over entire prompt sequence (P tokens) with Shift Register State & SiLU Activation
+kernel void causal_conv1d_sequence_silu(
+    device const float* inRawSeq [[buffer(0)]],      // [seqLen, numChannels]
+    device const uchar* convWeight [[buffer(1)]],     // [numChannels, 4] (BF16)
+    device float* convState [[buffer(2)]],           // [numChannels, 4] (shift register)
+    device float* outQKVSeq [[buffer(3)]],           // [seqLen, numChannels]
+    constant uint64_t& weightOffset [[buffer(4)]],
+    constant uint32_t& numChannels [[buffer(5)]],
+    constant uint32_t& seqLen [[buffer(6)]],
+    uint c [[thread_position_in_grid]]
+) {
+    if (c >= numChannels) return;
+
+    uint32_t stateBase = c * 4;
+    float s0 = convState[stateBase + 0];
+    float s1 = convState[stateBase + 1];
+    float s2 = convState[stateBase + 2];
+    float s3 = convState[stateBase + 3];
+
+    device const uchar* wBase = convWeight + weightOffset + ((uint64_t)c * 4 * 2);
+    float w0 = read_bf16_unaligned(wBase + 0 * 2);
+    float w1 = read_bf16_unaligned(wBase + 1 * 2);
+    float w2 = read_bf16_unaligned(wBase + 2 * 2);
+    float w3 = read_bf16_unaligned(wBase + 3 * 2);
+
+    for (uint32_t p = 0; p < seqLen; p++) {
+        float inVal = inRawSeq[((uint64_t)p * numChannels) + c];
+        s0 = s1;
+        s1 = s2;
+        s2 = s3;
+        s3 = inVal;
+
+        float convVal = (w0 * s0) + (w1 * s1) + (w2 * s2) + (w3 * s3);
+        float siluVal = convVal / (1.0f + exp(-convVal));
+        outQKVSeq[((uint64_t)p * numChannels) + c] = siluVal;
+    }
+
+    // Persist final state for subsequent autoregressive decoding steps
+    convState[stateBase + 0] = s0;
+    convState[stateBase + 1] = s1;
+    convState[stateBase + 2] = s2;
+    convState[stateBase + 3] = s3;
+}
+
+/// MSL Kernel: Per-head L2 Normalization on Q and K vectors across all sequence tokens
+/// Grid: (numHeads, seqLen, 1)
+kernel void l2_norm_qk_sequence(
+    device float* qkvVectorSeq [[buffer(0)]], // [seqLen, qkvDim]
+    constant uint32_t& numHeads [[buffer(1)]],
+    constant uint32_t& headDim [[buffer(2)]],
+    constant uint32_t& qkvDim [[buffer(3)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint headIdx = pos.x;
+    uint p = pos.y;
+    if (headIdx >= numHeads) return;
+
+    device float* qkvToken = qkvVectorSeq + ((uint64_t)p * qkvDim);
+
+    // Q head at headIdx * headDim
+    uint32_t qBase = headIdx * headDim;
+    float qSumSq = 0.0f;
+    for (uint32_t i = 0; i < headDim; i++) {
+        float v = qkvToken[qBase + i];
+        qSumSq += v * v;
+    }
+    float invQNorm = rsqrt(qSumSq + 1e-6f);
+    for (uint32_t i = 0; i < headDim; i++) {
+        qkvToken[qBase + i] *= invQNorm;
+    }
+
+    // K head at (numHeads * headDim) + (headIdx * headDim)
+    uint32_t kBase = (numHeads * headDim) + (headIdx * headDim);
+    float kSumSq = 0.0f;
+    for (uint32_t i = 0; i < headDim; i++) {
+        float v = qkvToken[kBase + i];
+        kSumSq += v * v;
+    }
+    float invKNorm = rsqrt(kSumSq + 1e-6f);
+    for (uint32_t i = 0; i < headDim; i++) {
+        qkvToken[kBase + i] *= invKNorm;
+    }
+}
+
+/// MSL Kernel: Gated DeltaNet (GDN) Recurrent Linear Attention over entire sequence (DeltaNet with 32-Thread SIMDgroup Parallelization)
+/// Grid: (numValHeads, 1, 1), threadgroup: (32, 1, 1)
+kernel void linear_attention_recurrent_sequence(
+    device const float* qkvVectorSeq [[buffer(0)]], // [seqLen, qkvStride]
+    device const float* zVectorSeq [[buffer(1)]],   // [seqLen, zStride]
+    device const float* aVectorSeq [[buffer(2)]],   // [seqLen, aStride]
+    device const float* bVectorSeq [[buffer(3)]],   // [seqLen, bStride]
+    device const uchar* aLogBuf [[buffer(4)]],      // [numValHeads] (BF16)
+    device const uchar* dtBiasBuf [[buffer(5)]],    // [numValHeads] (BF16)
+    device const uchar* normBuf [[buffer(6)]],      // [headDim] (BF16)
+    device float* stateMatrix [[buffer(7)]],        // [numValHeads, headDim, headDim]
+    device float* outputVectorSeq [[buffer(8)]],    // [seqLen, outStride]
+    constant uint64_t& aLogOffset [[buffer(9)]],
+    constant uint64_t& dtBiasOffset [[buffer(10)]],
+    constant uint64_t& normOffset [[buffer(11)]],
+    constant uint32_t& numValHeads [[buffer(12)]],  // 48 (or 32)
+    constant uint32_t& numKeyHeads [[buffer(13)]],  // 16
+    constant uint32_t& headDim [[buffer(14)]],      // 128
+    constant float& eps [[buffer(15)]],             // 1e-6
+    constant uint32_t& seqLen [[buffer(16)]],
+    uint headIdx [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    if (headIdx >= numValHeads) return;
+
+    uint32_t keyHeadIdx = headIdx / (numValHeads / numKeyHeads); // e.g. headIdx / 3 for 48/16
+    uint32_t headDimVec4 = headDim / 4;
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    uint32_t qBaseInToken = keyHeadIdx * headDim;
+    uint32_t kBaseInToken = (numKeyHeads * headDim) + (keyHeadIdx * headDim);
+    uint32_t vBaseInToken = (2 * numKeyHeads * headDim) + (headIdx * headDim);
+    uint32_t zBaseInToken = headIdx * headDim;
+    uint32_t outBaseInToken = headIdx * headDim;
+    uint32_t stateBase = headIdx * headDim * headDim;
+
+    uint32_t qkvStride = (2 * numKeyHeads + numValHeads) * headDim;
+    uint32_t zStride = numValHeads * headDim;
+    uint32_t aStride = numValHeads;
+    uint32_t bStride = numValHeads;
+    uint32_t outStride = numValHeads * headDim;
+
+    float aLogVal = read_bf16_unaligned(aLogBuf + aLogOffset + ((uint64_t)headIdx * 2));
+    float dtBiasVal = read_bf16_unaligned(dtBiasBuf + dtBiasOffset + ((uint64_t)headIdx * 2));
+    float expALog = exp(aLogVal);
+
+    uint32_t row_indices[4];
+    uint32_t numLocalRows = 0;
+    for (uint32_t i = laneId; i < headDim; i += 32) {
+        row_indices[numLocalRows++] = i;
+    }
+
+    for (uint32_t p = 0; p < seqLen; p++) {
+        uint64_t qkvTokenBase = (uint64_t)p * qkvStride;
+        uint64_t zTokenBase   = (uint64_t)p * zStride;
+        uint64_t aTokenBase   = (uint64_t)p * aStride;
+        uint64_t bTokenBase   = (uint64_t)p * bStride;
+        uint64_t outTokenBase = (uint64_t)p * outStride;
+
+        float aVal = aVectorSeq[aTokenBase + headIdx];
+        float bVal = bVectorSeq[bTokenBase + headIdx];
+
+        float x = aVal + dtBiasVal;
+        float dt = (x > 20.0f) ? x : ((x < -20.0f) ? exp(x) : log(1.0f + exp(x)));
+        float alpha = exp(-expALog * dt);
+        float beta = 1.0f / (1.0f + exp(-bVal));
+
+        device const float* qkvToken = qkvVectorSeq + qkvTokenBase;
+        device const float4* kVec4 = (device const float4*)(qkvToken + kBaseInToken);
+        device const float4* qVec4 = (device const float4*)(qkvToken + qBaseInToken);
+
+        float y_local[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float localSumSq = 0.0f;
+
+        for (uint32_t r = 0; r < numLocalRows; r++) {
+            uint32_t i = row_indices[r];
+            uint32_t sRowBase = stateBase + (i * headDim);
+            device float4* sRowVec4 = (device float4*)(stateMatrix + sRowBase);
+
+            float Sk_i = 0.0f;
+            for (uint32_t j = 0; j < headDimVec4; j++) {
+                Sk_i += dot(sRowVec4[j], kVec4[j]);
+            }
+
+            float v_val = qkvToken[vBaseInToken + i];
+            float delta_v_i = beta * (v_val - Sk_i);
+
+            for (uint32_t j = 0; j < headDimVec4; j++) {
+                sRowVec4[j] = (sRowVec4[j] * alpha) + (delta_v_i * kVec4[j]);
+            }
+
+            float y_i = 0.0f;
+            for (uint32_t j = 0; j < headDimVec4; j++) {
+                y_i += dot(sRowVec4[j], qVec4[j]);
+            }
+            y_i *= invSqrtHeadDim;
+
+            y_local[r] = y_i;
+            localSumSq += y_i * y_i;
+        }
+
+        float headSumSq = simd_sum(localSumSq);
+        float rms = rsqrt((headSumSq / (float)headDim) + eps);
+
+        device const float* zToken = zVectorSeq + zTokenBase;
+        device float* outToken = outputVectorSeq + outTokenBase;
+
+        for (uint32_t r = 0; r < numLocalRows; r++) {
+            uint32_t i = row_indices[r];
+            float gamma = read_bf16_unaligned(normBuf + normOffset + ((uint64_t)i * 2));
+            float yNorm = y_local[r] * rms * gamma;
+
+            float z = zToken[zBaseInToken + i];
+            float sig_z = 1.0f / (1.0f + exp(-z));
+
+            outToken[outBaseInToken + i] = yNorm * sig_z;
+        }
+    }
+}
+
 // ============================================================================
 // SIMDgroup Cooperative Compute Kernels (32 Threads per Row Reduction)
 // ============================================================================
@@ -2119,9 +2526,10 @@ kernel void bf16_swiglu_gate_up_simd(
     constant uint64_t& upWeightOffset [[buffer(5)]],
     constant uint32_t& hiddenDim [[buffer(6)]],
     constant uint32_t& intermediateDim [[buffer(7)]],
-    uint r [[threadgroup_position_in_grid]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
     uint laneId [[thread_index_in_simdgroup]]
 ) {
+    uint r = tgPos.x;
     if (r >= intermediateDim) return;
 
     uint64_t gateRowStart = (gateWeightOffset / 2) + ((uint64_t)r * hiddenDim);
@@ -2172,6 +2580,74 @@ kernel void bf16_swiglu_gate_up_simd(
     }
 }
 
+/// MSL Kernel: 32-Thread SIMDgroup Cooperative BF16 SwiGLU Gate & Up Projections (Batched with Token Index Buffer)
+kernel void bf16_swiglu_gate_up_batched(
+    device const ushort* rawGateBuffer [[buffer(0)]],
+    device const ushort* rawUpBuffer [[buffer(1)]],
+    device const float* inputVector [[buffer(2)]],
+    device float* intermediateOutput [[buffer(3)]],
+    constant uint64_t& gateWeightOffset [[buffer(4)]],
+    constant uint64_t& upWeightOffset [[buffer(5)]],
+    constant uint32_t& hiddenDim [[buffer(6)]],
+    constant uint32_t& intermediateDim [[buffer(7)]],
+    device const uint32_t* activeTokens [[buffer(8)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint r = tgPos.x;
+    uint batchIdx = tgPos.y;
+    if (r >= intermediateDim) return;
+
+    uint tokenIdx = activeTokens[batchIdx];
+
+    uint64_t gateRowStart = (gateWeightOffset / 2) + ((uint64_t)r * hiddenDim);
+    uint64_t upRowStart   = (upWeightOffset / 2) + ((uint64_t)r * hiddenDim);
+
+    device const ushort4* g4 = (device const ushort4*)(rawGateBuffer + gateRowStart);
+    device const ushort4* u4 = (device const ushort4*)(rawUpBuffer + upRowStart);
+    device const float4* in4 = (device const float4*)(inputVector + ((uint64_t)tokenIdx * hiddenDim));
+
+    float gate_dot = 0.0f;
+    float up_dot   = 0.0f;
+
+    uint32_t numChunks = hiddenDim / 8;
+    for (uint32_t c = laneId; c < numChunks; c += 32) {
+        ushort4 g_lo = g4[c * 2 + 0];
+        ushort4 g_hi = g4[c * 2 + 1];
+        ushort4 u_lo = u4[c * 2 + 0];
+        ushort4 u_hi = u4[c * 2 + 1];
+
+        float4 in_lo = in4[c * 2 + 0];
+        float4 in_hi = in4[c * 2 + 1];
+
+        gate_dot += (bf16_to_fp32(g_lo.x) * in_lo.x) +
+                    (bf16_to_fp32(g_lo.y) * in_lo.y) +
+                    (bf16_to_fp32(g_lo.z) * in_lo.z) +
+                    (bf16_to_fp32(g_lo.w) * in_lo.w) +
+                    (bf16_to_fp32(g_hi.x) * in_hi.x) +
+                    (bf16_to_fp32(g_hi.y) * in_hi.y) +
+                    (bf16_to_fp32(g_hi.z) * in_hi.z) +
+                    (bf16_to_fp32(g_hi.w) * in_hi.w);
+
+        up_dot   += (bf16_to_fp32(u_lo.x) * in_lo.x) +
+                    (bf16_to_fp32(u_lo.y) * in_lo.y) +
+                    (bf16_to_fp32(u_lo.z) * in_lo.z) +
+                    (bf16_to_fp32(u_lo.w) * in_lo.w) +
+                    (bf16_to_fp32(u_hi.x) * in_hi.x) +
+                    (bf16_to_fp32(u_hi.y) * in_hi.y) +
+                    (bf16_to_fp32(u_hi.z) * in_hi.z) +
+                    (bf16_to_fp32(u_hi.w) * in_hi.w);
+    }
+
+    gate_dot = simd_sum(gate_dot);
+    up_dot   = simd_sum(up_dot);
+
+    if (laneId == 0) {
+        float silu_gate = gate_dot / (1.0f + exp(-gate_dot));
+        intermediateOutput[((uint64_t)tokenIdx * intermediateDim) + r] = silu_gate * up_dot;
+    }
+}
+
 /// MSL Kernel: 32-Thread SIMDgroup Cooperative BF16 Down-Projection with Weighted Accumulation (128-bit Vectorized)
 kernel void bf16_down_proj_accumulate_simd(
     device const ushort* rawDownBuffer [[buffer(0)]],
@@ -2181,9 +2657,10 @@ kernel void bf16_down_proj_accumulate_simd(
     constant uint32_t& intermediateDim [[buffer(4)]],
     constant uint32_t& hiddenDim [[buffer(5)]],
     constant float& routingWeight [[buffer(6)]],
-    uint d [[threadgroup_position_in_grid]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
     uint laneId [[thread_index_in_simdgroup]]
 ) {
+    uint d = tgPos.x;
     if (d >= hiddenDim) return;
 
     uint64_t downRowStart = (downWeightOffset / 2) + ((uint64_t)d * intermediateDim);
@@ -2216,7 +2693,59 @@ kernel void bf16_down_proj_accumulate_simd(
     }
 }
 
+/// MSL Kernel: 32-Thread SIMDgroup Cooperative BF16 Down-Projection with Weighted Accumulation (Batched)
+kernel void bf16_down_proj_accumulate_batched(
+    device const ushort* rawDownBuffer [[buffer(0)]],
+    device const float* intermediateVector [[buffer(1)]],
+    device float* outputAccumulator [[buffer(2)]],
+    constant uint64_t& downWeightOffset [[buffer(3)]],
+    constant uint32_t& intermediateDim [[buffer(4)]],
+    constant uint32_t& hiddenDim [[buffer(5)]],
+    constant float& defaultRoutingWeight [[buffer(6)]],
+    device const uint32_t* activeTokens [[buffer(7)]],
+    device const float* activeWeights [[buffer(8)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint d = tgPos.x;
+    uint batchIdx = tgPos.y;
+    if (d >= hiddenDim) return;
+
+    uint tokenIdx = activeTokens[batchIdx];
+    float routingWeight = activeWeights[batchIdx];
+
+    uint64_t downRowStart = (downWeightOffset / 2) + ((uint64_t)d * intermediateDim);
+    device const ushort4* d4 = (device const ushort4*)(rawDownBuffer + downRowStart);
+    device const float4* in4 = (device const float4*)(intermediateVector + ((uint64_t)tokenIdx * intermediateDim));
+
+    float down_dot = 0.0f;
+    uint32_t numChunks = intermediateDim / 8;
+
+    for (uint32_t c = laneId; c < numChunks; c += 32) {
+        ushort4 d_lo = d4[c * 2 + 0];
+        ushort4 d_hi = d4[c * 2 + 1];
+        float4 in_lo = in4[c * 2 + 0];
+        float4 in_hi = in4[c * 2 + 1];
+
+        down_dot += (bf16_to_fp32(d_lo.x) * in_lo.x) +
+                    (bf16_to_fp32(d_lo.y) * in_lo.y) +
+                    (bf16_to_fp32(d_lo.z) * in_lo.z) +
+                    (bf16_to_fp32(d_lo.w) * in_lo.w) +
+                    (bf16_to_fp32(d_hi.x) * in_hi.x) +
+                    (bf16_to_fp32(d_hi.y) * in_hi.y) +
+                    (bf16_to_fp32(d_hi.z) * in_hi.z) +
+                    (bf16_to_fp32(d_hi.w) * in_hi.w);
+    }
+
+    down_dot = simd_sum(down_dot);
+
+    if (laneId == 0) {
+        outputAccumulator[((uint64_t)tokenIdx * hiddenDim) + d] += routingWeight * down_dot;
+    }
+}
+
 /// MSL Kernel: 32-Thread SIMDgroup Cooperative BF16 GEMV (out = W * x) (128-bit Vectorized)
+/// Supports 2D batched grid (outDim, batchSize, 1) with threadgroup (32, 1, 1)
 kernel void bf16_gemv_simd(
     device const ushort* rawWeightBuffer [[buffer(0)]],
     device const float* inputVector [[buffer(1)]],
@@ -2224,14 +2753,16 @@ kernel void bf16_gemv_simd(
     constant uint64_t& weightOffset [[buffer(3)]],
     constant uint32_t& inDim [[buffer(4)]],
     constant uint32_t& outDim [[buffer(5)]],
-    uint row [[threadgroup_position_in_grid]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
     uint laneId [[thread_index_in_simdgroup]]
 ) {
+    uint row = tgPos.x;
+    uint tokenIdx = tgPos.y;
     if (row >= outDim) return;
 
     uint64_t rowWeightStart = (weightOffset / 2) + ((uint64_t)row * inDim);
     device const ushort4* w4 = (device const ushort4*)(rawWeightBuffer + rowWeightStart);
-    device const float4* in4 = (device const float4*)inputVector;
+    device const float4* in4 = (device const float4*)(inputVector + ((uint64_t)tokenIdx * inDim));
 
     float dot = 0.0f;
     uint32_t numChunks = inDim / 8;
@@ -2255,7 +2786,7 @@ kernel void bf16_gemv_simd(
     dot = simd_sum(dot);
 
     if (laneId == 0) {
-        outputVector[row] = dot;
+        outputVector[((uint64_t)tokenIdx * outDim) + row] = dot;
     }
 }
 
@@ -2273,9 +2804,10 @@ kernel void fp8_swiglu_gate_up_simd(
     constant uint64_t& upScaleOffset [[buffer(9)]],
     constant uint32_t& hiddenDim [[buffer(10)]],
     constant uint32_t& intermediateDim [[buffer(11)]],
-    uint r [[threadgroup_position_in_grid]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
     uint laneId [[thread_index_in_simdgroup]]
 ) {
+    uint r = tgPos.x;
     if (r >= intermediateDim) return;
 
     float gateScale = bf16_to_fp32(rawGateScaleBuffer[(gateScaleOffset / 2) + r]);
@@ -2283,6 +2815,7 @@ kernel void fp8_swiglu_gate_up_simd(
 
     device const uchar* gRow = rawGateBuffer + gateWeightOffset + ((uint64_t)r * hiddenDim);
     device const uchar* uRow = rawUpBuffer + upWeightOffset + ((uint64_t)r * hiddenDim);
+    device const float* inPtr = inputVector;
 
     float gate_dot = 0.0f;
     float up_dot   = 0.0f;
@@ -2292,8 +2825,8 @@ kernel void fp8_swiglu_gate_up_simd(
         uchar4 g4_1 = *(device const uchar4*)(gRow + baseD + 4);
         uchar4 u4_0 = *(device const uchar4*)(uRow + baseD);
         uchar4 u4_1 = *(device const uchar4*)(uRow + baseD + 4);
-        float4 in4_0 = *(device const float4*)(inputVector + baseD);
-        float4 in4_1 = *(device const float4*)(inputVector + baseD + 4);
+        float4 in4_0 = *(device const float4*)(inPtr + baseD);
+        float4 in4_1 = *(device const float4*)(inPtr + baseD + 4);
 
         gate_dot += (unpack_e4m3(g4_0.x) * in4_0.x) + (unpack_e4m3(g4_0.y) * in4_0.y) +
                     (unpack_e4m3(g4_1.x) * in4_1.x) + (unpack_e4m3(g4_1.y) * in4_1.y) +
@@ -2317,6 +2850,70 @@ kernel void fp8_swiglu_gate_up_simd(
     }
 }
 
+/// MSL Kernel: 32-Thread SIMDgroup Cooperative FP8 SwiGLU Gate & Up Projections (Batched with Token Index Buffer)
+kernel void fp8_swiglu_gate_up_batched(
+    device const uchar* rawGateBuffer [[buffer(0)]],
+    device const uchar* rawUpBuffer [[buffer(1)]],
+    device const float* inputVector [[buffer(2)]],
+    device float* intermediateOutput [[buffer(3)]],
+    device const ushort* rawGateScaleBuffer [[buffer(4)]],
+    device const ushort* rawUpScaleBuffer [[buffer(5)]],
+    constant uint64_t& gateWeightOffset [[buffer(6)]],
+    constant uint64_t& gateScaleOffset [[buffer(7)]],
+    constant uint64_t& upWeightOffset [[buffer(8)]],
+    constant uint64_t& upScaleOffset [[buffer(9)]],
+    constant uint32_t& hiddenDim [[buffer(10)]],
+    constant uint32_t& intermediateDim [[buffer(11)]],
+    device const uint32_t* activeTokens [[buffer(12)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint r = tgPos.x;
+    uint batchIdx = tgPos.y;
+    if (r >= intermediateDim) return;
+
+    uint tokenIdx = activeTokens[batchIdx];
+
+    float gateScale = bf16_to_fp32(rawGateScaleBuffer[(gateScaleOffset / 2) + r]);
+    float upScale   = bf16_to_fp32(rawUpScaleBuffer[(upScaleOffset / 2) + r]);
+
+    device const uchar* gRow = rawGateBuffer + gateWeightOffset + ((uint64_t)r * hiddenDim);
+    device const uchar* uRow = rawUpBuffer + upWeightOffset + ((uint64_t)r * hiddenDim);
+    device const float* inPtr = inputVector + ((uint64_t)tokenIdx * hiddenDim);
+
+    float gate_dot = 0.0f;
+    float up_dot   = 0.0f;
+
+    for (uint32_t baseD = laneId * 8; baseD < hiddenDim; baseD += 32 * 8) {
+        uchar4 g4_0 = *(device const uchar4*)(gRow + baseD);
+        uchar4 g4_1 = *(device const uchar4*)(gRow + baseD + 4);
+        uchar4 u4_0 = *(device const uchar4*)(uRow + baseD);
+        uchar4 u4_1 = *(device const uchar4*)(uRow + baseD + 4);
+        float4 in4_0 = *(device const float4*)(inPtr + baseD);
+        float4 in4_1 = *(device const float4*)(inPtr + baseD + 4);
+
+        gate_dot += (unpack_e4m3(g4_0.x) * in4_0.x) + (unpack_e4m3(g4_0.y) * in4_0.y) +
+                    (unpack_e4m3(g4_1.x) * in4_1.x) + (unpack_e4m3(g4_1.y) * in4_1.y) +
+                    (unpack_e4m3(g4_0.z) * in4_0.z) + (unpack_e4m3(g4_0.w) * in4_0.w) +
+                    (unpack_e4m3(g4_1.z) * in4_1.z) + (unpack_e4m3(g4_1.w) * in4_1.w);
+
+        up_dot   += (unpack_e4m3(u4_0.x) * in4_0.x) + (unpack_e4m3(u4_0.y) * in4_0.y) +
+                    (unpack_e4m3(u4_1.x) * in4_1.x) + (unpack_e4m3(u4_1.y) * in4_1.y) +
+                    (unpack_e4m3(u4_0.z) * in4_0.z) + (unpack_e4m3(u4_0.w) * in4_0.w) +
+                    (unpack_e4m3(u4_1.z) * in4_1.z) + (unpack_e4m3(u4_1.w) * in4_1.w);
+    }
+
+    gate_dot = simd_sum(gate_dot);
+    up_dot   = simd_sum(up_dot);
+
+    if (laneId == 0) {
+        float finalGate = gate_dot * gateScale;
+        float finalUp   = up_dot * upScale;
+        float silu_gate = finalGate / (1.0f + exp(-finalGate));
+        intermediateOutput[((uint64_t)tokenIdx * intermediateDim) + r] = silu_gate * finalUp;
+    }
+}
+
 /// MSL Kernel: 32-Thread SIMDgroup Cooperative FP8 Down-Projection with Weighted Accumulation
 kernel void fp8_down_proj_accumulate_simd(
     device const uchar* rawDownBuffer [[buffer(0)]],
@@ -2328,20 +2925,22 @@ kernel void fp8_down_proj_accumulate_simd(
     constant uint32_t& intermediateDim [[buffer(6)]],
     constant uint32_t& hiddenDim [[buffer(7)]],
     constant float& routingWeight [[buffer(8)]],
-    uint d [[threadgroup_position_in_grid]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
     uint laneId [[thread_index_in_simdgroup]]
 ) {
+    uint d = tgPos.x;
     if (d >= hiddenDim) return;
 
     float downScale = bf16_to_fp32(rawDownScaleBuffer[(downScaleOffset / 2) + d]);
     device const uchar* dRow = rawDownBuffer + downWeightOffset + ((uint64_t)d * intermediateDim);
+    device const float* interPtr = intermediateVector;
 
     float down_dot = 0.0f;
     for (uint32_t baseI = laneId * 8; baseI < intermediateDim; baseI += 32 * 8) {
         uchar4 d4_0 = *(device const uchar4*)(dRow + baseI);
         uchar4 d4_1 = *(device const uchar4*)(dRow + baseI + 4);
-        float4 in4_0 = *(device const float4*)(intermediateVector + baseI);
-        float4 in4_1 = *(device const float4*)(intermediateVector + baseI + 4);
+        float4 in4_0 = *(device const float4*)(interPtr + baseI);
+        float4 in4_1 = *(device const float4*)(interPtr + baseI + 4);
 
         down_dot += (unpack_e4m3(d4_0.x) * in4_0.x) + (unpack_e4m3(d4_0.y) * in4_0.y) +
                     (unpack_e4m3(d4_1.x) * in4_1.x) + (unpack_e4m3(d4_1.y) * in4_1.y) +
@@ -2353,6 +2952,299 @@ kernel void fp8_down_proj_accumulate_simd(
 
     if (laneId == 0) {
         outputAccumulator[d] += routingWeight * (down_dot * downScale);
+    }
+}
+
+/// MSL Kernel: 32-Thread SIMDgroup Cooperative FP8 Down-Projection with Weighted Accumulation (Batched)
+kernel void fp8_down_proj_accumulate_batched(
+    device const uchar* rawDownBuffer [[buffer(0)]],
+    device const float* intermediateVector [[buffer(1)]],
+    device float* outputAccumulator [[buffer(2)]],
+    device const ushort* rawDownScaleBuffer [[buffer(3)]],
+    constant uint64_t& downWeightOffset [[buffer(4)]],
+    constant uint64_t& downScaleOffset [[buffer(5)]],
+    constant uint32_t& intermediateDim [[buffer(6)]],
+    constant uint32_t& hiddenDim [[buffer(7)]],
+    constant float& defaultRoutingWeight [[buffer(8)]],
+    device const uint32_t* activeTokens [[buffer(9)]],
+    device const float* activeWeights [[buffer(10)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint d = tgPos.x;
+    uint batchIdx = tgPos.y;
+    if (d >= hiddenDim) return;
+
+    uint tokenIdx = activeTokens[batchIdx];
+    float routingWeight = activeWeights[batchIdx];
+
+    float downScale = bf16_to_fp32(rawDownScaleBuffer[(downScaleOffset / 2) + d]);
+    device const uchar* dRow = rawDownBuffer + downWeightOffset + ((uint64_t)d * intermediateDim);
+    device const float* interPtr = intermediateVector + ((uint64_t)tokenIdx * intermediateDim);
+
+    float down_dot = 0.0f;
+    for (uint32_t baseI = laneId * 8; baseI < intermediateDim; baseI += 32 * 8) {
+        uchar4 d4_0 = *(device const uchar4*)(dRow + baseI);
+        uchar4 d4_1 = *(device const uchar4*)(dRow + baseI + 4);
+        float4 in4_0 = *(device const float4*)(interPtr + baseI);
+        float4 in4_1 = *(device const float4*)(interPtr + baseI + 4);
+
+        down_dot += (unpack_e4m3(d4_0.x) * in4_0.x) + (unpack_e4m3(d4_0.y) * in4_0.y) +
+                    (unpack_e4m3(d4_1.x) * in4_1.x) + (unpack_e4m3(d4_1.y) * in4_1.y) +
+                    (unpack_e4m3(d4_0.z) * in4_0.z) + (unpack_e4m3(d4_0.w) * in4_0.w) +
+                    (unpack_e4m3(d4_1.z) * in4_1.z) + (unpack_e4m3(d4_1.w) * in4_1.w);
+    }
+
+    down_dot = simd_sum(down_dot);
+
+    if (laneId == 0) {
+        outputAccumulator[((uint64_t)tokenIdx * hiddenDim) + d] += routingWeight * (down_dot * downScale);
+    }
+}
+
+/// MSL Kernel: 32-Thread SIMDgroup Cooperative 2D 128x128 Block-Scaled FP8 SwiGLU Gate & Up Projections
+kernel void fp8_block_swiglu_gate_up_simd(
+    device const uchar* rawGateBuffer [[buffer(0)]],
+    device const uchar* rawUpBuffer [[buffer(1)]],
+    device const float* inputVector [[buffer(2)]],
+    device float* intermediateOutput [[buffer(3)]],
+    device const ushort* rawGateScaleBuffer [[buffer(4)]],
+    device const ushort* rawUpScaleBuffer [[buffer(5)]],
+    constant uint64_t& gateWeightOffset [[buffer(6)]],
+    constant uint64_t& gateScaleOffset [[buffer(7)]],
+    constant uint64_t& upWeightOffset [[buffer(8)]],
+    constant uint64_t& upScaleOffset [[buffer(9)]],
+    constant uint32_t& hiddenDim [[buffer(10)]],
+    constant uint32_t& intermediateDim [[buffer(11)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint r = tgPos.x;
+    if (r >= intermediateDim) return;
+
+    // Block-wise 128x128 scale indexing: scale matrix shape [intermediateDim / 128, hiddenDim / 128]
+    uint32_t numBlocksK = hiddenDim / 128;
+    uint32_t blockR = r / 128;
+    uint32_t scaleRowBase = blockR * numBlocksK;
+
+    device const uchar* gRow = rawGateBuffer + gateWeightOffset + ((uint64_t)r * hiddenDim);
+    device const uchar* uRow = rawUpBuffer + upWeightOffset + ((uint64_t)r * hiddenDim);
+    device const float* inPtr = inputVector;
+
+    float gate_dot = 0.0f;
+    float up_dot   = 0.0f;
+
+    for (uint32_t baseD = laneId * 8; baseD < hiddenDim; baseD += 32 * 8) {
+        uint32_t blockK = baseD / 128;
+        float gScale = bf16_to_fp32(rawGateScaleBuffer[(gateScaleOffset / 2) + scaleRowBase + blockK]);
+        float uScale = bf16_to_fp32(rawUpScaleBuffer[(upScaleOffset / 2) + scaleRowBase + blockK]);
+
+        uchar4 g4_0 = *(device const uchar4*)(gRow + baseD);
+        uchar4 g4_1 = *(device const uchar4*)(gRow + baseD + 4);
+        uchar4 u4_0 = *(device const uchar4*)(uRow + baseD);
+        uchar4 u4_1 = *(device const uchar4*)(uRow + baseD + 4);
+        float4 in4_0 = *(device const float4*)(inPtr + baseD);
+        float4 in4_1 = *(device const float4*)(inPtr + baseD + 4);
+
+        float g_chunk = (unpack_e4m3(g4_0.x) * in4_0.x) + (unpack_e4m3(g4_0.y) * in4_0.y) +
+                        (unpack_e4m3(g4_1.x) * in4_1.x) + (unpack_e4m3(g4_1.y) * in4_1.y) +
+                        (unpack_e4m3(g4_0.z) * in4_0.z) + (unpack_e4m3(g4_0.w) * in4_0.w) +
+                        (unpack_e4m3(g4_1.z) * in4_1.z) + (unpack_e4m3(g4_1.w) * in4_1.w);
+
+        float u_chunk = (unpack_e4m3(u4_0.x) * in4_0.x) + (unpack_e4m3(u4_0.y) * in4_0.y) +
+                        (unpack_e4m3(u4_1.x) * in4_1.x) + (unpack_e4m3(u4_1.y) * in4_1.y) +
+                        (unpack_e4m3(u4_0.z) * in4_0.z) + (unpack_e4m3(u4_0.w) * in4_0.w) +
+                        (unpack_e4m3(u4_1.z) * in4_1.z) + (unpack_e4m3(u4_1.w) * in4_1.w);
+
+        gate_dot += g_chunk * gScale;
+        up_dot   += u_chunk * uScale;
+    }
+
+    gate_dot = simd_sum(gate_dot);
+    up_dot   = simd_sum(up_dot);
+
+    if (laneId == 0) {
+        float finalGate = gate_dot;
+        float finalUp   = up_dot;
+        float silu_gate = finalGate / (1.0f + exp(-finalGate));
+        intermediateOutput[r] = silu_gate * finalUp;
+    }
+}
+
+/// MSL Kernel: 32-Thread SIMDgroup Cooperative 2D 128x128 Block-Scaled FP8 SwiGLU Gate & Up Projections (Batched)
+kernel void fp8_block_swiglu_gate_up_batched(
+    device const uchar* rawGateBuffer [[buffer(0)]],
+    device const uchar* rawUpBuffer [[buffer(1)]],
+    device const float* inputVector [[buffer(2)]],
+    device float* intermediateOutput [[buffer(3)]],
+    device const ushort* rawGateScaleBuffer [[buffer(4)]],
+    device const ushort* rawUpScaleBuffer [[buffer(5)]],
+    constant uint64_t& gateWeightOffset [[buffer(6)]],
+    constant uint64_t& gateScaleOffset [[buffer(7)]],
+    constant uint64_t& upWeightOffset [[buffer(8)]],
+    constant uint64_t& upScaleOffset [[buffer(9)]],
+    constant uint32_t& hiddenDim [[buffer(10)]],
+    constant uint32_t& intermediateDim [[buffer(11)]],
+    device const uint32_t* activeTokens [[buffer(12)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint r = tgPos.x;
+    uint batchIdx = tgPos.y;
+    if (r >= intermediateDim) return;
+
+    uint tokenIdx = activeTokens[batchIdx];
+
+    uint32_t numBlocksK = hiddenDim / 128;
+    uint32_t blockR = r / 128;
+    uint32_t scaleRowBase = blockR * numBlocksK;
+
+    device const uchar* gRow = rawGateBuffer + gateWeightOffset + ((uint64_t)r * hiddenDim);
+    device const uchar* uRow = rawUpBuffer + upWeightOffset + ((uint64_t)r * hiddenDim);
+    device const float* inPtr = inputVector + ((uint64_t)tokenIdx * hiddenDim);
+
+    float gate_dot = 0.0f;
+    float up_dot   = 0.0f;
+
+    for (uint32_t baseD = laneId * 8; baseD < hiddenDim; baseD += 32 * 8) {
+        uint32_t blockK = baseD / 128;
+        float gScale = bf16_to_fp32(rawGateScaleBuffer[(gateScaleOffset / 2) + scaleRowBase + blockK]);
+        float uScale = bf16_to_fp32(rawUpScaleBuffer[(upScaleOffset / 2) + scaleRowBase + blockK]);
+
+        uchar4 g4_0 = *(device const uchar4*)(gRow + baseD);
+        uchar4 g4_1 = *(device const uchar4*)(gRow + baseD + 4);
+        uchar4 u4_0 = *(device const uchar4*)(uRow + baseD);
+        uchar4 u4_1 = *(device const uchar4*)(uRow + baseD + 4);
+        float4 in4_0 = *(device const float4*)(inPtr + baseD);
+        float4 in4_1 = *(device const float4*)(inPtr + baseD + 4);
+
+        float g_chunk = (unpack_e4m3(g4_0.x) * in4_0.x) + (unpack_e4m3(g4_0.y) * in4_0.y) +
+                        (unpack_e4m3(g4_1.x) * in4_1.x) + (unpack_e4m3(g4_1.y) * in4_1.y) +
+                        (unpack_e4m3(g4_0.z) * in4_0.z) + (unpack_e4m3(g4_0.w) * in4_0.w) +
+                        (unpack_e4m3(g4_1.z) * in4_1.z) + (unpack_e4m3(g4_1.w) * in4_1.w);
+
+        float u_chunk = (unpack_e4m3(u4_0.x) * in4_0.x) + (unpack_e4m3(u4_0.y) * in4_0.y) +
+                        (unpack_e4m3(u4_1.x) * in4_1.x) + (unpack_e4m3(u4_1.y) * in4_1.y) +
+                        (unpack_e4m3(u4_0.z) * in4_0.z) + (unpack_e4m3(u4_0.w) * in4_0.w) +
+                        (unpack_e4m3(u4_1.z) * in4_1.z) + (unpack_e4m3(u4_1.w) * in4_1.w);
+
+        gate_dot += g_chunk * gScale;
+        up_dot   += u_chunk * uScale;
+    }
+
+    gate_dot = simd_sum(gate_dot);
+    up_dot   = simd_sum(up_dot);
+
+    if (laneId == 0) {
+        float finalGate = gate_dot;
+        float finalUp   = up_dot;
+        float silu_gate = finalGate / (1.0f + exp(-finalGate));
+        intermediateOutput[((uint64_t)tokenIdx * intermediateDim) + r] = silu_gate * finalUp;
+    }
+}
+
+/// MSL Kernel: 32-Thread SIMDgroup Cooperative 2D 128x128 Block-Scaled FP8 Down-Projection with Weighted Accumulation
+kernel void fp8_block_down_proj_accumulate_simd(
+    device const uchar* rawDownBuffer [[buffer(0)]],
+    device const float* intermediateVector [[buffer(1)]],
+    device float* outputAccumulator [[buffer(2)]],
+    device const ushort* rawDownScaleBuffer [[buffer(3)]],
+    constant uint64_t& downWeightOffset [[buffer(4)]],
+    constant uint64_t& downScaleOffset [[buffer(5)]],
+    constant uint32_t& intermediateDim [[buffer(6)]],
+    constant uint32_t& hiddenDim [[buffer(7)]],
+    constant float& routingWeight [[buffer(8)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint d = tgPos.x;
+    if (d >= hiddenDim) return;
+
+    // Block-wise 128x128 scale indexing: scale matrix shape [hiddenDim / 128, intermediateDim / 128]
+    uint32_t numBlocksI = intermediateDim / 128;
+    uint32_t blockD = d / 128;
+    uint32_t scaleRowBase = blockD * numBlocksI;
+
+    device const uchar* dRow = rawDownBuffer + downWeightOffset + ((uint64_t)d * intermediateDim);
+    device const float* interPtr = intermediateVector;
+
+    float down_dot = 0.0f;
+    for (uint32_t baseI = laneId * 8; baseI < intermediateDim; baseI += 32 * 8) {
+        uint32_t blockI = baseI / 128;
+        float dScale = bf16_to_fp32(rawDownScaleBuffer[(downScaleOffset / 2) + scaleRowBase + blockI]);
+
+        uchar4 d4_0 = *(device const uchar4*)(dRow + baseI);
+        uchar4 d4_1 = *(device const uchar4*)(dRow + baseI + 4);
+        float4 in4_0 = *(device const float4*)(interPtr + baseI);
+        float4 in4_1 = *(device const float4*)(interPtr + baseI + 4);
+
+        float d_chunk = (unpack_e4m3(d4_0.x) * in4_0.x) + (unpack_e4m3(d4_0.y) * in4_0.y) +
+                        (unpack_e4m3(d4_1.x) * in4_1.x) + (unpack_e4m3(d4_1.y) * in4_1.y) +
+                        (unpack_e4m3(d4_0.z) * in4_0.z) + (unpack_e4m3(d4_0.w) * in4_0.w) +
+                        (unpack_e4m3(d4_1.z) * in4_1.z) + (unpack_e4m3(d4_1.w) * in4_1.w);
+
+        down_dot += d_chunk * dScale;
+    }
+
+    down_dot = simd_sum(down_dot);
+
+    if (laneId == 0) {
+        outputAccumulator[d] += routingWeight * down_dot;
+    }
+}
+
+/// MSL Kernel: 32-Thread SIMDgroup Cooperative 2D 128x128 Block-Scaled FP8 Down-Projection with Weighted Accumulation (Batched)
+kernel void fp8_block_down_proj_accumulate_batched(
+    device const uchar* rawDownBuffer [[buffer(0)]],
+    device const float* intermediateVector [[buffer(1)]],
+    device float* outputAccumulator [[buffer(2)]],
+    device const ushort* rawDownScaleBuffer [[buffer(3)]],
+    constant uint64_t& downWeightOffset [[buffer(4)]],
+    constant uint64_t& downScaleOffset [[buffer(5)]],
+    constant uint32_t& intermediateDim [[buffer(6)]],
+    constant uint32_t& hiddenDim [[buffer(7)]],
+    constant float& defaultRoutingWeight [[buffer(8)]],
+    device const uint32_t* activeTokens [[buffer(9)]],
+    device const float* activeWeights [[buffer(10)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint d = tgPos.x;
+    uint batchIdx = tgPos.y;
+    if (d >= hiddenDim) return;
+
+    uint tokenIdx = activeTokens[batchIdx];
+    float routingWeight = activeWeights[batchIdx];
+
+    uint32_t numBlocksI = intermediateDim / 128;
+    uint32_t blockD = d / 128;
+    uint32_t scaleRowBase = blockD * numBlocksI;
+
+    device const uchar* dRow = rawDownBuffer + downWeightOffset + ((uint64_t)d * intermediateDim);
+    device const float* interPtr = intermediateVector + ((uint64_t)tokenIdx * intermediateDim);
+
+    float down_dot = 0.0f;
+    for (uint32_t baseI = laneId * 8; baseI < intermediateDim; baseI += 32 * 8) {
+        uint32_t blockI = baseI / 128;
+        float dScale = bf16_to_fp32(rawDownScaleBuffer[(downScaleOffset / 2) + scaleRowBase + blockI]);
+
+        uchar4 d4_0 = *(device const uchar4*)(dRow + baseI);
+        uchar4 d4_1 = *(device const uchar4*)(dRow + baseI + 4);
+        float4 in4_0 = *(device const float4*)(interPtr + baseI);
+        float4 in4_1 = *(device const float4*)(interPtr + baseI + 4);
+
+        float d_chunk = (unpack_e4m3(d4_0.x) * in4_0.x) + (unpack_e4m3(d4_0.y) * in4_0.y) +
+                        (unpack_e4m3(d4_1.x) * in4_1.x) + (unpack_e4m3(d4_1.y) * in4_1.y) +
+                        (unpack_e4m3(d4_0.z) * in4_0.z) + (unpack_e4m3(d4_0.w) * in4_0.w) +
+                        (unpack_e4m3(d4_1.z) * in4_1.z) + (unpack_e4m3(d4_1.w) * in4_1.w);
+
+        down_dot += d_chunk * dScale;
+    }
+
+    down_dot = simd_sum(down_dot);
+
+    if (laneId == 0) {
+        outputAccumulator[((uint64_t)tokenIdx * hiddenDim) + d] += routingWeight * down_dot;
     }
 }
 
@@ -2834,6 +3726,7 @@ kernel void q8_down_proj_accumulate(
 }
 
 /// MSL Kernel: 32-Thread SIMDgroup Cooperative MXFP8 GEMV (out = W * x) (128-bit Vectorized)
+/// Supports 2D batched grid (outDim, batchSize, 1) with threadgroup (32, 1, 1)
 kernel void mxfp8_gemv_simd(
     device const uchar* rawWeightBuffer [[buffer(0)]],
     device const float* inputVector [[buffer(1)]],
@@ -2843,14 +3736,17 @@ kernel void mxfp8_gemv_simd(
     constant uint64_t& scaleOffset [[buffer(5)]],
     constant uint32_t& inDim [[buffer(6)]],
     constant uint32_t& outDim [[buffer(7)]],
-    uint row [[threadgroup_position_in_grid]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
     uint laneId [[thread_index_in_simdgroup]]
 ) {
+    uint row = tgPos.x;
+    uint tokenIdx = tgPos.y;
     if (row >= outDim) return;
 
     uint32_t blocksPerRow = inDim / 32;
     uint64_t rowWeightStart = weightOffset + ((uint64_t)row * inDim);
     uint64_t rowScaleStart  = scaleOffset  + ((uint64_t)row * blocksPerRow);
+    device const float* inPtr = inputVector + ((uint64_t)tokenIdx * inDim);
 
     float threadDot = 0.0f;
 
@@ -2863,7 +3759,7 @@ kernel void mxfp8_gemv_simd(
         uint32_t inStart = b * 32;
 
         device const uchar4* w4 = (device const uchar4*)(rawWeightBuffer + blkStart);
-        device const float4* in4 = (device const float4*)(inputVector + inStart);
+        device const float4* in4 = (device const float4*)(inPtr + inStart);
 
         for (uint32_t i = 0; i < 8; i++) {
             uchar4 bytes = w4[i];
@@ -2875,7 +3771,7 @@ kernel void mxfp8_gemv_simd(
 
     float totalDot = simd_sum(threadDot);
     if (laneId == 0) {
-        outputVector[row] = totalDot;
+        outputVector[((uint64_t)tokenIdx * outDim) + row] = totalDot;
     }
 }
 
@@ -3294,8 +4190,8 @@ kernel void gdn_linear_attention_recurrent_step(
         float gamma = read_bf16_unaligned(normBuf + normOffset + ((uint64_t)i * 2));
         float yNorm = y_local[r] * rms * gamma;
         float z = zVector[zBase + i];
-        float silu_z = z / (1.0f + exp(-z));
-        outputVector[outBase + i] = yNorm * silu_z;
+        float sig_z = 1.0f / (1.0f + exp(-z));
+        outputVector[outBase + i] = yNorm * sig_z;
     }
 }
 
@@ -3390,6 +4286,219 @@ kernel void fuse_ngram_ple_embedding(
 ) {
     if (d >= hiddenDim) return;
     hiddenState[d] += ngramEmbedding[d] * pleScale;
+}
+
+/// MSL Kernel: Fused Initialize/Copy Streams from Token Embedding (Stream 0 -> Streams 0,1,2,3)
+/// Supports 2D batched grid (hiddenDim, batchSize, 1)
+kernel void fused_init_4streams(
+    device const float* inVector [[buffer(0)]], // [hiddenDim * batchSize]
+    device float* outStreams [[buffer(1)]],      // [4 * hiddenDim * batchSize]
+    constant uint32_t& hiddenDim [[buffer(2)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint d = pos.x;
+    uint tokenIdx = pos.y;
+    if (d >= hiddenDim) return;
+
+    float val = inVector[((uint64_t)tokenIdx * hiddenDim) + d];
+    uint64_t streamBase = (uint64_t)tokenIdx * (4 * hiddenDim);
+    outStreams[streamBase + d] = val;
+    outStreams[streamBase + hiddenDim + d] = val;
+    outStreams[streamBase + 2 * hiddenDim + d] = val;
+    outStreams[streamBase + 3 * hiddenDim + d] = val;
+}
+
+/// MSL Kernel: Extract Stream 0 to Output Vector
+/// Supports 2D batched grid (hiddenDim, batchSize, 1)
+kernel void extract_stream0(
+    device const float* inStreams [[buffer(0)]], // [4 * hiddenDim * batchSize]
+    device float* outVector [[buffer(1)]],       // [hiddenDim * batchSize]
+    constant uint32_t& hiddenDim [[buffer(2)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint d = pos.x;
+    uint tokenIdx = pos.y;
+    if (d >= hiddenDim) return;
+    outVector[((uint64_t)tokenIdx * hiddenDim) + d] = inStreams[((uint64_t)tokenIdx * (4 * hiddenDim)) + d];
+}
+
+/// MSL Kernel: Hyper-Connection Group RMSNorm (4 Streams of hiddenDim elements with Centered Weights)
+/// Supports 2D batched grid (4, batchSize, 1) with threadgroup (32, 1, 1)
+kernel void hyper_connection_norm_bf16(
+    device const float* inStreams [[buffer(0)]],        // [4 * hiddenDim * batchSize]
+    device const uchar* normBuf [[buffer(1)]],          // [4 * hiddenDim] (BF16)
+    device float* outNormedStreams [[buffer(2)]],       // [4 * hiddenDim * batchSize]
+    constant uint64_t& normOffset [[buffer(3)]],
+    constant uint32_t& hiddenDim [[buffer(4)]],         // 2560
+    constant float& eps [[buffer(5)]],                  // 1e-6
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint s = tgPos.x;
+    uint tokenIdx = tgPos.y;
+    if (s >= 4) return;
+
+    uint64_t streamBase = ((uint64_t)tokenIdx * (4 * hiddenDim)) + ((uint64_t)s * hiddenDim);
+    uint64_t normByteBase = normOffset + (((uint64_t)s * hiddenDim) * 2);
+
+    device const float* inPtr = inStreams + streamBase;
+    device float* outPtr = outNormedStreams + streamBase;
+
+    float sqSum = 0.0f;
+    for (uint32_t d = laneId; d < hiddenDim; d += 32) {
+        float val = inPtr[d];
+        sqSum += val * val;
+    }
+    sqSum = simd_sum(sqSum);
+    float rmsInv = rsqrt((sqSum / (float)hiddenDim) + eps);
+
+    for (uint32_t d = laneId; d < hiddenDim; d += 32) {
+        float val = inPtr[d];
+        float gamma = read_bf16_unaligned(normBuf + normByteBase + ((uint64_t)d * 2));
+        outPtr[d] = (val * rmsInv) * (1.0f + gamma);
+    }
+}
+
+/// MSL Kernel: Hyper-Connection Down-Projection (10240 Normed -> 320 Bottleneck with / 4 Scaling and SiLU Activation)
+/// Supports 2D batched grid (bottleneckRank, batchSize, 1) with threadgroup (32, 1, 1)
+kernel void hyper_connection_down_proj_bf16(
+    device const float* normedStreams [[buffer(0)]],    // [10240 * batchSize]
+    device const uchar* downWeightBuf [[buffer(1)]],    // [320, 10240] (BF16)
+    device float* outBottleneck [[buffer(2)]],          // [320 * batchSize]
+    constant uint64_t& downWeightOffset [[buffer(3)]],
+    constant uint32_t& totalDim [[buffer(4)]],          // 10240
+    constant uint32_t& bottleneckRank [[buffer(5)]],    // 320
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint rankIdx = tgPos.x;
+    uint tokenIdx = tgPos.y;
+    if (rankIdx >= bottleneckRank) return;
+
+    device const float* normedToken = normedStreams + ((uint64_t)tokenIdx * totalDim);
+    uint64_t rowByteBase = downWeightOffset + ((uint64_t)rankIdx * totalDim * 2);
+
+    float partialSum = 0.0f;
+    for (uint32_t i = laneId; i < totalDim; i += 32) {
+        float normed = normedToken[i];
+        float w_down = read_bf16_unaligned(downWeightBuf + rowByteBase + ((uint64_t)i * 2));
+        partialSum += normed * w_down;
+    }
+
+    float totalRowSum = simd_sum(partialSum);
+    if (laneId == 0) {
+        // Scaled by 1/4 and activated with SiLU: w = silu(down(normed) / 4)
+        float scaled = totalRowSum * 0.25f;
+        float silu_val = scaled / (1.0f + exp(-scaled));
+        outBottleneck[((uint64_t)tokenIdx * bottleneckRank) + rankIdx] = silu_val;
+    }
+}
+
+/// MSL Kernel: Hyper-Connection Up-Projection and Stream Blending (320 Bottleneck -> 10240 Gates -> 2560 Layer Input)
+/// Multiplies sigmoid(up) * normed and averages across 4 streams: mixed = (w * normed).mean(axis=-2)
+/// Supports 2D batched grid (hiddenDim, batchSize, 1) with threadgroup (32, 1, 1)
+kernel void hyper_connection_up_proj_blend_bf16(
+    device const float* normedStreams [[buffer(0)]],  // [10240 * batchSize] (4 streams normed)
+    device const float* bottleneck [[buffer(1)]],     // [320 * batchSize] (SiLU activated)
+    device const uchar* upWeightBuf [[buffer(2)]],    // [10240, 320] (BF16)
+    device float* outLayerInput [[buffer(3)]],        // [2560 * batchSize]
+    constant uint64_t& upWeightOffset [[buffer(4)]],
+    constant uint32_t& hiddenDim [[buffer(5)]],       // 2560
+    constant uint32_t& bottleneckRank [[buffer(6)]],  // 320
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint d = tgPos.x;
+    uint tokenIdx = tgPos.y;
+    if (d >= hiddenDim) return;
+
+    device const float* normedToken = normedStreams + ((uint64_t)tokenIdx * (4 * hiddenDim));
+    device const float* bottleneckToken = bottleneck + ((uint64_t)tokenIdx * bottleneckRank);
+
+    float mixed_d = 0.0f;
+
+    for (uint32_t s = 0; s < 4; s++) {
+        uint32_t gateIdx = (s * hiddenDim) + d;
+        uint64_t rowByteBase = upWeightOffset + ((uint64_t)gateIdx * bottleneckRank * 2);
+
+        float gateSum = 0.0f;
+        for (uint32_t r = laneId; r < bottleneckRank; r += 32) {
+            float z_r = bottleneckToken[r];
+            float w_up = read_bf16_unaligned(upWeightBuf + rowByteBase + ((uint64_t)r * 2));
+            gateSum += z_r * w_up;
+        }
+        float gateVal = simd_sum(gateSum);
+
+        if (laneId == 0) {
+            float normed_val = normedToken[gateIdx];
+            float gate_act = 1.0f / (1.0f + exp(-gateVal));
+            mixed_d += normed_val * gate_act;
+        }
+    }
+
+    if (laneId == 0) {
+        // Average across 4 streams: mixed = (w * normed).mean(axis=-2)
+        outLayerInput[((uint64_t)tokenIdx * hiddenDim) + d] = mixed_d * 0.25f;
+    }
+}
+
+/// MSL Kernel: Hyper-Connection Block Injection Scale Computation (10240 Normed -> 4 Scalar Injection Weights)
+/// Computes inject = 2.0 * sigmoid( (block_inject_weight * normed) / 4 )
+/// Supports 2D batched grid (4, batchSize, 1) with threadgroup (32, 1, 1)
+kernel void hyper_connection_inject_scale_bf16(
+    device const float* normedStreams [[buffer(0)]],    // [10240 * batchSize]
+    device const uchar* injectWeightBuf [[buffer(1)]],  // [4, 10240] (BF16)
+    device float* outInjectScale [[buffer(2)]],         // [4 * batchSize]
+    constant uint64_t& injectOffset [[buffer(3)]],
+    constant uint32_t& totalDim [[buffer(4)]],          // 10240
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint s = tgPos.x;
+    uint tokenIdx = tgPos.y;
+    if (s >= 4) return;
+
+    device const float* normedToken = normedStreams + ((uint64_t)tokenIdx * totalDim);
+    uint64_t rowByteBase = injectOffset + ((uint64_t)s * totalDim * 2);
+
+    float partialSum = 0.0f;
+    for (uint32_t i = laneId; i < totalDim; i += 32) {
+        float normed = normedToken[i];
+        float w_inj = read_bf16_unaligned(injectWeightBuf + rowByteBase + ((uint64_t)i * 2));
+        partialSum += normed * w_inj;
+    }
+
+    float totalRowSum = simd_sum(partialSum);
+    if (laneId == 0) {
+        // inject = 2.0 * sigmoid(inj_out / 4)
+        float scaled = totalRowSum * 0.25f;
+        float sig_val = 1.0f / (1.0f + exp(-scaled));
+        outInjectScale[((uint64_t)tokenIdx * 4) + s] = 2.0f * sig_val;
+    }
+}
+
+/// MSL Kernel: Hyper-Connection Stream Addition (Sublayer Output -> 4 Residual Streams)
+/// Applies: stream[s, d] += inject_scale[s] * layer_output[d]
+/// Supports 2D batched grid (hiddenDim, batchSize, 1)
+kernel void hyper_connection_inject_bf16(
+    device float* inOutStreams [[buffer(0)]],          // [10240 * batchSize] (4 streams)
+    device const float* layerOutput [[buffer(1)]],     // [2560 * batchSize]
+    device const float* injectScale [[buffer(2)]],      // [4 * batchSize]
+    constant uint32_t& hiddenDim [[buffer(3)]],        // 2560
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint d = pos.x;
+    uint tokenIdx = pos.y;
+    if (d >= hiddenDim) return;
+
+    device float* streamsToken = inOutStreams + ((uint64_t)tokenIdx * (4 * hiddenDim));
+    device const float* outToken = layerOutput + ((uint64_t)tokenIdx * hiddenDim);
+    device const float* scaleToken = injectScale + ((uint64_t)tokenIdx * 4);
+
+    float y_d = outToken[d];
+    for (uint32_t s = 0; s < 4; s++) {
+        streamsToken[(s * hiddenDim) + d] += scaleToken[s] * y_d;
+    }
 }
 
 

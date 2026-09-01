@@ -134,6 +134,18 @@ public struct NestedTextConfig: Codable {
     public var tieWordEmbeddings: Bool?
     public var skipLoopFinalNorm: Bool?
 
+    public var linearNumValueHeads: Int?
+    public var linearNumKeyHeads: Int?
+    public var linearValueHeadDim: Int?
+    public var linearKeyHeadDim: Int?
+    public var linearConvKernelDim: Int?
+    public var moeIntermediateSize: Int?
+    public var hcCount: Int?
+    public var hcLowrank: Int?
+    public var indexerNHeads: Int?
+    public var indexerKvHeads: Int?
+    public var indexerHeadDim: Int?
+
     enum CodingKeys: String, CodingKey {
         case hiddenSize = "hidden_size"
         case numHiddenLayers = "num_hidden_layers"
@@ -156,6 +168,17 @@ public struct NestedTextConfig: Codable {
         case bosTokenId = "bos_token_id"
         case tieWordEmbeddings = "tie_word_embeddings"
         case skipLoopFinalNorm = "skip_loop_final_norm"
+        case linearNumValueHeads = "linear_num_value_heads"
+        case linearNumKeyHeads = "linear_num_key_heads"
+        case linearValueHeadDim = "linear_value_head_dim"
+        case linearKeyHeadDim = "linear_key_head_dim"
+        case linearConvKernelDim = "linear_conv_kernel_dim"
+        case moeIntermediateSize = "moe_intermediate_size"
+        case hcCount = "hc_count"
+        case hcLowrank = "hc_lowrank"
+        case indexerNHeads = "indexer_n_heads"
+        case indexerKvHeads = "indexer_kv_heads"
+        case indexerHeadDim = "indexer_head_dim"
     }
 }
 
@@ -183,6 +206,17 @@ public struct ModelConfig: Codable {
     public var bosTokenId: TokenIdOrArray?
     public var tieWordEmbeddings: Bool?
     public var skipLoopFinalNorm: Bool?
+    public var linearNumValueHeads: Int?
+    public var linearNumKeyHeads: Int?
+    public var linearValueHeadDim: Int?
+    public var linearKeyHeadDim: Int?
+    public var linearConvKernelDim: Int?
+    public var moeIntermediateSize: Int?
+    public var hcCount: Int?
+    public var hcLowrank: Int?
+    public var indexerNHeads: Int?
+    public var indexerKvHeads: Int?
+    public var indexerHeadDim: Int?
     public var textConfig: NestedTextConfig?
 
     enum CodingKeys: String, CodingKey {
@@ -209,6 +243,17 @@ public struct ModelConfig: Codable {
         case bosTokenId = "bos_token_id"
         case tieWordEmbeddings = "tie_word_embeddings"
         case skipLoopFinalNorm = "skip_loop_final_norm"
+        case linearNumValueHeads = "linear_num_value_heads"
+        case linearNumKeyHeads = "linear_num_key_heads"
+        case linearValueHeadDim = "linear_value_head_dim"
+        case linearKeyHeadDim = "linear_key_head_dim"
+        case linearConvKernelDim = "linear_conv_kernel_dim"
+        case moeIntermediateSize = "moe_intermediate_size"
+        case hcCount = "hc_count"
+        case hcLowrank = "hc_lowrank"
+        case indexerNHeads = "indexer_n_heads"
+        case indexerKvHeads = "indexer_kv_heads"
+        case indexerHeadDim = "indexer_head_dim"
         case textConfig = "text_config"
     }
 
@@ -303,16 +348,44 @@ public struct ModelConfig: Codable {
         return headDim
     }
 
+    public var effectiveLinearNumValueHeads: Int {
+        return textConfig?.linearNumValueHeads ?? linearNumValueHeads ?? 48
+    }
+
+    public var effectiveLinearNumKeyHeads: Int {
+        return textConfig?.linearNumKeyHeads ?? linearNumKeyHeads ?? 16
+    }
+
+    public var effectiveLinearValueHeadDim: Int {
+        return textConfig?.linearValueHeadDim ?? linearValueHeadDim ?? 128
+    }
+
+    public var effectiveLinearKeyHeadDim: Int {
+        return textConfig?.linearKeyHeadDim ?? linearKeyHeadDim ?? 128
+    }
+
+    public var effectiveMoeIntermediateSize: Int {
+        return textConfig?.moeIntermediateSize ?? moeIntermediateSize ?? 640
+    }
+
+    public var effectiveHcCount: Int {
+        return textConfig?.hcCount ?? hcCount ?? 4
+    }
+
+    public var effectiveHcLowrank: Int {
+        return textConfig?.hcLowrank ?? hcLowrank ?? 320
+    }
+
     public var effectiveLayerTypesStrings: [String]? {
         return textConfig?.layerTypes ?? layerTypes
     }
 
     /// Auto-detect the architecture type from config and topology summary
     public func resolveArchitectureType(summary: ModelSummary?) -> ModelArchitectureType {
-        let rawType = (textConfig != nil ? "qwen3_5_moe" : (modelType ?? "")).lowercased()
+        let rawType = (modelType ?? (textConfig != nil ? "qwen3_5_moe" : "")).lowercased()
         let archs = architectures?.map { $0.lowercased() } ?? []
 
-        let isQwen38Model = rawType.contains("qwen3_8") || rawType.contains("qwen38") || rawType.contains("flash_next") || archs.contains(where: { $0.contains("qwen3_8") || $0.contains("flash_next") }) || effectiveNumExperts >= 512 || (summary != nil && summary!.maxExpertId >= 500)
+        let isQwen38Model = rawType.contains("qwen3_8") || rawType.contains("qwen38") || rawType.contains("flash_next") || rawType.contains("qwen4") || archs.contains(where: { $0.contains("qwen3_8") || $0.contains("flash_next") || $0.contains("qwen4") }) || effectiveNumExperts >= 512 || (summary != nil && summary!.maxExpertId >= 500)
         if isQwen38Model {
             return .qwen38FlashNext
         }
@@ -372,10 +445,14 @@ public struct ModelConfig: Codable {
         let archs = architectures?.map { $0.lowercased() } ?? []
         let modelTypeLower = (modelType ?? "").lowercased()
 
-        // Qwen 3.5 / Qwen 3.5 MoE / Ornith models use 0-mean unit-offset RMSNorm weights (1.0 + weight)
+        // Qwen 3.5 / Qwen 3.8 / Qwen 4 / Ornith models use 0-mean unit-offset RMSNorm weights (1.0 + weight)
         if rawType.contains("qwen3_5") || rawType.contains("qwen3.5") ||
+           rawType.contains("qwen3_8") || rawType.contains("qwen3.8") ||
+           rawType.contains("qwen3_next") || rawType.contains("qwen4") ||
            modelTypeLower.contains("qwen3_5") || modelTypeLower.contains("qwen3.5") ||
-           archs.contains(where: { $0.contains("qwen3_5") || $0.contains("qwen3.5") }) ||
+           modelTypeLower.contains("qwen3_8") || modelTypeLower.contains("qwen3.8") ||
+           modelTypeLower.contains("qwen3_next") || modelTypeLower.contains("qwen4") ||
+           archs.contains(where: { $0.contains("qwen3_5") || $0.contains("qwen3.5") || $0.contains("qwen3_8") || $0.contains("qwen3.8") || $0.contains("qwen3_next") || $0.contains("qwen4") }) ||
            rawType.contains("ornith") || modelTypeLower.contains("ornith") ||
            archs.contains(where: { $0.contains("ornith") }) {
             return true

@@ -2,7 +2,7 @@
 
 *Dynamic, SSD-Streamed Mixture-of-Experts and Dense LLM Inference on Apple Silicon.*
 
-DynaMoE is a high-performance native macOS application, local inference engine, Model Context Protocol (MCP) server, and OpenAI-compatible API host. Engineered specifically for Apple Silicon's Unified Memory Architecture, DynaMoE runs massive Mixture-of-Experts (MoE) and Dense language models that exceed physical system RAM by dynamically memory-mapping and streaming weights directly from high-speed NVMe storage to the GPU.
+DynaMoE is a high-performance native macOS application, local inference engine, Model Context Protocol (MCP) server, and OpenAI-compatible API host. Engineered specifically for Apple Silicon's Unified Memory Architecture, DynaMoE runs massive Mixture-of-Experts (MoE), newer hybrid attention models (Qwen 3.8 Flash Next), and dense language models that exceed physical system RAM by dynamically memory-mapping and streaming weights directly from high-speed NVMe storage to the GPU.
 
 ---
 
@@ -22,16 +22,15 @@ DynaMoE supports both sparse Mixture-of-Experts and dense autoregressive transfo
 
 | Model / Family | Parameters | Active Parameters | Architecture Type | Quantization & Precision | Context Window |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Ornith 1.5 35B MoE** | 35B (256 Experts) | ~3B (8 Active + Shared) | Hybrid GatedDeltaNet + GQA | Q4 Affine / Q8 / BF16 / FP8 (MXFP8) | 262,144 (Native) / 1M+ (YaRN) |
-| **Qwen 3.5 35B MoE** | 35B (256 Experts) | ~3B (8 Active + Shared) | Hybrid GatedDeltaNet + GQA | Q4 Affine / Q8 / BF16 / FP8 | 262,144 (Native) / 1M+ (YaRN) |
+| **Qwen 3.8 Flash Next** | ~180B (512 Experts + 51B PLE) | ~6B (10 Active + Shared) | Hybrid GatedDeltaNet + QSA Sparse Attention + Gated Residuals | FP8 (MXFP8) / BF16 / NVFP4 | 131,072 / 262,144 |
+| **Ornith 1.5 35B A3B** | 35B (256 Experts) | ~3B (8 Active + Shared) | Hybrid GatedDeltaNet + GQA | Q4 Affine / Q8 / BF16 / FP8 (MXFP8) | 262,144 (Native) / 1M+ (YaRN) |
 | **Ornith 1.5 9B Dense** | 9B Dense | 9B | Hybrid GatedDeltaNet + GQA | 8-Bit Affine / BF16 / FP16 | 131,072 |
-| **Nanbeige 4.2 3B** | 3B Dense | 3B | Dense Transformer (22 Layers) | FP8 (E4M3) / BF16 / FP16 | 32,768 |
-| **Qwen 2.5 / DeepSeek / LLaMA** | 0.5B – 70B+ | All / Active | Dense & Sparse MoE | Q4 / Q8 / FP8 / BF16 / FP16 | Up to 128,000+ |
+| **Standard Dense LLMs** | 3B – 32B | Full Layer Width | Dense Transformer (LLaMA / Qwen 2.5 / Nanbeige) | Q4 / Q8 / BF16 / FP16 | Model Default |
 
 ### Key Architectural Strengths:
-* **Hybrid GatedDeltaNet SSM + Full Attention**: 30 linear attention layers with $O(1)$ constant-memory recurrent state plus 10 full Grouped-Query Attention (GQA) layers with partial rotary position embeddings (RoPE).
-* **Dense Transformer Acceleration**: Dedicated compute pipelines for standard dense MLP architectures, non-offset RMSNorms, and 22–32 layer dense configurations.
-* **Granular Sparsity**: 256 fine-grained routed experts per layer (Top-8 activated per token) plus dedicated Sigmoid-gated shared experts.
+* **Hybrid Recurrent SSM + Sparse/Full Attention**: GatedDeltaNet linear recurrent attention layers ($O(1)$ constant-memory state) interleaved 3:1 with Qwen Sparse Attention (QSA) or Grouped-Query Attention (GQA).
+* **Massive Fine-Grained Sparsity & High Throughput Routing**: 256–512 routed experts per layer (Top-8 / Top-10 activated per token) plus dedicated Sigmoid-gated shared experts with zero-copy NVMe streaming.
+* **4-Stream Gated Residuals & N-Gram PLE Support**: 4 parallel structural residual streams with rank-320 bottleneck read gates and zero-copy Layer 2 N-gram Predictive Local Embedding (PLE) row gathering.
 * **Dynamic Architecture Auto-Detection**: Inspects `config.json`, SafeTensors headers, and tensor topologies to automatically configure layer count, hidden dimensions, attention heads, KV heads, RoPE theta, RMSNorm eps, unit offsets, and MLP projection types.
 
 ---

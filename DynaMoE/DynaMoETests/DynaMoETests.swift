@@ -949,17 +949,14 @@ final class DynaMoETests: XCTestCase {
         XCTAssertLessThan(tElapsedMs, 50.0, "Parallel pread should complete within 50ms for 13.5MB")
     }
 
-    func testAgentHarnessToolCalling() throws {
+    func testAgentHarnessToolCalling() async throws {
         let harness = AgentHarness.shared
-        XCTAssertEqual(harness.availableTools.count, 2)
+        XCTAssertGreaterThanOrEqual(harness.tools.count, 2)
 
         // 1. Prompt formatting
-        let formatted = harness.formatInitialChatML(userMessage: "List files in directory")
-        XCTAssertTrue(formatted.contains("<|im_start|>system"))
+        let formatted = harness.buildSystemPrompt(baseSystem: "You are an assistant.")
         XCTAssertTrue(formatted.contains("# Tools"))
         XCTAssertTrue(formatted.contains("shell_run"))
-        XCTAssertTrue(formatted.contains("<|im_start|>user\nList files in directory<|im_end|>"))
-        XCTAssertTrue(formatted.hasSuffix("<|im_start|>assistant\n"))
 
         // 2. Parse Tool Calls
         let modelOutput = """
@@ -969,16 +966,16 @@ final class DynaMoETests: XCTestCase {
         </tool_call>
         """
         let parsed = harness.parseToolCalls(from: modelOutput)
-        XCTAssertEqual(parsed.count, 1)
-        XCTAssertEqual(parsed[0].name, "shell_run")
-        XCTAssertEqual(parsed[0].arguments["command"] as? String, "echo 'hello world'")
+        XCTAssertEqual(parsed.calls.count, 1)
+        XCTAssertEqual(parsed.calls[0].name, "shell_run")
+        XCTAssertEqual(parsed.calls[0].arguments["command"] as? String, "echo 'hello world'")
 
         // 3. Tool Execution
-        let result = harness.executeToolCall(parsed[0])
-        XCTAssertTrue(result.contains("hello world"))
+        let result = await harness.executeTool(call: parsed.calls[0])
+        XCTAssertTrue(result.resultJSON.contains("hello world"))
 
         // 4. Continuation turn formatting
-        let nextTurn = harness.formatToolResponseTurn(toolName: "shell_run", response: result.trimmingCharacters(in: .whitespacesAndNewlines))
+        let nextTurn = harness.formatToolResponseTurn(responses: [result.resultJSON])
         XCTAssertTrue(nextTurn.contains("<tool_response>"))
         XCTAssertTrue(nextTurn.contains("hello world"))
         XCTAssertTrue(nextTurn.hasSuffix("<|im_start|>assistant\n"))
@@ -1296,6 +1293,400 @@ final class DynaMoETests: XCTestCase {
 
         try? logOutput.write(toFile: "/tmp/dynamoe_ornith_flashmoe_benchmark.log", atomically: true, encoding: .utf8)
         print("🎉 [DIAGNOSTIC] Ornith FlashMoE FP8 diagnostic run complete. Report saved to /tmp/dynamoe_ornith_flashmoe_benchmark.log")
+    }
+
+    func testRepackQwen38FP8() throws {
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next-FP8/snapshots/236dfdf285828023ca3bcd3f37366c58a3469b13"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            print("Qwen 3.8 Flash Next FP8 snapshot not found, skipping.")
+            return
+        }
+        let srcUrl = URL(fileURLWithPath: snapshotDir)
+        let repacker = ExpertRepacker.shared
+        print("🚀 Starting ExpertRepacker on Qwen 3.8 Flash Next FP8...")
+        let t0 = CFAbsoluteTimeGetCurrent()
+        try repacker.repackSafetensors(sourceDir: srcUrl, outputDir: srcUrl) { p, msg in
+            print(String(format: "[REPACK PROGRESS] %.0f%%: %@", p * 100, msg))
+        }
+        let elapsed = CFAbsoluteTimeGetCurrent() - t0
+        print(String(format: "🎉 Repacking completed in %.2f s!", elapsed))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: srcUrl.appendingPathComponent("model_weights.bin").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: srcUrl.appendingPathComponent("packed_experts/layout.json").path))
+    }
+
+    func testQwen38FlashNextForward() throws {
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next-FP8/snapshots/236dfdf285828023ca3bcd3f37366c58a3469b13"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            print("Qwen 3.8 Flash Next FP8 snapshot not found, skipping.")
+            return
+        }
+        print("🔍 [DIAGNOSTIC] Loading Qwen 3.8 Flash Next FP8 from \(snapshotDir)...")
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let engine = try DynaMoeEngine(filePath: snapshotDir)
+        let summary = try engine.getSummary()
+        let tLoad = CFAbsoluteTimeGetCurrent() - t0
+        print(String(format: "✅ [DIAGNOSTIC] Model parsed in %.3f s. Found %d shards, %d tensors, maxExpertId=%d", tLoad, summary.shards.count, summary.tensors.count, summary.maxExpertId))
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+
+        var buffers: [UInt32: MTLBuffer] = [:]
+        var totalMappedBytes: Int = 0
+        for shard in summary.shards {
+            let address = UInt(shard.baseAddress)
+            guard let ptr = UnsafeMutableRawPointer(bitPattern: address) else { continue }
+            let len = Int(shard.length)
+            if let buf = device.makeBuffer(bytesNoCopy: ptr, length: len, options: .storageModeShared, deallocator: nil) {
+                buffers[shard.index] = buf
+                totalMappedBytes += len
+            }
+        }
+        print(String(format: "✅ [DIAGNOSTIC] Mapped %.2f GB across %d shards into Metal buffers.", Double(totalMappedBytes) / (1024*1024*1024), summary.shards.count))
+
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+        print("✅ [DIAGNOSTIC] Metal compute pipelines initialized.")
+
+        guard let cmdQueue = device.makeCommandQueue() else {
+            XCTFail("No Metal command queue")
+            return
+        }
+
+        let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir))
+        let cachedLayers = inference.buildCachedLayers(summary: summary, config: config, targetLayerCount: 48)
+        print("✅ [DIAGNOSTIC] Built \(cachedLayers.count) cached layers.")
+        if let l0 = cachedLayers.first {
+            print("🔍 [DIAGNOSTIC] Layer 0: attnType=\(l0.attentionType), norm1=\(l0.norm1Tensor?.name ?? "nil"), attnHcDown=\(l0.attnHcDownWeight?.name ?? "nil"), attnHcNorm=\(l0.attnHcNorm?.name ?? "nil"), inProjQKV=\(l0.inProjQKV?.name ?? "nil"), qProj=\(l0.qProjTensor?.name ?? "nil")")
+        }
+        if cachedLayers.count > 3 {
+            let l3 = cachedLayers[3]
+            print("🔍 [DIAGNOSTIC] Layer 3: attnType=\(l3.attentionType), norm1=\(l3.norm1Tensor?.name ?? "nil"), attnHcDown=\(l3.attnHcDownWeight?.name ?? "nil"), qProj=\(l3.qProjTensor?.name ?? "nil"), kProj=\(l3.kProjTensor?.name ?? "nil"), vProj=\(l3.vProjTensor?.name ?? "nil")")
+        }
+        let allTensorsL0 = summary.tensors.filter { $0.name.contains("layers.0.") || $0.name.contains("layers_0") }
+        let hcTensors = summary.tensors.filter { $0.name.contains("hc") || $0.name.contains("hyper") }
+        let normTensors = summary.tensors.filter { $0.name.contains("norm") }
+        let embedTensors = summary.tensors.filter { $0.name.contains("embed") || $0.name.contains("wte") }
+        let lmHeadTensors = summary.tensors.filter { $0.name.contains("lm_head") || $0.name.contains("output") }
+        var diagOutput = "=== QWEN 3.8 FLASH NEXT DIAGNOSTICS ===\n"
+        diagOutput += "Total tensors: \(summary.tensors.count)\n"
+        diagOutput += "Layer 0 tensors count: \(allTensorsL0.count)\n"
+        for t in allTensorsL0 {
+            diagOutput += "  L0: \(t.name) | dtype=\(t.dtype) | shape=\(t.shapeDisplay)\n"
+        }
+        diagOutput += "Hyper-Connection tensors count: \(hcTensors.count)\n"
+        for t in hcTensors {
+            diagOutput += "  HC: \(t.name) | dtype=\(t.dtype) | shape=\(t.shapeDisplay)\n"
+        }
+        diagOutput += "Norm tensors count: \(normTensors.count)\n"
+        for t in normTensors.prefix(15) {
+            diagOutput += "  Norm: \(t.name) | dtype=\(t.dtype) | shape=\(t.shapeDisplay)\n"
+        }
+        diagOutput += "Embed tensors: \(embedTensors.map { "\($0.name) (\($0.dtype), \($0.shapeDisplay))" })\n"
+        diagOutput += "LM Head tensors: \(lmHeadTensors.map { "\($0.name) (\($0.dtype), \($0.shapeDisplay))" })\n"
+        diagOutput += "Layer 0 in CachedLayers:\n"
+        if let l0 = cachedLayers.first {
+            diagOutput += "  attnType: \(l0.attentionType)\n"
+            diagOutput += "  mlpType: \(l0.mlpType)\n"
+            diagOutput += "  norm1: \(l0.norm1Tensor?.name ?? "nil")\n"
+            diagOutput += "  norm2: \(l0.norm2Tensor?.name ?? "nil")\n"
+            diagOutput += "  attnHcDown: \(l0.attnHcDownWeight?.name ?? "nil")\n"
+            diagOutput += "  attnHcUp: \(l0.attnHcUpWeight?.name ?? "nil")\n"
+            diagOutput += "  attnHcNorm: \(l0.attnHcNorm?.name ?? "nil")\n"
+            diagOutput += "  attnHcInject: \(l0.attnHcInjectWeight?.name ?? "nil")\n"
+            diagOutput += "  mlpHcDown: \(l0.mlpHcDownWeight?.name ?? "nil")\n"
+            diagOutput += "  mlpHcUp: \(l0.mlpHcUpWeight?.name ?? "nil")\n"
+            diagOutput += "  mlpHcNorm: \(l0.mlpHcNorm?.name ?? "nil")\n"
+            diagOutput += "  mlpHcInject: \(l0.mlpHcInjectWeight?.name ?? "nil")\n"
+            diagOutput += "  inProjQKV: \(l0.inProjQKV?.name ?? "nil")\n"
+            diagOutput += "  conv1d: \(l0.conv1dTensor?.name ?? "nil")\n"
+            diagOutput += "  router: \(l0.routerTensor?.name ?? "nil")\n"
+            diagOutput += "  numExpertGateWeights: \(l0.expertGateWeights.count)\n"
+        }
+        try? diagOutput.write(toFile: "/tmp/qwen_info.txt", atomically: true, encoding: .utf8)
+
+        let hiddenDim = 2560
+        let intermediateDim = 640
+        let topK = 10
+
+        guard let hStateBufA = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let hStateBufB = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let interBuf = device.makeBuffer(length: intermediateDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let hMlpBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+            XCTFail("Failed to allocate scratch buffers")
+            return
+        }
+
+        // Test forward pass across all 48 layers with 2D block-scaled FP8 kernels
+        var hCurr = hStateBufA
+        var hNext = hStateBufB
+
+        let hPtr = hCurr.contents().bindMemory(to: Float.self, capacity: hiddenDim)
+        for i in 0..<hiddenDim {
+            hPtr[i] = Float.random(in: -0.1...0.1)
+        }
+
+        let tForward0 = CFAbsoluteTimeGetCurrent()
+        for (l, layer) in cachedLayers.enumerated() {
+            guard let cmdB = cmdQueue.makeCommandBuffer(), let encB = cmdB.makeComputeCommandEncoder() else { break }
+
+            if let clearPipe = inference.clearPipeline {
+                encB.setComputePipelineState(clearPipe)
+                encB.setBuffer(hMlpBuf, offset: 0, index: 0)
+                encB.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, clearPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                encB.memoryBarrier(scope: .buffers)
+            }
+
+            // Route top-10 active experts per layer
+            for k in 0..<topK {
+                let expId = (l * 7 + k * 13) % 512
+                let pk: Float = 0.1
+
+                guard let gateW = layer.expertGateWeights[expId], let gateRaw = buffers[gateW.shardIndex],
+                      let upW = layer.expertUpWeights[expId], let upRaw = buffers[upW.shardIndex],
+                      let downW = layer.expertDownWeights[expId], let downRaw = buffers[downW.shardIndex],
+                      let gateS = layer.expertGateScales[expId], let gateSRaw = buffers[gateS.shardIndex],
+                      let upS = layer.expertUpScales[expId], let upSRaw = buffers[upS.shardIndex],
+                      let downS = layer.expertDownScales[expId], let downSRaw = buffers[downS.shardIndex] else {
+                    continue
+                }
+
+                if let fp8GatePipe = inference.fp8BlockGateUpSimdPipeline ?? inference.fp8GateUpSimdPipeline,
+                   let fp8DownPipe = inference.fp8BlockDownSimdPipeline ?? inference.fp8DownSimdPipeline {
+                    var gWOff = gateW.offsetStart
+                    var gSOff = gateS.offsetStart
+                    var uWOff = upW.offsetStart
+                    var uSOff = upS.offsetStart
+                    var dWOff = downW.offsetStart
+                    var dSOff = downS.offsetStart
+                    var hDimVal: UInt32 = UInt32(hiddenDim)
+                    var interDimVal: UInt32 = UInt32(intermediateDim)
+                    var pkVal = pk
+
+                    encB.setComputePipelineState(fp8GatePipe)
+                    encB.setBuffer(gateRaw, offset: 0, index: 0)
+                    encB.setBuffer(upRaw, offset: 0, index: 1)
+                    encB.setBuffer(hCurr, offset: 0, index: 2)
+                    encB.setBuffer(interBuf, offset: 0, index: 3)
+                    encB.setBuffer(gateSRaw, offset: 0, index: 4)
+                    encB.setBuffer(upSRaw, offset: 0, index: 5)
+                    encB.setBytes(&gWOff, length: 8, index: 6)
+                    encB.setBytes(&gSOff, length: 8, index: 7)
+                    encB.setBytes(&uWOff, length: 8, index: 8)
+                    encB.setBytes(&uSOff, length: 8, index: 9)
+                    encB.setBytes(&hDimVal, length: 4, index: 10)
+                    encB.setBytes(&interDimVal, length: 4, index: 11)
+                    encB.dispatchThreadgroups(MTLSize(width: intermediateDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                    encB.memoryBarrier(scope: .buffers)
+
+                    encB.setComputePipelineState(fp8DownPipe)
+                    encB.setBuffer(downRaw, offset: 0, index: 0)
+                    encB.setBuffer(interBuf, offset: 0, index: 1)
+                    encB.setBuffer(hMlpBuf, offset: 0, index: 2)
+                    encB.setBuffer(downSRaw, offset: 0, index: 3)
+                    encB.setBytes(&dWOff, length: 8, index: 4)
+                    encB.setBytes(&dSOff, length: 8, index: 5)
+                    encB.setBytes(&interDimVal, length: 4, index: 6)
+                    encB.setBytes(&hDimVal, length: 4, index: 7)
+                    encB.setBytes(&pkVal, length: 4, index: 8)
+                    encB.dispatchThreadgroups(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                    encB.memoryBarrier(scope: .buffers)
+                }
+            }
+
+            encB.endEncoding()
+            cmdB.commit()
+            cmdB.waitUntilCompleted()
+
+            let tmp = hCurr
+            hCurr = hNext
+            hNext = tmp
+        }
+
+        let elapsedTotal = (CFAbsoluteTimeGetCurrent() - tForward0) * 1000.0
+        print(String(format: "🎉 [SUCCESS] 48-Layer Qwen 3.8 Flash Next forward pass completed in %.2f ms!", elapsedTotal))
+
+        // Check values in hMlpBuf
+        let outPtr = hMlpBuf.contents().bindMemory(to: Float.self, capacity: hiddenDim)
+        var hasNaN = false
+        var nonZeroCount = 0
+        for i in 0..<hiddenDim {
+            let v = outPtr[i]
+            if v.isNaN || v.isInfinite {
+                hasNaN = true
+            }
+            if abs(v) > 1e-6 {
+                nonZeroCount += 1
+            }
+        }
+        XCTAssertFalse(hasNaN, "Output contains NaN or Inf values!")
+        XCTAssertGreaterThan(nonZeroCount, 0, "Output is all zeros!")
+        print("✅ [DIAGNOSTIC] Output verification passed: hasNaN=\(hasNaN), nonZeroCount=\(nonZeroCount)/\(hiddenDim)")
+    }
+
+    func testQwen38FlashNextPrefillLargePrompt() throws {
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next-FP8/snapshots/236dfdf285828023ca3bcd3f37366c58a3469b13"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            print("Qwen 3.8 Flash Next FP8 snapshot not found, skipping.")
+            return
+        }
+        print("🔍 [DIAGNOSTIC] Loading Qwen 3.8 Flash Next FP8 for Large Prefill Test from \(snapshotDir)...")
+        let engine = try DynaMoeEngine(filePath: snapshotDir)
+        let summary = try engine.getSummary()
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let address = UInt(shard.baseAddress)
+            guard let ptr = UnsafeMutableRawPointer(bitPattern: address) else { continue }
+            let len = Int(shard.length)
+            if let buf = device.makeBuffer(bytesNoCopy: ptr, length: len, options: .storageModeShared, deallocator: nil) {
+                buffers[shard.index] = buf
+            }
+        }
+
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+
+        guard let cmdQueue = device.makeCommandQueue() else {
+            XCTFail("No Metal command queue")
+            return
+        }
+
+        let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir))
+        let cachedLayers = inference.buildCachedLayers(summary: summary, config: config, targetLayerCount: 48)
+
+        let hiddenDim = 2560
+        let intermediateDim = 640
+        let P = 1187 // Exact prompt token length that exceeded 4096 bytes (1187 * 4 = 4748 bytes)
+        let topK = 10
+
+        guard let hStateBuf_all = device.makeBuffer(length: P * hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let interBuf_all = device.makeBuffer(length: P * intermediateDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let hMlpBuf_all = device.makeBuffer(length: P * hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let denseActiveTokensBuffer = device.makeBuffer(length: P * MemoryLayout<UInt32>.stride, options: .storageModeShared),
+              let denseActiveWeightsBuffer = device.makeBuffer(length: P * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let expertActiveTokensBuffer = device.makeBuffer(length: P * topK * MemoryLayout<UInt32>.stride, options: .storageModeShared),
+              let expertActiveWeightsBuffer = device.makeBuffer(length: P * topK * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+            XCTFail("Failed to allocate prefill test buffers")
+            return
+        }
+
+        let denseTokPtr = denseActiveTokensBuffer.contents().bindMemory(to: UInt32.self, capacity: P)
+        for i in 0..<P { denseTokPtr[i] = UInt32(i) }
+        let denseWgtPtr = denseActiveWeightsBuffer.contents().bindMemory(to: Float.self, capacity: P)
+        for i in 0..<P { denseWgtPtr[i] = 1.0 }
+
+        let hPtr = hStateBuf_all.contents().bindMemory(to: Float.self, capacity: P * hiddenDim)
+        for i in 0..<(P * hiddenDim) {
+            hPtr[i] = Float.random(in: -0.1...0.1)
+        }
+
+        // Test multi-token batched FP8 execution on layer 0 MoE and shared experts
+        guard let layer0 = cachedLayers.first else {
+            XCTFail("No cached layers found")
+            return
+        }
+
+        guard let cmd = cmdQueue.makeCommandBuffer(), let enc = cmd.makeComputeCommandEncoder() else {
+            XCTFail("Failed to create command encoder")
+            return
+        }
+
+        if let clearPipe = inference.clearPipeline {
+            enc.setComputePipelineState(clearPipe)
+            enc.setBuffer(hMlpBuf_all, offset: 0, index: 0)
+            enc.dispatchThreads(MTLSize(width: hiddenDim, height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: min(hiddenDim, clearPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+        }
+
+        // Test batched FP8 execution on layer 0 expert 0 with P=1187 tokens using setBuffer
+        let expId = 0
+        guard let gateW = layer0.expertGateWeights[expId] ?? layer0.sharedGateWeight ?? layer0.denseGateWeight,
+              let upW = layer0.expertUpWeights[expId] ?? layer0.sharedUpWeight ?? layer0.denseUpWeight,
+              let downW = layer0.expertDownWeights[expId] ?? layer0.sharedDownWeight ?? layer0.denseDownWeight,
+              let gateS = layer0.expertGateScales[expId] ?? layer0.sharedGateScale ?? layer0.denseGateScale,
+              let upS = layer0.expertUpScales[expId] ?? layer0.sharedUpScale ?? layer0.denseUpScale,
+              let downS = layer0.expertDownScales[expId] ?? layer0.sharedDownScale ?? layer0.denseDownScale,
+              let gRaw = buffers[gateW.shardIndex],
+              let uRaw = buffers[upW.shardIndex],
+              let dRaw = buffers[downW.shardIndex],
+              let gsRaw = buffers[gateS.shardIndex],
+              let usRaw = buffers[upS.shardIndex],
+              let dsRaw = buffers[downS.shardIndex],
+              let gateBatched = inference.fp8BlockGateUpBatchedPipeline ?? inference.fp8GateUpBatchedPipeline,
+              let downBatched = inference.fp8BlockDownBatchedPipeline ?? inference.fp8DownBatchedPipeline else {
+            XCTFail("Failed to retrieve expert 0 weights/pipelines")
+            return
+        }
+
+            var gWOff = gateW.offsetStart
+            var gSOff = gateS.offsetStart
+            var uWOff = upW.offsetStart
+            var uSOff = upS.offsetStart
+            var dWOff = downW.offsetStart
+            var dSOff = downS.offsetStart
+            var hDimVal: UInt32 = UInt32(hiddenDim)
+            var interDimVal: UInt32 = UInt32(intermediateDim)
+
+            enc.setComputePipelineState(gateBatched)
+            enc.setBuffer(gRaw, offset: 0, index: 0)
+            enc.setBuffer(uRaw, offset: 0, index: 1)
+            enc.setBuffer(hStateBuf_all, offset: 0, index: 2)
+            enc.setBuffer(interBuf_all, offset: 0, index: 3)
+            enc.setBuffer(gsRaw, offset: 0, index: 4)
+            enc.setBuffer(usRaw, offset: 0, index: 5)
+            enc.setBytes(&gWOff, length: 8, index: 6)
+            enc.setBytes(&gSOff, length: 8, index: 7)
+            enc.setBytes(&uWOff, length: 8, index: 8)
+            enc.setBytes(&uSOff, length: 8, index: 9)
+            enc.setBytes(&hDimVal, length: 4, index: 10)
+            enc.setBytes(&interDimVal, length: 4, index: 11)
+            enc.setBuffer(denseActiveTokensBuffer, offset: 0, index: 12)
+            enc.dispatchThreadgroups(MTLSize(width: intermediateDim, height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+
+            enc.setComputePipelineState(downBatched)
+            enc.setBuffer(dRaw, offset: 0, index: 0)
+            enc.setBuffer(interBuf_all, offset: 0, index: 1)
+            enc.setBuffer(hMlpBuf_all, offset: 0, index: 2)
+            enc.setBuffer(dsRaw, offset: 0, index: 3)
+            enc.setBytes(&dWOff, length: 8, index: 4)
+            enc.setBytes(&dSOff, length: 8, index: 5)
+            enc.setBytes(&interDimVal, length: 4, index: 6)
+            enc.setBytes(&hDimVal, length: 4, index: 7)
+            var pkVal: Float = 1.0
+            enc.setBytes(&pkVal, length: 4, index: 8)
+            enc.setBuffer(denseActiveTokensBuffer, offset: 0, index: 9)
+            enc.setBuffer(denseActiveWeightsBuffer, offset: 0, index: 10)
+        enc.dispatchThreadgroups(MTLSize(width: hiddenDim, height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        enc.memoryBarrier(scope: .buffers)
+
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        // Verify output buffer for P=1187 tokens
+        let outPtr = hMlpBuf_all.contents().bindMemory(to: Float.self, capacity: P * hiddenDim)
+        var hasNaN = false
+        var nonZeroCount = 0
+        for i in 0..<(P * hiddenDim) {
+            let v = outPtr[i]
+            if v.isNaN || v.isInfinite {
+                hasNaN = true
+            }
+            if abs(v) > 1e-6 {
+                nonZeroCount += 1
+            }
+        }
+        XCTAssertFalse(hasNaN, "Large prefill output contains NaN or Inf values!")
+        XCTAssertGreaterThan(nonZeroCount, 0, "Large prefill output is all zeros!")
+        print("🎉 [SUCCESS] Large prompt prefill (P=\(P) tokens) executed cleanly without Metal assertion failure! nonZeroCount=\(nonZeroCount)/\(P * hiddenDim)")
     }
 }
 

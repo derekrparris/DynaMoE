@@ -143,6 +143,16 @@ public struct EngineCachedLayer {
     public let grReadWeight: TensorMetadata?
     public let grWriteScale: TensorMetadata?
     public let qsaMqaIndexerWeight: TensorMetadata?
+
+    // Hyper-Connections (Qwen 3.8 Flash Next)
+    public let attnHcNorm: TensorMetadata?
+    public let attnHcDownWeight: TensorMetadata?
+    public let attnHcUpWeight: TensorMetadata?
+    public let attnHcInjectWeight: TensorMetadata?
+    public let mlpHcNorm: TensorMetadata?
+    public let mlpHcDownWeight: TensorMetadata?
+    public let mlpHcUpWeight: TensorMetadata?
+    public let mlpHcInjectWeight: TensorMetadata?
 }
 
 public final class InferenceEngine {
@@ -193,12 +203,24 @@ public final class InferenceEngine {
     public var fp8DownPipeline: MTLComputePipelineState?
     public var fp8GateUpSimdPipeline: MTLComputePipelineState?
     public var fp8DownSimdPipeline: MTLComputePipelineState?
+    public var fp8BlockGateUpPipeline: MTLComputePipelineState?
+    public var fp8BlockDownPipeline: MTLComputePipelineState?
+    public var fp8BlockGateUpSimdPipeline: MTLComputePipelineState?
+    public var fp8BlockDownSimdPipeline: MTLComputePipelineState?
+    public var fp8BlockGemvPipeline: MTLComputePipelineState?
+    public var fp8BlockGemvSimdPipeline: MTLComputePipelineState?
     public var mxfp8GateUpPipeline: MTLComputePipelineState?
     public var mxfp8DownPipeline: MTLComputePipelineState?
     public var mxfp8GateUpSimdPipeline: MTLComputePipelineState?
     public var mxfp8DownSimdPipeline: MTLComputePipelineState?
     public var bf16GateUpPipeline: MTLComputePipelineState?
     public var bf16DownPipeline: MTLComputePipelineState?
+    public var fp8GateUpBatchedPipeline: MTLComputePipelineState?
+    public var fp8DownBatchedPipeline: MTLComputePipelineState?
+    public var fp8BlockGateUpBatchedPipeline: MTLComputePipelineState?
+    public var fp8BlockDownBatchedPipeline: MTLComputePipelineState?
+    public var bf16GateUpBatchedPipeline: MTLComputePipelineState?
+    public var bf16DownBatchedPipeline: MTLComputePipelineState?
 
     // Qwen 3.8 Flash Next Specialized Pipelines
     public var router512Pipeline: MTLComputePipelineState?
@@ -207,6 +229,13 @@ public final class InferenceEngine {
     public var qsaMqaIndexerPipeline: MTLComputePipelineState?
     public var gatedResidualBlendPipeline: MTLComputePipelineState?
     public var fuseNgramPlePipeline: MTLComputePipelineState?
+    public var fusedInit4StreamsPipeline: MTLComputePipelineState?
+    public var extractStream0Pipeline: MTLComputePipelineState?
+    public var hcNormPipeline: MTLComputePipelineState?
+    public var hcDownProjPipeline: MTLComputePipelineState?
+    public var hcUpBlendPipeline: MTLComputePipelineState?
+    public var hcInjectScalePipeline: MTLComputePipelineState?
+    public var hcInjectPipeline: MTLComputePipelineState?
 
     private init() {}
 
@@ -341,6 +370,18 @@ public final class InferenceEngine {
         if let fp8DownSimdFunc = defaultLib.makeFunction(name: "fp8_down_proj_accumulate_simd") {
             fp8DownSimdPipeline = try device.makeComputePipelineState(function: fp8DownSimdFunc)
         }
+        if let fp8BlockGateSimdFunc = defaultLib.makeFunction(name: "fp8_block_swiglu_gate_up_simd") {
+            fp8BlockGateUpSimdPipeline = try device.makeComputePipelineState(function: fp8BlockGateSimdFunc)
+        }
+        if let fp8BlockDownSimdFunc = defaultLib.makeFunction(name: "fp8_block_down_proj_accumulate_simd") {
+            fp8BlockDownSimdPipeline = try device.makeComputePipelineState(function: fp8BlockDownSimdFunc)
+        }
+        if let fp8BlockGemvFunc = defaultLib.makeFunction(name: "fp8_block_gemv") {
+            fp8BlockGemvPipeline = try device.makeComputePipelineState(function: fp8BlockGemvFunc)
+        }
+        if let fp8BlockGemvSimdFunc = defaultLib.makeFunction(name: "fp8_block_gemv_simd") {
+            fp8BlockGemvSimdPipeline = try device.makeComputePipelineState(function: fp8BlockGemvSimdFunc)
+        }
         if let mxfp8GateUpFunc = defaultLib.makeFunction(name: "mxfp8_swiglu_gate_up") {
             mxfp8GateUpPipeline = try device.makeComputePipelineState(function: mxfp8GateUpFunc)
         }
@@ -358,6 +399,24 @@ public final class InferenceEngine {
         }
         if let bf16DownFunc = defaultLib.makeFunction(name: "bf16_down_proj_accumulate") {
             bf16DownPipeline = try device.makeComputePipelineState(function: bf16DownFunc)
+        }
+        if let fp8GateBatchedFunc = defaultLib.makeFunction(name: "fp8_swiglu_gate_up_batched") {
+            fp8GateUpBatchedPipeline = try device.makeComputePipelineState(function: fp8GateBatchedFunc)
+        }
+        if let fp8DownBatchedFunc = defaultLib.makeFunction(name: "fp8_down_proj_accumulate_batched") {
+            fp8DownBatchedPipeline = try device.makeComputePipelineState(function: fp8DownBatchedFunc)
+        }
+        if let fp8BlockGateBatchedFunc = defaultLib.makeFunction(name: "fp8_block_swiglu_gate_up_batched") {
+            fp8BlockGateUpBatchedPipeline = try device.makeComputePipelineState(function: fp8BlockGateBatchedFunc)
+        }
+        if let fp8BlockDownBatchedFunc = defaultLib.makeFunction(name: "fp8_block_down_proj_accumulate_batched") {
+            fp8BlockDownBatchedPipeline = try device.makeComputePipelineState(function: fp8BlockDownBatchedFunc)
+        }
+        if let bf16GateBatchedFunc = defaultLib.makeFunction(name: "bf16_swiglu_gate_up_batched") {
+            bf16GateUpBatchedPipeline = try device.makeComputePipelineState(function: bf16GateBatchedFunc)
+        }
+        if let bf16DownBatchedFunc = defaultLib.makeFunction(name: "bf16_down_proj_accumulate_batched") {
+            bf16DownBatchedPipeline = try device.makeComputePipelineState(function: bf16DownBatchedFunc)
         }
 
         // Qwen 3.8 Flash Next Pipelines
@@ -379,10 +438,31 @@ public final class InferenceEngine {
         if let pleFunc = defaultLib.makeFunction(name: "fuse_ngram_ple_embedding") {
             fuseNgramPlePipeline = try device.makeComputePipelineState(function: pleFunc)
         }
+        if let init4StreamsFunc = defaultLib.makeFunction(name: "fused_init_4streams") {
+            fusedInit4StreamsPipeline = try device.makeComputePipelineState(function: init4StreamsFunc)
+        }
+        if let extract0Func = defaultLib.makeFunction(name: "extract_stream0") {
+            extractStream0Pipeline = try device.makeComputePipelineState(function: extract0Func)
+        }
+        if let hcNormFunc = defaultLib.makeFunction(name: "hyper_connection_norm_bf16") {
+            hcNormPipeline = try device.makeComputePipelineState(function: hcNormFunc)
+        }
+        if let hcDownFunc = defaultLib.makeFunction(name: "hyper_connection_down_proj_bf16") {
+            hcDownProjPipeline = try device.makeComputePipelineState(function: hcDownFunc)
+        }
+        if let hcUpFunc = defaultLib.makeFunction(name: "hyper_connection_up_proj_blend_bf16") {
+            hcUpBlendPipeline = try device.makeComputePipelineState(function: hcUpFunc)
+        }
+        if let hcInjScaleFunc = defaultLib.makeFunction(name: "hyper_connection_inject_scale_bf16") {
+            hcInjectScalePipeline = try device.makeComputePipelineState(function: hcInjScaleFunc)
+        }
+        if let hcInjFunc = defaultLib.makeFunction(name: "hyper_connection_inject_bf16") {
+            hcInjectPipeline = try device.makeComputePipelineState(function: hcInjFunc)
+        }
     }
 
     /// Builds structured layer representations inspecting tensors for Dense, Standard MoE, or Hybrid SSM-MoE
-    public func buildCachedLayers(summary: ModelSummary, config: ModelConfig?, targetLayerCount: Int = 40) -> [EngineCachedLayer] {
+    public func buildCachedLayers(summary: ModelSummary, config: ModelConfig?, targetLayerCount: Int? = nil) -> [EngineCachedLayer] {
         var tensorsByLayer: [UInt32: [TensorMetadata]] = [:]
         for t in summary.tensors {
             if t.name.hasPrefix("mtp.") || t.name.hasPrefix("visual.") { continue }
@@ -391,7 +471,8 @@ public final class InferenceEngine {
             }
         }
 
-        let numLayers = min(targetLayerCount, Int(summary.layerCount > 0 ? summary.layerCount : 40))
+        let totalModelLayers = summary.layerCount > 0 ? Int(summary.layerCount) : (config?.effectiveNumHiddenLayers ?? 48)
+        let numLayers = targetLayerCount != nil ? min(targetLayerCount!, totalModelLayers) : totalModelLayers
         let arch = config?.resolveArchitectureType(summary: summary) ?? (summary.maxExpertId > 0 ? .hybridSsmMoe : .denseTransformer)
         let layerAttnTypes = config?.resolveLayerAttentionTypes(totalLayers: numLayers) ?? (arch.isHybridSsm ? (0..<numLayers).map { ($0 % 4 == 3) ? .fullAttention : .linearAttention } : Array(repeating: .fullAttention, count: numLayers))
 
@@ -472,13 +553,13 @@ public final class InferenceEngine {
             let inBScale = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_b") && ($0.name.contains("scale") || $0.name.contains("scales")) })
             let inBBias = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_b") && ($0.name.contains("bias") || $0.name.contains("biases")) })
 
-            let aLog = layerTensors.first(where: { $0.name.contains("linear_attn.A_log") })
-            let dtBias = layerTensors.first(where: { $0.name.contains("linear_attn.dt_bias") })
-            let linNorm = layerTensors.first(where: { $0.name.contains("linear_attn.norm") })
+            let aLog = layerTensors.first(where: { $0.name.lowercased().contains("linear_attn.a_log") || $0.name.contains("A_log") || $0.name.contains("a_log") })
+            let dtBias = layerTensors.first(where: { $0.name.lowercased().contains("linear_attn.dt_bias") || $0.name.contains("dt_bias") })
+            let linNorm = layerTensors.first(where: { $0.name.lowercased().contains("linear_attn.norm") || $0.name.contains("linear_attn_norm") })
 
-            let linOut = layerTensors.first(where: { $0.name.contains("linear_attn.out_proj") && !$0.name.contains("scale") && !$0.name.contains("bias") })
-            let linOutScale = layerTensors.first(where: { $0.name.contains("linear_attn.out_proj") && ($0.name.contains("scale") || $0.name.contains("scales")) })
-            let linOutBias = layerTensors.first(where: { $0.name.contains("linear_attn.out_proj") && ($0.name.contains("bias") || $0.name.contains("biases")) })
+            let linOut = layerTensors.first(where: { ($0.name.contains("linear_attn.out_proj") || $0.name.contains("linear_attn.o_proj")) && !$0.name.contains("scale") && !$0.name.contains("bias") })
+            let linOutScale = layerTensors.first(where: { ($0.name.contains("linear_attn.out_proj") || $0.name.contains("linear_attn.o_proj")) && ($0.name.contains("scale") || $0.name.contains("scales")) })
+            let linOutBias = layerTensors.first(where: { ($0.name.contains("linear_attn.out_proj") || $0.name.contains("linear_attn.o_proj")) && ($0.name.contains("bias") || $0.name.contains("biases")) })
 
             // Shared Expert
             let sharedGateW = layerTensors.first(where: { $0.name.contains("shared_expert") && $0.name.contains("gate_proj") && !$0.name.contains("scale") && !$0.name.contains("bias") })
@@ -541,6 +622,16 @@ public final class InferenceEngine {
             let grRead = layerTensors.first(where: { $0.name.contains("gated_residual.read") || $0.name.contains("residual_gate.read") })
             let grWrite = layerTensors.first(where: { $0.name.contains("gated_residual.write") || $0.name.contains("residual_gate.write") })
             let qsaMqaIdx = layerTensors.first(where: { $0.name.contains("qsa.indexer") || $0.name.contains("self_attn.indexer") })
+
+            let attnHcNorm = layerTensors.first(where: { $0.name.contains("attn_hyper_connection.hc_norm") || $0.name.contains("attn_hc.norm") || $0.name.contains("attn_norm_hc") })
+            let attnHcDown = layerTensors.first(where: { $0.name.contains("attn_hyper_connection.input_mix_weight_down") || $0.name.contains("attn_hc.down") || $0.name.contains("attn_hc_down") })
+            let attnHcUp = layerTensors.first(where: { $0.name.contains("attn_hyper_connection.input_mix_weight_up") || $0.name.contains("attn_hc.up") || $0.name.contains("attn_hc_up") })
+            let attnHcInject = layerTensors.first(where: { $0.name.contains("attn_hyper_connection.block_inject_weight") || $0.name.contains("attn_hc.inject") || $0.name.contains("attn_hc_inject") })
+
+            let mlpHcNorm = layerTensors.first(where: { $0.name.contains("mlp_hyper_connection.hc_norm") || $0.name.contains("mlp_hc.norm") || $0.name.contains("mlp_norm_hc") })
+            let mlpHcDown = layerTensors.first(where: { $0.name.contains("mlp_hyper_connection.input_mix_weight_down") || $0.name.contains("mlp_hc.down") || $0.name.contains("mlp_hc_down") })
+            let mlpHcUp = layerTensors.first(where: { $0.name.contains("mlp_hyper_connection.input_mix_weight_up") || $0.name.contains("mlp_hc.up") || $0.name.contains("mlp_hc_up") })
+            let mlpHcInject = layerTensors.first(where: { $0.name.contains("mlp_hyper_connection.block_inject_weight") || $0.name.contains("mlp_hc.inject") || $0.name.contains("mlp_hc_inject") })
 
             cached.append(EngineCachedLayer(
                 layerIndex: UInt32(l),
@@ -619,7 +710,15 @@ public final class InferenceEngine {
                 intermediateDim: interDim,
                 grReadWeight: grRead,
                 grWriteScale: grWrite,
-                qsaMqaIndexerWeight: qsaMqaIdx
+                qsaMqaIndexerWeight: qsaMqaIdx,
+                attnHcNorm: attnHcNorm,
+                attnHcDownWeight: attnHcDown,
+                attnHcUpWeight: attnHcUp,
+                attnHcInjectWeight: attnHcInject,
+                mlpHcNorm: mlpHcNorm,
+                mlpHcDownWeight: mlpHcDown,
+                mlpHcUpWeight: mlpHcUp,
+                mlpHcInjectWeight: mlpHcInject
             ))
         }
 
@@ -655,7 +754,9 @@ extension EngineCachedLayer {
             linearOutProjTensor, linearOutProjScale, linearOutProjBias,
             sharedGateWeight, sharedGateScale, sharedGateBias,
             sharedUpWeight, sharedUpScale, sharedUpBias,
-            sharedDownWeight, sharedDownScale, sharedDownBias
+            sharedDownWeight, sharedDownScale, sharedDownBias,
+            attnHcNorm, attnHcDownWeight, attnHcUpWeight, attnHcInjectWeight,
+            mlpHcNorm, mlpHcDownWeight, mlpHcUpWeight, mlpHcInjectWeight
         ]
         for c in candidates {
             if let t = c {

@@ -31,151 +31,33 @@ public final class ExpertIOThreadPool {
 
     public static let defaultNumThreads: Int = 8
 
-    private var threads: [pthread_t] = []
-    private var mutex = pthread_mutex_t()
-    private var workReadyCond = pthread_cond_t()
-    private var workDoneCond = pthread_cond_t()
-
-    private var activeTasks: [ExpertPreadTask] = []
-    private var tasksCount: Int = 0
-    private var tasksCompleted: Int = 0
-    private var currentGeneration: Int = 0
-    private var completedGeneration: Int = 0
-    private var isShutdown: Bool = false
-    private var isInitialized: Bool = false
-
     // Cached open file descriptors: layerIndex -> open fd
     private var layerFDs: [Int: Int32] = [:]
-    private var layerFDLock = NSLock()
+    private var layerFDLock = NSRecursiveLock()
 
-    private init() {
-        initialize(numThreads: Self.defaultNumThreads)
-    }
+    private init() {}
 
     deinit {
         shutdown()
     }
 
     public func initialize(numThreads: Int = 8) {
-        guard !isInitialized else { return }
-
-        pthread_mutex_init(&mutex, nil)
-        pthread_cond_init(&workReadyCond, nil)
-        pthread_cond_init(&workDoneCond, nil)
-
-        isShutdown = false
-        currentGeneration = 0
-        completedGeneration = 0
-        tasksCount = 0
-        tasksCompleted = 0
-        threads.removeAll()
-
-        for i in 0..<numThreads {
-            var thread: pthread_t?
-            let threadId = UnsafeMutablePointer<Int>.allocate(capacity: 1)
-            threadId.pointee = i
-
-            let createResult = pthread_create(&thread, nil, { arg -> UnsafeMutableRawPointer? in
-                let tid = arg.assumingMemoryBound(to: Int.self).pointee
-                arg.deallocate()
-                ExpertIOThreadPool.shared.workerLoop(threadId: tid)
-                return nil
-            }, threadId)
-
-            if createResult == 0, let t = thread {
-                threads.append(t)
-            }
-        }
-
-        isInitialized = true
+        // GCD manages thread pool automatically
     }
 
-    private func workerLoop(threadId: Int) {
-        var myGeneration = 0
-
-        pthread_mutex_lock(&mutex)
-        while true {
-            while currentGeneration == myGeneration && !isShutdown {
-                pthread_cond_wait(&workReadyCond, &mutex)
-            }
-
-            if isShutdown {
-                pthread_mutex_unlock(&mutex)
-                break
-            }
-
-            myGeneration = currentGeneration
-            let count = tasksCount
-
-            // Work stealing across threadId
-            var localTasksToProcess: [(index: Int, task: ExpertPreadTask)] = []
-            var idx = threadId
-            while idx < count {
-                localTasksToProcess.append((index: idx, task: activeTasks[idx]))
-                idx += threads.count
-            }
-
-            pthread_mutex_unlock(&mutex)
-
-            // Perform pread outside the mutex lock
-            for item in localTasksToProcess {
-                var task = item.task
-                let bytesRead = pread(task.fd, task.dst, task.size, task.offset)
-                task.result = bytesRead
-
-                pthread_mutex_lock(&mutex)
-                if item.index < activeTasks.count {
-                    activeTasks[item.index].result = bytesRead
-                }
-                tasksCompleted += 1
-                if tasksCompleted >= count {
-                    completedGeneration = myGeneration
-                    pthread_cond_broadcast(&workDoneCond)
-                }
-                pthread_mutex_unlock(&mutex)
-            }
-
-            pthread_mutex_lock(&mutex)
-        }
-    }
-
-    /// Asynchronously dispatches pread tasks across the 8-thread pool, returning a generation token
-    @discardableResult
-    public func dispatchAsync(tasks: [ExpertPreadTask]) -> Int {
-        guard !tasks.isEmpty else { return 0 }
-
-        pthread_mutex_lock(&mutex)
-        activeTasks = tasks
-        tasksCount = tasks.count
-        tasksCompleted = 0
-        currentGeneration += 1
-        let gen = currentGeneration
-        pthread_cond_broadcast(&workReadyCond)
-        pthread_mutex_unlock(&mutex)
-
-        return gen
-    }
-
-    /// Waits for a dispatched generation token to complete and returns results
-    @discardableResult
-    public func wait(generation: Int) -> [ExpertPreadTask] {
-        guard generation > 0 else { return [] }
-
-        pthread_mutex_lock(&mutex)
-        while completedGeneration < generation && !isShutdown {
-            pthread_cond_wait(&workDoneCond, &mutex)
-        }
-        let completed = activeTasks
-        pthread_mutex_unlock(&mutex)
-        return completed
-    }
-
-    /// Synchronously dispatches and waits for all pread tasks to complete
+    /// Synchronously dispatches pread tasks in parallel across all CPU cores via GCD
     @discardableResult
     public func dispatchSync(tasks: [ExpertPreadTask]) -> [ExpertPreadTask] {
         guard !tasks.isEmpty else { return [] }
-        let gen = dispatchAsync(tasks: tasks)
-        return wait(generation: gen)
+        var resultTasks = tasks
+        resultTasks.withUnsafeMutableBufferPointer { buffer in
+            DispatchQueue.concurrentPerform(iterations: buffer.count) { i in
+                let task = buffer[i]
+                let bytesRead = pread(task.fd, task.dst, task.size, task.offset)
+                buffer[i].result = bytesRead
+            }
+        }
+        return resultTasks
     }
 
     /// Synchronously dispatches and updates inout tasks array
@@ -221,23 +103,7 @@ public final class ExpertIOThreadPool {
     }
 
     public func shutdown() {
-        guard isInitialized else { return }
-
-        pthread_mutex_lock(&mutex)
-        isShutdown = true
-        pthread_cond_broadcast(&workReadyCond)
-        pthread_mutex_unlock(&mutex)
-
-        for t in threads {
-            pthread_join(t, nil)
-        }
-        threads.removeAll()
-
         closeAllLayerFDs()
-
-        pthread_mutex_destroy(&mutex)
-        pthread_cond_destroy(&workReadyCond)
-        pthread_cond_destroy(&workDoneCond)
-        isInitialized = false
     }
 }
+
