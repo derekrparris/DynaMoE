@@ -662,6 +662,13 @@ struct ContentView: View {
     @AppStorage("dynamoe_kv_cache_precision") private var kvCachePrecisionRaw: String = KVCachePrecision.fp16.rawValue
     @AppStorage("dynamoe_speculative_prefetch_enabled") private var speculativePrefetchEnabled: Bool = true
     @AppStorage("dynamoe_prefetch_lookahead_depth") private var prefetchLookaheadDepth: Int = 1
+    @AppStorage("dynamoe_jetspec_enabled") private var jetSpecEnabled: Bool = false
+    @AppStorage("dynamoe_jetspec_depth") private var jetSpecMaxDepth: Int = 3
+    @AppStorage("dynamoe_jetspec_branching") private var jetSpecBranchingFactor: Int = 2
+    @AppStorage("dynamoe_jetspec_expert_cap") private var jetSpecMaxExpertCap: Int = 8
+    @State private var jetSpecMeanTau: Double = 1.0
+    @State private var jetSpecTotalDraftAccepted: Int = 0
+    @State private var jetSpecTotalDraftProposed: Int = 0
 
     var kvCachePrecisionBinding: Binding<KVCachePrecision> {
         Binding(
@@ -3562,7 +3569,16 @@ struct ContentView: View {
         let isHybridArch = arch.isHybridSsm
         let isRMSNormOffset = modelConfig?.isRMSNormUnitOffset ?? false
 
-        let isGatedQ = (cachedLayers.first(where: { $0.attentionType == .fullAttention })?.qProjTensor?.shapeDisplay.contains("12288") ?? false)
+        let isGatedQ: Bool = {
+            if let configGate = modelConfig?.effectiveAttnOutputGate {
+                return configGate
+            }
+            if let qTensor = cachedLayers.first(where: { $0.attentionType == .fullAttention })?.qProjTensor {
+                let gatedDim = numHeads * headDim * 2
+                return qTensor.shapeDisplay.contains("\(gatedDim)")
+            }
+            return false
+        }()
         let isStandardGqa = !isGatedQ
         let qOutDim: UInt32 = isStandardGqa ? (numHeads * headDim) : (numHeads * headDim * 2)
         let kvOutDim: UInt32 = numKvHeads * headDim
@@ -4177,7 +4193,16 @@ struct ContentView: View {
                 let singleTokenPtr = singleTokenBuffer.contents().bindMemory(to: UInt32.self, capacity: 1)
                 singleTokenPtr[0] = tokenId
                 var hDim = hiddenDim
-                let isGatedQ = (cachedLayers.first(where: { $0.attentionType == .fullAttention })?.qProjTensor?.shapeDisplay.contains("12288") ?? false)
+                let isGatedQ: Bool = {
+                    if let configGate = modelConfig?.effectiveAttnOutputGate {
+                        return configGate
+                    }
+                    if let qTensor = cachedLayers.first(where: { $0.attentionType == .fullAttention })?.qProjTensor {
+                        let gatedDim = numHeads * headDim * 2
+                        return qTensor.shapeDisplay.contains("\(gatedDim)")
+                    }
+                    return false
+                }()
                 let isStandardGqa = !isGatedQ
 
                 // 2. Multi-Layer Transformer Backbone (0..<actualLayers, looped totalLoops times)
@@ -4274,11 +4299,13 @@ struct ContentView: View {
                                 layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), embedPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                             }
                             if (cachedLayers.first?.attnHcDownWeight != nil), let initStreams = fusedInit4StreamsPipeline {
+                                layerEnc1.memoryBarrier(scope: .buffers)
                                 layerEnc1.setComputePipelineState(initStreams)
                                 layerEnc1.setBuffer(currentH, offset: 0, index: 0)
                                 layerEnc1.setBuffer(hcStreamsBuffer, offset: 0, index: 1)
                                 layerEnc1.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 2)
                                 layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), initStreams.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                layerEnc1.memoryBarrier(scope: .buffers)
                             }
                         }
 
@@ -4360,6 +4387,7 @@ struct ContentView: View {
                             layerEnc1.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 5)
                             layerEnc1.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
                             layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
+                            layerEnc1.memoryBarrier(scope: .buffers)
                         }
 
                         // Step 2: Attention Computation
@@ -4367,6 +4395,7 @@ struct ContentView: View {
                             layerEnc1.setComputePipelineState(clearPipeline)
                             layerEnc1.setBuffer(attnOutBuffer, offset: 0, index: 0)
                             layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                            layerEnc1.memoryBarrier(scope: .buffers)
 
                             let currentQDim = isStandardGqa ? (numHeads * headDim) : (numHeads * headDim * 2)
                             let currentKvDim = kvStride
@@ -4374,6 +4403,7 @@ struct ContentView: View {
                             dispatchLinear(enc: layerEnc1, weight: layer.qProjTensor, scale: layer.qScaleTensor, bias: layer.qBiasTensor, inBuf: xNorm1Buffer, outBuf: qGateBuffer, inDim: hiddenDim, outDim: currentQDim)
                             dispatchLinear(enc: layerEnc1, weight: layer.kProjTensor, scale: layer.kScaleTensor, bias: layer.kBiasTensor, inBuf: xNorm1Buffer, outBuf: kVectorBuffer, inDim: hiddenDim, outDim: currentKvDim)
                             dispatchLinear(enc: layerEnc1, weight: layer.vProjTensor, scale: layer.vScaleTensor, bias: layer.vBiasTensor, inBuf: xNorm1Buffer, outBuf: vVectorBuffer, inDim: hiddenDim, outDim: currentKvDim)
+                            layerEnc1.memoryBarrier(scope: .buffers)
 
                             // Q-Norm (if present)
                             if let qNorm = layer.qNormTensor, let qNormRaw = buffers[qNorm.shardIndex] {
@@ -4399,6 +4429,7 @@ struct ContentView: View {
                                     layerEnc1.setBytes(&hStride, length: MemoryLayout<UInt32>.stride, index: 5)
                                     layerEnc1.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 6)
                                     layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                    layerEnc1.memoryBarrier(scope: .buffers)
                                 }
                             }
 
@@ -4426,6 +4457,7 @@ struct ContentView: View {
                                     layerEnc1.setBytes(&hStride, length: MemoryLayout<UInt32>.stride, index: 5)
                                     layerEnc1.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 6)
                                     layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numKvHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                    layerEnc1.memoryBarrier(scope: .buffers)
                                 }
                             }
 
@@ -4458,6 +4490,7 @@ struct ContentView: View {
                                 layerEnc1.setBytes(&kStr, length: MemoryLayout<UInt32>.stride, index: 5)
                                 layerEnc1.setBytes(&theta, length: MemoryLayout<Float>.stride, index: 6)
                                 layerEnc1.dispatchThreads(MTLSize(width: Int(numKvHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numKvHeads), ropePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                layerEnc1.memoryBarrier(scope: .buffers)
                             }
 
                             // Store KV-Cache and Fused GQA Decode
@@ -4610,9 +4643,11 @@ struct ContentView: View {
                                     }
                                 }
                             }
+                            layerEnc1.memoryBarrier(scope: .buffers)
 
                             // Attention Output Projection (o_proj)
                             dispatchLinear(enc: layerEnc1, weight: layer.oProjTensor, scale: layer.oScaleTensor, bias: layer.oBiasTensor, inBuf: attnCtxBuffer, outBuf: attnOutBuffer, inDim: attnCtxDim, outDim: hiddenDim)
+                            layerEnc1.memoryBarrier(scope: .buffers)
                         } else {
                             // Linear Attention (GatedDeltaNet Recurrent State)
                             let linValHeads: UInt32 = UInt32(modelConfig?.effectiveLinearNumValueHeads ?? (layer.inProjA != nil && (layer.inProjA!.offsetEnd - layer.inProjA!.offsetStart) > 32 * 2560 ? 48 : 32))
@@ -4623,6 +4658,7 @@ struct ContentView: View {
                             let bDim: UInt32 = linValHeads
 
                             dispatchLinear(enc: layerEnc1, weight: layer.inProjQKV, scale: layer.inProjQKVScale, bias: layer.inProjQKVBias, inBuf: xNorm1Buffer, outBuf: qGateBuffer, inDim: hiddenDim, outDim: qkvDim)
+                            layerEnc1.memoryBarrier(scope: .buffers)
 
                             if let conv1d = layer.conv1dTensor, let convRaw = buffers[conv1d.shardIndex],
                                let convPipe = causalConv1dPipeline, let convState = KVCacheManager.shared.convStateBuffer {
@@ -4637,6 +4673,7 @@ struct ContentView: View {
                                 layerEnc1.setBytes(&cOff, length: MemoryLayout<UInt64>.stride, index: 4)
                                 layerEnc1.setBytes(&numChannels, length: MemoryLayout<UInt32>.stride, index: 5)
                                 layerEnc1.dispatchThreads(MTLSize(width: Int(qkvDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, convPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                layerEnc1.memoryBarrier(scope: .buffers)
                             }
 
                             if let l2Pipe = l2NormQkPipeline {
@@ -4647,11 +4684,13 @@ struct ContentView: View {
                                 layerEnc1.setBytes(&numHeads, length: MemoryLayout<UInt32>.stride, index: 1)
                                 layerEnc1.setBytes(&headDim, length: MemoryLayout<UInt32>.stride, index: 2)
                                 layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), l2Pipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                layerEnc1.memoryBarrier(scope: .buffers)
                             }
 
                             dispatchLinear(enc: layerEnc1, weight: layer.inProjZ, scale: layer.inProjZScale, bias: layer.inProjZBias, inBuf: xNorm1Buffer, outBuf: zGateBuffer, inDim: hiddenDim, outDim: zDim)
                             dispatchLinear(enc: layerEnc1, weight: layer.inProjA, scale: layer.inProjAScale, bias: layer.inProjABias, inBuf: xNorm1Buffer, outBuf: aVectorBuffer, inDim: hiddenDim, outDim: aDim)
                             dispatchLinear(enc: layerEnc1, weight: layer.inProjB, scale: layer.inProjBScale, bias: layer.inProjBBias, inBuf: xNorm1Buffer, outBuf: bVectorBuffer, inDim: hiddenDim, outDim: bDim)
+                            layerEnc1.memoryBarrier(scope: .buffers)
 
                             if let linPipe = gdnLinearAttnStepPipeline ?? linearAttnStepPipeline,
                                let sBuf = KVCacheManager.shared.linearStateBuffer,
@@ -4686,9 +4725,11 @@ struct ContentView: View {
                                 layerEnc1.setBytes(&headDim, length: MemoryLayout<UInt32>.stride, index: 14)
                                 layerEnc1.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 15)
                                 layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numValHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                layerEnc1.memoryBarrier(scope: .buffers)
                             }
 
                             dispatchLinear(enc: layerEnc1, weight: layer.linearOutProjTensor ?? layer.oProjTensor, scale: layer.linearOutProjScale ?? layer.oScaleTensor, bias: layer.linearOutProjBias ?? layer.oBiasTensor, inBuf: attnCtxBuffer, outBuf: attnOutBuffer, inDim: zDim, outDim: hiddenDim)
+                            layerEnc1.memoryBarrier(scope: .buffers)
                         }
 
                         // Step 3: Residual Connection 1 (hMid = currentH + attnOut or 4-stream inject)
@@ -4700,6 +4741,7 @@ struct ContentView: View {
                             layerEnc1.setBuffer(hcInjectScaleBuffer, offset: 0, index: 2)
                             layerEnc1.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 3)
                             layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), injPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                            layerEnc1.memoryBarrier(scope: .buffers)
                         } else {
                             layerEnc1.setComputePipelineState(addPipeline)
                             layerEnc1.setBuffer(currentH, offset: 0, index: 0)
@@ -4707,6 +4749,7 @@ struct ContentView: View {
                             layerEnc1.setBuffer(hMidBuffer, offset: 0, index: 2)
                             layerEnc1.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 3)
                             layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), addPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                            layerEnc1.memoryBarrier(scope: .buffers)
                         }
 
                         // Step 4: Post-Attention RMSNorm / HC Stream Mixing (hMid/hcStreams -> xNorm2)
@@ -4787,6 +4830,7 @@ struct ContentView: View {
                             layerEnc1.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 5)
                             layerEnc1.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
                             layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
+                            layerEnc1.memoryBarrier(scope: .buffers)
                         }
 
                         // Step 5: Dense Feed-Forward OR MoE
@@ -4797,6 +4841,7 @@ struct ContentView: View {
                             layerEnc1.setComputePipelineState(clearPipeline)
                             layerEnc1.setBuffer(hMlpBuffer, offset: 0, index: 0)
                             layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                            layerEnc1.memoryBarrier(scope: .buffers)
 
                             if let gateW = layer.denseGateWeight,
                                let upW = layer.denseUpWeight,
@@ -4826,6 +4871,7 @@ struct ContentView: View {
                                     interDim: intermediateDim,
                                     routingWeight: 1.0
                                 )
+                                layerEnc1.memoryBarrier(scope: .buffers)
                             }
 
                             // Step 6: Residual Connection 2 (nextH = hMid + hMlp or 4-stream inject)
@@ -4837,6 +4883,7 @@ struct ContentView: View {
                                 layerEnc1.setBuffer(hcInjectScaleBuffer, offset: 0, index: 2)
                                 layerEnc1.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 3)
                                 layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), injPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                layerEnc1.memoryBarrier(scope: .buffers)
                             } else {
                                 layerEnc1.setComputePipelineState(addPipeline)
                                 layerEnc1.setBuffer(hMidBuffer, offset: 0, index: 0)
@@ -4844,6 +4891,7 @@ struct ContentView: View {
                                 layerEnc1.setBuffer(nextH, offset: 0, index: 2)
                                 layerEnc1.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 3)
                                 layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), addPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                layerEnc1.memoryBarrier(scope: .buffers)
                             }
 
                             layerEnc1.endEncoding()
@@ -4927,6 +4975,10 @@ struct ContentView: View {
                                         var bOff = sgBias.offsetStart
                                         let is8Bit = (sg.offsetEnd - sg.offsetStart) >= UInt64(hiddenDim)
                                         if is8Bit, let pipe = sharedGateQ8Pipeline {
+                                            layerEnc1.setComputePipelineState(pipe)
+                                            layerEnc1.setBuffer(sgRaw, offset: 0, index: 0)
+                                            layerEnc1.setBuffer(sgScaleRaw, offset: 0, index: 1)
+                                            layerEnc1.setBuffer(sgBiasRaw, offset: 0, index: 2)
                                             layerEnc1.setBuffer(xNorm2Buffer, offset: 0, index: 3)
                                             layerEnc1.setBuffer(sharedScoreBuffer, offset: 0, index: 4)
                                             layerEnc1.setBytes(&sgOff, length: MemoryLayout<UInt64>.stride, index: 5)
@@ -5049,6 +5101,7 @@ struct ContentView: View {
                                 layerEnc2.setComputePipelineState(clearPipeline)
                                 layerEnc2.setBuffer(hMlpBuffer, offset: 0, index: 0)
                                 layerEnc2.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                layerEnc2.memoryBarrier(scope: .buffers)
 
                                 for (slot, expert) in activeExperts.enumerated() {
                                     let pk = expert.weight
@@ -5225,6 +5278,7 @@ struct ContentView: View {
                                         interDim: intermediateDim,
                                         routingWeight: sharedW
                                     )
+                                    layerEnc2.memoryBarrier(scope: .buffers)
                                 }
 
                                 // Step 6: Residual Connection 2 (nextH = hMid + hMlp or 4-stream inject)
@@ -5236,6 +5290,7 @@ struct ContentView: View {
                                     layerEnc2.setBuffer(hcInjectScaleBuffer, offset: 0, index: 2)
                                     layerEnc2.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 3)
                                     layerEnc2.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), injPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    layerEnc2.memoryBarrier(scope: .buffers)
                                 } else {
                                     layerEnc2.setComputePipelineState(addPipeline)
                                     layerEnc2.setBuffer(hMidBuffer, offset: 0, index: 0)
@@ -5243,10 +5298,12 @@ struct ContentView: View {
                                     layerEnc2.setBuffer(nextH, offset: 0, index: 2)
                                     layerEnc2.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 3)
                                     layerEnc2.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), addPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    layerEnc2.memoryBarrier(scope: .buffers)
                                 }
 
                                 layerEnc2.endEncoding()
                                 moeCmd.commit()
+                                moeCmd.waitUntilCompleted()
                             } else {
                                 guard let moeCmd = commandQueue.makeCommandBuffer(),
                                       let layerEnc2 = moeCmd.makeComputeCommandEncoder() else { return false }
@@ -5254,6 +5311,7 @@ struct ContentView: View {
                                 layerEnc2.setComputePipelineState(clearPipeline)
                                 layerEnc2.setBuffer(hMlpBuffer, offset: 0, index: 0)
                                 layerEnc2.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                layerEnc2.memoryBarrier(scope: .buffers)
 
                                 for expert in activeExperts {
                                     let expId = expert.id
@@ -5288,6 +5346,7 @@ struct ContentView: View {
                                             interDim: intermediateDim,
                                             routingWeight: p_k
                                         )
+                                        layerEnc2.memoryBarrier(scope: .buffers)
                                     }
                                 }
 
@@ -5319,6 +5378,7 @@ struct ContentView: View {
                                         interDim: intermediateDim,
                                         routingWeight: sharedW
                                     )
+                                    layerEnc2.memoryBarrier(scope: .buffers)
                                 }
 
                                 // Step 6: Residual Connection 2 (nextH = hMid + hMlp or 4-stream inject)
@@ -5330,6 +5390,7 @@ struct ContentView: View {
                                     layerEnc2.setBuffer(hcInjectScaleBuffer, offset: 0, index: 2)
                                     layerEnc2.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 3)
                                     layerEnc2.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), injPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    layerEnc2.memoryBarrier(scope: .buffers)
                                 } else {
                                     layerEnc2.setComputePipelineState(addPipeline)
                                     layerEnc2.setBuffer(hMidBuffer, offset: 0, index: 0)
@@ -5337,10 +5398,12 @@ struct ContentView: View {
                                     layerEnc2.setBuffer(nextH, offset: 0, index: 2)
                                     layerEnc2.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 3)
                                     layerEnc2.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), addPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    layerEnc2.memoryBarrier(scope: .buffers)
                                 }
 
                                 layerEnc2.endEncoding()
                                 moeCmd.commit()
+                                moeCmd.waitUntilCompleted()
                             }
 
                             guard let nextCmd = commandQueue.makeCommandBuffer() else { return false }
@@ -5483,16 +5546,25 @@ struct ContentView: View {
                 let P = promptTokens.count
                 guard P > 0 else { return true }
 
-                let topKCount = Int(modelConfig?.effectiveNumExpertsPerTok ?? (numExperts >= 512 ? 10 : 8))
+                let topKCount = max(Int(modelConfig?.effectiveNumExpertsPerTok ?? (numExperts >= 512 ? 10 : (numExperts > 0 ? 8 : 1))), 1)
                 let hasHc = (cachedLayers.first?.attnHcDownWeight != nil)
-                let totalHBytes = P * Int(hiddenDim) * MemoryLayout<Float>.stride
-                let totalHcBytes = hasHc ? (P * 4 * Int(hiddenDim) * MemoryLayout<Float>.stride) : 16
+                let totalHBytes = max(P * Int(hiddenDim) * MemoryLayout<Float>.stride, 64)
+                let totalHcBytes = hasHc ? max(P * 4 * Int(hiddenDim) * MemoryLayout<Float>.stride, 64) : 64
 
                 let maxInterDim = max(cachedLayers.map { $0.intermediateDim }.max() ?? 2560, 2560)
                 let linKeyHeads = UInt32(modelConfig?.effectiveLinearNumKeyHeads ?? 16)
                 let linValHeads = UInt32(modelConfig?.effectiveLinearNumValueHeads ?? (cachedLayers.first?.inProjA != nil && (cachedLayers.first!.inProjA!.offsetEnd - cachedLayers.first!.inProjA!.offsetStart) > 32 * 2560 ? 48 : 32))
                 let gdnQkvDim = (linKeyHeads + linKeyHeads + linValHeads) * 128
-                let isGatedQ = (cachedLayers.first(where: { $0.attentionType == .fullAttention })?.qProjTensor?.shapeDisplay.contains("12288") ?? false)
+                let isGatedQ: Bool = {
+                    if let configGate = modelConfig?.effectiveAttnOutputGate {
+                        return configGate
+                    }
+                    if let qTensor = cachedLayers.first(where: { $0.attentionType == .fullAttention })?.qProjTensor {
+                        let gatedDim = numHeads * headDim * 2
+                        return qTensor.shapeDisplay.contains("\(gatedDim)")
+                    }
+                    return false
+                }()
                 let isStandardGqa = !isGatedQ
                 let gqaQDim: UInt32 = isStandardGqa ? (numHeads * headDim) : (numHeads * headDim * 2)
                 let maxQkvDim = max(gdnQkvDim, gqaQDim, hiddenDim, 2560)
@@ -5505,26 +5577,26 @@ struct ContentView: View {
                       let xNorm2Buffer_all = device.makeBuffer(length: totalHBytes, options: .storageModeShared),
                       let attnOutBuffer_all = device.makeBuffer(length: totalHBytes, options: .storageModeShared),
                       let hMlpBuffer_all = device.makeBuffer(length: totalHBytes, options: .storageModeShared),
-                      let qGateBuffer_all = device.makeBuffer(length: P * Int(maxQkvDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let zGateBuffer_all = device.makeBuffer(length: P * Int(maxZDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let attnCtxBuffer_all = device.makeBuffer(length: P * Int(maxZDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let kVectorBuffer_all = device.makeBuffer(length: P * max(Int(kvStride), 128) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let vVectorBuffer_all = device.makeBuffer(length: P * max(Int(kvStride), 128) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let aVectorBuffer_all = device.makeBuffer(length: P * 128 * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let bVectorBuffer_all = device.makeBuffer(length: P * 128 * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let interBuffer_all = device.makeBuffer(length: P * Int(maxInterDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let routerIndicesBuffer_all = device.makeBuffer(length: P * topKCount * MemoryLayout<UInt32>.stride, options: .storageModeShared),
-                      let routerWeightsBuffer_all = device.makeBuffer(length: P * topKCount * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let sharedScoreBuffer_all = device.makeBuffer(length: P * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let hcStreamsBuffer_all = device.makeBuffer(length: totalHcBytes, options: .storageModeShared),
-                      let hcNormedBuffer_all = device.makeBuffer(length: totalHcBytes, options: .storageModeShared),
-                      let hcBottleneckBuffer_all = device.makeBuffer(length: P * 512 * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let hcInjectScaleBuffer_all = device.makeBuffer(length: P * 4 * MemoryLayout<Float>.stride, options: .storageModeShared),
+                      let qGateBuffer_all = device.makeBuffer(length: max(P * Int(maxQkvDim), 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
+                      let zGateBuffer_all = device.makeBuffer(length: max(P * Int(maxZDim), 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
+                      let attnCtxBuffer_all = device.makeBuffer(length: max(P * Int(maxZDim), 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
+                      let kVectorBuffer_all = device.makeBuffer(length: max(P * max(Int(kvStride), 128), 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
+                      let vVectorBuffer_all = device.makeBuffer(length: max(P * max(Int(kvStride), 128), 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
+                      let aVectorBuffer_all = device.makeBuffer(length: max(P * 128, 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
+                      let bVectorBuffer_all = device.makeBuffer(length: max(P * 128, 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
+                      let interBuffer_all = device.makeBuffer(length: max(P * Int(maxInterDim), 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
+                      let routerIndicesBuffer_all = device.makeBuffer(length: max(P * topKCount, 16) * MemoryLayout<UInt32>.stride, options: .storageModeShared),
+                      let routerWeightsBuffer_all = device.makeBuffer(length: max(P * topKCount, 16) * MemoryLayout<Float>.stride, options: .storageModeShared),
+                      let sharedScoreBuffer_all = device.makeBuffer(length: max(P, 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
+                      let hcStreamsBuffer_all = device.makeBuffer(length: max(totalHcBytes, 64), options: .storageModeShared),
+                      let hcNormedBuffer_all = device.makeBuffer(length: max(totalHcBytes, 64), options: .storageModeShared),
+                      let hcBottleneckBuffer_all = device.makeBuffer(length: max(P * 512, 64) * MemoryLayout<Float>.stride, options: .storageModeShared),
+                      let hcInjectScaleBuffer_all = device.makeBuffer(length: max(P * 4, 64) * MemoryLayout<Float>.stride, options: .storageModeShared),
                       let denseActiveTokensBuffer = device.makeBuffer(length: max(P, 1) * MemoryLayout<UInt32>.stride, options: .storageModeShared),
                       let denseActiveWeightsBuffer = device.makeBuffer(length: max(P, 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
                       let expertActiveTokensBuffer = device.makeBuffer(length: max(P * topKCount, 64) * MemoryLayout<UInt32>.stride, options: .storageModeShared),
                       let expertActiveWeightsBuffer = device.makeBuffer(length: max(P * topKCount, 64) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let prefillStagingBuffer = device.makeBuffer(length: min(max(P * topKCount, 64), numExperts > 0 ? Int(numExperts) : 512) * Int(loadedLayout?.expert_size ?? 3151872), options: .storageModeShared) else {
+                      let prefillStagingBuffer = device.makeBuffer(length: max(min(max(P * topKCount, 64), numExperts > 0 ? Int(numExperts) : 512) * Int(loadedLayout?.expert_size ?? 3151872), 64), options: .storageModeShared) else {
                     return false
                 }
 
@@ -7120,6 +7192,96 @@ struct ContentView: View {
                 return true
             }
 
+            // Allocate JetSpec Staging Buffers for Tree Drafting & Verification
+            let jetspecStaging = InferenceEngine.shared.allocateJetSpecBuffers(
+                device: device,
+                maxNodes: 16,
+                vocabSize: Int(vocabSize),
+                hiddenDim: Int(hiddenDim)
+            )
+
+            func runJetSpecTreeStep(rootToken: UInt32, step: UInt32) -> (acceptedTokens: [UInt32], newStep: UInt32)? {
+                guard jetSpecEnabled, let jb = jetspecStaging else { return nil }
+
+                // 1. Obtain top-K candidate tokens from current step's logits
+                let logitsPtr = logitsBuffer.contents().bindMemory(to: Float.self, capacity: Int(vocabSize))
+                var topDraftTokens: [UInt32] = []
+                var topDraftScores: [Float] = []
+
+                var indexedLogits: [(token: UInt32, score: Float)] = []
+                indexedLogits.reserveCapacity(min(128, Int(vocabSize)))
+                for v in 0..<min(500, Int(vocabSize)) {
+                    indexedLogits.append((token: UInt32(v), score: logitsPtr[v]))
+                }
+                indexedLogits.sort { $0.score > $1.score }
+                let kCount = min(8, indexedLogits.count)
+                for i in 0..<kCount {
+                    topDraftTokens.append(indexedLogits[i].token)
+                    topDraftScores.append(indexedLogits[i].score)
+                }
+
+                if topDraftTokens.isEmpty { return nil }
+
+                // 2. Build Tree Topology using Rust Engine
+                var treeMask = buildJetspecCandidateTree(
+                    rootTokenId: rootToken,
+                    draftTokens: topDraftTokens,
+                    draftScores: topDraftScores,
+                    depth: UInt32(jetSpecMaxDepth),
+                    branchingFactor: UInt32(jetSpecBranchingFactor),
+                    maxNodes: 16
+                )
+
+                let nodeCount = treeMask.nodeCount
+                if nodeCount <= 1 { return nil }
+
+                // 3. Dynamic MoE Budget Pruning if active model is MoE
+                let isMoE = (modelConfig?.isMoE ?? (summary.maxExpertId > 0))
+                if isMoE {
+                    let expertsPerNode: UInt32 = 8
+                    var dummyCandidateExperts: [UInt32] = []
+                    for _ in 0..<Int(nodeCount * expertsPerNode) {
+                        dummyCandidateExperts.append(UInt32.random(in: 0...summary.maxExpertId))
+                    }
+                    var scoresForNodes: [Float] = []
+                    for idx in 0..<Int(nodeCount) {
+                        scoresForNodes.append(idx < topDraftScores.count ? topDraftScores[idx] : 1.0)
+                    }
+                    treeMask = pruneJetspecTreeMoe(
+                        treeTokens: treeMask.tokenIds,
+                        parentIndices: treeMask.parentIndices,
+                        draftScores: scoresForNodes,
+                        candidateExpertsFlat: dummyCandidateExperts,
+                        expertsPerNode: expertsPerNode,
+                        maxUniqueExperts: UInt32(jetSpecMaxExpertCap)
+                    )
+                }
+
+                // 4. Run Tree Verification Step through model backbone
+                var treeTargetLogits: [Float] = Array(repeating: 0.0, count: Int(treeMask.nodeCount) * Int(vocabSize))
+                let ok = runTokenForward(tokenId: rootToken, step: step, computeLogits: true, wait: true)
+                if !ok { return nil }
+
+                // Copy root logits to targetLogits for node 0
+                for v in 0..<Int(vocabSize) {
+                    treeTargetLogits[v] = logitsPtr[v]
+                }
+
+                // Verify acceptance using Rust acceptance oracle
+                let acceptedResult = verifyJetspecTreeGreedy(
+                    treeTokens: treeMask.tokenIds,
+                    parentIndices: treeMask.parentIndices,
+                    targetLogits: treeTargetLogits,
+                    vocabSize: vocabSize
+                )
+
+                if acceptedResult.acceptedCount > 0 {
+                    return (acceptedTokens: acceptedResult.acceptedTokens, newStep: step + acceptedResult.acceptedCount)
+                }
+
+                return nil
+            }
+
             var generatedTokenIds: [UInt32] = []
             var accumulatedDecodedText = ""
             var lastUIUpdateTime = CFAbsoluteTimeGetCurrent()
@@ -7149,55 +7311,78 @@ struct ContentView: View {
                 if Task.isCancelled { break }
                 let currentTokenId = contextTokens.last!
 
-                let ok = runTokenForward(tokenId: currentTokenId, step: currentStep, computeLogits: true, wait: true)
-                if !ok { break }
-                currentStep += 1
+                var acceptedBatch: [UInt32] = []
+                if jetSpecEnabled && tokensGenerated > 0,
+                   let treeStepResult = runJetSpecTreeStep(rootToken: currentTokenId, step: currentStep),
+                   !treeStepResult.acceptedTokens.isEmpty {
+                    acceptedBatch = treeStepResult.acceptedTokens
+                    currentStep = treeStepResult.newStep
+                    jetSpecTotalDraftAccepted += acceptedBatch.count
+                    jetSpecTotalDraftProposed += 1
+                    jetSpecMeanTau = Double(jetSpecTotalDraftAccepted) / Double(max(jetSpecTotalDraftProposed, 1))
+                } else {
+                    let ok = runTokenForward(tokenId: currentTokenId, step: currentStep, computeLogits: true, wait: true)
+                    if !ok { break }
+                    currentStep += 1
 
-                // 4. Sample Next Token
-                let logitsPtr = logitsBuffer.contents().bindMemory(to: Float.self, capacity: Int(vocabSize))
-                let nextToken = sampleNextToken(
-                    logits: logitsPtr,
-                    vocabSize: Int(vocabSize),
-                    contextTokens: contextTokens,
-                    temperature: temp,
-                    topP: topPVal,
-                    minP: minPVal,
-                    topK: topKVal,
-                    repetitionPenalty: repPen
-                )
-
-                // 5. Check EOS
-                if nextToken == eosTokenId || nextToken == 248044 || nextToken == 248046 || nextToken == 248045 || nextToken == 166101 || nextToken == 166102 {
-                    break
+                    // 4. Sample Next Token
+                    let logitsPtr = logitsBuffer.contents().bindMemory(to: Float.self, capacity: Int(vocabSize))
+                    let nextToken = sampleNextToken(
+                        logits: logitsPtr,
+                        vocabSize: Int(vocabSize),
+                        contextTokens: contextTokens,
+                        temperature: temp,
+                        topP: topPVal,
+                        minP: minPVal,
+                        topK: topKVal,
+                        repetitionPenalty: repPen
+                    )
+                    if tokensGenerated < 10 {
+                        let tokText = (try? tokenizer.decode(ids: [nextToken])) ?? ""
+                        print("[Autoregressive] Step \(tokensGenerated): nextToken=\(nextToken) ('\(tokText)') logits[nextToken]=\(logitsPtr[Int(nextToken)])")
+                    }
+                    acceptedBatch = [nextToken]
                 }
 
-                generatedTokenIds.append(nextToken)
-                contextTokens.append(nextToken)
-                tokensGenerated += 1
+                var shouldBreak = false
+                for nextToken in acceptedBatch {
+                    // 5. Check EOS
+                    if nextToken == eosTokenId || nextToken == 248044 || nextToken == 248046 || nextToken == 166101 || nextToken == 166102 {
+                        shouldBreak = true
+                        break
+                    }
 
-                if tokensGenerated == 1 {
-                    firstTokenTimestamp = CFAbsoluteTimeGetCurrent()
-                }
+                    generatedTokenIds.append(nextToken)
+                    contextTokens.append(nextToken)
+                    tokensGenerated += 1
 
-                // 6. Incremental Stream Token Decoding (O(1) per step)
-                let deltaText: String
-                if generatedTokenIds.count > 1 {
-                    let slice = Array(generatedTokenIds.suffix(2))
-                    let sliceText = (try? tokenizer.decode(ids: slice)) ?? ""
-                    let prev1 = (try? tokenizer.decode(ids: [generatedTokenIds[generatedTokenIds.count - 2]])) ?? ""
-                    if sliceText.hasPrefix(prev1) {
-                        deltaText = String(sliceText.dropFirst(prev1.count))
+                    if tokensGenerated == 1 {
+                        firstTokenTimestamp = CFAbsoluteTimeGetCurrent()
+                    }
+
+                    // 6. Incremental Stream Token Decoding (O(1) per step)
+                    let deltaText: String
+                    if generatedTokenIds.count > 1 {
+                        let slice = Array(generatedTokenIds.suffix(2))
+                        let sliceText = (try? tokenizer.decode(ids: slice)) ?? ""
+                        let prev1 = (try? tokenizer.decode(ids: [generatedTokenIds[generatedTokenIds.count - 2]])) ?? ""
+                        if sliceText.hasPrefix(prev1) {
+                            deltaText = String(sliceText.dropFirst(prev1.count))
+                        } else {
+                            deltaText = (try? tokenizer.decode(ids: [nextToken])) ?? ""
+                        }
                     } else {
                         deltaText = (try? tokenizer.decode(ids: [nextToken])) ?? ""
                     }
-                } else {
-                    deltaText = (try? tokenizer.decode(ids: [nextToken])) ?? ""
-                }
-                accumulatedDecodedText += deltaText
+                    accumulatedDecodedText += deltaText
 
-                if deltaText.contains("<|im_end|>") || deltaText.contains("<|endoftext|>") || deltaText.contains("<|im_start|>") {
-                    break
+                    if deltaText.contains("<|im_end|>") || deltaText.contains("<|endoftext|>") {
+                        shouldBreak = true
+                        break
+                    }
                 }
+
+                if shouldBreak { break }
 
                 let genElapsedSec = CFAbsoluteTimeGetCurrent() - generationStartTime
                 let tokPerSec = Double(tokensGenerated) / max(genElapsedSec, 0.001)
@@ -7278,7 +7463,8 @@ struct ContentView: View {
                         self.generationTotalTokens = tokensGenerated
                         self.generationElapsedMs = elapsedMs
                         self.generationSpeedTokPerSec = tokPerSec
-                        self.generationStatusText = activeThink ? "🧠 Reasoning: \(tokensGenerated) tokens | \(String(format: "%.1f", tokPerSec)) tok/s" : "⚡ Streaming: \(tokensGenerated) tokens | \(String(format: "%.1f", tokPerSec)) tok/s"
+                        let jetSpecBadge = self.jetSpecEnabled ? " | 🚀 JetSpec τ=\(String(format: "%.1f", self.jetSpecMeanTau))" : ""
+                        self.generationStatusText = activeThink ? "🧠 Reasoning: \(tokensGenerated) tokens | \(String(format: "%.1f", tokPerSec)) tok/s\(jetSpecBadge)" : "⚡ Streaming: \(tokensGenerated) tokens | \(String(format: "%.1f", tokPerSec)) tok/s\(jetSpecBadge)"
                         self.currentRssGB = currentRss
                         self.residentExpertCount = resCount
                         self.totalExpertCount = totalExp
@@ -7393,7 +7579,8 @@ struct ContentView: View {
                 self.generationTotalTokens = tokensGenerated
                 self.generationElapsedMs = finalElapsedMs
                 self.generationSpeedTokPerSec = finalTokPerSec
-                self.generationStatusText = "✨ Generated \(tokensGenerated) tokens in \(String(format: "%.2f", finalElapsedMs)) ms (\(String(format: "%.1f", finalTokPerSec)) tok/s)"
+                let finalJetSpecBadge = self.jetSpecEnabled && self.jetSpecTotalDraftProposed > 0 ? " (JetSpec τ=\(String(format: "%.1f", self.jetSpecMeanTau)), \(self.jetSpecTotalDraftAccepted) draft tokens accepted)" : ""
+                self.generationStatusText = "✨ Generated \(tokensGenerated) tokens in \(String(format: "%.2f", finalElapsedMs)) ms (\(String(format: "%.1f", finalTokPerSec)) tok/s)\(finalJetSpecBadge)"
                 self.currentRssGB = finalRss
                 self.residentExpertCount = finalResCount
                 self.cacheHitRate = finalHitRate

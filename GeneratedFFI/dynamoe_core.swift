@@ -431,6 +431,22 @@ fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterFloat: FfiConverterPrimitive {
+    typealias FfiType = Float
+    typealias SwiftType = Float
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Float {
+        return try lift(readFloat(&buf))
+    }
+
+    public static func write(_ value: Float, into buf: inout [UInt8]) {
+        writeFloat(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterDouble: FfiConverterPrimitive {
     typealias FfiType = Double
     typealias SwiftType = Double
@@ -786,6 +802,366 @@ public func FfiConverterTypeDynaMoeTokenizer_lift(_ pointer: UnsafeMutableRawPoi
 #endif
 public func FfiConverterTypeDynaMoeTokenizer_lower(_ value: DynaMoeTokenizer) -> UnsafeMutableRawPointer {
     return FfiConverterTypeDynaMoeTokenizer.lower(value)
+}
+
+
+public struct DraftCandidateNode {
+    public var nodeId: UInt32
+    public var parentId: UInt32
+    public var tokenId: UInt32
+    public var depth: UInt32
+    public var branchIdx: UInt32
+    public var score: Float
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(nodeId: UInt32, parentId: UInt32, tokenId: UInt32, depth: UInt32, branchIdx: UInt32, score: Float) {
+        self.nodeId = nodeId
+        self.parentId = parentId
+        self.tokenId = tokenId
+        self.depth = depth
+        self.branchIdx = branchIdx
+        self.score = score
+    }
+}
+
+
+
+extension DraftCandidateNode: Equatable, Hashable {
+    public static func ==(lhs: DraftCandidateNode, rhs: DraftCandidateNode) -> Bool {
+        if lhs.nodeId != rhs.nodeId {
+            return false
+        }
+        if lhs.parentId != rhs.parentId {
+            return false
+        }
+        if lhs.tokenId != rhs.tokenId {
+            return false
+        }
+        if lhs.depth != rhs.depth {
+            return false
+        }
+        if lhs.branchIdx != rhs.branchIdx {
+            return false
+        }
+        if lhs.score != rhs.score {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(nodeId)
+        hasher.combine(parentId)
+        hasher.combine(tokenId)
+        hasher.combine(depth)
+        hasher.combine(branchIdx)
+        hasher.combine(score)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDraftCandidateNode: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DraftCandidateNode {
+        return
+            try DraftCandidateNode(
+                nodeId: FfiConverterUInt32.read(from: &buf), 
+                parentId: FfiConverterUInt32.read(from: &buf), 
+                tokenId: FfiConverterUInt32.read(from: &buf), 
+                depth: FfiConverterUInt32.read(from: &buf), 
+                branchIdx: FfiConverterUInt32.read(from: &buf), 
+                score: FfiConverterFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: DraftCandidateNode, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.nodeId, into: &buf)
+        FfiConverterUInt32.write(value.parentId, into: &buf)
+        FfiConverterUInt32.write(value.tokenId, into: &buf)
+        FfiConverterUInt32.write(value.depth, into: &buf)
+        FfiConverterUInt32.write(value.branchIdx, into: &buf)
+        FfiConverterFloat.write(value.score, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDraftCandidateNode_lift(_ buf: RustBuffer) throws -> DraftCandidateNode {
+    return try FfiConverterTypeDraftCandidateNode.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDraftCandidateNode_lower(_ value: DraftCandidateNode) -> RustBuffer {
+    return FfiConverterTypeDraftCandidateNode.lower(value)
+}
+
+
+public struct JetSpecAcceptedResult {
+    public var acceptedTokens: [UInt32]
+    public var acceptedNodeIndices: [UInt32]
+    public var bonusToken: UInt32?
+    public var acceptedCount: UInt32
+    public var effectiveTau: Float
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(acceptedTokens: [UInt32], acceptedNodeIndices: [UInt32], bonusToken: UInt32?, acceptedCount: UInt32, effectiveTau: Float) {
+        self.acceptedTokens = acceptedTokens
+        self.acceptedNodeIndices = acceptedNodeIndices
+        self.bonusToken = bonusToken
+        self.acceptedCount = acceptedCount
+        self.effectiveTau = effectiveTau
+    }
+}
+
+
+
+extension JetSpecAcceptedResult: Equatable, Hashable {
+    public static func ==(lhs: JetSpecAcceptedResult, rhs: JetSpecAcceptedResult) -> Bool {
+        if lhs.acceptedTokens != rhs.acceptedTokens {
+            return false
+        }
+        if lhs.acceptedNodeIndices != rhs.acceptedNodeIndices {
+            return false
+        }
+        if lhs.bonusToken != rhs.bonusToken {
+            return false
+        }
+        if lhs.acceptedCount != rhs.acceptedCount {
+            return false
+        }
+        if lhs.effectiveTau != rhs.effectiveTau {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(acceptedTokens)
+        hasher.combine(acceptedNodeIndices)
+        hasher.combine(bonusToken)
+        hasher.combine(acceptedCount)
+        hasher.combine(effectiveTau)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeJetSpecAcceptedResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> JetSpecAcceptedResult {
+        return
+            try JetSpecAcceptedResult(
+                acceptedTokens: FfiConverterSequenceUInt32.read(from: &buf), 
+                acceptedNodeIndices: FfiConverterSequenceUInt32.read(from: &buf), 
+                bonusToken: FfiConverterOptionUInt32.read(from: &buf), 
+                acceptedCount: FfiConverterUInt32.read(from: &buf), 
+                effectiveTau: FfiConverterFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: JetSpecAcceptedResult, into buf: inout [UInt8]) {
+        FfiConverterSequenceUInt32.write(value.acceptedTokens, into: &buf)
+        FfiConverterSequenceUInt32.write(value.acceptedNodeIndices, into: &buf)
+        FfiConverterOptionUInt32.write(value.bonusToken, into: &buf)
+        FfiConverterUInt32.write(value.acceptedCount, into: &buf)
+        FfiConverterFloat.write(value.effectiveTau, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeJetSpecAcceptedResult_lift(_ buf: RustBuffer) throws -> JetSpecAcceptedResult {
+    return try FfiConverterTypeJetSpecAcceptedResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeJetSpecAcceptedResult_lower(_ value: JetSpecAcceptedResult) -> RustBuffer {
+    return FfiConverterTypeJetSpecAcceptedResult.lower(value)
+}
+
+
+public struct JetSpecTreeConfig {
+    public var maxDepth: UInt32
+    public var branchingFactor: UInt32
+    public var topK: UInt32
+    public var maxNodes: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(maxDepth: UInt32, branchingFactor: UInt32, topK: UInt32, maxNodes: UInt32) {
+        self.maxDepth = maxDepth
+        self.branchingFactor = branchingFactor
+        self.topK = topK
+        self.maxNodes = maxNodes
+    }
+}
+
+
+
+extension JetSpecTreeConfig: Equatable, Hashable {
+    public static func ==(lhs: JetSpecTreeConfig, rhs: JetSpecTreeConfig) -> Bool {
+        if lhs.maxDepth != rhs.maxDepth {
+            return false
+        }
+        if lhs.branchingFactor != rhs.branchingFactor {
+            return false
+        }
+        if lhs.topK != rhs.topK {
+            return false
+        }
+        if lhs.maxNodes != rhs.maxNodes {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(maxDepth)
+        hasher.combine(branchingFactor)
+        hasher.combine(topK)
+        hasher.combine(maxNodes)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeJetSpecTreeConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> JetSpecTreeConfig {
+        return
+            try JetSpecTreeConfig(
+                maxDepth: FfiConverterUInt32.read(from: &buf), 
+                branchingFactor: FfiConverterUInt32.read(from: &buf), 
+                topK: FfiConverterUInt32.read(from: &buf), 
+                maxNodes: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: JetSpecTreeConfig, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.maxDepth, into: &buf)
+        FfiConverterUInt32.write(value.branchingFactor, into: &buf)
+        FfiConverterUInt32.write(value.topK, into: &buf)
+        FfiConverterUInt32.write(value.maxNodes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeJetSpecTreeConfig_lift(_ buf: RustBuffer) throws -> JetSpecTreeConfig {
+    return try FfiConverterTypeJetSpecTreeConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeJetSpecTreeConfig_lower(_ value: JetSpecTreeConfig) -> RustBuffer {
+    return FfiConverterTypeJetSpecTreeConfig.lower(value)
+}
+
+
+public struct JetSpecTreeMask {
+    public var nodeCount: UInt32
+    public var mask: [Float]
+    public var parentIndices: [UInt32]
+    public var depths: [UInt32]
+    public var tokenIds: [UInt32]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(nodeCount: UInt32, mask: [Float], parentIndices: [UInt32], depths: [UInt32], tokenIds: [UInt32]) {
+        self.nodeCount = nodeCount
+        self.mask = mask
+        self.parentIndices = parentIndices
+        self.depths = depths
+        self.tokenIds = tokenIds
+    }
+}
+
+
+
+extension JetSpecTreeMask: Equatable, Hashable {
+    public static func ==(lhs: JetSpecTreeMask, rhs: JetSpecTreeMask) -> Bool {
+        if lhs.nodeCount != rhs.nodeCount {
+            return false
+        }
+        if lhs.mask != rhs.mask {
+            return false
+        }
+        if lhs.parentIndices != rhs.parentIndices {
+            return false
+        }
+        if lhs.depths != rhs.depths {
+            return false
+        }
+        if lhs.tokenIds != rhs.tokenIds {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(nodeCount)
+        hasher.combine(mask)
+        hasher.combine(parentIndices)
+        hasher.combine(depths)
+        hasher.combine(tokenIds)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeJetSpecTreeMask: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> JetSpecTreeMask {
+        return
+            try JetSpecTreeMask(
+                nodeCount: FfiConverterUInt32.read(from: &buf), 
+                mask: FfiConverterSequenceFloat.read(from: &buf), 
+                parentIndices: FfiConverterSequenceUInt32.read(from: &buf), 
+                depths: FfiConverterSequenceUInt32.read(from: &buf), 
+                tokenIds: FfiConverterSequenceUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: JetSpecTreeMask, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.nodeCount, into: &buf)
+        FfiConverterSequenceFloat.write(value.mask, into: &buf)
+        FfiConverterSequenceUInt32.write(value.parentIndices, into: &buf)
+        FfiConverterSequenceUInt32.write(value.depths, into: &buf)
+        FfiConverterSequenceUInt32.write(value.tokenIds, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeJetSpecTreeMask_lift(_ buf: RustBuffer) throws -> JetSpecTreeMask {
+    return try FfiConverterTypeJetSpecTreeMask.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeJetSpecTreeMask_lower(_ value: JetSpecTreeMask) -> RustBuffer {
+    return FfiConverterTypeJetSpecTreeMask.lower(value)
 }
 
 
@@ -1423,6 +1799,31 @@ fileprivate struct FfiConverterSequenceUInt32: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceFloat: FfiConverterRustBuffer {
+    typealias SwiftType = [Float]
+
+    public static func write(_ value: [Float], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterFloat.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Float] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [Float]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterFloat.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeLayerSummary: FfiConverterRustBuffer {
     typealias SwiftType = [LayerSummary]
 
@@ -1494,6 +1895,53 @@ fileprivate struct FfiConverterSequenceTypeTensorMetadata: FfiConverterRustBuffe
         return seq
     }
 }
+public func buildJetspecCandidateTree(rootTokenId: UInt32, draftTokens: [UInt32], draftScores: [Float], depth: UInt32, branchingFactor: UInt32, maxNodes: UInt32) -> JetSpecTreeMask {
+    return try!  FfiConverterTypeJetSpecTreeMask.lift(try! rustCall() {
+    uniffi_dynamoe_core_fn_func_build_jetspec_candidate_tree(
+        FfiConverterUInt32.lower(rootTokenId),
+        FfiConverterSequenceUInt32.lower(draftTokens),
+        FfiConverterSequenceFloat.lower(draftScores),
+        FfiConverterUInt32.lower(depth),
+        FfiConverterUInt32.lower(branchingFactor),
+        FfiConverterUInt32.lower(maxNodes),$0
+    )
+})
+}
+public func pruneJetspecTreeMoe(treeTokens: [UInt32], parentIndices: [UInt32], draftScores: [Float], candidateExpertsFlat: [UInt32], expertsPerNode: UInt32, maxUniqueExperts: UInt32) -> JetSpecTreeMask {
+    return try!  FfiConverterTypeJetSpecTreeMask.lift(try! rustCall() {
+    uniffi_dynamoe_core_fn_func_prune_jetspec_tree_moe(
+        FfiConverterSequenceUInt32.lower(treeTokens),
+        FfiConverterSequenceUInt32.lower(parentIndices),
+        FfiConverterSequenceFloat.lower(draftScores),
+        FfiConverterSequenceUInt32.lower(candidateExpertsFlat),
+        FfiConverterUInt32.lower(expertsPerNode),
+        FfiConverterUInt32.lower(maxUniqueExperts),$0
+    )
+})
+}
+public func verifyJetspecTreeGreedy(treeTokens: [UInt32], parentIndices: [UInt32], targetLogits: [Float], vocabSize: UInt32) -> JetSpecAcceptedResult {
+    return try!  FfiConverterTypeJetSpecAcceptedResult.lift(try! rustCall() {
+    uniffi_dynamoe_core_fn_func_verify_jetspec_tree_greedy(
+        FfiConverterSequenceUInt32.lower(treeTokens),
+        FfiConverterSequenceUInt32.lower(parentIndices),
+        FfiConverterSequenceFloat.lower(targetLogits),
+        FfiConverterUInt32.lower(vocabSize),$0
+    )
+})
+}
+public func verifyJetspecTreeSampling(treeTokens: [UInt32], parentIndices: [UInt32], draftProbs: [Float], targetLogits: [Float], vocabSize: UInt32, temperature: Float, rngSeed: UInt64) -> JetSpecAcceptedResult {
+    return try!  FfiConverterTypeJetSpecAcceptedResult.lift(try! rustCall() {
+    uniffi_dynamoe_core_fn_func_verify_jetspec_tree_sampling(
+        FfiConverterSequenceUInt32.lower(treeTokens),
+        FfiConverterSequenceUInt32.lower(parentIndices),
+        FfiConverterSequenceFloat.lower(draftProbs),
+        FfiConverterSequenceFloat.lower(targetLogits),
+        FfiConverterUInt32.lower(vocabSize),
+        FfiConverterFloat.lower(temperature),
+        FfiConverterUInt64.lower(rngSeed),$0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -1509,6 +1957,18 @@ private var initializationResult: InitializationResult = {
     let scaffolding_contract_version = ffi_dynamoe_core_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
+    }
+    if (uniffi_dynamoe_core_checksum_func_build_jetspec_candidate_tree() != 58691) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_dynamoe_core_checksum_func_prune_jetspec_tree_moe() != 38728) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_dynamoe_core_checksum_func_verify_jetspec_tree_greedy() != 47992) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_dynamoe_core_checksum_func_verify_jetspec_tree_sampling() != 25599) {
+        return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_dynamoe_core_checksum_method_dynamoeengine_advise_shard_range() != 7519) {
         return InitializationResult.apiChecksumMismatch

@@ -375,12 +375,12 @@ struct ChatDetailView: View {
                                     if !isAgentToolsEnabled {
                                         Image(systemName: "checkmark")
                                     }
-                                    Label("Agent Tools Off", systemImage: "wrench.slash")
+                                    Label("Agent Tools Off", systemImage: "wrench.and.screwdriver")
                                 }
                             }
                         } label: {
                             HStack(spacing: 5) {
-                                Image(systemName: isAgentToolsEnabled ? "wrench.and.screwdriver.fill" : "wrench.slash")
+                                Image(systemName: isAgentToolsEnabled ? "wrench.and.screwdriver.fill" : "wrench.and.screwdriver")
                                     .font(.system(size: max(8.5, 10 * zoomManager.zoomScale)))
                                     .foregroundColor(isAgentToolsEnabled ? .indigo : .secondary)
                                 Text(isAgentToolsEnabled ? "Tools On" : "Tools Off")

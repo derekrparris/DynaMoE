@@ -40,6 +40,10 @@ struct SettingsSheetView: View {
     @AppStorage("dynamoe_max_tool_output_length") private var maxToolOutputLength: Int = 4000
     @AppStorage("dynamoe_max_agent_steps") private var maxAgentSteps: Int = 15
     @AppStorage("dynamoe_brave_search_api_key") private var braveApiKey: String = ""
+    @AppStorage("dynamoe_jetspec_enabled") private var jetSpecEnabled: Bool = false
+    @AppStorage("dynamoe_jetspec_depth") private var jetSpecMaxDepth: Int = 3
+    @AppStorage("dynamoe_jetspec_branching") private var jetSpecBranchingFactor: Int = 2
+    @AppStorage("dynamoe_jetspec_expert_cap") private var jetSpecMaxExpertCap: Int = 8
 
     // Model & Tokenizer bindings
     var summary: ModelSummary?
@@ -589,6 +593,80 @@ struct SettingsSheetView: View {
                         }
                     }
                 }
+
+                // JetSpec Causal Speculative Tree Acceleration
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "arrow.triangle.branch")
+                                    .foregroundColor(.purple)
+                                Text("JetSpec Causal Speculative Tree")
+                                    .font(.subheadline)
+                                    .fontWeight(.semibold)
+                            }
+                            Text("Accelerates token generation via causal parallel tree drafting and dynamic MoE budget pruning.")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
+                        Toggle("", isOn: $jetSpecEnabled)
+                            .toggleStyle(.switch)
+                    }
+
+                    if jetSpecEnabled {
+                        // Max Tree Depth
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text("Max Tree Depth")
+                                    .font(.caption)
+                                Spacer()
+                                Text("\(jetSpecMaxDepth)")
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundColor(.purple)
+                            }
+                            Slider(value: Binding(
+                                get: { Float(jetSpecMaxDepth) },
+                                set: { jetSpecMaxDepth = Int($0) }
+                            ), in: 1...5, step: 1)
+                        }
+
+                        // Branching Factor
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text("Branching Factor")
+                                    .font(.caption)
+                                Spacer()
+                                Text("\(jetSpecBranchingFactor)")
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundColor(.purple)
+                            }
+                            Slider(value: Binding(
+                                get: { Float(jetSpecBranchingFactor) },
+                                set: { jetSpecBranchingFactor = Int($0) }
+                            ), in: 1...4, step: 1)
+                        }
+
+                        // Max Unique MoE Expert Cap
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack {
+                                Text("Max Expert Cap per Step")
+                                    .font(.caption)
+                                Spacer()
+                                Text("\(jetSpecMaxExpertCap) experts")
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundColor(.purple)
+                            }
+                            Slider(value: Binding(
+                                get: { Float(jetSpecMaxExpertCap) },
+                                set: { jetSpecMaxExpertCap = Int($0) }
+                            ), in: 2...16, step: 1)
+                        }
+                    }
+                }
+                .padding(12)
+                .background(Color.purple.opacity(0.06))
+                .cornerRadius(8)
 
                 // System Prompt Editor & Conjunction Combination
                 VStack(alignment: .leading, spacing: 8) {

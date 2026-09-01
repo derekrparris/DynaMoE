@@ -1,5 +1,8 @@
 uniffi::setup_scaffolding!();
 
+pub mod jetspec;
+pub use jetspec::*;
+
 use memmap2::{Mmap, MmapOptions};
 use safetensors::SafeTensors;
 use serde::Deserialize;
@@ -754,6 +757,131 @@ impl DynaMoeEngine {
         }
         Ok(())
     }
+}
+
+// MARK: - JetSpec UniFFI Export Functions
+
+#[uniffi::export]
+pub fn build_jetspec_candidate_tree(
+    root_token_id: u32,
+    draft_tokens: Vec<u32>,
+    draft_scores: Vec<f32>,
+    depth: u32,
+    branching_factor: u32,
+    max_nodes: u32,
+) -> JetSpecTreeMask {
+    let tree = DraftTreeTopology::from_candidate_tokens(
+        root_token_id,
+        &draft_tokens,
+        &draft_scores,
+        depth,
+        branching_factor,
+        max_nodes,
+    );
+    tree.generate_tree_mask()
+}
+
+#[uniffi::export]
+pub fn verify_jetspec_tree_greedy(
+    tree_tokens: Vec<u32>,
+    parent_indices: Vec<u32>,
+    target_logits: Vec<f32>,
+    vocab_size: u32,
+) -> JetSpecAcceptedResult {
+    let mut tree = DraftTreeTopology::new();
+    for (i, (&tok, &parent)) in tree_tokens.iter().zip(parent_indices.iter()).enumerate() {
+        let node = DraftCandidateNode {
+            node_id: i as u32,
+            parent_id: parent,
+            token_id: tok,
+            depth: 0,
+            branch_idx: 0,
+            score: 1.0,
+        };
+        tree.nodes.push(node);
+        if i > 0 {
+            tree.children_map.entry(parent).or_default().push(i as u32);
+        }
+    }
+    JetSpecAcceptanceOracle::verify_greedy(&tree, &target_logits, vocab_size as usize)
+}
+
+#[uniffi::export]
+pub fn verify_jetspec_tree_sampling(
+    tree_tokens: Vec<u32>,
+    parent_indices: Vec<u32>,
+    draft_probs: Vec<f32>,
+    target_logits: Vec<f32>,
+    vocab_size: u32,
+    temperature: f32,
+    rng_seed: u64,
+) -> JetSpecAcceptedResult {
+    let mut tree = DraftTreeTopology::new();
+    for (i, (&tok, &parent)) in tree_tokens.iter().zip(parent_indices.iter()).enumerate() {
+        let node = DraftCandidateNode {
+            node_id: i as u32,
+            parent_id: parent,
+            token_id: tok,
+            depth: 0,
+            branch_idx: 0,
+            score: 1.0,
+        };
+        tree.nodes.push(node);
+        if i > 0 {
+            tree.children_map.entry(parent).or_default().push(i as u32);
+        }
+    }
+    JetSpecAcceptanceOracle::verify_speculative_sampling(
+        &tree,
+        &draft_probs,
+        &target_logits,
+        vocab_size as usize,
+        temperature,
+        rng_seed,
+    )
+}
+
+#[uniffi::export]
+pub fn prune_jetspec_tree_moe(
+    tree_tokens: Vec<u32>,
+    parent_indices: Vec<u32>,
+    draft_scores: Vec<f32>,
+    candidate_experts_flat: Vec<u32>,
+    experts_per_node: u32,
+    max_unique_experts: u32,
+) -> JetSpecTreeMask {
+    let mut tree = DraftTreeTopology::new();
+    for (i, (&tok, &parent)) in tree_tokens.iter().zip(parent_indices.iter()).enumerate() {
+        let score = if i < draft_scores.len() { draft_scores[i] } else { 1.0 };
+        let node = DraftCandidateNode {
+            node_id: i as u32,
+            parent_id: parent,
+            token_id: tok,
+            depth: 0,
+            branch_idx: 0,
+            score,
+        };
+        tree.nodes.push(node);
+        if i > 0 {
+            tree.children_map.entry(parent).or_default().push(i as u32);
+        }
+    }
+
+    let n = tree_tokens.len();
+    let k = experts_per_node as usize;
+    let mut candidate_experts = Vec::with_capacity(n);
+    for i in 0..n {
+        let start = i * k;
+        let end = (start + k).min(candidate_experts_flat.len());
+        if start < candidate_experts_flat.len() {
+            candidate_experts.push(candidate_experts_flat[start..end].to_vec());
+        } else {
+            candidate_experts.push(Vec::new());
+        }
+    }
+
+    let pruned_tree = tree.prune_for_expert_budget(&candidate_experts, max_unique_experts as usize);
+    pruned_tree.generate_tree_mask()
 }
 
 #[cfg(test)]

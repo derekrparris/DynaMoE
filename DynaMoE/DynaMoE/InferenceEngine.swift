@@ -237,11 +237,19 @@ public final class InferenceEngine {
     public var hcInjectScalePipeline: MTLComputePipelineState?
     public var hcInjectPipeline: MTLComputePipelineState?
 
+    // JetSpec Speculative Decoding Pipelines
+    public var jetDraftHeadPredictPipeline: MTLComputePipelineState?
+    public var gqaAttentionTreeVerifyStandardPipeline: MTLComputePipelineState?
+    public var gqaAttentionTreeVerifyStandardF16Pipeline: MTLComputePipelineState?
+    public var gqaAttentionTreeVerifyFusedPipeline: MTLComputePipelineState?
+    public var gqaAttentionTreeVerifyFusedF16Pipeline: MTLComputePipelineState?
+    public var gdnLinearAttnTreeStepPipeline: MTLComputePipelineState?
+
     private init() {}
 
     public func initializePipelines(device: MTLDevice) throws {
         self.device = device
-        guard let defaultLib = device.makeDefaultLibrary() else {
+        guard let defaultLib = device.makeDefaultLibrary() ?? (try? device.makeDefaultLibrary(bundle: Bundle(for: InferenceEngine.self))) else {
             throw NSError(domain: "InferenceEngine", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to load default Metal library."])
         }
         self.defaultLibrary = defaultLib
@@ -458,6 +466,26 @@ public final class InferenceEngine {
         }
         if let hcInjFunc = defaultLib.makeFunction(name: "hyper_connection_inject_bf16") {
             hcInjectPipeline = try device.makeComputePipelineState(function: hcInjFunc)
+        }
+
+        // JetSpec Speculative Decoding Kernels
+        if let jetDraftFunc = defaultLib.makeFunction(name: "jet_draft_head_predict_bf16") {
+            jetDraftHeadPredictPipeline = try device.makeComputePipelineState(function: jetDraftFunc)
+        }
+        if let gqaTreeStdFunc = defaultLib.makeFunction(name: "gqa_attention_tree_verify_standard") {
+            gqaAttentionTreeVerifyStandardPipeline = try device.makeComputePipelineState(function: gqaTreeStdFunc)
+        }
+        if let gqaTreeStdF16Func = defaultLib.makeFunction(name: "gqa_attention_tree_verify_standard_f16") {
+            gqaAttentionTreeVerifyStandardF16Pipeline = try device.makeComputePipelineState(function: gqaTreeStdF16Func)
+        }
+        if let gqaTreeFusedFunc = defaultLib.makeFunction(name: "gqa_attention_tree_verify_fused") {
+            gqaAttentionTreeVerifyFusedPipeline = try device.makeComputePipelineState(function: gqaTreeFusedFunc)
+        }
+        if let gqaTreeFusedF16Func = defaultLib.makeFunction(name: "gqa_attention_tree_verify_fused_f16") {
+            gqaAttentionTreeVerifyFusedF16Pipeline = try device.makeComputePipelineState(function: gqaTreeFusedF16Func)
+        }
+        if let gdnTreeStepFunc = defaultLib.makeFunction(name: "gdn_linear_attention_tree_step") {
+            gdnLinearAttnTreeStepPipeline = try device.makeComputePipelineState(function: gdnTreeStepFunc)
         }
     }
 
@@ -797,6 +825,61 @@ extension InferenceEngine {
         #if os(macOS)
         _ = posix_madvise(ptr, len, POSIX_MADV_WILLNEED)
         #endif
+    }
+}
+
+// MARK: - JetSpec Speculative Staging Buffers & Topology
+extension InferenceEngine {
+    public struct JetSpecStagingBuffers {
+        public let treeMaskBuffer: MTLBuffer        // [maxNodes * maxNodes] f32
+        public let candidateTokensBuffer: MTLBuffer // [maxNodes] u32
+        public let parentIndicesBuffer: MTLBuffer   // [maxNodes] u32
+        public let depthsBuffer: MTLBuffer          // [maxNodes] u32
+        public let draftLogitsBuffer: MTLBuffer     // [maxNodes * vocabSize] f32
+        public let targetLogitsBuffer: MTLBuffer    // [maxNodes * vocabSize] f32
+        public let treeHiddenBuffer: MTLBuffer      // [maxNodes * hiddenDim] f32
+        public let treeAttnOutBuffer: MTLBuffer     // [maxNodes * hiddenDim] f32
+        public let maxNodes: Int
+        public let vocabSize: Int
+        public let hiddenDim: Int
+    }
+
+    /// Allocates shared memory buffers for JetSpec speculative tree expansion and parallel verification
+    public func allocateJetSpecBuffers(
+        device: MTLDevice,
+        maxNodes: Int = 16,
+        vocabSize: Int = 152064,
+        hiddenDim: Int = 4096
+    ) -> JetSpecStagingBuffers? {
+        let maskBytes = maxNodes * maxNodes * MemoryLayout<Float>.stride
+        let u32Bytes = maxNodes * MemoryLayout<UInt32>.stride
+        let logitsBytes = maxNodes * vocabSize * MemoryLayout<Float>.stride
+        let hiddenBytes = maxNodes * hiddenDim * MemoryLayout<Float>.stride
+
+        guard let maskBuf = device.makeBuffer(length: maskBytes, options: .storageModeShared),
+              let tokensBuf = device.makeBuffer(length: u32Bytes, options: .storageModeShared),
+              let parentBuf = device.makeBuffer(length: u32Bytes, options: .storageModeShared),
+              let depthsBuf = device.makeBuffer(length: u32Bytes, options: .storageModeShared),
+              let draftLogitsBuf = device.makeBuffer(length: logitsBytes, options: .storageModeShared),
+              let targetLogitsBuf = device.makeBuffer(length: logitsBytes, options: .storageModeShared),
+              let hiddenBuf = device.makeBuffer(length: hiddenBytes, options: .storageModeShared),
+              let attnOutBuf = device.makeBuffer(length: hiddenBytes, options: .storageModeShared) else {
+            return nil
+        }
+
+        return JetSpecStagingBuffers(
+            treeMaskBuffer: maskBuf,
+            candidateTokensBuffer: tokensBuf,
+            parentIndicesBuffer: parentBuf,
+            depthsBuffer: depthsBuf,
+            draftLogitsBuffer: draftLogitsBuf,
+            targetLogitsBuffer: targetLogitsBuf,
+            treeHiddenBuffer: hiddenBuf,
+            treeAttnOutBuffer: attnOutBuf,
+            maxNodes: maxNodes,
+            vocabSize: vocabSize,
+            hiddenDim: hiddenDim
+        )
     }
 }
 

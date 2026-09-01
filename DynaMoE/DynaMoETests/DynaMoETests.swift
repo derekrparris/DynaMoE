@@ -1688,7 +1688,274 @@ final class DynaMoETests: XCTestCase {
         XCTAssertGreaterThan(nonZeroCount, 0, "Large prefill output is all zeros!")
         print("🎉 [SUCCESS] Large prompt prefill (P=\(P) tokens) executed cleanly without Metal assertion failure! nonZeroCount=\(nonZeroCount)/\(P * hiddenDim)")
     }
+
+    func testQwen38AutoregressiveChat() throws {
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next-FP8/snapshots/236dfdf285828023ca3bcd3f37366c58a3469b13"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            print("Qwen 3.8 Flash Next FP8 snapshot not found, skipping.")
+            return
+        }
+        print("🔍 [DIAGNOSTIC] Loading Qwen 3.8 Flash Next FP8 for Autoregressive Chat Test from \(snapshotDir)...")
+        let engine = try DynaMoeEngine(filePath: snapshotDir)
+        let summary = try engine.getSummary()
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let address = UInt(shard.baseAddress)
+            guard let ptr = UnsafeMutableRawPointer(bitPattern: address) else { continue }
+            let len = Int(shard.length)
+            if let buf = device.makeBuffer(bytesNoCopy: ptr, length: len, options: .storageModeShared, deallocator: nil) {
+                buffers[shard.index] = buf
+            }
+        }
+
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+
+        guard let cmdQueue = device.makeCommandQueue() else {
+            XCTFail("No Metal command queue")
+            return
+        }
+
+        let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir))
+        let cachedLayers = inference.buildCachedLayers(summary: summary, config: config, targetLayerCount: 48)
+
+        let hiddenDim: UInt32 = 2560
+        let vocabSize: UInt32 = 248320
+        let eps: Float = 1e-6
+
+        // Discover embed, final HC, LM head tensors
+        let embedWeight = summary.tensors.first(where: {
+            !$0.name.hasPrefix("visual.") && !$0.name.hasPrefix("mtp.") &&
+            ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.contains("wte")) &&
+            !$0.name.contains("scale") && !$0.name.contains("scales") &&
+            !$0.name.contains("bias") && !$0.name.contains("biases")
+        })!
+        let embedScale = summary.tensors.first(where: {
+            !$0.name.hasPrefix("visual.") && !$0.name.hasPrefix("mtp.") &&
+            ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.contains("wte")) &&
+            ($0.name.contains("scale") || $0.name.contains("scales"))
+        })
+
+        let finalHcNormWeight = summary.tensors.first(where: {
+            $0.name.contains("hyper_connection_mixer") && $0.name.contains("hc_norm")
+        })
+        let finalHcDownWeight = summary.tensors.first(where: {
+            $0.name.contains("hyper_connection_mixer") && $0.name.contains("input_mix_weight_down")
+        })
+        let finalHcUpWeight = summary.tensors.first(where: {
+            $0.name.contains("hyper_connection_mixer") && $0.name.contains("input_mix_weight_up")
+        })
+
+        let lmHeadTensorCandidate = summary.tensors.first(where: {
+            ($0.name == "lm_head.weight" ||
+             $0.name == "language_model.lm_head.weight" ||
+             $0.name == "model.lm_head.weight" ||
+             $0.name == "lm_head") &&
+            !$0.name.contains("scale") && !$0.name.contains("scales") &&
+            !$0.name.contains("bias") && !$0.name.contains("biases")
+        }) ?? embedWeight
+        let lmHeadScale = summary.tensors.first(where: {
+            ($0.name == "lm_head.scale" ||
+             $0.name == "language_model.lm_head.scale" ||
+             $0.name == "model.lm_head.scale" ||
+             $0.name == "lm_head.weight_scale_inv" ||
+             $0.name == "lm_head.weight_scale")
+        })
+        let lmHeadBias = summary.tensors.first(where: {
+            ($0.name == "lm_head.bias" ||
+             $0.name == "language_model.lm_head.bias" ||
+             $0.name == "model.lm_head.bias")
+        })
+
+        print("🔍 [DIAGNOSTIC] Final HC Mixer: norm=\(finalHcNormWeight?.name ?? "nil"), down=\(finalHcDownWeight?.name ?? "nil"), up=\(finalHcUpWeight?.name ?? "nil")")
+        print("🔍 [DIAGNOSTIC] LM Head: tensor=\(lmHeadTensorCandidate.name), dtype=\(lmHeadTensorCandidate.dtype), shape=\(lmHeadTensorCandidate.shapeDisplay), scale=\(lmHeadScale?.name ?? "nil"), bias=\(lmHeadBias?.name ?? "nil")")
+
+        guard let currentH = device.makeBuffer(length: Int(hiddenDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let nextH = device.makeBuffer(length: Int(hiddenDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let hcStreamsBuffer = device.makeBuffer(length: 4 * Int(hiddenDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let hcNormedBuffer = device.makeBuffer(length: 4 * Int(hiddenDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let hcBottleneckBuffer = device.makeBuffer(length: 512 * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let hcInjectScaleBuffer = device.makeBuffer(length: 4 * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let xFinalBuffer = device.makeBuffer(length: Int(hiddenDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let logitsBuffer = device.makeBuffer(length: Int(vocabSize) * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let embedShardBuffer = buffers[embedWeight.shardIndex] else {
+            XCTFail("Failed to allocate test buffers")
+            return
+        }
+
+        // Test single token forward for token ID 248045 (<|im_start|>)
+        let testTokenId: UInt32 = 248045
+        guard let cmd = cmdQueue.makeCommandBuffer(), let enc = cmd.makeComputeCommandEncoder() else {
+            XCTFail("Failed to create encoder")
+            return
+        }
+
+        let isEmbedMXFP8 = (embedScale != nil) && (embedScale!.dtype.contains("U8") || embedScale!.dtype.contains("UINT8"))
+        var embedOffset = embedWeight.offsetStart
+        var hDimVal = hiddenDim
+
+        guard let tokenBuf = device.makeBuffer(length: 4, options: .storageModeShared) else {
+            XCTFail("Failed to allocate token buffer")
+            return
+        }
+        tokenBuf.contents().bindMemory(to: UInt32.self, capacity: 1)[0] = testTokenId
+
+        if isEmbedMXFP8, let embedMXPipe = inference.embedMXFP8Pipeline, let sRaw = buffers[embedScale!.shardIndex] {
+            var tokVal = testTokenId
+            var sOff = embedScale!.offsetStart
+            enc.setComputePipelineState(embedMXPipe)
+            enc.setBuffer(embedShardBuffer, offset: 0, index: 0)
+            enc.setBytes(&tokVal, length: 4, index: 1)
+            enc.setBuffer(currentH, offset: 0, index: 2)
+            enc.setBuffer(sRaw, offset: 0, index: 3)
+            enc.setBytes(&embedOffset, length: 8, index: 4)
+            enc.setBytes(&sOff, length: 8, index: 5)
+            enc.setBytes(&hDimVal, length: 4, index: 6)
+            enc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), embedMXPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+        } else if let embedPipe = inference.embedPipeline {
+            enc.setComputePipelineState(embedPipe)
+            enc.setBuffer(embedShardBuffer, offset: 0, index: 0)
+            enc.setBuffer(tokenBuf, offset: 0, index: 1)
+            enc.setBuffer(currentH, offset: 0, index: 2)
+            enc.setBytes(&embedOffset, length: 8, index: 3)
+            enc.setBytes(&hDimVal, length: 4, index: 4)
+            enc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), embedPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+        }
+
+        enc.memoryBarrier(scope: .buffers)
+
+        if let initPipe = inference.fusedInit4StreamsPipeline {
+            enc.setComputePipelineState(initPipe)
+            enc.setBuffer(currentH, offset: 0, index: 0)
+            enc.setBuffer(hcStreamsBuffer, offset: 0, index: 1)
+            enc.setBytes(&hDimVal, length: 4, index: 2)
+            enc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), initPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+        }
+
+        // Run Final HC Mixer & LM Head
+        if let finalHcDown = finalHcDownWeight, let finalHcDownRaw = buffers[finalHcDown.shardIndex],
+           let finalHcUp = finalHcUpWeight, let finalHcUpRaw = buffers[finalHcUp.shardIndex],
+           let finalHcNorm = finalHcNormWeight, let finalHcNormRaw = buffers[finalHcNorm.shardIndex],
+           let normPipe = inference.hcNormPipeline, let downPipe = inference.hcDownProjPipeline, let upPipe = inference.hcUpBlendPipeline {
+            var nOff = finalHcNorm.offsetStart
+            var dOff = finalHcDown.offsetStart
+            var uOff = finalHcUp.offsetStart
+            var totDim: UInt32 = 4 * hiddenDim
+            var rank: UInt32 = 320
+            var epsVal = eps
+
+            enc.setComputePipelineState(normPipe)
+            enc.setBuffer(hcStreamsBuffer, offset: 0, index: 0)
+            enc.setBuffer(finalHcNormRaw, offset: 0, index: 1)
+            enc.setBuffer(hcNormedBuffer, offset: 0, index: 2)
+            enc.setBytes(&nOff, length: 8, index: 3)
+            enc.setBytes(&hDimVal, length: 4, index: 4)
+            enc.setBytes(&epsVal, length: 4, index: 5)
+            enc.dispatchThreadgroups(MTLSize(width: 4, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+
+            enc.setComputePipelineState(downPipe)
+            enc.setBuffer(hcNormedBuffer, offset: 0, index: 0)
+            enc.setBuffer(finalHcDownRaw, offset: 0, index: 1)
+            enc.setBuffer(hcBottleneckBuffer, offset: 0, index: 2)
+            enc.setBytes(&dOff, length: 8, index: 3)
+            enc.setBytes(&totDim, length: 4, index: 4)
+            enc.setBytes(&rank, length: 4, index: 5)
+            enc.dispatchThreadgroups(MTLSize(width: Int(rank), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+
+            enc.setComputePipelineState(upPipe)
+            enc.setBuffer(hcNormedBuffer, offset: 0, index: 0)
+            enc.setBuffer(hcBottleneckBuffer, offset: 0, index: 1)
+            enc.setBuffer(finalHcUpRaw, offset: 0, index: 2)
+            enc.setBuffer(xFinalBuffer, offset: 0, index: 3)
+            enc.setBytes(&uOff, length: 8, index: 4)
+            enc.setBytes(&hDimVal, length: 4, index: 5)
+            enc.setBytes(&rank, length: 4, index: 6)
+            enc.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+        }
+
+        // LM Head dispatch
+        if let lmHeadRaw = buffers[lmHeadTensorCandidate.shardIndex] {
+            var wOff = lmHeadTensorCandidate.offsetStart
+            var inD = hiddenDim
+            var outD = vocabSize
+            if let bSimdPipe = inference.bf16GemvSimdPipeline {
+                enc.setComputePipelineState(bSimdPipe)
+                enc.setBuffer(lmHeadRaw, offset: 0, index: 0)
+                enc.setBuffer(xFinalBuffer, offset: 0, index: 1)
+                enc.setBuffer(logitsBuffer, offset: 0, index: 2)
+                enc.setBytes(&wOff, length: 8, index: 3)
+                enc.setBytes(&inD, length: 4, index: 4)
+                enc.setBytes(&outD, length: 4, index: 5)
+                enc.dispatchThreadgroups(MTLSize(width: Int(vocabSize), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            }
+        }
+
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        let currHPtr = currentH.contents().bindMemory(to: Float.self, capacity: Int(hiddenDim))
+        var currHNonZero = 0
+        for i in 0..<Int(hiddenDim) { if abs(currHPtr[i]) > 1e-6 { currHNonZero += 1 } }
+        print("🔍 [DIAGNOSTIC] currentH nonZeroCount=\(currHNonZero)/\(hiddenDim), [0]=\(currHPtr[0]), [1]=\(currHPtr[1])")
+
+        let xFinalPtr = xFinalBuffer.contents().bindMemory(to: Float.self, capacity: Int(hiddenDim))
+        var xFinalNonZero = 0
+        for i in 0..<Int(hiddenDim) { if abs(xFinalPtr[i]) > 1e-6 { xFinalNonZero += 1 } }
+        print("🔍 [DIAGNOSTIC] xFinal nonZeroCount=\(xFinalNonZero)/\(hiddenDim), [0]=\(xFinalPtr[0]), [1]=\(xFinalPtr[1])")
+
+        let logitsPtr = logitsBuffer.contents().bindMemory(to: Float.self, capacity: Int(vocabSize))
+        var minL: Float = Float.infinity
+        var maxL: Float = -Float.infinity
+        var hasNaN = false
+        var nonZeroCount = 0
+
+        for i in 0..<Int(vocabSize) {
+            let l = logitsPtr[i]
+            if l.isNaN || l.isInfinite {
+                hasNaN = true
+            }
+            if abs(l) > 1e-6 {
+                nonZeroCount += 1
+            }
+            if l < minL { minL = l }
+            if l > maxL { maxL = l }
+        }
+
+        print("🔍 [DIAGNOSTIC] LM Head Logits: min=\(minL), max=\(maxL), nonZeroCount=\(nonZeroCount)/\(vocabSize), hasNaN=\(hasNaN)")
+        XCTAssertFalse(hasNaN, "Logits contain NaN or Inf values!")
+        XCTAssertGreaterThan(nonZeroCount, 0, "Logits are all zeros!")
+
+        // Find top 5 tokens
+        var topTokens: [(id: Int, logit: Float)] = []
+        for i in 0..<Int(vocabSize) {
+            let l = logitsPtr[i]
+            if topTokens.count < 5 {
+                topTokens.append((id: i, logit: l))
+                topTokens.sort { $0.logit > $1.logit }
+            } else if l > topTokens.last!.logit {
+                topTokens[topTokens.count - 1] = (id: i, logit: l)
+                topTokens.sort { $0.logit > $1.logit }
+            }
+        }
+
+        for (rank, item) in topTokens.enumerated() {
+            print("  Top \(rank + 1): Token \(item.id) with logit \(item.logit)")
+        }
+        print("🎉 [SUCCESS] Qwen 3.8 Flash Next LM Head & Logits computed cleanly!")
+    }
 }
+
 
 
 

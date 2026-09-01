@@ -1304,6 +1304,7 @@ kernel void mxfp8_down_proj_accumulate(
 }
 
 /// MSL Kernel: General BF16 Matrix-Vector GEMV (out = W * x)
+/// Supports 2D batched grid (outDim, batchSize, 1)
 kernel void bf16_gemv(
     device const ushort* rawWeightBuffer [[buffer(0)]],
     device const float* inputVector [[buffer(1)]],
@@ -1311,12 +1312,15 @@ kernel void bf16_gemv(
     constant uint64_t& weightOffset [[buffer(3)]],
     constant uint32_t& inDim [[buffer(4)]],
     constant uint32_t& outDim [[buffer(5)]],
-    uint row [[thread_position_in_grid]]
+    uint2 pos [[thread_position_in_grid]]
 ) {
+    uint row = pos.x;
+    uint tokenIdx = pos.y;
     if (row >= outDim) return;
 
     uint64_t rowWeightStart = (weightOffset / 2) + ((uint64_t)row * inDim);
     device const ushort* wRow = rawWeightBuffer + rowWeightStart;
+    device const float* inPtr = inputVector + ((uint64_t)tokenIdx * inDim);
 
     float dot0 = 0.0f;
     float dot1 = 0.0f;
@@ -1324,12 +1328,12 @@ kernel void bf16_gemv(
     for (uint32_t i = 0; i < num4; i++) {
         uint32_t base = i * 4;
         ushort4 w4 = *(device const ushort4*)(wRow + base);
-        float4 in4 = *(device const float4*)(inputVector + base);
+        float4 in4 = *(device const float4*)(inPtr + base);
         dot0 += (bf16_to_fp32(w4.x) * in4.x) + (bf16_to_fp32(w4.y) * in4.y);
         dot1 += (bf16_to_fp32(w4.z) * in4.z) + (bf16_to_fp32(w4.w) * in4.w);
     }
 
-    outputVector[row] = dot0 + dot1;
+    outputVector[((uint64_t)tokenIdx * outDim) + row] = dot0 + dot1;
 }
 
 /// MSL Kernel: Per-Head RMSNorm for Attention Heads (32-Thread SIMDgroup Cooperative, 2D Grid Aware)
@@ -1684,8 +1688,9 @@ kernel void gqa_attention_decode_fused(
     uint32_t headsPerKv = numQHeads / numKvHeads;
     uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
 
-    uint32_t qHeadBase = (tokenIdx * numQHeads * 512) + (qHeadIdx * 512);
-    uint32_t gateBase = qHeadBase + 256;
+    uint32_t qStride = headDim * 2;
+    uint32_t qHeadBase = (tokenIdx * numQHeads * qStride) + (qHeadIdx * qStride);
+    uint32_t gateBase = qHeadBase + headDim;
     uint32_t kvStride = numKvHeads * headDim;
     uint32_t kvHeadBase = kvHeadIdx * headDim;
 
@@ -1756,8 +1761,9 @@ kernel void gqa_attention_decode_fused_f16(
     uint32_t headsPerKv = numQHeads / numKvHeads;
     uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
 
-    uint32_t qHeadBase = (tokenIdx * numQHeads * 512) + (qHeadIdx * 512);
-    uint32_t gateBase = qHeadBase + 256;
+    uint32_t qStride = headDim * 2;
+    uint32_t qHeadBase = (tokenIdx * numQHeads * qStride) + (qHeadIdx * qStride);
+    uint32_t gateBase = qHeadBase + headDim;
     uint32_t kvStride = numKvHeads * headDim;
     uint32_t kvHeadBase = kvHeadIdx * headDim;
 
@@ -1836,8 +1842,9 @@ kernel void gqa_attention_decode_fused_fp8(
     uint32_t headsPerKv = numQHeads / numKvHeads;
     uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
 
-    uint32_t qHeadBase = (tokenIdx * numQHeads * 512) + (qHeadIdx * 512);
-    uint32_t gateBase = qHeadBase + 256;
+    uint32_t qStride = headDim * 2;
+    uint32_t qHeadBase = (tokenIdx * numQHeads * qStride) + (qHeadIdx * qStride);
+    uint32_t gateBase = qHeadBase + headDim;
     uint32_t kvStride = numKvHeads * headDim;
     uint32_t kvHeadBase = kvHeadIdx * headDim;
 
@@ -3383,6 +3390,7 @@ kernel void q4_down_proj_accumulate(
 }
 
 /// MSL Kernel: General Q4 Affine GEMV (out = (W_q4 * in)) (128-bit Vectorized)
+/// Supports 2D batched grid (outDim, batchSize, 1) with threadgroup (32, 1, 1)
 kernel void q4_gemv(
     device const uchar* rawWeightBuffer [[buffer(0)]],
     device const uchar* rawScaleBuffer [[buffer(1)]],
@@ -3395,15 +3403,18 @@ kernel void q4_gemv(
     constant uint32_t& inDim [[buffer(8)]],
     constant uint32_t& outDim [[buffer(9)]],
     constant uint32_t& groupSize [[buffer(10)]],
-    uint row [[threadgroup_position_in_grid]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
     uint laneId [[thread_index_in_simdgroup]]
 ) {
+    uint row = tgPos.x;
+    uint tokenIdx = tgPos.y;
     if (row >= outDim) return;
 
     uint32_t numGroups = inDim / groupSize;
     device const uchar* wRow = rawWeightBuffer + weightOffset + ((uint64_t)row * (inDim / 8) * 4);
     device const uchar* sRow = rawScaleBuffer + scaleOffset + ((uint64_t)row * numGroups * 2);
     device const uchar* bRow = rawBiasBuffer + biasOffset + ((uint64_t)row * numGroups * 2);
+    device const float* inPtr = inputVector + ((uint64_t)tokenIdx * inDim);
 
     float sum = 0.0f;
     uint32_t numU32 = inDim / 8;
@@ -3417,8 +3428,8 @@ kernel void q4_gemv(
 
         uint32_t u32 = read_u32_unaligned(wRow + i * 4);
 
-        float4 in4_0 = *(device const float4*)(inputVector + col);
-        float4 in4_1 = *(device const float4*)(inputVector + col + 4);
+        float4 in4_0 = *(device const float4*)(inPtr + col);
+        float4 in4_1 = *(device const float4*)(inPtr + col + 4);
 
         float4 w0_3 = float4(float(u32 & 0x0F), float((u32 >> 4) & 0x0F), float((u32 >> 8) & 0x0F), float((u32 >> 12) & 0x0F));
         float4 w4_7 = float4(float((u32 >> 16) & 0x0F), float((u32 >> 20) & 0x0F), float((u32 >> 24) & 0x0F), float((u32 >> 28) & 0x0F));
@@ -3432,7 +3443,7 @@ kernel void q4_gemv(
     sum = simd_sum(sum);
 
     if (laneId == 0) {
-        outputVector[row] = sum;
+        outputVector[((uint64_t)tokenIdx * outDim) + row] = sum;
     }
 }
 
@@ -3471,6 +3482,7 @@ kernel void lookup_embeddings_q4(
 }
 
 /// MSL Kernel: Q8 (8-bit affine quantized) Matrix-Vector Multiplication (y = W * x) (128-bit Vectorized)
+/// Supports 2D batched grid (outDim, batchSize, 1) with threadgroup (32, 1, 1)
 kernel void q8_gemv(
     device const uchar* rawWeightBuffer [[buffer(0)]],
     device const uchar* rawScaleBuffer [[buffer(1)]],
@@ -3483,15 +3495,18 @@ kernel void q8_gemv(
     constant uint32_t& inDim [[buffer(8)]],
     constant uint32_t& outDim [[buffer(9)]],
     constant uint32_t& groupSize [[buffer(10)]],
-    uint row [[threadgroup_position_in_grid]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
     uint laneId [[thread_index_in_simdgroup]]
 ) {
+    uint row = tgPos.x;
+    uint tokenIdx = tgPos.y;
     if (row >= outDim) return;
 
     uint32_t numGroups = inDim / groupSize;
     device const uchar* wRow = rawWeightBuffer + weightOffset + ((uint64_t)row * inDim);
     device const uchar* sRow = rawScaleBuffer + scaleOffset + ((uint64_t)row * numGroups * 2);
     device const uchar* bRow = rawBiasBuffer + biasOffset + ((uint64_t)row * numGroups * 2);
+    device const float* inPtr = inputVector + ((uint64_t)tokenIdx * inDim);
 
     float threadSum = 0.0f;
     for (uint32_t g = laneId; g < numGroups; g += 32) {
@@ -3502,7 +3517,7 @@ kernel void q8_gemv(
         float groupXSum = 0.0f;
 
         uint32_t numVec4 = groupSize / 4;
-        device const float4* inVec4 = (device const float4*)(inputVector + colStart);
+        device const float4* inVec4 = (device const float4*)(inPtr + colStart);
 
         for (uint32_t c = 0; c < numVec4; c++) {
             uint32_t baseCol = colStart + (c * 4);
@@ -3518,7 +3533,7 @@ kernel void q8_gemv(
         }
         for (uint32_t c = numVec4 * 4; c < groupSize; c++) {
             uint32_t col = colStart + c;
-            float x = inputVector[col];
+            float x = inPtr[col];
             float w8 = float(wRow[col]);
             groupSum += w8 * x;
             groupXSum += x;
@@ -3528,7 +3543,7 @@ kernel void q8_gemv(
 
     float totalSum = simd_sum(threadSum);
     if (laneId == 0) {
-        outputVector[row] = totalSum;
+        outputVector[((uint64_t)tokenIdx * outDim) + row] = totalSum;
     }
 }
 
@@ -4498,6 +4513,580 @@ kernel void hyper_connection_inject_bf16(
     float y_d = outToken[d];
     for (uint32_t s = 0; s < 4; s++) {
         streamsToken[(s * hiddenDim) + d] += scaleToken[s] * y_d;
+    }
+}
+
+// MARK: - JetSpec Metal Compute Kernels
+
+/// MSL Kernel: JetSpec Draft Head Token Prediction (BF16 weights)
+/// Projects previous hidden states through draft head projection matrix W_draft
+kernel void jet_draft_head_predict_bf16(
+    device const float* hiddenStates [[buffer(0)]],       // [numNodes, hiddenDim]
+    device const uchar* draftHeadWeights [[buffer(1)]],    // [vocabSize, hiddenDim] (BF16)
+    device const uchar* normWeights [[buffer(2)]],         // [hiddenDim] (BF16)
+    device float* outLogits [[buffer(3)]],                 // [numNodes, vocabSize]
+    constant uint64_t& weightOffset [[buffer(4)]],
+    constant uint64_t& normOffset [[buffer(5)]],
+    constant uint32_t& hiddenDim [[buffer(6)]],
+    constant uint32_t& vocabSize [[buffer(7)]],
+    constant float& eps [[buffer(8)]],
+    constant uint32_t& hasNorm [[buffer(9)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],          // (vocabIdx, nodeIdx)
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint vIdx = tgPos.x;
+    uint nodeIdx = tgPos.y;
+    if (vIdx >= vocabSize) return;
+
+    device const float* nodeHidden = hiddenStates + ((uint64_t)nodeIdx * hiddenDim);
+
+    float rms = 1.0f;
+    if (hasNorm != 0) {
+        float localSumSq = 0.0f;
+        for (uint32_t i = laneId; i < hiddenDim; i += 32) {
+            float val = nodeHidden[i];
+            localSumSq += val * val;
+        }
+        float totalSumSq = simd_sum(localSumSq);
+        rms = rsqrt((totalSumSq / (float)hiddenDim) + eps);
+    }
+
+    uint64_t rowByteBase = weightOffset + ((uint64_t)vIdx * hiddenDim * 2);
+    float partialDot = 0.0f;
+
+    for (uint32_t i = laneId; i < hiddenDim; i += 32) {
+        float h_val = nodeHidden[i] * rms;
+        if (hasNorm != 0 && normOffset > 0) {
+            float gamma = read_bf16_unaligned(normWeights + normOffset + ((uint64_t)i * 2));
+            h_val *= gamma;
+        }
+        float w_val = read_bf16_unaligned(draftHeadWeights + rowByteBase + ((uint64_t)i * 2));
+        partialDot += h_val * w_val;
+    }
+
+    float totalDot = simd_sum(partialDot);
+    if (laneId == 0) {
+        outLogits[((uint64_t)nodeIdx * vocabSize) + vIdx] = totalDot;
+    }
+}
+
+/// MSL Kernel: Standard Grouped-Query Attention (GQA) Tree Causal Verification (FP32)
+kernel void gqa_attention_tree_verify_standard(
+    device const float* qVector [[buffer(0)]],          // [numNodes, numQHeads, headDim]
+    device const float* kCacheBuffer [[buffer(1)]],     // [prefixLen + numNodes, numKvHeads, headDim]
+    device const float* vCacheBuffer [[buffer(2)]],     // [prefixLen + numNodes, numKvHeads, headDim]
+    device const float* treeMaskBuffer [[buffer(3)]],   // [numNodes, numNodes]
+    device float* attnOutBuffer [[buffer(4)]],          // [numNodes, numQHeads, headDim]
+    constant uint32_t& prefixLen [[buffer(5)]],
+    constant uint32_t& numNodes [[buffer(6)]],
+    constant uint32_t& numQHeads [[buffer(7)]],
+    constant uint32_t& numKvHeads [[buffer(8)]],
+    constant uint32_t& headDim [[buffer(9)]],
+    uint2 pos [[thread_position_in_grid]]              // (qHeadIdx, nodeIdx)
+) {
+    uint qHeadIdx = pos.x;
+    uint nodeIdx = pos.y;
+    if (qHeadIdx >= numQHeads || nodeIdx >= numNodes) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+
+    uint32_t qHeadBase = (nodeIdx * numQHeads * headDim) + (qHeadIdx * headDim);
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    float4 acc[64];
+    uint32_t headDimVec = headDim / 4;
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        acc[d] = float4(0.0f);
+    }
+
+    float m = -1e20f;
+    float l = 0.0f;
+
+    device const float4* qHeadVec = (device const float4*)(qVector + qHeadBase);
+
+    // 1. Attend to full prefix KV cache (shared across all tree nodes)
+    for (uint32_t tau = 0; tau < prefixLen; tau++) {
+        uint32_t kBase = (tau * kvStride) + kvHeadBase;
+        device const float4* kVec = (device const float4*)(kCacheBuffer + kBase);
+
+        float dot_val = 0.0f;
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            dot_val += dot(qHeadVec[d], kVec[d]);
+        }
+        float score = dot_val * invSqrtHeadDim;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+
+        l = (l * alpha) + beta;
+
+        uint32_t vBase = (tau * kvStride) + kvHeadBase;
+        device const float4* vVec = (device const float4*)(vCacheBuffer + vBase);
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            acc[d] = (acc[d] * alpha) + (beta * vVec[d]);
+        }
+    }
+
+    // 2. Attend to candidate tree KV slots with tree causal mask
+    for (uint32_t k = 0; k < numNodes; k++) {
+        float maskVal = treeMaskBuffer[(nodeIdx * numNodes) + k];
+        if (maskVal < -1e4f) continue; // Not an ancestor
+
+        uint32_t treeSlot = prefixLen + k;
+        uint32_t kBase = (treeSlot * kvStride) + kvHeadBase;
+        device const float4* kVec = (device const float4*)(kCacheBuffer + kBase);
+
+        float dot_val = 0.0f;
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            dot_val += dot(qHeadVec[d], kVec[d]);
+        }
+        float score = (dot_val * invSqrtHeadDim) + maskVal;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+
+        l = (l * alpha) + beta;
+
+        uint32_t vBase = (treeSlot * kvStride) + kvHeadBase;
+        device const float4* vVec = (device const float4*)(vCacheBuffer + vBase);
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            acc[d] = (acc[d] * alpha) + (beta * vVec[d]);
+        }
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    uint32_t outOffset = (nodeIdx * numQHeads * headDim) + (qHeadIdx * headDim);
+    device float4* outVec = (device float4*)(attnOutBuffer + outOffset);
+
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        outVec[d] = acc[d] * invL;
+    }
+}
+
+/// MSL Kernel: Standard Grouped-Query Attention (GQA) Tree Causal Verification (FP16 KV Cache)
+kernel void gqa_attention_tree_verify_standard_f16(
+    device const float* qVector [[buffer(0)]],          // [numNodes, numQHeads, headDim]
+    device const half* kCacheBuffer [[buffer(1)]],      // [prefixLen + numNodes, numKvHeads, headDim]
+    device const half* vCacheBuffer [[buffer(2)]],      // [prefixLen + numNodes, numKvHeads, headDim]
+    device const float* treeMaskBuffer [[buffer(3)]],   // [numNodes, numNodes]
+    device float* attnOutBuffer [[buffer(4)]],          // [numNodes, numQHeads, headDim]
+    constant uint32_t& prefixLen [[buffer(5)]],
+    constant uint32_t& numNodes [[buffer(6)]],
+    constant uint32_t& numQHeads [[buffer(7)]],
+    constant uint32_t& numKvHeads [[buffer(8)]],
+    constant uint32_t& headDim [[buffer(9)]],
+    uint2 pos [[thread_position_in_grid]]              // (qHeadIdx, nodeIdx)
+) {
+    uint qHeadIdx = pos.x;
+    uint nodeIdx = pos.y;
+    if (qHeadIdx >= numQHeads || nodeIdx >= numNodes) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+
+    uint32_t qHeadBase = (nodeIdx * numQHeads * headDim) + (qHeadIdx * headDim);
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    float4 acc[64];
+    uint32_t headDimVec = headDim / 4;
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        acc[d] = float4(0.0f);
+    }
+
+    float m = -1e20f;
+    float l = 0.0f;
+
+    device const float4* qHeadVec = (device const float4*)(qVector + qHeadBase);
+
+    // 1. Attend to full prefix KV cache
+    for (uint32_t tau = 0; tau < prefixLen; tau++) {
+        uint32_t kBase = (tau * kvStride) + kvHeadBase;
+        device const half4* kVecH = (device const half4*)(kCacheBuffer + kBase);
+
+        float dot_val = 0.0f;
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            float4 kVec = float4(kVecH[d]);
+            dot_val += dot(qHeadVec[d], kVec);
+        }
+        float score = dot_val * invSqrtHeadDim;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+
+        l = (l * alpha) + beta;
+
+        uint32_t vBase = (tau * kvStride) + kvHeadBase;
+        device const half4* vVecH = (device const half4*)(vCacheBuffer + vBase);
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            float4 vVec = float4(vVecH[d]);
+            acc[d] = (acc[d] * alpha) + (beta * vVec);
+        }
+    }
+
+    // 2. Attend to candidate tree KV slots with mask
+    for (uint32_t k = 0; k < numNodes; k++) {
+        float maskVal = treeMaskBuffer[(nodeIdx * numNodes) + k];
+        if (maskVal < -1e4f) continue;
+
+        uint32_t treeSlot = prefixLen + k;
+        uint32_t kBase = (treeSlot * kvStride) + kvHeadBase;
+        device const half4* kVecH = (device const half4*)(kCacheBuffer + kBase);
+
+        float dot_val = 0.0f;
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            float4 kVec = float4(kVecH[d]);
+            dot_val += dot(qHeadVec[d], kVec);
+        }
+        float score = (dot_val * invSqrtHeadDim) + maskVal;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+
+        l = (l * alpha) + beta;
+
+        uint32_t vBase = (treeSlot * kvStride) + kvHeadBase;
+        device const half4* vVecH = (device const half4*)(vCacheBuffer + vBase);
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            float4 vVec = float4(vVecH[d]);
+            acc[d] = (acc[d] * alpha) + (beta * vVec);
+        }
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    uint32_t outOffset = (nodeIdx * numQHeads * headDim) + (qHeadIdx * headDim);
+    device float4* outVec = (device float4*)(attnOutBuffer + outOffset);
+
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        outVec[d] = acc[d] * invL;
+    }
+}
+
+/// MSL Kernel: Fused GQA / QSA Tree Causal Verification with Sigmoid Output Gating (FP32)
+kernel void gqa_attention_tree_verify_fused(
+    device const float* qGateVector [[buffer(0)]],      // [numNodes, numQHeads * (headDim + headDim)]
+    device const float* kCacheBuffer [[buffer(1)]],     // [prefixLen + numNodes, numKvHeads, headDim]
+    device const float* vCacheBuffer [[buffer(2)]],     // [prefixLen + numNodes, numKvHeads, headDim]
+    device const float* treeMaskBuffer [[buffer(3)]],   // [numNodes, numNodes]
+    device float* attnOutBuffer [[buffer(4)]],          // [numNodes, numQHeads, headDim]
+    constant uint32_t& prefixLen [[buffer(5)]],
+    constant uint32_t& numNodes [[buffer(6)]],
+    constant uint32_t& numQHeads [[buffer(7)]],
+    constant uint32_t& numKvHeads [[buffer(8)]],
+    constant uint32_t& headDim [[buffer(9)]],
+    uint2 pos [[thread_position_in_grid]]              // (qHeadIdx, nodeIdx)
+) {
+    uint qHeadIdx = pos.x;
+    uint nodeIdx = pos.y;
+    if (qHeadIdx >= numQHeads || nodeIdx >= numNodes) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+
+    uint32_t qHeadBase = (nodeIdx * numQHeads * (headDim * 2)) + (qHeadIdx * (headDim * 2));
+    uint32_t gateBase = qHeadBase + headDim;
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    float acc[256];
+    for (uint32_t d = 0; d < headDim; d++) {
+        acc[d] = 0.0f;
+    }
+
+    float m = -1e20f;
+    float l = 0.0f;
+
+    // 1. Prefix KV Cache
+    for (uint32_t tau = 0; tau < prefixLen; tau++) {
+        uint32_t kBase = (tau * kvStride) + kvHeadBase;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < headDim; d++) {
+            dot += qGateVector[qHeadBase + d] * kCacheBuffer[kBase + d];
+        }
+        float score = dot * invSqrtHeadDim;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+
+        l = (l * alpha) + beta;
+
+        uint32_t vBase = (tau * kvStride) + kvHeadBase;
+        for (uint32_t d = 0; d < headDim; d++) {
+            acc[d] = (acc[d] * alpha) + (beta * vCacheBuffer[vBase + d]);
+        }
+    }
+
+    // 2. Tree KV Cache with Mask
+    for (uint32_t k = 0; k < numNodes; k++) {
+        float maskVal = treeMaskBuffer[(nodeIdx * numNodes) + k];
+        if (maskVal < -1e4f) continue;
+
+        uint32_t treeSlot = prefixLen + k;
+        uint32_t kBase = (treeSlot * kvStride) + kvHeadBase;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < headDim; d++) {
+            dot += qGateVector[qHeadBase + d] * kCacheBuffer[kBase + d];
+        }
+        float score = (dot * invSqrtHeadDim) + maskVal;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+
+        l = (l * alpha) + beta;
+
+        uint32_t vBase = (treeSlot * kvStride) + kvHeadBase;
+        for (uint32_t d = 0; d < headDim; d++) {
+            acc[d] = (acc[d] * alpha) + (beta * vCacheBuffer[vBase + d]);
+        }
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    uint32_t outOffset = (nodeIdx * numQHeads * headDim) + (qHeadIdx * headDim);
+
+    for (uint32_t d = 0; d < headDim; d++) {
+        float ctx = acc[d] * invL;
+        float g = qGateVector[gateBase + d];
+        float sig_g = 1.0f / (1.0f + exp(-g));
+        attnOutBuffer[outOffset + d] = ctx * sig_g;
+    }
+}
+
+/// MSL Kernel: Fused GQA / QSA Tree Causal Verification with Sigmoid Output Gating (FP16 KV Cache)
+kernel void gqa_attention_tree_verify_fused_f16(
+    device const float* qGateVector [[buffer(0)]],      // [numNodes, numQHeads * (headDim + headDim)]
+    device const half* kCacheBuffer [[buffer(1)]],      // [prefixLen + numNodes, numKvHeads, headDim]
+    device const half* vCacheBuffer [[buffer(2)]],      // [prefixLen + numNodes, numKvHeads, headDim]
+    device const float* treeMaskBuffer [[buffer(3)]],   // [numNodes, numNodes]
+    device float* attnOutBuffer [[buffer(4)]],          // [numNodes, numQHeads, headDim]
+    constant uint32_t& prefixLen [[buffer(5)]],
+    constant uint32_t& numNodes [[buffer(6)]],
+    constant uint32_t& numQHeads [[buffer(7)]],
+    constant uint32_t& numKvHeads [[buffer(8)]],
+    constant uint32_t& headDim [[buffer(9)]],
+    uint2 pos [[thread_position_in_grid]]              // (qHeadIdx, nodeIdx)
+) {
+    uint qHeadIdx = pos.x;
+    uint nodeIdx = pos.y;
+    if (qHeadIdx >= numQHeads || nodeIdx >= numNodes) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+
+    uint32_t qHeadBase = (nodeIdx * numQHeads * (headDim * 2)) + (qHeadIdx * (headDim * 2));
+    uint32_t gateBase = qHeadBase + headDim;
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    float acc[256];
+    for (uint32_t d = 0; d < headDim; d++) {
+        acc[d] = 0.0f;
+    }
+
+    float m = -1e20f;
+    float l = 0.0f;
+
+    // 1. Prefix KV Cache
+    for (uint32_t tau = 0; tau < prefixLen; tau++) {
+        uint32_t kBase = (tau * kvStride) + kvHeadBase;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < headDim; d++) {
+            dot += qGateVector[qHeadBase + d] * (float)kCacheBuffer[kBase + d];
+        }
+        float score = dot * invSqrtHeadDim;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+
+        l = (l * alpha) + beta;
+
+        uint32_t vBase = (tau * kvStride) + kvHeadBase;
+        for (uint32_t d = 0; d < headDim; d++) {
+            acc[d] = (acc[d] * alpha) + (beta * (float)vCacheBuffer[vBase + d]);
+        }
+    }
+
+    // 2. Tree KV Cache with Mask
+    for (uint32_t k = 0; k < numNodes; k++) {
+        float maskVal = treeMaskBuffer[(nodeIdx * numNodes) + k];
+        if (maskVal < -1e4f) continue;
+
+        uint32_t treeSlot = prefixLen + k;
+        uint32_t kBase = (treeSlot * kvStride) + kvHeadBase;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < headDim; d++) {
+            dot += qGateVector[qHeadBase + d] * (float)kCacheBuffer[kBase + d];
+        }
+        float score = (dot * invSqrtHeadDim) + maskVal;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+
+        l = (l * alpha) + beta;
+
+        uint32_t vBase = (treeSlot * kvStride) + kvHeadBase;
+        for (uint32_t d = 0; d < headDim; d++) {
+            acc[d] = (acc[d] * alpha) + (beta * (float)vCacheBuffer[vBase + d]);
+        }
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    uint32_t outOffset = (nodeIdx * numQHeads * headDim) + (qHeadIdx * headDim);
+
+    for (uint32_t d = 0; d < headDim; d++) {
+        float ctx = acc[d] * invL;
+        float g = qGateVector[gateBase + d];
+        float sig_g = 1.0f / (1.0f + exp(-g));
+        attnOutBuffer[outOffset + d] = ctx * sig_g;
+    }
+}
+
+/// MSL Kernel: Gated DeltaNet (GDN) Tree Recurrent Step
+/// Updates GDN state matrix along tree branches according to parent index table
+kernel void gdn_linear_attention_tree_step(
+    device const float* qkvVector [[buffer(0)]],          // [numNodes, Q: 2048, K: 2048, V: 6144]
+    device const float* zVector [[buffer(1)]],            // [numNodes, 6144]
+    device const float* aVector [[buffer(2)]],            // [numNodes, 48]
+    device const float* bVector [[buffer(3)]],            // [numNodes, 48]
+    device const uchar* aLogBuf [[buffer(4)]],            // [48] (BF16)
+    device const uchar* dtBiasBuf [[buffer(5)]],          // [48] (BF16)
+    device const uchar* normBuf [[buffer(6)]],            // [128] (BF16)
+    device const float* inParentStateMatrix [[buffer(7)]],// [numNodes, 48, 128, 128] (States copied from parent node)
+    device float* outNodeStateMatrix [[buffer(8)]],       // [numNodes, 48, 128, 128] (Updated states for node)
+    device float* outputVector [[buffer(9)]],             // [numNodes, 6144]
+    constant uint64_t& aLogOffset [[buffer(10)]],
+    constant uint64_t& dtBiasOffset [[buffer(11)]],
+    constant uint64_t& normOffset [[buffer(12)]],
+    constant uint32_t& numValHeads [[buffer(13)]],        // 48
+    constant uint32_t& numKeyHeads [[buffer(14)]],        // 16
+    constant uint32_t& headDim [[buffer(15)]],            // 128
+    constant float& eps [[buffer(16)]],                   // 1e-6
+    uint2 tgPos [[threadgroup_position_in_grid]],         // (headIdx, nodeIdx)
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint headIdx = tgPos.x;
+    uint nodeIdx = tgPos.y;
+    if (headIdx >= numValHeads) return;
+
+    uint32_t keyHeadIdx = headIdx / (numValHeads / numKeyHeads); // headIdx / 3
+
+    uint32_t qkvNodeBase = nodeIdx * (2 * numKeyHeads * headDim + numValHeads * headDim);
+    uint32_t qBase = qkvNodeBase + (keyHeadIdx * headDim);
+    uint32_t kBase = qkvNodeBase + (numKeyHeads * headDim) + (keyHeadIdx * headDim);
+    uint32_t vBase = qkvNodeBase + (2 * numKeyHeads * headDim) + (headIdx * headDim);
+
+    uint32_t zBase = (nodeIdx * numValHeads * headDim) + (headIdx * headDim);
+    uint32_t outBase = zBase;
+    uint32_t stateBase = (nodeIdx * numValHeads * headDim * headDim) + (headIdx * headDim * headDim);
+
+    float aLogVal = read_bf16_unaligned(aLogBuf + aLogOffset + ((uint64_t)headIdx * 2));
+    float dtBiasVal = read_bf16_unaligned(dtBiasBuf + dtBiasOffset + ((uint64_t)headIdx * 2));
+    float aVal = aVector[(nodeIdx * numValHeads) + headIdx];
+    float bVal = bVector[(nodeIdx * numValHeads) + headIdx];
+
+    float x = aVal + dtBiasVal;
+    float dt = (x > 20.0f) ? x : ((x < -20.0f) ? exp(x) : log(1.0f + exp(x)));
+    float alpha = exp(-exp(aLogVal) * dt);
+    float beta = 1.0f / (1.0f + exp(-bVal));
+
+    uint32_t headDimVec4 = headDim / 4;
+    device const float4* kVec4 = (device const float4*)(qkvVector + kBase);
+    device const float4* qVec4 = (device const float4*)(qkvVector + qBase);
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    float y_local[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    uint32_t row_indices[4];
+    uint32_t numLocalRows = 0;
+    float localSumSq = 0.0f;
+
+    for (uint32_t i = laneId; i < headDim; i += 32) {
+        row_indices[numLocalRows] = i;
+        uint32_t sRowBase = stateBase + (i * headDim);
+        device const float4* inParentRowVec4 = (device const float4*)(inParentStateMatrix + sRowBase);
+        device float4* outRowVec4 = (device float4*)(outNodeStateMatrix + sRowBase);
+
+        float Sk_i = 0.0f;
+        for (uint32_t j = 0; j < headDimVec4; j++) {
+            Sk_i += dot(inParentRowVec4[j], kVec4[j]);
+        }
+
+        float v_val = qkvVector[vBase + i];
+        float delta_v_i = beta * (v_val - Sk_i);
+
+        for (uint32_t j = 0; j < headDimVec4; j++) {
+            outRowVec4[j] = (inParentRowVec4[j] * alpha) + (delta_v_i * kVec4[j]);
+        }
+
+        float y_i = 0.0f;
+        for (uint32_t j = 0; j < headDimVec4; j++) {
+            y_i += dot(outRowVec4[j], qVec4[j]);
+        }
+        y_i *= invSqrtHeadDim;
+
+        y_local[numLocalRows] = y_i;
+        localSumSq += y_i * y_i;
+        numLocalRows++;
+    }
+
+    float headSumSq = simd_sum(localSumSq);
+    float rms = rsqrt((headSumSq / (float)headDim) + eps);
+
+    for (uint32_t r = 0; r < numLocalRows; r++) {
+        uint32_t i = row_indices[r];
+        float gamma = read_bf16_unaligned(normBuf + normOffset + ((uint64_t)i * 2));
+        float yNorm = y_local[r] * rms * gamma;
+        float z = zVector[zBase + i];
+        float sig_z = 1.0f / (1.0f + exp(-z));
+        outputVector[outBase + i] = yNorm * sig_z;
     }
 }
 
