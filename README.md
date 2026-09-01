@@ -22,6 +22,8 @@ Special thanks and acknowledgement to the open-source projects and research that
 
 DynaMoE supports sparse Mixture-of-Experts, hybrid recurrent SSM/attention architectures, and dense autoregressive transformers with automatic model topology detection.
 
+**Note:** Qwen 3.8 Flash Next and Ornith 1.5 9B will be the first fully supported models. Neither are currently functioning properly, but will be working soon, so try at your own risk right now 😆
+
 | Model / Family | Parameters | Active Parameters | Architecture Type | Quantization & Precision | Context Window |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Qwen 3.8 Flash Next** | ~180B (512 Experts + 51B PLE) | ~6B (10 Active + Shared) | Hybrid GatedDeltaNet + QSA Sparse Attention + Gated Residuals | FP8 (MXFP8) / BF16 / NVFP4 | 131,072 / 262,144 |
