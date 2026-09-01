@@ -211,7 +211,7 @@ flowchart TD
 
 ### Prerequisites
 * macOS 14.0+ (Sonoma or Sequoia recommended)
-* Apple Silicon Mac (M1/M2/M3/M4, 16 GB+ Unified Memory recommended)
+* Apple Silicon Mac (M1/M2/M3/M4/M5/M6, 16 GB+ Unified Memory recommended)
 * Xcode 15.0+ with Command Line Tools
 * Rust toolchain (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
 
