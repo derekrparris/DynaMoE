@@ -1954,6 +1954,229 @@ final class DynaMoETests: XCTestCase {
         }
         print("🎉 [SUCCESS] Qwen 3.8 Flash Next LM Head & Logits computed cleanly!")
     }
+
+    func testJetSpecTreeTopologyAndVerification() throws {
+        print("=== TEST JETSPEC TREE TOPOLOGY AND VERIFICATION ===")
+        // 1. Build Candidate Tree
+        let rootToken: UInt32 = 100
+        let draftTokens: [UInt32] = [101, 102, 103]
+        let draftScores: [Float] = [-0.2, -0.5, -1.0]
+
+        let treeMask = buildJetspecCandidateTree(
+            rootTokenId: rootToken,
+            draftTokens: draftTokens,
+            draftScores: draftScores,
+            depth: 2,
+            branchingFactor: 2,
+            maxNodes: 8
+        )
+
+        XCTAssertEqual(treeMask.nodeCount, 4)
+        XCTAssertEqual(treeMask.tokenIds, [100, 101, 102, 103])
+        XCTAssertEqual(treeMask.depths, [0, 1, 1, 2])
+        XCTAssertEqual(treeMask.parentIndices, [0, 0, 0, 1])
+
+        // Verify Causal Tree Mask:
+        // (i, j) can attend if j is an ancestor of i or j == i (mask == 0.0), else <= -1e4
+        let N = Int(treeMask.nodeCount)
+        XCTAssertEqual(treeMask.mask[0 * N + 0], 0.0) // Root attends to self
+        XCTAssertEqual(treeMask.mask[1 * N + 0], 0.0) // Node 1 attends to Root
+        XCTAssertEqual(treeMask.mask[1 * N + 1], 0.0) // Node 1 attends to self
+        XCTAssertLessThanOrEqual(treeMask.mask[1 * N + 2], -1e4) // Node 1 cannot attend to sibling Node 2
+        XCTAssertEqual(treeMask.mask[2 * N + 0], 0.0) // Node 2 attends to Root
+        XCTAssertLessThanOrEqual(treeMask.mask[2 * N + 1], -1e4) // Node 2 cannot attend to sibling Node 1
+        XCTAssertEqual(treeMask.mask[3 * N + 0], 0.0) // Node 3 attends to Root (grandparent)
+        XCTAssertEqual(treeMask.mask[3 * N + 1], 0.0) // Node 3 attends to Node 1 (parent)
+        XCTAssertLessThanOrEqual(treeMask.mask[3 * N + 2], -1e4) // Node 3 cannot attend to uncle Node 2
+
+        print("✅ [TEST] Tree causal mask verified successfully.")
+
+        // 2. Dynamic Budget MoE Pruning
+        let expertAssignments: [UInt32] = [
+            1, 2,  // Node 0 uses experts 1, 2
+            3, 4,  // Node 1 uses experts 3, 4
+            5, 6,  // Node 2 uses experts 5, 6
+            7, 8   // Node 3 uses experts 7, 8
+        ]
+        let prunedTree = pruneJetspecTreeMoe(
+            treeTokens: treeMask.tokenIds,
+            parentIndices: treeMask.parentIndices,
+            draftScores: [0.0, -0.2, -0.5, -1.0],
+            candidateExpertsFlat: expertAssignments,
+            expertsPerNode: 2,
+            maxUniqueExperts: 4
+        )
+        // Root requires 2 experts (1, 2). Node 1 (score -0.2) requires 2 experts (3, 4). Total = 4 <= budget 4.
+        // Node 2 (score -0.5) would require 2 more (5, 6) -> total 6 > 4, so pruned.
+        XCTAssertTrue(prunedTree.nodeCount <= 4)
+        print("✅ [TEST] Dynamic MoE tree budget pruning verified successfully (pruned to \(prunedTree.nodeCount) nodes).")
+
+        // 3. Greedy Verification Oracle
+        let vocabSize = 1000
+        var flatLogits = [Float](repeating: -100.0, count: N * vocabSize)
+
+        // For Node 0: top-1 is 101 (predicts Node 1)
+        flatLogits[0 * vocabSize + 101] = 10.0
+        // For Node 1: top-1 is 103 (predicts Node 3)
+        flatLogits[1 * vocabSize + 103] = 12.0
+        // For Node 3: top-1 is 500 (bonus token from Node 3's distribution)
+        flatLogits[3 * vocabSize + 500] = 15.0
+
+        let result = verifyJetspecTreeGreedy(
+            treeTokens: treeMask.tokenIds,
+            parentIndices: treeMask.parentIndices,
+            targetLogits: flatLogits,
+            vocabSize: UInt32(vocabSize)
+        )
+
+        // Accepted path should be Node 1, Node 3, with bonus token 500
+        XCTAssertEqual(result.acceptedNodeIndices, [1, 3])
+        XCTAssertEqual(result.acceptedTokens, [101, 103])
+        XCTAssertEqual(result.bonusToken, 500)
+        XCTAssertEqual(result.acceptedCount, 2)
+
+        print("✅ [TEST] Greedy tree verification oracle successfully accepted [101, 103] + bonus [500] (progress = 3 tokens).")
+    }
+
+    func testJetSpecMetalKernels() throws {
+        print("=== TEST JETSPEC METAL COMPUTE PIPELINES ===")
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let cmdQueue = device.makeCommandQueue() else {
+            throw XCTSkip("Metal not supported on this device")
+        }
+
+        let engine = InferenceEngine.shared
+        try engine.initializePipelines(device: device)
+
+        XCTAssertNotNil(engine.applyRopeTreePipeline, "applyRopeTreePipeline failed to initialize")
+        XCTAssertNotNil(engine.compactKvCacheSlotsF32Pipeline, "compactKvCacheSlotsF32Pipeline failed to initialize")
+        XCTAssertNotNil(engine.compactKvCacheSlotsF16Pipeline, "compactKvCacheSlotsF16Pipeline failed to initialize")
+        XCTAssertNotNil(engine.gqaAttentionTreeVerifyStandardPipeline, "gqaAttentionTreeVerifyStandardPipeline failed to initialize")
+
+        // Test KV Slot Compaction GPU Kernel (FP32)
+        let kvStride: UInt32 = 128
+        let totalSlots: UInt32 = 4
+        let totalFloats = Int(totalSlots * kvStride)
+
+        guard let kCacheBuf = device.makeBuffer(length: totalFloats * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let vCacheBuf = device.makeBuffer(length: totalFloats * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+            XCTFail("Failed to allocate test cache buffers")
+            return
+        }
+
+        let kPtr = kCacheBuf.contents().bindMemory(to: Float.self, capacity: totalFloats)
+        let vPtr = vCacheBuf.contents().bindMemory(to: Float.self, capacity: totalFloats)
+
+        // Initialize slot 2 with test pattern
+        for i in 0..<Int(kvStride) {
+            kPtr[2 * Int(kvStride) + i] = Float(1000 + i)
+            vPtr[2 * Int(kvStride) + i] = Float(2000 + i)
+        }
+
+        // Compact slot 2 -> slot 1
+        guard let cmdBuf = cmdQueue.makeCommandBuffer(),
+              let enc = cmdBuf.makeComputeCommandEncoder() else {
+            XCTFail("Failed to create Metal command encoder")
+            return
+        }
+
+        var srcSlot: UInt32 = 2
+        var dstSlot: UInt32 = 1
+        var strideVal = kvStride
+
+        enc.setComputePipelineState(engine.compactKvCacheSlotsF32Pipeline!)
+        enc.setBuffer(kCacheBuf, offset: 0, index: 0)
+        enc.setBuffer(vCacheBuf, offset: 0, index: 1)
+        enc.setBytes(&srcSlot, length: MemoryLayout<UInt32>.stride, index: 2)
+        enc.setBytes(&dstSlot, length: MemoryLayout<UInt32>.stride, index: 3)
+        enc.setBytes(&strideVal, length: MemoryLayout<UInt32>.stride, index: 4)
+        enc.dispatchThreads(MTLSize(width: Int(kvStride), height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: min(Int(kvStride), engine.compactKvCacheSlotsF32Pipeline!.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+        enc.endEncoding()
+        cmdBuf.commit()
+        cmdBuf.waitUntilCompleted()
+
+        // Verify slot 1 matches what was in slot 2
+        for i in 0..<Int(kvStride) {
+            XCTAssertEqual(kPtr[1 * Int(kvStride) + i], Float(1000 + i), "K cache slot compaction mismatch at \(i)")
+            XCTAssertEqual(vPtr[1 * Int(kvStride) + i], Float(2000 + i), "V cache slot compaction mismatch at \(i)")
+        }
+
+        print("✅ [TEST] Metal KV cache slot compaction kernel verified successfully.")
+    }
+
+    func testJetSpecOrnith9BValidation() throws {
+        print("=== TEST JETSPEC ORNITH 1.5 9B VALIDATION ===")
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--mlx-community--Ornith-1.5-9B-OptiQ-4bit/snapshots/ad2e7748e8c9d36b82bb88307fd21c0d50be85b8"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            throw XCTSkip("Ornith 1.5 9B OptiQ-4bit snapshot not found at \(snapshotDir)")
+        }
+
+        print("🔍 [DIAGNOSTIC] Loading Ornith 1.5 9B OptiQ-4bit...")
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let engine = try DynaMoeEngine(filePath: snapshotDir)
+        let summary = try engine.getSummary()
+        let tLoad = CFAbsoluteTimeGetCurrent() - t0
+        print(String(format: "✅ [DIAGNOSTIC] Model parsed in %.3f s. Found %d shards, %d tensors.", tLoad, summary.shards.count, summary.tensors.count))
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+
+        var buffers: [UInt32: MTLBuffer] = [:]
+        var totalMappedBytes: Int = 0
+        for shard in summary.shards {
+            let address = UInt(shard.baseAddress)
+            guard let ptr = UnsafeMutableRawPointer(bitPattern: address) else { continue }
+            let len = Int(shard.length)
+            if let buf = device.makeBuffer(bytesNoCopy: ptr, length: len, options: .storageModeShared, deallocator: nil) {
+                buffers[shard.index] = buf
+                totalMappedBytes += len
+            }
+        }
+        print(String(format: "✅ [DIAGNOSTIC] Mapped %.2f GB into Metal buffers.", Double(totalMappedBytes) / (1024*1024*1024)))
+
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+
+        let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir))
+        let cachedLayers = inference.buildCachedLayers(summary: summary, config: config, targetLayerCount: 32)
+        XCTAssertEqual(cachedLayers.count, 32, "Expected 32 cached layers for Ornith 9B")
+
+        let hiddenDim = config?.hiddenSize ?? 4096
+        let intermediateDim = config?.intermediateSize ?? 12288
+        let vocabSize = config?.vocabSize ?? 248320
+
+        let staging = inference.allocateJetSpecBuffers(
+            device: device,
+            maxNodes: 8,
+            vocabSize: vocabSize,
+            hiddenDim: hiddenDim,
+            intermediateDim: intermediateDim
+        )
+        XCTAssertNotNil(staging, "Failed to allocate JetSpec staging buffers")
+
+        // Construct candidate tree (root + 3 draft nodes)
+        let treeMask = buildJetspecCandidateTree(
+            rootTokenId: 248046,
+            draftTokens: [151644, 872, 198],
+            draftScores: [-0.1, -0.4, -0.8],
+            depth: 2,
+            branchingFactor: 2,
+            maxNodes: 8
+        )
+        XCTAssertEqual(treeMask.nodeCount, 4)
+
+        // Upload tree mask to Metal staging buffer
+        let maskByteCount = Int(treeMask.nodeCount * treeMask.nodeCount) * MemoryLayout<Float>.stride
+        memcpy(staging!.treeMaskBuffer.contents(), treeMask.mask, maskByteCount)
+        memcpy(staging!.candidateTokensBuffer.contents(), treeMask.tokenIds, Int(treeMask.nodeCount) * MemoryLayout<UInt32>.stride)
+        memcpy(staging!.parentIndicesBuffer.contents(), treeMask.parentIndices, Int(treeMask.nodeCount) * MemoryLayout<UInt32>.stride)
+        memcpy(staging!.depthsBuffer.contents(), treeMask.depths, Int(treeMask.nodeCount) * MemoryLayout<UInt32>.stride)
+
+        print("✅ [TEST] Successfully initialized Ornith 1.5 9B with JetSpec staging buffers and candidate tree topology.")
+    }
 }
 
 

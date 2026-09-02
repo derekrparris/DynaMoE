@@ -5089,6 +5089,73 @@ kernel void gdn_linear_attention_tree_step(
         outputVector[outBase + i] = yNorm * sig_z;
     }
 }
+/// MSL Kernel: Fused Rotary Position Embeddings (RoPE) for JetSpec Candidate Tree Nodes
+/// Each node's sequence position is determined by its tree depth: effectivePos = tokenPos + nodeDepths[nodeIdx]
+kernel void apply_rope_tree(
+    device float* qkVector [[buffer(0)]],
+    device const uint32_t* nodeDepths [[buffer(1)]],
+    constant uint32_t& tokenPos [[buffer(2)]],
+    constant uint32_t& numHeads [[buffer(3)]],
+    constant uint32_t& headDim [[buffer(4)]],
+    constant uint32_t& rotaryDim [[buffer(5)]],
+    constant uint32_t& headStride [[buffer(6)]],
+    constant float& ropeTheta [[buffer(7)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint headIdx = pos.x;
+    uint nodeIdx = pos.y;
+    if (headIdx >= numHeads) return;
 
+    uint32_t effectivePos = tokenPos + nodeDepths[nodeIdx];
+    uint64_t headBase = (uint64_t)nodeIdx * ((uint64_t)numHeads * headStride) + ((uint64_t)headIdx * headStride);
+    uint32_t halfRotary = rotaryDim / 2;
 
+    for (uint32_t i = 0; i < halfRotary; i++) {
+        float exponent = (2.0f * (float)i) / (float)rotaryDim;
+        float freq = 1.0f / pow(ropeTheta, exponent);
+        float angle = (float)effectivePos * freq;
+        float cosVal = cos(angle);
+        float sinVal = sin(angle);
 
+        uint64_t idx0 = headBase + i;
+        uint64_t idx1 = headBase + i + halfRotary;
+
+        float v0 = qkVector[idx0];
+        float v1 = qkVector[idx1];
+
+        qkVector[idx0] = v0 * cosVal - v1 * sinVal;
+        qkVector[idx1] = v0 * sinVal + v1 * cosVal;
+    }
+}
+
+/// MSL Kernel: Compacts speculative KV cache slots by moving accepted candidate slot to permanent slot (FP32)
+kernel void compact_kv_cache_slots_f32(
+    device float* kCacheBuffer [[buffer(0)]],
+    device float* vCacheBuffer [[buffer(1)]],
+    constant uint32_t& srcSlot [[buffer(2)]],
+    constant uint32_t& dstSlot [[buffer(3)]],
+    constant uint32_t& kvStride [[buffer(4)]],
+    uint elemIdx [[thread_position_in_grid]]
+) {
+    if (elemIdx >= kvStride) return;
+    uint32_t srcOffset = (srcSlot * kvStride) + elemIdx;
+    uint32_t dstOffset = (dstSlot * kvStride) + elemIdx;
+    kCacheBuffer[dstOffset] = kCacheBuffer[srcOffset];
+    vCacheBuffer[dstOffset] = vCacheBuffer[srcOffset];
+}
+
+/// MSL Kernel: Compacts speculative KV cache slots by moving accepted candidate slot to permanent slot (FP16)
+kernel void compact_kv_cache_slots_f16(
+    device half* kCacheBuffer [[buffer(0)]],
+    device half* vCacheBuffer [[buffer(1)]],
+    constant uint32_t& srcSlot [[buffer(2)]],
+    constant uint32_t& dstSlot [[buffer(3)]],
+    constant uint32_t& kvStride [[buffer(4)]],
+    uint elemIdx [[thread_position_in_grid]]
+) {
+    if (elemIdx >= kvStride) return;
+    uint32_t srcOffset = (srcSlot * kvStride) + elemIdx;
+    uint32_t dstOffset = (dstSlot * kvStride) + elemIdx;
+    kCacheBuffer[dstOffset] = kCacheBuffer[srcOffset];
+    vCacheBuffer[dstOffset] = vCacheBuffer[srcOffset];
+}

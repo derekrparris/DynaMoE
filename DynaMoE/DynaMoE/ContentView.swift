@@ -7193,31 +7193,603 @@ struct ContentView: View {
             }
 
             // Allocate JetSpec Staging Buffers for Tree Drafting & Verification
+            let effectiveInterDim = modelConfig?.intermediateSize ?? Int(cachedLayers.first?.intermediateDim ?? 14336)
+            let effectiveQkvDim = Int(max(hiddenDim * 2, 8192))
+            let effectiveZDim = Int(max(hiddenDim * 2, 8192))
+            let effectiveTopK = Int(modelConfig?.effectiveNumExpertsPerTok ?? 8)
             let jetspecStaging = InferenceEngine.shared.allocateJetSpecBuffers(
                 device: device,
                 maxNodes: 16,
                 vocabSize: Int(vocabSize),
-                hiddenDim: Int(hiddenDim)
+                hiddenDim: Int(hiddenDim),
+                intermediateDim: effectiveInterDim,
+                maxQkvDim: effectiveQkvDim,
+                maxZDim: effectiveZDim,
+                kvStride: Int(kvStride),
+                topK: effectiveTopK
             )
+
+            // Multi-Node Parallel Tree Forward Pass (Target Backbone Execution)
+            func runJetSpecTreeForward(treeMask: JetSpecTreeMask, step: UInt32) -> Bool {
+                guard let jb = jetspecStaging else { return false }
+                let N = Int(treeMask.nodeCount)
+                if N == 0 { return false }
+
+                let getRmsNormPipe = { (dtype: String) -> MTLComputePipelineState in
+                    let isF16 = (dtype.contains("F16") || dtype.contains("HALF") || dtype.contains("FLOAT16")) && !dtype.contains("BF16") && !dtype.contains("BFLOAT")
+                    if isRMSNormOffset {
+                        return (isF16 && rmsnormOffsetF16Pipeline != nil) ? rmsnormOffsetF16Pipeline! : (rmsnormOffsetPipeline ?? rmsnormPipeline)
+                    } else {
+                        return (isF16 && rmsnormF16Pipeline != nil) ? rmsnormF16Pipeline! : rmsnormPipeline
+                    }
+                }
+
+                // 1. Stage Tree Metadata in JetSpec buffers
+                let maskPtr = jb.treeMaskBuffer.contents().bindMemory(to: Float.self, capacity: N * N)
+                for i in 0..<(N * N) {
+                    maskPtr[i] = i < treeMask.mask.count ? treeMask.mask[i] : -1e9
+                }
+
+                let depthsPtr = jb.depthsBuffer.contents().bindMemory(to: UInt32.self, capacity: N)
+                for i in 0..<N {
+                    depthsPtr[i] = i < treeMask.depths.count ? treeMask.depths[i] : 0
+                }
+
+                let parentsPtr = jb.parentIndicesBuffer.contents().bindMemory(to: UInt32.self, capacity: N)
+                for i in 0..<N {
+                    parentsPtr[i] = i < treeMask.parentIndices.count ? treeMask.parentIndices[i] : 0
+                }
+
+                let tokensPtr = jb.candidateTokensBuffer.contents().bindMemory(to: UInt32.self, capacity: N)
+                for i in 0..<N {
+                    tokensPtr[i] = i < treeMask.tokenIds.count ? treeMask.tokenIds[i] : 0
+                }
+
+                guard let activeCmd = commandQueue.makeCommandBuffer() else { return false }
+
+                // 2. Embed all N candidate tree tokens into jb.treeHiddenBuffer
+                guard let embedEnc = activeCmd.makeComputeCommandEncoder() else { return false }
+                if let rawBaseBuffer = buffers[embedWeight.shardIndex] {
+                    var baseOff = embedWeight.offsetStart
+                    var hDim = hiddenDim
+                    let hasEmbedScale = (embedScale != nil)
+                    let hasEmbedBias = (embedBias != nil)
+                    let isEmbedMXFP8 = hasEmbedScale && (embedScale!.dtype.contains("U8") || embedScale!.dtype.contains("UINT8") || (!hasEmbedBias && (embedWeight.dtype.contains("U32") || embedWeight.dtype.contains("U8") || embedWeight.dtype.contains("FP8")) && (embedScale!.offsetEnd - embedScale!.offsetStart) >= UInt64(hiddenDim / 32)))
+                    let isEmbedAffine = (hasEmbedBias || embedWeight.dtype.contains("Q4") || embedWeight.dtype.contains("Q8") || hasEmbedScale) && !isEmbedMXFP8
+
+                    if isEmbedMXFP8, let embedMXFP8Pipe = embedMXFP8Pipeline,
+                       let embedScaleRaw = buffers[embedScale!.shardIndex] {
+                        var wOffset = embedOffset
+                        var sOffset = embedScale!.offsetStart
+                        embedEnc.setComputePipelineState(embedMXFP8Pipe)
+                        embedEnc.setBuffer(rawBaseBuffer, offset: 0, index: 0)
+                        embedEnc.setBuffer(jb.candidateTokensBuffer, offset: 0, index: 1)
+                        embedEnc.setBuffer(jb.treeHiddenBuffer, offset: 0, index: 2)
+                        embedEnc.setBuffer(embedScaleRaw, offset: 0, index: 3)
+                        embedEnc.setBytes(&wOffset, length: MemoryLayout<UInt64>.stride, index: 4)
+                        embedEnc.setBytes(&sOffset, length: MemoryLayout<UInt64>.stride, index: 5)
+                        embedEnc.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 6)
+                        embedEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), embedMXFP8Pipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                    } else if isEmbedAffine,
+                              let embedScaleRaw = (embedScale != nil) ? buffers[embedScale!.shardIndex] : nil,
+                              let embedBiasRaw = (embedBias != nil) ? buffers[embedBias!.shardIndex] : nil {
+                        var wOffset = embedOffset
+                        var sOffset = embedScale!.offsetStart
+                        var bOffset = embedBias!.offsetStart
+                        var grpSize: UInt32 = 64
+                        let is8Bit = (embedWeight.offsetEnd - embedWeight.offsetStart) >= (UInt64(vocabSize) * UInt64(hiddenDim) * 3) / 4
+
+                        for n in 0..<N {
+                            var tok = treeMask.tokenIds[n]
+                            let outOffset = n * Int(hiddenDim) * MemoryLayout<Float>.stride
+                            if is8Bit, let embedQ8Pipe = embedQ8Pipeline {
+                                embedEnc.setComputePipelineState(embedQ8Pipe)
+                                embedEnc.setBuffer(rawBaseBuffer, offset: 0, index: 0)
+                                embedEnc.setBuffer(embedScaleRaw, offset: 0, index: 1)
+                                embedEnc.setBuffer(embedBiasRaw, offset: 0, index: 2)
+                                embedEnc.setBuffer(jb.treeHiddenBuffer, offset: outOffset, index: 3)
+                                embedEnc.setBytes(&tok, length: MemoryLayout<UInt32>.stride, index: 4)
+                                embedEnc.setBytes(&wOffset, length: MemoryLayout<UInt64>.stride, index: 5)
+                                embedEnc.setBytes(&sOffset, length: MemoryLayout<UInt64>.stride, index: 6)
+                                embedEnc.setBytes(&bOffset, length: MemoryLayout<UInt64>.stride, index: 7)
+                                embedEnc.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 8)
+                                embedEnc.setBytes(&grpSize, length: MemoryLayout<UInt32>.stride, index: 9)
+                                embedEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), embedQ8Pipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                            } else if let embedQ4Pipe = embedQ4Pipeline {
+                                embedEnc.setComputePipelineState(embedQ4Pipe)
+                                embedEnc.setBuffer(rawBaseBuffer, offset: 0, index: 0)
+                                embedEnc.setBuffer(embedScaleRaw, offset: 0, index: 1)
+                                embedEnc.setBuffer(embedBiasRaw, offset: 0, index: 2)
+                                embedEnc.setBuffer(jb.treeHiddenBuffer, offset: outOffset, index: 3)
+                                embedEnc.setBytes(&tok, length: MemoryLayout<UInt32>.stride, index: 4)
+                                embedEnc.setBytes(&wOffset, length: MemoryLayout<UInt64>.stride, index: 5)
+                                embedEnc.setBytes(&sOffset, length: MemoryLayout<UInt64>.stride, index: 6)
+                                embedEnc.setBytes(&bOffset, length: MemoryLayout<UInt64>.stride, index: 7)
+                                embedEnc.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 8)
+                                embedEnc.setBytes(&grpSize, length: MemoryLayout<UInt32>.stride, index: 9)
+                                embedEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), embedQ4Pipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                            }
+                        }
+                    } else {
+                        let embedPipe = embedPipeline
+                        var wOffset = embedOffset
+                        var tokCount: UInt32 = UInt32(N)
+                        embedEnc.setComputePipelineState(embedPipe)
+                        embedEnc.setBuffer(rawBaseBuffer, offset: 0, index: 0)
+                        embedEnc.setBuffer(jb.candidateTokensBuffer, offset: 0, index: 1)
+                        embedEnc.setBuffer(jb.treeHiddenBuffer, offset: 0, index: 2)
+                        embedEnc.setBytes(&wOffset, length: MemoryLayout<UInt64>.stride, index: 3)
+                        embedEnc.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 4)
+                        embedEnc.setBytes(&tokCount, length: MemoryLayout<UInt32>.stride, index: 5)
+                        embedEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), embedPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                    }
+                }
+                embedEnc.endEncoding()
+
+                // 3. Forward Pass through Backbone Layers
+                for loopIdx in 0..<totalLoops {
+                    for l in 0..<actualLayers {
+                        if Task.isCancelled { return false }
+                        let layer = cachedLayers[l]
+                        guard let layerEnc = activeCmd.makeComputeCommandEncoder() else { return false }
+
+                        // Step A: Pre-Attention RMSNorm 1
+                        if let norm1 = layer.norm1Tensor, let normRaw = buffers[norm1.shardIndex] {
+                            let rmsPipe = getRmsNormPipe(norm1.dtype)
+                            var nOff = norm1.offsetStart
+                            var hD = hiddenDim
+                            var epsVal = eps
+                            layerEnc.setComputePipelineState(rmsPipe)
+                            layerEnc.setBuffer(jb.treeHiddenBuffer, offset: 0, index: 0)
+                            layerEnc.setBuffer(normRaw, offset: 0, index: 1)
+                            layerEnc.setBuffer(jb.treeXNorm1Buffer, offset: 0, index: 2)
+                            layerEnc.setBytes(&nOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                            layerEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 4)
+                            layerEnc.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 5)
+                            layerEnc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), rmsPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                            layerEnc.memoryBarrier(scope: .buffers)
+                        }
+
+                        // Step B: Attention (Full Attention or Linear Attention)
+                        if layer.attentionType == .fullAttention {
+                            let currentQDim = isStandardGqa ? (numHeads * headDim) : (numHeads * headDim * 2)
+                            let currentKvDim = numKvHeads * headDim
+                            let attnCtxDim = numHeads * headDim
+
+                            // Q, K, V Projections for all N candidate tree nodes
+                            dispatchLinear(enc: layerEnc, weight: layer.qProjTensor, scale: layer.qScaleTensor, bias: layer.qBiasTensor, inBuf: jb.treeXNorm1Buffer, outBuf: jb.treeQGateBuffer, inDim: hiddenDim, outDim: currentQDim, batchSize: N)
+                            dispatchLinear(enc: layerEnc, weight: layer.kProjTensor, scale: layer.kScaleTensor, bias: layer.kBiasTensor, inBuf: jb.treeXNorm1Buffer, outBuf: jb.treeKVectorBuffer, inDim: hiddenDim, outDim: currentKvDim, batchSize: N)
+                            dispatchLinear(enc: layerEnc, weight: layer.vProjTensor, scale: layer.vScaleTensor, bias: layer.vBiasTensor, inBuf: jb.treeXNorm1Buffer, outBuf: jb.treeVVectorBuffer, inDim: hiddenDim, outDim: currentKvDim, batchSize: N)
+                            layerEnc.memoryBarrier(scope: .buffers)
+
+                            // Q / K Normalization if present
+                            if let qNorm = layer.qNormTensor, let qNormRaw = buffers[qNorm.shardIndex] {
+                                let rmsPipe = getRmsNormPipe(qNorm.dtype)
+                                var qNormOff = qNorm.offsetStart
+                                var hD = headDim
+                                var epsVal = eps
+                                var hStride = isStandardGqa ? headDim : (headDim * 2)
+                                layerEnc.setComputePipelineState(rmsPipe)
+                                layerEnc.setBuffer(jb.treeQGateBuffer, offset: 0, index: 0)
+                                layerEnc.setBuffer(qNormRaw, offset: 0, index: 1)
+                                layerEnc.setBuffer(jb.treeQGateBuffer, offset: 0, index: 2)
+                                layerEnc.setBytes(&qNormOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                                layerEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 4)
+                                layerEnc.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 5)
+                                layerEnc.setBytes(&hStride, length: MemoryLayout<UInt32>.stride, index: 6)
+                                layerEnc.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(headDim), rmsPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                layerEnc.memoryBarrier(scope: .buffers)
+                            }
+                            if let kNorm = layer.kNormTensor, let kNormRaw = buffers[kNorm.shardIndex] {
+                                let rmsPipe = getRmsNormPipe(kNorm.dtype)
+                                var kNormOff = kNorm.offsetStart
+                                var hD = headDim
+                                var epsVal = eps
+                                layerEnc.setComputePipelineState(rmsPipe)
+                                layerEnc.setBuffer(jb.treeKVectorBuffer, offset: 0, index: 0)
+                                layerEnc.setBuffer(kNormRaw, offset: 0, index: 1)
+                                layerEnc.setBuffer(jb.treeKVectorBuffer, offset: 0, index: 2)
+                                layerEnc.setBytes(&kNormOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                                layerEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 4)
+                                layerEnc.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 5)
+                                layerEnc.dispatchThreadgroups(MTLSize(width: Int(numKvHeads), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(headDim), rmsPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                layerEnc.memoryBarrier(scope: .buffers)
+                            }
+
+                            // Tree-Aware RoPE Rotation: effectivePos = tokenPos + nodeDepths[nodeIdx]
+                            if let ropePipe = InferenceEngine.shared.applyRopeTreePipeline {
+                                var tPos = step
+                                var rDim = rotaryDim
+                                var hDimVal = headDim
+                                var thVal = thetaVal
+                                var qStr = isStandardGqa ? headDim : (headDim * 2)
+                                var numNodesVal = UInt32(N)
+
+                                // Rotate Q
+                                layerEnc.setComputePipelineState(ropePipe)
+                                layerEnc.setBuffer(jb.treeQGateBuffer, offset: 0, index: 0)
+                                layerEnc.setBuffer(jb.depthsBuffer, offset: 0, index: 1)
+                                layerEnc.setBytes(&tPos, length: MemoryLayout<UInt32>.stride, index: 2)
+                                layerEnc.setBytes(&rDim, length: MemoryLayout<UInt32>.stride, index: 3)
+                                layerEnc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 4)
+                                layerEnc.setBytes(&thVal, length: MemoryLayout<Float>.stride, index: 5)
+                                layerEnc.setBytes(&qStr, length: MemoryLayout<UInt32>.stride, index: 6)
+                                layerEnc.setBytes(&numNodesVal, length: MemoryLayout<UInt32>.stride, index: 7)
+                                layerEnc.dispatchThreads(MTLSize(width: Int(numHeads), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), ropePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+
+                                // Rotate K
+                                var kStr = headDim
+                                layerEnc.setBuffer(jb.treeKVectorBuffer, offset: 0, index: 0)
+                                layerEnc.setBytes(&kStr, length: MemoryLayout<UInt32>.stride, index: 6)
+                                layerEnc.dispatchThreads(MTLSize(width: Int(numKvHeads), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numKvHeads), ropePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                layerEnc.memoryBarrier(scope: .buffers)
+                            }
+
+                            // Store K and V vectors into KV Cache at slots [step ..< step + N]
+                            let slotIndex = (loopIdx * actualLayers) + layer.fullAttnIndex
+                            let maxSeq = KVCacheManager.shared.allocatedSeqLen
+                            let prec = KVCacheManager.shared.activePrecision
+
+                            if prec == .fp16, let storePipe = storeKvCacheF16Pipeline,
+                               let kCache = KVCacheManager.shared.kCacheBuffer,
+                               let vCache = KVCacheManager.shared.vCacheBuffer {
+                                let layerByteOffset = slotIndex * maxSeq * Int(kvStride) * MemoryLayout<Float16>.stride
+                                var tPos = step
+                                var nKv = numKvHeads
+                                var hD = headDim
+
+                                layerEnc.setComputePipelineState(storePipe)
+                                layerEnc.setBuffer(jb.treeKVectorBuffer, offset: 0, index: 0)
+                                layerEnc.setBuffer(jb.treeVVectorBuffer, offset: 0, index: 1)
+                                layerEnc.setBuffer(kCache, offset: layerByteOffset, index: 2)
+                                layerEnc.setBuffer(vCache, offset: layerByteOffset, index: 3)
+                                layerEnc.setBytes(&tPos, length: MemoryLayout<UInt32>.stride, index: 4)
+                                layerEnc.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 5)
+                                layerEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 6)
+                                layerEnc.dispatchThreads(MTLSize(width: Int(kvStride), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(kvStride), storePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                layerEnc.memoryBarrier(scope: .buffers)
+                            } else if let storePipe = storeKvCachePipeline,
+                                      let kCache = KVCacheManager.shared.kCacheBuffer,
+                                      let vCache = KVCacheManager.shared.vCacheBuffer {
+                                let layerByteOffset = slotIndex * maxSeq * Int(kvStride) * MemoryLayout<Float>.stride
+                                var tPos = step
+                                var nKv = numKvHeads
+                                var hD = headDim
+
+                                layerEnc.setComputePipelineState(storePipe)
+                                layerEnc.setBuffer(jb.treeKVectorBuffer, offset: 0, index: 0)
+                                layerEnc.setBuffer(jb.treeVVectorBuffer, offset: 0, index: 1)
+                                layerEnc.setBuffer(kCache, offset: layerByteOffset, index: 2)
+                                layerEnc.setBuffer(vCache, offset: layerByteOffset, index: 3)
+                                layerEnc.setBytes(&tPos, length: MemoryLayout<UInt32>.stride, index: 4)
+                                layerEnc.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 5)
+                                layerEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 6)
+                                layerEnc.dispatchThreads(MTLSize(width: Int(kvStride), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(kvStride), storePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                layerEnc.memoryBarrier(scope: .buffers)
+                            }
+
+                            // Grouped-Query Attention Tree Causal Verification
+                            if prec == .fp16, let treeAttnPipe = InferenceEngine.shared.gqaAttentionTreeVerifyStandardF16Pipeline,
+                               let kCache = KVCacheManager.shared.kCacheBuffer,
+                               let vCache = KVCacheManager.shared.vCacheBuffer {
+                                let layerByteOffset = slotIndex * maxSeq * Int(kvStride) * MemoryLayout<Float16>.stride
+                                var pLen = step
+                                var numNodesVal = UInt32(N)
+                                var nQ = numHeads
+                                var nKv = numKvHeads
+                                var hD = headDim
+
+                                layerEnc.setComputePipelineState(treeAttnPipe)
+                                layerEnc.setBuffer(jb.treeQGateBuffer, offset: 0, index: 0)
+                                layerEnc.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                layerEnc.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                layerEnc.setBuffer(jb.treeMaskBuffer, offset: 0, index: 3)
+                                layerEnc.setBuffer(jb.treeAttnCtxBuffer, offset: 0, index: 4)
+                                layerEnc.setBytes(&pLen, length: MemoryLayout<UInt32>.stride, index: 5)
+                                layerEnc.setBytes(&numNodesVal, length: MemoryLayout<UInt32>.stride, index: 6)
+                                layerEnc.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 7)
+                                layerEnc.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 8)
+                                layerEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 9)
+                                layerEnc.dispatchThreads(MTLSize(width: Int(numHeads), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), treeAttnPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                layerEnc.memoryBarrier(scope: .buffers)
+                            } else if let treeAttnPipe = InferenceEngine.shared.gqaAttentionTreeVerifyStandardPipeline,
+                                      let kCache = KVCacheManager.shared.kCacheBuffer,
+                                      let vCache = KVCacheManager.shared.vCacheBuffer {
+                                let layerByteOffset = slotIndex * maxSeq * Int(kvStride) * MemoryLayout<Float>.stride
+                                var pLen = step
+                                var numNodesVal = UInt32(N)
+                                var nQ = numHeads
+                                var nKv = numKvHeads
+                                var hD = headDim
+
+                                layerEnc.setComputePipelineState(treeAttnPipe)
+                                layerEnc.setBuffer(jb.treeQGateBuffer, offset: 0, index: 0)
+                                layerEnc.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                layerEnc.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                layerEnc.setBuffer(jb.treeMaskBuffer, offset: 0, index: 3)
+                                layerEnc.setBuffer(jb.treeAttnCtxBuffer, offset: 0, index: 4)
+                                layerEnc.setBytes(&pLen, length: MemoryLayout<UInt32>.stride, index: 5)
+                                layerEnc.setBytes(&numNodesVal, length: MemoryLayout<UInt32>.stride, index: 6)
+                                layerEnc.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 7)
+                                layerEnc.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 8)
+                                layerEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 9)
+                                layerEnc.dispatchThreads(MTLSize(width: Int(numHeads), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), treeAttnPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                layerEnc.memoryBarrier(scope: .buffers)
+                            }
+
+                            // Attention Output Projection (o_proj)
+                            dispatchLinear(enc: layerEnc, weight: layer.oProjTensor, scale: layer.oScaleTensor, bias: layer.oBiasTensor, inBuf: jb.treeAttnCtxBuffer, outBuf: jb.treeAttnOutBuffer, inDim: attnCtxDim, outDim: hiddenDim, batchSize: N)
+                            layerEnc.memoryBarrier(scope: .buffers)
+                        } else {
+                            // Linear Attention (GatedDeltaNet Recurrent State)
+                            let linValHeads: UInt32 = UInt32(modelConfig?.effectiveLinearNumValueHeads ?? (layer.inProjA != nil && (layer.inProjA!.offsetEnd - layer.inProjA!.offsetStart) > 32 * 2560 ? 48 : 32))
+                            let linKeyHeads: UInt32 = UInt32(modelConfig?.effectiveLinearNumKeyHeads ?? 16)
+                            let qkvDim: UInt32 = (linKeyHeads + linKeyHeads + linValHeads) * 128
+                            let zDim: UInt32 = linValHeads * 128
+                            let aDim: UInt32 = linValHeads
+                            let bDim: UInt32 = linValHeads
+
+                            dispatchLinear(enc: layerEnc, weight: layer.inProjQKV, scale: layer.inProjQKVScale, bias: layer.inProjQKVBias, inBuf: jb.treeXNorm1Buffer, outBuf: jb.treeQGateBuffer, inDim: hiddenDim, outDim: qkvDim, batchSize: N)
+                            layerEnc.memoryBarrier(scope: .buffers)
+
+                            if let l2Pipe = l2NormQkPipeline {
+                                var numHeads: UInt32 = linKeyHeads
+                                var headDim: UInt32 = 128
+                                layerEnc.setComputePipelineState(l2Pipe)
+                                layerEnc.setBuffer(jb.treeQGateBuffer, offset: 0, index: 0)
+                                layerEnc.setBytes(&numHeads, length: MemoryLayout<UInt32>.stride, index: 1)
+                                layerEnc.setBytes(&headDim, length: MemoryLayout<UInt32>.stride, index: 2)
+                                layerEnc.dispatchThreads(MTLSize(width: Int(numHeads), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), l2Pipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                layerEnc.memoryBarrier(scope: .buffers)
+                            }
+
+                            dispatchLinear(enc: layerEnc, weight: layer.inProjZ, scale: layer.inProjZScale, bias: layer.inProjZBias, inBuf: jb.treeXNorm1Buffer, outBuf: jb.treeZGateBuffer, inDim: hiddenDim, outDim: zDim, batchSize: N)
+                            dispatchLinear(enc: layerEnc, weight: layer.inProjA, scale: layer.inProjAScale, bias: layer.inProjABias, inBuf: jb.treeXNorm1Buffer, outBuf: jb.treeAVectorBuffer, inDim: hiddenDim, outDim: aDim, batchSize: N)
+                            dispatchLinear(enc: layerEnc, weight: layer.inProjB, scale: layer.inProjBScale, bias: layer.inProjBBias, inBuf: jb.treeXNorm1Buffer, outBuf: jb.treeBVectorBuffer, inDim: hiddenDim, outDim: bDim, batchSize: N)
+                            layerEnc.memoryBarrier(scope: .buffers)
+
+                            if let linPipe = gdnLinearAttnStepPipeline ?? linearAttnStepPipeline,
+                               let sBuf = KVCacheManager.shared.linearStateBuffer,
+                               let aLog = layer.aLogTensor, let aLogRaw = buffers[aLog.shardIndex],
+                               let dtBias = layer.dtBiasTensor, let dtBiasRaw = buffers[dtBias.shardIndex],
+                               let linNorm = layer.linearNormTensor, let linNormRaw = buffers[linNorm.shardIndex] {
+                                let linIdx = layer.linAttnIndex
+                                let stateByteOffset = linIdx * Int(linValHeads * 128 * 128) * MemoryLayout<Float>.stride
+                                var aLogOff = aLog.offsetStart
+                                var dtBiasOff = dtBias.offsetStart
+                                var linNormOff = linNorm.offsetStart
+                                var numValHeads: UInt32 = linValHeads
+                                var numKeyHeads: UInt32 = linKeyHeads
+                                var headDim: UInt32 = 128
+                                var epsVal = eps
+
+                                layerEnc.setComputePipelineState(linPipe)
+                                layerEnc.setBuffer(jb.treeQGateBuffer, offset: 0, index: 0)
+                                layerEnc.setBuffer(jb.treeZGateBuffer, offset: 0, index: 1)
+                                layerEnc.setBuffer(jb.treeAVectorBuffer, offset: 0, index: 2)
+                                layerEnc.setBuffer(jb.treeBVectorBuffer, offset: 0, index: 3)
+                                layerEnc.setBuffer(aLogRaw, offset: 0, index: 4)
+                                layerEnc.setBuffer(dtBiasRaw, offset: 0, index: 5)
+                                layerEnc.setBuffer(linNormRaw, offset: 0, index: 6)
+                                layerEnc.setBuffer(sBuf, offset: stateByteOffset, index: 7)
+                                layerEnc.setBuffer(jb.treeAttnCtxBuffer, offset: 0, index: 8)
+                                layerEnc.setBytes(&aLogOff, length: MemoryLayout<UInt64>.stride, index: 9)
+                                layerEnc.setBytes(&dtBiasOff, length: MemoryLayout<UInt64>.stride, index: 10)
+                                layerEnc.setBytes(&linNormOff, length: MemoryLayout<UInt64>.stride, index: 11)
+                                layerEnc.setBytes(&numValHeads, length: MemoryLayout<UInt32>.stride, index: 12)
+                                layerEnc.setBytes(&numKeyHeads, length: MemoryLayout<UInt32>.stride, index: 13)
+                                layerEnc.setBytes(&headDim, length: MemoryLayout<UInt32>.stride, index: 14)
+                                layerEnc.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 15)
+                                layerEnc.dispatchThreads(MTLSize(width: Int(linValHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(linValHeads), linPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                layerEnc.memoryBarrier(scope: .buffers)
+                            }
+
+                            let linAttnCtxDim = linValHeads * 128
+                            dispatchLinear(enc: layerEnc, weight: layer.oProjTensor, scale: layer.oScaleTensor, bias: layer.oBiasTensor, inBuf: jb.treeAttnCtxBuffer, outBuf: jb.treeAttnOutBuffer, inDim: linAttnCtxDim, outDim: hiddenDim, batchSize: N)
+                            layerEnc.memoryBarrier(scope: .buffers)
+                        }
+
+                        // Residual 1: treeHMidBuffer = treeHiddenBuffer + treeAttnOutBuffer
+                        let addPipe = addPipeline
+                        layerEnc.setComputePipelineState(addPipe)
+                        layerEnc.setBuffer(jb.treeHiddenBuffer, offset: 0, index: 0)
+                        layerEnc.setBuffer(jb.treeAttnOutBuffer, offset: 0, index: 1)
+                        layerEnc.setBuffer(jb.treeHMidBuffer, offset: 0, index: 2)
+                        var hD = hiddenDim
+                        layerEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 3)
+                        layerEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), addPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                        layerEnc.memoryBarrier(scope: .buffers)
+
+                        // Step C: Post-Attention RMSNorm 2
+                        if let norm2 = layer.norm2Tensor, let normRaw = buffers[norm2.shardIndex] {
+                            let rmsPipe = getRmsNormPipe(norm2.dtype)
+                            var nOff = norm2.offsetStart
+                            var hD = hiddenDim
+                            var epsVal = eps
+                            layerEnc.setComputePipelineState(rmsPipe)
+                            layerEnc.setBuffer(jb.treeHMidBuffer, offset: 0, index: 0)
+                            layerEnc.setBuffer(normRaw, offset: 0, index: 1)
+                            layerEnc.setBuffer(jb.treeXNorm2Buffer, offset: 0, index: 2)
+                            layerEnc.setBytes(&nOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                            layerEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 4)
+                            layerEnc.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 5)
+                            layerEnc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), rmsPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                            layerEnc.memoryBarrier(scope: .buffers)
+                        }
+
+                        // Step D: Feed-Forward MLP (Dense or MoE)
+                        layerEnc.setComputePipelineState(clearPipeline)
+                        layerEnc.setBuffer(jb.treeHMlpBuffer, offset: 0, index: 0)
+                        layerEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                        layerEnc.memoryBarrier(scope: .buffers)
+
+                        if layer.mlpType == .denseMlp || layer.routerTensor == nil {
+                            if let gateW = layer.denseGateWeight,
+                               let upW = layer.denseUpWeight,
+                               let downW = layer.denseDownWeight {
+                                for n in 0..<N {
+                                    let inOff = n * Int(hiddenDim) * MemoryLayout<Float>.stride
+                                    let interOff = n * Int(layer.intermediateDim) * MemoryLayout<Float>.stride
+                                    let accumOff = n * Int(hiddenDim) * MemoryLayout<Float>.stride
+                                    dispatchExpertMlp(
+                                        enc: layerEnc,
+                                        gateW: gateW,
+                                        gateS: layer.denseGateScale,
+                                        gateB: layer.denseGateBias,
+                                        upW: upW,
+                                        upS: layer.denseUpScale,
+                                        upB: layer.denseUpBias,
+                                        downW: downW,
+                                        downS: layer.denseDownScale,
+                                        downB: layer.denseDownBias,
+                                        inBuf: jb.treeXNorm2Buffer,
+                                        interBuf: jb.treeInterBuffer,
+                                        accumBuf: jb.treeHMlpBuffer,
+                                        inDim: hiddenDim,
+                                        interDim: layer.intermediateDim,
+                                        routingWeight: 1.0,
+                                        inOffset: inOff,
+                                        interOffset: interOff,
+                                        accumOffset: accumOff
+                                    )
+                                }
+                                layerEnc.memoryBarrier(scope: .buffers)
+                            }
+                        } else {
+                            // MoE Expert Evaluation across candidate tree nodes
+                            let routedCount = min(4, layer.expertGateWeights.count)
+                            if routedCount > 0 {
+                                let sortedExpertIds = layer.expertGateWeights.keys.sorted().prefix(routedCount)
+                                for n in 0..<N {
+                                    let inOff = n * Int(hiddenDim) * MemoryLayout<Float>.stride
+                                    let interOff = n * Int(layer.intermediateDim) * MemoryLayout<Float>.stride
+                                    let accumOff = n * Int(hiddenDim) * MemoryLayout<Float>.stride
+                                    for expId in sortedExpertIds {
+                                        if let gW = layer.expertGateWeights[expId],
+                                           let uW = layer.expertUpWeights[expId],
+                                           let dW = layer.expertDownWeights[expId] {
+                                            dispatchExpertMlp(
+                                                enc: layerEnc,
+                                                gateW: gW,
+                                                gateS: layer.expertGateScales[expId],
+                                                gateB: layer.expertGateBiases[expId],
+                                                upW: uW,
+                                                upS: layer.expertUpScales[expId],
+                                                upB: layer.expertUpBiases[expId],
+                                                downW: dW,
+                                                downS: layer.expertDownScales[expId],
+                                                downB: layer.expertDownBiases[expId],
+                                                inBuf: jb.treeXNorm2Buffer,
+                                                interBuf: jb.treeInterBuffer,
+                                                accumBuf: jb.treeHMlpBuffer,
+                                                inDim: hiddenDim,
+                                                interDim: layer.intermediateDim,
+                                                routingWeight: 1.0 / Float(routedCount),
+                                                inOffset: inOff,
+                                                interOffset: interOff,
+                                                accumOffset: accumOff
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                            layerEnc.memoryBarrier(scope: .buffers)
+                        }
+
+                        // Residual 2: treeHiddenBuffer = treeHMidBuffer + treeHMlpBuffer
+                        layerEnc.setComputePipelineState(addPipe)
+                        layerEnc.setBuffer(jb.treeHMidBuffer, offset: 0, index: 0)
+                        layerEnc.setBuffer(jb.treeHMlpBuffer, offset: 0, index: 1)
+                        layerEnc.setBuffer(jb.treeHiddenBuffer, offset: 0, index: 2)
+                        var hD2 = hiddenDim
+                        layerEnc.setBytes(&hD2, length: MemoryLayout<UInt32>.stride, index: 3)
+                        layerEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), addPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                        layerEnc.memoryBarrier(scope: .buffers)
+
+                        layerEnc.endEncoding()
+                    }
+                }
+
+                // 4. Final RMSNorm & LM Head Output
+                guard let finalEnc = activeCmd.makeComputeCommandEncoder() else { return false }
+                if let normTensor = normTensor, let normShardBuffer = normShardBuffer {
+                    var nOff = normOffset
+                    var epsVal = eps
+                    var hD = hiddenDim
+                    let finalNormPipe = getRmsNormPipe(normTensor.dtype)
+                    finalEnc.setComputePipelineState(finalNormPipe)
+                    finalEnc.setBuffer(jb.treeHiddenBuffer, offset: 0, index: 0)
+                    finalEnc.setBuffer(normShardBuffer, offset: 0, index: 1)
+                    finalEnc.setBuffer(jb.treeXNorm1Buffer, offset: 0, index: 2)
+                    finalEnc.setBytes(&nOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                    finalEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 4)
+                    finalEnc.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 5)
+                    finalEnc.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
+                    finalEnc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
+                    finalEnc.memoryBarrier(scope: .buffers)
+                }
+
+                // LM Head Projection across all N candidate tree nodes
+                let lmHead = lmHeadTensor
+                dispatchLinear(enc: finalEnc, weight: lmHead, scale: lmHeadScale, bias: lmHeadBias, inBuf: jb.treeXNorm1Buffer, outBuf: jb.targetLogitsBuffer, inDim: hiddenDim, outDim: vocabSize, batchSize: N)
+                finalEnc.endEncoding()
+
+                activeCmd.commit()
+                activeCmd.waitUntilCompleted()
+
+                return true
+            }
 
             func runJetSpecTreeStep(rootToken: UInt32, step: UInt32) -> (acceptedTokens: [UInt32], newStep: UInt32)? {
                 guard jetSpecEnabled, let jb = jetspecStaging else { return nil }
 
-                // 1. Obtain top-K candidate tokens from current step's logits
-                let logitsPtr = logitsBuffer.contents().bindMemory(to: Float.self, capacity: Int(vocabSize))
+                // 1. Obtain draft candidate proposals (N-gram Prompt Lookup + Top-K Logits fallback)
                 var topDraftTokens: [UInt32] = []
                 var topDraftScores: [Float] = []
 
-                var indexedLogits: [(token: UInt32, score: Float)] = []
-                indexedLogits.reserveCapacity(min(128, Int(vocabSize)))
-                for v in 0..<min(500, Int(vocabSize)) {
-                    indexedLogits.append((token: UInt32(v), score: logitsPtr[v]))
+                let ctxLen = contextTokens.count
+                if ctxLen >= 3 {
+                    let ngramSize = min(3, ctxLen - 1)
+                    let pattern = Array(contextTokens.suffix(ngramSize))
+                    for i in stride(from: ctxLen - ngramSize - 1, through: 0, by: -1) {
+                        if Array(contextTokens[i..<(i + ngramSize)]) == pattern {
+                            let matchEnd = i + ngramSize
+                            let numDraft = min(8, ctxLen - matchEnd)
+                            for j in 0..<numDraft {
+                                topDraftTokens.append(contextTokens[matchEnd + j])
+                                topDraftScores.append(1.0 - Float(j) * 0.1)
+                            }
+                            break
+                        }
+                    }
                 }
-                indexedLogits.sort { $0.score > $1.score }
-                let kCount = min(8, indexedLogits.count)
-                for i in 0..<kCount {
-                    topDraftTokens.append(indexedLogits[i].token)
-                    topDraftScores.append(indexedLogits[i].score)
+
+                if topDraftTokens.isEmpty {
+                    let logitsPtr = logitsBuffer.contents().bindMemory(to: Float.self, capacity: Int(vocabSize))
+                    let kCount = min(8, Int(vocabSize))
+                    var topCandidates: [(token: UInt32, score: Float)] = []
+                    topCandidates.reserveCapacity(kCount + 1)
+
+                    for v in 0..<Int(vocabSize) {
+                        let score = logitsPtr[v]
+                        if topCandidates.count < kCount {
+                            topCandidates.append((token: UInt32(v), score: score))
+                            if topCandidates.count == kCount {
+                                topCandidates.sort { $0.score > $1.score }
+                            }
+                        } else if score > topCandidates.last!.score {
+                            topCandidates[kCount - 1] = (token: UInt32(v), score: score)
+                            var idx = kCount - 1
+                            while idx > 0 && topCandidates[idx].score > topCandidates[idx - 1].score {
+                                topCandidates.swapAt(idx, idx - 1)
+                                idx -= 1
+                            }
+                        }
+                    }
+                    for cand in topCandidates {
+                        topDraftTokens.append(cand.token)
+                        topDraftScores.append(cand.score)
+                    }
                 }
 
                 if topDraftTokens.isEmpty { return nil }
@@ -7257,17 +7829,14 @@ struct ContentView: View {
                     )
                 }
 
-                // 4. Run Tree Verification Step through model backbone
-                var treeTargetLogits: [Float] = Array(repeating: 0.0, count: Int(treeMask.nodeCount) * Int(vocabSize))
-                let ok = runTokenForward(tokenId: rootToken, step: step, computeLogits: true, wait: true)
+                // 4. Run Multi-Node Parallel Tree Forward Pass through model backbone
+                let ok = runJetSpecTreeForward(treeMask: treeMask, step: step)
                 if !ok { return nil }
 
-                // Copy root logits to targetLogits for node 0
-                for v in 0..<Int(vocabSize) {
-                    treeTargetLogits[v] = logitsPtr[v]
-                }
+                // 5. Verify acceptance using Rust acceptance oracle
+                let targetLogitsPtr = jb.targetLogitsBuffer.contents().bindMemory(to: Float.self, capacity: Int(treeMask.nodeCount) * Int(vocabSize))
+                let treeTargetLogits = Array(UnsafeBufferPointer(start: targetLogitsPtr, count: Int(treeMask.nodeCount) * Int(vocabSize)))
 
-                // Verify acceptance using Rust acceptance oracle
                 let acceptedResult = verifyJetspecTreeGreedy(
                     treeTokens: treeMask.tokenIds,
                     parentIndices: treeMask.parentIndices,
@@ -7275,11 +7844,70 @@ struct ContentView: View {
                     vocabSize: vocabSize
                 )
 
-                if acceptedResult.acceptedCount > 0 {
-                    return (acceptedTokens: acceptedResult.acceptedTokens, newStep: step + acceptedResult.acceptedCount)
+                // 6. Speculative KV Cache Compaction for accepted branch
+                if acceptedResult.acceptedCount > 0,
+                   let kCache = KVCacheManager.shared.kCacheBuffer,
+                   let vCache = KVCacheManager.shared.vCacheBuffer {
+                    let maxSeq = KVCacheManager.shared.allocatedSeqLen
+                    let prec = KVCacheManager.shared.activePrecision
+                    let slotByteSize = Int(kvStride) * prec.bytesPerElement
+
+                    var needsCompaction = false
+                    for (i, nodeIdx) in acceptedResult.acceptedNodeIndices.enumerated() {
+                        let destSlot = UInt32(i + 1)
+                        if nodeIdx != destSlot {
+                            needsCompaction = true
+                            break
+                        }
+                    }
+
+                    if needsCompaction,
+                       let copyCmd = commandQueue.makeCommandBuffer(),
+                       let blit = copyCmd.makeBlitCommandEncoder() {
+                        for loopIdx in 0..<totalLoops {
+                            for l in 0..<actualLayers {
+                                let layer = cachedLayers[l]
+                                if layer.attentionType == .fullAttention {
+                                    let slot = (loopIdx * actualLayers) + layer.fullAttnIndex
+                                    let layerByteOffset = slot * maxSeq * Int(kvStride) * prec.bytesPerElement
+                                    for (i, nodeIdx) in acceptedResult.acceptedNodeIndices.enumerated() {
+                                        let destSlot = UInt32(i + 1)
+                                        if nodeIdx != destSlot {
+                                            let srcOffset = layerByteOffset + Int(step + nodeIdx) * slotByteSize
+                                            let dstOffset = layerByteOffset + Int(step + destSlot) * slotByteSize
+                                            blit.copy(from: kCache, sourceOffset: srcOffset, to: kCache, destinationOffset: dstOffset, size: slotByteSize)
+                                            blit.copy(from: vCache, sourceOffset: srcOffset, to: vCache, destinationOffset: dstOffset, size: slotByteSize)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        blit.endEncoding()
+                        copyCmd.commit()
+                        copyCmd.waitUntilCompleted()
+                    }
                 }
 
-                return nil
+                // 7. Copy winning node logits into logitsBuffer for next token sampling
+                let lastNodeIdx = acceptedResult.acceptedNodeIndices.last ?? 0
+                let srcOffset = Int(lastNodeIdx) * Int(vocabSize) * MemoryLayout<Float>.stride
+                if let copyCmd = commandQueue.makeCommandBuffer(),
+                   let blit = copyCmd.makeBlitCommandEncoder() {
+                    blit.copy(from: jb.targetLogitsBuffer, sourceOffset: srcOffset, to: logitsBuffer, destinationOffset: 0, size: Int(vocabSize) * MemoryLayout<Float>.stride)
+                    blit.endEncoding()
+                    copyCmd.commit()
+                    copyCmd.waitUntilCompleted()
+                }
+
+                // 8. Emit accepted tokens + bonus token
+                var emittedTokens = acceptedResult.acceptedTokens
+                if let bonus = acceptedResult.bonusToken {
+                    emittedTokens.append(bonus)
+                }
+
+                if emittedTokens.isEmpty { return nil }
+
+                return (acceptedTokens: emittedTokens, newStep: step + UInt32(emittedTokens.count))
             }
 
             var generatedTokenIds: [UInt32] = []

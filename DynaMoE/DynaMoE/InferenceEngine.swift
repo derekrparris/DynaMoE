@@ -244,6 +244,9 @@ public final class InferenceEngine {
     public var gqaAttentionTreeVerifyFusedPipeline: MTLComputePipelineState?
     public var gqaAttentionTreeVerifyFusedF16Pipeline: MTLComputePipelineState?
     public var gdnLinearAttnTreeStepPipeline: MTLComputePipelineState?
+    public var applyRopeTreePipeline: MTLComputePipelineState?
+    public var compactKvCacheSlotsF32Pipeline: MTLComputePipelineState?
+    public var compactKvCacheSlotsF16Pipeline: MTLComputePipelineState?
 
     private init() {}
 
@@ -486,6 +489,15 @@ public final class InferenceEngine {
         }
         if let gdnTreeStepFunc = defaultLib.makeFunction(name: "gdn_linear_attention_tree_step") {
             gdnLinearAttnTreeStepPipeline = try device.makeComputePipelineState(function: gdnTreeStepFunc)
+        }
+        if let ropeTreeFunc = defaultLib.makeFunction(name: "apply_rope_tree") {
+            applyRopeTreePipeline = try device.makeComputePipelineState(function: ropeTreeFunc)
+        }
+        if let compactF32Func = defaultLib.makeFunction(name: "compact_kv_cache_slots_f32") {
+            compactKvCacheSlotsF32Pipeline = try device.makeComputePipelineState(function: compactF32Func)
+        }
+        if let compactF16Func = defaultLib.makeFunction(name: "compact_kv_cache_slots_f16") {
+            compactKvCacheSlotsF16Pipeline = try device.makeComputePipelineState(function: compactF16Func)
         }
     }
 
@@ -839,9 +851,30 @@ extension InferenceEngine {
         public let targetLogitsBuffer: MTLBuffer    // [maxNodes * vocabSize] f32
         public let treeHiddenBuffer: MTLBuffer      // [maxNodes * hiddenDim] f32
         public let treeAttnOutBuffer: MTLBuffer     // [maxNodes * hiddenDim] f32
+
+        // Scratch buffers for multi-node parallel tree forward pass
+        public let treeXNorm1Buffer: MTLBuffer      // [maxNodes * hiddenDim] f32
+        public let treeQGateBuffer: MTLBuffer       // [maxNodes * maxQkvDim] f32
+        public let treeZGateBuffer: MTLBuffer       // [maxNodes * maxZDim] f32
+        public let treeAttnCtxBuffer: MTLBuffer     // [maxNodes * maxZDim] f32
+        public let treeKVectorBuffer: MTLBuffer     // [maxNodes * kvStride] f32
+        public let treeVVectorBuffer: MTLBuffer     // [maxNodes * kvStride] f32
+        public let treeAVectorBuffer: MTLBuffer     // [maxNodes * 64] f32
+        public let treeBVectorBuffer: MTLBuffer     // [maxNodes * 64] f32
+        public let treeHMidBuffer: MTLBuffer        // [maxNodes * hiddenDim] f32
+        public let treeXNorm2Buffer: MTLBuffer      // [maxNodes * hiddenDim] f32
+        public let treeInterBuffer: MTLBuffer       // [maxNodes * intermediateDim] f32
+        public let treeHMlpBuffer: MTLBuffer        // [maxNodes * hiddenDim] f32
+        public let treeRouterIndicesBuffer: MTLBuffer // [maxNodes * topK] u32
+        public let treeRouterWeightsBuffer: MTLBuffer // [maxNodes * topK] f32
+        public let treeGdnParentStateBuffer: MTLBuffer // [maxNodes * 48 * 128 * 128] f32
+        public let treeGdnOutStateBuffer: MTLBuffer    // [maxNodes * 48 * 128 * 128] f32
+
         public let maxNodes: Int
         public let vocabSize: Int
         public let hiddenDim: Int
+        public let intermediateDim: Int
+        public let kvStride: Int
     }
 
     /// Allocates shared memory buffers for JetSpec speculative tree expansion and parallel verification
@@ -849,12 +882,25 @@ extension InferenceEngine {
         device: MTLDevice,
         maxNodes: Int = 16,
         vocabSize: Int = 152064,
-        hiddenDim: Int = 4096
+        hiddenDim: Int = 4096,
+        intermediateDim: Int = 14336,
+        maxQkvDim: Int = 8192,
+        maxZDim: Int = 8192,
+        kvStride: Int = 2048,
+        topK: Int = 8
     ) -> JetSpecStagingBuffers? {
         let maskBytes = maxNodes * maxNodes * MemoryLayout<Float>.stride
         let u32Bytes = maxNodes * MemoryLayout<UInt32>.stride
         let logitsBytes = maxNodes * vocabSize * MemoryLayout<Float>.stride
         let hiddenBytes = maxNodes * hiddenDim * MemoryLayout<Float>.stride
+        let qkvBytes = maxNodes * maxQkvDim * MemoryLayout<Float>.stride
+        let zBytes = maxNodes * maxZDim * MemoryLayout<Float>.stride
+        let kvBytes = maxNodes * kvStride * MemoryLayout<Float>.stride
+        let abBytes = maxNodes * 64 * MemoryLayout<Float>.stride
+        let interBytes = maxNodes * intermediateDim * MemoryLayout<Float>.stride
+        let routerBytes = maxNodes * topK * MemoryLayout<UInt32>.stride
+        let routerWBytes = maxNodes * topK * MemoryLayout<Float>.stride
+        let gdnStateBytes = maxNodes * 48 * 128 * 128 * MemoryLayout<Float>.stride
 
         guard let maskBuf = device.makeBuffer(length: maskBytes, options: .storageModeShared),
               let tokensBuf = device.makeBuffer(length: u32Bytes, options: .storageModeShared),
@@ -863,7 +909,23 @@ extension InferenceEngine {
               let draftLogitsBuf = device.makeBuffer(length: logitsBytes, options: .storageModeShared),
               let targetLogitsBuf = device.makeBuffer(length: logitsBytes, options: .storageModeShared),
               let hiddenBuf = device.makeBuffer(length: hiddenBytes, options: .storageModeShared),
-              let attnOutBuf = device.makeBuffer(length: hiddenBytes, options: .storageModeShared) else {
+              let attnOutBuf = device.makeBuffer(length: hiddenBytes, options: .storageModeShared),
+              let xNorm1Buf = device.makeBuffer(length: hiddenBytes, options: .storageModeShared),
+              let qGateBuf = device.makeBuffer(length: qkvBytes, options: .storageModeShared),
+              let zGateBuf = device.makeBuffer(length: zBytes, options: .storageModeShared),
+              let attnCtxBuf = device.makeBuffer(length: zBytes, options: .storageModeShared),
+              let kVecBuf = device.makeBuffer(length: kvBytes, options: .storageModeShared),
+              let vVecBuf = device.makeBuffer(length: kvBytes, options: .storageModeShared),
+              let aVecBuf = device.makeBuffer(length: abBytes, options: .storageModeShared),
+              let bVecBuf = device.makeBuffer(length: abBytes, options: .storageModeShared),
+              let hMidBuf = device.makeBuffer(length: hiddenBytes, options: .storageModeShared),
+              let xNorm2Buf = device.makeBuffer(length: hiddenBytes, options: .storageModeShared),
+              let interBuf = device.makeBuffer(length: interBytes, options: .storageModeShared),
+              let hMlpBuf = device.makeBuffer(length: hiddenBytes, options: .storageModeShared),
+              let routerIdxBuf = device.makeBuffer(length: routerBytes, options: .storageModeShared),
+              let routerWBuf = device.makeBuffer(length: routerWBytes, options: .storageModeShared),
+              let gdnParentBuf = device.makeBuffer(length: gdnStateBytes, options: .storageModeShared),
+              let gdnOutBuf = device.makeBuffer(length: gdnStateBytes, options: .storageModeShared) else {
             return nil
         }
 
@@ -876,9 +938,27 @@ extension InferenceEngine {
             targetLogitsBuffer: targetLogitsBuf,
             treeHiddenBuffer: hiddenBuf,
             treeAttnOutBuffer: attnOutBuf,
+            treeXNorm1Buffer: xNorm1Buf,
+            treeQGateBuffer: qGateBuf,
+            treeZGateBuffer: zGateBuf,
+            treeAttnCtxBuffer: attnCtxBuf,
+            treeKVectorBuffer: kVecBuf,
+            treeVVectorBuffer: vVecBuf,
+            treeAVectorBuffer: aVecBuf,
+            treeBVectorBuffer: bVecBuf,
+            treeHMidBuffer: hMidBuf,
+            treeXNorm2Buffer: xNorm2Buf,
+            treeInterBuffer: interBuf,
+            treeHMlpBuffer: hMlpBuf,
+            treeRouterIndicesBuffer: routerIdxBuf,
+            treeRouterWeightsBuffer: routerWBuf,
+            treeGdnParentStateBuffer: gdnParentBuf,
+            treeGdnOutStateBuffer: gdnOutBuf,
             maxNodes: maxNodes,
             vocabSize: vocabSize,
-            hiddenDim: hiddenDim
+            hiddenDim: hiddenDim,
+            intermediateDim: intermediateDim,
+            kvStride: kvStride
         )
     }
 }
