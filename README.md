@@ -14,7 +14,6 @@ Special thanks and acknowledgement to the open-source projects and research that
 * **JetSpec** (Hao AI Lab / UC San Diego — [arXiv:2606.18394](https://arxiv.org/html/2606.18394v2)): Causal parallel tree drafting and tree-causal attention verification for breakthrough speculative decoding throughput.
 * **Flash-MoE** (https://github.com/danveloper/flash-moe) by Dan Woods: Pioneering work on MoE expert repackaging format and contiguous binary layer storage layout (`packed_experts/layer_XX.bin`). DynaMoE builds upon Flash-MoE's expert restructuring concepts to enable high-throughput asynchronous POSIX `pread` file streaming directly into shared Metal GPU buffers.
 * **Colibri** (https://github.com/JustVugg/colibri): Pioneering work on high-speed off-disk model execution.
-* **Osaurus** (https://github.com/osaurus-ai/osaurus): Local AI harness written in Swift for macOS.
 
 ---
 
