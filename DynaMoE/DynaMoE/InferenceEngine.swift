@@ -247,6 +247,8 @@ public final class InferenceEngine {
     public var gqaAttentionTreeVerifyFusedPipeline: MTLComputePipelineState?
     public var gqaAttentionTreeVerifyFusedF16Pipeline: MTLComputePipelineState?
     public var gdnLinearAttnTreeStepPipeline: MTLComputePipelineState?
+    public var gatherGdnTreeParentStatesPipeline: MTLComputePipelineState?
+    public var commitGdnTreeWinningStatePipeline: MTLComputePipelineState?
     public var applyRopeTreePipeline: MTLComputePipelineState?
     public var compactKvCacheSlotsF32Pipeline: MTLComputePipelineState?
     public var compactKvCacheSlotsF16Pipeline: MTLComputePipelineState?
@@ -501,6 +503,12 @@ public final class InferenceEngine {
         }
         if let gdnTreeStepFunc = defaultLib.makeFunction(name: "gdn_linear_attention_tree_step") {
             gdnLinearAttnTreeStepPipeline = try device.makeComputePipelineState(function: gdnTreeStepFunc)
+        }
+        if let gatherGdnFunc = defaultLib.makeFunction(name: "gather_gdn_tree_parent_states") {
+            gatherGdnTreeParentStatesPipeline = try device.makeComputePipelineState(function: gatherGdnFunc)
+        }
+        if let commitGdnFunc = defaultLib.makeFunction(name: "commit_gdn_tree_winning_state") {
+            commitGdnTreeWinningStatePipeline = try device.makeComputePipelineState(function: commitGdnFunc)
         }
         if let ropeTreeFunc = defaultLib.makeFunction(name: "apply_rope_tree") {
             applyRopeTreePipeline = try device.makeComputePipelineState(function: ropeTreeFunc)
@@ -887,6 +895,8 @@ extension InferenceEngine {
         public let hiddenDim: Int
         public let intermediateDim: Int
         public let kvStride: Int
+        public let maxLinearLayers: Int
+        public let linValHeads: Int
     }
 
     /// Allocates shared memory buffers for JetSpec speculative tree expansion and parallel verification
@@ -899,7 +909,9 @@ extension InferenceEngine {
         maxQkvDim: Int = 8192,
         maxZDim: Int = 8192,
         kvStride: Int = 2048,
-        topK: Int = 8
+        topK: Int = 8,
+        maxLinearLayers: Int = 32,
+        linValHeads: Int = 48
     ) -> JetSpecStagingBuffers? {
         let safeTopK = max(1, topK)
         let safeInterDim = max(1, intermediateDim)
@@ -914,7 +926,8 @@ extension InferenceEngine {
         let interBytes = max(16, maxNodes * safeInterDim * MemoryLayout<Float>.stride)
         let routerBytes = max(16, maxNodes * safeTopK * MemoryLayout<UInt32>.stride)
         let routerWBytes = max(16, maxNodes * safeTopK * MemoryLayout<Float>.stride)
-        let gdnStateBytes = max(16, maxNodes * 48 * 128 * 128 * MemoryLayout<Float>.stride)
+        let gdnParentBytes = max(16, maxNodes * linValHeads * 128 * 128 * MemoryLayout<Float>.stride)
+        let gdnOutStateBytes = max(16, maxLinearLayers * maxNodes * linValHeads * 128 * 128 * MemoryLayout<Float>.stride)
 
         guard let maskBuf = device.makeBuffer(length: maskBytes, options: .storageModeShared),
               let tokensBuf = device.makeBuffer(length: u32Bytes, options: .storageModeShared),
@@ -938,8 +951,8 @@ extension InferenceEngine {
               let hMlpBuf = device.makeBuffer(length: hiddenBytes, options: .storageModeShared),
               let routerIdxBuf = device.makeBuffer(length: routerBytes, options: .storageModeShared),
               let routerWBuf = device.makeBuffer(length: routerWBytes, options: .storageModeShared),
-              let gdnParentBuf = device.makeBuffer(length: gdnStateBytes, options: .storageModeShared),
-              let gdnOutBuf = device.makeBuffer(length: gdnStateBytes, options: .storageModeShared) else {
+              let gdnParentBuf = device.makeBuffer(length: gdnParentBytes, options: .storageModeShared),
+              let gdnOutBuf = device.makeBuffer(length: gdnOutStateBytes, options: .storageModeShared) else {
             return nil
         }
 
@@ -972,11 +985,11 @@ extension InferenceEngine {
             vocabSize: vocabSize,
             hiddenDim: hiddenDim,
             intermediateDim: intermediateDim,
-            kvStride: kvStride
+            kvStride: kvStride,
+            maxLinearLayers: maxLinearLayers,
+            linValHeads: linValHeads
         )
     }
 }
 
 public typealias CachedLayer = EngineCachedLayer
-
-

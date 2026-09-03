@@ -5140,6 +5140,58 @@ kernel void gqa_attention_tree_verify_fused_f16(
     }
 }
 
+/// MSL Kernel: Gather Gated DeltaNet parent recurrent states along candidate tree branches
+/// For nodes at targetDepth:
+///   If targetDepth == 0 or parent == nodeIdx, copies from baseLinearState (persistent state)
+///   Otherwise, copies from outNodeStateMatrix of parent node
+kernel void gather_gdn_tree_parent_states(
+    device const float* baseLinearState [[buffer(0)]],       // [numValHeads, 128, 128]
+    device const float* outNodeStateMatrix [[buffer(1)]],    // [numNodes, numValHeads, 128, 128] for this layer
+    device float* inParentStateMatrix [[buffer(2)]],         // [numNodes, numValHeads, 128, 128]
+    device const uint32_t* parentIndices [[buffer(3)]],      // [numNodes]
+    device const uint32_t* depths [[buffer(4)]],             // [numNodes]
+    constant uint32_t& targetDepth [[buffer(5)]],
+    constant uint32_t& numNodes [[buffer(6)]],
+    constant uint32_t& stateSizeInFloats [[buffer(7)]],      // numValHeads * headDim * headDim
+    uint2 gid [[thread_position_in_grid]]                    // (vec4Idx, nodeIdx)
+) {
+    uint nodeIdx = gid.y;
+    uint vec4Idx = gid.x;
+    if (nodeIdx >= numNodes || vec4Idx >= (stateSizeInFloats / 4)) return;
+    if (depths[nodeIdx] != targetDepth) return;
+
+    uint32_t p = parentIndices[nodeIdx];
+    device float4* dstVec4 = ((device float4*)inParentStateMatrix) + (nodeIdx * (stateSizeInFloats / 4)) + vec4Idx;
+
+    if (targetDepth == 0 || p == nodeIdx) {
+        device const float4* srcVec4 = ((device const float4*)baseLinearState) + vec4Idx;
+        dstVec4[0] = srcVec4[0];
+    } else {
+        device const float4* srcVec4 = ((device const float4*)outNodeStateMatrix) + (p * (stateSizeInFloats / 4)) + vec4Idx;
+        dstVec4[0] = srcVec4[0];
+    }
+}
+
+/// MSL Kernel: Commit winning node recurrent states to base linear state buffer
+kernel void commit_gdn_tree_winning_state(
+    device const float* outNodeStateMatrix [[buffer(0)]], // [numLinLayers, maxNodes, stateSizeInFloats]
+    device float* baseLinearState [[buffer(1)]],          // [numLinLayers, stateSizeInFloats]
+    constant uint32_t& winningNodeIdx [[buffer(2)]],
+    constant uint32_t& maxNodes [[buffer(3)]],
+    constant uint32_t& numLinLayers [[buffer(4)]],
+    constant uint32_t& stateSizeInFloats [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]                 // (vec4Idx, linIdx)
+) {
+    uint linIdx = gid.y;
+    uint vec4Idx = gid.x;
+    if (linIdx >= numLinLayers || vec4Idx >= (stateSizeInFloats / 4)) return;
+
+    uint32_t srcOffset = (linIdx * maxNodes + winningNodeIdx) * (stateSizeInFloats / 4) + vec4Idx;
+    uint32_t dstOffset = linIdx * (stateSizeInFloats / 4) + vec4Idx;
+
+    ((device float4*)baseLinearState)[dstOffset] = ((device const float4*)outNodeStateMatrix)[srcOffset];
+}
+
 /// MSL Kernel: Gated DeltaNet (GDN) Tree Recurrent Step
 /// Updates GDN state matrix along tree branches according to parent index table
 kernel void gdn_linear_attention_tree_step(
@@ -5156,16 +5208,19 @@ kernel void gdn_linear_attention_tree_step(
     constant uint64_t& aLogOffset [[buffer(10)]],
     constant uint64_t& dtBiasOffset [[buffer(11)]],
     constant uint64_t& normOffset [[buffer(12)]],
-    constant uint32_t& numValHeads [[buffer(13)]],        // 48
+    constant uint32_t& numValHeads [[buffer(13)]],        // 48 or 32
     constant uint32_t& numKeyHeads [[buffer(14)]],        // 16
     constant uint32_t& headDim [[buffer(15)]],            // 128
     constant float& eps [[buffer(16)]],                   // 1e-6
+    constant uint32_t& targetDepth [[buffer(17)]],
+    device const uint32_t* depths [[buffer(18)]],
     uint2 tgPos [[threadgroup_position_in_grid]],         // (headIdx, nodeIdx)
     uint laneId [[thread_index_in_simdgroup]]
 ) {
     uint headIdx = tgPos.x;
     uint nodeIdx = tgPos.y;
     if (headIdx >= numValHeads) return;
+    if (depths != nullptr && depths[nodeIdx] != targetDepth) return;
 
     uint32_t keyHeadIdx = headIdx / (numValHeads / numKeyHeads); // headIdx / 3
 

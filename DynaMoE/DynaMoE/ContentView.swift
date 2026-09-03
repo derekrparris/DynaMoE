@@ -7193,22 +7193,25 @@ struct ContentView: View {
             }
 
             // Allocate JetSpec Staging Buffers for Tree Drafting & Verification
-            let hasLinearAttn = cachedLayers.contains { $0.attentionType == .linearAttention }
-            let effectiveJetSpec = jetSpecEnabled && !hasLinearAttn
+            let effectiveJetSpec = jetSpecEnabled
             let effectiveInterDim = modelConfig?.intermediateSize ?? Int(cachedLayers.first?.intermediateDim ?? 14336)
             let effectiveQkvDim = Int(max(hiddenDim * 2, 8192))
             let effectiveZDim = Int(max(hiddenDim * 2, 8192))
             let effectiveTopK = max(1, Int(modelConfig?.effectiveNumExpertsPerTok ?? 8))
+            let linLayers = cachedLayers.filter { $0.attentionType == .linearAttention }.count
+            let linValHeads = max(32, modelConfig?.effectiveLinearNumValueHeads ?? 32)
             let jetspecStaging = effectiveJetSpec ? InferenceEngine.shared.allocateJetSpecBuffers(
                 device: device,
-                maxNodes: 16,
+                maxNodes: 8,
                 vocabSize: Int(vocabSize),
                 hiddenDim: Int(hiddenDim),
                 intermediateDim: effectiveInterDim,
                 maxQkvDim: effectiveQkvDim,
                 maxZDim: effectiveZDim,
                 kvStride: Int(kvStride),
-                topK: effectiveTopK
+                topK: effectiveTopK,
+                maxLinearLayers: max(1, linLayers),
+                linValHeads: linValHeads
             ) : nil
 
             // Multi-Node Parallel Tree Forward Pass (Target Backbone Execution)
@@ -7216,6 +7219,7 @@ struct ContentView: View {
                 guard let jb = jetspecStaging else { return false }
                 let N = Int(treeMask.nodeCount)
                 if N == 0 { return false }
+                let maxTreeDepth = Int(treeMask.depths.max() ?? 0)
 
                 let getRmsNormPipe = { (dtype: String) -> MTLComputePipelineState in
                     let isF16 = (dtype.contains("F16") || dtype.contains("HALF") || dtype.contains("FLOAT16")) && !dtype.contains("BF16") && !dtype.contains("BFLOAT")
@@ -7557,13 +7561,14 @@ struct ContentView: View {
                             dispatchLinear(enc: layerEnc, weight: layer.inProjB, scale: layer.inProjBScale, bias: layer.inProjBBias, inBuf: jb.treeXNorm1Buffer, outBuf: jb.treeBVectorBuffer, inDim: hiddenDim, outDim: bDim, batchSize: N)
                             layerEnc.memoryBarrier(scope: .buffers)
 
-                            if let linPipe = gdnLinearAttnStepPipeline ?? linearAttnStepPipeline,
-                               let sBuf = KVCacheManager.shared.linearStateBuffer,
+                            if let sBuf = KVCacheManager.shared.linearStateBuffer,
                                let aLog = layer.aLogTensor, let aLogRaw = buffers[aLog.shardIndex],
                                let dtBias = layer.dtBiasTensor, let dtBiasRaw = buffers[dtBias.shardIndex],
                                let linNorm = layer.linearNormTensor, let linNormRaw = buffers[linNorm.shardIndex] {
                                 let linIdx = layer.linAttnIndex
-                                let stateByteOffset = linIdx * Int(linValHeads * 128 * 128) * MemoryLayout<Float>.stride
+                                let stateFloatsPerNode = Int(linValHeads * 128 * 128)
+                                let baseStateByteOffset = linIdx * stateFloatsPerNode * MemoryLayout<Float>.stride
+                                let layerOutStateByteOffset = linIdx * jb.maxNodes * stateFloatsPerNode * MemoryLayout<Float>.stride
                                 var aLogOff = aLog.offsetStart
                                 var dtBiasOff = dtBias.offsetStart
                                 var linNormOff = linNorm.offsetStart
@@ -7571,26 +7576,53 @@ struct ContentView: View {
                                 var numKeyHeads: UInt32 = linKeyHeads
                                 var headDim: UInt32 = 128
                                 var epsVal = eps
+                                var numNodesVal = UInt32(N)
+                                var stateSizeFloats = UInt32(stateFloatsPerNode)
 
-                                layerEnc.setComputePipelineState(linPipe)
-                                layerEnc.setBuffer(jb.treeQGateBuffer, offset: 0, index: 0)
-                                layerEnc.setBuffer(jb.treeZGateBuffer, offset: 0, index: 1)
-                                layerEnc.setBuffer(jb.treeAVectorBuffer, offset: 0, index: 2)
-                                layerEnc.setBuffer(jb.treeBVectorBuffer, offset: 0, index: 3)
-                                layerEnc.setBuffer(aLogRaw, offset: 0, index: 4)
-                                layerEnc.setBuffer(dtBiasRaw, offset: 0, index: 5)
-                                layerEnc.setBuffer(linNormRaw, offset: 0, index: 6)
-                                layerEnc.setBuffer(sBuf, offset: stateByteOffset, index: 7)
-                                layerEnc.setBuffer(jb.treeAttnCtxBuffer, offset: 0, index: 8)
-                                layerEnc.setBytes(&aLogOff, length: MemoryLayout<UInt64>.stride, index: 9)
-                                layerEnc.setBytes(&dtBiasOff, length: MemoryLayout<UInt64>.stride, index: 10)
-                                layerEnc.setBytes(&linNormOff, length: MemoryLayout<UInt64>.stride, index: 11)
-                                layerEnc.setBytes(&numValHeads, length: MemoryLayout<UInt32>.stride, index: 12)
-                                layerEnc.setBytes(&numKeyHeads, length: MemoryLayout<UInt32>.stride, index: 13)
-                                layerEnc.setBytes(&headDim, length: MemoryLayout<UInt32>.stride, index: 14)
-                                layerEnc.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 15)
-                                layerEnc.dispatchThreadgroups(MTLSize(width: Int(linValHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-                                layerEnc.memoryBarrier(scope: .buffers)
+                                for d in 0...maxTreeDepth {
+                                    var dVal = UInt32(d)
+                                    // 1. Gather parent states for candidate nodes at depth d
+                                    if let gatherPipe = InferenceEngine.shared.gatherGdnTreeParentStatesPipeline {
+                                        layerEnc.setComputePipelineState(gatherPipe)
+                                        layerEnc.setBuffer(sBuf, offset: baseStateByteOffset, index: 0)
+                                        layerEnc.setBuffer(jb.treeGdnOutStateBuffer, offset: layerOutStateByteOffset, index: 1)
+                                        layerEnc.setBuffer(jb.treeGdnParentStateBuffer, offset: 0, index: 2)
+                                        layerEnc.setBuffer(jb.parentIndicesBuffer, offset: 0, index: 3)
+                                        layerEnc.setBuffer(jb.depthsBuffer, offset: 0, index: 4)
+                                        layerEnc.setBytes(&dVal, length: MemoryLayout<UInt32>.stride, index: 5)
+                                        layerEnc.setBytes(&numNodesVal, length: MemoryLayout<UInt32>.stride, index: 6)
+                                        layerEnc.setBytes(&stateSizeFloats, length: MemoryLayout<UInt32>.stride, index: 7)
+                                        let vec4Count = Int(stateSizeFloats / 4)
+                                        layerEnc.dispatchThreads(MTLSize(width: vec4Count, height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, gatherPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                        layerEnc.memoryBarrier(scope: .buffers)
+                                    }
+
+                                    // 2. Compute tree step for candidate nodes at depth d
+                                    if let treeStepPipe = InferenceEngine.shared.gdnLinearAttnTreeStepPipeline {
+                                        layerEnc.setComputePipelineState(treeStepPipe)
+                                        layerEnc.setBuffer(jb.treeQGateBuffer, offset: 0, index: 0)
+                                        layerEnc.setBuffer(jb.treeZGateBuffer, offset: 0, index: 1)
+                                        layerEnc.setBuffer(jb.treeAVectorBuffer, offset: 0, index: 2)
+                                        layerEnc.setBuffer(jb.treeBVectorBuffer, offset: 0, index: 3)
+                                        layerEnc.setBuffer(aLogRaw, offset: 0, index: 4)
+                                        layerEnc.setBuffer(dtBiasRaw, offset: 0, index: 5)
+                                        layerEnc.setBuffer(linNormRaw, offset: 0, index: 6)
+                                        layerEnc.setBuffer(jb.treeGdnParentStateBuffer, offset: 0, index: 7)
+                                        layerEnc.setBuffer(jb.treeGdnOutStateBuffer, offset: layerOutStateByteOffset, index: 8)
+                                        layerEnc.setBuffer(jb.treeAttnCtxBuffer, offset: 0, index: 9)
+                                        layerEnc.setBytes(&aLogOff, length: MemoryLayout<UInt64>.stride, index: 10)
+                                        layerEnc.setBytes(&dtBiasOff, length: MemoryLayout<UInt64>.stride, index: 11)
+                                        layerEnc.setBytes(&linNormOff, length: MemoryLayout<UInt64>.stride, index: 12)
+                                        layerEnc.setBytes(&numValHeads, length: MemoryLayout<UInt32>.stride, index: 13)
+                                        layerEnc.setBytes(&numKeyHeads, length: MemoryLayout<UInt32>.stride, index: 14)
+                                        layerEnc.setBytes(&headDim, length: MemoryLayout<UInt32>.stride, index: 15)
+                                        layerEnc.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 16)
+                                        layerEnc.setBytes(&dVal, length: MemoryLayout<UInt32>.stride, index: 17)
+                                        layerEnc.setBuffer(jb.depthsBuffer, offset: 0, index: 18)
+                                        layerEnc.dispatchThreadgroups(MTLSize(width: Int(linValHeads), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                        layerEnc.memoryBarrier(scope: .buffers)
+                                    }
+                                }
                             }
 
                             let linAttnCtxDim = linValHeads * 128
@@ -8005,7 +8037,7 @@ struct ContentView: View {
                     draftScores: topDraftScores,
                     depth: UInt32(jetSpecMaxDepth),
                     branchingFactor: UInt32(jetSpecBranchingFactor),
-                    maxNodes: 16
+                    maxNodes: UInt32(jb.maxNodes)
                 )
 
                 let nodeCount = treeMask.nodeCount
@@ -8068,6 +8100,34 @@ struct ContentView: View {
                         copyCmd.commit()
                         copyCmd.waitUntilCompleted()
                     }
+                }
+
+                // 6.5 Commit winning node linear attention recurrent states to linearStateBuffer
+                let winningNodeIdx = acceptedResult.acceptedNodeIndices.last ?? 0
+                let linLayerCount = UInt32(cachedLayers.filter { $0.attentionType == .linearAttention }.count)
+                if linLayerCount > 0,
+                   let sBuf = KVCacheManager.shared.linearStateBuffer,
+                   let commitPipe = InferenceEngine.shared.commitGdnTreeWinningStatePipeline,
+                   let commitCmd = commandQueue.makeCommandBuffer(),
+                   let commitEnc = commitCmd.makeComputeCommandEncoder() {
+                    var winNode = UInt32(winningNodeIdx)
+                    var maxN = UInt32(jb.maxNodes)
+                    var numLin = linLayerCount
+                    var stateSizeFloats = UInt32(jb.linValHeads * 128 * 128)
+
+                    commitEnc.setComputePipelineState(commitPipe)
+                    commitEnc.setBuffer(jb.treeGdnOutStateBuffer, offset: 0, index: 0)
+                    commitEnc.setBuffer(sBuf, offset: 0, index: 1)
+                    commitEnc.setBytes(&winNode, length: MemoryLayout<UInt32>.stride, index: 2)
+                    commitEnc.setBytes(&maxN, length: MemoryLayout<UInt32>.stride, index: 3)
+                    commitEnc.setBytes(&numLin, length: MemoryLayout<UInt32>.stride, index: 4)
+                    commitEnc.setBytes(&stateSizeFloats, length: MemoryLayout<UInt32>.stride, index: 5)
+
+                    let vec4Count = Int(stateSizeFloats / 4)
+                    commitEnc.dispatchThreads(MTLSize(width: vec4Count, height: Int(numLin), depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, commitPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                    commitEnc.endEncoding()
+                    commitCmd.commit()
+                    commitCmd.waitUntilCompleted()
                 }
 
                 // 7. Copy winning node logits into logitsBuffer for next token sampling

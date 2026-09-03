@@ -2052,6 +2052,9 @@ final class DynaMoETests: XCTestCase {
         XCTAssertNotNil(engine.compactKvCacheSlotsF32Pipeline, "compactKvCacheSlotsF32Pipeline failed to initialize")
         XCTAssertNotNil(engine.compactKvCacheSlotsF16Pipeline, "compactKvCacheSlotsF16Pipeline failed to initialize")
         XCTAssertNotNil(engine.gqaAttentionTreeVerifyStandardPipeline, "gqaAttentionTreeVerifyStandardPipeline failed to initialize")
+        XCTAssertNotNil(engine.gdnLinearAttnTreeStepPipeline, "gdnLinearAttnTreeStepPipeline failed to initialize")
+        XCTAssertNotNil(engine.gatherGdnTreeParentStatesPipeline, "gatherGdnTreeParentStatesPipeline failed to initialize")
+        XCTAssertNotNil(engine.commitGdnTreeWinningStatePipeline, "commitGdnTreeWinningStatePipeline failed to initialize")
 
         // Test KV Slot Compaction GPU Kernel (FP32)
         let kvStride: UInt32 = 128
@@ -2525,6 +2528,200 @@ final class DynaMoETests: XCTestCase {
         if let staging = stagingZeroInter {
             XCTAssertGreaterThan(staging.treeInterBuffer.length, 0)
         }
+    }
+
+    func testJetSpecOrnith9BGatedDeltaNetTreeAcceleration() throws {
+        print("=== TEST JETSPEC GATED DELTANET TREE ACCELERATION & STATE COMMIT ===")
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let cmdQueue = device.makeCommandQueue() else {
+            throw XCTSkip("Metal not supported on this device")
+        }
+
+        let engine = InferenceEngine.shared
+        try engine.initializePipelines(device: device)
+
+        guard let gatherPipe = engine.gatherGdnTreeParentStatesPipeline,
+              let commitPipe = engine.commitGdnTreeWinningStatePipeline else {
+            XCTFail("GDN Tree pipelines not initialized")
+            return
+        }
+
+        // Test setup: 4 tree nodes across 3 depths:
+        // Node 0: Root (depth 0, parent 0)
+        // Node 1: Child of 0 (depth 1, parent 0)
+        // Node 2: Child of 0 (depth 1, parent 0)
+        // Node 3: Child of 1 (depth 2, parent 1)
+        let numNodes: UInt32 = 4
+        let numLinLayers: UInt32 = 2
+        let numValHeads: UInt32 = 2
+        let headDim: UInt32 = 128
+        let stateFloatsPerNode = Int(numValHeads * headDim * headDim) // 32768 floats
+        let stateBytesPerNode = stateFloatsPerNode * MemoryLayout<Float>.stride
+
+        // 1. Base persistent state buffer: [numLinLayers, stateFloatsPerNode]
+        let baseStateBuf = device.makeBuffer(length: Int(numLinLayers) * stateBytesPerNode, options: .storageModeShared)!
+        let basePtr = baseStateBuf.contents().bindMemory(to: Float.self, capacity: Int(numLinLayers) * stateFloatsPerNode)
+        for i in 0..<stateFloatsPerNode {
+            basePtr[i] = 1.0 // Layer 0 base state
+            basePtr[stateFloatsPerNode + i] = 2.0 // Layer 1 base state
+        }
+
+        // 2. Tree out state buffer: [numLinLayers, numNodes, stateFloatsPerNode]
+        let treeOutBuf = device.makeBuffer(length: Int(numLinLayers * numNodes) * stateBytesPerNode, options: .storageModeShared)!
+        let treeOutPtr = treeOutBuf.contents().bindMemory(to: Float.self, capacity: Int(numLinLayers * numNodes) * stateFloatsPerNode)
+        treeOutPtr.initialize(repeating: 0.0, count: Int(numLinLayers * numNodes) * stateFloatsPerNode)
+
+        // 3. Tree parent state scratch buffer: [numNodes, stateFloatsPerNode] (for 1 layer)
+        let parentStateBuf = device.makeBuffer(length: Int(numNodes) * stateBytesPerNode, options: .storageModeShared)!
+        let parentStatePtr = parentStateBuf.contents().bindMemory(to: Float.self, capacity: Int(numNodes) * stateFloatsPerNode)
+        parentStatePtr.initialize(repeating: 0.0, count: Int(numNodes) * stateFloatsPerNode)
+
+        // 4. Tree topology buffers
+        let parentIndicesBuf = device.makeBuffer(length: Int(numNodes) * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
+        let depthsBuf = device.makeBuffer(length: Int(numNodes) * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
+        let pPtr = parentIndicesBuf.contents().bindMemory(to: UInt32.self, capacity: Int(numNodes))
+        let dPtr = depthsBuf.contents().bindMemory(to: UInt32.self, capacity: Int(numNodes))
+        pPtr[0] = 0; dPtr[0] = 0 // Root
+        pPtr[1] = 0; dPtr[1] = 1 // Node 1 -> parent 0
+        pPtr[2] = 0; dPtr[2] = 1 // Node 2 -> parent 0
+        pPtr[3] = 1; dPtr[3] = 2 // Node 3 -> parent 1
+
+        var stateFloatsU32 = UInt32(stateFloatsPerNode)
+        let vec4Count = Int(stateFloatsU32 / 4)
+
+        // Depth 0: Gather root parent state from baseStateBuf (layer 0)
+        do {
+            var targetD: UInt32 = 0
+            var nVal = numNodes
+            guard let cmd = cmdQueue.makeCommandBuffer(),
+                  let enc = cmd.makeComputeCommandEncoder() else {
+                XCTFail("Failed to make encoder")
+                return
+            }
+            enc.setComputePipelineState(gatherPipe)
+            enc.setBuffer(baseStateBuf, offset: 0, index: 0)
+            enc.setBuffer(treeOutBuf, offset: 0, index: 1)
+            enc.setBuffer(parentStateBuf, offset: 0, index: 2)
+            enc.setBuffer(parentIndicesBuf, offset: 0, index: 3)
+            enc.setBuffer(depthsBuf, offset: 0, index: 4)
+            enc.setBytes(&targetD, length: MemoryLayout<UInt32>.stride, index: 5)
+            enc.setBytes(&nVal, length: MemoryLayout<UInt32>.stride, index: 6)
+            enc.setBytes(&stateFloatsU32, length: MemoryLayout<UInt32>.stride, index: 7)
+            enc.dispatchThreads(MTLSize(width: vec4Count, height: Int(numNodes), depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, gatherPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            enc.endEncoding()
+            cmd.commit()
+            cmd.waitUntilCompleted()
+
+            // Verify Node 0 gathered base state (1.0)
+            XCTAssertEqual(parentStatePtr[0], 1.0, "Node 0 must gather base state")
+            // Node 1 should not have been updated at depth 0
+            XCTAssertEqual(parentStatePtr[1 * stateFloatsPerNode], 0.0)
+        }
+
+        // Simulate Node 0 executing and producing output state 42.0
+        for i in 0..<stateFloatsPerNode {
+            treeOutPtr[0 * stateFloatsPerNode + i] = 42.0
+        }
+
+        // Depth 1: Gather parent states for nodes 1 & 2 (parent is 0)
+        do {
+            var targetD: UInt32 = 1
+            var nVal = numNodes
+            guard let cmd = cmdQueue.makeCommandBuffer(),
+                  let enc = cmd.makeComputeCommandEncoder() else {
+                XCTFail("Failed to make encoder")
+                return
+            }
+            enc.setComputePipelineState(gatherPipe)
+            enc.setBuffer(baseStateBuf, offset: 0, index: 0)
+            enc.setBuffer(treeOutBuf, offset: 0, index: 1)
+            enc.setBuffer(parentStateBuf, offset: 0, index: 2)
+            enc.setBuffer(parentIndicesBuf, offset: 0, index: 3)
+            enc.setBuffer(depthsBuf, offset: 0, index: 4)
+            enc.setBytes(&targetD, length: MemoryLayout<UInt32>.stride, index: 5)
+            enc.setBytes(&nVal, length: MemoryLayout<UInt32>.stride, index: 6)
+            enc.setBytes(&stateFloatsU32, length: MemoryLayout<UInt32>.stride, index: 7)
+            enc.dispatchThreads(MTLSize(width: vec4Count, height: Int(numNodes), depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, gatherPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            enc.endEncoding()
+            cmd.commit()
+            cmd.waitUntilCompleted()
+
+            // Verify Nodes 1 and 2 received parent Node 0's state (42.0)
+            XCTAssertEqual(parentStatePtr[1 * stateFloatsPerNode], 42.0, "Node 1 must inherit Node 0's state")
+            XCTAssertEqual(parentStatePtr[2 * stateFloatsPerNode], 42.0, "Node 2 must inherit Node 0's state")
+            // Node 3 should not have updated at depth 1
+            XCTAssertEqual(parentStatePtr[3 * stateFloatsPerNode], 0.0)
+        }
+
+        // Simulate Node 1 executing and producing output state 99.0
+        for i in 0..<stateFloatsPerNode {
+            treeOutPtr[1 * stateFloatsPerNode + i] = 99.0
+        }
+
+        // Depth 2: Gather parent state for Node 3 (parent is 1)
+        do {
+            var targetD: UInt32 = 2
+            var nVal = numNodes
+            guard let cmd = cmdQueue.makeCommandBuffer(),
+                  let enc = cmd.makeComputeCommandEncoder() else {
+                XCTFail("Failed to make encoder")
+                return
+            }
+            enc.setComputePipelineState(gatherPipe)
+            enc.setBuffer(baseStateBuf, offset: 0, index: 0)
+            enc.setBuffer(treeOutBuf, offset: 0, index: 1)
+            enc.setBuffer(parentStateBuf, offset: 0, index: 2)
+            enc.setBuffer(parentIndicesBuf, offset: 0, index: 3)
+            enc.setBuffer(depthsBuf, offset: 0, index: 4)
+            enc.setBytes(&targetD, length: MemoryLayout<UInt32>.stride, index: 5)
+            enc.setBytes(&nVal, length: MemoryLayout<UInt32>.stride, index: 6)
+            enc.setBytes(&stateFloatsU32, length: MemoryLayout<UInt32>.stride, index: 7)
+            enc.dispatchThreads(MTLSize(width: vec4Count, height: Int(numNodes), depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, gatherPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            enc.endEncoding()
+            cmd.commit()
+            cmd.waitUntilCompleted()
+
+            // Verify Node 3 received parent Node 1's state (99.0)
+            XCTAssertEqual(parentStatePtr[3 * stateFloatsPerNode], 99.0, "Node 3 must inherit Node 1's state")
+        }
+
+        // 5. Test Winning Branch State Commit Kernel
+        // Simulate Node 3 winning across both linear layers:
+        // Layer 0, Node 3 output: 555.0
+        // Layer 1, Node 3 output: 777.0
+        let layer1Base = Int(numNodes) * stateFloatsPerNode
+        for i in 0..<stateFloatsPerNode {
+            treeOutPtr[3 * stateFloatsPerNode + i] = 555.0
+            treeOutPtr[layer1Base + 3 * stateFloatsPerNode + i] = 777.0
+        }
+
+        do {
+            var winningNode: UInt32 = 3
+            var maxN: UInt32 = numNodes
+            var numLin: UInt32 = numLinLayers
+            guard let cmd = cmdQueue.makeCommandBuffer(),
+                  let enc = cmd.makeComputeCommandEncoder() else {
+                XCTFail("Failed to make commit encoder")
+                return
+            }
+            enc.setComputePipelineState(commitPipe)
+            enc.setBuffer(treeOutBuf, offset: 0, index: 0)
+            enc.setBuffer(baseStateBuf, offset: 0, index: 1)
+            enc.setBytes(&winningNode, length: MemoryLayout<UInt32>.stride, index: 2)
+            enc.setBytes(&maxN, length: MemoryLayout<UInt32>.stride, index: 3)
+            enc.setBytes(&numLin, length: MemoryLayout<UInt32>.stride, index: 4)
+            enc.setBytes(&stateFloatsU32, length: MemoryLayout<UInt32>.stride, index: 5)
+            enc.dispatchThreads(MTLSize(width: vec4Count, height: Int(numLinLayers), depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, commitPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            enc.endEncoding()
+            cmd.commit()
+            cmd.waitUntilCompleted()
+
+            // Verify baseStateBuf committed winning Node 3's states for both layers
+            XCTAssertEqual(basePtr[0], 555.0, "Base state layer 0 must be updated to winning Node 3 state")
+            XCTAssertEqual(basePtr[stateFloatsPerNode], 777.0, "Base state layer 1 must be updated to winning Node 3 state")
+        }
+
+        print("✅ [TEST] Gated DeltaNet tree recurrence & state commit kernels verified successfully.")
     }
 
     func testOrnith9BStep0Diagnostics() throws {
