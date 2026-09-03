@@ -645,6 +645,7 @@ struct ContentView: View {
     @State private var repetitionPenalty: Float = 1.1
     @State private var presencePenalty: Float = 0.0
     @AppStorage("dynamoe_max_tokens") private var maxNewTokens: Int = 8192
+    @State private var activeProfile: ModelProfileType = .coder
     @State private var isGeneratingText: Bool = false
     @State private var generatedStreamText: String = ""
     @State private var thinkingText: String = ""
@@ -811,6 +812,45 @@ struct ContentView: View {
         summary?.tensors.first(where: { $0.name == selectedTensorID })
     }
 
+    private func applyProfile(_ profile: ModelProfileType, for modelIdentifier: String? = nil) {
+        let modelKey = modelIdentifier ?? activeModelDisplayName ?? localModelManager.defaultModelId
+        let settings = ModelProfileManager.shared.getProfile(for: modelKey, type: profile)
+        self.activeProfile = profile
+        ModelProfileManager.shared.setActiveProfile(for: modelKey, type: profile)
+
+        self.temperature = settings.temperature
+        self.topP = settings.topP
+        self.minP = settings.minP
+        self.topK = settings.topK
+        self.repetitionPenalty = settings.repetitionPenalty
+        self.presencePenalty = settings.presencePenalty
+        self.maxNewTokens = settings.maxNewTokens
+        self.systemPrompt = settings.systemPrompt
+        self.jetSpecEnabled = settings.jetSpecEnabled
+        self.jetSpecMaxDepth = settings.jetSpecMaxDepth
+        self.jetSpecBranchingFactor = settings.jetSpecBranchingFactor
+        self.jetSpecMaxExpertCap = settings.jetSpecMaxExpertCap
+    }
+
+    private func saveCurrentSettingsToProfile(_ profile: ModelProfileType, for modelIdentifier: String? = nil) {
+        let modelKey = modelIdentifier ?? activeModelDisplayName ?? localModelManager.defaultModelId
+        let settings = GenerationProfileSettings(
+            temperature: self.temperature,
+            topP: self.topP,
+            minP: self.minP,
+            topK: self.topK,
+            repetitionPenalty: self.repetitionPenalty,
+            presencePenalty: self.presencePenalty,
+            maxNewTokens: self.maxNewTokens,
+            systemPrompt: self.systemPrompt,
+            jetSpecEnabled: self.jetSpecEnabled,
+            jetSpecMaxDepth: self.jetSpecMaxDepth,
+            jetSpecBranchingFactor: self.jetSpecBranchingFactor,
+            jetSpecMaxExpertCap: self.jetSpecMaxExpertCap
+        )
+        ModelProfileManager.shared.saveProfile(for: modelKey, type: profile, settings: settings)
+    }
+
     private func switchModel(to model: DiscoveredModel) {
         loadAndBridgeToMetal(filePath: model.snapshotPath)
         activeLoadedModelPath = model.snapshotPath
@@ -821,6 +861,8 @@ struct ContentView: View {
             sessions[idx].selectedModelName = model.displayName
             sessions[idx].selectedModelPath = model.snapshotPath
         }
+        let preferredProfile = ModelProfileManager.shared.getActiveProfile(for: model.id)
+        applyProfile(preferredProfile, for: model.id)
     }
 
     var body: some View {
@@ -879,6 +921,10 @@ struct ContentView: View {
                     jetSpecDraftAccepted: jetSpecTotalDraftAccepted,
                     modelName: activeModelDisplayName,
                     tokenizer: tokenizer,
+                    activeProfile: activeProfile,
+                    onSelectProfile: { profile in
+                        applyProfile(profile, for: activeLoadedModelPath ?? localModelManager.defaultModelId)
+                    },
                     supportsThinking: activeModelSupportsThinking,
                     isThinkingEnabled: isThinkingEnabledForActiveSession,
                     isAgentToolsEnabled: isAgentToolsEnabledForActiveSession,
@@ -971,6 +1017,9 @@ struct ContentView: View {
                 if let initialModel = localModelManager.getDefaultOrFirstModel() {
                     switchModel(to: initialModel)
                 }
+            } else {
+                let initialProfile = ModelProfileManager.shared.getActiveProfile(for: activeLoadedModelPath ?? localModelManager.defaultModelId)
+                applyProfile(initialProfile, for: activeLoadedModelPath ?? localModelManager.defaultModelId)
             }
             updatePagingStats()
         }
@@ -982,6 +1031,8 @@ struct ContentView: View {
                 } else {
                     loadAndBridgeToMetal(filePath: targetPath)
                     activeLoadedModelPath = targetPath
+                    let preferredProfile = ModelProfileManager.shared.getActiveProfile(for: targetPath)
+                    applyProfile(preferredProfile, for: targetPath)
                 }
             }
         }
@@ -1029,6 +1080,7 @@ struct ContentView: View {
             maxNewTokens: $maxNewTokens,
             systemPrompt: $systemPrompt,
             targetLayerCount: $targetLayerCount,
+            activeProfile: $activeProfile,
             memoryExecutionMode: $memoryExecutionMode,
             memoryBudgetMode: $memoryBudgetMode,
             kvCachePrecision: kvCachePrecisionBinding,

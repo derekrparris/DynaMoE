@@ -3826,6 +3826,80 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(logitsPtr[1000], 20.0, "Original logit 1000 must be restored cleanly by defer")
         print("  ✅ [TEST] Presence penalty (1.00) suppression and defer logit restoration verified.")
     }
+
+    func testModelSpecificProfilesCoderAndAssistant() throws {
+        let manager = ModelProfileManager.shared
+        let testOrnithId = "mlx-community/Ornith-1.5-9B-OptiQ-4bit"
+        let testQwenId = "Qwen/Qwen3.8-Flash-Next-FP8"
+
+        // Ensure clean test isolation
+        manager.resetProfile(for: testOrnithId, type: .coder)
+        manager.resetProfile(for: testOrnithId, type: .assistant)
+        manager.resetProfile(for: testQwenId, type: .coder)
+        manager.resetProfile(for: testQwenId, type: .assistant)
+
+        defer {
+            manager.resetProfile(for: testOrnithId, type: .coder)
+            manager.resetProfile(for: testOrnithId, type: .assistant)
+            manager.resetProfile(for: testQwenId, type: .coder)
+            manager.resetProfile(for: testQwenId, type: .assistant)
+        }
+
+        // 1. Verify default Coder and Assistant profiles for Ornith
+        let defaultOrnithCoder = manager.getProfile(for: testOrnithId, type: .coder)
+        let defaultOrnithAssistant = manager.getProfile(for: testOrnithId, type: .assistant)
+
+        XCTAssertEqual(defaultOrnithCoder.temperature, 0.60, accuracy: 0.01)
+        XCTAssertEqual(defaultOrnithCoder.topP, 0.95, accuracy: 0.01)
+        XCTAssertEqual(defaultOrnithCoder.topK, 20)
+        XCTAssertEqual(defaultOrnithCoder.maxNewTokens, 8192)
+        XCTAssertFalse(defaultOrnithCoder.jetSpecEnabled, "Ornith linear recurrence must disable JetSpec by default")
+        XCTAssertTrue(defaultOrnithCoder.systemPrompt.contains("software engineer") || defaultOrnithCoder.systemPrompt.contains("programming"))
+
+        XCTAssertEqual(defaultOrnithAssistant.temperature, 0.70, accuracy: 0.01)
+        XCTAssertEqual(defaultOrnithAssistant.topP, 0.90, accuracy: 0.01)
+        XCTAssertEqual(defaultOrnithAssistant.minP, 0.05, accuracy: 0.01)
+        XCTAssertEqual(defaultOrnithAssistant.topK, 50)
+        XCTAssertEqual(defaultOrnithAssistant.maxNewTokens, 4096)
+        XCTAssertTrue(defaultOrnithAssistant.systemPrompt.contains("helpful") || defaultOrnithAssistant.systemPrompt.contains("assistant"))
+
+        // 2. Modify and Save Custom Settings for Ornith Coder
+        var customOrnithCoder = defaultOrnithCoder
+        customOrnithCoder.temperature = 0.25
+        customOrnithCoder.presencePenalty = 0.50
+        customOrnithCoder.repetitionPenalty = 1.05
+        customOrnithCoder.maxNewTokens = 10000
+        customOrnithCoder.systemPrompt = "Specialized Metal Coder"
+        manager.saveProfile(for: testOrnithId, type: .coder, settings: customOrnithCoder)
+
+        // 3. Verify Ornith Coder was persisted and retrieved
+        let reloadedOrnithCoder = manager.getProfile(for: testOrnithId, type: .coder)
+        XCTAssertEqual(reloadedOrnithCoder.temperature, 0.25, accuracy: 0.01)
+        XCTAssertEqual(reloadedOrnithCoder.presencePenalty, 0.50, accuracy: 0.01)
+        XCTAssertEqual(reloadedOrnithCoder.repetitionPenalty, 1.05, accuracy: 0.01)
+        XCTAssertEqual(reloadedOrnithCoder.maxNewTokens, 10000)
+        XCTAssertEqual(reloadedOrnithCoder.systemPrompt, "Specialized Metal Coder")
+
+        // 4. Verify Ornith Assistant was NOT overwritten or mutated
+        let reloadedOrnithAssistant = manager.getProfile(for: testOrnithId, type: .assistant)
+        XCTAssertEqual(reloadedOrnithAssistant.temperature, 0.70, accuracy: 0.01)
+        XCTAssertEqual(reloadedOrnithAssistant.maxNewTokens, 4096)
+
+        // 5. Verify Qwen profiles remain isolated from Ornith customization
+        let defaultQwenCoder = manager.getProfile(for: testQwenId, type: .coder)
+        XCTAssertEqual(defaultQwenCoder.temperature, 0.60, accuracy: 0.01)
+        XCTAssertNotEqual(defaultQwenCoder.systemPrompt, "Specialized Metal Coder")
+
+        // 6. Test Active Profile Selection per Model
+        manager.setActiveProfile(for: testOrnithId, type: .coder)
+        XCTAssertEqual(manager.getActiveProfile(for: testOrnithId), .coder)
+
+        manager.setActiveProfile(for: testQwenId, type: .assistant)
+        XCTAssertEqual(manager.getActiveProfile(for: testQwenId), .assistant)
+        XCTAssertEqual(manager.getActiveProfile(for: testOrnithId), .coder, "Model active profile states must be isolated")
+
+        print("  ✅ [TEST] Model-specific Coder & Assistant profiles fully verified with persistence and isolation.")
+    }
 }
 
 

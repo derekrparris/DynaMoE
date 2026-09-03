@@ -45,6 +45,13 @@ struct SettingsSheetView: View {
     @AppStorage("dynamoe_jetspec_branching") private var jetSpecBranchingFactor: Int = 2
     @AppStorage("dynamoe_jetspec_expert_cap") private var jetSpecMaxExpertCap: Int = 8
 
+    // Model Profile Management State
+    @ObservedObject private var profileManager = ModelProfileManager.shared
+    @State private var selectedModelForProfiles: String? = nil
+    @State private var inspectingProfileType: ModelProfileType = .coder
+    @State private var editingDraft: GenerationProfileSettings = GenerationProfileSettings.defaultFor(type: .coder)
+    @State private var profileFeedbackText: String? = nil
+
     // Model & Tokenizer bindings
     var summary: ModelSummary?
     var modelConfig: ModelConfig? = nil
@@ -66,6 +73,7 @@ struct SettingsSheetView: View {
     @Binding var maxNewTokens: Int
     @Binding var systemPrompt: String
     @Binding var targetLayerCount: Int
+    @Binding var activeProfile: ModelProfileType
 
     // Memory & Working Set bindings
     @Binding var memoryExecutionMode: MemoryExecutionMode
@@ -232,7 +240,8 @@ struct SettingsSheetView: View {
                         let isDefault = localModelManager.defaultModelId == model.id || localModelManager.defaultModelId == model.repoId
                         let isCurrentActive = (activeModelPath != nil && (activeModelPath == model.snapshotPath || activeModelPath == model.weightsEntryPath || (summary != nil && (modelConfig?.modelType ?? "").localizedCaseInsensitiveContains(model.displayName))))
 
-                        HStack(alignment: .center, spacing: 14) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(alignment: .center, spacing: 14) {
                             // Leading Model Icon
                             ZStack {
                                 RoundedRectangle(cornerRadius: 10)
@@ -376,6 +385,32 @@ struct SettingsSheetView: View {
                                 .buttonStyle(.plain)
                                 .help("Make this model load by default for all new conversations")
 
+                                Button(action: {
+                                    withAnimation(.easeInOut(duration: 0.2)) {
+                                        if selectedModelForProfiles == model.id {
+                                            selectedModelForProfiles = nil
+                                        } else {
+                                            selectedModelForProfiles = model.id
+                                            loadProfileDraft(modelId: model.id, type: inspectingProfileType)
+                                        }
+                                    }
+                                }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: selectedModelForProfiles == model.id ? "slider.horizontal.3" : "slider.horizontal.2.square")
+                                            .font(.system(size: 11))
+                                            .foregroundColor(.purple)
+                                        Text("Profiles")
+                                            .font(.caption)
+                                            .fontWeight(selectedModelForProfiles == model.id ? .semibold : .regular)
+                                    }
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 5)
+                                    .background(selectedModelForProfiles == model.id ? Color.purple.opacity(0.18) : Color.purple.opacity(0.08))
+                                    .cornerRadius(6)
+                                }
+                                .buttonStyle(.plain)
+                                .help("Configure Coder and Assistant generation profiles for \(model.displayName)")
+
                                 if isCurrentActive {
                                     HStack(spacing: 4) {
                                         Image(systemName: "checkmark.circle.fill")
@@ -402,14 +437,19 @@ struct SettingsSheetView: View {
                                 }
                             }
                         }
-                        .padding(12)
-                        .background(Color(NSColor.controlBackgroundColor))
-                        .cornerRadius(10)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 10)
-                                .stroke(isCurrentActive ? Color.purple.opacity(0.3) : Color.primary.opacity(0.06), lineWidth: 1)
-                        )
+                        if selectedModelForProfiles == model.id {
+                            modelProfileEditorSection(for: model)
+                                .transition(.opacity.combined(with: .move(edge: .top)))
+                        }
                     }
+                    .padding(12)
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(10)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(selectedModelForProfiles == model.id ? Color.purple.opacity(0.4) : (isCurrentActive ? Color.purple.opacity(0.3) : Color.primary.opacity(0.06)), lineWidth: selectedModelForProfiles == model.id ? 1.5 : 1)
+                    )
+                }
                 }
             }
 
@@ -487,6 +527,78 @@ struct SettingsSheetView: View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Inference & Sampling Parameters")
                 .font(.headline)
+
+            // Active Profile Banner
+            HStack(spacing: 12) {
+                Image(systemName: activeProfile.icon)
+                    .font(.system(size: 20))
+                    .foregroundColor(.purple)
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text("Active Profile: \(activeProfile.rawValue)")
+                            .font(.system(size: 13, weight: .bold))
+                        if let path = activeModelPath,
+                           let model = localModelManager.discoveredModels.first(where: { $0.snapshotPath == path || $0.weightsEntryPath == path }) {
+                            Text("• \(model.displayName)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        } else if let modelType = modelConfig?.modelType {
+                            Text("• \(modelType)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        } else {
+                            Text("• \(detectedArchitecture.rawValue)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    Text(activeProfile.description)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+
+                Spacer()
+
+                Picker("Profile", selection: $activeProfile) {
+                    ForEach(ModelProfileType.allCases) { profile in
+                        Label(profile.rawValue, systemImage: profile.icon).tag(profile)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 220)
+                .onChange(of: activeProfile) { newProfile in
+                    let modelKey = activeModelPath ?? localModelManager.defaultModelId
+                    let settings = profileManager.getProfile(for: modelKey, type: newProfile)
+                    temperature = settings.temperature
+                    topP = settings.topP
+                    minP = settings.minP
+                    topK = settings.topK
+                    repetitionPenalty = settings.repetitionPenalty
+                    presencePenalty = settings.presencePenalty
+                    maxNewTokens = settings.maxNewTokens
+                    systemPrompt = settings.systemPrompt
+                    jetSpecEnabled = settings.jetSpecEnabled
+                    jetSpecMaxDepth = settings.jetSpecMaxDepth
+                    jetSpecBranchingFactor = settings.jetSpecBranchingFactor
+                    jetSpecMaxExpertCap = settings.jetSpecMaxExpertCap
+                    profileManager.setActiveProfile(for: modelKey, type: newProfile)
+                }
+
+                Button(action: {
+                    let modelKey = activeModelPath ?? localModelManager.defaultModelId
+                    saveCurrentGenerationToProfile(modelId: modelKey)
+                }) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "square.and.arrow.down")
+                        Text("Save to \(activeProfile.rawValue)")
+                    }
+                    .font(.caption)
+                }
+                .buttonStyle(.bordered)
+            }
+            .padding(12)
+            .background(Color.purple.opacity(0.08))
+            .cornerRadius(10)
 
             VStack(spacing: 16) {
                 // Temperature
@@ -1227,6 +1339,323 @@ struct SettingsSheetView: View {
             .background(Color.secondary.opacity(0.06))
             .cornerRadius(10)
         }
+    }
+
+    // MARK: - Model Profile Management Helpers & Views
+    private func loadProfileDraft(modelId: String, type: ModelProfileType) {
+        inspectingProfileType = type
+        editingDraft = profileManager.getProfile(for: modelId, type: type)
+    }
+
+    private func saveProfileDraft(model: DiscoveredModel, type: ModelProfileType) {
+        profileManager.saveProfile(for: model.id, type: type, settings: editingDraft)
+        profileFeedbackText = "Saved \(type.rawValue) Profile!"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            profileFeedbackText = nil
+        }
+        let isCurrentActive = (activeModelPath != nil && (activeModelPath == model.snapshotPath || activeModelPath == model.weightsEntryPath || (summary != nil && (modelConfig?.modelType ?? "").localizedCaseInsensitiveContains(model.displayName))))
+        if isCurrentActive && type == activeProfile {
+            applyDraftToActiveSession()
+        }
+    }
+
+    private func resetProfileDraft(model: DiscoveredModel, type: ModelProfileType) {
+        let defaults = GenerationProfileSettings.defaultFor(type: type, modelName: model.displayName)
+        editingDraft = defaults
+        profileManager.saveProfile(for: model.id, type: type, settings: defaults)
+        profileFeedbackText = "Reset to Defaults!"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            profileFeedbackText = nil
+        }
+    }
+
+    private func applyDraftToActiveSession() {
+        temperature = editingDraft.temperature
+        topP = editingDraft.topP
+        minP = editingDraft.minP
+        topK = editingDraft.topK
+        repetitionPenalty = editingDraft.repetitionPenalty
+        presencePenalty = editingDraft.presencePenalty
+        maxNewTokens = editingDraft.maxNewTokens
+        systemPrompt = editingDraft.systemPrompt
+        jetSpecEnabled = editingDraft.jetSpecEnabled
+        jetSpecMaxDepth = editingDraft.jetSpecMaxDepth
+        jetSpecBranchingFactor = editingDraft.jetSpecBranchingFactor
+        jetSpecMaxExpertCap = editingDraft.jetSpecMaxExpertCap
+    }
+
+    private func saveCurrentGenerationToProfile(modelId: String?) {
+        let settings = GenerationProfileSettings(
+            temperature: temperature,
+            topP: topP,
+            minP: minP,
+            topK: topK,
+            repetitionPenalty: repetitionPenalty,
+            presencePenalty: presencePenalty,
+            maxNewTokens: maxNewTokens,
+            systemPrompt: systemPrompt,
+            jetSpecEnabled: jetSpecEnabled,
+            jetSpecMaxDepth: jetSpecMaxDepth,
+            jetSpecBranchingFactor: jetSpecBranchingFactor,
+            jetSpecMaxExpertCap: jetSpecMaxExpertCap
+        )
+        profileManager.saveProfile(for: modelId, type: activeProfile, settings: settings)
+        profileFeedbackText = "Saved to \(activeProfile.rawValue) Profile!"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+            profileFeedbackText = nil
+        }
+    }
+
+    @ViewBuilder
+    private func modelProfileEditorSection(for model: DiscoveredModel) -> some View {
+        let isCurrentActive = (activeModelPath != nil && (activeModelPath == model.snapshotPath || activeModelPath == model.weightsEntryPath || (summary != nil && (modelConfig?.modelType ?? "").localizedCaseInsensitiveContains(model.displayName))))
+
+        VStack(alignment: .leading, spacing: 14) {
+            Divider()
+
+            // Header: Model Profile Switcher
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        Image(systemName: inspectingProfileType.icon)
+                            .foregroundColor(.purple)
+                        Text("\(inspectingProfileType.rawValue) Profile Settings")
+                            .font(.system(size: 13, weight: .bold))
+                        Text("•")
+                            .foregroundColor(.secondary)
+                        Text(model.displayName)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    Text(inspectingProfileType.description)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+
+                Spacer()
+
+                Picker("Profile", selection: $inspectingProfileType) {
+                    ForEach(ModelProfileType.allCases) { profile in
+                        Label(profile.rawValue, systemImage: profile.icon).tag(profile)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 220)
+                .onChange(of: inspectingProfileType) { newType in
+                    loadProfileDraft(modelId: model.id, type: newType)
+                }
+            }
+            .padding(.bottom, 4)
+
+            // Sliders Grid
+            VStack(spacing: 12) {
+                // Temperature
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Temperature")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                        Spacer()
+                        Text(String(format: "%.2f", editingDraft.temperature))
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.purple)
+                    }
+                    Slider(value: $editingDraft.temperature, in: 0.0...2.0, step: 0.05)
+                }
+
+                // Top-P (Nucleus)
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Top-P (Nucleus)")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                        Spacer()
+                        Text(String(format: "%.2f", editingDraft.topP))
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.purple)
+                    }
+                    Slider(value: $editingDraft.topP, in: 0.0...1.0, step: 0.05)
+                }
+
+                // Min-P
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Min-P (Dynamic Truncation)")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                        Spacer()
+                        Text(String(format: "%.2f", editingDraft.minP))
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.purple)
+                    }
+                    Slider(value: $editingDraft.minP, in: 0.0...0.5, step: 0.01)
+                }
+
+                // Top-K
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Top-K")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                        Spacer()
+                        Text("\(editingDraft.topK)")
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.purple)
+                    }
+                    Slider(value: Binding(
+                        get: { Float(editingDraft.topK) },
+                        set: { editingDraft.topK = Int($0) }
+                    ), in: 1...100, step: 1)
+                }
+
+                // Repetition Penalty
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Repetition Penalty")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                        Spacer()
+                        Text(String(format: "%.2f", editingDraft.repetitionPenalty))
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.purple)
+                    }
+                    Slider(value: $editingDraft.repetitionPenalty, in: 1.0...2.0, step: 0.05)
+                }
+
+                // Presence Penalty
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Presence Penalty")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                        Spacer()
+                        Text(String(format: "%.2f", editingDraft.presencePenalty))
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.purple)
+                    }
+                    Slider(value: $editingDraft.presencePenalty, in: 0.0...2.0, step: 0.05)
+                }
+
+                // Max Output Tokens
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Max Output Tokens")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                        Spacer()
+                        Text("\(editingDraft.maxNewTokens) tokens")
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.purple)
+                    }
+                    Slider(value: Binding(
+                        get: { Float(editingDraft.maxNewTokens) },
+                        set: { editingDraft.maxNewTokens = Int($0) }
+                    ), in: 32...10000, step: 32)
+
+                    HStack(spacing: 5) {
+                        Text("Presets:")
+                            .font(.system(size: 9))
+                            .foregroundColor(.secondary)
+                        ForEach([512, 1024, 2048, 4096, 8192, 10000], id: \.self) { preset in
+                            Button("\(preset)") {
+                                editingDraft.maxNewTokens = preset
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 9.5, weight: editingDraft.maxNewTokens == preset ? .bold : .regular, design: .monospaced))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(editingDraft.maxNewTokens == preset ? Color.purple.opacity(0.18) : Color.secondary.opacity(0.08))
+                            .foregroundColor(editingDraft.maxNewTokens == preset ? .purple : .primary)
+                            .cornerRadius(3)
+                        }
+                    }
+                }
+
+                // JetSpec Toggle
+                Toggle(isOn: $editingDraft.jetSpecEnabled) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "arrow.triangle.branch")
+                            .foregroundColor(.purple)
+                        Text("JetSpec Speculative Tree Acceleration")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                    }
+                }
+                .toggleStyle(.switch)
+
+                // System Prompt
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Profile System Prompt")
+                        .font(.caption)
+                        .fontWeight(.medium)
+                    TextEditor(text: $editingDraft.systemPrompt)
+                        .font(.system(.caption, design: .monospaced))
+                        .frame(minHeight: 55, maxHeight: 90)
+                        .padding(4)
+                        .background(Color(NSColor.controlBackgroundColor))
+                        .cornerRadius(6)
+                        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.2), lineWidth: 1))
+                }
+            }
+            .padding(12)
+            .background(Color.secondary.opacity(0.04))
+            .cornerRadius(8)
+
+            // Action Buttons
+            HStack(spacing: 10) {
+                Button(action: {
+                    resetProfileDraft(model: model, type: inspectingProfileType)
+                }) {
+                    Text("Reset to Defaults")
+                        .font(.caption)
+                }
+                .buttonStyle(.bordered)
+
+                Spacer()
+
+                if let feedback = profileFeedbackText {
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                        Text(feedback)
+                            .font(.caption)
+                            .fontWeight(.medium)
+                            .foregroundColor(.green)
+                    }
+                }
+
+                if isCurrentActive {
+                    Button(action: {
+                        activeProfile = inspectingProfileType
+                        applyDraftToActiveSession()
+                        profileFeedbackText = "Applied to Session!"
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                            profileFeedbackText = nil
+                        }
+                    }) {
+                        Label("Apply to Session", systemImage: "bolt.fill")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                Button(action: {
+                    saveProfileDraft(model: model, type: inspectingProfileType)
+                }) {
+                    Label("Save \(inspectingProfileType.rawValue) Profile", systemImage: "square.and.arrow.down")
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(12)
+        .background(Color.purple.opacity(0.03))
+        .cornerRadius(10)
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.purple.opacity(0.18), lineWidth: 1)
+        )
     }
 
     private func repackModel(_ model: DiscoveredModel) {

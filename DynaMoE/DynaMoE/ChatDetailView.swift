@@ -21,6 +21,8 @@ struct ChatDetailView: View {
     var jetSpecDraftAccepted: Int = 0
     var modelName: String?
     var tokenizer: DynaMoeTokenizer? = nil
+    var activeProfile: ModelProfileType = .coder
+    var onSelectProfile: ((ModelProfileType) -> Void)? = nil
     var supportsThinking: Bool = false
     var isThinkingEnabled: Bool = true
     var isAgentToolsEnabled: Bool = true
@@ -318,6 +320,55 @@ struct ChatDetailView: View {
                         }
                         .menuStyle(.borderlessButton)
                         .fixedSize()
+
+                        // Profile Selector Menu (Coder / Assistant)
+                        Menu {
+                            Section("Generation Profile") {
+                                ForEach(ModelProfileType.allCases) { profile in
+                                    Button(action: {
+                                        onSelectProfile?(profile)
+                                    }) {
+                                        HStack {
+                                            if activeProfile == profile {
+                                                Image(systemName: "checkmark")
+                                            }
+                                            Label("\(profile.rawValue) (\(profile == .coder ? "Code & Syntax" : "Chat & Reasoning"))", systemImage: profile.icon)
+                                        }
+                                    }
+                                }
+                            }
+
+                            Divider()
+
+                            if let onOpenSettings = onOpenSettings {
+                                Button(action: onOpenSettings) {
+                                    Label("Configure Profiles in Settings...", systemImage: "slider.horizontal.3")
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: activeProfile.icon)
+                                    .font(.system(size: max(8.5, 10 * zoomManager.zoomScale)))
+                                    .foregroundColor(.purple)
+                                Text(activeProfile.rawValue)
+                                    .font(.system(size: max(9.5, 11.5 * zoomManager.zoomScale), weight: .medium))
+                                    .foregroundColor(.primary)
+                                Image(systemName: "chevron.up.chevron.down")
+                                    .font(.system(size: max(6.5, 7.5 * zoomManager.zoomScale), weight: .semibold))
+                                    .foregroundColor(.secondary.opacity(0.7))
+                            }
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4.5)
+                            .background(Color.purple.opacity(0.12))
+                            .cornerRadius(10)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .stroke(Color.purple.opacity(0.25), lineWidth: 1)
+                            )
+                        }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                        .help("Active generation profile: \(activeProfile.rawValue) (\(activeProfile.description))")
 
                         // Thinking On/Off Dropdown beside Model Selector (shown only if loaded model supports thinking)
                         if supportsThinking {
