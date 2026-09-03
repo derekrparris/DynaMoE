@@ -21,13 +21,13 @@ Special thanks and acknowledgement to the open-source projects and research that
 
 DynaMoE supports sparse Mixture-of-Experts, hybrid recurrent SSM/attention architectures, and dense autoregressive transformers with automatic model topology detection.
 
-**Note:** Qwen 3.8 Flash Next and Ornith 1.5 9B will be the first fully supported models. Neither are currently functioning properly, but will be working soon, so try at your own risk right now 😆
+**Note:** **Ornith 1.5 9B Dense** is now functioning with live autoregressive decoding, reasoning/thinking chains, and model-specific profiles ("Coder" & "Assistant"). **Qwen 3.8 Flash Next** MoE SSD streaming and parallel JetSpec validation remain in active implementation.
 
 | Model / Family | Parameters | Active Parameters | Architecture Type | Quantization & Precision | Context Window |
 | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Ornith 1.5 9B Dense** | 9B Dense | 9B | Hybrid GatedDeltaNet + GQA | 8-Bit Affine / BF16 / FP16 | 131,072 |
 | **Qwen 3.8 Flash Next** | ~180B (512 Experts + 51B PLE) | ~6B (10 Active + Shared) | Hybrid GatedDeltaNet + QSA Sparse Attention + Gated Residuals | FP8 (MXFP8) / BF16 / NVFP4 | 131,072 / 262,144 |
 | **Ornith 1.5 35B A3B** | 35B (256 Experts) | ~3B (8 Active + Shared) | Hybrid GatedDeltaNet + GQA | Q4 Affine / Q8 / BF16 / FP8 (MXFP8) | 262,144 (Native) / 1M+ (YaRN) |
-| **Ornith 1.5 9B Dense** | 9B Dense | 9B | Hybrid GatedDeltaNet + GQA | 8-Bit Affine / BF16 / FP16 | 131,072 |
 | **Standard Dense LLMs** | 3B – 32B | Full Layer Width | Dense Transformer (LLaMA / Qwen 2.5 / Nanbeige) | Q4 / Q8 / BF16 / FP16 | Model Default |
 
 ### Key Architectural Strengths:
@@ -74,13 +74,15 @@ When verifying $N$ candidate tree nodes simultaneously on an MoE model, each can
 * **FlashMoE Contiguous Expert Repackaging & Multi-Threaded Direct I/O:** Inspired by and adapted from Dan Woods' Flash-MoE project, DynaMoE supports restructuring sparse MoE model layers into contiguous per-layer expert binaries (`packed_experts/layer_XX.bin` + `layout.json`). A dedicated 8-thread background POSIX `pread` I/O pool (`ExpertIOThreadPool`) streams selected expert slices directly into shared Metal staging buffers, eliminating file fragmentation and maximizing NVMe read bandwidth during token generation.
 * **Quantized FP8 & FP16 KV Cache:** Dynamically configurable KV cache precision (**FP32**, **FP16**, and **FP8 E4M3/E5M2**), reducing attention cache memory footprints by up to 75% and enabling long-context inference (32k+ tokens) on memory-constrained Macs.
 * **Speculative MoE Expert Prefetching (`WorkingSetManager`):** Thread-safe background speculative lookahead prefetching pipeline using `posix_madvise(POSIX_MADV_WILLNEED)` to warm upcoming layer experts asynchronously before routing execution, alongside LRU page eviction (`POSIX_MADV_DONTNEED`) to keep RSS within strict hardware thresholds.
-* **Hardware-Vectorized Accelerate Sampling:** Apple Accelerate framework integration using `vDSP_maxvi` for zero-overhead greedy sampling, $O(\log K)$ min-heap Top-$K$ candidate tracking, vectorized softmax normalization (`vvexpf`, `vDSP_vsmul`), and dynamic **Min-$P$** and **Top-$P$ (Nucleus)** probability truncation.
+* **Hardware-Vectorized Accelerate Sampling & Penalties:** Apple Accelerate framework integration using `vDSP_maxvi` for zero-overhead greedy sampling, $O(\log K)$ min-heap Top-$K$ candidate tracking, vectorized softmax normalization (`vvexpf`, `vDSP_vsmul`), dynamic **Min-$P$** and **Top-$P$ (Nucleus)** probability truncation, and bounded **Repetition Penalty** and additive **Presence Penalty** to eliminate vocabulary looping without degrading throughput.
+* **Model-Specific Profiles ("Coder" & "Assistant"):** Dedicated per-model generation profiles saving tailored sampling parameters (Temperature, Top-P, Min-P, Top-K, Repetition/Presence Penalties, JetSpec toggles, and System Prompts) for coding versus conversational tasks. Persisted across sessions and quickly toggleable via an in-chat selector.
 * **Universal Reasoning & `<think>` Accordion:** Automatic detection of reasoning/thinking models across Ornith, Qwen 2.5/3.5, DeepSeek-R1, Nanbeige, GLM, and Nemotron with dynamic inspection of `tokenizer_config.json` and `chat_template.jinja`. Renders real-time, collapsible chain-of-thought blocks with duration timers, char counts, and live streaming pace indicators.
 * **Rich Markdown & Code Rendering Engine:** High-performance, debounced token streaming UI with full GitHub Flavored Markdown support, including tables with column alignment, blockquotes, callout alerts (`[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`), nested lists, and syntax-highlighted code blocks with one-click copy.
 * **Hugging Face Local Cache Auto-Discovery:** Automatically scans `~/.cache/huggingface/hub` on launch to discover all downloaded models, snapshots, weight formats, and quantizations. Allows selecting an overall **Default Model** and automatically tracks the **Last Used Model**.
-* **Antigravity-Style Multi-Session Chat UI:** Full multi-session chat workspace with persistent session history, creation, renaming, deletion, and an interactive in-chat dropdown model switcher to swap active models on the fly.
+* **Antigravity-Style Multi-Session Chat UI:** Full multi-session chat workspace with persistent session history, creation, renaming, deletion, an interactive model switcher, and a 1-click **Profile Selector** (Coder vs. Assistant) in the chat toolbar.
 * **Model-Specific System Prompts & Conjunction Merging:** Built-in repository of required instruct personas (e.g. Nanbeige, Qwen, DeepSeek, Ornith). User-customized default system prompts in Settings are combined with model-required prompts *in conjunction* during inference.
 * **Native macOS View Menu & Zoom Controls:** Top "View" menu options with standard keyboard shortcuts for **Actual Size** (`⌘0`), **Zoom In** (`⌘+`), and **Zoom Out** (`⌘-`) featuring proportional pixel-perfect geometry scaling.
+* **In-App Help & Comprehensive Settings Guide:** Native documentation viewer accessible via **Help $\to$ DynaMoE Help & Settings Guide** (`⌘?`), Settings header button, or offline via [`SETTINGS_GUIDE.md`](SETTINGS_GUIDE.md), detailing parameter math, memory tuning, profiles, and hardware recommendations.
 
 ---
 
@@ -89,13 +91,15 @@ When verifying $N$ candidate tree nodes simultaneously on an MoE model, each can
 ```text
 DynaMoE/
 ├── DynaMoE/                 # Native macOS App (SwiftUI, Metal GPU Pipelines, Inference Engine)
-│   ├── DynaMoEApp.swift     # Application entry point, View menu Zoom commands, and AppZoomManager
+│   ├── DynaMoEApp.swift     # Application entry point, View/Help menu commands, and AppZoomManager
 │   ├── ContentView.swift    # Core workspace coordinator, Metal compute dispatch, and autoregressive engine
-│   ├── ChatDetailView.swift # Antigravity-style chat interface, markdown parser, thinking accordion, model switcher
+│   ├── ChatDetailView.swift # Antigravity-style chat interface, markdown parser, thinking accordion, model/profile switcher
 │   ├── ChatModels.swift     # Multi-session chat models, message state, and persistence
 │   ├── LocalModelManager.swift # Hugging Face cache scanner (~/.cache/huggingface/hub) and model registry
 │   ├── ModelConfig.swift    # Config parser, architecture detection, and system prompt conjunction resolver
-│   ├── SettingsSheetView.swift # Comprehensive Settings: Models, JetSpec Controls, Memory Modes, and Prompts
+│   ├── ModelProfileManager.swift # Model-specific generation profiles (Coder & Assistant) and persistence
+│   ├── SettingsSheetView.swift # Comprehensive Settings: Models, Model Profiles, JetSpec Controls, Memory Modes, and Prompts
+│   ├── HelpAndSettingsGuideView.swift # In-app searchable Help & Settings Guide (⌘?)
 │   ├── SidebarView.swift    # Navigation sidebar for chat sessions, model info, and tensor catalog
 │   ├── InferenceEngine.swift # GPU pipeline abstractions and compute shaders bridge
 │   └── ComputeShaders.metal # MSL Kernels (Q4/Q8 GEMV, SIMD SwiGLU, MXFP8, DeltaNet, GQA, Tree-Causal Verification)
@@ -106,6 +110,7 @@ DynaMoE/
 │   ├── Cargo.toml           # Engine dependencies (memmap2, safetensors, uniffi, tokenizers)
 │   ├── src/lib.rs           # Multi-shard mmap engine, index parser, tensor catalog, generalized 3D slicing
 │   └── src/jetspec.rs       # JetSpec candidate tree topology, causal masks, MoE pruner, acceptance oracles
+├── SETTINGS_GUIDE.md        # Complete Settings documentation & hardware tuning guide
 └── README.md
 ```
 
@@ -149,12 +154,14 @@ flowchart TD
 - [x] **Dense Transformer Engine**: Dedicated compute path supporting dense LLMs (e.g., Nanbeige, Ornith 9B, Qwen 2.5, LLaMA) with standard dense MLPs and RMSNorms.
 - [x] **Quantized FP8 / FP16 KV Cache**: Configurable KV cache precision (FP32, FP16, FP8) with dedicated fused storage and attention decode kernels.
 - [x] **Speculative MoE Expert Prefetching (`WorkingSetManager`)**: Asynchronous multi-layer lookahead prefetching (`POSIX_MADV_WILLNEED`) and LRU working set eviction (`POSIX_MADV_DONTNEED`).
-- [x] **Hardware-Vectorized Accelerate Sampling**: Apple Accelerate (`vDSP_maxvi`, `vvexpf`) greedy and min-heap Top-$K$ sampling, adaptive **Min-$P$**, and **Top-$P$ (Nucleus)** truncation.
+- [x] **Hardware-Vectorized Accelerate Sampling & Penalties**: Apple Accelerate (`vDSP_maxvi`, `vvexpf`) greedy and min-heap Top-$K$ sampling, adaptive **Min-$P$**, **Top-$P$ (Nucleus)** truncation, repetition penalties, and presence penalties.
 
 ### Phase 4: Multi-Session Chat & User Experience ✅ *(Completed)*
 - [x] **Hugging Face Cache Auto-Discovery**: Automatic discovery of local models in `~/.cache/huggingface/hub` with size computation and model registry.
 - [x] **Multi-Session Chat Workspace**: Antigravity-style session history, creation, renaming, and persistent session state.
-- [x] **In-Chat Model Switcher**: Fast dropdown menu below chat input to switch active models with automatic session retention.
+- [x] **Model-Specific Profiles ("Coder" & "Assistant")**: Dual generation profiles per model for targeted parameter tuning (temperature, penalties, top-k/p, max tokens, custom system prompts).
+- [x] **In-Chat Profile & Model Switchers**: Seamless dropdown menus in the chat toolbar to switch active models and swap between "Coder" and "Assistant" profiles on the fly.
+- [x] **Presence & Repetition Penalties**: Configurable presence penalty slider and additive penalty logic disincentivizing repeated tokens in recent context windows.
 - [x] **Universal Thinking / `<think>` Visualization**: Expandable/collapsible reasoning view with live token count, duration timers, streaming pace indicators, and toggleable reasoning prefill.
 - [x] **Rich Markdown & Code Block Engine**: Full GitHub Flavored Markdown renderer with table support, callout alerts, blockquotes, and syntax-highlighted code blocks with one-click copying.
 - [x] **Model-Specific System Prompts & Conjunction Merging**: Automatic injection of mandatory instruct prompts combined with user-saved default system prompts.
@@ -230,6 +237,7 @@ flowchart TD
 3. Open `DynaMoE/DynaMoE.xcodeproj` in Xcode.
 4. Press **Cmd + R** to build and launch DynaMoE.
 5. On startup, DynaMoE automatically scans your `~/.cache/huggingface/hub` directory for downloaded models. Open **Settings (⌘,) $\to$ Models** to select your default model, or select any discovered model directly from the chat dropdown!
+6. For detailed explanations of every setting, sampling formulas, and hardware presets, consult the [**DynaMoE Settings & User Guide**](SETTINGS_GUIDE.md) or open it directly in the app via **Help $\to$ DynaMoE Help & Settings Guide** (`⌘?`).
 
 ---
 

@@ -3900,6 +3900,35 @@ final class DynaMoETests: XCTestCase {
 
         print("  ✅ [TEST] Model-specific Coder & Assistant profiles fully verified with persistence and isolation.")
     }
+
+    func testHelpTopicsAndSettingsGuideCoverage() throws {
+        // 1. Verify all 11 HelpTopic enum cases are present
+        let topics = HelpTopic.allCases
+        XCTAssertEqual(topics.count, 11, "HelpTopic must have exactly 11 documented sections")
+
+        // 2. Verify all topics have valid non-empty titles and SF Symbols
+        for topic in topics {
+            XCTAssertFalse(topic.rawValue.isEmpty, "Topic title must not be empty")
+            XCTAssertFalse(topic.icon.isEmpty, "Topic SF symbol icon must not be empty")
+            XCTAssertEqual(topic.id, topic.rawValue)
+        }
+
+        // 3. Verify specific critical topics are included
+        let topicRawValues = Set(topics.map { $0.rawValue })
+        XCTAssertTrue(topicRawValues.contains("Quick Start & Overview"))
+        XCTAssertTrue(topicRawValues.contains("Models & Repackaging"))
+        XCTAssertTrue(topicRawValues.contains("Model Profiles (Coder vs. Assistant)"))
+        XCTAssertTrue(topicRawValues.contains("Generation & Sampling"))
+        XCTAssertTrue(topicRawValues.contains("Memory & SSD Streaming"))
+        XCTAssertTrue(topicRawValues.contains("KV Cache Precision"))
+        XCTAssertTrue(topicRawValues.contains("JetSpec Acceleration"))
+        XCTAssertTrue(topicRawValues.contains("Agent & Tool Execution"))
+        XCTAssertTrue(topicRawValues.contains("Advanced Diagnostics"))
+        XCTAssertTrue(topicRawValues.contains("Hardware Profiles (16GB - 128GB)"))
+        XCTAssertTrue(topicRawValues.contains("Troubleshooting & FAQs"))
+
+        print("  ✅ [TEST] Help topics and settings guide coverage verified with 11 distinct sections.")
+    }
 }
 
 

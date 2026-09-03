@@ -131,11 +131,22 @@ struct DynaMoEApp: App {
                 }
                 .keyboardShortcut("-", modifiers: .command)
             }
+            CommandGroup(replacing: .help) {
+                Button("DynaMoE Help & Settings Guide") {
+                    openWindow(id: "dynamoe-help")
+                }
+                .keyboardShortcut("?", modifiers: .command)
+            }
         }
 
         Window("About DynaMoE", id: "about-dynamoe") {
             AboutDynaMoEView()
         }
         .windowResizability(.contentSize)
+
+        Window("DynaMoE Help & Settings Guide", id: "dynamoe-help") {
+            HelpAndSettingsGuideView()
+        }
+        .defaultSize(width: 880, height: 680)
     }
 }

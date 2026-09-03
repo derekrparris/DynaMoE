@@ -28,6 +28,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
 
 struct SettingsSheetView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openWindow) private var openWindow
     @State private var selectedTab: SettingsTab = .models
     @State private var isPromptSavedFeedback: Bool = false
     @State private var repackingModelId: String? = nil
@@ -126,12 +127,21 @@ struct SettingsSheetView: View {
     var body: some View {
         VStack(spacing: 0) {
             // Header
-            HStack {
+            HStack(spacing: 12) {
                 Text("Settings & Diagnostics")
                     .font(.headline)
                     .fontWeight(.bold)
 
                 Spacer()
+
+                Button(action: {
+                    openWindow(id: "dynamoe-help")
+                }) {
+                    Label("Help & Guide", systemImage: "questionmark.circle")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .buttonStyle(.bordered)
+                .help("Open DynaMoE Help & Settings Guide (⌘?)")
 
                 Button("Done") {
                     SettingsWindowManager.shared.close()
