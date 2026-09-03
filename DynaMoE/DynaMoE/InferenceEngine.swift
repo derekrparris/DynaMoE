@@ -7,6 +7,7 @@
 
 import Foundation
 import Metal
+import Accelerate
 
 public enum MemoryExecutionMode: String, CaseIterable, Identifiable, Codable {
     case autoDetect = "Auto (Smart)"
@@ -525,7 +526,7 @@ public final class InferenceEngine {
     public func buildCachedLayers(summary: ModelSummary, config: ModelConfig?, targetLayerCount: Int? = nil) -> [EngineCachedLayer] {
         var tensorsByLayer: [UInt32: [TensorMetadata]] = [:]
         for t in summary.tensors {
-            if t.name.hasPrefix("mtp.") || t.name.hasPrefix("visual.") { continue }
+            if t.name.contains("mtp") || t.name.contains("visual") { continue }
             if let l = t.layerIndex {
                 tensorsByLayer[l, default: []].append(t)
             }
@@ -989,6 +990,188 @@ extension InferenceEngine {
             maxLinearLayers: maxLinearLayers,
             linValHeads: linValHeads
         )
+    }
+
+    public static func sampleNextToken(
+        logits: UnsafeMutablePointer<Float>,
+        vocabSize: Int,
+        contextTokens: [UInt32],
+        temperature: Float,
+        topP: Float,
+        minP: Float,
+        topK: Int,
+        repetitionPenalty: Float,
+        presencePenalty: Float = 0.0
+    ) -> UInt32 {
+        // 1. Direct repetition and presence penalties to recent context tokens (no Set lookup across 166k items)
+        let recent = contextTokens.suffix(256)
+        var origVals: [(Int, Float)] = []
+        if repetitionPenalty > 1.001 || abs(presencePenalty) > 0.001 {
+            var seen = Set<Int>()
+            origVals.reserveCapacity(recent.count)
+            for tok in recent {
+                let v = Int(tok)
+                guard v < vocabSize else { continue }
+                if seen.insert(v).inserted {
+                    let l = logits[v]
+                    origVals.append((v, l))
+                    var modified = l
+                    if repetitionPenalty > 1.001 {
+                        modified = modified > 0 ? (modified / repetitionPenalty) : (modified * repetitionPenalty)
+                    }
+                    if abs(presencePenalty) > 0.001 {
+                        modified -= presencePenalty
+                    }
+                    logits[v] = modified
+                }
+            }
+        }
+        defer {
+            for (v, orig) in origVals {
+                logits[v] = orig
+            }
+        }
+
+        // Hardware-Vectorized Greedy Fast Path (temperature <= 0.01) using vDSP_maxvi
+        if temperature <= 0.01 {
+            var bestIdx: vDSP_Length = 0
+            var bestVal: Float = 0
+            vDSP_maxvi(logits, 1, &bestVal, &bestIdx, vDSP_Length(vocabSize))
+            return UInt32(bestIdx)
+        }
+
+        // 2. High-performance top-K selection using Min-Heap (O(log K) per candidate without array shifting)
+        let effectiveTopK = max(1, min(topK, vocabSize))
+        var heap: [(id: Int, logit: Float)] = []
+        heap.reserveCapacity(effectiveTopK)
+
+        for v in 0..<effectiveTopK {
+            heap.append((id: v, logit: logits[v]))
+        }
+        // Build min-heap (root at index 0 is minimum element)
+        if effectiveTopK > 1 {
+            for i in stride(from: (effectiveTopK / 2) - 1, through: 0, by: -1) {
+                var parent = i
+                while true {
+                    let left = 2 * parent + 1
+                    let right = left + 1
+                    var smallest = parent
+                    if left < effectiveTopK && heap[left].logit < heap[smallest].logit {
+                        smallest = left
+                    }
+                    if right < effectiveTopK && heap[right].logit < heap[smallest].logit {
+                        smallest = right
+                    }
+                    if smallest != parent {
+                        heap.swapAt(parent, smallest)
+                        parent = smallest
+                    } else {
+                        break
+                    }
+                }
+            }
+        }
+
+        // Stream through remaining logits, updating min-heap in O(log K) without array shifting
+        var minLogit = heap[0].logit
+        for v in effectiveTopK..<vocabSize {
+            let logit = logits[v]
+            if logit > minLogit {
+                heap[0] = (id: v, logit: logit)
+                var parent = 0
+                while true {
+                    let left = 2 * parent + 1
+                    let right = left + 1
+                    var smallest = parent
+                    if left < effectiveTopK && heap[left].logit < heap[smallest].logit {
+                        smallest = left
+                    }
+                    if right < effectiveTopK && heap[right].logit < heap[smallest].logit {
+                        smallest = right
+                    }
+                    if smallest != parent {
+                        heap.swapAt(parent, smallest)
+                        parent = smallest
+                    } else {
+                        break
+                    }
+                }
+                minLogit = heap[0].logit
+            }
+        }
+
+        // Restore context logits
+        for (v, orig) in origVals {
+            logits[v] = orig
+        }
+
+        let candidates = heap.sorted(by: { $0.logit > $1.logit })
+        guard let first = candidates.first else { return 0 }
+
+        let count = candidates.count
+        var logitVec = candidates.map { $0.logit }
+        var scaledLogits = [Float](repeating: 0, count: count)
+        var probs = [Float](repeating: 0, count: count)
+
+        let invTemp = 1.0 / max(temperature, 0.01)
+        let maxLogit = first.logit
+
+        // Vectorized: (logits - maxLogit) * invTemp using Accelerate vDSP
+        var negMaxLogit = -maxLogit
+        var tempScale = invTemp
+        vDSP_vsadd(logitVec, 1, &negMaxLogit, &scaledLogits, 1, vDSP_Length(count))
+        vDSP_vsmul(scaledLogits, 1, &tempScale, &scaledLogits, 1, vDSP_Length(count))
+
+        // Vectorized exponential: probs = exp(scaledLogits)
+        var n = Int32(count)
+        vvexpf(&probs, scaledLogits, &n)
+
+        // Vectorized sum of exponents
+        var expSum: Float = 0
+        vDSP_sve(probs, 1, &expSum, vDSP_Length(count))
+
+        if expSum <= 0.0 {
+            return UInt32(first.id)
+        }
+
+        // Vectorized normalization: probs = probs / expSum
+        var invExpSum = 1.0 / expSum
+        vDSP_vsmul(probs, 1, &invExpSum, &probs, 1, vDSP_Length(count))
+
+        // 3. Adaptive Min-P Dynamic Truncation
+        let maxProb = probs[0]
+        let minPThreshold = maxProb * max(0.0, min(minP, 1.0))
+        var minPFilteredCount = count
+        for i in 0..<count {
+            if probs[i] < minPThreshold {
+                minPFilteredCount = max(1, i)
+                break
+            }
+        }
+
+        // 4. Top-P (Nucleus) Truncation on top of Min-P
+        var cumulativeProb: Float = 0.0
+        var cutoffIndex = minPFilteredCount - 1
+        for i in 0..<minPFilteredCount {
+            cumulativeProb += probs[i]
+            if cumulativeProb >= topP {
+                cutoffIndex = i
+                break
+            }
+        }
+
+        var nucleusSum: Float = 0
+        vDSP_sve(probs, 1, &nucleusSum, vDSP_Length(cutoffIndex + 1))
+        let randomVal = Float.random(in: 0..<1.0) * nucleusSum
+        var runningSum: Float = 0.0
+        for i in 0...cutoffIndex {
+            runningSum += probs[i]
+            if runningSum >= randomVal {
+                return UInt32(candidates[i].id)
+            }
+        }
+
+        return UInt32(candidates[0].id)
     }
 }
 

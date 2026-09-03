@@ -16,6 +16,9 @@ struct ChatDetailView: View {
     var isStreamingOffDisk: Bool = false
     var generationSpeed: Double
     var generationTokens: Int
+    var jetSpecEnabled: Bool = false
+    var jetSpecMeanTau: Double = 1.0
+    var jetSpecDraftAccepted: Int = 0
     var modelName: String?
     var tokenizer: DynaMoeTokenizer? = nil
     var supportsThinking: Bool = false
@@ -116,6 +119,18 @@ struct ChatDetailView: View {
                                         .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
                                         .fontWeight(.bold)
                                         .foregroundColor(isStreamingOffDisk ? .orange : .purple)
+                                }
+                                if jetSpecEnabled && (jetSpecMeanTau > 1.0 || jetSpecDraftAccepted > 0) {
+                                    Text("•")
+                                        .foregroundColor(.secondary.opacity(0.6))
+                                    HStack(spacing: 3) {
+                                        Image(systemName: "bolt.badge.sparkle")
+                                            .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .bold))
+                                            .foregroundColor(.cyan)
+                                        Text(String(format: "🚀 JetSpec τ=%.1f", jetSpecMeanTau))
+                                            .font(.system(size: max(9, 11 * zoomManager.zoomScale), weight: .bold, design: .monospaced))
+                                            .foregroundColor(.cyan)
+                                    }
                                 }
                             }
                         }
@@ -838,6 +853,20 @@ struct ChatMessageView: View {
                                     Text("\(message.tokenCount.formatted()) tokens")
                                         .font(.system(size: max(8.5, 11 * zoomManager.zoomScale), design: .monospaced))
                                         .foregroundColor(.secondary.opacity(0.8))
+                                }
+
+                                if let tau = message.jetSpecTau, tau > 1.0 {
+                                    Text("•")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(.secondary.opacity(0.4))
+                                    HStack(spacing: 3) {
+                                        Image(systemName: "bolt.badge.sparkle")
+                                            .font(.system(size: max(7.5, 9.5 * zoomManager.zoomScale), weight: .bold))
+                                            .foregroundColor(.cyan)
+                                        Text(String(format: "JetSpec τ=%.1fx", tau))
+                                            .font(.system(size: max(8.5, 11 * zoomManager.zoomScale), weight: .semibold, design: .monospaced))
+                                            .foregroundColor(.cyan)
+                                    }
                                 }
                             }
 

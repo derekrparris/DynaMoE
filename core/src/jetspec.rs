@@ -437,17 +437,44 @@ impl JetSpecAcceptanceOracle {
                 accepted_node_indices.push(child_id);
                 curr_node_id = child_id;
             } else {
-                // Rejection: sample bonus token from target distribution
-                let r = rand_f32();
-                let mut cum = 0.0f32;
-                let mut bonus = 0u32;
-                for (v_idx, &p) in p_target.iter().enumerate() {
-                    cum += p;
-                    if r <= cum || v_idx == vocab_size - 1 {
-                        bonus = v_idx as u32;
-                        break;
-                    }
+                if accepted_tokens.is_empty() {
+                    // If no draft tokens were accepted, return empty result to let the engine
+                    // fall back cleanly to standard single-token forward pass with full KV cache integrity.
+                    return JetSpecAcceptedResult {
+                        accepted_tokens,
+                        accepted_node_indices,
+                        bonus_token: None,
+                        accepted_count: 0,
+                        effective_tau: 0.0,
+                    };
                 }
+
+                // Sample bonus token from top candidates of target distribution (filtered to prevent tail corruption)
+                let max_p = p_target.iter().cloned().fold(0.0f32, f32::max);
+                let min_p_thresh = max_p * 0.05;
+                let valid_candidates: Vec<(usize, f32)> = p_target
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &p)| p >= min_p_thresh)
+                    .map(|(i, &p)| (i, p))
+                    .collect();
+
+                let bonus = if !valid_candidates.is_empty() {
+                    let total_mass: f32 = valid_candidates.iter().map(|(_, p)| *p).sum();
+                    let r = rand_f32() * total_mass;
+                    let mut cum = 0.0f32;
+                    let mut selected = valid_candidates[0].0 as u32;
+                    for (idx, p) in &valid_candidates {
+                        cum += p;
+                        if r <= cum {
+                            selected = *idx as u32;
+                            break;
+                        }
+                    }
+                    selected
+                } else {
+                    p_target.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i as u32).unwrap_or(0)
+                };
 
                 let accepted_count = accepted_tokens.len() as u32;
                 let effective_tau = (accepted_count + 1) as f32;
@@ -571,5 +598,24 @@ mod tests {
         assert!(pruned.nodes.len() >= 1);
         let pruned_mask = pruned.generate_tree_mask();
         assert_eq!(pruned_mask.node_count, pruned.nodes.len() as u32);
+    }
+
+    #[test]
+    fn test_speculative_sampling_clean_fallback() {
+        let draft_tokens = vec![101, 102, 103, 104, 105, 106];
+        let draft_scores = vec![0.9, 0.8, 0.7, 0.6, 0.5, 0.4];
+        let tree = DraftTreeTopology::from_candidate_tokens(100, &draft_tokens, &draft_scores, 2, 2, 7);
+
+        let vocab_size = 200;
+        let mut target_logits = vec![0.0f32; 7 * vocab_size];
+
+        // Target at root node predicts token 50 (which does NOT match any draft child 101 or 102)
+        target_logits[0 * vocab_size + 50] = 100.0;
+
+        let result = JetSpecAcceptanceOracle::verify_speculative_sampling(&tree, &target_logits, &[], vocab_size, 0.6, 42);
+        // Clean fallback: no un-forwarded tokens emitted, allowing engine to run standard autoregressive step
+        assert!(result.accepted_tokens.is_empty());
+        assert_eq!(result.bonus_token, None);
+        assert_eq!(result.accepted_count, 0);
     }
 }

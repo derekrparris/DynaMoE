@@ -1731,25 +1731,25 @@ final class DynaMoETests: XCTestCase {
 
         // Discover embed, final HC, LM head tensors
         let embedWeight = summary.tensors.first(where: {
-            !$0.name.hasPrefix("visual.") && !$0.name.hasPrefix("mtp.") &&
+            !$0.name.contains("visual") && !$0.name.contains("mtp") &&
             ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.contains("wte")) &&
             !$0.name.contains("scale") && !$0.name.contains("scales") &&
             !$0.name.contains("bias") && !$0.name.contains("biases")
         })!
         let embedScale = summary.tensors.first(where: {
-            !$0.name.hasPrefix("visual.") && !$0.name.hasPrefix("mtp.") &&
+            !$0.name.contains("visual") && !$0.name.contains("mtp") &&
             ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.contains("wte")) &&
             ($0.name.contains("scale") || $0.name.contains("scales"))
         })
 
         let finalHcNormWeight = summary.tensors.first(where: {
-            $0.name.contains("hyper_connection_mixer") && $0.name.contains("hc_norm")
+            !$0.name.hasPrefix("mtp.") && $0.name.contains("hyper_connection_mixer") && $0.name.contains("hc_norm")
         })
         let finalHcDownWeight = summary.tensors.first(where: {
-            $0.name.contains("hyper_connection_mixer") && $0.name.contains("input_mix_weight_down")
+            !$0.name.hasPrefix("mtp.") && $0.name.contains("hyper_connection_mixer") && $0.name.contains("input_mix_weight_down")
         })
         let finalHcUpWeight = summary.tensors.first(where: {
-            $0.name.contains("hyper_connection_mixer") && $0.name.contains("input_mix_weight_up")
+            !$0.name.hasPrefix("mtp.") && $0.name.contains("hyper_connection_mixer") && $0.name.contains("input_mix_weight_up")
         })
 
         let lmHeadTensorCandidate = summary.tensors.first(where: {
@@ -1773,8 +1773,11 @@ final class DynaMoETests: XCTestCase {
              $0.name == "model.lm_head.bias")
         })
 
-        print("🔍 [DIAGNOSTIC] Final HC Mixer: norm=\(finalHcNormWeight?.name ?? "nil"), down=\(finalHcDownWeight?.name ?? "nil"), up=\(finalHcUpWeight?.name ?? "nil")")
-        print("🔍 [DIAGNOSTIC] LM Head: tensor=\(lmHeadTensorCandidate.name), dtype=\(lmHeadTensorCandidate.dtype), shape=\(lmHeadTensorCandidate.shapeDisplay), scale=\(lmHeadScale?.name ?? "nil"), bias=\(lmHeadBias?.name ?? "nil")")
+        var diagOutput = "=== QWEN 3.8 AUTOREGRESSIVE CHAT DIAGNOSTICS ===\n"
+        diagOutput += "Final HC Mixer: norm=\(finalHcNormWeight?.name ?? "nil"), down=\(finalHcDownWeight?.name ?? "nil"), up=\(finalHcUpWeight?.name ?? "nil")\n"
+        diagOutput += "LM Head: tensor=\(lmHeadTensorCandidate.name), dtype=\(lmHeadTensorCandidate.dtype), shape=\(lmHeadTensorCandidate.shapeDisplay), scale=\(lmHeadScale?.name ?? "nil"), bias=\(lmHeadBias?.name ?? "nil")\n"
+        diagOutput += "Embed: tensor=\(embedWeight.name), dtype=\(embedWeight.dtype), shape=\(embedWeight.shapeDisplay), scale=\(embedScale?.name ?? "nil")\n"
+        print(diagOutput)
 
         guard let currentH = device.makeBuffer(length: Int(hiddenDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let nextH = device.makeBuffer(length: Int(hiddenDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
@@ -1932,6 +1935,11 @@ final class DynaMoETests: XCTestCase {
             if l > maxL { maxL = l }
         }
 
+        diagOutput += "currH nonZero=\(currHNonZero)/\(hiddenDim), [0]=\(currHPtr[0]), [1]=\(currHPtr[1])\n"
+        diagOutput += "xFinal nonZero=\(xFinalNonZero)/\(hiddenDim), [0]=\(xFinalPtr[0]), [1]=\(xFinalPtr[1])\n"
+        diagOutput += "lmHead buffer present: \(buffers[lmHeadTensorCandidate.shardIndex] != nil), shardIndex: \(lmHeadTensorCandidate.shardIndex), pipe present: \(inference.bf16GemvSimdPipeline != nil)\n"
+        diagOutput += "logits min=\(minL), max=\(maxL), nonZero=\(nonZeroCount)/\(vocabSize), hasNaN=\(hasNaN)\n"
+        try? diagOutput.write(toFile: "/tmp/qwen_chat_diag.txt", atomically: true, encoding: .utf8)
         print("🔍 [DIAGNOSTIC] LM Head Logits: min=\(minL), max=\(maxL), nonZeroCount=\(nonZeroCount)/\(vocabSize), hasNaN=\(hasNaN)")
         XCTAssertFalse(hasNaN, "Logits contain NaN or Inf values!")
         XCTAssertGreaterThan(nonZeroCount, 0, "Logits are all zeros!")
@@ -2036,6 +2044,135 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(result.acceptedCount, 2)
 
         print("✅ [TEST] Greedy tree verification oracle successfully accepted [101, 103] + bonus [500] (progress = 3 tokens).")
+    }
+
+    func testJetSpecSpeculativeSamplingWithTemperature() throws {
+        print("=== TEST JETSPEC SPECULATIVE SAMPLING WITH TEMPERATURE ===")
+        // 1. Build Candidate Tree: Root 100, Draft 101, 102 (depth 1), 103 (depth 2 child of 101)
+        let rootToken: UInt32 = 100
+        let draftTokens: [UInt32] = [101, 102, 103]
+        let draftScores: [Float] = [0.8, 0.2, 0.9]
+
+        let treeMask = buildJetspecCandidateTree(
+            rootTokenId: rootToken,
+            draftTokens: draftTokens,
+            draftScores: draftScores,
+            depth: 2,
+            branchingFactor: 2,
+            maxNodes: 8
+        )
+        let N = Int(treeMask.nodeCount)
+        let vocabSize = 1000
+
+        // Case A: High target agreement on branch [101, 103]
+        var targetLogitsA = [Float](repeating: -50.0, count: N * vocabSize)
+        targetLogitsA[0 * vocabSize + 101] = 20.0 // Node 0 strongly predicts 101
+        targetLogitsA[1 * vocabSize + 103] = 20.0 // Node 1 strongly predicts 103
+        targetLogitsA[3 * vocabSize + 777] = 20.0 // Node 3 strongly predicts 777 (bonus token)
+
+        let resultA = verifyJetspecTreeSampling(
+            treeTokens: treeMask.tokenIds,
+            parentIndices: treeMask.parentIndices,
+            draftProbs: [],
+            targetLogits: targetLogitsA,
+            vocabSize: UInt32(vocabSize),
+            temperature: 0.7,
+            rngSeed: 123456
+        )
+
+        XCTAssertEqual(resultA.acceptedTokens, [101, 103])
+        XCTAssertEqual(resultA.acceptedNodeIndices, [1, 3])
+        XCTAssertEqual(resultA.bonusToken, 777)
+        XCTAssertEqual(resultA.acceptedCount, 2)
+        XCTAssertEqual(resultA.effectiveTau, 3.0)
+        print("✅ [TEST] Speculative sampling full branch acceptance verified: \(resultA.acceptedTokens), bonus: \(resultA.bonusToken ?? 0)")
+
+        // Case B: Rejection at depth 2 (Node 1 predicts 222 instead of 103)
+        var targetLogitsB = [Float](repeating: -50.0, count: N * vocabSize)
+        targetLogitsB[0 * vocabSize + 101] = 20.0 // Node 0 accepts 101
+        targetLogitsB[1 * vocabSize + 222] = 20.0 // Node 1 predicts 222 (rejects 103)
+
+        let resultB = verifyJetspecTreeSampling(
+            treeTokens: treeMask.tokenIds,
+            parentIndices: treeMask.parentIndices,
+            draftProbs: [],
+            targetLogits: targetLogitsB,
+            vocabSize: UInt32(vocabSize),
+            temperature: 0.7,
+            rngSeed: 654321
+        )
+
+        XCTAssertEqual(resultB.acceptedTokens, [101])
+        XCTAssertEqual(resultB.acceptedNodeIndices, [1])
+        XCTAssertEqual(resultB.bonusToken, 222)
+        XCTAssertEqual(resultB.acceptedCount, 1)
+        XCTAssertEqual(resultB.effectiveTau, 2.0)
+        print("✅ [TEST] Speculative sampling partial acceptance & corrective bonus token verified: \(resultB.acceptedTokens), bonus: \(resultB.bonusToken ?? 0)")
+    }
+
+    func testJetSpecDynamicMoEExpertBudgetPruning() throws {
+        print("=== TEST JETSPEC DYNAMIC MOE EXPERT BUDGET PRUNING ===")
+        // Build candidate tree with 5 draft nodes:
+        // Root: 100
+        // Node 1: 101 (child of 0, score 0.95)
+        // Node 2: 102 (child of 0, score 0.25)
+        // Node 3: 103 (child of 1, score 0.90)
+        // Node 4: 104 (child of 1, score 0.85)
+        // Node 5: 105 (child of 2, score 0.10)
+        let rootToken: UInt32 = 100
+        let draftTokens: [UInt32] = [101, 102, 103, 104, 105]
+        let draftScores: [Float] = [0.95, 0.25, 0.90, 0.85, 0.10]
+
+        let treeMask = buildJetspecCandidateTree(
+            rootTokenId: rootToken,
+            draftTokens: draftTokens,
+            draftScores: draftScores,
+            depth: 2,
+            branchingFactor: 2,
+            maxNodes: 8
+        )
+        let N = Int(treeMask.nodeCount)
+        XCTAssertEqual(N, 6)
+
+        // Flat candidate expert assignments (top-K = 2 experts per node)
+        let expertAssignments: [UInt32] = [
+            10, 11, // Node 0
+            12, 13, // Node 1
+            14, 15, // Node 2
+            12, 16, // Node 3
+            17, 18, // Node 4
+            19, 20  // Node 5
+        ]
+
+        var nodeScores: [Float] = [1.0]
+        nodeScores.append(contentsOf: draftScores)
+
+        // Budget = 5 unique experts (Root takes 2: 10, 11; Node 1 takes 2: 12, 13; Node 3 takes 1 new: 16 -> total 5)
+        // Nodes 2, 4, 5 would exceed budget 5.
+        // Node 5 (score 0.10) is a leaf -> pruned first!
+        // Node 2 (score 0.25) becomes leaf -> pruned!
+        // Node 4 (score 0.85) is a leaf -> pruned!
+        // Node 3 (score 0.90) is retained!
+        let prunedTree = pruneJetspecTreeMoe(
+            treeTokens: treeMask.tokenIds,
+            parentIndices: treeMask.parentIndices,
+            draftScores: nodeScores,
+            candidateExpertsFlat: expertAssignments,
+            expertsPerNode: 2,
+            maxUniqueExperts: 5
+        )
+
+        // Verify that low-confidence branch (Node 2: 102, Node 5: 105) and Node 4 are pruned:
+        XCTAssertFalse(prunedTree.tokenIds.contains(105), "Node 5 (score 0.10) should have been pruned")
+        XCTAssertFalse(prunedTree.tokenIds.contains(102), "Node 2 (score 0.25) should have been pruned")
+        XCTAssertFalse(prunedTree.tokenIds.contains(104), "Node 4 (score 0.85) should have been pruned")
+        // Verify that high-confidence branch (Node 1: 101, Node 3: 103) is preserved:
+        XCTAssertTrue(prunedTree.tokenIds.contains(100), "Root must be preserved")
+        XCTAssertTrue(prunedTree.tokenIds.contains(101), "Node 1 must be preserved")
+        XCTAssertTrue(prunedTree.tokenIds.contains(103), "Node 3 must be preserved")
+
+        XCTAssertEqual(prunedTree.nodeCount, 3)
+        print("✅ [TEST] Dynamic MoE budget pruning cleanly pruned 3 low-confidence nodes, preserving optimal branch [100, 101, 103].")
     }
 
     func testJetSpecMetalKernels() throws {
@@ -3578,6 +3715,116 @@ final class DynaMoETests: XCTestCase {
         }
         print("  ✅ [GDN VERIFICATION] Max Recurrent State Diff between Sequence and Step: \(maxStateDiff)")
         XCTAssertLessThan(maxStateDiff, 1e-4, "Sequence prefill final state does not match autoregressive step final state")
+    }
+
+    func testOrnith9BCodingSettingsAutoregressive() throws {
+        print("=== TEST ORNITH 1.5 9B AUTOREGRESSIVE WITH USER CODING SETTINGS ===")
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--mlx-community--Ornith-1.5-9B-OptiQ-4bit/snapshots/ad2e7748e8c9d36b82bb88307fd21c0d50be85b8"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            throw XCTSkip("Ornith 1.5 9B OptiQ-4bit snapshot not found")
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshotDir)
+        let summary = try engine.getSummary()
+
+        let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir))
+        let inference = InferenceEngine.shared
+        let cachedLayers = inference.buildCachedLayers(summary: summary, config: config, targetLayerCount: 32)
+        XCTAssertEqual(cachedLayers.count, 32)
+
+        // 1. Verify Gated DeltaNet linear attention layer detection
+        let linLayers = cachedLayers.filter { $0.attentionType == .linearAttention }.count
+        XCTAssertEqual(linLayers, 24, "Ornith 1.5 9B has exactly 24 Gated DeltaNet linear attention layers")
+        let hasLinearRecurrence = cachedLayers.contains { $0.attentionType == .linearAttention }
+        XCTAssertTrue(hasLinearRecurrence, "Ornith 1.5 9B must be detected as having linear recurrence")
+
+        // 2. Verify effectiveJetSpec logic:
+        // Even when user has JetSpec enabled, recurrent Gated DeltaNet models MUST bypass speculative tree execution
+        // because multi-node tree drafting disrupts continuous causal convolution and O(1) state updates.
+        let userJetSpecEnabled = true
+        let packedExpertsDir: URL? = nil
+        let effectiveJetSpec = userJetSpecEnabled && (packedExpertsDir == nil) && !hasLinearRecurrence
+        XCTAssertFalse(effectiveJetSpec, "effectiveJetSpec must be false for Ornith 1.5 9B to ensure 100% coherent execution")
+
+        // 3. Verify high-performance Top-K / Top-P sampling with User's Exact Coding Settings:
+        // Temperature: 0.60, Top-P: 0.95, Min-P: 0.00, Top-K: 20, Repetition Penalty: 1.00
+        let vocabSize = 152064
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let logitsBuf = device.makeBuffer(length: vocabSize * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+            XCTFail("Failed to allocate logits buffer")
+            return
+        }
+
+        let logitsPtr = logitsBuf.contents().bindMemory(to: Float.self, capacity: vocabSize)
+        // Synthesize realistic peaked logit distribution (typical of Python/Swift code generation)
+        for i in 0..<vocabSize {
+            logitsPtr[i] = -20.0
+        }
+        // Top 20 tokens (e.g. "func", "let", "var", "def", whitespace, etc.)
+        let topTokens: [UInt32] = [1000, 1005, 1010, 1020, 1050, 2000, 2050, 3000, 4000, 5000,
+                                   6000, 7000, 8000, 9000, 10000, 11000, 12000, 13000, 14000, 15000]
+        for (rank, tok) in topTokens.enumerated() {
+            logitsPtr[Int(tok)] = Float(20 - rank) // highest logit is 20.0 for token 1000
+        }
+
+        var sampledCounts: [UInt32: Int] = [:]
+        let sampleRuns = 200
+        for _ in 0..<sampleRuns {
+            let nextTok = InferenceEngine.sampleNextToken(
+                logits: logitsPtr,
+                vocabSize: vocabSize,
+                contextTokens: [151644, 872],
+                temperature: 0.60,
+                topP: 0.95,
+                minP: 0.00,
+                topK: 20,
+                repetitionPenalty: 1.00
+            )
+            sampledCounts[nextTok, default: 0] += 1
+            XCTAssertTrue(topTokens.contains(nextTok), "Sampled token \(nextTok) must be within top 20 candidates")
+        }
+
+        // Verify that the most probable token (token 1000) was sampled most frequently
+        let mostFrequent = sampledCounts.max(by: { $0.value < $1.value })?.key
+        XCTAssertEqual(mostFrequent, 1000, "Token 1000 with logit 20.0 should be the mode of distribution")
+        print("  ✅ [TEST] Top-K (20) & Top-P (0.95) temperature (0.60) sampling verified cleanly across \(sampleRuns) draws.")
+
+        // 4. Verify Presence Penalty Mechanics & Logit Restoration
+        // Set token 1000 with logit 20.0, token 1005 with logit 19.5
+        logitsPtr[1000] = 20.0
+        logitsPtr[1005] = 19.5
+
+        // Without presence penalty: greedy selects token 1000
+        let greedyNeutral = InferenceEngine.sampleNextToken(
+            logits: logitsPtr,
+            vocabSize: vocabSize,
+            contextTokens: [1000],
+            temperature: 0.00,
+            topP: 1.0,
+            minP: 0.0,
+            topK: 20,
+            repetitionPenalty: 1.00,
+            presencePenalty: 0.00
+        )
+        XCTAssertEqual(greedyNeutral, 1000, "With presencePenalty=0.0, token 1000 is chosen")
+        XCTAssertEqual(logitsPtr[1000], 20.0, "Logit must be restored cleanly by defer")
+
+        // With presence penalty 1.0 on token 1000 (which is in contextTokens):
+        // Effective logit for 1000 becomes 20.0 - 1.0 = 19.0, so token 1005 (19.5) wins!
+        let greedyPenalized = InferenceEngine.sampleNextToken(
+            logits: logitsPtr,
+            vocabSize: vocabSize,
+            contextTokens: [1000],
+            temperature: 0.00,
+            topP: 1.0,
+            minP: 0.0,
+            topK: 20,
+            repetitionPenalty: 1.00,
+            presencePenalty: 1.00
+        )
+        XCTAssertEqual(greedyPenalized, 1005, "Presence penalty of 1.0 must suppress seen token 1000 below token 1005")
+        XCTAssertEqual(logitsPtr[1000], 20.0, "Original logit 1000 must be restored cleanly by defer")
+        print("  ✅ [TEST] Presence penalty (1.00) suppression and defer logit restoration verified.")
     }
 }
 

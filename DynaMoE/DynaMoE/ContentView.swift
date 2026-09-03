@@ -643,6 +643,7 @@ struct ContentView: View {
     @State private var minP: Float = 0.05
     @State private var topK: Int = 50
     @State private var repetitionPenalty: Float = 1.1
+    @State private var presencePenalty: Float = 0.0
     @AppStorage("dynamoe_max_tokens") private var maxNewTokens: Int = 8192
     @State private var isGeneratingText: Bool = false
     @State private var generatedStreamText: String = ""
@@ -873,6 +874,9 @@ struct ContentView: View {
                     isStreamingOffDisk: isStreamingOffDisk,
                     generationSpeed: generationSpeedTokPerSec,
                     generationTokens: generationTotalTokens,
+                    jetSpecEnabled: jetSpecEnabled,
+                    jetSpecMeanTau: jetSpecMeanTau,
+                    jetSpecDraftAccepted: jetSpecTotalDraftAccepted,
                     modelName: activeModelDisplayName,
                     tokenizer: tokenizer,
                     supportsThinking: activeModelSupportsThinking,
@@ -1021,6 +1025,7 @@ struct ContentView: View {
             minP: $minP,
             topK: $topK,
             repetitionPenalty: $repetitionPenalty,
+            presencePenalty: $presencePenalty,
             maxNewTokens: $maxNewTokens,
             systemPrompt: $systemPrompt,
             targetLayerCount: $targetLayerCount,
@@ -1208,7 +1213,7 @@ struct ContentView: View {
 
         do {
             guard let embedWeight = summary.tensors.first(where: {
-                !$0.name.hasPrefix("visual.") && !$0.name.hasPrefix("mtp.") &&
+                !$0.name.contains("visual") && !$0.name.contains("mtp") &&
                 ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.contains("wte")) &&
                 $0.name.contains("weight") && !$0.name.contains("scale")
             }) else {
@@ -2776,168 +2781,20 @@ struct ContentView: View {
         topP: Float,
         minP: Float,
         topK: Int,
-        repetitionPenalty: Float
+        repetitionPenalty: Float,
+        presencePenalty: Float = 0.0
     ) -> UInt32 {
-        // 1. Direct repetition penalty to recent context tokens (no Set lookup across 166k items)
-        let recent = contextTokens.suffix(256)
-        var origVals: [(Int, Float)] = []
-        if repetitionPenalty > 1.001 {
-            origVals.reserveCapacity(recent.count)
-            for tok in recent {
-                let v = Int(tok)
-                if v < vocabSize {
-                    let l = logits[v]
-                    origVals.append((v, l))
-                    logits[v] = l > 0 ? (l / repetitionPenalty) : (l * repetitionPenalty)
-                }
-            }
-        }
-
-        // Hardware-Vectorized Greedy Fast Path (temperature <= 0.01) using vDSP_maxvi
-        if temperature <= 0.01 {
-            var bestIdx: vDSP_Length = 0
-            var bestVal: Float = 0
-            vDSP_maxvi(logits, 1, &bestVal, &bestIdx, vDSP_Length(vocabSize))
-            // Restore context logits
-            for (v, orig) in origVals {
-                logits[v] = orig
-            }
-            return UInt32(bestIdx)
-        }
-
-        // 2. High-performance top-K selection using Min-Heap (O(log K) per candidate without array shifting)
-        let effectiveTopK = max(1, min(topK, vocabSize))
-        var heap: [(id: Int, logit: Float)] = []
-        heap.reserveCapacity(effectiveTopK)
-
-        for v in 0..<effectiveTopK {
-            heap.append((id: v, logit: logits[v]))
-        }
-        // Build min-heap (root at index 0 is minimum element)
-        if effectiveTopK > 1 {
-            for i in stride(from: (effectiveTopK / 2) - 1, through: 0, by: -1) {
-                var parent = i
-                while true {
-                    let left = 2 * parent + 1
-                    let right = left + 1
-                    var smallest = parent
-                    if left < effectiveTopK && heap[left].logit < heap[smallest].logit {
-                        smallest = left
-                    }
-                    if right < effectiveTopK && heap[right].logit < heap[smallest].logit {
-                        smallest = right
-                    }
-                    if smallest != parent {
-                        heap.swapAt(parent, smallest)
-                        parent = smallest
-                    } else {
-                        break
-                    }
-                }
-            }
-        }
-
-        // Stream through remaining logits, updating min-heap in O(log K) without array shifting
-        var minLogit = heap[0].logit
-        for v in effectiveTopK..<vocabSize {
-            let logit = logits[v]
-            if logit > minLogit {
-                heap[0] = (id: v, logit: logit)
-                var parent = 0
-                while true {
-                    let left = 2 * parent + 1
-                    let right = left + 1
-                    var smallest = parent
-                    if left < effectiveTopK && heap[left].logit < heap[smallest].logit {
-                        smallest = left
-                    }
-                    if right < effectiveTopK && heap[right].logit < heap[smallest].logit {
-                        smallest = right
-                    }
-                    if smallest != parent {
-                        heap.swapAt(parent, smallest)
-                        parent = smallest
-                    } else {
-                        break
-                    }
-                }
-                minLogit = heap[0].logit
-            }
-        }
-
-        // Restore context logits
-        for (v, orig) in origVals {
-            logits[v] = orig
-        }
-
-        let candidates = heap.sorted(by: { $0.logit > $1.logit })
-        guard let first = candidates.first else { return 0 }
-
-        let count = candidates.count
-        var logitVec = candidates.map { $0.logit }
-        var scaledLogits = [Float](repeating: 0, count: count)
-        var probs = [Float](repeating: 0, count: count)
-
-        let invTemp = 1.0 / max(temperature, 0.01)
-        let maxLogit = first.logit
-
-        // Vectorized: (logits - maxLogit) * invTemp using Accelerate vDSP
-        var negMaxLogit = -maxLogit
-        var tempScale = invTemp
-        vDSP_vsadd(logitVec, 1, &negMaxLogit, &scaledLogits, 1, vDSP_Length(count))
-        vDSP_vsmul(scaledLogits, 1, &tempScale, &scaledLogits, 1, vDSP_Length(count))
-
-        // Vectorized exponential: probs = exp(scaledLogits)
-        var n = Int32(count)
-        vvexpf(&probs, scaledLogits, &n)
-
-        // Vectorized sum of exponents
-        var expSum: Float = 0
-        vDSP_sve(probs, 1, &expSum, vDSP_Length(count))
-
-        if expSum <= 0.0 {
-            return UInt32(first.id)
-        }
-
-        // Vectorized normalization: probs = probs / expSum
-        var invExpSum = 1.0 / expSum
-        vDSP_vsmul(probs, 1, &invExpSum, &probs, 1, vDSP_Length(count))
-
-        // 3. Adaptive Min-P Dynamic Truncation
-        // Retain only tokens whose probability is >= max_prob * minP
-        let maxProb = probs[0]
-        let minPThreshold = maxProb * max(0.0, min(minP, 1.0))
-        var minPFilteredCount = count
-        for i in 0..<count {
-            if probs[i] < minPThreshold {
-                minPFilteredCount = max(1, i)
-                break
-            }
-        }
-
-        // 4. Top-P (Nucleus) Truncation on top of Min-P
-        var cumulativeProb: Float = 0.0
-        var cutoffIndex = minPFilteredCount - 1
-        for i in 0..<minPFilteredCount {
-            cumulativeProb += probs[i]
-            if cumulativeProb >= topP {
-                cutoffIndex = i
-                break
-            }
-        }
-
-        var nucleusSum: Float = 0
-        vDSP_sve(probs, 1, &nucleusSum, vDSP_Length(cutoffIndex + 1))
-        let randomVal = Float.random(in: 0..<1.0) * nucleusSum
-        var runningSum: Float = 0.0
-        for i in 0...cutoffIndex {
-            runningSum += probs[i]
-            if runningSum >= randomVal {
-                return UInt32(candidates[i].id)
-            }
-        }
-
-        return UInt32(candidates[0].id)
+        return InferenceEngine.sampleNextToken(
+            logits: logits,
+            vocabSize: vocabSize,
+            contextTokens: contextTokens,
+            temperature: temperature,
+            topP: topP,
+            minP: minP,
+            topK: topK,
+            repetitionPenalty: repetitionPenalty,
+            presencePenalty: presencePenalty
+        )
     }
 
     private func stopAutoregressiveGeneration() {
@@ -3040,7 +2897,7 @@ struct ContentView: View {
 
         // Find Embedding Weight & Affine Scales/Biases
         guard let embedWeight = summary.tensors.first(where: {
-            !$0.name.hasPrefix("visual.") && !$0.name.hasPrefix("mtp.") &&
+            !$0.name.contains("visual") && !$0.name.contains("mtp") &&
             ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.contains("wte")) &&
             !$0.name.contains("scale") && !$0.name.contains("scales") &&
             !$0.name.contains("bias") && !$0.name.contains("biases")
@@ -3052,12 +2909,12 @@ struct ContentView: View {
         }
 
         let embedScale = summary.tensors.first(where: {
-            !$0.name.hasPrefix("visual.") && !$0.name.hasPrefix("mtp.") &&
+            !$0.name.contains("visual") && !$0.name.contains("mtp") &&
             ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.contains("wte")) &&
             ($0.name.contains("scale") || $0.name.contains("scales"))
         })
         let embedBias = summary.tensors.first(where: {
-            !$0.name.hasPrefix("visual.") && !$0.name.hasPrefix("mtp.") &&
+            !$0.name.contains("visual") && !$0.name.contains("mtp") &&
             ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.contains("wte")) &&
             ($0.name.contains("bias") || $0.name.contains("biases"))
         })
@@ -3650,6 +3507,7 @@ struct ContentView: View {
         let minPVal = self.minP
         let topKVal = self.topK
         let repPen = self.repetitionPenalty
+        let presPen = self.presencePenalty
         let maxTokens = self.maxNewTokens
         let buffers = self.shardBuffers
         let effMode = self.memoryExecutionMode.resolveEffectiveMode(modelFootprintGB: summary.sizeGb)
@@ -7193,7 +7051,12 @@ struct ContentView: View {
             }
 
             // Allocate JetSpec Staging Buffers for Tree Drafting & Verification
-            let effectiveJetSpec = jetSpecEnabled
+            // Speculative tree forward pass is enabled for resident in-memory standard attention models.
+            // Disk-streamed MoE models (packedExpertsDir != nil) and Linear Recurrence / Gated DeltaNet
+            // hybrid models (maintaining continuous causal convolution and O(1) recurrent states)
+            // execute via the direct single-token path for maximum throughput and state integrity.
+            let hasLinearRecurrence = cachedLayers.contains { $0.attentionType == .linearAttention }
+            let effectiveJetSpec = jetSpecEnabled && (packedExpertsDir == nil) && !hasLinearRecurrence
             let effectiveInterDim = modelConfig?.intermediateSize ?? Int(cachedLayers.first?.intermediateDim ?? 14336)
             let effectiveQkvDim = Int(max(hiddenDim * 2, 8192))
             let effectiveZDim = Int(max(hiddenDim * 2, 8192))
@@ -7215,7 +7078,7 @@ struct ContentView: View {
             ) : nil
 
             // Multi-Node Parallel Tree Forward Pass (Target Backbone Execution)
-            func runJetSpecTreeForward(treeMask: JetSpecTreeMask, step: UInt32) -> Bool {
+            func runJetSpecTreeForward(treeMask: JetSpecTreeMask, nodeScores: [Float], step: UInt32) -> Bool {
                 guard let jb = jetspecStaging else { return false }
                 let N = Int(treeMask.nodeCount)
                 if N == 0 { return false }
@@ -7812,14 +7675,10 @@ struct ContentView: View {
 
                             var activeNodeIndices = Array(0..<N)
                             if uniqueActiveExperts.count > jetSpecMaxExpertCap && N > 1 {
-                                var scoresForNodes: [Float] = []
-                                for idx in 0..<N {
-                                    scoresForNodes.append(idx < treeMask.tokenIds.count ? 1.0 : 0.5)
-                                }
                                 let prunedMask = pruneJetspecTreeMoe(
                                     treeTokens: treeMask.tokenIds,
                                     parentIndices: treeMask.parentIndices,
-                                    draftScores: scoresForNodes,
+                                    draftScores: nodeScores,
                                     candidateExpertsFlat: flatCandidateExperts,
                                     expertsPerNode: UInt32(topKCount),
                                     maxUniqueExperts: UInt32(jetSpecMaxExpertCap)
@@ -7976,7 +7835,7 @@ struct ContentView: View {
                 return true
             }
 
-            func runJetSpecTreeStep(rootToken: UInt32, step: UInt32) -> (acceptedTokens: [UInt32], newStep: UInt32)? {
+            func runJetSpecTreeStep(rootToken: UInt32, step: UInt32, temperature: Float) -> (acceptedTokens: [UInt32], newStep: UInt32)? {
                 guard effectiveJetSpec, let jb = jetspecStaging else { return nil }
 
                 // 1. Obtain draft candidate proposals (N-gram Prompt Lookup + Top-K Logits fallback)
@@ -7993,7 +7852,7 @@ struct ContentView: View {
                             let numDraft = min(8, ctxLen - matchEnd)
                             for j in 0..<numDraft {
                                 topDraftTokens.append(contextTokens[matchEnd + j])
-                                topDraftScores.append(1.0 - Float(j) * 0.1)
+                                topDraftScores.append(max(0.1, 1.0 - Float(j) * 0.1))
                             }
                             break
                         }
@@ -8022,9 +7881,15 @@ struct ContentView: View {
                             }
                         }
                     }
-                    for cand in topCandidates {
+
+                    let maxScore = topCandidates.map { $0.score }.max() ?? 0.0
+                    let effTemp = max(0.01, temperature)
+                    let expScores = topCandidates.map { exp(($0.score - maxScore) / effTemp) }
+                    let sumExp = expScores.reduce(0.0, +)
+                    for (idx, cand) in topCandidates.enumerated() {
                         topDraftTokens.append(cand.token)
-                        topDraftScores.append(cand.score)
+                        let prob = sumExp > 0 ? (expScores[idx] / sumExp) : (1.0 / Float(topCandidates.count))
+                        topDraftScores.append(prob)
                     }
                 }
 
@@ -8044,19 +7909,40 @@ struct ContentView: View {
                 if nodeCount <= 1 { return nil }
 
                 // 3. Multi-Node Parallel Tree Forward Pass with real MoE router pre-pass and expert budget enforcement
-                let ok = runJetSpecTreeForward(treeMask: treeMask, step: step)
+                var nodeScores: [Float] = [1.0]
+                for s in topDraftScores {
+                    nodeScores.append(s)
+                }
+                while nodeScores.count < Int(treeMask.nodeCount) {
+                    nodeScores.append(0.5)
+                }
+                let ok = runJetSpecTreeForward(treeMask: treeMask, nodeScores: nodeScores, step: step)
                 if !ok { return nil }
 
-                // 5. Verify acceptance using Rust acceptance oracle
+                // 5. Verify acceptance using Rust acceptance oracle (Greedy fast-path or Stochastic Sampling)
                 let targetLogitsPtr = jb.targetLogitsBuffer.contents().bindMemory(to: Float.self, capacity: Int(treeMask.nodeCount) * Int(vocabSize))
                 let treeTargetLogits = Array(UnsafeBufferPointer(start: targetLogitsPtr, count: Int(treeMask.nodeCount) * Int(vocabSize)))
 
-                let acceptedResult = verifyJetspecTreeGreedy(
-                    treeTokens: treeMask.tokenIds,
-                    parentIndices: treeMask.parentIndices,
-                    targetLogits: treeTargetLogits,
-                    vocabSize: vocabSize
-                )
+                let acceptedResult: JetSpecAcceptedResult
+                if temperature <= 0.01 {
+                    acceptedResult = verifyJetspecTreeGreedy(
+                        treeTokens: treeMask.tokenIds,
+                        parentIndices: treeMask.parentIndices,
+                        targetLogits: treeTargetLogits,
+                        vocabSize: vocabSize
+                    )
+                } else {
+                    let rngSeed = UInt64.random(in: 1...UInt64.max)
+                    acceptedResult = verifyJetspecTreeSampling(
+                        treeTokens: treeMask.tokenIds,
+                        parentIndices: treeMask.parentIndices,
+                        draftProbs: [],
+                        targetLogits: treeTargetLogits,
+                        vocabSize: vocabSize,
+                        temperature: temperature,
+                        rngSeed: rngSeed
+                    )
+                }
 
                 // 6. Speculative KV Cache Compaction for accepted branch
                 if acceptedResult.acceptedCount > 0,
@@ -8183,7 +8069,7 @@ struct ContentView: View {
 
                 var acceptedBatch: [UInt32] = []
                 if effectiveJetSpec && tokensGenerated > 0,
-                   let treeStepResult = runJetSpecTreeStep(rootToken: currentTokenId, step: currentStep),
+                   let treeStepResult = runJetSpecTreeStep(rootToken: currentTokenId, step: currentStep, temperature: temp),
                    !treeStepResult.acceptedTokens.isEmpty {
                     acceptedBatch = treeStepResult.acceptedTokens
                     currentStep = treeStepResult.newStep
@@ -8205,7 +8091,8 @@ struct ContentView: View {
                         topP: topPVal,
                         minP: minPVal,
                         topK: topKVal,
-                        repetitionPenalty: repPen
+                        repetitionPenalty: repPen,
+                        presencePenalty: presPen
                     )
                     if tokensGenerated < 10 {
                         let tokText = (try? tokenizer.decode(ids: [nextToken])) ?? ""
@@ -8374,6 +8261,8 @@ struct ContentView: View {
                                 self.sessions[sIdx].messages[mIdx].tokensPerSec = tokPerSec
                                 self.sessions[sIdx].messages[mIdx].timeToFirstTokenSeconds = liveTtft
                                 self.sessions[sIdx].messages[mIdx].thinkingTimeSeconds = liveThinkDuration
+                                self.sessions[sIdx].messages[mIdx].jetSpecTau = (effectiveJetSpec && self.jetSpecTotalDraftProposed > 0) ? self.jetSpecMeanTau : nil
+                                self.sessions[sIdx].messages[mIdx].jetSpecDraftAccepted = (effectiveJetSpec && self.jetSpecTotalDraftAccepted > 0) ? self.jetSpecTotalDraftAccepted : nil
                             }
                         }
                     }
@@ -8449,7 +8338,7 @@ struct ContentView: View {
                 self.generationTotalTokens = tokensGenerated
                 self.generationElapsedMs = finalElapsedMs
                 self.generationSpeedTokPerSec = finalTokPerSec
-                let finalJetSpecBadge = self.jetSpecEnabled && self.jetSpecTotalDraftProposed > 0 ? " (JetSpec τ=\(String(format: "%.1f", self.jetSpecMeanTau)), \(self.jetSpecTotalDraftAccepted) draft tokens accepted)" : ""
+                let finalJetSpecBadge = effectiveJetSpec && self.jetSpecTotalDraftProposed > 0 ? " (JetSpec τ=\(String(format: "%.1f", self.jetSpecMeanTau)), \(self.jetSpecTotalDraftAccepted) draft tokens accepted)" : ""
                 self.generationStatusText = "✨ Generated \(tokensGenerated) tokens in \(String(format: "%.2f", finalElapsedMs)) ms (\(String(format: "%.1f", finalTokPerSec)) tok/s)\(finalJetSpecBadge)"
                 self.currentRssGB = finalRss
                 self.residentExpertCount = finalResCount
@@ -8489,6 +8378,8 @@ struct ContentView: View {
                         self.sessions[sIdx].messages[mIdx].tokensPerSec = finalTokPerSec
                         self.sessions[sIdx].messages[mIdx].timeToFirstTokenSeconds = finalTtft
                         self.sessions[sIdx].messages[mIdx].thinkingTimeSeconds = finalThinkDuration
+                        self.sessions[sIdx].messages[mIdx].jetSpecTau = (effectiveJetSpec && self.jetSpecTotalDraftProposed > 0) ? self.jetSpecMeanTau : nil
+                        self.sessions[sIdx].messages[mIdx].jetSpecDraftAccepted = (effectiveJetSpec && self.jetSpecTotalDraftAccepted > 0) ? self.jetSpecTotalDraftAccepted : nil
                     }
                 }
             }

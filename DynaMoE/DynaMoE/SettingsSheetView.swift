@@ -62,6 +62,7 @@ struct SettingsSheetView: View {
     @Binding var minP: Float
     @Binding var topK: Int
     @Binding var repetitionPenalty: Float
+    @Binding var presencePenalty: Float
     @Binding var maxNewTokens: Int
     @Binding var systemPrompt: String
     @Binding var targetLayerCount: Int
@@ -556,6 +557,19 @@ struct SettingsSheetView: View {
                     Slider(value: $repetitionPenalty, in: 1.0...2.0, step: 0.05)
                 }
 
+                // Presence Penalty
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Presence Penalty")
+                            .font(.subheadline)
+                        Spacer()
+                        Text(String(format: "%.2f", presencePenalty))
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(.purple)
+                    }
+                    Slider(value: $presencePenalty, in: 0.0...2.0, step: 0.05)
+                }
+
                 // Max New Tokens
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
@@ -605,7 +619,7 @@ struct SettingsSheetView: View {
                                     .font(.subheadline)
                                     .fontWeight(.semibold)
                             }
-                            Text("Accelerates token generation via causal parallel tree drafting and dynamic MoE budget pruning.")
+                            Text("Accelerates generation via parallel tree drafting and dynamic MoE budget pruning on resident standard attention models. Gated DeltaNet recurrent models (such as Ornith 1.5) and disk-streamed models automatically use optimized direct execution for maximum speed and state accuracy.")
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                         }

@@ -64,6 +64,8 @@ public struct ChatMessage: Identifiable, Codable, Equatable {
     public var thinkingTimeSeconds: Double?
     public var prefillStatus: String?
     public var toolCalls: [ToolCallRecord]?
+    public var jetSpecTau: Double?
+    public var jetSpecDraftAccepted: Int?
 
     public init(
         id: UUID = UUID(),
@@ -77,7 +79,9 @@ public struct ChatMessage: Identifiable, Codable, Equatable {
         timeToFirstTokenSeconds: Double? = nil,
         thinkingTimeSeconds: Double? = nil,
         prefillStatus: String? = nil,
-        toolCalls: [ToolCallRecord]? = nil
+        toolCalls: [ToolCallRecord]? = nil,
+        jetSpecTau: Double? = nil,
+        jetSpecDraftAccepted: Int? = nil
     ) {
         self.id = id
         self.role = role
@@ -91,6 +95,8 @@ public struct ChatMessage: Identifiable, Codable, Equatable {
         self.thinkingTimeSeconds = thinkingTimeSeconds
         self.prefillStatus = prefillStatus
         self.toolCalls = toolCalls
+        self.jetSpecTau = jetSpecTau
+        self.jetSpecDraftAccepted = jetSpecDraftAccepted
     }
 }
 
