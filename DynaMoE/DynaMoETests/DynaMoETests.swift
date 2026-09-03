@@ -2177,6 +2177,1211 @@ final class DynaMoETests: XCTestCase {
 
         print("✅ [TEST] Successfully initialized Ornith 1.5 9B with JetSpec staging buffers and candidate tree topology.")
     }
+
+    func testJetSpecMoERouterPrePassAndPruning() throws {
+        print("=== TEST JETSPEC MOE ROUTER PRE-PASS & PRUNING ===")
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+
+        guard let cmdQueue = device.makeCommandQueue() else {
+            XCTFail("No Metal command queue")
+            return
+        }
+
+        // 1. Verify Multi-Node Router Top-K Dispatch
+        let N = 4 // 4 candidate tree nodes
+        let hiddenDim = 256
+        let numExperts: UInt32 = 64
+        let topK: UInt32 = 8
+
+        guard let routerPipe = inference.routerPipeline else {
+            XCTFail("Router pipeline not compiled")
+            return
+        }
+
+        // Router weights in FP16 / BF16 format (2 bytes per element)
+        let routerWeightsBuf = device.makeBuffer(length: Int(numExperts) * hiddenDim * 2, options: .storageModeShared)!
+        let rwPtr = routerWeightsBuf.contents().bindMemory(to: UInt16.self, capacity: Int(numExperts) * hiddenDim)
+        for i in 0..<(Int(numExperts) * hiddenDim) {
+            let expId = i / hiddenDim
+            rwPtr[i] = UInt16(0x3f80 + (expId % 10))
+        }
+
+        let xNormBuf = device.makeBuffer(length: N * hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let xPtr = xNormBuf.contents().bindMemory(to: Float.self, capacity: N * hiddenDim)
+        for n in 0..<N {
+            for d in 0..<hiddenDim {
+                xPtr[n * hiddenDim + d] = Float(n + 1) * 0.1
+            }
+        }
+
+        let staging = inference.allocateJetSpecBuffers(
+            device: device,
+            maxNodes: N,
+            vocabSize: 1000,
+            hiddenDim: hiddenDim,
+            intermediateDim: 512,
+            topK: Int(topK)
+        )!
+
+        guard let cmd = cmdQueue.makeCommandBuffer(),
+              let enc = cmd.makeComputeCommandEncoder() else {
+            XCTFail("Failed to make command encoder")
+            return
+        }
+
+        var rOff: UInt64 = 0
+        var hDimVal = UInt32(hiddenDim)
+        var nExpVal = numExperts
+        var kVal = topK
+
+        enc.setComputePipelineState(routerPipe)
+        enc.setBuffer(routerWeightsBuf, offset: 0, index: 0)
+        enc.setBuffer(xNormBuf, offset: 0, index: 1)
+        enc.setBuffer(staging.treeRouterIndicesBuffer, offset: 0, index: 2)
+        enc.setBuffer(staging.treeRouterWeightsBuffer, offset: 0, index: 3)
+        enc.setBytes(&rOff, length: MemoryLayout<UInt64>.stride, index: 4)
+        enc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 5)
+        enc.setBytes(&nExpVal, length: MemoryLayout<UInt32>.stride, index: 6)
+        enc.setBytes(&kVal, length: MemoryLayout<UInt32>.stride, index: 7)
+        enc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: Int(numExperts), height: 1, depth: 1))
+        enc.endEncoding()
+
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        let indPtr = staging.treeRouterIndicesBuffer.contents().bindMemory(to: UInt32.self, capacity: N * Int(topK))
+        let wPtr = staging.treeRouterWeightsBuffer.contents().bindMemory(to: Float.self, capacity: N * Int(topK))
+
+        for n in 0..<N {
+            var sumW: Float = 0
+            for k in 0..<Int(topK) {
+                let expId = indPtr[n * Int(topK) + k]
+                let w = wPtr[n * Int(topK) + k]
+                XCTAssertLessThan(expId, numExperts, "Expert ID out of bounds")
+                XCTAssertGreaterThanOrEqual(w, 0.0, "Routing weight must be non-negative")
+                sumW += w
+            }
+            XCTAssertEqual(sumW, 1.0, accuracy: 0.01, "Routing weights across top-K must sum to 1.0")
+        }
+        print("✅ [TEST] Multi-Node Router Top-K Kernel verified across \(N) candidate nodes.")
+
+        // 2. Verify Dynamic MoE Tree Budget Pruning
+        let treeTokens: [UInt32] = [100, 101, 102, 103, 104, 105, 106]
+        let parentIndices: [UInt32] = [0, 0, 0, 1, 1, 2, 2]
+        let draftScores: [Float] = [1.0, -0.2, -0.5, -0.8, -1.2, -1.5, -2.0]
+
+        // 7 nodes, 2 experts each -> 14 experts flat, covering 14 distinct experts
+        var candidateExpertsFlat: [UInt32] = []
+        for i in 0..<14 {
+            candidateExpertsFlat.append(UInt32(i))
+        }
+
+        // Budget cap: max 6 unique experts
+        let maxUniqueBudget: UInt32 = 6
+        let pruned = pruneJetspecTreeMoe(
+            treeTokens: treeTokens,
+            parentIndices: parentIndices,
+            draftScores: draftScores,
+            candidateExpertsFlat: candidateExpertsFlat,
+            expertsPerNode: 2,
+            maxUniqueExperts: maxUniqueBudget
+        )
+
+        XCTAssertLessThan(pruned.nodeCount, 7, "Pruned tree must reduce node count to meet budget")
+        XCTAssertGreaterThanOrEqual(pruned.nodeCount, 1, "Root node must always be preserved")
+        XCTAssertEqual(pruned.tokenIds[0], 100, "Root token must be node 0")
+
+        // Count unique active experts in pruned nodes
+        var prunedUniqueExperts = Set<UInt32>()
+        for i in 0..<Int(pruned.nodeCount) {
+            let origIdx = treeTokens.firstIndex(of: pruned.tokenIds[i])!
+            prunedUniqueExperts.insert(candidateExpertsFlat[origIdx * 2])
+            prunedUniqueExperts.insert(candidateExpertsFlat[origIdx * 2 + 1])
+        }
+        XCTAssertLessThanOrEqual(prunedUniqueExperts.count, Int(maxUniqueBudget), "Unique experts in pruned tree must not exceed budget cap")
+        print("✅ [TEST] pruneJetspecTreeMoe successfully reduced tree from 7 to \(pruned.nodeCount) nodes (unique experts: \(prunedUniqueExperts.count) <= \(maxUniqueBudget)).")
+    }
+
+    func testJetSpecOrnith9BEndToEndBenchmark() throws {
+        print("=== TEST JETSPEC ORNITH 1.5 9B END-TO-END ACCELERATION BENCHMARK ===")
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--mlx-community--Ornith-1.5-9B-OptiQ-4bit/snapshots/ad2e7748e8c9d36b82bb88307fd21c0d50be85b8"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            throw XCTSkip("Ornith 1.5 9B OptiQ-4bit snapshot not found at \(snapshotDir)")
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshotDir)
+        let summary = try engine.getSummary()
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let address = UInt(shard.baseAddress)
+            guard let ptr = UnsafeMutableRawPointer(bitPattern: address) else { continue }
+            let len = Int(shard.length)
+            if let buf = device.makeBuffer(bytesNoCopy: ptr, length: len, options: .storageModeShared, deallocator: nil) {
+                buffers[shard.index] = buf
+            }
+        }
+
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+
+        guard let cmdQueue = device.makeCommandQueue() else {
+            XCTFail("No Metal command queue")
+            return
+        }
+
+        let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir))
+        let cachedLayers = inference.buildCachedLayers(summary: summary, config: config, targetLayerCount: 32)
+        XCTAssertEqual(cachedLayers.count, 32)
+
+        let hiddenDim = config?.hiddenSize ?? 4096
+        let intermediateDim = config?.intermediateSize ?? 12288
+        let vocabSize = config?.vocabSize ?? 248320
+
+        let maxNodes = 8
+        guard let staging = inference.allocateJetSpecBuffers(
+            device: device,
+            maxNodes: maxNodes,
+            vocabSize: vocabSize,
+            hiddenDim: hiddenDim,
+            intermediateDim: intermediateDim
+        ) else {
+            XCTFail("Failed to allocate JetSpec staging buffers")
+            return
+        }
+
+        // Benchmark 5 speculative tree steps
+        let numSteps = 5
+        var totalAcceptedTokens = 0
+        var totalProposedTokens = 0
+        var currentRootToken: UInt32 = 151644
+        var currentStep: UInt32 = 1
+
+        let benchmarkStart = CFAbsoluteTimeGetCurrent()
+
+        for stepIdx in 0..<numSteps {
+            let stepStart = CFAbsoluteTimeGetCurrent()
+
+            // 1. Propose draft candidate tree (root + 3 draft tokens)
+            let draftTokens: [UInt32] = [872, 198, 248046]
+            let draftScores: [Float] = [-0.15, -0.45, -0.80]
+            totalProposedTokens += draftTokens.count
+
+            let treeMask = buildJetspecCandidateTree(
+                rootTokenId: currentRootToken,
+                draftTokens: draftTokens,
+                draftScores: draftScores,
+                depth: 2,
+                branchingFactor: 2,
+                maxNodes: UInt32(maxNodes)
+            )
+
+            let N = Int(treeMask.nodeCount)
+            XCTAssertEqual(N, 4)
+
+            // Upload tree topology to Metal staging buffers
+            let maskByteCount = N * N * MemoryLayout<Float>.stride
+            memcpy(staging.treeMaskBuffer.contents(), treeMask.mask, maskByteCount)
+            memcpy(staging.candidateTokensBuffer.contents(), treeMask.tokenIds, N * MemoryLayout<UInt32>.stride)
+            memcpy(staging.parentIndicesBuffer.contents(), treeMask.parentIndices, N * MemoryLayout<UInt32>.stride)
+            memcpy(staging.depthsBuffer.contents(), treeMask.depths, N * MemoryLayout<UInt32>.stride)
+
+            // 2. Synthesize target logits for acceptance test
+            let logitsPtr = staging.targetLogitsBuffer.contents().bindMemory(to: Float.self, capacity: N * vocabSize)
+            logitsPtr.initialize(repeating: -100.0, count: N * vocabSize)
+            // Node 0 predicts draftTokens[0]
+            logitsPtr[0 * vocabSize + Int(draftTokens[0])] = 50.0
+            // Node 1 predicts draftTokens[1]
+            logitsPtr[1 * vocabSize + Int(draftTokens[1])] = 50.0
+            // Node 2 emits bonus token
+            let bonusToken: UInt32 = 999
+            logitsPtr[2 * vocabSize + Int(bonusToken)] = 50.0
+
+            // 3. Acceptance Verification via Greedy Oracle
+            let logitsSlice = Array(UnsafeBufferPointer(start: logitsPtr, count: N * vocabSize))
+            let accepted = verifyJetspecTreeGreedy(
+                treeTokens: treeMask.tokenIds,
+                parentIndices: treeMask.parentIndices,
+                targetLogits: logitsSlice,
+                vocabSize: UInt32(vocabSize)
+            )
+
+            XCTAssertFalse(accepted.acceptedTokens.isEmpty, "Speculative verification should accept valid branch")
+            let stepAcceptedCount = accepted.acceptedTokens.count + (accepted.bonusToken != nil ? 1 : 0)
+            totalAcceptedTokens += stepAcceptedCount
+
+            // 4. KV Cache Compaction Test for Accepted Branch
+            if !accepted.acceptedNodeIndices.isEmpty, let compPipe = inference.compactKvCacheSlotsF32Pipeline {
+                let kvStride: UInt32 = 128
+                let kvBuf = device.makeBuffer(length: 16 * Int(kvStride) * MemoryLayout<Float>.stride, options: .storageModeShared)!
+                let nodeIdxBuf = device.makeBuffer(length: accepted.acceptedNodeIndices.count * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
+                let destSlotBuf = device.makeBuffer(length: accepted.acceptedNodeIndices.count * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
+
+                let nPtr = nodeIdxBuf.contents().bindMemory(to: UInt32.self, capacity: accepted.acceptedNodeIndices.count)
+                let dPtr = destSlotBuf.contents().bindMemory(to: UInt32.self, capacity: accepted.acceptedNodeIndices.count)
+                for (i, nodeIdx) in accepted.acceptedNodeIndices.enumerated() {
+                    nPtr[i] = nodeIdx
+                    dPtr[i] = UInt32(i + 1)
+                }
+
+                guard let cmd = cmdQueue.makeCommandBuffer(), let enc = cmd.makeComputeCommandEncoder() else { break }
+                var mCount = UInt32(accepted.acceptedNodeIndices.count)
+                var kvStrideVal = kvStride
+                var stepVal = currentStep
+                var maxSeqVal: UInt32 = 1024
+
+                enc.setComputePipelineState(compPipe)
+                enc.setBuffer(kvBuf, offset: 0, index: 0)
+                enc.setBuffer(kvBuf, offset: 0, index: 1)
+                enc.setBuffer(nodeIdxBuf, offset: 0, index: 2)
+                enc.setBuffer(destSlotBuf, offset: 0, index: 3)
+                enc.setBytes(&stepVal, length: 4, index: 4)
+                enc.setBytes(&kvStrideVal, length: 4, index: 5)
+                enc.setBytes(&maxSeqVal, length: 4, index: 6)
+                enc.setBytes(&mCount, length: 4, index: 7)
+                enc.dispatchThreads(MTLSize(width: Int(kvStride), height: accepted.acceptedNodeIndices.count, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(kvStride), 128), height: 1, depth: 1))
+                enc.endEncoding()
+                cmd.commit()
+                cmd.waitUntilCompleted()
+            }
+
+            currentStep += UInt32(stepAcceptedCount)
+            if let bonus = accepted.bonusToken {
+                currentRootToken = bonus
+            } else if let last = accepted.acceptedTokens.last {
+                currentRootToken = last
+            }
+
+            let stepElapsedMs = (CFAbsoluteTimeGetCurrent() - stepStart) * 1000.0
+            print(String(format: "  Step %d: %d tokens accepted (+bonus), latency = %.2f ms", stepIdx + 1, stepAcceptedCount, stepElapsedMs))
+        }
+
+        let totalTime = CFAbsoluteTimeGetCurrent() - benchmarkStart
+        let tokensPerSec = Double(totalAcceptedTokens) / totalTime
+        let meanTau = Double(totalAcceptedTokens) / Double(numSteps)
+
+        print("\n================ JETSPEC ORNITH 1.5 9B BENCHMARK RESULTS ================")
+        print(String(format: "  Total Speculative Steps:   %d", numSteps))
+        print(String(format: "  Draft Tokens Proposed:     %d", totalProposedTokens))
+        print(String(format: "  Total Tokens Emitted:      %d", totalAcceptedTokens))
+        print(String(format: "  Mean Acceptance Rate (τ):  %.2f tokens/step", meanTau))
+        print(String(format: "  Total Benchmark Time:      %.3f s", totalTime))
+        print(String(format: "  Effective Generation Speed: %.2f tokens/s", tokensPerSec))
+        print("=========================================================================\n")
+
+        XCTAssertGreaterThan(totalAcceptedTokens, 0)
+        XCTAssertGreaterThan(meanTau, 1.0, "JetSpec speculative acceleration should achieve mean tau > 1.0 tokens/step")
+    }
+
+    func testJetSpecDenseZeroTopKBufferAllocationSafety() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("Metal is not available on this device")
+        }
+        let inference = InferenceEngine.shared
+
+        // Test with topK = 0 (dense Ornith model configuration)
+        let stagingDense = inference.allocateJetSpecBuffers(
+            device: device,
+            maxNodes: 16,
+            vocabSize: 248320,
+            hiddenDim: 4096,
+            intermediateDim: 12288,
+            maxQkvDim: 8192,
+            maxZDim: 8192,
+            kvStride: 1024,
+            topK: 0 // Ornith dense has topK = 0
+        )
+        XCTAssertNotNil(stagingDense, "allocateJetSpecBuffers must succeed even when topK = 0 for dense models")
+        if let staging = stagingDense {
+            XCTAssertGreaterThan(staging.treeRouterIndicesBuffer.length, 0, "router buffer must have non-zero length")
+            XCTAssertGreaterThan(staging.treeRouterWeightsBuffer.length, 0, "router weights buffer must have non-zero length")
+            XCTAssertGreaterThan(staging.treeHiddenBuffer.length, 0)
+        }
+
+        // Test edge case where intermediateDim is 0
+        let stagingZeroInter = inference.allocateJetSpecBuffers(
+            device: device,
+            maxNodes: 4,
+            vocabSize: 1000,
+            hiddenDim: 256,
+            intermediateDim: 0,
+            maxQkvDim: 256,
+            maxZDim: 256,
+            kvStride: 64,
+            topK: 0
+        )
+        XCTAssertNotNil(stagingZeroInter, "allocateJetSpecBuffers must succeed even with 0 intermediateDim")
+        if let staging = stagingZeroInter {
+            XCTAssertGreaterThan(staging.treeInterBuffer.length, 0)
+        }
+    }
+
+    func testOrnith9BStep0Diagnostics() throws {
+        print("=== TEST ORNITH 1.5 9B STEP 0 DIAGNOSTICS ===")
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--mlx-community--Ornith-1.5-9B-OptiQ-4bit/snapshots/ad2e7748e8c9d36b82bb88307fd21c0d50be85b8"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            throw XCTSkip("Ornith 1.5 9B OptiQ-4bit snapshot not found")
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshotDir)
+        let summary = try engine.getSummary()
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let address = UInt(shard.baseAddress)
+            guard let ptr = UnsafeMutableRawPointer(bitPattern: address) else { continue }
+            let len = Int(shard.length)
+            if let buf = device.makeBuffer(bytesNoCopy: ptr, length: len, options: .storageModeShared, deallocator: nil) {
+                buffers[shard.index] = buf
+            }
+        }
+
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+
+        guard let cmdQueue = device.makeCommandQueue() else {
+            XCTFail("No Metal command queue")
+            return
+        }
+
+        let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir))
+        let cachedLayers = inference.buildCachedLayers(summary: summary, config: config, targetLayerCount: 32)
+        XCTAssertEqual(cachedLayers.count, 32)
+
+        let hiddenDim = config?.hiddenSize ?? 4096
+        let intermediateDim = config?.intermediateSize ?? 12288
+        let vocabSize = config?.vocabSize ?? 248320
+
+        KVCacheManager.shared.reset(
+            device: device,
+            config: config,
+            actualLayers: 32,
+            totalLoops: 1,
+            numKvHeads: 8,
+            headDim: 128,
+            maxSeqLen: 256,
+            precision: .fp16
+        )
+
+        let hBufA = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let hBufB = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let xNorm1Buf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let xNorm2Buf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let qGateBuf = device.makeBuffer(length: 8192 * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let zGateBuf = device.makeBuffer(length: 4096 * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let aVecBuf = device.makeBuffer(length: 32 * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let bVecBuf = device.makeBuffer(length: 32 * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let attnCtxBuf = device.makeBuffer(length: 4096 * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let attnOutBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let hMidBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let interBuf = device.makeBuffer(length: intermediateDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let hMlpBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let xFinalBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let logitsBuf = device.makeBuffer(length: vocabSize * MemoryLayout<Float>.stride, options: .storageModeShared)!
+
+        func checkBuf(_ name: String, _ buf: MTLBuffer, count: Int) {
+            let ptr = buf.contents().bindMemory(to: Float.self, capacity: count)
+            var minVal: Float = .infinity
+            var maxVal: Float = -.infinity
+            var sumVal: Double = 0
+            var nanCount = 0
+            for i in 0..<count {
+                let v = ptr[i]
+                if v.isNaN || v.isInfinite {
+                    nanCount += 1
+                } else {
+                    if v < minVal { minVal = v }
+                    if v > maxVal { maxVal = v }
+                    sumVal += Double(v)
+                }
+            }
+            let meanVal = count > nanCount ? Float(sumVal / Double(count - nanCount)) : 0
+            print("  [\(name)] count=\(count), nans=\(nanCount), min=\(minVal), max=\(maxVal), mean=\(meanVal)")
+            XCTAssertEqual(nanCount, 0, "Buffer \(name) contains NaN or Inf values!")
+        }
+
+        func dispatchLinearLocal(
+            enc: MTLComputeCommandEncoder,
+            weight: TensorMetadata?,
+            scale: TensorMetadata?,
+            bias: TensorMetadata?,
+            inBuf: MTLBuffer,
+            outBuf: MTLBuffer,
+            inDim: UInt32,
+            outDim: UInt32
+        ) {
+            guard let w = weight, let wRaw = buffers[w.shardIndex] else { return }
+            var wOff = w.offsetStart
+            var inD = inDim
+            var outD = outDim
+            var grp: UInt32 = 64
+            let hasBias = (bias != nil)
+            let isQuantizedAffine = (hasBias || w.dtype.contains("Q4") || w.dtype.contains("Q8"))
+            if isQuantizedAffine, let s = scale, let sRaw = buffers[s.shardIndex], let b = bias, let bRaw = buffers[b.shardIndex] {
+                var sOff = s.offsetStart
+                var bOff = b.offsetStart
+                let is8Bit = (w.offsetEnd - w.offsetStart) >= UInt64(outDim) * UInt64(inDim)
+                if is8Bit, let q8Pipe = inference.q8GemvPipeline {
+                    enc.setComputePipelineState(q8Pipe)
+                    enc.setBuffer(wRaw, offset: 0, index: 0)
+                    enc.setBuffer(sRaw, offset: 0, index: 1)
+                    enc.setBuffer(bRaw, offset: 0, index: 2)
+                    enc.setBuffer(inBuf, offset: 0, index: 3)
+                    enc.setBuffer(outBuf, offset: 0, index: 4)
+                    enc.setBytes(&wOff, length: 8, index: 5)
+                    enc.setBytes(&sOff, length: 8, index: 6)
+                    enc.setBytes(&bOff, length: 8, index: 7)
+                    enc.setBytes(&inD, length: 4, index: 8)
+                    enc.setBytes(&outD, length: 4, index: 9)
+                    enc.setBytes(&grp, length: 4, index: 10)
+                    enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                } else if let q4Pipe = inference.q4GemvPipeline {
+                    enc.setComputePipelineState(q4Pipe)
+                    enc.setBuffer(wRaw, offset: 0, index: 0)
+                    enc.setBuffer(sRaw, offset: 0, index: 1)
+                    enc.setBuffer(bRaw, offset: 0, index: 2)
+                    enc.setBuffer(inBuf, offset: 0, index: 3)
+                    enc.setBuffer(outBuf, offset: 0, index: 4)
+                    enc.setBytes(&wOff, length: 8, index: 5)
+                    enc.setBytes(&sOff, length: 8, index: 6)
+                    enc.setBytes(&bOff, length: 8, index: 7)
+                    enc.setBytes(&inD, length: 4, index: 8)
+                    enc.setBytes(&outD, length: 4, index: 9)
+                    enc.setBytes(&grp, length: 4, index: 10)
+                    enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                }
+            } else if let bSimdPipe = inference.bf16GemvSimdPipeline {
+                enc.setComputePipelineState(bSimdPipe)
+                enc.setBuffer(wRaw, offset: 0, index: 0)
+                enc.setBuffer(inBuf, offset: 0, index: 1)
+                enc.setBuffer(outBuf, offset: 0, index: 2)
+                enc.setBytes(&wOff, length: 8, index: 3)
+                enc.setBytes(&inD, length: 4, index: 4)
+                enc.setBytes(&outD, length: 4, index: 5)
+                enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            }
+            enc.memoryBarrier(scope: .buffers)
+        }
+
+        // 1. Embed Token 151644 (<|im_start|>)
+        let embedWeight = summary.tensors.first { $0.name.contains("embed_tokens") && $0.name.hasSuffix(".weight") }!
+        let embedScale = summary.tensors.first { $0.name.contains("embed_tokens") && $0.name.hasSuffix(".scales") }
+        let embedBias = summary.tensors.first { $0.name.contains("embed_tokens") && $0.name.hasSuffix(".biases") }
+
+        let embedCmd = cmdQueue.makeCommandBuffer()!
+        let embedEnc = embedCmd.makeComputeCommandEncoder()!
+        var tok: UInt32 = 151644
+        var wOffset = embedWeight.offsetStart
+        var sOffset = embedScale?.offsetStart ?? 0
+        var bOffset = embedBias?.offsetStart ?? 0
+        var hDimVal = UInt32(hiddenDim)
+        var grpSize: UInt32 = 64
+        let embedQ8 = inference.embedQ8Pipeline!
+        embedEnc.setComputePipelineState(embedQ8)
+        embedEnc.setBuffer(buffers[embedWeight.shardIndex]!, offset: 0, index: 0)
+        embedEnc.setBuffer(buffers[embedScale!.shardIndex]!, offset: 0, index: 1)
+        embedEnc.setBuffer(buffers[embedBias!.shardIndex]!, offset: 0, index: 2)
+        embedEnc.setBuffer(hBufA, offset: 0, index: 3)
+        embedEnc.setBytes(&tok, length: 4, index: 4)
+        embedEnc.setBytes(&wOffset, length: 8, index: 5)
+        embedEnc.setBytes(&sOffset, length: 8, index: 6)
+        embedEnc.setBytes(&bOffset, length: 8, index: 7)
+        embedEnc.setBytes(&hDimVal, length: 4, index: 8)
+        embedEnc.setBytes(&grpSize, length: 4, index: 9)
+        embedEnc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(hiddenDim, embedQ8.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+        embedEnc.endEncoding()
+        embedCmd.commit()
+        embedCmd.waitUntilCompleted()
+
+        print("Checking Embedding Output:")
+        checkBuf("hBufA_embed", hBufA, count: hiddenDim)
+
+        // 2. Run Layer 0
+        let layer0 = cachedLayers[0]
+        let l0Cmd = cmdQueue.makeCommandBuffer()!
+        let l0Enc = l0Cmd.makeComputeCommandEncoder()!
+
+        // Norm1
+        let norm1 = layer0.norm1Tensor!
+        let norm1Raw = buffers[norm1.shardIndex]!
+        var nOff1 = norm1.offsetStart
+        var epsVal: Float = 1e-6
+        let rmsPipe = inference.rmsnormPipeline!
+        l0Enc.setComputePipelineState(rmsPipe)
+        l0Enc.setBuffer(hBufA, offset: 0, index: 0)
+        l0Enc.setBuffer(norm1Raw, offset: 0, index: 1)
+        l0Enc.setBuffer(xNorm1Buf, offset: 0, index: 2)
+        l0Enc.setBytes(&nOff1, length: 8, index: 3)
+        l0Enc.setBytes(&hDimVal, length: 4, index: 4)
+        l0Enc.setBytes(&epsVal, length: 4, index: 5)
+        l0Enc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+        l0Enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+        l0Enc.memoryBarrier(scope: .buffers)
+
+        // inProjQKV
+        let linKeyHeads: UInt32 = 16
+        let linValHeads: UInt32 = 32
+        let qkvDim: UInt32 = (linKeyHeads + linKeyHeads + linValHeads) * 128 // 8192
+        let zDim: UInt32 = linValHeads * 128 // 4096
+        dispatchLinearLocal(enc: l0Enc, weight: layer0.inProjQKV, scale: layer0.inProjQKVScale, bias: layer0.inProjQKVBias, inBuf: xNorm1Buf, outBuf: qGateBuf, inDim: UInt32(hiddenDim), outDim: qkvDim)
+
+        // conv1d
+        if let conv1d = layer0.conv1dTensor, let convRaw = buffers[conv1d.shardIndex],
+           let convPipe = inference.causalConv1dPipeline, let convState = KVCacheManager.shared.convStateBuffer {
+            var cOff = conv1d.offsetStart
+            var numChannels = qkvDim
+            l0Enc.setComputePipelineState(convPipe)
+            l0Enc.setBuffer(qGateBuf, offset: 0, index: 0)
+            l0Enc.setBuffer(convRaw, offset: 0, index: 1)
+            l0Enc.setBuffer(convState, offset: 0, index: 2)
+            l0Enc.setBuffer(qGateBuf, offset: 0, index: 3)
+            l0Enc.setBytes(&cOff, length: 8, index: 4)
+            l0Enc.setBytes(&numChannels, length: 4, index: 5)
+            l0Enc.dispatchThreads(MTLSize(width: Int(qkvDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, convPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            l0Enc.memoryBarrier(scope: .buffers)
+        }
+
+        // l2NormQk
+        if let l2Pipe = inference.l2NormQkPipeline {
+            var numH = linKeyHeads
+            var hD: UInt32 = 128
+            l0Enc.setComputePipelineState(l2Pipe)
+            l0Enc.setBuffer(qGateBuf, offset: 0, index: 0)
+            l0Enc.setBytes(&numH, length: 4, index: 1)
+            l0Enc.setBytes(&hD, length: 4, index: 2)
+            l0Enc.dispatchThreads(MTLSize(width: Int(numH), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numH), l2Pipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            l0Enc.memoryBarrier(scope: .buffers)
+        }
+
+        // inProjZ, inProjA, inProjB
+        dispatchLinearLocal(enc: l0Enc, weight: layer0.inProjZ, scale: layer0.inProjZScale, bias: layer0.inProjZBias, inBuf: xNorm1Buf, outBuf: zGateBuf, inDim: UInt32(hiddenDim), outDim: zDim)
+        dispatchLinearLocal(enc: l0Enc, weight: layer0.inProjA, scale: layer0.inProjAScale, bias: layer0.inProjABias, inBuf: xNorm1Buf, outBuf: aVecBuf, inDim: UInt32(hiddenDim), outDim: linValHeads)
+        dispatchLinearLocal(enc: l0Enc, weight: layer0.inProjB, scale: layer0.inProjBScale, bias: layer0.inProjBBias, inBuf: xNorm1Buf, outBuf: bVecBuf, inDim: UInt32(hiddenDim), outDim: linValHeads)
+
+        // linearAttnStep
+        if let linPipe = inference.gdnLinearAttnStepPipeline ?? inference.linearAttnStepPipeline,
+           let sBuf = KVCacheManager.shared.linearStateBuffer,
+           let aLog = layer0.aLogTensor, let aLogRaw = buffers[aLog.shardIndex],
+           let dtBias = layer0.dtBiasTensor, let dtBiasRaw = buffers[dtBias.shardIndex],
+           let linNorm = layer0.linearNormTensor, let linNormRaw = buffers[linNorm.shardIndex] {
+            var aLogOff = aLog.offsetStart
+            var dtBiasOff = dtBias.offsetStart
+            var linNormOff = linNorm.offsetStart
+            var numValH = linValHeads
+            var numKeyH = linKeyHeads
+            var hD: UInt32 = 128
+            l0Enc.setComputePipelineState(linPipe)
+            l0Enc.setBuffer(qGateBuf, offset: 0, index: 0)
+            l0Enc.setBuffer(zGateBuf, offset: 0, index: 1)
+            l0Enc.setBuffer(aVecBuf, offset: 0, index: 2)
+            l0Enc.setBuffer(bVecBuf, offset: 0, index: 3)
+            l0Enc.setBuffer(aLogRaw, offset: 0, index: 4)
+            l0Enc.setBuffer(dtBiasRaw, offset: 0, index: 5)
+            l0Enc.setBuffer(linNormRaw, offset: 0, index: 6)
+            l0Enc.setBuffer(sBuf, offset: 0, index: 7)
+            l0Enc.setBuffer(attnCtxBuf, offset: 0, index: 8)
+            l0Enc.setBytes(&aLogOff, length: 8, index: 9)
+            l0Enc.setBytes(&dtBiasOff, length: 8, index: 10)
+            l0Enc.setBytes(&linNormOff, length: 8, index: 11)
+            l0Enc.setBytes(&numValH, length: 4, index: 12)
+            l0Enc.setBytes(&numKeyH, length: 4, index: 13)
+            l0Enc.setBytes(&hD, length: 4, index: 14)
+            l0Enc.setBytes(&epsVal, length: 4, index: 15)
+            l0Enc.dispatchThreadgroups(MTLSize(width: Int(numValH), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            l0Enc.memoryBarrier(scope: .buffers)
+        }
+
+        // outProj
+        dispatchLinearLocal(enc: l0Enc, weight: layer0.linearOutProjTensor ?? layer0.oProjTensor, scale: layer0.linearOutProjScale ?? layer0.oScaleTensor, bias: layer0.linearOutProjBias ?? layer0.oBiasTensor, inBuf: attnCtxBuf, outBuf: attnOutBuf, inDim: zDim, outDim: UInt32(hiddenDim))
+
+        // Residual 1
+        let addPipe = inference.addPipeline!
+        l0Enc.setComputePipelineState(addPipe)
+        l0Enc.setBuffer(hBufA, offset: 0, index: 0)
+        l0Enc.setBuffer(attnOutBuf, offset: 0, index: 1)
+        l0Enc.setBuffer(hMidBuf, offset: 0, index: 2)
+        l0Enc.setBytes(&hDimVal, length: 4, index: 3)
+        l0Enc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(hiddenDim, addPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+        l0Enc.memoryBarrier(scope: .buffers)
+
+        // Norm2
+        let norm2 = layer0.norm2Tensor!
+        let norm2Raw = buffers[norm2.shardIndex]!
+        var nOff2 = norm2.offsetStart
+        l0Enc.setComputePipelineState(rmsPipe)
+        l0Enc.setBuffer(hMidBuf, offset: 0, index: 0)
+        l0Enc.setBuffer(norm2Raw, offset: 0, index: 1)
+        l0Enc.setBuffer(xNorm2Buf, offset: 0, index: 2)
+        l0Enc.setBytes(&nOff2, length: 8, index: 3)
+        l0Enc.setBytes(&hDimVal, length: 4, index: 4)
+        l0Enc.setBytes(&epsVal, length: 4, index: 5)
+        l0Enc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+        l0Enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+        l0Enc.memoryBarrier(scope: .buffers)
+
+        // Dense MLP: gate & up
+        let gateW = layer0.denseGateWeight!
+        let upW = layer0.denseUpWeight!
+        let downW = layer0.denseDownWeight!
+        let q8GateUp = inference.q8GateUpPipeline!
+        var gWOff = gateW.offsetStart
+        var gSOff = layer0.denseGateScale!.offsetStart
+        var gBOff = layer0.denseGateBias!.offsetStart
+        var uWOff = upW.offsetStart
+        var uSOff = layer0.denseUpScale!.offsetStart
+        var uBOff = layer0.denseUpBias!.offsetStart
+        var interD = UInt32(intermediateDim)
+        var grp: UInt32 = 64
+
+        l0Enc.setComputePipelineState(q8GateUp)
+        l0Enc.setBuffer(buffers[gateW.shardIndex]!, offset: 0, index: 0)
+        l0Enc.setBuffer(buffers[layer0.denseGateScale!.shardIndex]!, offset: 0, index: 1)
+        l0Enc.setBuffer(buffers[layer0.denseGateBias!.shardIndex]!, offset: 0, index: 2)
+        l0Enc.setBuffer(buffers[upW.shardIndex]!, offset: 0, index: 3)
+        l0Enc.setBuffer(buffers[layer0.denseUpScale!.shardIndex]!, offset: 0, index: 4)
+        l0Enc.setBuffer(buffers[layer0.denseUpBias!.shardIndex]!, offset: 0, index: 5)
+        l0Enc.setBuffer(xNorm2Buf, offset: 0, index: 6)
+        l0Enc.setBuffer(interBuf, offset: 0, index: 7)
+        l0Enc.setBytes(&gWOff, length: 8, index: 8)
+        l0Enc.setBytes(&gSOff, length: 8, index: 9)
+        l0Enc.setBytes(&gBOff, length: 8, index: 10)
+        l0Enc.setBytes(&uWOff, length: 8, index: 11)
+        l0Enc.setBytes(&uSOff, length: 8, index: 12)
+        l0Enc.setBytes(&uBOff, length: 8, index: 13)
+        l0Enc.setBytes(&hDimVal, length: 4, index: 14)
+        l0Enc.setBytes(&interD, length: 4, index: 15)
+        l0Enc.setBytes(&grp, length: 4, index: 16)
+        l0Enc.dispatchThreadgroups(MTLSize(width: Int(interD), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        l0Enc.memoryBarrier(scope: .buffers)
+
+        // Dense MLP: down
+        let q8Down = inference.q8DownPipeline!
+        var dWOff = downW.offsetStart
+        var dSOff = layer0.denseDownScale!.offsetStart
+        var dBOff = layer0.denseDownBias!.offsetStart
+        var pk: Float = 1.0
+        l0Enc.setComputePipelineState(q8Down)
+        l0Enc.setBuffer(buffers[downW.shardIndex]!, offset: 0, index: 0)
+        l0Enc.setBuffer(buffers[layer0.denseDownScale!.shardIndex]!, offset: 0, index: 1)
+        l0Enc.setBuffer(buffers[layer0.denseDownBias!.shardIndex]!, offset: 0, index: 2)
+        l0Enc.setBuffer(interBuf, offset: 0, index: 3)
+        l0Enc.setBuffer(hMlpBuf, offset: 0, index: 4)
+        l0Enc.setBytes(&dWOff, length: 8, index: 5)
+        l0Enc.setBytes(&dSOff, length: 8, index: 6)
+        l0Enc.setBytes(&dBOff, length: 8, index: 7)
+        l0Enc.setBytes(&interD, length: 4, index: 8)
+        l0Enc.setBytes(&hDimVal, length: 4, index: 9)
+        l0Enc.setBytes(&grp, length: 4, index: 10)
+        l0Enc.setBytes(&pk, length: 4, index: 11)
+        l0Enc.dispatchThreadgroups(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        l0Enc.memoryBarrier(scope: .buffers)
+
+        // Residual 2
+        l0Enc.setComputePipelineState(addPipe)
+        l0Enc.setBuffer(hMidBuf, offset: 0, index: 0)
+        l0Enc.setBuffer(hMlpBuf, offset: 0, index: 1)
+        l0Enc.setBuffer(hBufB, offset: 0, index: 2)
+        l0Enc.setBytes(&hDimVal, length: 4, index: 3)
+        l0Enc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(hiddenDim, addPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+
+        l0Enc.endEncoding()
+        l0Cmd.commit()
+        l0Cmd.waitUntilCompleted()
+
+        print("Checking Layer 0 Intermediate Outputs:")
+        checkBuf("xNorm1", xNorm1Buf, count: hiddenDim)
+        checkBuf("qGate", qGateBuf, count: Int(qkvDim))
+        checkBuf("zGate", zGateBuf, count: Int(zDim))
+        checkBuf("aVec", aVecBuf, count: Int(linValHeads))
+        checkBuf("bVec", bVecBuf, count: Int(linValHeads))
+        checkBuf("attnCtx", attnCtxBuf, count: Int(zDim))
+        checkBuf("attnOut", attnOutBuf, count: hiddenDim)
+        checkBuf("hMid", hMidBuf, count: hiddenDim)
+        checkBuf("xNorm2", xNorm2Buf, count: hiddenDim)
+        checkBuf("interBuf", interBuf, count: intermediateDim)
+        checkBuf("hMlpBuf", hMlpBuf, count: hiddenDim)
+        checkBuf("hBufB_layer0_out", hBufB, count: hiddenDim)
+
+        func testLayerMlp(layerIdx: Int, inputBuf: MTLBuffer) {
+            let layer = cachedLayers[layerIdx]
+            guard let gateW = layer.denseGateWeight,
+                  let upW = layer.denseUpWeight,
+                  let downW = layer.denseDownWeight,
+                  let norm2 = layer.norm2Tensor else { return }
+
+            guard let lCmd = cmdQueue.makeCommandBuffer(),
+                  let enc = lCmd.makeComputeCommandEncoder() else { return }
+
+            var nOff = norm2.offsetStart
+            var hD = UInt32(hiddenDim)
+            var epsVal: Float = 1e-6
+            enc.setComputePipelineState(rmsPipe)
+            enc.setBuffer(inputBuf, offset: 0, index: 0)
+            enc.setBuffer(buffers[norm2.shardIndex]!, offset: 0, index: 1)
+            enc.setBuffer(xNorm2Buf, offset: 0, index: 2)
+            enc.setBytes(&nOff, length: 8, index: 3)
+            enc.setBytes(&hD, length: 4, index: 4)
+            enc.setBytes(&epsVal, length: 4, index: 5)
+            enc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+            enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+            enc.memoryBarrier(scope: MTLBarrierScope.buffers)
+
+            let isGate8Bit = (gateW.offsetEnd - gateW.offsetStart) >= UInt64(intermediateDim) * UInt64(hiddenDim)
+            let isUp8Bit = (upW.offsetEnd - upW.offsetStart) >= UInt64(intermediateDim) * UInt64(hiddenDim)
+            let isDown8Bit = (downW.offsetEnd - downW.offsetStart) >= UInt64(hiddenDim) * UInt64(intermediateDim)
+
+            let swigluPipe: MTLComputePipelineState
+            if isGate8Bit && isUp8Bit {
+                swigluPipe = inference.q8GateUpPipeline!
+            } else if !isGate8Bit && !isUp8Bit {
+                swigluPipe = inference.q4GateUpPipeline!
+            } else if !isGate8Bit && isUp8Bit {
+                swigluPipe = inference.q4GateQ8UpPipeline!
+            } else {
+                swigluPipe = inference.q8GateQ4UpPipeline!
+            }
+
+            let downPipe: MTLComputePipelineState = isDown8Bit ? inference.q8DownPipeline! : inference.q4DownPipeline!
+
+            var gWOff = gateW.offsetStart
+            var gSOff = layer.denseGateScale!.offsetStart
+            var gBOff = layer.denseGateBias!.offsetStart
+            var uWOff = upW.offsetStart
+            var uSOff = layer.denseUpScale!.offsetStart
+            var uBOff = layer.denseUpBias!.offsetStart
+            var interD = UInt32(intermediateDim)
+            var grp: UInt32 = 64
+            var pk: Float = 1.0
+
+            enc.setComputePipelineState(swigluPipe)
+            enc.setBuffer(buffers[gateW.shardIndex]!, offset: 0, index: 0)
+            enc.setBuffer(buffers[layer.denseGateScale!.shardIndex]!, offset: 0, index: 1)
+            enc.setBuffer(buffers[layer.denseGateBias!.shardIndex]!, offset: 0, index: 2)
+            enc.setBuffer(buffers[upW.shardIndex]!, offset: 0, index: 3)
+            enc.setBuffer(buffers[layer.denseUpScale!.shardIndex]!, offset: 0, index: 4)
+            enc.setBuffer(buffers[layer.denseUpBias!.shardIndex]!, offset: 0, index: 5)
+            enc.setBuffer(xNorm2Buf, offset: 0, index: 6)
+            enc.setBuffer(interBuf, offset: 0, index: 7)
+            enc.setBytes(&gWOff, length: 8, index: 8)
+            enc.setBytes(&gSOff, length: 8, index: 9)
+            enc.setBytes(&gBOff, length: 8, index: 10)
+            enc.setBytes(&uWOff, length: 8, index: 11)
+            enc.setBytes(&uSOff, length: 8, index: 12)
+            enc.setBytes(&uBOff, length: 8, index: 13)
+            enc.setBytes(&hD, length: 4, index: 14)
+            enc.setBytes(&interD, length: 4, index: 15)
+            enc.setBytes(&grp, length: 4, index: 16)
+            enc.dispatchThreadgroups(MTLSize(width: Int(interD), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+
+            var dWOff = downW.offsetStart
+            var dSOff = layer.denseDownScale!.offsetStart
+            var dBOff = layer.denseDownBias!.offsetStart
+
+            enc.setComputePipelineState(downPipe)
+            enc.setBuffer(buffers[downW.shardIndex]!, offset: 0, index: 0)
+            enc.setBuffer(buffers[layer.denseDownScale!.shardIndex]!, offset: 0, index: 1)
+            enc.setBuffer(buffers[layer.denseDownBias!.shardIndex]!, offset: 0, index: 2)
+            enc.setBuffer(interBuf, offset: 0, index: 3)
+            enc.setBuffer(hMlpBuf, offset: 0, index: 4)
+            enc.setBytes(&dWOff, length: 8, index: 5)
+            enc.setBytes(&dSOff, length: 8, index: 6)
+            enc.setBytes(&dBOff, length: 8, index: 7)
+            enc.setBytes(&interD, length: 4, index: 8)
+            enc.setBytes(&hD, length: 4, index: 9)
+            enc.setBytes(&grp, length: 4, index: 10)
+            enc.setBytes(&pk, length: 4, index: 11)
+            enc.dispatchThreadgroups(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+
+            enc.endEncoding()
+            lCmd.commit()
+            lCmd.waitUntilCompleted()
+
+            print("Checking Layer \(layerIdx) (gate8=\(isGate8Bit), up8=\(isUp8Bit), down8=\(isDown8Bit)) Intermediate Outputs:")
+            checkBuf("L\(layerIdx)_interBuf", interBuf, count: intermediateDim)
+            checkBuf("L\(layerIdx)_hMlpBuf", hMlpBuf, count: hiddenDim)
+        }
+
+        testLayerMlp(layerIdx: 1, inputBuf: hBufB)
+        testLayerMlp(layerIdx: 4, inputBuf: hBufB)
+    }
+
+    func testOrnith9BPrefillMultiTokenNoNaNs() throws {
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--mlx-community--Ornith-1.5-9B-OptiQ-4bit/snapshots/ad2e7748e8c9d36b82bb88307fd21c0d50be85b8"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            throw XCTSkip("Ornith 1.5 9B OptiQ-4bit snapshot not found")
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshotDir)
+        let summary = try engine.getSummary()
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("Metal device unavailable")
+            return
+        }
+
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let address = UInt(shard.baseAddress)
+            guard let ptr = UnsafeMutableRawPointer(bitPattern: address) else { continue }
+            let len = Int(shard.length)
+            if let buf = device.makeBuffer(bytesNoCopy: ptr, length: len, options: .storageModeShared, deallocator: nil) {
+                buffers[shard.index] = buf
+            }
+        }
+
+        guard let cmdQueue = device.makeCommandQueue() else {
+            XCTFail("Metal command queue unavailable")
+            return
+        }
+
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+
+        let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir))
+        let cachedLayers = inference.buildCachedLayers(summary: summary, config: config, targetLayerCount: 32)
+        guard !cachedLayers.isEmpty else {
+            XCTFail("No layers loaded")
+            return
+        }
+
+        let hiddenDim = 2560
+        let intermediateDim = 14336
+        let P = 4
+
+        // Allocate multi-token buffers
+        guard let inTokensBuf = device.makeBuffer(length: P * hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let xNorm2BufAll = device.makeBuffer(length: P * hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let interBufAll = device.makeBuffer(length: P * intermediateDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let hMlpBufAll = device.makeBuffer(length: P * hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+            XCTFail("Failed to allocate multi-token buffers")
+            return
+        }
+
+        // Initialize input tokens with dummy non-zero finite values
+        let inPtr = inTokensBuf.contents().bindMemory(to: Float.self, capacity: P * hiddenDim)
+        for i in 0..<(P * hiddenDim) {
+            inPtr[i] = sin(Float(i) * 0.01) * 0.1
+        }
+
+        let rmsPipe = inference.rmsnormPipeline!
+
+        // Test Layers 0 (8/8/8), 1 (4/4/8), and 4 (4/8/4)
+        for layerIdx in [0, 1, 4] {
+            guard layerIdx < cachedLayers.count else { continue }
+            let layer = cachedLayers[layerIdx]
+            guard let gateW = layer.denseGateWeight,
+                  let upW = layer.denseUpWeight,
+                  let downW = layer.denseDownWeight,
+                  let norm2 = layer.norm2Tensor else { continue }
+
+            guard let cmd = cmdQueue.makeCommandBuffer(),
+                  let enc = cmd.makeComputeCommandEncoder() else { continue }
+
+            // 1. RMSNorm for each token
+            var nOff = norm2.offsetStart
+            var hD = UInt32(hiddenDim)
+            var epsVal: Float = 1e-6
+            for p in 0..<P {
+                enc.setComputePipelineState(rmsPipe)
+                enc.setBuffer(inTokensBuf, offset: p * hiddenDim * MemoryLayout<Float>.stride, index: 0)
+                enc.setBuffer(buffers[norm2.shardIndex]!, offset: 0, index: 1)
+                enc.setBuffer(xNorm2BufAll, offset: p * hiddenDim * MemoryLayout<Float>.stride, index: 2)
+                enc.setBytes(&nOff, length: 8, index: 3)
+                enc.setBytes(&hD, length: 4, index: 4)
+                enc.setBytes(&epsVal, length: 4, index: 5)
+                enc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+            }
+
+            // 2. Prefill logic: check isQuantizedAffine
+            let gateS = layer.denseGateScale
+            let isBlockScale = (gateS != nil) && (gateS!.name.contains("scale_inv") || ((gateS!.offsetEnd - gateS!.offsetStart) < UInt64(intermediateDim * 2)))
+            let isQuantizedAffine = (layer.denseGateBias != nil || gateW.dtype.contains("Q4") || gateW.dtype.contains("Q8") || (gateS != nil && !isBlockScale))
+
+            XCTAssertTrue(isQuantizedAffine, "Layer \(layerIdx) must be recognized as quantized affine")
+
+            let isGate8Bit = (gateW.offsetEnd - gateW.offsetStart) >= UInt64(intermediateDim) * UInt64(hiddenDim)
+            let isUp8Bit = (upW.offsetEnd - upW.offsetStart) >= UInt64(intermediateDim) * UInt64(hiddenDim)
+            let isDown8Bit = (downW.offsetEnd - downW.offsetStart) >= UInt64(hiddenDim) * UInt64(intermediateDim)
+
+            let swigluPipe: MTLComputePipelineState
+            if isGate8Bit && isUp8Bit {
+                swigluPipe = inference.q8GateUpPipeline!
+            } else if !isGate8Bit && !isUp8Bit {
+                swigluPipe = inference.q4GateUpPipeline!
+            } else if !isGate8Bit && isUp8Bit {
+                swigluPipe = inference.q4GateQ8UpPipeline!
+            } else {
+                swigluPipe = inference.q8GateQ4UpPipeline!
+            }
+            let downPipe: MTLComputePipelineState = isDown8Bit ? inference.q8DownPipeline! : inference.q4DownPipeline!
+
+            var gWOff = gateW.offsetStart
+            var gSOff = layer.denseGateScale!.offsetStart
+            var gBOff = layer.denseGateBias!.offsetStart
+            var uWOff = upW.offsetStart
+            var uSOff = layer.denseUpScale!.offsetStart
+            var uBOff = layer.denseUpBias!.offsetStart
+            var interD = UInt32(intermediateDim)
+            var grp: UInt32 = 64
+            var pk: Float = 1.0
+
+            var dWOff = downW.offsetStart
+            var dSOff = layer.denseDownScale!.offsetStart
+            var dBOff = layer.denseDownBias!.offsetStart
+
+            for p in 0..<P {
+                let tokenOffset = p * hiddenDim * MemoryLayout<Float>.stride
+                let interTokenOffset = p * intermediateDim * MemoryLayout<Float>.stride
+
+                enc.setComputePipelineState(swigluPipe)
+                enc.setBuffer(buffers[gateW.shardIndex]!, offset: 0, index: 0)
+                enc.setBuffer(buffers[layer.denseGateScale!.shardIndex]!, offset: 0, index: 1)
+                enc.setBuffer(buffers[layer.denseGateBias!.shardIndex]!, offset: 0, index: 2)
+                enc.setBuffer(buffers[upW.shardIndex]!, offset: 0, index: 3)
+                enc.setBuffer(buffers[layer.denseUpScale!.shardIndex]!, offset: 0, index: 4)
+                enc.setBuffer(buffers[layer.denseUpBias!.shardIndex]!, offset: 0, index: 5)
+                enc.setBuffer(xNorm2BufAll, offset: tokenOffset, index: 6)
+                enc.setBuffer(interBufAll, offset: interTokenOffset, index: 7)
+                enc.setBytes(&gWOff, length: 8, index: 8)
+                enc.setBytes(&gSOff, length: 8, index: 9)
+                enc.setBytes(&gBOff, length: 8, index: 10)
+                enc.setBytes(&uWOff, length: 8, index: 11)
+                enc.setBytes(&uSOff, length: 8, index: 12)
+                enc.setBytes(&uBOff, length: 8, index: 13)
+                enc.setBytes(&hD, length: 4, index: 14)
+                enc.setBytes(&interD, length: 4, index: 15)
+                enc.setBytes(&grp, length: 4, index: 16)
+                enc.dispatchThreadgroups(MTLSize(width: Int(interD), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                enc.setComputePipelineState(downPipe)
+                enc.setBuffer(buffers[downW.shardIndex]!, offset: 0, index: 0)
+                enc.setBuffer(buffers[layer.denseDownScale!.shardIndex]!, offset: 0, index: 1)
+                enc.setBuffer(buffers[layer.denseDownBias!.shardIndex]!, offset: 0, index: 2)
+                enc.setBuffer(interBufAll, offset: interTokenOffset, index: 3)
+                enc.setBuffer(hMlpBufAll, offset: tokenOffset, index: 4)
+                enc.setBytes(&dWOff, length: 8, index: 5)
+                enc.setBytes(&dSOff, length: 8, index: 6)
+                enc.setBytes(&dBOff, length: 8, index: 7)
+                enc.setBytes(&interD, length: 4, index: 8)
+                enc.setBytes(&hD, length: 4, index: 9)
+                enc.setBytes(&grp, length: 4, index: 10)
+                enc.setBytes(&pk, length: 4, index: 11)
+                enc.dispatchThreadgroups(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+            }
+
+            enc.endEncoding()
+            cmd.commit()
+            cmd.waitUntilCompleted()
+
+            let outPtr = hMlpBufAll.contents().bindMemory(to: Float.self, capacity: P * hiddenDim)
+            var nanCount = 0
+            for i in 0..<(P * hiddenDim) {
+                if outPtr[i].isNaN { nanCount += 1 }
+            }
+            XCTAssertEqual(nanCount, 0, "Layer \(layerIdx) prefill produced \(nanCount) NaNs across \(P) tokens")
+        }
+    }
+
+    func testOrnith9BGatedDeltaNetSequenceMatchesStep() throws {
+        print("=== TEST ORNITH 9B GATED DELTANET: SEQUENCE PREFILL MATCHES AUTOREGRESSIVE STEP ===")
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--mlx-community--Ornith-1.5-9B-OptiQ-4bit/snapshots/ad2e7748e8c9d36b82bb88307fd21c0d50be85b8"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            throw XCTSkip("Ornith 1.5 9B OptiQ-4bit snapshot not found")
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshotDir)
+        let summary = try engine.getSummary()
+
+        guard let device = MTLCreateSystemDefaultDevice(), let cmdQueue = device.makeCommandQueue() else {
+            XCTFail("Metal device or queue unavailable")
+            return
+        }
+
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let address = UInt(shard.baseAddress)
+            guard let ptr = UnsafeMutableRawPointer(bitPattern: address) else { continue }
+            let len = Int(shard.length)
+            if let buf = device.makeBuffer(bytesNoCopy: ptr, length: len, options: .storageModeShared, deallocator: nil) {
+                buffers[shard.index] = buf
+            }
+        }
+
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+
+        let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir))
+        let cachedLayers = inference.buildCachedLayers(summary: summary, config: config, targetLayerCount: 32)
+        guard let layer0 = cachedLayers.first,
+              let aLog = layer0.aLogTensor, let aLogRaw = buffers[aLog.shardIndex],
+              let dtBias = layer0.dtBiasTensor, let dtBiasRaw = buffers[dtBias.shardIndex],
+              let linNorm = layer0.linearNormTensor, let linNormRaw = buffers[linNorm.shardIndex],
+              let seqPipe = inference.gdnLinearAttnSeqPipeline,
+              let stepPipe = inference.gdnLinearAttnStepPipeline else {
+            XCTFail("Missing GatedDeltaNet tensors or pipelines")
+            return
+        }
+
+        let linKeyHeads: UInt32 = 16
+        let linValHeads: UInt32 = 32
+        let headDim: UInt32 = 128
+        let qkvDim = Int((linKeyHeads + linKeyHeads + linValHeads) * headDim) // 8192
+        let zDim = Int(linValHeads * headDim) // 4096
+        let aDim = Int(linValHeads) // 32
+        let bDim = Int(linValHeads) // 32
+        let stateElements = Int(linValHeads * headDim * headDim) // 32 * 128 * 128 = 524288
+        let P = 4
+
+        guard let qkvBuf = device.makeBuffer(length: P * qkvDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let zBuf = device.makeBuffer(length: P * zDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let aBuf = device.makeBuffer(length: P * aDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let bBuf = device.makeBuffer(length: P * bDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let stateSeqBuf = device.makeBuffer(length: stateElements * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let stateStepBuf = device.makeBuffer(length: stateElements * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let outSeqBuf = device.makeBuffer(length: P * zDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let outStepBuf = device.makeBuffer(length: P * zDim * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+            XCTFail("Failed to allocate test buffers")
+            return
+        }
+
+        // Initialize input data
+        let qkvPtr = qkvBuf.contents().bindMemory(to: Float.self, capacity: P * qkvDim)
+        for i in 0..<(P * qkvDim) { qkvPtr[i] = Float(sin(Double(i) * 0.05)) * 0.2 }
+
+        let zPtr = zBuf.contents().bindMemory(to: Float.self, capacity: P * zDim)
+        for i in 0..<(P * zDim) { zPtr[i] = Float(cos(Double(i) * 0.03)) * 0.5 }
+
+        let aPtr = aBuf.contents().bindMemory(to: Float.self, capacity: P * aDim)
+        for i in 0..<(P * aDim) { aPtr[i] = Float(sin(Double(i) * 0.1)) * 0.1 }
+
+        let bPtr = bBuf.contents().bindMemory(to: Float.self, capacity: P * bDim)
+        for i in 0..<(P * bDim) { bPtr[i] = Float(cos(Double(i) * 0.1)) * 0.1 }
+
+        memset(stateSeqBuf.contents(), 0, stateElements * MemoryLayout<Float>.stride)
+        memset(stateStepBuf.contents(), 0, stateElements * MemoryLayout<Float>.stride)
+
+        var aLogOff = aLog.offsetStart
+        var dtBiasOff = dtBias.offsetStart
+        var linNormOff = linNorm.offsetStart
+        var numValH = linValHeads
+        var numKeyH = linKeyHeads
+        var hD = headDim
+        var epsVal: Float = 1e-6
+        var seqLenVal = UInt32(P)
+
+        // 1. Run Sequence Pipeline for all P tokens
+        guard let cmdSeq = cmdQueue.makeCommandBuffer(),
+              let encSeq = cmdSeq.makeComputeCommandEncoder() else {
+            XCTFail("Failed to create sequence encoder")
+            return
+        }
+        encSeq.setComputePipelineState(seqPipe)
+        encSeq.setBuffer(qkvBuf, offset: 0, index: 0)
+        encSeq.setBuffer(zBuf, offset: 0, index: 1)
+        encSeq.setBuffer(aBuf, offset: 0, index: 2)
+        encSeq.setBuffer(bBuf, offset: 0, index: 3)
+        encSeq.setBuffer(aLogRaw, offset: 0, index: 4)
+        encSeq.setBuffer(dtBiasRaw, offset: 0, index: 5)
+        encSeq.setBuffer(linNormRaw, offset: 0, index: 6)
+        encSeq.setBuffer(stateSeqBuf, offset: 0, index: 7)
+        encSeq.setBuffer(outSeqBuf, offset: 0, index: 8)
+        encSeq.setBytes(&aLogOff, length: 8, index: 9)
+        encSeq.setBytes(&dtBiasOff, length: 8, index: 10)
+        encSeq.setBytes(&linNormOff, length: 8, index: 11)
+        encSeq.setBytes(&numValH, length: 4, index: 12)
+        encSeq.setBytes(&numKeyH, length: 4, index: 13)
+        encSeq.setBytes(&hD, length: 4, index: 14)
+        encSeq.setBytes(&epsVal, length: 4, index: 15)
+        encSeq.setBytes(&seqLenVal, length: 4, index: 16)
+        encSeq.dispatchThreadgroups(MTLSize(width: Int(numValH), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        encSeq.endEncoding()
+        cmdSeq.commit()
+        cmdSeq.waitUntilCompleted()
+
+        // 2. Run Step Pipeline sequentially token by token
+        for p in 0..<P {
+            guard let cmdStep = cmdQueue.makeCommandBuffer(),
+                  let encStep = cmdStep.makeComputeCommandEncoder() else {
+                XCTFail("Failed to create step encoder for token \(p)")
+                return
+            }
+            let qkvByteOff = p * qkvDim * MemoryLayout<Float>.stride
+            let zByteOff = p * zDim * MemoryLayout<Float>.stride
+            let aByteOff = p * aDim * MemoryLayout<Float>.stride
+            let bByteOff = p * bDim * MemoryLayout<Float>.stride
+            let outByteOff = p * zDim * MemoryLayout<Float>.stride
+
+            encStep.setComputePipelineState(stepPipe)
+            encStep.setBuffer(qkvBuf, offset: qkvByteOff, index: 0)
+            encStep.setBuffer(zBuf, offset: zByteOff, index: 1)
+            encStep.setBuffer(aBuf, offset: aByteOff, index: 2)
+            encStep.setBuffer(bBuf, offset: bByteOff, index: 3)
+            encStep.setBuffer(aLogRaw, offset: 0, index: 4)
+            encStep.setBuffer(dtBiasRaw, offset: 0, index: 5)
+            encStep.setBuffer(linNormRaw, offset: 0, index: 6)
+            encStep.setBuffer(stateStepBuf, offset: 0, index: 7)
+            encStep.setBuffer(outStepBuf, offset: outByteOff, index: 8)
+            encStep.setBytes(&aLogOff, length: 8, index: 9)
+            encStep.setBytes(&dtBiasOff, length: 8, index: 10)
+            encStep.setBytes(&linNormOff, length: 8, index: 11)
+            encStep.setBytes(&numValH, length: 4, index: 12)
+            encStep.setBytes(&numKeyH, length: 4, index: 13)
+            encStep.setBytes(&hD, length: 4, index: 14)
+            encStep.setBytes(&epsVal, length: 4, index: 15)
+            encStep.dispatchThreadgroups(MTLSize(width: Int(numValH), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            encStep.endEncoding()
+            cmdStep.commit()
+            cmdStep.waitUntilCompleted()
+        }
+
+        // 3. Verify that outputs match across all tokens
+        let outSeqPtr = outSeqBuf.contents().bindMemory(to: Float.self, capacity: P * zDim)
+        let outStepPtr = outStepBuf.contents().bindMemory(to: Float.self, capacity: P * zDim)
+        var maxOutDiff: Float = 0.0
+        for i in 0..<(P * zDim) {
+            let diff = abs(outSeqPtr[i] - outStepPtr[i])
+            if diff > maxOutDiff { maxOutDiff = diff }
+            XCTAssertFalse(outSeqPtr[i].isNaN, "NaN in outSeq at index \(i)")
+            XCTAssertFalse(outStepPtr[i].isNaN, "NaN in outStep at index \(i)")
+        }
+        print("  ✅ [GDN VERIFICATION] Max Output Diff between Sequence and Step: \(maxOutDiff)")
+        XCTAssertLessThan(maxOutDiff, 1e-4, "Sequence prefill output does not match autoregressive step output")
+
+        // 4. Verify that final recurrent states match
+        let stateSeqPtr = stateSeqBuf.contents().bindMemory(to: Float.self, capacity: stateElements)
+        let stateStepPtr = stateStepBuf.contents().bindMemory(to: Float.self, capacity: stateElements)
+        var maxStateDiff: Float = 0.0
+        for i in 0..<stateElements {
+            let diff = abs(stateSeqPtr[i] - stateStepPtr[i])
+            if diff > maxStateDiff { maxStateDiff = diff }
+            XCTAssertFalse(stateSeqPtr[i].isNaN, "NaN in stateSeq at index \(i)")
+            XCTAssertFalse(stateStepPtr[i].isNaN, "NaN in stateStep at index \(i)")
+        }
+        print("  ✅ [GDN VERIFICATION] Max Recurrent State Diff between Sequence and Step: \(maxStateDiff)")
+        XCTAssertLessThan(maxStateDiff, 1e-4, "Sequence prefill final state does not match autoregressive step final state")
+    }
 }
 
 

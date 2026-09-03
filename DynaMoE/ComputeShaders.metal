@@ -2482,6 +2482,7 @@ kernel void linear_attention_recurrent_sequence(
             for (uint32_t j = 0; j < headDimVec4; j++) {
                 Sk_i += dot(sRowVec4[j], kVec4[j]);
             }
+            Sk_i *= alpha;
 
             float v_val = qkvToken[vBaseInToken + i];
             float delta_v_i = beta * (v_val - Sk_i);
@@ -2512,9 +2513,9 @@ kernel void linear_attention_recurrent_sequence(
             float yNorm = y_local[r] * rms * gamma;
 
             float z = zToken[zBaseInToken + i];
-            float sig_z = 1.0f / (1.0f + exp(-z));
+            float silu_z = z / (1.0f + exp(-z));
 
-            outToken[outBaseInToken + i] = yNorm * sig_z;
+            outToken[outBaseInToken + i] = yNorm * silu_z;
         }
     }
 }
@@ -3671,6 +3672,154 @@ kernel void q8_swiglu_gate_up(
     }
 }
 
+/// MSL Kernel: SIMDgroup Cooperative Mixed Q4-Gate / Q8-Up Affine SwiGLU Projections
+kernel void q4_gate_q8_up_swiglu(
+    device const uchar* rawGateWeight [[buffer(0)]],
+    device const uchar* rawGateScales [[buffer(1)]],
+    device const uchar* rawGateBiases [[buffer(2)]],
+    device const uchar* rawUpWeight [[buffer(3)]],
+    device const uchar* rawUpScales [[buffer(4)]],
+    device const uchar* rawUpBiases [[buffer(5)]],
+    device const float* inputVector [[buffer(6)]],
+    device float* intermediateOutput [[buffer(7)]],
+    constant uint64_t& gateWeightOffset [[buffer(8)]],
+    constant uint64_t& gateScaleOffset [[buffer(9)]],
+    constant uint64_t& gateBiasOffset [[buffer(10)]],
+    constant uint64_t& upWeightOffset [[buffer(11)]],
+    constant uint64_t& upScaleOffset [[buffer(12)]],
+    constant uint64_t& upBiasOffset [[buffer(13)]],
+    constant uint32_t& hiddenDim [[buffer(14)]],
+    constant uint32_t& intermediateDim [[buffer(15)]],
+    constant uint32_t& groupSize [[buffer(16)]],
+    uint r [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    if (r >= intermediateDim) return;
+
+    uint32_t numGroups = hiddenDim / groupSize;
+    device const uchar* gWRow = rawGateWeight + gateWeightOffset + ((uint64_t)r * (hiddenDim / 8) * 4);
+    device const uchar* gSRow = rawGateScales + gateScaleOffset + ((uint64_t)r * numGroups * 2);
+    device const uchar* gBRow = rawGateBiases + gateBiasOffset + ((uint64_t)r * numGroups * 2);
+
+    device const uchar* uWRow = rawUpWeight + upWeightOffset + ((uint64_t)r * hiddenDim);
+    device const uchar* uSRow = rawUpScales + upScaleOffset + ((uint64_t)r * numGroups * 2);
+    device const uchar* uBRow = rawUpBiases + upBiasOffset + ((uint64_t)r * numGroups * 2);
+
+    float gate_sum = 0.0f;
+    float up_sum   = 0.0f;
+
+    uint32_t numU32 = hiddenDim / 8;
+    for (uint32_t i = laneId; i < numU32; i += 32) {
+        uint32_t col = i * 8;
+        uint32_t gIdx = col / groupSize;
+
+        float gScale = read_bf16_unaligned(gSRow + gIdx * 2);
+        float gBias  = read_bf16_unaligned(gBRow + gIdx * 2);
+        float uScale = read_bf16_unaligned(uSRow + gIdx * 2);
+        float uBias  = read_bf16_unaligned(uBRow + gIdx * 2);
+
+        uint32_t gU32 = read_u32_unaligned(gWRow + i * 4);
+
+        float4 in4_0 = *(device const float4*)(inputVector + col);
+        float4 in4_1 = *(device const float4*)(inputVector + col + 4);
+
+        float4 gw0_3 = float4(float(gU32 & 0x0F), float((gU32 >> 4) & 0x0F), float((gU32 >> 8) & 0x0F), float((gU32 >> 12) & 0x0F));
+        float4 gw4_7 = float4(float((gU32 >> 16) & 0x0F), float((gU32 >> 20) & 0x0F), float((gU32 >> 24) & 0x0F), float((gU32 >> 28) & 0x0F));
+
+        float4 uw0_3 = float4(float(uWRow[col + 0]), float(uWRow[col + 1]), float(uWRow[col + 2]), float(uWRow[col + 3]));
+        float4 uw4_7 = float4(float(uWRow[col + 4]), float(uWRow[col + 5]), float(uWRow[col + 6]), float(uWRow[col + 7]));
+
+        float gDot = dot(gw0_3, in4_0) + dot(gw4_7, in4_1);
+        float uDot = dot(uw0_3, in4_0) + dot(uw4_7, in4_1);
+        float xSum = (in4_0.x + in4_0.y + in4_0.z + in4_0.w) + (in4_1.x + in4_1.y + in4_1.z + in4_1.w);
+
+        gate_sum += gScale * gDot + gBias * xSum;
+        up_sum   += uScale * uDot + uBias * xSum;
+    }
+
+    gate_sum = simd_sum(gate_sum);
+    up_sum   = simd_sum(up_sum);
+
+    if (laneId == 0) {
+        float silu_gate = gate_sum / (1.0f + exp(-gate_sum));
+        intermediateOutput[r] = silu_gate * up_sum;
+    }
+}
+
+/// MSL Kernel: SIMDgroup Cooperative Mixed Q8-Gate / Q4-Up Affine SwiGLU Projections
+kernel void q8_gate_q4_up_swiglu(
+    device const uchar* rawGateWeight [[buffer(0)]],
+    device const uchar* rawGateScales [[buffer(1)]],
+    device const uchar* rawGateBiases [[buffer(2)]],
+    device const uchar* rawUpWeight [[buffer(3)]],
+    device const uchar* rawUpScales [[buffer(4)]],
+    device const uchar* rawUpBiases [[buffer(5)]],
+    device const float* inputVector [[buffer(6)]],
+    device float* intermediateOutput [[buffer(7)]],
+    constant uint64_t& gateWeightOffset [[buffer(8)]],
+    constant uint64_t& gateScaleOffset [[buffer(9)]],
+    constant uint64_t& gateBiasOffset [[buffer(10)]],
+    constant uint64_t& upWeightOffset [[buffer(11)]],
+    constant uint64_t& upScaleOffset [[buffer(12)]],
+    constant uint64_t& upBiasOffset [[buffer(13)]],
+    constant uint32_t& hiddenDim [[buffer(14)]],
+    constant uint32_t& intermediateDim [[buffer(15)]],
+    constant uint32_t& groupSize [[buffer(16)]],
+    uint r [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    if (r >= intermediateDim) return;
+
+    uint32_t numGroups = hiddenDim / groupSize;
+    device const uchar* gWRow = rawGateWeight + gateWeightOffset + ((uint64_t)r * hiddenDim);
+    device const uchar* gSRow = rawGateScales + gateScaleOffset + ((uint64_t)r * numGroups * 2);
+    device const uchar* gBRow = rawGateBiases + gateBiasOffset + ((uint64_t)r * numGroups * 2);
+
+    device const uchar* uWRow = rawUpWeight + upWeightOffset + ((uint64_t)r * (hiddenDim / 8) * 4);
+    device const uchar* uSRow = rawUpScales + upScaleOffset + ((uint64_t)r * numGroups * 2);
+    device const uchar* uBRow = rawUpBiases + upBiasOffset + ((uint64_t)r * numGroups * 2);
+
+    float gate_sum = 0.0f;
+    float up_sum   = 0.0f;
+
+    uint32_t numU32 = hiddenDim / 8;
+    for (uint32_t i = laneId; i < numU32; i += 32) {
+        uint32_t col = i * 8;
+        uint32_t gIdx = col / groupSize;
+
+        float gScale = read_bf16_unaligned(gSRow + gIdx * 2);
+        float gBias  = read_bf16_unaligned(gBRow + gIdx * 2);
+        float uScale = read_bf16_unaligned(uSRow + gIdx * 2);
+        float uBias  = read_bf16_unaligned(uBRow + gIdx * 2);
+
+        uint32_t uU32 = read_u32_unaligned(uWRow + i * 4);
+
+        float4 in4_0 = *(device const float4*)(inputVector + col);
+        float4 in4_1 = *(device const float4*)(inputVector + col + 4);
+
+        float4 gw0_3 = float4(float(gWRow[col + 0]), float(gWRow[col + 1]), float(gWRow[col + 2]), float(gWRow[col + 3]));
+        float4 gw4_7 = float4(float(gWRow[col + 4]), float(gWRow[col + 5]), float(gWRow[col + 6]), float(gWRow[col + 7]));
+
+        float4 uw0_3 = float4(float(uU32 & 0x0F), float((uU32 >> 4) & 0x0F), float((uU32 >> 8) & 0x0F), float((uU32 >> 12) & 0x0F));
+        float4 uw4_7 = float4(float((uU32 >> 16) & 0x0F), float((uU32 >> 20) & 0x0F), float((uU32 >> 24) & 0x0F), float((uU32 >> 28) & 0x0F));
+
+        float gDot = dot(gw0_3, in4_0) + dot(gw4_7, in4_1);
+        float uDot = dot(uw0_3, in4_0) + dot(uw4_7, in4_1);
+        float xSum = (in4_0.x + in4_0.y + in4_0.z + in4_0.w) + (in4_1.x + in4_1.y + in4_1.z + in4_1.w);
+
+        gate_sum += gScale * gDot + gBias * xSum;
+        up_sum   += uScale * uDot + uBias * xSum;
+    }
+
+    gate_sum = simd_sum(gate_sum);
+    up_sum   = simd_sum(up_sum);
+
+    if (laneId == 0) {
+        float silu_gate = gate_sum / (1.0f + exp(-gate_sum));
+        intermediateOutput[r] = silu_gate * up_sum;
+    }
+}
+
 /// MSL Kernel: SIMDgroup Cooperative Q8 Affine Down-Projection with Weighted Accumulation (128-bit Vectorized)
 kernel void q8_down_proj_accumulate(
     device const uchar* rawDownWeight [[buffer(0)]],
@@ -4178,6 +4327,7 @@ kernel void gdn_linear_attention_recurrent_step(
         for (uint32_t j = 0; j < headDimVec4; j++) {
             Sk_i += dot(sRowVec4[j], kVec4[j]);
         }
+        Sk_i *= alpha;
 
         float v_val = qkvVector[vBase + i];
         float delta_v_i = beta * (v_val - Sk_i);
@@ -4205,8 +4355,8 @@ kernel void gdn_linear_attention_recurrent_step(
         float gamma = read_bf16_unaligned(normBuf + normOffset + ((uint64_t)i * 2));
         float yNorm = y_local[r] * rms * gamma;
         float z = zVector[zBase + i];
-        float sig_z = 1.0f / (1.0f + exp(-z));
-        outputVector[outBase + i] = yNorm * sig_z;
+        float silu_z = z / (1.0f + exp(-z));
+        outputVector[outBase + i] = yNorm * silu_z;
     }
 }
 
@@ -5058,6 +5208,7 @@ kernel void gdn_linear_attention_tree_step(
         for (uint32_t j = 0; j < headDimVec4; j++) {
             Sk_i += dot(inParentRowVec4[j], kVec4[j]);
         }
+        Sk_i *= alpha;
 
         float v_val = qkvVector[vBase + i];
         float delta_v_i = beta * (v_val - Sk_i);
@@ -5085,8 +5236,8 @@ kernel void gdn_linear_attention_tree_step(
         float gamma = read_bf16_unaligned(normBuf + normOffset + ((uint64_t)i * 2));
         float yNorm = y_local[r] * rms * gamma;
         float z = zVector[zBase + i];
-        float sig_z = 1.0f / (1.0f + exp(-z));
-        outputVector[outBase + i] = yNorm * sig_z;
+        float silu_z = z / (1.0f + exp(-z));
+        outputVector[outBase + i] = yNorm * silu_z;
     }
 }
 /// MSL Kernel: Fused Rotary Position Embeddings (RoPE) for JetSpec Candidate Tree Nodes

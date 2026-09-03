@@ -199,6 +199,8 @@ public final class InferenceEngine {
     public var q4DownPipeline: MTLComputePipelineState?
     public var q8GateUpPipeline: MTLComputePipelineState?
     public var q8DownPipeline: MTLComputePipelineState?
+    public var q4GateQ8UpPipeline: MTLComputePipelineState?
+    public var q8GateQ4UpPipeline: MTLComputePipelineState?
     public var fp8GateUpPipeline: MTLComputePipelineState?
     public var fp8DownPipeline: MTLComputePipelineState?
     public var fp8GateUpSimdPipeline: MTLComputePipelineState?
@@ -226,6 +228,7 @@ public final class InferenceEngine {
     public var router512Pipeline: MTLComputePipelineState?
     public var router512Q4Pipeline: MTLComputePipelineState?
     public var gdnLinearAttnStepPipeline: MTLComputePipelineState?
+    public var gdnLinearAttnSeqPipeline: MTLComputePipelineState?
     public var qsaMqaIndexerPipeline: MTLComputePipelineState?
     public var gatedResidualBlendPipeline: MTLComputePipelineState?
     public var fuseNgramPlePipeline: MTLComputePipelineState?
@@ -327,7 +330,7 @@ public final class InferenceEngine {
         if let linStepFunc = defaultLib.makeFunction(name: "linear_attention_recurrent_step") {
             linearAttnStepPipeline = try device.makeComputePipelineState(function: linStepFunc)
         }
-        if let rFunc = defaultLib.makeFunction(name: "moe_router_topk") {
+        if let rFunc = defaultLib.makeFunction(name: "moe_router_topk_bf16") ?? defaultLib.makeFunction(name: "moe_router_topk") {
             routerPipeline = try device.makeComputePipelineState(function: rFunc)
         }
         if let rQ4Func = defaultLib.makeFunction(name: "moe_router_topk_q4") {
@@ -368,6 +371,12 @@ public final class InferenceEngine {
         }
         if let q8DownFunc = defaultLib.makeFunction(name: "q8_down_proj_accumulate") {
             q8DownPipeline = try device.makeComputePipelineState(function: q8DownFunc)
+        }
+        if let q4q8Func = defaultLib.makeFunction(name: "q4_gate_q8_up_swiglu") {
+            q4GateQ8UpPipeline = try device.makeComputePipelineState(function: q4q8Func)
+        }
+        if let q8q4Func = defaultLib.makeFunction(name: "q8_gate_q4_up_swiglu") {
+            q8GateQ4UpPipeline = try device.makeComputePipelineState(function: q8q4Func)
         }
         if let fp8GateUpFunc = defaultLib.makeFunction(name: "fp8_swiglu_gate_up") {
             fp8GateUpPipeline = try device.makeComputePipelineState(function: fp8GateUpFunc)
@@ -439,6 +448,9 @@ public final class InferenceEngine {
         }
         if let gdnStepFunc = defaultLib.makeFunction(name: "gdn_linear_attention_recurrent_step") {
             gdnLinearAttnStepPipeline = try device.makeComputePipelineState(function: gdnStepFunc)
+        }
+        if let gdnSeqFunc = defaultLib.makeFunction(name: "linear_attention_recurrent_sequence") {
+            gdnLinearAttnSeqPipeline = try device.makeComputePipelineState(function: gdnSeqFunc)
         }
         if let qsaIdxFunc = defaultLib.makeFunction(name: "qsa_mqa_indexer_score_blocks") {
             qsaMqaIndexerPipeline = try device.makeComputePipelineState(function: qsaIdxFunc)
@@ -889,18 +901,20 @@ extension InferenceEngine {
         kvStride: Int = 2048,
         topK: Int = 8
     ) -> JetSpecStagingBuffers? {
-        let maskBytes = maxNodes * maxNodes * MemoryLayout<Float>.stride
-        let u32Bytes = maxNodes * MemoryLayout<UInt32>.stride
-        let logitsBytes = maxNodes * vocabSize * MemoryLayout<Float>.stride
-        let hiddenBytes = maxNodes * hiddenDim * MemoryLayout<Float>.stride
-        let qkvBytes = maxNodes * maxQkvDim * MemoryLayout<Float>.stride
-        let zBytes = maxNodes * maxZDim * MemoryLayout<Float>.stride
-        let kvBytes = maxNodes * kvStride * MemoryLayout<Float>.stride
-        let abBytes = maxNodes * 64 * MemoryLayout<Float>.stride
-        let interBytes = maxNodes * intermediateDim * MemoryLayout<Float>.stride
-        let routerBytes = maxNodes * topK * MemoryLayout<UInt32>.stride
-        let routerWBytes = maxNodes * topK * MemoryLayout<Float>.stride
-        let gdnStateBytes = maxNodes * 48 * 128 * 128 * MemoryLayout<Float>.stride
+        let safeTopK = max(1, topK)
+        let safeInterDim = max(1, intermediateDim)
+        let maskBytes = max(16, maxNodes * maxNodes * MemoryLayout<Float>.stride)
+        let u32Bytes = max(16, maxNodes * MemoryLayout<UInt32>.stride)
+        let logitsBytes = max(16, maxNodes * vocabSize * MemoryLayout<Float>.stride)
+        let hiddenBytes = max(16, maxNodes * hiddenDim * MemoryLayout<Float>.stride)
+        let qkvBytes = max(16, maxNodes * maxQkvDim * MemoryLayout<Float>.stride)
+        let zBytes = max(16, maxNodes * maxZDim * MemoryLayout<Float>.stride)
+        let kvBytes = max(16, maxNodes * kvStride * MemoryLayout<Float>.stride)
+        let abBytes = max(16, maxNodes * 64 * MemoryLayout<Float>.stride)
+        let interBytes = max(16, maxNodes * safeInterDim * MemoryLayout<Float>.stride)
+        let routerBytes = max(16, maxNodes * safeTopK * MemoryLayout<UInt32>.stride)
+        let routerWBytes = max(16, maxNodes * safeTopK * MemoryLayout<Float>.stride)
+        let gdnStateBytes = max(16, maxNodes * 48 * 128 * 128 * MemoryLayout<Float>.stride)
 
         guard let maskBuf = device.makeBuffer(length: maskBytes, options: .storageModeShared),
               let tokensBuf = device.makeBuffer(length: u32Bytes, options: .storageModeShared),
