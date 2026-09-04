@@ -338,7 +338,7 @@ fn try_load_flash_moe(search_path: &Path) -> Option<(Vec<ShardHandle>, Vec<Tenso
         let packed_experts_dir = dir.join("packed_experts");
         let layout_json_path = packed_experts_dir.join("layout.json");
 
-        if weights_json_path.is_file() && weights_bin_path.is_file() {
+        if weights_json_path.is_file() && weights_bin_path.is_file() && layout_json_path.is_file() {
             let weights_json_data = std::fs::read_to_string(&weights_json_path).ok()?;
             let weights_json: FlashMoEWeightsJson = serde_json::from_str(&weights_json_data).ok()?;
 

@@ -121,7 +121,14 @@ public final class ExpertRepacker {
 
         // 1. Separate Non-Expert Tensors -> model_weights.bin
         progress(0.10, "Extracting dense backbone weights...")
-        let nonExpertTensors = summary.tensors.filter { $0.expertId == nil }
+        let nonExpertTensors = summary.tensors.filter { tensor in
+            guard tensor.expertId == nil else { return false }
+            let name = tensor.name.lowercased()
+            if name.contains("ple.") || name.contains("ngram_embedding") { return false }
+            if name.starts(with: "mtp.") || name.contains(".mtp.") { return false }
+            if name.starts(with: "visual.") || name.starts(with: "model.visual.") { return false }
+            return true
+        }
         var nonExpertManifest: [String: FlashMoEWeightsManifest.TensorEntry] = [:]
 
         let weightsBinUrl = outputDir.appendingPathComponent("model_weights.bin")

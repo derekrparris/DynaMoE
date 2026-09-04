@@ -8924,6 +8924,10 @@ struct ContentView: View {
                     let address = UInt(shard.baseAddress)
                     guard let pointer = UnsafeMutableRawPointer(bitPattern: address) else { continue }
                     let length = Int(shard.length)
+                    guard length <= Int(device.maxBufferLength) else {
+                        print("⚠️ [Metal Warning] Shard #\(shard.index) (\(shard.filename)) size \(Double(length) / (1024*1024*1024)) GB exceeds device maxBufferLength (\(Double(device.maxBufferLength) / (1024*1024*1024)) GB). Skipping single-buffer mapping.")
+                        continue
+                    }
                     
                     if let buffer = device.makeBuffer(bytesNoCopy: pointer, length: length, options: .storageModeShared, deallocator: nil) {
                         buffers[shard.index] = buffer
