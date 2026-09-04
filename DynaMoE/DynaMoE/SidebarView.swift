@@ -119,6 +119,7 @@ struct SidebarView: View {
                             Text(String(format: "%.1f GB", currentRssGB))
                                 .font(.system(size: max(8, 10 * zoomManager.zoomScale), design: .monospaced))
                                 .foregroundColor(.secondary.opacity(0.8))
+                                .help(String(format: "Working Set RAM: %.1f GB\nProcess Heap (Activity Monitor / Xcode): %.1f GB\n\nApple Silicon maps zero-copy model weights directly into the Unified Memory buffer cache, while Activity Monitor tracks dirty process heap.", currentRssGB, getProcessResidentMemoryGB()))
                         }
                     }
                     .padding(.horizontal, 10)

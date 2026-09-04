@@ -259,21 +259,26 @@ struct HelpAndSettingsGuideView: View {
         VStack(alignment: .leading, spacing: 16) {
             headerBadge("Model Profiles", color: .green)
 
-            Text("Tailored Profiles: Coder vs. Assistant")
+            Text("Official Architecture Profiles: Ornith & Qwen")
                 .font(.title2).bold()
 
-            Text("Different tasks require fundamentally different sampling dynamics. Code generation demands precision, structural consistency, and low entropy, while assistant conversations require natural flow, topic freshness, and conversational variety.")
+            Text("Different tasks and model architectures require fundamentally different sampling dynamics. DynaMoE automatically defaults to and persists the official publisher-recommended generation profiles per model family:")
                 .font(.body)
+
+            // Ornith Profiles
+            Text("Ornith-1.5-9B Recommended Profiles")
+                .font(.headline)
+                .padding(.top, 4)
 
             HStack(alignment: .top, spacing: 16) {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
-                        Image(systemName: "laptopcomputer")
+                        Image(systemName: "curlybraces")
                             .foregroundColor(.blue)
-                        Text("Coder Profile")
+                        Text("Precise Coding & Tool Calling")
                             .font(.headline).bold()
                     }
-                    Text("• Temperature: 0.60 (low entropy)\n• Top-P: 0.95 | Top-K: 20\n• Min-P: 0.00\n• Repetition Penalty: 1.00 (disabled)\n• Presence Penalty: 0.00\n• Max Tokens: 8,192\n• JetSpec: Disabled for Ornith linear recurrence")
+                    Text("• Temperature: 0.60 (low entropy)\n• Top-P: 0.95 | Top-K: 20\n• Min-P: 0.00\n• Repetition Penalty: 1.00\n• Presence Penalty: 0.00 (strict syntax)\n• Max Tokens: 8,192\n• JetSpec: Disabled (linear recurrence)")
                         .font(.system(size: 12, design: .monospaced))
                         .lineSpacing(4)
                 }
@@ -286,10 +291,10 @@ struct HelpAndSettingsGuideView: View {
                     HStack {
                         Image(systemName: "bubble.left.and.bubble.right.fill")
                             .foregroundColor(.orange)
-                        Text("Assistant Profile")
+                        Text("General Chat / Agent Loops")
                             .font(.headline).bold()
                     }
-                    Text("• Temperature: 0.70 (natural pacing)\n• Top-P: 0.90 | Top-K: 50\n• Min-P: 0.05\n• Repetition Penalty: 1.10\n• Presence Penalty: 0.20 (fresh vocabulary)\n• Max Tokens: 4,096\n• JetSpec: Enabled where supported")
+                    Text("• Temperature: 1.00 (creative pacing)\n• Top-P: 0.95 | Top-K: 20\n• Min-P: 0.00\n• Repetition Penalty: 1.00\n• Presence Penalty: 1.50 (fresh vocabulary)\n• Max Tokens: 4,096\n• JetSpec: Disabled (linear recurrence)")
                         .font(.system(size: 12, design: .monospaced))
                         .lineSpacing(4)
                 }
@@ -297,6 +302,45 @@ struct HelpAndSettingsGuideView: View {
                 .background(Color(NSColor.controlBackgroundColor).opacity(0.4))
                 .cornerRadius(10)
                 .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.orange.opacity(0.3), lineWidth: 1))
+            }
+
+            // Qwen Profiles
+            Text("Qwen 3.8 Flash Next Recommended Profiles")
+                .font(.headline)
+                .padding(.top, 4)
+
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Image(systemName: "brain.head.profile")
+                            .foregroundColor(.purple)
+                        Text("Coding & Agentic (Thinking Mode)")
+                            .font(.headline).bold()
+                    }
+                    Text("• Temperature: 1.00 (high entropy)\n• Top-P: 0.95 | Top-K: 20\n• Min-P: 0.00\n• Repetition Penalty: 1.00\n• Presence Penalty: 0.00 (code consistency)\n• Max Tokens: 8,192\n• JetSpec: Enabled (Speculative Draft)")
+                        .font(.system(size: 12, design: .monospaced))
+                        .lineSpacing(4)
+                }
+                .padding(14)
+                .background(Color(NSColor.controlBackgroundColor).opacity(0.4))
+                .cornerRadius(10)
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.purple.opacity(0.3), lineWidth: 1))
+
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Image(systemName: "bolt.fill")
+                            .foregroundColor(.green)
+                        Text("General Assistant (Instruct Mode)")
+                            .font(.headline).bold()
+                    }
+                    Text("• Temperature: 0.70 (balanced focus)\n• Top-P: 0.80 | Top-K: 20\n• Min-P: 0.00\n• Repetition Penalty: 1.00\n• Presence Penalty: 1.50 (fresh vocabulary)\n• Max Tokens: 4,096\n• JetSpec: Enabled (Speculative Draft)")
+                        .font(.system(size: 12, design: .monospaced))
+                        .lineSpacing(4)
+                }
+                .padding(14)
+                .background(Color(NSColor.controlBackgroundColor).opacity(0.4))
+                .cornerRadius(10)
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.green.opacity(0.3), lineWidth: 1))
             }
 
             infoBox(title: "Why Repetition Penalty is 1.00 for Coding", icon: "exclamationmark.triangle.fill") {

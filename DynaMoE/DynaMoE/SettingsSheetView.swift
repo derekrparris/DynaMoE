@@ -543,9 +543,10 @@ struct SettingsSheetView: View {
                 Image(systemName: activeProfile.icon)
                     .font(.system(size: 20))
                     .foregroundColor(.purple)
+                let currentModelIdentifier = activeModelPath ?? modelConfig?.modelType ?? localModelManager.defaultModelId
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
-                        Text("Active Profile: \(activeProfile.rawValue)")
+                        Text("Active Profile: \(activeProfile.profileDisplayName(for: currentModelIdentifier))")
                             .font(.system(size: 13, weight: .bold))
                         if let path = activeModelPath,
                            let model = localModelManager.discoveredModels.first(where: { $0.snapshotPath == path || $0.weightsEntryPath == path }) {
@@ -562,7 +563,7 @@ struct SettingsSheetView: View {
                                 .foregroundColor(.secondary)
                         }
                     }
-                    Text(activeProfile.description)
+                    Text(activeProfile.description(for: currentModelIdentifier))
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
@@ -1001,14 +1002,23 @@ struct SettingsSheetView: View {
                 // Telemetry Metrics Grid
                 HStack(spacing: 14) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("PHYSICAL RSS")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundColor(.secondary)
+                        HStack(spacing: 3) {
+                            Text("WORKING SET RAM")
+                                .font(.system(size: 9, weight: .bold))
+                                .foregroundColor(.secondary)
+                            Image(systemName: "info.circle")
+                                .font(.system(size: 8))
+                                .foregroundColor(.secondary)
+                        }
                         Text(String(format: "%.2f GB", currentRssGB))
                             .font(.system(.subheadline, design: .monospaced))
                             .fontWeight(.bold)
                             .foregroundColor(.indigo)
+                        Text(String(format: "Heap: %.2f GB", getProcessResidentMemoryGB()))
+                            .font(.system(size: 8, design: .monospaced))
+                            .foregroundColor(.secondary)
                     }
+                    .help(String(format: "Working Set RAM: %.2f GB\nProcess Heap (Activity Monitor): %.2f GB\nUnified Memory Cache: %.2f GB\n\nApple Silicon places clean zero-copy model weights in Darwin's Unified Memory Buffer Cache, which Activity Monitor excludes from process footprint.", currentRssGB, getProcessResidentMemoryGB(), max(0, currentRssGB - getProcessResidentMemoryGB())))
 
                     VStack(alignment: .leading, spacing: 2) {
                         Text("RESIDENT EXPERTS")
@@ -1429,7 +1439,7 @@ struct SettingsSheetView: View {
                     HStack(spacing: 6) {
                         Image(systemName: inspectingProfileType.icon)
                             .foregroundColor(.purple)
-                        Text("\(inspectingProfileType.rawValue) Profile Settings")
+                        Text("\(inspectingProfileType.profileDisplayName(for: model.displayName)) Settings")
                             .font(.system(size: 13, weight: .bold))
                         Text("•")
                             .foregroundColor(.secondary)
@@ -1437,7 +1447,7 @@ struct SettingsSheetView: View {
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
-                    Text(inspectingProfileType.description)
+                    Text(inspectingProfileType.description(for: model.displayName))
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }

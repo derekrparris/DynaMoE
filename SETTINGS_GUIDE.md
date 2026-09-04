@@ -91,16 +91,43 @@ Sparse MoE models with hundreds of experts (e.g., Qwen 3.8 Flash Next with 512 r
 > [!TIP]
 > Repackaging is recommended for large MoE models that will run in **SSD Streaming** mode. For models that fit entirely into physical RAM (like Ornith 1.5 9B), repackaging is not required.
 
-### Model-Specific Profiles ("Coder" & "Assistant")
+#### Model-Specific Profiles ("Coder" & "Assistant")
 Different workloads demand opposite sampling behaviors. Coding requires precision, structural consistency, and low entropy, while assistant conversations require natural flow, topic freshness, and conversational variety.
 
-DynaMoE provides **Model-Specific Profiles**:
+DynaMoE automatically defaults to and persists the official publisher-tuned profiles for each model family:
+
+#### Ornith-1.5-9B Official Profiles
+- **Precise Coding & Tool Calling (`Coder`)**:
+  - **Temperature**: $0.60$ (low entropy, deterministic syntax)
+  - **Top-P**: $0.95$ | **Top-K**: $20$ | **Min-P**: $0.00$
+  - **Repetition Penalty**: $1.00$ (disabled to preserve code braces/keywords)
+  - **Presence Penalty**: $0.00$ (strict schema & JSON compliance)
+  - **Max Tokens**: $8,192$ | **JetSpec**: Disabled (linear recurrent GDN)
+- **General Chat / Agent Loops (`Assistant`)**:
+  - **Temperature**: $1.00$ (creative conversational pacing)
+  - **Top-P**: $0.95$ | **Top-K**: $20$ | **Min-P**: $0.00$
+  - **Repetition Penalty**: $1.00$
+  - **Presence Penalty**: $1.50$ (fresh vocabulary, prevents looping)
+  - **Max Tokens**: $4,096$ | **JetSpec**: Disabled (linear recurrent GDN)
+
+#### Qwen 3.8 Flash Next FP8 Official Profiles
+- **Coding & Agentic Profile (Thinking Mode - `Coder`)**:
+  - **Temperature**: $1.00$ (high-entropy exploration for SWE-bench & reasoning)
+  - **Top-P**: $0.95$ | **Top-K**: $20$ | **Min-P**: $0.00$
+  - **Repetition Penalty**: $1.00$
+  - **Presence Penalty**: $0.00$ (code consistency)
+  - **Max Tokens**: $8,192$ | **JetSpec**: Enabled (draft speculative decoding)
+- **General Assistant Profile (Instruct / Direct Mode - `Assistant`)**:
+  - **Temperature**: $0.70$ (balanced direct responses without reasoning overhead)
+  - **Top-P**: $0.80$ | **Top-K**: $20$ | **Min-P**: $0.00$
+  - **Repetition Penalty**: $1.00$
+  - **Presence Penalty**: $1.50$ (fresh conversational flow)
+  - **Max Tokens**: $4,096$ | **JetSpec**: Enabled (draft speculative decoding)
+
+#### Profile Customization & Persistence
 1. Click any model card in the **Models** tab or click its **"Profiles"** button.
 2. Select either the **Coder** or **Assistant** tab in the inspector.
-3. Customize hyperparameters specifically for that model:
-   - Temperature, Top-P, Min-P, Top-K, Repetition Penalty, Presence Penalty, Max Tokens.
-   - Speculative JetSpec toggle (e.g., keep enabled for dense/MoE models, disabled for linear recurrence models like Ornith).
-   - Dedicated Model System Prompt for that specific profile.
+3. Customize hyperparameters specifically for that model (Temperature, Top-P, Min-P, Top-K, Repetition Penalty, Presence Penalty, Max Tokens, JetSpec, System Prompt).
 4. Click **Save Profile** to persist these settings permanently to `UserDefaults`.
 5. In the chat interface, toggle between **[ 💻 Coder ▾ ]** and **[ 💬 Assistant ▾ ]** right next to the model selector with zero friction.
 
@@ -329,10 +356,13 @@ Test GPU compute pipelines in isolation without running full autoregressive gene
 - **KV Cache Precision**: `FP16` or `FP8 E4M3` (FP8 recommended for $>8,000$ token contexts).
 - **JetSpec**: Disabled (`false`).
 - **Coder Profile**: $T=0.60$, $\text{Top-}P=0.95$, $\text{Top-}K=20$, $\text{RepPen}=1.00$, $\text{PresPen}=0.00$.
-- **Assistant Profile**: $T=0.70$, $\text{Top-}P=0.90$, $\text{Top-}K=50$, $\text{RepPen}=1.10$, $\text{PresPen}=0.20$.
+- **Assistant Profile**: $T=1.00$, $\text{Top-}P=0.95$, $\text{Top-}K=20$, $\text{RepPen}=1.00$, $\text{PresPen}=1.50$.
 
 ### 24 GB – 36 GB Unified RAM
 - **Primary Models**: Ornith 1.5 9B (Full RAM) or Ornith 1.5 35B A3B / Qwen 3.8 Flash Next (SSD Streaming).
+- **Qwen 3.8 Flash Next Profiles**:
+  - **Thinking Mode (Coder)**: $T=1.00$, $\text{Top-}P=0.95$, $\text{Top-}K=20$, $\text{RepPen}=1.00$, $\text{PresPen}=0.00$.
+  - **Instruct Mode (Assistant)**: $T=0.70$, $\text{Top-}P=0.80$, $\text{Top-}K=20$, $\text{RepPen}=1.00$, $\text{PresPen}=1.50$.
 - **Memory Execution Mode**: `Auto (Smart)`.
 - **Memory Budget Mode**: `Balanced (16GB)` or `High Capacity (24GB)`.
 - **KV Cache Precision**: `FP16`.

@@ -321,6 +321,7 @@ struct ChatDetailView: View {
                         .menuStyle(.borderlessButton)
                         .fixedSize()
 
+                        let currentProfileModel = session?.selectedModelName ?? modelName
                         // Profile Selector Menu (Coder / Assistant)
                         Menu {
                             Section("Generation Profile") {
@@ -332,7 +333,7 @@ struct ChatDetailView: View {
                                             if activeProfile == profile {
                                                 Image(systemName: "checkmark")
                                             }
-                                            Label("\(profile.rawValue) (\(profile == .coder ? "Code & Syntax" : "Chat & Reasoning"))", systemImage: profile.icon)
+                                            Label("\(profile.rawValue) (\(profile.profileDisplayName(for: currentProfileModel)))", systemImage: profile.icon)
                                         }
                                     }
                                 }
@@ -368,7 +369,7 @@ struct ChatDetailView: View {
                         }
                         .menuStyle(.borderlessButton)
                         .fixedSize()
-                        .help("Active generation profile: \(activeProfile.rawValue) (\(activeProfile.description))")
+                        .help("Active generation profile: \(activeProfile.profileDisplayName(for: currentProfileModel)) (\(activeProfile.description(for: currentProfileModel)))")
 
                         // Thinking On/Off Dropdown beside Model Selector (shown only if loaded model supports thinking)
                         if supportsThinking {

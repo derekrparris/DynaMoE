@@ -21,7 +21,7 @@ Special thanks and acknowledgement to the open-source projects and research that
 
 DynaMoE supports sparse Mixture-of-Experts, hybrid recurrent SSM/attention architectures, and dense autoregressive transformers with automatic model topology detection.
 
-**Note:** **Ornith 1.5 9B Dense** is now functioning with live autoregressive decoding, reasoning/thinking chains, and model-specific profiles ("Coder" & "Assistant"). **Qwen 3.8 Flash Next** MoE SSD streaming and parallel JetSpec validation remain in active implementation.
+**Status Update:** Both **Ornith 1.5 9B Dense** and **Qwen 3.8 Flash Next FP8 MoE** are fully operational with live prompt prefill, high-speed autoregressive decoding, NVMe SSD streaming, dynamic working set memory budgets, reasoning/thinking chains, and task-specific generation profiles ("Coder" & "Assistant").
 
 | Model / Family | Parameters | Active Parameters | Architecture Type | Quantization & Precision | Context Window |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -31,10 +31,12 @@ DynaMoE supports sparse Mixture-of-Experts, hybrid recurrent SSM/attention archi
 | **Standard Dense LLMs** | 3B – 32B | Full Layer Width | Dense Transformer (LLaMA / Qwen 2.5 / Nanbeige) | Q4 / Q8 / BF16 / FP16 | Model Default |
 
 ### Key Architectural Strengths:
-* **Hybrid Recurrent SSM + Sparse/Full Attention**: GatedDeltaNet linear recurrent attention layers ($O(1)$ constant-memory recurrent state updates) interleaved 3:1 with Qwen Sparse Attention (QSA) or Grouped-Query Attention (GQA).
+* **Hybrid Recurrent SSM + Sparse/Full Attention**: GatedDeltaNet linear recurrent attention layers ($O(1)$ constant-memory recurrent state updates) with Sigmoid output gating interleaved 3:1 with Qwen Sparse Attention (QSA) or Grouped-Query Attention (GQA).
 * **Massive Fine-Grained Sparsity & High-Throughput Routing**: 256–512 routed experts per layer (Top-8 / Top-10 activated per token) plus dedicated Sigmoid-gated shared experts with zero-copy NVMe streaming.
-* **4-Stream Gated Residuals & N-Gram PLE Support**: 4 parallel structural residual streams with rank-320 bottleneck read/write gates and zero-copy Layer 2 N-gram Predictive Local Embedding (PLE) row gathering.
-* **JetSpec Speculative Tree Acceleration**: Parallel candidate tree drafting with tree-causal attention masking and expert-aware MoE pruning.
+* **Direct Unpacked Shard Streaming**: Direct POSIX `pread` bulk priming from 100+ HuggingFace `.safetensors` shards at sequential NVMe line rate (>4.1 GB/s) without requiring disk-doubling weight repacking.
+* **Strict Working Set RAM Budgeting**: Double-bounded expert cache (`WorkingSetManager`) that evicts stale experts at layer boundaries during prefill and at token boundaries during generation, eliminating RAM spikes.
+* **4-Stream Gated Residuals & N-Gram PLE Support**: 4 parallel structural residual streams with rank-320 bottleneck read/write gates, unit-offset RMSNorms, and zero-copy Layer 2 N-gram Predictive Local Embedding (PLE) row gathering.
+* **JetSpec Speculative Tree Acceleration**: Parallel candidate tree drafting with tree-causal attention masking, expert-aware MoE pruning, and speculative KV cache compaction/rollback.
 * **Dynamic Architecture Auto-Detection**: Inspects `config.json`, SafeTensors headers, and tensor topologies to automatically configure layer count, hidden dimensions, attention heads, KV heads, RoPE theta, RMSNorm eps, unit offsets, and MLP projection types.
 
 ---
@@ -70,13 +72,16 @@ When verifying $N$ candidate tree nodes simultaneously on an MoE model, each can
 ## Key Highlights & Capabilities
 
 * **Zero-Copy Apple Silicon Unified Memory Bridge:** Memory-maps multi-gigabyte SafeTensors weight shards via `memmap2` in Rust and wraps raw memory addresses directly into Metal GPU buffers (`MTLBuffer(bytesNoCopy:length:options:deallocator:)` with `.storageModeShared`), eliminating redundant CPU-to-GPU copies.
+* **High-Throughput NVMe Parallel `pread` Bulk Priming Engine:** Dynamically caches read-only file descriptors for all `.safetensors` model shards (e.g. 131 files for Qwen 3.8 Flash Next) and issues multi-threaded contiguous `pread` block transfers (256 KB chunks) alongside kernel readahead advisories (`fcntl(F_RDADVISE)`). Maximizes NVMe throughput at line rate (>2,500 MB/s to >4,100 MB/s), bypassing macOS page-fault traps and dropping cold-expert slice loading times to ~0.45 ms.
+* **Layer-Boundary & Token-Boundary Working Set Memory Management:** Enforces strict memory budgets (`lowMemory`, `balanced16GB`, `unrestricted`) across both prompt prefill and token generation. Automatically evicts stale layer experts at layer boundaries during prefill and evicts inactive experts at token boundaries during generation, eliminating RAM spikes (>16 GB) and keeping physical RAM bounded to the chosen target (e.g. 5.5 GB or 11.5 GB).
+* **Apple Silicon Unified Memory (UMA) Telemetry & Reporting:** Dual memory accounting distinguishing between Darwin's `phys_footprint` (dirty process heap displayed in Activity Monitor / Xcode) and the clean zero-copy pages in the macOS Unified Memory Buffer Cache. Features interactive in-app tooltips explaining memory behavior.
 * **SIMD-Coalesced Metal Compute Kernels:** Custom Metal Shading Language (MSL) compute shaders featuring SIMD-coalesced memory access and threadgroup shared memory caching for packed 4-bit/8-bit affine matrix-vector operations, FP8 (`E4M3`/`E5M2`) with block scales (MXFP8), SwiGLU expert projections (`gate_proj`, `up_proj`, `down_proj`), dynamic Top-8/Top-10 routing across up to 512 experts, and token embedding lookups.
-* **FlashMoE Contiguous Expert Repackaging & Multi-Threaded Direct I/O:** Inspired by and adapted from Dan Woods' Flash-MoE project, DynaMoE supports restructuring sparse MoE model layers into contiguous per-layer expert binaries (`packed_experts/layer_XX.bin` + `layout.json`). A dedicated 8-thread background POSIX `pread` I/O pool (`ExpertIOThreadPool`) streams selected expert slices directly into shared Metal staging buffers, eliminating file fragmentation and maximizing NVMe read bandwidth during token generation.
+* **FlashMoE Contiguous Expert Repackaging (Optional):** Inspired by Dan Woods' Flash-MoE project, DynaMoE supports restructuring sparse MoE model layers into contiguous per-layer expert binaries (`packed_experts/layer_XX.bin` + `layout.json`) with an 8-thread background POSIX `pread` I/O pool (`ExpertIOThreadPool`) for dedicated single-file streaming.
 * **Quantized FP8 & FP16 KV Cache:** Dynamically configurable KV cache precision (**FP32**, **FP16**, and **FP8 E4M3/E5M2**), reducing attention cache memory footprints by up to 75% and enabling long-context inference (32k+ tokens) on memory-constrained Macs.
-* **Speculative MoE Expert Prefetching (`WorkingSetManager`):** Thread-safe background speculative lookahead prefetching pipeline using `posix_madvise(POSIX_MADV_WILLNEED)` to warm upcoming layer experts asynchronously before routing execution, alongside LRU page eviction (`POSIX_MADV_DONTNEED`) to keep RSS within strict hardware thresholds.
-* **Hardware-Vectorized Accelerate Sampling & Penalties:** Apple Accelerate framework integration using `vDSP_maxvi` for zero-overhead greedy sampling, $O(\log K)$ min-heap Top-$K$ candidate tracking, vectorized softmax normalization (`vvexpf`, `vDSP_vsmul`), dynamic **Min-$P$** and **Top-$P$ (Nucleus)** probability truncation, and bounded **Repetition Penalty** and additive **Presence Penalty** to eliminate vocabulary looping without degrading throughput.
-* **Model-Specific Profiles ("Coder" & "Assistant"):** Dedicated per-model generation profiles saving tailored sampling parameters (Temperature, Top-P, Min-P, Top-K, Repetition/Presence Penalties, JetSpec toggles, and System Prompts) for coding versus conversational tasks. Persisted across sessions and quickly toggleable via an in-chat selector.
 * **Universal Reasoning & `<think>` Accordion:** Automatic detection of reasoning/thinking models across Ornith, Qwen 2.5/3.5, DeepSeek-R1, Nanbeige, GLM, and Nemotron with dynamic inspection of `tokenizer_config.json` and `chat_template.jinja`. Renders real-time, collapsible chain-of-thought blocks with duration timers, char counts, and live streaming pace indicators.
+* **Hardware-Vectorized Accelerate Sampling & Penalties:** Apple Accelerate framework integration using `vDSP_maxvi` for zero-overhead greedy sampling, $O(\log K)$ min-heap Top-$K$ candidate tracking, vectorized softmax normalization (`vvexpf`, `vDSP_vsmul`), dynamic **Min-$P$** and **Top-$P$ (Nucleus)** probability truncation, and bounded **Repetition Penalty** and additive **Presence Penalty** to eliminate vocabulary looping without degrading throughput.
+* **Native Tool Calling & Agent Harness (`AgentHarness.swift`):** Autonomous tool calling pipeline supporting web search queries, local file operations, and Model Context Protocol (MCP) tool execution with collapsible in-chat tool status cards.
+* **Model-Specific Profiles ("Coder" & "Assistant"):** Dedicated per-model generation profiles saving tailored sampling parameters (Temperature, Top-P, Min-P, Top-K, Repetition/Presence Penalties, JetSpec toggles, and System Prompts) for coding versus conversational tasks. Persisted across sessions and quickly toggleable via an in-chat selector.
 * **Rich Markdown & Code Rendering Engine:** High-performance, debounced token streaming UI with full GitHub Flavored Markdown support, including tables with column alignment, blockquotes, callout alerts (`[!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`), nested lists, and syntax-highlighted code blocks with one-click copy.
 * **Hugging Face Local Cache Auto-Discovery:** Automatically scans `~/.cache/huggingface/hub` on launch to discover all downloaded models, snapshots, weight formats, and quantizations. Allows selecting an overall **Default Model** and automatically tracks the **Last Used Model**.
 * **Antigravity-Style Multi-Session Chat UI:** Full multi-session chat workspace with persistent session history, creation, renaming, deletion, an interactive model switcher, and a 1-click **Profile Selector** (Coder vs. Assistant) in the chat toolbar.
@@ -95,12 +100,17 @@ DynaMoE/
 │   ├── ContentView.swift    # Core workspace coordinator, Metal compute dispatch, and autoregressive engine
 │   ├── ChatDetailView.swift # Antigravity-style chat interface, markdown parser, thinking accordion, model/profile switcher
 │   ├── ChatModels.swift     # Multi-session chat models, message state, and persistence
+│   ├── AgentHarness.swift   # Autonomous tool calling, web search integration, and MCP bridge
 │   ├── LocalModelManager.swift # Hugging Face cache scanner (~/.cache/huggingface/hub) and model registry
 │   ├── ModelConfig.swift    # Config parser, architecture detection, and system prompt conjunction resolver
 │   ├── ModelProfileManager.swift # Model-specific generation profiles (Coder & Assistant) and persistence
-│   ├── SettingsSheetView.swift # Comprehensive Settings: Models, Model Profiles, JetSpec Controls, Memory Modes, and Prompts
+│   ├── ExpertRepacker.swift # Flash-MoE layer packing utility (packed_experts/layer_XX.bin)
+│   ├── ExpertIOThreadPool.swift # Dedicated background POSIX pread worker pool for packed layers
+│   ├── SettingsSheetView.swift # Comprehensive Settings: Models, Profiles, JetSpec Controls, Memory Modes, Prompts
+│   ├── SettingsWindowManager.swift # Independent window management for Settings
 │   ├── HelpAndSettingsGuideView.swift # In-app searchable Help & Settings Guide (⌘?)
-│   ├── SidebarView.swift    # Navigation sidebar for chat sessions, model info, and tensor catalog
+│   ├── AboutDynaMoEView.swift # Rich About DynaMoE modal
+│   ├── SidebarView.swift    # Navigation sidebar for chat sessions, model info, and working set RAM telemetry
 │   ├── InferenceEngine.swift # GPU pipeline abstractions and compute shaders bridge
 │   └── ComputeShaders.metal # MSL Kernels (Q4/Q8 GEMV, SIMD SwiGLU, MXFP8, DeltaNet, GQA, Tree-Causal Verification)
 ├── GeneratedFFI/            # Auto-Generated Swift UniFFI Bindings
@@ -123,14 +133,14 @@ flowchart TD
     A["Phase 1: Ingestion & Zero-Copy ✅"] --> B["Phase 2: MoE Layer Compute ✅"]
     B --> C["Phase 3: Generation & Memory Optimization ✅"]
     C --> D["Phase 4: Multi-Session Chat & Rich UX ✅"]
-    D --> E["Phase 5: JetSpec Speculative Tree Engine 🚀 (In Progress)"]
-    E --> F["Phase 6: Server & MCP Ecosystem ⏳"]
+    D --> E["Phase 5: JetSpec Speculative Tree Engine ✅"]
+    E --> F["Phase 6: Server & MCP Ecosystem ⏳ (In Progress)"]
     
     style A fill:#4CAF50,stroke:#388E3C,stroke-width:2px,color:#fff
     style B fill:#4CAF50,stroke:#388E3C,stroke-width:2px,color:#fff
     style C fill:#4CAF50,stroke:#388E3C,stroke-width:2px,color:#fff
     style D fill:#4CAF50,stroke:#388E3C,stroke-width:2px,color:#fff
-    style E fill:#FF9800,stroke:#F57C00,stroke-width:2px,color:#fff
+    style E fill:#4CAF50,stroke:#388E3C,stroke-width:2px,color:#fff
     style F fill:#2196F3,stroke:#1976D2,stroke-width:2px,color:#fff
 ```
 
@@ -146,14 +156,18 @@ flowchart TD
 - [x] **MoE Top-$K$ Gating Kernel (`mlp.gate.weight`)**: Metal shaders multiplying hidden states against router weights and extracting top-$K$ expert indices (supporting up to 512 fine-grained experts) with Softmax routing probabilities.
 - [x] **SIMD-Coalesced Q4/Q8 Affine GEMV & SwiGLU**: Threadgroup-cached 4-bit/8-bit dequantization matrix-vector multiplication with SiLU activation and Hadamard product for expert projections (`gate_proj`, `up_proj`, `down_proj`).
 - [x] **Shared Expert & Accumulation Pipeline**: Parallel GPU dispatch across active routed experts and Sigmoid-gated shared experts, accumulating into post-MLP hidden state vector $h_{\text{mlp}}$.
-- [x] **Hybrid GatedDeltaNet SSM & GQA Attention**: Causal Conv1D, linear attention recurrent step, L2 head norm, per-head RMSNorm, partial RoPE, and fused GQA decode.
-- [x] **4-Branch Gated Residual Blending**: Metal kernel performing read gating, write scaling, and accumulation across 4 structural streams.
+- [x] **Hybrid GatedDeltaNet SSM & GQA Attention**: Causal Conv1D, linear attention recurrent step with Sigmoid output gating, L2 head norm, per-head RMSNorm, partial RoPE, and fused GQA decode.
+- [x] **4-Branch Gated Residual Blending**: Metal kernel performing read gating, write scaling, and accumulation across 4 structural streams (HC inject / down-projection).
+- [x] **Qwen 3.8 Flash Next Architecture Support**: Native support for Sigmoid-gated DeltaNet linear attention recurrence, unit-offset RMSNorms (`1 + weight`), 4-stream HC inject/down residual blending, and auto-loaded `tokenizer.json`.
 
 ### Phase 3: Generation, Sampling & Memory Optimization ✅ *(Completed)*
 - [x] **Sequential Multi-Layer Backbone Engine ($h_0 \to h_N$)**: Double-buffered GPU layer loop chaining dynamic MoE routing, SwiGLU expert dispatch, RMSNorm, SSM DeltaNet, and GQA attention.
+- [x] **Layer-Wise MoE Prompt Prefill (`runLayerWisePrefill`)**: Memory-bounded prompt ingestion processing tokens through each layer sequentially with double-buffered hidden state ping-ponging and layer-boundary working set trimming.
 - [x] **Dense Transformer Engine**: Dedicated compute path supporting dense LLMs (e.g., Nanbeige, Ornith 9B, Qwen 2.5, LLaMA) with standard dense MLPs and RMSNorms.
+- [x] **Direct POSIX `pread` Bulk Priming Engine**: Sharded `.safetensors` direct streaming via cached file descriptors and parallel 256 KB block transfers with `fcntl(F_RDADVISE)`, achieving >4.1 GB/s NVMe line rate and eliminating 460k+ OS page fault traps.
+- [x] **Dynamic Working Set Budget Enforcement (`WorkingSetManager`)**: Strict layer-boundary and token-boundary expert eviction keeping physical RAM bounded to user-selected hardware profiles (5.5 GB Low Memory, 11.5 GB Balanced, Unrestricted).
+- [x] **Dual Unified Memory & Heap Telemetry**: Real-time tracking distinguishing between macOS `phys_footprint` (dirty process heap) and zero-copy clean weight buffers in the Apple Silicon Unified Memory Buffer Cache.
 - [x] **Quantized FP8 / FP16 KV Cache**: Configurable KV cache precision (FP32, FP16, FP8) with dedicated fused storage and attention decode kernels.
-- [x] **Speculative MoE Expert Prefetching (`WorkingSetManager`)**: Asynchronous multi-layer lookahead prefetching (`POSIX_MADV_WILLNEED`) and LRU working set eviction (`POSIX_MADV_DONTNEED`).
 - [x] **Hardware-Vectorized Accelerate Sampling & Penalties**: Apple Accelerate (`vDSP_maxvi`, `vvexpf`) greedy and min-heap Top-$K$ sampling, adaptive **Min-$P$**, **Top-$P$ (Nucleus)** truncation, repetition penalties, and presence penalties.
 
 ### Phase 4: Multi-Session Chat & User Experience ✅ *(Completed)*
@@ -164,6 +178,7 @@ flowchart TD
 - [x] **Presence & Repetition Penalties**: Configurable presence penalty slider and additive penalty logic disincentivizing repeated tokens in recent context windows.
 - [x] **Universal Thinking / `<think>` Visualization**: Expandable/collapsible reasoning view with live token count, duration timers, streaming pace indicators, and toggleable reasoning prefill.
 - [x] **Rich Markdown & Code Block Engine**: Full GitHub Flavored Markdown renderer with table support, callout alerts, blockquotes, and syntax-highlighted code blocks with one-click copying.
+- [x] **Native Agent Harness & Tool Calling (`AgentHarness.swift`)**: Tool call parsing, recursive agent loops, and execution cards for web search and local filesystem interactions.
 - [x] **Model-Specific System Prompts & Conjunction Merging**: Automatic injection of mandatory instruct prompts combined with user-saved default system prompts.
 - [x] **Native macOS View Menu Zoom**: Zoom In (`⌘+`), Zoom Out (`⌘-`), and Actual Size (`⌘0`) with proportional geometry scaling.
 
@@ -205,7 +220,7 @@ flowchart TD
 
 ---
 
-### Phase 6: Local Server & Ecosystem Integration ⏳ *(Upcoming)*
+### Phase 6: Local Server & Ecosystem Integration ⏳ *(In Progress)*
 - [ ] Embedded OpenAI-compatible HTTP server (`/v1/chat/completions`, `/v1/models`).
 - [ ] Native Model Context Protocol (MCP) server for local tool execution and agent integration.
 - [ ] Configurable YaRN RoPE scaling UI toggle for long-context execution up to 1M tokens.

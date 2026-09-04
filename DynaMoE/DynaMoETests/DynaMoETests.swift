@@ -4131,25 +4131,57 @@ final class DynaMoETests: XCTestCase {
             manager.resetProfile(for: testQwenId, type: .assistant)
         }
 
-        // 1. Verify default Coder and Assistant profiles for Ornith
+        // 1. Verify official default Coder and Assistant profiles for Ornith-1.5-9B
         let defaultOrnithCoder = manager.getProfile(for: testOrnithId, type: .coder)
         let defaultOrnithAssistant = manager.getProfile(for: testOrnithId, type: .assistant)
 
+        // Ornith Precise Coding & Tool Calling Profile
         XCTAssertEqual(defaultOrnithCoder.temperature, 0.60, accuracy: 0.01)
         XCTAssertEqual(defaultOrnithCoder.topP, 0.95, accuracy: 0.01)
+        XCTAssertEqual(defaultOrnithCoder.minP, 0.00, accuracy: 0.01)
         XCTAssertEqual(defaultOrnithCoder.topK, 20)
+        XCTAssertEqual(defaultOrnithCoder.repetitionPenalty, 1.00, accuracy: 0.01)
+        XCTAssertEqual(defaultOrnithCoder.presencePenalty, 0.00, accuracy: 0.01)
         XCTAssertEqual(defaultOrnithCoder.maxNewTokens, 8192)
         XCTAssertFalse(defaultOrnithCoder.jetSpecEnabled, "Ornith linear recurrence must disable JetSpec by default")
         XCTAssertTrue(defaultOrnithCoder.systemPrompt.contains("software engineer") || defaultOrnithCoder.systemPrompt.contains("programming"))
 
-        XCTAssertEqual(defaultOrnithAssistant.temperature, 0.70, accuracy: 0.01)
-        XCTAssertEqual(defaultOrnithAssistant.topP, 0.90, accuracy: 0.01)
-        XCTAssertEqual(defaultOrnithAssistant.minP, 0.05, accuracy: 0.01)
-        XCTAssertEqual(defaultOrnithAssistant.topK, 50)
+        // Ornith General Chat / Agent Loops Profile
+        XCTAssertEqual(defaultOrnithAssistant.temperature, 1.00, accuracy: 0.01)
+        XCTAssertEqual(defaultOrnithAssistant.topP, 0.95, accuracy: 0.01)
+        XCTAssertEqual(defaultOrnithAssistant.minP, 0.00, accuracy: 0.01)
+        XCTAssertEqual(defaultOrnithAssistant.topK, 20)
+        XCTAssertEqual(defaultOrnithAssistant.repetitionPenalty, 1.00, accuracy: 0.01)
+        XCTAssertEqual(defaultOrnithAssistant.presencePenalty, 1.50, accuracy: 0.01)
         XCTAssertEqual(defaultOrnithAssistant.maxNewTokens, 4096)
+        XCTAssertFalse(defaultOrnithAssistant.jetSpecEnabled)
         XCTAssertTrue(defaultOrnithAssistant.systemPrompt.contains("helpful") || defaultOrnithAssistant.systemPrompt.contains("assistant"))
 
-        // 2. Modify and Save Custom Settings for Ornith Coder
+        // 2. Verify official default Coder and Assistant profiles for Qwen 3.8 Flash Next
+        let defaultQwenCoder = manager.getProfile(for: testQwenId, type: .coder)
+        let defaultQwenAssistant = manager.getProfile(for: testQwenId, type: .assistant)
+
+        // Qwen Coding & Agentic Profile (Thinking Mode)
+        XCTAssertEqual(defaultQwenCoder.temperature, 1.00, accuracy: 0.01)
+        XCTAssertEqual(defaultQwenCoder.topP, 0.95, accuracy: 0.01)
+        XCTAssertEqual(defaultQwenCoder.minP, 0.00, accuracy: 0.01)
+        XCTAssertEqual(defaultQwenCoder.topK, 20)
+        XCTAssertEqual(defaultQwenCoder.repetitionPenalty, 1.00, accuracy: 0.01)
+        XCTAssertEqual(defaultQwenCoder.presencePenalty, 0.00, accuracy: 0.01)
+        XCTAssertEqual(defaultQwenCoder.maxNewTokens, 8192)
+        XCTAssertTrue(defaultQwenCoder.jetSpecEnabled)
+
+        // Qwen General Assistant Profile (Instruct / Direct Mode)
+        XCTAssertEqual(defaultQwenAssistant.temperature, 0.70, accuracy: 0.01)
+        XCTAssertEqual(defaultQwenAssistant.topP, 0.80, accuracy: 0.01)
+        XCTAssertEqual(defaultQwenAssistant.minP, 0.00, accuracy: 0.01)
+        XCTAssertEqual(defaultQwenAssistant.topK, 20)
+        XCTAssertEqual(defaultQwenAssistant.repetitionPenalty, 1.00, accuracy: 0.01)
+        XCTAssertEqual(defaultQwenAssistant.presencePenalty, 1.50, accuracy: 0.01)
+        XCTAssertEqual(defaultQwenAssistant.maxNewTokens, 4096)
+        XCTAssertTrue(defaultQwenAssistant.jetSpecEnabled)
+
+        // 3. Modify and Save Custom Settings for Ornith Coder
         var customOrnithCoder = defaultOrnithCoder
         customOrnithCoder.temperature = 0.25
         customOrnithCoder.presencePenalty = 0.50
@@ -4158,7 +4190,7 @@ final class DynaMoETests: XCTestCase {
         customOrnithCoder.systemPrompt = "Specialized Metal Coder"
         manager.saveProfile(for: testOrnithId, type: .coder, settings: customOrnithCoder)
 
-        // 3. Verify Ornith Coder was persisted and retrieved
+        // 4. Verify Ornith Coder was persisted and retrieved
         let reloadedOrnithCoder = manager.getProfile(for: testOrnithId, type: .coder)
         XCTAssertEqual(reloadedOrnithCoder.temperature, 0.25, accuracy: 0.01)
         XCTAssertEqual(reloadedOrnithCoder.presencePenalty, 0.50, accuracy: 0.01)
@@ -4166,17 +4198,18 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(reloadedOrnithCoder.maxNewTokens, 10000)
         XCTAssertEqual(reloadedOrnithCoder.systemPrompt, "Specialized Metal Coder")
 
-        // 4. Verify Ornith Assistant was NOT overwritten or mutated
+        // 5. Verify Ornith Assistant was NOT overwritten or mutated
         let reloadedOrnithAssistant = manager.getProfile(for: testOrnithId, type: .assistant)
-        XCTAssertEqual(reloadedOrnithAssistant.temperature, 0.70, accuracy: 0.01)
+        XCTAssertEqual(reloadedOrnithAssistant.temperature, 1.00, accuracy: 0.01)
+        XCTAssertEqual(reloadedOrnithAssistant.presencePenalty, 1.50, accuracy: 0.01)
         XCTAssertEqual(reloadedOrnithAssistant.maxNewTokens, 4096)
 
-        // 5. Verify Qwen profiles remain isolated from Ornith customization
-        let defaultQwenCoder = manager.getProfile(for: testQwenId, type: .coder)
-        XCTAssertEqual(defaultQwenCoder.temperature, 0.60, accuracy: 0.01)
-        XCTAssertNotEqual(defaultQwenCoder.systemPrompt, "Specialized Metal Coder")
+        // 6. Verify Qwen profiles remain isolated from Ornith customization
+        let reloadedQwenCoder = manager.getProfile(for: testQwenId, type: .coder)
+        XCTAssertEqual(reloadedQwenCoder.temperature, 1.00, accuracy: 0.01)
+        XCTAssertNotEqual(reloadedQwenCoder.systemPrompt, "Specialized Metal Coder")
 
-        // 6. Test Active Profile Selection per Model
+        // 7. Test Active Profile Selection per Model
         manager.setActiveProfile(for: testOrnithId, type: .coder)
         XCTAssertEqual(manager.getActiveProfile(for: testOrnithId), .coder)
 
@@ -4184,7 +4217,13 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(manager.getActiveProfile(for: testQwenId), .assistant)
         XCTAssertEqual(manager.getActiveProfile(for: testOrnithId), .coder, "Model active profile states must be isolated")
 
-        print("  ✅ [TEST] Model-specific Coder & Assistant profiles fully verified with persistence and isolation.")
+        // 8. Test Display Names and Descriptions
+        XCTAssertEqual(ModelProfileType.coder.profileDisplayName(for: testOrnithId), "Precise Coding & Tool Calling")
+        XCTAssertEqual(ModelProfileType.assistant.profileDisplayName(for: testOrnithId), "General Chat / Agent Loops")
+        XCTAssertEqual(ModelProfileType.coder.profileDisplayName(for: testQwenId), "Coding & Agentic (Thinking Mode)")
+        XCTAssertEqual(ModelProfileType.assistant.profileDisplayName(for: testQwenId), "General Assistant (Instruct Mode)")
+
+        print("  ✅ [TEST] Official Ornith & Qwen model profiles verified with persistence, isolation, and metadata.")
     }
 
     func testHelpTopicsAndSettingsGuideCoverage() throws {
@@ -4371,6 +4410,208 @@ final class DynaMoETests: XCTestCase {
         XCTAssertGreaterThan(valHead0Dim0_negZ, 0.0, "Sigmoid gating must strictly remain positive (in [0, 1]) even for negative z. SiLU would have inverted the sign!")
 
         print("🎉 [SUCCESS] GDN Sigmoid Gating Kernel strictly verified against SiLU regression!")
+    }
+
+    func testWorkingSetManagerTokenBoundaryEviction() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal device")
+            return
+        }
+
+        // Create 2 mock buffers: shard 0 (dense + experts), shard 1 (expert-only)
+        guard let buf0 = device.makeBuffer(length: 64 * 1024, options: .storageModeShared),
+              let buf1 = device.makeBuffer(length: 64 * 1024, options: .storageModeShared) else {
+            XCTFail("Failed to allocate mock Metal buffers")
+            return
+        }
+        let shardBuffers: [UInt32: MTLBuffer] = [0: buf0, 1: buf1]
+
+        var shards: [ShardMetadata] = [
+            ShardMetadata(index: 0, filename: "shard_0.safetensors", baseAddress: UInt64(UInt(bitPattern: buf0.contents())), length: 64 * 1024),
+            ShardMetadata(index: 1, filename: "shard_1.safetensors", baseAddress: UInt64(UInt(bitPattern: buf1.contents())), length: 64 * 1024)
+        ]
+
+        var tensors: [TensorMetadata] = []
+        // Add dense backbone tensors to shard 0
+        for l in 0..<48 {
+            tensors.append(TensorMetadata(
+                name: "model.layers.\(l).input_layernorm.weight",
+                shapeDisplay: "[2560]",
+                dtype: "F32",
+                sizeMb: 0.01,
+                shardIndex: 0,
+                offsetStart: 0,
+                offsetEnd: 2560 * 4,
+                category: "Backbone",
+                layerIndex: UInt32(l),
+                expertId: nil
+            ))
+        }
+
+        // Add 32 experts per layer across 48 layers to shard 1 (expert-only)
+        for l in 0..<48 {
+            for exp in 0..<32 {
+                tensors.append(TensorMetadata(
+                    name: "model.layers.\(l).mlp.experts.\(exp).gate_proj.weight",
+                    shapeDisplay: "[640, 2560]",
+                    dtype: "FP8_E4M3",
+                    sizeMb: 1.63,
+                    shardIndex: 1,
+                    offsetStart: UInt64(exp * 128),
+                    offsetEnd: UInt64((exp + 1) * 128),
+                    category: "Expert",
+                    layerIndex: UInt32(l),
+                    expertId: UInt32(exp)
+                ))
+            }
+        }
+
+        let summary = ModelSummary(
+            sizeGb: 0.1,
+            tensorCount: UInt32(tensors.count),
+            layerCount: 48,
+            maxExpertId: 31,
+            shards: shards,
+            tensors: tensors,
+            layers: []
+        )
+
+        let mgr = WorkingSetManager.shared
+        mgr.initialize(summary: summary, shardBuffers: shardBuffers, mode: .balanced16GB)
+
+        XCTAssertEqual(mgr.residentExpertsCount, 0)
+        XCTAssertEqual(mgr.totalExpertKeysCount, 48 * 32)
+        let initRss = mgr.effectiveResidentMemoryGB
+        XCTAssertGreaterThan(initRss, 0.0, "Effective resident memory should track process heap + dense backbone")
+
+        // Verify primeSlices parallel page faulting
+        let sampleSlices = [
+            ExpertSlice(shardIndex: 0, offset: 0, length: 16384),
+            ExpertSlice(shardIndex: 1, offset: 0, length: 32768)
+        ]
+        mgr.primeSlices(sampleSlices, shardBuffers: shardBuffers)
+
+        // Token 0: Access 10 experts per layer (experts 0..9)
+        for l in 0..<48 {
+            let active = Array(0..<10)
+            mgr.touchAndEvict(layer: l, activeExpertIds: active, mode: .balanced16GB, shardBuffers: shardBuffers)
+        }
+        XCTAssertEqual(mgr.residentExpertsCount, 480, "All 480 active experts must be resident")
+        let tok0Rss = mgr.effectiveResidentMemoryGB
+        XCTAssertGreaterThanOrEqual(tok0Rss, initRss, "Effective RSS must increase with resident experts")
+
+        // Prune at Token 0 boundary: should NOT evict because 480 <= 1280
+        mgr.trimToBudget(mode: .balanced16GB, shardBuffers: shardBuffers)
+        XCTAssertEqual(mgr.residentExpertsCount, 480, "No experts should be evicted below capacity")
+
+        // Token 1: 8 common experts (0..7) and 2 new experts (10..11) per layer
+        for l in 0..<48 {
+            let active = Array(0..<8) + [10, 11]
+            mgr.touchAndEvict(layer: l, activeExpertIds: active, mode: .balanced16GB, shardBuffers: shardBuffers)
+        }
+        // Total resident = 480 original + (48 * 2 new) = 480 + 96 = 576
+        XCTAssertEqual(mgr.residentExpertsCount, 576)
+        XCTAssertGreaterThan(mgr.cacheHitRatePercent, 35.0, "Cache hit rate must reflect repeated expert hits")
+
+        mgr.trimToBudget(mode: .balanced16GB, shardBuffers: shardBuffers)
+        XCTAssertEqual(mgr.residentExpertsCount, 576)
+
+        // Tokens 2..10: Add more unique experts to exceed budget capacity of 1280
+        for tok in 2..<15 {
+            let expOffset = (tok * 2) % 20
+            for l in 0..<48 {
+                let active = Array(expOffset..<(expOffset + 10))
+                mgr.touchAndEvict(layer: l, activeExpertIds: active, mode: .balanced16GB, shardBuffers: shardBuffers)
+            }
+            mgr.trimToBudget(mode: .balanced16GB, shardBuffers: shardBuffers)
+        }
+
+        // Verify that resident set is strictly bounded by maxResidentExperts (1280)
+        XCTAssertLessThanOrEqual(mgr.residentExpertsCount, 1280, "Resident experts must not exceed 1280 in balanced16GB mode")
+        XCTAssertGreaterThan(mgr.cacheHitRatePercent, 60.0, "Multi-token cache hit rate should exceed 60%")
+        print("🎉 [SUCCESS] WorkingSetManager token-boundary eviction verified! Final resident=\(mgr.residentExpertsCount), hitRate=\(String(format: "%.1f", mgr.cacheHitRatePercent))%")
+    }
+
+    func testWorkingSetManagerBulkPreadPriming() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("Metal not available")
+        }
+
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let shardFilename = "model-00001-of-00001.safetensors"
+        let shardFileUrl = tempDir.appendingPathComponent(shardFilename)
+        let dummyDataSize = 1024 * 1024 // 1 MB
+        let dummyData = Data(repeating: 42, count: dummyDataSize)
+        try dummyData.write(to: shardFileUrl)
+
+        let buffer = device.makeBuffer(length: dummyDataSize, options: .storageModeShared)!
+        let shardBuffers: [UInt32: MTLBuffer] = [0: buffer]
+
+        var mockTensors: [TensorMetadata] = []
+        let sliceSize: UInt64 = 65536
+        // Layer 0, Expert 0
+        mockTensors.append(TensorMetadata(
+            name: "model.layers.0.mlp.experts.0.gate_proj.weight",
+            shapeDisplay: "[256, 256]",
+            dtype: "FP8",
+            sizeMb: 0.065,
+            shardIndex: 0,
+            offsetStart: 0,
+            offsetEnd: sliceSize,
+            category: "Expert",
+            layerIndex: 0,
+            expertId: 0
+        ))
+        // Layer 0, Expert 1
+        mockTensors.append(TensorMetadata(
+            name: "model.layers.0.mlp.experts.1.gate_proj.weight",
+            shapeDisplay: "[256, 256]",
+            dtype: "FP8",
+            sizeMb: 0.065,
+            shardIndex: 0,
+            offsetStart: sliceSize,
+            offsetEnd: sliceSize * 2,
+            category: "Expert",
+            layerIndex: 0,
+            expertId: 1
+        ))
+
+        let mockShards = [ShardMetadata(
+            index: 0,
+            filename: shardFilename,
+            baseAddress: UInt64(UInt(bitPattern: buffer.contents())),
+            length: UInt64(dummyDataSize)
+        )]
+        let summary = ModelSummary(
+            sizeGb: 0.001,
+            tensorCount: 2,
+            layerCount: 1,
+            maxExpertId: 1,
+            shards: mockShards,
+            tensors: mockTensors,
+            layers: []
+        )
+
+        let mgr = WorkingSetManager.shared
+        mgr.initialize(summary: summary, shardBuffers: shardBuffers, mode: .balanced16GB, modelDir: tempDir)
+
+        // Prime the active experts using bulk pread via touchAndEvict
+        let t0 = CFAbsoluteTimeGetCurrent()
+        mgr.touchAndEvict(layer: 0, activeExpertIds: [0, 1], mode: .balanced16GB, shardBuffers: shardBuffers)
+        let dtMs = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+        print("⚡ [TEST] Bulk pread priming for 2 experts took: \(String(format: "%.3f", dtMs)) ms")
+
+        XCTAssertEqual(mgr.residentExpertsCount, 2)
+        XCTAssertGreaterThan(mgr.effectiveResidentMemoryGB, 0.0)
+
+        // Close file descriptors and verify cleanup
+        mgr.closeAllFileDescriptors()
+        mgr.flushAllExperts(shardBuffers: shardBuffers)
+        XCTAssertEqual(mgr.residentExpertsCount, 0)
+        print("🎉 [SUCCESS] Bulk pread priming test passed!")
     }
 }
 
