@@ -4441,6 +4441,156 @@ final class DynaMoETests: XCTestCase {
         print("🎉 [SUCCESS] GDN SiLU Gating Kernel strictly verified!")
     }
 
+    func testQwen38GDNSigmoidGatingKernel() throws {
+        print("=== TEST QWEN 3.8 GDN SIGMOID GATING KERNEL ===")
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+
+        guard let gdnSigPipe = inference.gdnLinearAttnStepSigmoidPipeline else {
+            XCTFail("gdn_linear_attention_recurrent_step_sigmoid pipeline not compiled")
+            return
+        }
+
+        guard let cmdQueue = device.makeCommandQueue(),
+              let cmd = cmdQueue.makeCommandBuffer(),
+              let enc = cmd.makeComputeCommandEncoder() else {
+            XCTFail("Failed to create Metal command buffer or encoder")
+            return
+        }
+
+        let numValHeads: UInt32 = 48
+        let numKeyHeads: UInt32 = 16
+        let headDim: UInt32 = 128
+        let eps: Float = 1e-6
+
+        let qkvCount = Int((numKeyHeads + numKeyHeads + numValHeads) * headDim)
+        let zCount = Int(numValHeads * headDim)
+        let stateCount = Int(numValHeads * headDim * headDim)
+
+        guard let qkvBuf = device.makeBuffer(length: qkvCount * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let zBuf = device.makeBuffer(length: zCount * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let aBuf = device.makeBuffer(length: Int(numValHeads) * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let bBuf = device.makeBuffer(length: Int(numValHeads) * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let aLogBuf = device.makeBuffer(length: Int(numValHeads) * 2, options: .storageModeShared),
+              let dtBiasBuf = device.makeBuffer(length: Int(numValHeads) * 2, options: .storageModeShared),
+              let normBuf = device.makeBuffer(length: Int(headDim) * 2, options: .storageModeShared),
+              let stateBuf = device.makeBuffer(length: stateCount * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let outBuf = device.makeBuffer(length: zCount * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+            XCTFail("Failed to allocate test buffers")
+            return
+        }
+
+        // Initialize state to 0
+        memset(stateBuf.contents(), 0, stateCount * MemoryLayout<Float>.stride)
+
+        // Initialize Q and K to unit vectors along dimension 0 for head 0
+        let qkvPtr = qkvBuf.contents().bindMemory(to: Float.self, capacity: qkvCount)
+        memset(qkvPtr, 0, qkvCount * MemoryLayout<Float>.stride)
+        qkvPtr[0] = 1.0 // Q: keyHead 0, dim 0 = 1.0
+        qkvPtr[Int(numKeyHeads * headDim)] = 1.0 // K: keyHead 0, dim 0 = 1.0
+        qkvPtr[Int(2 * numKeyHeads * headDim)] = 2.0 // V: valHead 0, dim 0 = 2.0
+
+        // Initialize zBuf to 0.0 for valHead 0.
+        // Under Sigmoid gating: sigmoid(0.0) = 0.5. Out must be > 0.0 (specifically yNorm * 0.5)!
+        let zPtr = zBuf.contents().bindMemory(to: Float.self, capacity: zCount)
+        memset(zPtr, 0, zCount * MemoryLayout<Float>.stride)
+
+        let aPtr = aBuf.contents().bindMemory(to: Float.self, capacity: Int(numValHeads))
+        let bPtr = bBuf.contents().bindMemory(to: Float.self, capacity: Int(numValHeads))
+        for h in 0..<Int(numValHeads) {
+            aPtr[h] = 0.0
+            bPtr[h] = 5.0 // beta ~ 1.0
+        }
+
+        let normPtr = normBuf.contents().bindMemory(to: UInt16.self, capacity: Int(headDim))
+        for i in 0..<Int(headDim) { normPtr[i] = 0x3F80 } // gamma = 1.0 in BF16
+
+        let aLogPtr = aLogBuf.contents().bindMemory(to: UInt16.self, capacity: Int(numValHeads))
+        let dtBiasPtr = dtBiasBuf.contents().bindMemory(to: UInt16.self, capacity: Int(numValHeads))
+        for h in 0..<Int(numValHeads) {
+            aLogPtr[h] = 0x0000
+            dtBiasPtr[h] = 0x3F80
+        }
+
+        var aLogOff: UInt64 = 0
+        var dtBiasOff: UInt64 = 0
+        var normOff: UInt64 = 0
+        var nValH = numValHeads
+        var nKeyH = numKeyHeads
+        var hD = headDim
+        var epsVal = eps
+
+        enc.setComputePipelineState(gdnSigPipe)
+        enc.setBuffer(qkvBuf, offset: 0, index: 0)
+        enc.setBuffer(zBuf, offset: 0, index: 1)
+        enc.setBuffer(aBuf, offset: 0, index: 2)
+        enc.setBuffer(bBuf, offset: 0, index: 3)
+        enc.setBuffer(aLogBuf, offset: 0, index: 4)
+        enc.setBuffer(dtBiasBuf, offset: 0, index: 5)
+        enc.setBuffer(normBuf, offset: 0, index: 6)
+        enc.setBuffer(stateBuf, offset: 0, index: 7)
+        enc.setBuffer(outBuf, offset: 0, index: 8)
+        enc.setBytes(&aLogOff, length: 8, index: 9)
+        enc.setBytes(&dtBiasOff, length: 8, index: 10)
+        enc.setBytes(&normOff, length: 8, index: 11)
+        enc.setBytes(&nValH, length: 4, index: 12)
+        enc.setBytes(&nKeyH, length: 4, index: 13)
+        enc.setBytes(&hD, length: 4, index: 14)
+        enc.setBytes(&epsVal, length: 4, index: 15)
+        enc.dispatchThreadgroups(MTLSize(width: Int(numValHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        enc.endEncoding()
+
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        let outPtr = outBuf.contents().bindMemory(to: Float.self, capacity: zCount)
+        let valHead0Dim0 = outPtr[0]
+        print("🔍 [TEST] Sigmoid Head 0, Dim 0 Output: \(valHead0Dim0) (z=0.0)")
+
+        // Under Sigmoid gating: sigmoid(0.0) = 0.5. With yNorm = 2.0, out is 1.0!
+        XCTAssertGreaterThan(valHead0Dim0, 0.4, "Sigmoid gating must produce ~1.0 (positive non-zero) when z=0")
+        XCTAssertFalse(valHead0Dim0.isNaN || valHead0Dim0.isInfinite, "Output must be finite")
+
+        // Now test negative z: z = -2.0. Under Sigmoid: sigmoid(-2.0) = 0.1192 > 0. Out MUST BE POSITIVE!
+        zPtr[0] = -2.0
+        guard let cmd2 = cmdQueue.makeCommandBuffer(), let enc2 = cmd2.makeComputeCommandEncoder() else {
+            XCTFail("Failed to create command buffer 2")
+            return
+        }
+        enc2.setComputePipelineState(gdnSigPipe)
+        enc2.setBuffer(qkvBuf, offset: 0, index: 0)
+        enc2.setBuffer(zBuf, offset: 0, index: 1)
+        enc2.setBuffer(aBuf, offset: 0, index: 2)
+        enc2.setBuffer(bBuf, offset: 0, index: 3)
+        enc2.setBuffer(aLogBuf, offset: 0, index: 4)
+        enc2.setBuffer(dtBiasBuf, offset: 0, index: 5)
+        enc2.setBuffer(normBuf, offset: 0, index: 6)
+        enc2.setBuffer(stateBuf, offset: 0, index: 7)
+        enc2.setBuffer(outBuf, offset: 0, index: 8)
+        enc2.setBytes(&aLogOff, length: 8, index: 9)
+        enc2.setBytes(&dtBiasOff, length: 8, index: 10)
+        enc2.setBytes(&normOff, length: 8, index: 11)
+        enc2.setBytes(&nValH, length: 4, index: 12)
+        enc2.setBytes(&nKeyH, length: 4, index: 13)
+        enc2.setBytes(&hD, length: 4, index: 14)
+        enc2.setBytes(&epsVal, length: 4, index: 15)
+        enc2.dispatchThreadgroups(MTLSize(width: Int(numValHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        enc2.endEncoding()
+        cmd2.commit()
+        cmd2.waitUntilCompleted()
+
+        let valHead0Dim0_negZ = outPtr[0]
+        print("🔍 [TEST] Sigmoid Head 0, Dim 0 Output with z=-2.0: \(valHead0Dim0_negZ)")
+        XCTAssertGreaterThan(valHead0Dim0_negZ, 0.0, "Sigmoid gating output must ALWAYS be positive for positive activation even with negative z (unlike SiLU)")
+
+        print("🎉 [SUCCESS] Qwen 3.8 GDN Sigmoid Gating Kernel strictly verified!")
+    }
+
     func testWorkingSetManagerTokenBoundaryEviction() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             XCTFail("No Metal device")
@@ -4644,12 +4794,21 @@ final class DynaMoETests: XCTestCase {
     }
 
     func testOrnithRMSNormIsNotUnitOffset() throws {
-        print("=== TEST ORNITH RMSNORM IS NOT UNIT OFFSET ===")
+        print("=== TEST ORNITH & QWEN 3.8 RMSNORM & GATING CONFIGS ===")
         let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--mlx-community--Ornith-1.5-9B-OptiQ-4bit/snapshots/ad2e7748e8c9d36b82bb88307fd21c0d50be85b8"
         if FileManager.default.fileExists(atPath: snapshotDir) {
             let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir))
             XCTAssertNotNil(config)
             XCTAssertFalse(config!.isRMSNormUnitOffset, "Ornith 1.5 9B must NOT have isRMSNormUnitOffset = true (RMSNorm weights are centered at 1.0, not 0.0)")
+            XCTAssertEqual(config!.effectiveOutputGateType, "silu", "Ornith 1.5 9B must use silu output gating")
+        }
+
+        let qwenSnapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next-FP8/snapshots/236dfdf285828023ca3bcd3f37366c58a3469b13"
+        if FileManager.default.fileExists(atPath: qwenSnapshotDir) {
+            let config = ModelConfig.load(from: URL(fileURLWithPath: qwenSnapshotDir))
+            XCTAssertNotNil(config)
+            XCTAssertTrue(config!.isRMSNormUnitOffset, "Qwen 3.8 Flash Next MUST have isRMSNormUnitOffset = true (attention norms are centered at 0.0)")
+            XCTAssertEqual(config!.effectiveOutputGateType, "sigmoid", "Qwen 3.8 Flash Next must use sigmoid output gating")
         }
 
         // Test Gemma vs Qwen configs via JSON decoding
@@ -4671,7 +4830,16 @@ final class DynaMoETests: XCTestCase {
         """.data(using: .utf8)!
         let qwen35Config = try decoder.decode(ModelConfig.self, from: qwen35Data)
         XCTAssertFalse(qwen35Config.isRMSNormUnitOffset, "Qwen 3.5 / Ornith must NOT use unit-offset RMSNorm")
-        print("✅ [TEST] RMSNorm unit offset rules verified cleanly.")
+        XCTAssertEqual(qwen35Config.effectiveOutputGateType, "silu")
+
+        let qwen4ExpData = """
+        {"model_type": "qwen4_exp", "architectures": ["Qwen4ExpForConditionalGeneration"], "text_config": {"output_gate_type": "sigmoid"}}
+        """.data(using: .utf8)!
+        let qwen4ExpConfig = try decoder.decode(ModelConfig.self, from: qwen4ExpData)
+        XCTAssertTrue(qwen4ExpConfig.isRMSNormUnitOffset, "Qwen 4 Exp / Next must use unit-offset RMSNorm")
+        XCTAssertEqual(qwen4ExpConfig.effectiveOutputGateType, "sigmoid")
+
+        print("✅ [TEST] RMSNorm unit offset and output gate rules verified cleanly.")
     }
 
     func testOrnithSystemPromptDetection() throws {

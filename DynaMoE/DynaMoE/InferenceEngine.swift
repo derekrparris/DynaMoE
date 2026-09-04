@@ -190,6 +190,7 @@ public final class InferenceEngine {
     public var causalConv1dPipeline: MTLComputePipelineState?
     public var l2NormQkPipeline: MTLComputePipelineState?
     public var linearAttnStepPipeline: MTLComputePipelineState?
+    public var linearAttnStepSigmoidPipeline: MTLComputePipelineState?
     public var routerPipeline: MTLComputePipelineState?
     public var routerQ4Pipeline: MTLComputePipelineState?
     public var routerQ8Pipeline: MTLComputePipelineState?
@@ -233,7 +234,9 @@ public final class InferenceEngine {
     public var router512Pipeline: MTLComputePipelineState?
     public var router512Q4Pipeline: MTLComputePipelineState?
     public var gdnLinearAttnStepPipeline: MTLComputePipelineState?
+    public var gdnLinearAttnStepSigmoidPipeline: MTLComputePipelineState?
     public var gdnLinearAttnSeqPipeline: MTLComputePipelineState?
+    public var gdnLinearAttnSeqSigmoidPipeline: MTLComputePipelineState?
     public var qsaMqaIndexerPipeline: MTLComputePipelineState?
     public var gatedResidualBlendPipeline: MTLComputePipelineState?
     public var fuseNgramPlePipeline: MTLComputePipelineState?
@@ -252,6 +255,7 @@ public final class InferenceEngine {
     public var gqaAttentionTreeVerifyFusedPipeline: MTLComputePipelineState?
     public var gqaAttentionTreeVerifyFusedF16Pipeline: MTLComputePipelineState?
     public var gdnLinearAttnTreeStepPipeline: MTLComputePipelineState?
+    public var gdnLinearAttnTreeStepSigmoidPipeline: MTLComputePipelineState?
     public var gatherGdnTreeParentStatesPipeline: MTLComputePipelineState?
     public var commitGdnTreeWinningStatePipeline: MTLComputePipelineState?
     public var applyRopeTreePipeline: MTLComputePipelineState?
@@ -348,6 +352,9 @@ public final class InferenceEngine {
         }
         if let linStepFunc = defaultLib.makeFunction(name: "linear_attention_recurrent_step") {
             linearAttnStepPipeline = try device.makeComputePipelineState(function: linStepFunc)
+        }
+        if let linStepSigFunc = defaultLib.makeFunction(name: "linear_attention_recurrent_step_sigmoid") {
+            linearAttnStepSigmoidPipeline = try device.makeComputePipelineState(function: linStepSigFunc)
         }
         if let rFunc = defaultLib.makeFunction(name: "moe_router_topk_bf16") ?? defaultLib.makeFunction(name: "moe_router_topk") {
             routerPipeline = try device.makeComputePipelineState(function: rFunc)
@@ -468,8 +475,14 @@ public final class InferenceEngine {
         if let gdnStepFunc = defaultLib.makeFunction(name: "gdn_linear_attention_recurrent_step") {
             gdnLinearAttnStepPipeline = try device.makeComputePipelineState(function: gdnStepFunc)
         }
+        if let gdnStepSigFunc = defaultLib.makeFunction(name: "gdn_linear_attention_recurrent_step_sigmoid") {
+            gdnLinearAttnStepSigmoidPipeline = try device.makeComputePipelineState(function: gdnStepSigFunc)
+        }
         if let gdnSeqFunc = defaultLib.makeFunction(name: "linear_attention_recurrent_sequence") {
             gdnLinearAttnSeqPipeline = try device.makeComputePipelineState(function: gdnSeqFunc)
+        }
+        if let gdnSeqSigFunc = defaultLib.makeFunction(name: "linear_attention_recurrent_sequence_sigmoid") {
+            gdnLinearAttnSeqSigmoidPipeline = try device.makeComputePipelineState(function: gdnSeqSigFunc)
         }
         if let qsaIdxFunc = defaultLib.makeFunction(name: "qsa_mqa_indexer_score_blocks") {
             qsaMqaIndexerPipeline = try device.makeComputePipelineState(function: qsaIdxFunc)
@@ -520,6 +533,9 @@ public final class InferenceEngine {
         }
         if let gdnTreeStepFunc = defaultLib.makeFunction(name: "gdn_linear_attention_tree_step") {
             gdnLinearAttnTreeStepPipeline = try device.makeComputePipelineState(function: gdnTreeStepFunc)
+        }
+        if let gdnTreeStepSigFunc = defaultLib.makeFunction(name: "gdn_linear_attention_tree_step_sigmoid") {
+            gdnLinearAttnTreeStepSigmoidPipeline = try device.makeComputePipelineState(function: gdnTreeStepSigFunc)
         }
         if let gatherGdnFunc = defaultLib.makeFunction(name: "gather_gdn_tree_parent_states") {
             gatherGdnTreeParentStatesPipeline = try device.makeComputePipelineState(function: gatherGdnFunc)

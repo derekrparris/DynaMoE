@@ -3203,12 +3203,14 @@ struct ContentView: View {
         let causalConv1dPipeline: MTLComputePipelineState?
         let l2NormQkPipeline: MTLComputePipelineState?
         let linearAttnStepPipeline: MTLComputePipelineState?
+        let linearAttnStepSigmoidPipeline: MTLComputePipelineState?
         let sharedGatePipeline: MTLComputePipelineState?
         let sharedGateQ4Pipeline: MTLComputePipelineState?
         let sharedGateQ8Pipeline: MTLComputePipelineState?
         let router512Pipeline: MTLComputePipelineState?
         let router512Q4Pipeline: MTLComputePipelineState?
         let gdnLinearAttnStepPipeline: MTLComputePipelineState?
+        let gdnLinearAttnStepSigmoidPipeline: MTLComputePipelineState?
         let qsaMqaIndexerPipeline: MTLComputePipelineState?
         let gatedResidualBlendPipeline: MTLComputePipelineState?
         let fuseNgramPlePipeline: MTLComputePipelineState?
@@ -3222,6 +3224,7 @@ struct ContentView: View {
         let causalConv1dSeqPipeline: MTLComputePipelineState?
         let l2NormQkSeqPipeline: MTLComputePipelineState?
         let gdnLinearAttnSeqPipeline: MTLComputePipelineState?
+        let gdnLinearAttnSeqSigmoidPipeline: MTLComputePipelineState?
         let fp8GemvSimdPipeline: MTLComputePipelineState?
         let fp8GateUpBatchedPipeline: MTLComputePipelineState?
         let fp8DownBatchedPipeline: MTLComputePipelineState?
@@ -3464,6 +3467,10 @@ struct ContentView: View {
                 linearAttnStepPipeline = try device.makeComputePipelineState(function: linStepFunc)
             } else { linearAttnStepPipeline = nil }
 
+            if let linStepSigFunc = defaultLibrary.makeFunction(name: "linear_attention_recurrent_step_sigmoid") {
+                linearAttnStepSigmoidPipeline = try device.makeComputePipelineState(function: linStepSigFunc)
+            } else { linearAttnStepSigmoidPipeline = nil }
+
             if let sgFunc = defaultLibrary.makeFunction(name: "moe_shared_gate_bf16") {
                 sharedGatePipeline = try device.makeComputePipelineState(function: sgFunc)
             } else { sharedGatePipeline = nil }
@@ -3487,6 +3494,10 @@ struct ContentView: View {
             if let gdnFunc = defaultLibrary.makeFunction(name: "gdn_linear_attention_recurrent_step") {
                 gdnLinearAttnStepPipeline = try device.makeComputePipelineState(function: gdnFunc)
             } else { gdnLinearAttnStepPipeline = nil }
+
+            if let gdnSigFunc = defaultLibrary.makeFunction(name: "gdn_linear_attention_recurrent_step_sigmoid") {
+                gdnLinearAttnStepSigmoidPipeline = try device.makeComputePipelineState(function: gdnSigFunc)
+            } else { gdnLinearAttnStepSigmoidPipeline = nil }
 
             if let qsaIdxFunc = defaultLibrary.makeFunction(name: "qsa_mqa_indexer_score_blocks") {
                 qsaMqaIndexerPipeline = try device.makeComputePipelineState(function: qsaIdxFunc)
@@ -3543,6 +3554,10 @@ struct ContentView: View {
             if let gdnSeqFunc = defaultLibrary.makeFunction(name: "linear_attention_recurrent_sequence") {
                 gdnLinearAttnSeqPipeline = try device.makeComputePipelineState(function: gdnSeqFunc)
             } else { gdnLinearAttnSeqPipeline = nil }
+
+            if let gdnSeqSigFunc = defaultLibrary.makeFunction(name: "linear_attention_recurrent_sequence_sigmoid") {
+                gdnLinearAttnSeqSigmoidPipeline = try device.makeComputePipelineState(function: gdnSeqSigFunc)
+            } else { gdnLinearAttnSeqSigmoidPipeline = nil }
 
             if let fp8GateBatchedFunc = defaultLibrary.makeFunction(name: "fp8_swiglu_gate_up_batched") {
                 fp8GateUpBatchedPipeline = try device.makeComputePipelineState(function: fp8GateBatchedFunc)
@@ -4703,7 +4718,12 @@ struct ContentView: View {
                             dispatchLinear(enc: layerEnc1, weight: layer.inProjB, scale: layer.inProjBScale, bias: layer.inProjBBias, inBuf: xNorm1Buffer, outBuf: bVectorBuffer, inDim: hiddenDim, outDim: bDim)
                             layerEnc1.memoryBarrier(scope: .buffers)
 
-                            if let linPipe = gdnLinearAttnStepPipeline ?? linearAttnStepPipeline,
+                            let useSigmoidGate = (modelConfig?.effectiveOutputGateType.lowercased() == "sigmoid")
+                            let selectedStepPipe = useSigmoidGate
+                                ? (gdnLinearAttnStepSigmoidPipeline ?? linearAttnStepSigmoidPipeline ?? gdnLinearAttnStepPipeline ?? linearAttnStepPipeline)
+                                : (gdnLinearAttnStepPipeline ?? linearAttnStepPipeline)
+
+                            if let linPipe = selectedStepPipe,
                                let sBuf = KVCacheManager.shared.linearStateBuffer,
                                let aLog = layer.aLogTensor, let aLogRaw = buffers[aLog.shardIndex],
                                let dtBias = layer.dtBiasTensor, let dtBiasRaw = buffers[dtBias.shardIndex],
@@ -6099,7 +6119,12 @@ struct ContentView: View {
                                 dispatchLinear(enc: layerEnc1, weight: layer.inProjB, scale: layer.inProjBScale, bias: layer.inProjBBias, inBuf: xNorm1Buffer_all, outBuf: bVectorBuffer_all, inDim: hiddenDim, outDim: bDim, batchSize: P)
                                 layerEnc1.memoryBarrier(scope: .buffers)
 
-                                if let linPipe = gdnLinearAttnSeqPipeline ?? gdnLinearAttnStepPipeline ?? linearAttnStepPipeline,
+                                let useSigmoidGate = (modelConfig?.effectiveOutputGateType.lowercased() == "sigmoid")
+                                let selectedSeqPipe = useSigmoidGate
+                                    ? (gdnLinearAttnSeqSigmoidPipeline ?? gdnLinearAttnStepSigmoidPipeline ?? linearAttnStepSigmoidPipeline ?? gdnLinearAttnSeqPipeline ?? gdnLinearAttnStepPipeline ?? linearAttnStepPipeline)
+                                    : (gdnLinearAttnSeqPipeline ?? gdnLinearAttnStepPipeline ?? linearAttnStepPipeline)
+
+                                if let linPipe = selectedSeqPipe,
                                    let sBuf = KVCacheManager.shared.linearStateBuffer,
                                    let aLog = layer.aLogTensor, let aLogRaw = buffers[aLog.shardIndex],
                                    let dtBias = layer.dtBiasTensor, let dtBiasRaw = buffers[dtBias.shardIndex],
@@ -7621,7 +7646,12 @@ struct ContentView: View {
                                     }
 
                                     // 2. Compute tree step for candidate nodes at depth d
-                                    if let treeStepPipe = InferenceEngine.shared.gdnLinearAttnTreeStepPipeline {
+                                    let useSigmoidGate = (modelConfig?.effectiveOutputGateType.lowercased() == "sigmoid")
+                                    let selectedTreeStepPipe = useSigmoidGate
+                                        ? (InferenceEngine.shared.gdnLinearAttnTreeStepSigmoidPipeline ?? InferenceEngine.shared.gdnLinearAttnTreeStepPipeline)
+                                        : InferenceEngine.shared.gdnLinearAttnTreeStepPipeline
+
+                                    if let treeStepPipe = selectedTreeStepPipe {
                                         layerEnc.setComputePipelineState(treeStepPipe)
                                         layerEnc.setBuffer(jb.treeQGateBuffer, offset: 0, index: 0)
                                         layerEnc.setBuffer(jb.treeZGateBuffer, offset: 0, index: 1)

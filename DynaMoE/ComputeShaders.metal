@@ -2315,6 +2315,109 @@ kernel void linear_attention_recurrent_step(
     }
 }
 
+/// MSL Kernel: Gated Recurrent Linear Attention with Sigmoid Output Gating (e.g. Qwen 3.8 Flash Next / qwen4_exp)
+kernel void linear_attention_recurrent_step_sigmoid(
+    device const float* qkvVector [[buffer(0)]], // [8192] = normalized Q[2048] + normalized K[2048] + V[4096]
+    device const float* zVector [[buffer(1)]],   // [4096] (Gate)
+    device const float* aVector [[buffer(2)]],   // [32]
+    device const float* bVector [[buffer(3)]],   // [32]
+    device const uchar* aLogBuf [[buffer(4)]],   // [32] (BF16)
+    device const uchar* dtBiasBuf [[buffer(5)]], // [32] (BF16)
+    device const uchar* normBuf [[buffer(6)]],   // [128] (BF16)
+    device float* stateMatrix [[buffer(7)]],     // [32 heads, 128 keyDim, 128 valDim]
+    device float* outputVector [[buffer(8)]],    // [4096]
+    constant uint64_t& aLogOffset [[buffer(9)]],
+    constant uint64_t& dtBiasOffset [[buffer(10)]],
+    constant uint64_t& normOffset [[buffer(11)]],
+    constant uint32_t& numValHeads [[buffer(12)]],// 32
+    constant uint32_t& numKeyHeads [[buffer(13)]],// 16
+    constant uint32_t& headDim [[buffer(14)]],   // 128
+    constant float& eps [[buffer(15)]],          // 1e-6
+    uint headIdx [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    if (headIdx >= numValHeads) return;
+
+    uint32_t keyHeadIdx = headIdx / (numValHeads / numKeyHeads); // headIdx / 2
+
+    // Offsets
+    uint32_t qBase = keyHeadIdx * headDim;
+    uint32_t kBase = 2048 + (keyHeadIdx * headDim);
+    uint32_t vBase = 4096 + (headIdx * headDim);
+    uint32_t zBase = headIdx * headDim;
+    uint32_t outBase = headIdx * headDim;
+    uint32_t stateBase = headIdx * headDim * headDim;
+
+    // Decay rate computation: alpha = exp(-exp(A_log) * softplus(a + dt_bias))
+    float aLogVal = read_bf16_unaligned(aLogBuf + aLogOffset + ((uint64_t)headIdx * 2));
+    float dtBiasVal = read_bf16_unaligned(dtBiasBuf + dtBiasOffset + ((uint64_t)headIdx * 2));
+    float aVal = aVector[headIdx];
+    float bVal = bVector[headIdx];
+
+    float x = aVal + dtBiasVal;
+    float dt = (x > 20.0f) ? x : ((x < -20.0f) ? exp(x) : log(1.0f + exp(x))); // stable softplus
+    float alpha = exp(-exp(aLogVal) * dt);
+    float beta = 1.0f / (1.0f + exp(-bVal));     // sigmoid(b)
+
+    uint32_t headDimVec4 = headDim / 4;
+    device const float4* kVec4 = (device const float4*)(qkvVector + kBase);
+    device const float4* qVec4 = (device const float4*)(qkvVector + qBase);
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    // Each thread in the 32-thread SIMDgroup handles rows i = laneId, laneId + 32, laneId + 64, laneId + 96
+    float y_local[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    uint32_t row_indices[4];
+    uint32_t numLocalRows = 0;
+    float localSumSq = 0.0f;
+
+    for (uint32_t i = laneId; i < headDim; i += 32) {
+        row_indices[numLocalRows] = i;
+        uint32_t sRowBase = stateBase + (i * headDim);
+        device float4* sRowVec4 = (device float4*)(stateMatrix + sRowBase);
+
+        // Step 1: Sk_i = sum_j (S[i, j] * k[j]) using 128-bit float4 loads
+        float Sk_i = 0.0f;
+        for (uint32_t j = 0; j < headDimVec4; j++) {
+            Sk_i += dot(sRowVec4[j], kVec4[j]);
+        }
+
+        // Step 2 & 3: u_i = v_i - alpha * Sk_i, update state and compute y_i
+        float vi = qkvVector[vBase + i];
+        float ui = vi - (alpha * Sk_i);
+        float betaUi = beta * ui;
+
+        float yi = 0.0f;
+        for (uint32_t j = 0; j < headDimVec4; j++) {
+            float4 sOld = sRowVec4[j];
+            float4 kj = kVec4[j];
+            float4 sNew = (alpha * sOld) + (betaUi * kj);
+            sRowVec4[j] = sNew;
+            yi += dot(sNew, qVec4[j]);
+        }
+        yi *= invSqrtHeadDim;
+
+        y_local[numLocalRows] = yi;
+        localSumSq += yi * yi;
+        numLocalRows++;
+    }
+
+    // Step 4: Per-head RMSNorm across all 128 rows via 1-cycle SIMD reduction
+    float totalSumSq = simd_sum(localSumSq);
+    float invRms = rsqrt((totalSumSq / (float)headDim) + eps);
+
+    // Step 5: Normalization, weight scale, and Sigmoid gating (GDN with Sigmoid Output Gate)
+    for (uint32_t r = 0; r < numLocalRows; r++) {
+        uint32_t i = row_indices[r];
+        float normW = read_bf16_unaligned(normBuf + normOffset + ((uint64_t)i * 2));
+        float yNorm = y_local[r] * invRms * normW;
+
+        float z = zVector[zBase + i];
+        float sig_z = 1.0f / (1.0f + exp(-z));
+
+        outputVector[outBase + i] = yNorm * sig_z;
+    }
+}
+
 /// MSL Kernel: Causal 1D Convolution over entire prompt sequence (P tokens) with Shift Register State & SiLU Activation
 kernel void causal_conv1d_sequence_silu(
     device const float* inRawSeq [[buffer(0)]],      // [seqLen, numChannels]
@@ -2516,6 +2619,126 @@ kernel void linear_attention_recurrent_sequence(
             float silu_z = z / (1.0f + exp(-z));
 
             outToken[outBaseInToken + i] = yNorm * silu_z;
+        }
+    }
+}
+
+/// MSL Kernel: Prefill Gated DeltaNet Recurrent Scan across entire prompt sequence (P tokens) with Sigmoid Output Gating
+kernel void linear_attention_recurrent_sequence_sigmoid(
+    device const float* qkvVectorSeq [[buffer(0)]], // [seqLen, (2*keyHeads + valHeads)*headDim]
+    device const float* zVectorSeq [[buffer(1)]],   // [seqLen, valHeads*headDim]
+    device const float* aVectorSeq [[buffer(2)]],   // [seqLen, valHeads]
+    device const float* bVectorSeq [[buffer(3)]],   // [seqLen, valHeads]
+    device const uchar* aLogBuf [[buffer(4)]],      // [valHeads] (BF16)
+    device const uchar* dtBiasBuf [[buffer(5)]],    // [valHeads] (BF16)
+    device const uchar* normBuf [[buffer(6)]],      // [headDim] (BF16)
+    device float* stateMatrix [[buffer(7)]],        // [valHeads, headDim, headDim]
+    device float* outputVectorSeq [[buffer(8)]],    // [seqLen, valHeads*headDim]
+    constant uint64_t& aLogOffset [[buffer(9)]],
+    constant uint64_t& dtBiasOffset [[buffer(10)]],
+    constant uint64_t& normOffset [[buffer(11)]],
+    constant uint32_t& numValHeads [[buffer(12)]],  // e.g. 32 or 48
+    constant uint32_t& numKeyHeads [[buffer(13)]],  // 16
+    constant uint32_t& headDim [[buffer(14)]],      // 128
+    constant float& eps [[buffer(15)]],             // 1e-6
+    constant uint32_t& seqLen [[buffer(16)]],
+    uint headIdx [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    if (headIdx >= numValHeads) return;
+
+    uint32_t keyHeadIdx = headIdx / (numValHeads / numKeyHeads); // e.g. headIdx / 3 for 48/16
+    uint32_t headDimVec4 = headDim / 4;
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    uint32_t qBaseInToken = keyHeadIdx * headDim;
+    uint32_t kBaseInToken = (numKeyHeads * headDim) + (keyHeadIdx * headDim);
+    uint32_t vBaseInToken = (2 * numKeyHeads * headDim) + (headIdx * headDim);
+    uint32_t zBaseInToken = headIdx * headDim;
+    uint32_t outBaseInToken = headIdx * headDim;
+    uint32_t stateBase = headIdx * headDim * headDim;
+
+    uint32_t qkvStride = (2 * numKeyHeads + numValHeads) * headDim;
+    uint32_t zStride = numValHeads * headDim;
+    uint32_t aStride = numValHeads;
+    uint32_t bStride = numValHeads;
+    uint32_t outStride = numValHeads * headDim;
+
+    float aLogVal = read_bf16_unaligned(aLogBuf + aLogOffset + ((uint64_t)headIdx * 2));
+    float dtBiasVal = read_bf16_unaligned(dtBiasBuf + dtBiasOffset + ((uint64_t)headIdx * 2));
+    float expALog = exp(aLogVal);
+
+    uint32_t row_indices[4];
+    uint32_t numLocalRows = 0;
+    for (uint32_t i = laneId; i < headDim; i += 32) {
+        row_indices[numLocalRows++] = i;
+    }
+
+    for (uint32_t p = 0; p < seqLen; p++) {
+        uint64_t qkvTokenBase = (uint64_t)p * qkvStride;
+        uint64_t zTokenBase   = (uint64_t)p * zStride;
+        uint64_t aTokenBase   = (uint64_t)p * aStride;
+        uint64_t bTokenBase   = (uint64_t)p * bStride;
+        uint64_t outTokenBase = (uint64_t)p * outStride;
+
+        float aVal = aVectorSeq[aTokenBase + headIdx];
+        float bVal = bVectorSeq[bTokenBase + headIdx];
+
+        float x = aVal + dtBiasVal;
+        float dt = (x > 20.0f) ? x : ((x < -20.0f) ? exp(x) : log(1.0f + exp(x)));
+        float alpha = exp(-expALog * dt);
+        float beta = 1.0f / (1.0f + exp(-bVal));
+
+        device const float* qkvToken = qkvVectorSeq + qkvTokenBase;
+        device const float4* kVec4 = (device const float4*)(qkvToken + kBaseInToken);
+        device const float4* qVec4 = (device const float4*)(qkvToken + qBaseInToken);
+
+        float y_local[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float localSumSq = 0.0f;
+
+        for (uint32_t r = 0; r < numLocalRows; r++) {
+            uint32_t i = row_indices[r];
+            uint32_t sRowBase = stateBase + (i * headDim);
+            device float4* sRowVec4 = (device float4*)(stateMatrix + sRowBase);
+
+            float Sk_i = 0.0f;
+            for (uint32_t j = 0; j < headDimVec4; j++) {
+                Sk_i += dot(sRowVec4[j], kVec4[j]);
+            }
+            Sk_i *= alpha;
+
+            float v_val = qkvToken[vBaseInToken + i];
+            float delta_v_i = beta * (v_val - Sk_i);
+
+            for (uint32_t j = 0; j < headDimVec4; j++) {
+                sRowVec4[j] = (sRowVec4[j] * alpha) + (delta_v_i * kVec4[j]);
+            }
+
+            float y_i = 0.0f;
+            for (uint32_t j = 0; j < headDimVec4; j++) {
+                y_i += dot(sRowVec4[j], qVec4[j]);
+            }
+            y_i *= invSqrtHeadDim;
+
+            y_local[r] = y_i;
+            localSumSq += y_i * y_i;
+        }
+
+        float headSumSq = simd_sum(localSumSq);
+        float rms = rsqrt((headSumSq / (float)headDim) + eps);
+
+        device const float* zToken = zVectorSeq + zTokenBase;
+        device float* outToken = outputVectorSeq + outTokenBase;
+
+        for (uint32_t r = 0; r < numLocalRows; r++) {
+            uint32_t i = row_indices[r];
+            float gamma = read_bf16_unaligned(normBuf + normOffset + ((uint64_t)i * 2));
+            float yNorm = y_local[r] * rms * gamma;
+
+            float z = zToken[zBaseInToken + i];
+            float sig_z = 1.0f / (1.0f + exp(-z));
+
+            outToken[outBaseInToken + i] = yNorm * sig_z;
         }
     }
 }
@@ -4360,6 +4583,100 @@ kernel void gdn_linear_attention_recurrent_step(
     }
 }
 
+/// MSL Kernel: Gated DeltaNet (GDN) Recurrent Step for 48 Value Heads / 16 Key Heads (Head Dim 128) with Sigmoid Output Gating
+kernel void gdn_linear_attention_recurrent_step_sigmoid(
+    device const float* qkvVector [[buffer(0)]], // [Q: 2048, K: 2048, V: 6144]
+    device const float* zVector [[buffer(1)]],   // [6144] (Output Gate)
+    device const float* aVector [[buffer(2)]],   // [48]
+    device const float* bVector [[buffer(3)]],   // [48]
+    device const uchar* aLogBuf [[buffer(4)]],   // [48] (BF16)
+    device const uchar* dtBiasBuf [[buffer(5)]], // [48] (BF16)
+    device const uchar* normBuf [[buffer(6)]],   // [128] (BF16)
+    device float* stateMatrix [[buffer(7)]],     // [48 heads, 128 keyDim, 128 valDim]
+    device float* outputVector [[buffer(8)]],    // [6144]
+    constant uint64_t& aLogOffset [[buffer(9)]],
+    constant uint64_t& dtBiasOffset [[buffer(10)]],
+    constant uint64_t& normOffset [[buffer(11)]],
+    constant uint32_t& numValHeads [[buffer(12)]],// 48
+    constant uint32_t& numKeyHeads [[buffer(13)]],// 16
+    constant uint32_t& headDim [[buffer(14)]],   // 128
+    constant float& eps [[buffer(15)]],          // 1e-6
+    uint headIdx [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    if (headIdx >= numValHeads) return;
+
+    uint32_t keyHeadIdx = headIdx / (numValHeads / numKeyHeads); // headIdx / 3
+
+    uint32_t qBase = keyHeadIdx * headDim;
+    uint32_t kBase = (numKeyHeads * headDim) + (keyHeadIdx * headDim);
+    uint32_t vBase = (2 * numKeyHeads * headDim) + (headIdx * headDim);
+    uint32_t zBase = headIdx * headDim;
+    uint32_t outBase = headIdx * headDim;
+    uint32_t stateBase = headIdx * headDim * headDim;
+
+    float aLogVal = read_bf16_unaligned(aLogBuf + aLogOffset + ((uint64_t)headIdx * 2));
+    float dtBiasVal = read_bf16_unaligned(dtBiasBuf + dtBiasOffset + ((uint64_t)headIdx * 2));
+    float aVal = aVector[headIdx];
+    float bVal = bVector[headIdx];
+
+    float x = aVal + dtBiasVal;
+    float dt = (x > 20.0f) ? x : ((x < -20.0f) ? exp(x) : log(1.0f + exp(x)));
+    float alpha = exp(-exp(aLogVal) * dt);
+    float beta = 1.0f / (1.0f + exp(-bVal));
+
+    uint32_t headDimVec4 = headDim / 4;
+    device const float4* kVec4 = (device const float4*)(qkvVector + kBase);
+    device const float4* qVec4 = (device const float4*)(qkvVector + qBase);
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    float y_local[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    uint32_t row_indices[4];
+    uint32_t numLocalRows = 0;
+    float localSumSq = 0.0f;
+
+    for (uint32_t i = laneId; i < headDim; i += 32) {
+        row_indices[numLocalRows] = i;
+        uint32_t sRowBase = stateBase + (i * headDim);
+        device float4* sRowVec4 = (device float4*)(stateMatrix + sRowBase);
+
+        float Sk_i = 0.0f;
+        for (uint32_t j = 0; j < headDimVec4; j++) {
+            Sk_i += dot(sRowVec4[j], kVec4[j]);
+        }
+        Sk_i *= alpha;
+
+        float v_val = qkvVector[vBase + i];
+        float delta_v_i = beta * (v_val - Sk_i);
+
+        for (uint32_t j = 0; j < headDimVec4; j++) {
+            sRowVec4[j] = (sRowVec4[j] * alpha) + (delta_v_i * kVec4[j]);
+        }
+
+        float y_i = 0.0f;
+        for (uint32_t j = 0; j < headDimVec4; j++) {
+            y_i += dot(sRowVec4[j], qVec4[j]);
+        }
+        y_i *= invSqrtHeadDim;
+
+        y_local[numLocalRows] = y_i;
+        localSumSq += y_i * y_i;
+        numLocalRows++;
+    }
+
+    float headSumSq = simd_sum(localSumSq);
+    float rms = rsqrt((headSumSq / (float)headDim) + eps);
+
+    for (uint32_t r = 0; r < numLocalRows; r++) {
+        uint32_t i = row_indices[r];
+        float gamma = read_bf16_unaligned(normBuf + normOffset + ((uint64_t)i * 2));
+        float yNorm = y_local[r] * rms * gamma;
+        float z = zVector[zBase + i];
+        float sig_z = 1.0f / (1.0f + exp(-z));
+        outputVector[outBase + i] = yNorm * sig_z;
+    }
+}
+
 /// MSL Kernel: Qwen Sparse Attention (QSA) - Micro-Block Scoring Pass (Stage A)
 /// Groups KV keys into 64-token micro-blocks, scores them with 4 MQA Query heads, and outputs block scores.
 kernel void qsa_mqa_indexer_score_blocks(
@@ -5293,6 +5610,110 @@ kernel void gdn_linear_attention_tree_step(
         float z = zVector[zBase + i];
         float silu_z = z / (1.0f + exp(-z));
         outputVector[outBase + i] = yNorm * silu_z;
+    }
+}
+
+/// MSL Kernel: Gated DeltaNet (GDN) Tree Recurrent Step with Sigmoid Output Gating
+/// Updates GDN state matrix along tree branches according to parent index table with Sigmoid gating
+kernel void gdn_linear_attention_tree_step_sigmoid(
+    device const float* qkvVector [[buffer(0)]],          // [numNodes, Q: 2048, K: 2048, V: 6144]
+    device const float* zVector [[buffer(1)]],            // [numNodes, 6144]
+    device const float* aVector [[buffer(2)]],            // [numNodes, 48]
+    device const float* bVector [[buffer(3)]],            // [numNodes, 48]
+    device const uchar* aLogBuf [[buffer(4)]],            // [48] (BF16)
+    device const uchar* dtBiasBuf [[buffer(5)]],          // [48] (BF16)
+    device const uchar* normBuf [[buffer(6)]],            // [128] (BF16)
+    device const float* inParentStateMatrix [[buffer(7)]],// [numNodes, 48, 128, 128] (States copied from parent node)
+    device float* outNodeStateMatrix [[buffer(8)]],       // [numNodes, 48, 128, 128] (Updated states for node)
+    device float* outputVector [[buffer(9)]],             // [numNodes, 6144]
+    constant uint64_t& aLogOffset [[buffer(10)]],
+    constant uint64_t& dtBiasOffset [[buffer(11)]],
+    constant uint64_t& normOffset [[buffer(12)]],
+    constant uint32_t& numValHeads [[buffer(13)]],        // 48 or 32
+    constant uint32_t& numKeyHeads [[buffer(14)]],        // 16
+    constant uint32_t& headDim [[buffer(15)]],            // 128
+    constant float& eps [[buffer(16)]],                   // 1e-6
+    constant uint32_t& targetDepth [[buffer(17)]],
+    device const uint32_t* depths [[buffer(18)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],         // (headIdx, nodeIdx)
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint headIdx = tgPos.x;
+    uint nodeIdx = tgPos.y;
+    if (headIdx >= numValHeads) return;
+    if (depths != nullptr && depths[nodeIdx] != targetDepth) return;
+
+    uint32_t keyHeadIdx = headIdx / (numValHeads / numKeyHeads); // headIdx / 3
+
+    uint32_t qkvNodeBase = nodeIdx * (2 * numKeyHeads * headDim + numValHeads * headDim);
+    uint32_t qBase = qkvNodeBase + (keyHeadIdx * headDim);
+    uint32_t kBase = qkvNodeBase + (numKeyHeads * headDim) + (keyHeadIdx * headDim);
+    uint32_t vBase = qkvNodeBase + (2 * numKeyHeads * headDim) + (headIdx * headDim);
+
+    uint32_t zBase = (nodeIdx * numValHeads * headDim) + (headIdx * headDim);
+    uint32_t outBase = zBase;
+    uint32_t stateBase = (nodeIdx * numValHeads * headDim * headDim) + (headIdx * headDim * headDim);
+
+    float aLogVal = read_bf16_unaligned(aLogBuf + aLogOffset + ((uint64_t)headIdx * 2));
+    float dtBiasVal = read_bf16_unaligned(dtBiasBuf + dtBiasOffset + ((uint64_t)headIdx * 2));
+    float aVal = aVector[(nodeIdx * numValHeads) + headIdx];
+    float bVal = bVector[(nodeIdx * numValHeads) + headIdx];
+
+    float x = aVal + dtBiasVal;
+    float dt = (x > 20.0f) ? x : ((x < -20.0f) ? exp(x) : log(1.0f + exp(x)));
+    float alpha = exp(-exp(aLogVal) * dt);
+    float beta = 1.0f / (1.0f + exp(-bVal));
+
+    uint32_t headDimVec4 = headDim / 4;
+    device const float4* kVec4 = (device const float4*)(qkvVector + kBase);
+    device const float4* qVec4 = (device const float4*)(qkvVector + qBase);
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    float y_local[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    uint32_t row_indices[4];
+    uint32_t numLocalRows = 0;
+    float localSumSq = 0.0f;
+
+    for (uint32_t i = laneId; i < headDim; i += 32) {
+        row_indices[numLocalRows] = i;
+        uint32_t sRowBase = stateBase + (i * headDim);
+        device const float4* inParentRowVec4 = (device const float4*)(inParentStateMatrix + sRowBase);
+        device float4* outRowVec4 = (device float4*)(outNodeStateMatrix + sRowBase);
+
+        float Sk_i = 0.0f;
+        for (uint32_t j = 0; j < headDimVec4; j++) {
+            Sk_i += dot(inParentRowVec4[j], kVec4[j]);
+        }
+        Sk_i *= alpha;
+
+        float v_val = qkvVector[vBase + i];
+        float delta_v_i = beta * (v_val - Sk_i);
+
+        for (uint32_t j = 0; j < headDimVec4; j++) {
+            outRowVec4[j] = (inParentRowVec4[j] * alpha) + (delta_v_i * kVec4[j]);
+        }
+
+        float y_i = 0.0f;
+        for (uint32_t j = 0; j < headDimVec4; j++) {
+            y_i += dot(outRowVec4[j], qVec4[j]);
+        }
+        y_i *= invSqrtHeadDim;
+
+        y_local[numLocalRows] = y_i;
+        localSumSq += y_i * y_i;
+        numLocalRows++;
+    }
+
+    float headSumSq = simd_sum(localSumSq);
+    float rms = rsqrt((headSumSq / (float)headDim) + eps);
+
+    for (uint32_t r = 0; r < numLocalRows; r++) {
+        uint32_t i = row_indices[r];
+        float gamma = read_bf16_unaligned(normBuf + normOffset + ((uint64_t)i * 2));
+        float yNorm = y_local[r] * rms * gamma;
+        float z = zVector[zBase + i];
+        float sig_z = 1.0f / (1.0f + exp(-z));
+        outputVector[outBase + i] = yNorm * sig_z;
     }
 }
 /// MSL Kernel: Fused Rotary Position Embeddings (RoPE) for JetSpec Candidate Tree Nodes
