@@ -94,11 +94,19 @@ struct DynaMoEApp: App {
         }
     }()
 
+    private var isTesting: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil || NSClassFromString("XCTestCase") != nil
+    }
+
     var body: some Scene {
         WindowGroup {
-            ContentView()
-                .environmentObject(zoomManager)
-                .dynamicTypeSize(zoomManager.dynamicTypeSize)
+            if isTesting {
+                Text("Running XCTest...")
+            } else {
+                ContentView()
+                    .environmentObject(zoomManager)
+                    .dynamicTypeSize(zoomManager.dynamicTypeSize)
+            }
         }
         .modelContainer(sharedModelContainer)
         .commands {

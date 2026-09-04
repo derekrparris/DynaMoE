@@ -146,6 +146,7 @@ public struct NestedTextConfig: Codable {
     public var indexerKvHeads: Int?
     public var indexerHeadDim: Int?
     public var attnOutputGate: Bool?
+    public var outputGateType: String?
 
     enum CodingKeys: String, CodingKey {
         case hiddenSize = "hidden_size"
@@ -181,6 +182,7 @@ public struct NestedTextConfig: Codable {
         case indexerKvHeads = "indexer_kv_heads"
         case indexerHeadDim = "indexer_head_dim"
         case attnOutputGate = "attn_output_gate"
+        case outputGateType = "output_gate_type"
     }
 }
 
@@ -220,6 +222,7 @@ public struct ModelConfig: Codable {
     public var indexerKvHeads: Int?
     public var indexerHeadDim: Int?
     public var attnOutputGate: Bool?
+    public var outputGateType: String?
     public var textConfig: NestedTextConfig?
 
     enum CodingKeys: String, CodingKey {
@@ -258,6 +261,7 @@ public struct ModelConfig: Codable {
         case indexerKvHeads = "indexer_kv_heads"
         case indexerHeadDim = "indexer_head_dim"
         case attnOutputGate = "attn_output_gate"
+        case outputGateType = "output_gate_type"
         case textConfig = "text_config"
     }
 
@@ -390,6 +394,11 @@ public struct ModelConfig: Codable {
         return textConfig?.attnOutputGate ?? attnOutputGate ?? (arch.isQwen38 || arch.isHybridSsm)
     }
 
+    /// Output gate activation type for Gated DeltaNet / linear recurrence (default: "sigmoid")
+    public var effectiveOutputGateType: String {
+        return textConfig?.outputGateType ?? outputGateType ?? "sigmoid"
+    }
+
     /// Auto-detect the architecture type from config and topology summary
     public func resolveArchitectureType(summary: ModelSummary?) -> ModelArchitectureType {
         let rawType = (modelType ?? (textConfig != nil ? "qwen3_5_moe" : "")).lowercased()
@@ -451,9 +460,12 @@ public struct ModelConfig: Codable {
 
     /// Whether the model architecture uses 0-mean unit-offset RMSNorm weights (output = x * (1 + weight))
     public var isRMSNormUnitOffset: Bool {
-        let rawType = (textConfig != nil ? "qwen3_5_moe" : (modelType ?? "")).lowercased()
         let archs = architectures?.map { $0.lowercased() } ?? []
-        return rawType.contains("gemma") || archs.contains(where: { $0.contains("gemma") })
+        let modelTypeName = (modelType ?? "").lowercased()
+        let isGemma = modelTypeName.contains("gemma") || archs.contains(where: { $0.contains("gemma") })
+        let isQwenUnitNorm = modelTypeName.contains("qwen3") || modelTypeName.contains("qwen4") || modelTypeName.contains("next") ||
+                             archs.contains(where: { $0.contains("qwen3") || $0.contains("qwen4") || $0.contains("next") || $0.contains("qwen4exp") })
+        return isGemma || isQwenUnitNorm
     }
 
     public static let userDefaultSystemPromptKey = "dynamoe_user_default_system_prompt"

@@ -1301,6 +1301,13 @@ final class DynaMoETests: XCTestCase {
             print("Qwen 3.8 Flash Next FP8 snapshot not found, skipping.")
             return
         }
+        // Require at least 130 GB free space before attempting full model repack
+        if let attrs = try? FileManager.default.attributesOfFileSystem(forPath: snapshotDir),
+           let freeBytes = attrs[.systemFreeSize] as? Int64,
+           freeBytes < 130 * 1024 * 1024 * 1024 {
+            print("⚠️ Insufficient disk space for full 121 GB Qwen 3.8 repack (\(freeBytes / (1024*1024*1024)) GB available, 130 GB required). Skipping.")
+            return
+        }
         let srcUrl = URL(fileURLWithPath: snapshotDir)
         let repacker = ExpertRepacker.shared
         print("🚀 Starting ExpertRepacker on Qwen 3.8 Flash Next FP8...")
@@ -1957,9 +1964,14 @@ final class DynaMoETests: XCTestCase {
             }
         }
 
+        let tok = try? DynaMoeTokenizer(tokenizerPath: snapshotDir + "/tokenizer.json")
         for (rank, item) in topTokens.enumerated() {
-            print("  Top \(rank + 1): Token \(item.id) with logit \(item.logit)")
+            let text = (try? tok?.decode(ids: [UInt32(item.id)])) ?? ""
+            let msg = "  Top \(rank + 1): Token \(item.id) ('\(text)') with logit \(item.logit)\n"
+            print(msg)
+            diagOutput += msg
         }
+        try? diagOutput.write(toFile: "/tmp/qwen_chat_diag.txt", atomically: true, encoding: .utf8)
         print("🎉 [SUCCESS] Qwen 3.8 Flash Next LM Head & Logits computed cleanly!")
     }
 
@@ -4202,6 +4214,163 @@ final class DynaMoETests: XCTestCase {
         XCTAssertTrue(topicRawValues.contains("Troubleshooting & FAQs"))
 
         print("  ✅ [TEST] Help topics and settings guide coverage verified with 11 distinct sections.")
+    }
+
+    func testQwen38GDNSigmoidGatingKernel() throws {
+        print("=== TEST QWEN 3.8 GDN SIGMOID GATING KERNEL ===")
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+
+        guard let gdnPipe = inference.gdnLinearAttnStepPipeline else {
+            XCTFail("gdn_linear_attention_recurrent_step pipeline not compiled")
+            return
+        }
+
+        guard let cmdQueue = device.makeCommandQueue(),
+              let cmd = cmdQueue.makeCommandBuffer(),
+              let enc = cmd.makeComputeCommandEncoder() else {
+            XCTFail("Failed to create Metal command buffer or encoder")
+            return
+        }
+
+        let numValHeads: UInt32 = 48
+        let numKeyHeads: UInt32 = 16
+        let headDim: UInt32 = 128
+        let eps: Float = 1e-6
+
+        let qkvCount = Int((numKeyHeads + numKeyHeads + numValHeads) * headDim) // (16 + 16 + 48) * 128 = 10240
+        let zCount = Int(numValHeads * headDim) // 48 * 128 = 6144
+        let stateCount = Int(numValHeads * headDim * headDim) // 48 * 128 * 128 = 786432
+
+        guard let qkvBuf = device.makeBuffer(length: qkvCount * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let zBuf = device.makeBuffer(length: zCount * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let aBuf = device.makeBuffer(length: Int(numValHeads) * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let bBuf = device.makeBuffer(length: Int(numValHeads) * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let aLogBuf = device.makeBuffer(length: Int(numValHeads) * 2, options: .storageModeShared),
+              let dtBiasBuf = device.makeBuffer(length: Int(numValHeads) * 2, options: .storageModeShared),
+              let normBuf = device.makeBuffer(length: Int(headDim) * 2, options: .storageModeShared),
+              let stateBuf = device.makeBuffer(length: stateCount * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let outBuf = device.makeBuffer(length: zCount * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+            XCTFail("Failed to allocate test buffers")
+            return
+        }
+
+        // Initialize state to 0
+        memset(stateBuf.contents(), 0, stateCount * MemoryLayout<Float>.stride)
+
+        // Initialize Q and K to unit vectors along dimension 0 for head 0
+        let qkvPtr = qkvBuf.contents().bindMemory(to: Float.self, capacity: qkvCount)
+        memset(qkvPtr, 0, qkvCount * MemoryLayout<Float>.stride)
+        // Q: keyHead 0, dim 0 = 1.0
+        qkvPtr[0] = 1.0
+        // K: keyHead 0 (offset 16*128), dim 0 = 1.0
+        qkvPtr[Int(numKeyHeads * headDim)] = 1.0
+        // V: valHead 0 (offset 32*128), dim 0 = 2.0 (positive activation)
+        qkvPtr[Int(2 * numKeyHeads * headDim)] = 2.0
+
+        // Initialize zBuf to 0.0 for valHead 0.
+        // Under Sigmoid gating: sig(0.0) = 0.5. Out should be > 0.
+        // Under SiLU gating: silu(0.0) = 0.0 * sig(0.0) = 0.0. Out would be 0.0!
+        let zPtr = zBuf.contents().bindMemory(to: Float.self, capacity: zCount)
+        memset(zPtr, 0, zCount * MemoryLayout<Float>.stride)
+
+        let aPtr = aBuf.contents().bindMemory(to: Float.self, capacity: Int(numValHeads))
+        let bPtr = bBuf.contents().bindMemory(to: Float.self, capacity: Int(numValHeads))
+        for h in 0..<Int(numValHeads) {
+            aPtr[h] = 0.0
+            bPtr[h] = 5.0 // beta ~ 1.0
+        }
+
+        // BF16 1.0 is 0x3F80, BF16 0.0 is 0x0000
+        let normPtr = normBuf.contents().bindMemory(to: UInt16.self, capacity: Int(headDim))
+        for i in 0..<Int(headDim) { normPtr[i] = 0x3F80 } // gamma = 1.0 in BF16
+
+        let aLogPtr = aLogBuf.contents().bindMemory(to: UInt16.self, capacity: Int(numValHeads))
+        let dtBiasPtr = dtBiasBuf.contents().bindMemory(to: UInt16.self, capacity: Int(numValHeads))
+        for h in 0..<Int(numValHeads) {
+            aLogPtr[h] = 0x0000
+            dtBiasPtr[h] = 0x3F80 // dtBias = 1.0
+        }
+
+        var aLogOff: UInt64 = 0
+        var dtBiasOff: UInt64 = 0
+        var normOff: UInt64 = 0
+        var nValH = numValHeads
+        var nKeyH = numKeyHeads
+        var hD = headDim
+        var epsVal = eps
+
+        enc.setComputePipelineState(gdnPipe)
+        enc.setBuffer(qkvBuf, offset: 0, index: 0)
+        enc.setBuffer(zBuf, offset: 0, index: 1)
+        enc.setBuffer(aBuf, offset: 0, index: 2)
+        enc.setBuffer(bBuf, offset: 0, index: 3)
+        enc.setBuffer(aLogBuf, offset: 0, index: 4)
+        enc.setBuffer(dtBiasBuf, offset: 0, index: 5)
+        enc.setBuffer(normBuf, offset: 0, index: 6)
+        enc.setBuffer(stateBuf, offset: 0, index: 7)
+        enc.setBuffer(outBuf, offset: 0, index: 8)
+        enc.setBytes(&aLogOff, length: 8, index: 9)
+        enc.setBytes(&dtBiasOff, length: 8, index: 10)
+        enc.setBytes(&normOff, length: 8, index: 11)
+        enc.setBytes(&nValH, length: 4, index: 12)
+        enc.setBytes(&nKeyH, length: 4, index: 13)
+        enc.setBytes(&hD, length: 4, index: 14)
+        enc.setBytes(&epsVal, length: 4, index: 15)
+        enc.dispatchThreadgroups(MTLSize(width: Int(numValHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        enc.endEncoding()
+
+        cmd.commit()
+        cmd.waitUntilCompleted()
+
+        let outPtr = outBuf.contents().bindMemory(to: Float.self, capacity: zCount)
+        let valHead0Dim0 = outPtr[0]
+        print("🔍 [TEST] Head 0, Dim 0 Output: \(valHead0Dim0) (z=0.0)")
+
+        // Under Sigmoid gating: sig(0.0) = 0.5, so output is positive non-zero.
+        // Under erroneous SiLU gating: silu(0.0) = 0.0 * sig(0.0) = 0.0.
+        XCTAssertGreaterThan(valHead0Dim0, 0.01, "Sigmoid gating must preserve non-zero signal when z=0 (SiLU would produce exactly 0)")
+        XCTAssertFalse(valHead0Dim0.isNaN || valHead0Dim0.isInfinite, "Output must be finite")
+
+        // Now test negative z: z = -2.0. Under Sigmoid: sig(-2.0) = 0.1192 > 0.
+        // Under SiLU: silu(-2.0) = -2.0 * 0.1192 = -0.2384 (sign flips!).
+        zPtr[0] = -2.0
+        guard let cmd2 = cmdQueue.makeCommandBuffer(), let enc2 = cmd2.makeComputeCommandEncoder() else {
+            XCTFail("Failed to create command buffer 2")
+            return
+        }
+        enc2.setComputePipelineState(gdnPipe)
+        enc2.setBuffer(qkvBuf, offset: 0, index: 0)
+        enc2.setBuffer(zBuf, offset: 0, index: 1)
+        enc2.setBuffer(aBuf, offset: 0, index: 2)
+        enc2.setBuffer(bBuf, offset: 0, index: 3)
+        enc2.setBuffer(aLogBuf, offset: 0, index: 4)
+        enc2.setBuffer(dtBiasBuf, offset: 0, index: 5)
+        enc2.setBuffer(normBuf, offset: 0, index: 6)
+        enc2.setBuffer(stateBuf, offset: 0, index: 7)
+        enc2.setBuffer(outBuf, offset: 0, index: 8)
+        enc2.setBytes(&aLogOff, length: 8, index: 9)
+        enc2.setBytes(&dtBiasOff, length: 8, index: 10)
+        enc2.setBytes(&normOff, length: 8, index: 11)
+        enc2.setBytes(&nValH, length: 4, index: 12)
+        enc2.setBytes(&nKeyH, length: 4, index: 13)
+        enc2.setBytes(&hD, length: 4, index: 14)
+        enc2.setBytes(&epsVal, length: 4, index: 15)
+        enc2.dispatchThreadgroups(MTLSize(width: Int(numValHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        enc2.endEncoding()
+        cmd2.commit()
+        cmd2.waitUntilCompleted()
+
+        let valHead0Dim0_negZ = outPtr[0]
+        print("🔍 [TEST] Head 0, Dim 0 Output with z=-2.0: \(valHead0Dim0_negZ)")
+        XCTAssertGreaterThan(valHead0Dim0_negZ, 0.0, "Sigmoid gating must strictly remain positive (in [0, 1]) even for negative z. SiLU would have inverted the sign!")
+
+        print("🎉 [SUCCESS] GDN Sigmoid Gating Kernel strictly verified against SiLU regression!")
     }
 }
 

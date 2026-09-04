@@ -179,16 +179,16 @@ enum MemoryBudgetMode: String, CaseIterable, Identifiable {
 
     var maxResidentExperts: Int {
         switch self {
-        case .lowMemory8GB: return 384       // Up to 384 active resident experts (~2.5 GB) + 1.5 GB dense = 4.0 GB target
-        case .balanced16GB: return 896       // Up to 896 active resident experts (~5.5 GB) + 1.5 GB dense = 7.0 GB target
+        case .lowMemory8GB: return 120       // Up to 120 active resident experts (~600 MB FP8)
+        case .balanced16GB: return 480       // Up to 480 active resident experts (~2.4 GB FP8)
         case .unrestricted: return 65536     // All experts resident in RAM
         }
     }
 
     var targetMaxRssGB: Double {
         switch self {
-        case .lowMemory8GB: return 4.5
-        case .balanced16GB: return 8.5
+        case .lowMemory8GB: return 5.5
+        case .balanced16GB: return 11.5
         case .unrestricted: return 36.6
         }
     }
@@ -263,6 +263,7 @@ final class WorkingSetManager {
     private var prefetchCount: Int = 0
     private var prefetchHits: Int = 0
     private var lastPagingLatencyMs: Double = 0.0
+    private var expertOnlyShardIndices: Set<UInt32> = []
 
     var totalExpertKeysCount: Int {
         lock.lock()
@@ -312,7 +313,12 @@ final class WorkingSetManager {
         prefetchHits = 0
         lastPagingLatencyMs = 0.0
 
+        var shardHasDense: [UInt32: Bool] = [:]
         for tensor in summary.tensors {
+            let name = tensor.name.lowercased()
+            if name.contains("ple.") || name.contains("ngram_embedding") || name.contains("mtp.") || name.contains("visual.") {
+                continue
+            }
             let slice = ExpertSlice(
                 shardIndex: tensor.shardIndex,
                 offset: tensor.offsetStart,
@@ -324,28 +330,15 @@ final class WorkingSetManager {
                 expertSlices[key, default: []].append(slice)
             } else {
                 denseSlices.append(slice)
+                shardHasDense[tensor.shardIndex] = true
             }
         }
+        let allShardIndices = Set(summary.shards.map { $0.index })
+        expertOnlyShardIndices = allShardIndices.filter { shardHasDense[$0] != true }
         lock.unlock()
-
-        // Pin dense backbone immediately (Embeddings, Attn/QKV, RMSNorms, Routers, Shared Experts, LM Head)
-        pinDenseBackbone(shardBuffers: shardBuffers)
 
         if mode == .unrestricted {
             preFaultAll(shardBuffers: shardBuffers, summary: summary)
-        }
-    }
-
-    func pinDenseBackbone(shardBuffers: [UInt32: MTLBuffer]) {
-        lock.lock()
-        let slices = denseSlices
-        lock.unlock()
-
-        for slice in slices {
-            if let buf = shardBuffers[slice.shardIndex] {
-                let ptr = buf.contents().advanced(by: Int(slice.offset))
-                madvise(ptr, Int(slice.length), MADV_WILLNEED)
-            }
         }
     }
 
@@ -363,18 +356,29 @@ final class WorkingSetManager {
     }
 
     func flushAllExperts(shardBuffers: [UInt32: MTLBuffer]) {
+        var evictSlices: [ExpertSlice] = []
         lock.lock()
+        for (_, slices) in expertSlices {
+            for slice in slices {
+                if expertOnlyShardIndices.contains(slice.shardIndex) {
+                    evictSlices.append(slice)
+                }
+            }
+        }
         residentExperts.removeAll()
         prefetchedKeys.removeAll()
         accessOrder.removeAll()
         accessCounter = 0
-        let slices = expertSlices.values.flatMap { $0 }
         lock.unlock()
 
-        for slice in slices {
-            if let buf = shardBuffers[slice.shardIndex] {
-                let ptr = buf.contents().advanced(by: Int(slice.offset))
-                madvise(ptr, Int(slice.length), MADV_DONTNEED)
+        if !evictSlices.isEmpty {
+            prefetchQueue.async {
+                for slice in evictSlices {
+                    if let buf = shardBuffers[slice.shardIndex] {
+                        let ptr = buf.contents().advanced(by: Int(slice.offset))
+                        posix_madvise(ptr, Int(slice.length), POSIX_MADV_DONTNEED)
+                    }
+                }
             }
         }
     }
@@ -394,22 +398,26 @@ final class WorkingSetManager {
                 prefetchedKeys.remove(evictKey)
                 accessOrder.removeValue(forKey: evictKey)
                 if let slices = expertSlices[evictKey] {
-                    evictSlices.append(contentsOf: slices)
+                    for slice in slices {
+                        if expertOnlyShardIndices.contains(slice.shardIndex) {
+                            evictSlices.append(slice)
+                        }
+                    }
                 }
             }
         }
         lock.unlock()
 
         if !evictSlices.isEmpty {
-            for slice in evictSlices {
-                if let buf = shardBuffers[slice.shardIndex] {
-                    let ptr = buf.contents().advanced(by: Int(slice.offset))
-                    posix_madvise(ptr, Int(slice.length), POSIX_MADV_DONTNEED)
+            prefetchQueue.async {
+                for slice in evictSlices {
+                    if let buf = shardBuffers[slice.shardIndex] {
+                        let ptr = buf.contents().advanced(by: Int(slice.offset))
+                        posix_madvise(ptr, Int(slice.length), POSIX_MADV_DONTNEED)
+                    }
                 }
             }
         }
-
-        pinDenseBackbone(shardBuffers: shardBuffers)
     }
 
     func prefetchLayerBackbone(layer: CachedLayer, shardBuffers: [UInt32: MTLBuffer]) {
@@ -459,15 +467,14 @@ final class WorkingSetManager {
     }
 
     func touchAndEvict(layer: Int, activeExpertIds: [Int], mode: MemoryBudgetMode, shardBuffers: [UInt32: MTLBuffer], isPrefill: Bool = false) {
-        // In unrestricted full-RAM mode or during prompt prefill, bypass eviction overhead completely
-        if mode == .unrestricted || isPrefill {
+        // In unrestricted full-RAM mode, bypass eviction overhead completely
+        if mode == .unrestricted {
             return
         }
 
         let t0 = CFAbsoluteTimeGetCurrent()
         var pageFaulted = false
         var demandSlices: [ExpertSlice] = []
-        var evictSlices: [ExpertSlice] = []
 
         lock.lock()
         for expId in activeExpertIds {
@@ -479,49 +486,51 @@ final class WorkingSetManager {
             if residentExperts.contains(key) {
                 cacheHits += 1
             } else {
-                if prefetchedKeys.contains(key) {
+                let wasPrefetched = prefetchedKeys.contains(key)
+                if wasPrefetched {
                     prefetchHits += 1
+                } else {
+                    pageFaulted = true
                 }
                 cacheMisses += 1
-                pageFaulted = true
                 residentExperts.insert(key)
 
-                // Demand page-in from SSD
-                if let slices = expertSlices[key] {
+                // Demand page-in from SSD only if not already requested via prefetch
+                if !wasPrefetched, let slices = expertSlices[key] {
                     demandSlices.append(contentsOf: slices)
                 }
             }
         }
 
-        // Batch eviction: only perform sort & prune when excess is significant (>= 16 experts)
-        let maxAllowed = mode.maxResidentExperts
-        let excess = residentExperts.count - maxAllowed
-        if excess >= 16 {
-            let sortedOldest = accessOrder
-                .filter { !($0.key.layer == layer && activeExpertIds.contains($0.key.expertId)) }
-                .sorted(by: { $0.value < $1.value })
-                .prefix(excess)
+        // LRU pruning of resident tracking set:
+        // Safely evict expert slices located in expert-only shards using POSIX_MADV_DONTNEED,
+        // which frees physical RAM immediately while leaving the dense backbone completely intact.
+        var evictSlices: [ExpertSlice] = []
+        if !isPrefill {
+            let maxAllowed = mode.maxResidentExperts
+            let excess = residentExperts.count - maxAllowed
+            if excess >= 64 {
+                let sortedOldest = accessOrder
+                    .filter { !($0.key.layer == layer && activeExpertIds.contains($0.key.expertId)) }
+                    .sorted(by: { $0.value < $1.value })
+                    .prefix(excess)
 
-            for item in sortedOldest {
-                let evictKey = item.key
-                residentExperts.remove(evictKey)
-                prefetchedKeys.remove(evictKey)
-                accessOrder.removeValue(forKey: evictKey)
-                if let slices = expertSlices[evictKey] {
-                    evictSlices.append(contentsOf: slices)
+                for item in sortedOldest {
+                    let evictKey = item.key
+                    residentExperts.remove(evictKey)
+                    prefetchedKeys.remove(evictKey)
+                    accessOrder.removeValue(forKey: evictKey)
+                    if let slices = expertSlices[evictKey] {
+                        for slice in slices {
+                            if expertOnlyShardIndices.contains(slice.shardIndex) {
+                                evictSlices.append(slice)
+                            }
+                        }
+                    }
                 }
             }
         }
         lock.unlock()
-
-        if !demandSlices.isEmpty {
-            for slice in demandSlices {
-                if let buf = shardBuffers[slice.shardIndex] {
-                    let ptr = buf.contents().advanced(by: Int(slice.offset))
-                    posix_madvise(ptr, Int(slice.length), POSIX_MADV_WILLNEED)
-                }
-            }
-        }
 
         if !evictSlices.isEmpty {
             prefetchQueue.async {
@@ -530,6 +539,15 @@ final class WorkingSetManager {
                         let ptr = buf.contents().advanced(by: Int(slice.offset))
                         posix_madvise(ptr, Int(slice.length), POSIX_MADV_DONTNEED)
                     }
+                }
+            }
+        }
+
+        if !demandSlices.isEmpty {
+            for slice in demandSlices {
+                if let buf = shardBuffers[slice.shardIndex] {
+                    let ptr = buf.contents().advanced(by: Int(slice.offset))
+                    posix_madvise(ptr, Int(slice.length), POSIX_MADV_WILLNEED)
                 }
             }
         }
@@ -558,19 +576,26 @@ final class WorkingSetManager {
                     prefetchedKeys.remove(evictKey)
                     accessOrder.removeValue(forKey: evictKey)
                     if let slices = expertSlices[evictKey] {
-                        evictSlices.append(contentsOf: slices)
+                        for slice in slices {
+                            if expertOnlyShardIndices.contains(slice.shardIndex) {
+                                evictSlices.append(slice)
+                            }
+                        }
                     }
                 }
             }
             lock.unlock()
 
-            for slice in evictSlices {
-                if let buf = shardBuffers[slice.shardIndex] {
-                    let ptr = buf.contents().advanced(by: Int(slice.offset))
-                    madvise(ptr, Int(slice.length), MADV_DONTNEED)
+            if !evictSlices.isEmpty {
+                prefetchQueue.async {
+                    for slice in evictSlices {
+                        if let buf = shardBuffers[slice.shardIndex] {
+                            let ptr = buf.contents().advanced(by: Int(slice.offset))
+                            posix_madvise(ptr, Int(slice.length), POSIX_MADV_DONTNEED)
+                        }
+                    }
                 }
             }
-            pinDenseBackbone(shardBuffers: shardBuffers)
         }
     }
 }
@@ -1014,7 +1039,8 @@ struct ContentView: View {
                 selectedSessionId = sessions.first?.id
             }
             if summary == nil {
-                if let initialModel = localModelManager.getDefaultOrFirstModel() {
+                let isTesting = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil || NSClassFromString("XCTestCase") != nil
+                if !isTesting, let initialModel = localModelManager.getDefaultOrFirstModel() {
                     switchModel(to: initialModel)
                 }
             } else {
@@ -4954,9 +4980,9 @@ struct ContentView: View {
                                 if l + 1 < actualLayers {
                                     let prefetchCount = min(10, max(8, activeIds.count))
                                     let predicted = WorkingSetManager.shared.predictNextLayerExperts(currentLayer: l, currentActiveExperts: activeIds, topN: prefetchCount)
-                                    let fallbackIds = Array(0..<prefetchCount)
-                                    let prefetchIds = predicted.isEmpty ? fallbackIds : predicted
-                                    WorkingSetManager.shared.prefetchLayerExperts(layer: l + 1, expertIds: prefetchIds, shardBuffers: buffers)
+                                    if !predicted.isEmpty {
+                                        WorkingSetManager.shared.prefetchLayerExperts(layer: l + 1, expertIds: predicted, shardBuffers: buffers)
+                                    }
                                 }
 
                                 // 4. Lookahead prefetch layer l + 2 dense backbone
@@ -5205,7 +5231,6 @@ struct ContentView: View {
 
                                 layerEnc2.endEncoding()
                                 moeCmd.commit()
-                                moeCmd.waitUntilCompleted()
                             } else {
                                 guard let moeCmd = commandQueue.makeCommandBuffer(),
                                       let layerEnc2 = moeCmd.makeComputeCommandEncoder() else { return false }
@@ -5305,7 +5330,6 @@ struct ContentView: View {
 
                                 layerEnc2.endEncoding()
                                 moeCmd.commit()
-                                moeCmd.waitUntilCompleted()
                             }
 
                             guard let nextCmd = commandQueue.makeCommandBuffer() else { return false }
@@ -6722,15 +6746,15 @@ struct ContentView: View {
 
                                     layerEnc2.endEncoding()
                                     moeCmd.commit()
-                                    moeCmd.waitUntilCompleted()
                                 }
                             } else {
+                                let activeExpIds = Array(expertTokenMap.keys)
                                 if speculativePrefetchEnabled {
-                                    let activeExpIds = Array(expertTokenMap.keys)
                                     WorkingSetManager.shared.prefetchLayerExperts(layer: l, expertIds: activeExpIds, shardBuffers: buffers)
                                     let nextL = (l + 1) < actualLayers ? (l + 1) : 0
                                     WorkingSetManager.shared.prefetchLayerBackbone(layer: cachedLayers[nextL], shardBuffers: buffers)
                                 }
+                                WorkingSetManager.shared.touchAndEvict(layer: l, activeExpertIds: activeExpIds, mode: budgetMode, shardBuffers: buffers, isPrefill: true)
 
                                 guard let moeCmd = commandQueue.makeCommandBuffer(),
                                       let layerEnc2 = moeCmd.makeComputeCommandEncoder() else { return false }
@@ -7005,7 +7029,6 @@ struct ContentView: View {
 
                                 layerEnc2.endEncoding()
                                 moeCmd.commit()
-                                moeCmd.waitUntilCompleted()
                             }
                         }
 
@@ -8356,6 +8379,7 @@ struct ContentView: View {
                 let ok = runLayerWisePrefill(promptTokens: prefillTokens)
                 if !ok { return }
                 currentStep = UInt32(promptCount)
+                WorkingSetManager.shared.trimAfterPrefill(shardBuffers: buffers, mode: budgetMode)
 
                 // Clear prefill status once prefill completes
                 await MainActor.run {

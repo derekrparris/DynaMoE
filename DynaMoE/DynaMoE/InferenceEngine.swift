@@ -171,6 +171,8 @@ public final class InferenceEngine {
     public var rmsnormF16Pipeline: MTLComputePipelineState?
     public var headRmsnormPipeline: MTLComputePipelineState?
     public var headRmsnormF16Pipeline: MTLComputePipelineState?
+    public var headRmsnormOffsetPipeline: MTLComputePipelineState?
+    public var headRmsnormOffsetF16Pipeline: MTLComputePipelineState?
     public var addPipeline: MTLComputePipelineState?
     public var clearPipeline: MTLComputePipelineState?
     public var ropePipeline: MTLComputePipelineState?
@@ -287,6 +289,12 @@ public final class InferenceEngine {
         }
         if let hrmsF16Func = defaultLib.makeFunction(name: "per_head_rmsnorm_f16") {
             headRmsnormF16Pipeline = try device.makeComputePipelineState(function: hrmsF16Func)
+        }
+        if let hrmsOffsetFunc = defaultLib.makeFunction(name: "per_head_rmsnorm_offset_bf16") {
+            headRmsnormOffsetPipeline = try device.makeComputePipelineState(function: hrmsOffsetFunc)
+        }
+        if let hrmsOffsetF16Func = defaultLib.makeFunction(name: "per_head_rmsnorm_offset_f16") {
+            headRmsnormOffsetF16Pipeline = try device.makeComputePipelineState(function: hrmsOffsetF16Func)
         }
         if let addFunc = defaultLib.makeFunction(name: "vector_add_f32") {
             addPipeline = try device.makeComputePipelineState(function: addFunc)
