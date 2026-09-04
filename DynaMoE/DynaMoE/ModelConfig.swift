@@ -394,9 +394,9 @@ public struct ModelConfig: Codable {
         return textConfig?.attnOutputGate ?? attnOutputGate ?? (arch.isQwen38 || arch.isHybridSsm)
     }
 
-    /// Output gate activation type for Gated DeltaNet / linear recurrence (default: "sigmoid")
+    /// Output gate activation type for Gated DeltaNet / linear recurrence (default: "silu")
     public var effectiveOutputGateType: String {
-        return textConfig?.outputGateType ?? outputGateType ?? "sigmoid"
+        return textConfig?.outputGateType ?? outputGateType ?? "silu"
     }
 
     /// Auto-detect the architecture type from config and topology summary
@@ -459,13 +459,12 @@ public struct ModelConfig: Codable {
     }
 
     /// Whether the model architecture uses 0-mean unit-offset RMSNorm weights (output = x * (1 + weight))
+    /// NOTE: Only Gemma models initialize RMSNorm weights to zero and use unit offset (x * (1 + w)).
+    /// Standard architectures (LLaMA, Qwen, Ornith, Mistral, DeepSeek) initialize weights to one and use standard RMSNorm (x * w).
     public var isRMSNormUnitOffset: Bool {
         let archs = architectures?.map { $0.lowercased() } ?? []
         let modelTypeName = (modelType ?? "").lowercased()
-        let isGemma = modelTypeName.contains("gemma") || archs.contains(where: { $0.contains("gemma") })
-        let isQwenUnitNorm = modelTypeName.contains("qwen3") || modelTypeName.contains("qwen4") || modelTypeName.contains("next") ||
-                             archs.contains(where: { $0.contains("qwen3") || $0.contains("qwen4") || $0.contains("next") || $0.contains("qwen4exp") })
-        return isGemma || isQwenUnitNorm
+        return modelTypeName.contains("gemma") || archs.contains(where: { $0.contains("gemma") })
     }
 
     public static let userDefaultSystemPromptKey = "dynamoe_user_default_system_prompt"
@@ -511,7 +510,14 @@ public struct ModelConfig: Codable {
         }
 
         // Ornith models MUST be checked before Qwen fallback since Ornith configs inherit "qwen3_5_moe"
-        if nameLower.contains("ornith") || pathLower.contains("ornith") || typeStr.contains("ornith") || archStr.contains("ornith") {
+        let isOrnith = nameLower.contains("ornith") ||
+                       pathLower.contains("ornith") ||
+                       typeStr.contains("ornith") ||
+                       archStr.contains("ornith") ||
+                       (summary?.tensors.contains(where: { $0.name.contains("linear_attn") }) == true &&
+                        summary?.tensors.contains(where: { $0.name.contains("hc_norm") || $0.name.contains("hyper_connection") }) == false)
+
+        if isOrnith {
             // Ornith chat template defaults to clean instruct without mandatory prefix
             return ""
         }

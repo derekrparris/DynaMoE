@@ -4255,8 +4255,8 @@ final class DynaMoETests: XCTestCase {
         print("  ✅ [TEST] Help topics and settings guide coverage verified with 11 distinct sections.")
     }
 
-    func testQwen38GDNSigmoidGatingKernel() throws {
-        print("=== TEST QWEN 3.8 GDN SIGMOID GATING KERNEL ===")
+    func testGDNSiLUGatingKernel() throws {
+        print("=== TEST GDN SILU GATING KERNEL ===")
         guard let device = MTLCreateSystemDefaultDevice() else {
             XCTFail("No Metal GPU device")
             return
@@ -4313,8 +4313,7 @@ final class DynaMoETests: XCTestCase {
         qkvPtr[Int(2 * numKeyHeads * headDim)] = 2.0
 
         // Initialize zBuf to 0.0 for valHead 0.
-        // Under Sigmoid gating: sig(0.0) = 0.5. Out should be > 0.
-        // Under SiLU gating: silu(0.0) = 0.0 * sig(0.0) = 0.0. Out would be 0.0!
+        // Under SiLU gating: silu(0.0) = 0.0 * sig(0.0) = 0.0. Out must be 0.0!
         let zPtr = zBuf.contents().bindMemory(to: Float.self, capacity: zCount)
         memset(zPtr, 0, zCount * MemoryLayout<Float>.stride)
 
@@ -4371,14 +4370,12 @@ final class DynaMoETests: XCTestCase {
         let valHead0Dim0 = outPtr[0]
         print("🔍 [TEST] Head 0, Dim 0 Output: \(valHead0Dim0) (z=0.0)")
 
-        // Under Sigmoid gating: sig(0.0) = 0.5, so output is positive non-zero.
-        // Under erroneous SiLU gating: silu(0.0) = 0.0 * sig(0.0) = 0.0.
-        XCTAssertGreaterThan(valHead0Dim0, 0.01, "Sigmoid gating must preserve non-zero signal when z=0 (SiLU would produce exactly 0)")
+        // Under SiLU gating: silu(0.0) = 0.0 * sig(0.0) = 0.0.
+        XCTAssertEqual(valHead0Dim0, 0.0, accuracy: 1e-5, "SiLU gating must produce exactly 0 when z=0")
         XCTAssertFalse(valHead0Dim0.isNaN || valHead0Dim0.isInfinite, "Output must be finite")
 
-        // Now test negative z: z = -2.0. Under Sigmoid: sig(-2.0) = 0.1192 > 0.
-        // Under SiLU: silu(-2.0) = -2.0 * 0.1192 = -0.2384 (sign flips!).
-        zPtr[0] = -2.0
+        // Now test positive z: z = 2.0. Under SiLU: silu(2.0) = 2.0 / (1.0 + exp(-2.0)) = 1.7616.
+        zPtr[0] = 2.0
         guard let cmd2 = cmdQueue.makeCommandBuffer(), let enc2 = cmd2.makeComputeCommandEncoder() else {
             XCTFail("Failed to create command buffer 2")
             return
@@ -4405,11 +4402,43 @@ final class DynaMoETests: XCTestCase {
         cmd2.commit()
         cmd2.waitUntilCompleted()
 
+        let valHead0Dim0_posZ = outPtr[0]
+        print("🔍 [TEST] Head 0, Dim 0 Output with z=2.0: \(valHead0Dim0_posZ)")
+        XCTAssertGreaterThan(valHead0Dim0_posZ, 1.0, "SiLU gating must allow positive scaling > 1.0 for z=2.0")
+
+        // Now test negative z: z = -2.0. Under SiLU: silu(-2.0) = -2.0 * 0.1192 = -0.2384.
+        zPtr[0] = -2.0
+        guard let cmd3 = cmdQueue.makeCommandBuffer(), let enc3 = cmd3.makeComputeCommandEncoder() else {
+            XCTFail("Failed to create command buffer 3")
+            return
+        }
+        enc3.setComputePipelineState(gdnPipe)
+        enc3.setBuffer(qkvBuf, offset: 0, index: 0)
+        enc3.setBuffer(zBuf, offset: 0, index: 1)
+        enc3.setBuffer(aBuf, offset: 0, index: 2)
+        enc3.setBuffer(bBuf, offset: 0, index: 3)
+        enc3.setBuffer(aLogBuf, offset: 0, index: 4)
+        enc3.setBuffer(dtBiasBuf, offset: 0, index: 5)
+        enc3.setBuffer(normBuf, offset: 0, index: 6)
+        enc3.setBuffer(stateBuf, offset: 0, index: 7)
+        enc3.setBuffer(outBuf, offset: 0, index: 8)
+        enc3.setBytes(&aLogOff, length: 8, index: 9)
+        enc3.setBytes(&dtBiasOff, length: 8, index: 10)
+        enc3.setBytes(&normOff, length: 8, index: 11)
+        enc3.setBytes(&nValH, length: 4, index: 12)
+        enc3.setBytes(&nKeyH, length: 4, index: 13)
+        enc3.setBytes(&hD, length: 4, index: 14)
+        enc3.setBytes(&epsVal, length: 4, index: 15)
+        enc3.dispatchThreadgroups(MTLSize(width: Int(numValHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        enc3.endEncoding()
+        cmd3.commit()
+        cmd3.waitUntilCompleted()
+
         let valHead0Dim0_negZ = outPtr[0]
         print("🔍 [TEST] Head 0, Dim 0 Output with z=-2.0: \(valHead0Dim0_negZ)")
-        XCTAssertGreaterThan(valHead0Dim0_negZ, 0.0, "Sigmoid gating must strictly remain positive (in [0, 1]) even for negative z. SiLU would have inverted the sign!")
+        XCTAssertLessThan(valHead0Dim0_negZ, 0.0, "SiLU gating correctly preserves negative sign for negative z")
 
-        print("🎉 [SUCCESS] GDN Sigmoid Gating Kernel strictly verified against SiLU regression!")
+        print("🎉 [SUCCESS] GDN SiLU Gating Kernel strictly verified!")
     }
 
     func testWorkingSetManagerTokenBoundaryEviction() throws {
@@ -4612,6 +4641,190 @@ final class DynaMoETests: XCTestCase {
         mgr.flushAllExperts(shardBuffers: shardBuffers)
         XCTAssertEqual(mgr.residentExpertsCount, 0)
         print("🎉 [SUCCESS] Bulk pread priming test passed!")
+    }
+
+    func testOrnithRMSNormIsNotUnitOffset() throws {
+        print("=== TEST ORNITH RMSNORM IS NOT UNIT OFFSET ===")
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--mlx-community--Ornith-1.5-9B-OptiQ-4bit/snapshots/ad2e7748e8c9d36b82bb88307fd21c0d50be85b8"
+        if FileManager.default.fileExists(atPath: snapshotDir) {
+            let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir))
+            XCTAssertNotNil(config)
+            XCTAssertFalse(config!.isRMSNormUnitOffset, "Ornith 1.5 9B must NOT have isRMSNormUnitOffset = true (RMSNorm weights are centered at 1.0, not 0.0)")
+        }
+
+        // Test Gemma vs Qwen configs via JSON decoding
+        let decoder = JSONDecoder()
+        let gemmaData = """
+        {"model_type": "gemma2", "architectures": ["Gemma2ForCausalLM"]}
+        """.data(using: .utf8)!
+        let gemmaConfig = try decoder.decode(ModelConfig.self, from: gemmaData)
+        XCTAssertTrue(gemmaConfig.isRMSNormUnitOffset, "Gemma architectures MUST use unit-offset RMSNorm (output = x * (1 + weight))")
+
+        let qwenData = """
+        {"model_type": "qwen2", "architectures": ["Qwen2ForCausalLM"]}
+        """.data(using: .utf8)!
+        let qwenConfig = try decoder.decode(ModelConfig.self, from: qwenData)
+        XCTAssertFalse(qwenConfig.isRMSNormUnitOffset, "Qwen architectures must NOT use unit-offset RMSNorm")
+
+        let qwen35Data = """
+        {"model_type": "qwen3_5", "architectures": ["Qwen3_5ForConditionalGeneration"]}
+        """.data(using: .utf8)!
+        let qwen35Config = try decoder.decode(ModelConfig.self, from: qwen35Data)
+        XCTAssertFalse(qwen35Config.isRMSNormUnitOffset, "Qwen 3.5 / Ornith must NOT use unit-offset RMSNorm")
+        print("✅ [TEST] RMSNorm unit offset rules verified cleanly.")
+    }
+
+    func testOrnithSystemPromptDetection() throws {
+        print("=== TEST ORNITH SYSTEM PROMPT RESOLUTION ===")
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--mlx-community--Ornith-1.5-9B-OptiQ-4bit/snapshots/ad2e7748e8c9d36b82bb88307fd21c0d50be85b8"
+        let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir))
+
+        // 1. Path-based detection
+        let promptFromPath = ModelConfig.resolveRequiredSystemPrompt(
+            config: config,
+            summary: nil,
+            modelName: nil,
+            modelPath: snapshotDir
+        )
+        XCTAssertEqual(promptFromPath, "", "Ornith must resolve to empty required system prompt")
+        XCTAssertFalse(promptFromPath.contains("Alibaba"), "Ornith must never receive Alibaba Qwen system prompt")
+
+        // 2. Topology-based detection (even if modelName and modelPath are empty and modelType is qwen3_5)
+        let mockTensors = [
+            TensorMetadata(name: "language_model.model.layers.0.linear_attn.in_proj_qkv.weight", shapeDisplay: "[8192, 2560]", dtype: "BF16", sizeMb: 40.0, shardIndex: 0, offsetStart: 0, offsetEnd: 0, category: "linear_attn", layerIndex: 0, expertId: nil),
+            TensorMetadata(name: "language_model.model.layers.0.linear_attn.norm.weight", shapeDisplay: "[2560]", dtype: "BF16", sizeMb: 0.005, shardIndex: 0, offsetStart: 0, offsetEnd: 0, category: "linear_attn", layerIndex: 0, expertId: nil),
+            TensorMetadata(name: "language_model.model.layers.0.self_attn.q_proj.weight", shapeDisplay: "[2560, 2560]", dtype: "BF16", sizeMb: 12.5, shardIndex: 0, offsetStart: 0, offsetEnd: 0, category: "attn", layerIndex: 0, expertId: nil)
+        ]
+        let mockSummary = ModelSummary(
+            sizeGb: 7.0,
+            tensorCount: 3,
+            layerCount: 32,
+            maxExpertId: 0,
+            shards: [],
+            tensors: mockTensors,
+            layers: []
+        )
+
+        let promptFromTopology = ModelConfig.resolveRequiredSystemPrompt(
+            config: config,
+            summary: mockSummary,
+            modelName: "qwen3_5",
+            modelPath: nil
+        )
+        XCTAssertEqual(promptFromTopology, "", "Ornith GDN topology must resolve to empty required system prompt, preventing Qwen fallback")
+        print("✅ [TEST] Ornith system prompt resolution verified cleanly.")
+    }
+
+    func testOrnithPrefillOutputCoherence() throws {
+        print("=== TEST ORNITH PREFILL COHERENCE (NO MAGNITUDE EXPLOSION) ===")
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--mlx-community--Ornith-1.5-9B-OptiQ-4bit/snapshots/ad2e7748e8c9d36b82bb88307fd21c0d50be85b8"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            throw XCTSkip("Ornith snapshot not found")
+        }
+
+        let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir))
+        guard let config = config else {
+            XCTFail("Failed to load config")
+            return
+        }
+        XCTAssertFalse(config.isRMSNormUnitOffset, "RMSNorm unit offset must be false")
+
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let cmdQueue = device.makeCommandQueue() else {
+            XCTFail("Metal device or queue unavailable")
+            return
+        }
+
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+
+        let engine = try DynaMoeEngine(filePath: snapshotDir)
+        let summary = try engine.getSummary()
+
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let address = UInt(shard.baseAddress)
+            guard let ptr = UnsafeMutableRawPointer(bitPattern: address) else { continue }
+            let len = Int(shard.length)
+            if let buf = device.makeBuffer(bytesNoCopy: ptr, length: len, options: .storageModeShared, deallocator: nil) {
+                buffers[shard.index] = buf
+            }
+        }
+
+        let cachedLayers = inference.buildCachedLayers(summary: summary, config: config, targetLayerCount: 32)
+        guard let firstLayer = cachedLayers.first,
+              let norm1 = firstLayer.norm1Tensor,
+              let norm1Buf = buffers[norm1.shardIndex] else {
+            XCTFail("First layer norm1 missing")
+            return
+        }
+
+        let hiddenDim = 2560
+        guard let inBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let outStandardBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let outOffsetBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+            XCTFail("Failed to allocate test buffers")
+            return
+        }
+
+        // Initialize input with unit variance activations (typical residual state)
+        let inPtr = inBuf.contents().bindMemory(to: Float.self, capacity: hiddenDim)
+        for i in 0..<hiddenDim {
+            inPtr[i] = Float(sin(Double(i) * 0.05))
+        }
+
+        var gammaOff = norm1.offsetStart
+        var hDimU = UInt32(hiddenDim)
+        var epsVal: Float = 1e-6
+
+        // 1. Run Standard RMSNorm (correct for Ornith)
+        let cmd1 = cmdQueue.makeCommandBuffer()!
+        let enc1 = cmd1.makeComputeCommandEncoder()!
+        enc1.setComputePipelineState(inference.rmsnormPipeline!)
+        enc1.setBuffer(inBuf, offset: 0, index: 0)
+        enc1.setBuffer(norm1Buf, offset: 0, index: 1)
+        enc1.setBuffer(outStandardBuf, offset: 0, index: 2)
+        enc1.setBytes(&gammaOff, length: 8, index: 3)
+        enc1.setBytes(&hDimU, length: 4, index: 4)
+        enc1.setBytes(&epsVal, length: 4, index: 5)
+        enc1.setThreadgroupMemoryLength(1024 * 4, index: 0)
+        enc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+        enc1.endEncoding()
+        cmd1.commit()
+        cmd1.waitUntilCompleted()
+
+        // 2. Run Offset RMSNorm (the buggy path that was previously taken)
+        let cmd2 = cmdQueue.makeCommandBuffer()!
+        let enc2 = cmd2.makeComputeCommandEncoder()!
+        enc2.setComputePipelineState(inference.rmsnormOffsetPipeline!)
+        enc2.setBuffer(inBuf, offset: 0, index: 0)
+        enc2.setBuffer(norm1Buf, offset: 0, index: 1)
+        enc2.setBuffer(outOffsetBuf, offset: 0, index: 2)
+        enc2.setBytes(&gammaOff, length: 8, index: 3)
+        enc2.setBytes(&hDimU, length: 4, index: 4)
+        enc2.setBytes(&epsVal, length: 4, index: 5)
+        enc2.setThreadgroupMemoryLength(1024 * 4, index: 0)
+        enc2.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+        enc2.endEncoding()
+        cmd2.commit()
+        cmd2.waitUntilCompleted()
+
+        let stdPtr = outStandardBuf.contents().bindMemory(to: Float.self, capacity: hiddenDim)
+        let offPtr = outOffsetBuf.contents().bindMemory(to: Float.self, capacity: hiddenDim)
+
+        var stdMax: Float = 0
+        var offMax: Float = 0
+        for i in 0..<hiddenDim {
+            stdMax = max(stdMax, abs(stdPtr[i]))
+            offMax = max(offMax, abs(offPtr[i]))
+        }
+
+        print("⚡ [NORM COMPARISON] Standard RMSNorm max abs: \(stdMax), Offset RMSNorm max abs: \(offMax)")
+        // In standard RMSNorm, with norm weights ~1.0, normalized output peak is around 1.0 - 2.0
+        XCTAssertLessThan(stdMax, 5.0, "Standard RMSNorm output should be well-behaved")
+        // In offset RMSNorm, output is ~1.8x standard RMSNorm at a single layer, compounding to 2^64 over 32 layers!
+        XCTAssertGreaterThan(offMax, stdMax * 1.5, "Offset RMSNorm inflates activation scale by ~1.8x per norm")
+        print("✅ [TEST] Activation stability verified: Standard RMSNorm keeps magnitudes bounded.")
     }
 }
 

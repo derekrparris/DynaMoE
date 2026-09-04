@@ -2302,16 +2302,16 @@ kernel void linear_attention_recurrent_step(
     float totalSumSq = simd_sum(localSumSq);
     float invRms = rsqrt((totalSumSq / (float)headDim) + eps);
 
-    // Step 5: Normalization, weight scale, and Sigmoid gating (Gated DeltaNet)
+    // Step 5: Normalization, weight scale, and SiLU gating (Gated DeltaNet)
     for (uint32_t r = 0; r < numLocalRows; r++) {
         uint32_t i = row_indices[r];
         float normW = read_bf16_unaligned(normBuf + normOffset + ((uint64_t)i * 2));
         float yNorm = y_local[r] * invRms * normW;
 
         float z = zVector[zBase + i];
-        float sig_z = 1.0f / (1.0f + exp(-z));
+        float silu_z = z / (1.0f + exp(-z));
 
-        outputVector[outBase + i] = yNorm * sig_z;
+        outputVector[outBase + i] = yNorm * silu_z;
     }
 }
 
@@ -2513,9 +2513,9 @@ kernel void linear_attention_recurrent_sequence(
             float yNorm = y_local[r] * rms * gamma;
 
             float z = zToken[zBaseInToken + i];
-            float sig_z = 1.0f / (1.0f + exp(-z));
+            float silu_z = z / (1.0f + exp(-z));
 
-            outToken[outBaseInToken + i] = yNorm * sig_z;
+            outToken[outBaseInToken + i] = yNorm * silu_z;
         }
     }
 }
@@ -4355,8 +4355,8 @@ kernel void gdn_linear_attention_recurrent_step(
         float gamma = read_bf16_unaligned(normBuf + normOffset + ((uint64_t)i * 2));
         float yNorm = y_local[r] * rms * gamma;
         float z = zVector[zBase + i];
-        float sig_z = 1.0f / (1.0f + exp(-z));
-        outputVector[outBase + i] = yNorm * sig_z;
+        float silu_z = z / (1.0f + exp(-z));
+        outputVector[outBase + i] = yNorm * silu_z;
     }
 }
 
@@ -5291,8 +5291,8 @@ kernel void gdn_linear_attention_tree_step(
         float gamma = read_bf16_unaligned(normBuf + normOffset + ((uint64_t)i * 2));
         float yNorm = y_local[r] * rms * gamma;
         float z = zVector[zBase + i];
-        float sig_z = 1.0f / (1.0f + exp(-z));
-        outputVector[outBase + i] = yNorm * sig_z;
+        float silu_z = z / (1.0f + exp(-z));
+        outputVector[outBase + i] = yNorm * silu_z;
     }
 }
 /// MSL Kernel: Fused Rotary Position Embeddings (RoPE) for JetSpec Candidate Tree Nodes

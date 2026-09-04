@@ -840,14 +840,23 @@ struct ContentView: View {
            let name = session.selectedModelName, !name.isEmpty {
             return name
         }
-        if let activePath = activeLoadedModelPath,
-           let dm = localModelManager.discoveredModels.first(where: { $0.snapshotPath == activePath }) {
-            return dm.displayName
+        if let activePath = activeLoadedModelPath {
+            if let dm = localModelManager.discoveredModels.first(where: { $0.snapshotPath == activePath }) {
+                return dm.displayName
+            }
+            if activePath.lowercased().contains("ornith") {
+                return "Ornith 1.5 9B OptiQ-4bit"
+            }
         }
         if let summary = summary {
             if let type = modelConfig?.modelType, !type.isEmpty {
                 if type.lowercased().contains("ornith") {
                     return "Ornith 1.5 35B A3B FP8"
+                }
+                let isOrnithGDN = summary.tensors.contains(where: { $0.name.contains("linear_attn") }) &&
+                                 !summary.tensors.contains(where: { $0.name.contains("hc_norm") || $0.name.contains("hyper_connection") })
+                if isOrnithGDN {
+                    return "Ornith 1.5 9B OptiQ-4bit"
                 }
                 return type
             }
