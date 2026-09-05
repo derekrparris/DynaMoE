@@ -5381,6 +5381,7 @@ struct ContentView: View {
 
                                 layerEnc2.endEncoding()
                                 moeCmd.commit()
+                                moeCmd.waitUntilCompleted()
                             } else {
                                 guard let moeCmd = commandQueue.makeCommandBuffer(),
                                       let layerEnc2 = moeCmd.makeComputeCommandEncoder() else { return false }
@@ -5480,6 +5481,7 @@ struct ContentView: View {
 
                                 layerEnc2.endEncoding()
                                 moeCmd.commit()
+                                moeCmd.waitUntilCompleted()
                             }
 
                             guard let nextCmd = commandQueue.makeCommandBuffer() else { return false }
@@ -6901,6 +6903,7 @@ struct ContentView: View {
 
                                     layerEnc2.endEncoding()
                                     moeCmd.commit()
+                                    moeCmd.waitUntilCompleted()
                                 }
                             } else {
                                 let activeExpIds = Array(expertTokenMap.keys)
@@ -7183,6 +7186,7 @@ struct ContentView: View {
 
                                 layerEnc2.endEncoding()
                                 moeCmd.commit()
+                                moeCmd.waitUntilCompleted()
                             }
                         }
 

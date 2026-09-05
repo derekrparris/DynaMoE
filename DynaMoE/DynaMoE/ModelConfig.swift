@@ -459,18 +459,20 @@ public struct ModelConfig: Codable {
     }
 
     /// Whether the model architecture uses 0-mean unit-offset RMSNorm weights (output = x * (1 + weight))
-    /// NOTE: Gemma models and Qwen 4 / Next models (e.g. Qwen 3.8 Flash Next, qwen4_exp) initialize
-    /// their attention norms to 0-mean and use unit offset (x * (1 + w)).
-    /// Ornith 1.5 9B and standard Qwen 3.5 use standard 1-mean weights and must NOT use unit offset.
+    /// NOTE: Gemma models, Qwen 3.5 MoE / Ornith 35B models, and Qwen 4 / Next models (e.g. Qwen 3.8 Flash Next, qwen4_exp)
+    /// initialize their attention and layer norms to 0-mean and use unit offset (x * (1 + w)).
+    /// MLX-converted Ornith 1.5 9B and dense Qwen 3.5 use standard 1-mean weights and must NOT use unit offset.
     public var isRMSNormUnitOffset: Bool {
         let archs = architectures?.map { $0.lowercased() } ?? []
         let modelTypeName = (modelType ?? (textConfig != nil ? "qwen3_5_moe" : "")).lowercased()
         let isGemma = modelTypeName.contains("gemma") || archs.contains(where: { $0.contains("gemma") })
         let isQwen4OrNext = modelTypeName.contains("qwen4") || modelTypeName.contains("next") ||
                             archs.contains(where: { $0.contains("qwen4") || $0.contains("next") || $0.contains("qwen4exp") })
-        let isOrnithOrQwen35 = modelTypeName.contains("ornith") || modelTypeName.contains("qwen3_5") ||
-                               archs.contains(where: { $0.contains("ornith") || $0.contains("qwen3_5") })
-        return isGemma || (isQwen4OrNext && !isOrnithOrQwen35)
+        let isQwen35Moe = modelTypeName.contains("qwen3_5_moe") || archs.contains(where: { $0.contains("qwen3_5moe") || $0.contains("qwen3_5_moe") })
+        let isOrnith35B = modelTypeName.contains("35b") || archs.contains(where: { $0.contains("35b") })
+        let isOrnithOrQwen35Dense = (modelTypeName.contains("ornith") || modelTypeName.contains("qwen3_5") ||
+                               archs.contains(where: { $0.contains("ornith") || $0.contains("qwen3_5") })) && !isQwen35Moe && !isOrnith35B
+        return isGemma || isQwen35Moe || isOrnith35B || (isQwen4OrNext && !isOrnithOrQwen35Dense)
     }
 
     public static let userDefaultSystemPromptKey = "dynamoe_user_default_system_prompt"

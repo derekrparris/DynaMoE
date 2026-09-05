@@ -5276,7 +5276,8 @@ kernel void gqa_attention_tree_verify_fused(
     uint32_t headsPerKv = numQHeads / numKvHeads;
     uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
 
-    uint32_t qHeadBase = (nodeIdx * numQHeads * (headDim * 2)) + (qHeadIdx * (headDim * 2));
+    uint32_t qStride = headDim * 2;
+    uint32_t qHeadBase = (nodeIdx * numQHeads * qStride) + (qHeadIdx * qStride);
     uint32_t gateBase = qHeadBase + headDim;
     uint32_t kvStride = numKvHeads * headDim;
     uint32_t kvHeadBase = kvHeadIdx * headDim;
@@ -5377,7 +5378,8 @@ kernel void gqa_attention_tree_verify_fused_f16(
     uint32_t headsPerKv = numQHeads / numKvHeads;
     uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
 
-    uint32_t qHeadBase = (nodeIdx * numQHeads * (headDim * 2)) + (qHeadIdx * (headDim * 2));
+    uint32_t qStride = headDim * 2;
+    uint32_t qHeadBase = (nodeIdx * numQHeads * qStride) + (qHeadIdx * qStride);
     uint32_t gateBase = qHeadBase + headDim;
     uint32_t kvStride = numKvHeads * headDim;
     uint32_t kvHeadBase = kvHeadIdx * headDim;

@@ -194,9 +194,11 @@ public final class InferenceEngine {
     public var routerPipeline: MTLComputePipelineState?
     public var routerQ4Pipeline: MTLComputePipelineState?
     public var routerQ8Pipeline: MTLComputePipelineState?
+    public var sharedGatePipeline: MTLComputePipelineState?
     public var q4GemvPipeline: MTLComputePipelineState?
     public var q8GemvPipeline: MTLComputePipelineState?
     public var fp8GemvPipeline: MTLComputePipelineState?
+    public var fp8GemvSimdPipeline: MTLComputePipelineState?
     public var bf16GemvSimdPipeline: MTLComputePipelineState?
     public var gemvBF16Pipeline: MTLComputePipelineState?
     public var mxfp8GemvPipeline: MTLComputePipelineState?
@@ -311,7 +313,7 @@ public final class InferenceEngine {
         if let addFunc = defaultLib.makeFunction(name: "vector_add_f32") {
             addPipeline = try device.makeComputePipelineState(function: addFunc)
         }
-        if let clearFunc = defaultLib.makeFunction(name: "clear_buffer_f32") {
+        if let clearFunc = defaultLib.makeFunction(name: "clear_vector_f32") ?? defaultLib.makeFunction(name: "clear_buffer_f32") {
             clearPipeline = try device.makeComputePipelineState(function: clearFunc)
         }
         if let ropeFunc = defaultLib.makeFunction(name: "apply_rope_qwen") {
@@ -365,6 +367,9 @@ public final class InferenceEngine {
         if let rQ8Func = defaultLib.makeFunction(name: "moe_router_topk_q8") {
             routerQ8Pipeline = try device.makeComputePipelineState(function: rQ8Func)
         }
+        if let sgFunc = defaultLib.makeFunction(name: "moe_shared_gate_bf16") {
+            sharedGatePipeline = try device.makeComputePipelineState(function: sgFunc)
+        }
         if let q4GemvFunc = defaultLib.makeFunction(name: "q4_gemv") {
             q4GemvPipeline = try device.makeComputePipelineState(function: q4GemvFunc)
         }
@@ -377,7 +382,10 @@ public final class InferenceEngine {
         if let mxfp8GemvSimdFunc = defaultLib.makeFunction(name: "mxfp8_gemv_simd") {
             mxfp8GemvSimdPipeline = try device.makeComputePipelineState(function: mxfp8GemvSimdFunc)
         }
-        if let fp8GemvFunc = defaultLib.makeFunction(name: "mxfp8_gemv") ?? defaultLib.makeFunction(name: "fp8_gemv") {
+        if let fp8SimdFunc = defaultLib.makeFunction(name: "fp8_gemv_simd") {
+            fp8GemvSimdPipeline = try device.makeComputePipelineState(function: fp8SimdFunc)
+        }
+        if let fp8GemvFunc = defaultLib.makeFunction(name: "fp8_gemv") ?? defaultLib.makeFunction(name: "mxfp8_gemv") {
             fp8GemvPipeline = try device.makeComputePipelineState(function: fp8GemvFunc)
         }
         if let bf16SimdFunc = defaultLib.makeFunction(name: "bf16_gemv_simd") {
