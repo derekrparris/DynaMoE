@@ -1016,6 +1016,58 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(failResult.record.status, ToolExecutionStatus.error)
     }
 
+    func testPromptQueueDataModel() throws {
+        // 1. QueuedPrompt creation and equality
+        let q1 = QueuedPrompt(text: "First queued prompt")
+        let q2 = QueuedPrompt(text: "Second queued prompt")
+        XCTAssertEqual(q1.text, "First queued prompt")
+        XCTAssertEqual(q2.text, "Second queued prompt")
+        XCTAssertNotEqual(q1.id, q2.id)
+
+        // 2. ChatSession with queuedPrompts
+        var session = ChatSession(title: "Queue Test Session")
+        XCTAssertTrue(session.queuedPrompts.isEmpty)
+        session.queuedPrompts.append(q1)
+        session.queuedPrompts.append(q2)
+        XCTAssertEqual(session.queuedPrompts.count, 2)
+
+        // 3. FIFO Dequeue
+        let popped = session.queuedPrompts.removeFirst()
+        XCTAssertEqual(popped.id, q1.id)
+        XCTAssertEqual(popped.text, "First queued prompt")
+        XCTAssertEqual(session.queuedPrompts.count, 1)
+
+        // 4. Remove by ID
+        session.queuedPrompts.append(QueuedPrompt(text: "Third"))
+        XCTAssertEqual(session.queuedPrompts.count, 2)
+        session.queuedPrompts.removeAll(where: { $0.id == q2.id })
+        XCTAssertEqual(session.queuedPrompts.count, 1)
+        XCTAssertEqual(session.queuedPrompts.first?.text, "Third")
+
+        // 5. JSON Round-Trip Serialization
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+        let data = try encoder.encode(session)
+        let decodedSession = try decoder.decode(ChatSession.self, from: data)
+        XCTAssertEqual(decodedSession.id, session.id)
+        XCTAssertEqual(decodedSession.queuedPrompts.count, 1)
+        XCTAssertEqual(decodedSession.queuedPrompts.first?.text, "Third")
+
+        // 6. Backwards compatibility: Decoding JSON without 'queuedPrompts' key
+        let legacyJson = """
+        {
+            "id": "\(UUID().uuidString)",
+            "title": "Legacy Session",
+            "messages": [],
+            "createdAt": \(Date().timeIntervalSinceReferenceDate),
+            "updatedAt": \(Date().timeIntervalSinceReferenceDate)
+        }
+        """.data(using: .utf8)!
+        let legacySession = try decoder.decode(ChatSession.self, from: legacyJson)
+        XCTAssertEqual(legacySession.title, "Legacy Session")
+        XCTAssertTrue(legacySession.queuedPrompts.isEmpty)
+    }
+
     func testRepackOrnithFP8() throws {
         let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--ornith-ai--Ornith-1.5-35B-A3B-FP8/snapshots/0e048080ccd0ccf4296bfea5638036c196dccc0c"
         guard FileManager.default.fileExists(atPath: snapshotDir) else {

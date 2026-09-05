@@ -100,6 +100,22 @@ public struct ChatMessage: Identifiable, Codable, Equatable {
     }
 }
 
+public struct QueuedPrompt: Identifiable, Codable, Equatable {
+    public var id: UUID
+    public var text: String
+    public var timestamp: Date
+
+    public init(
+        id: UUID = UUID(),
+        text: String,
+        timestamp: Date = Date()
+    ) {
+        self.id = id
+        self.text = text
+        self.timestamp = timestamp
+    }
+}
+
 public struct ChatSession: Identifiable, Codable, Equatable {
     public var id: UUID
     public var title: String
@@ -111,6 +127,7 @@ public struct ChatSession: Identifiable, Codable, Equatable {
     public var selectedModelPath: String?
     public var isThinkingEnabled: Bool?
     public var isAgentToolsEnabled: Bool?
+    public var queuedPrompts: [QueuedPrompt]
 
     public init(
         id: UUID = UUID(),
@@ -122,7 +139,8 @@ public struct ChatSession: Identifiable, Codable, Equatable {
         selectedModelName: String? = nil,
         selectedModelPath: String? = nil,
         isThinkingEnabled: Bool? = nil,
-        isAgentToolsEnabled: Bool? = nil
+        isAgentToolsEnabled: Bool? = nil,
+        queuedPrompts: [QueuedPrompt] = []
     ) {
         self.id = id
         self.title = title
@@ -134,5 +152,43 @@ public struct ChatSession: Identifiable, Codable, Equatable {
         self.selectedModelPath = selectedModelPath
         self.isThinkingEnabled = isThinkingEnabled
         self.isAgentToolsEnabled = isAgentToolsEnabled
+        self.queuedPrompts = queuedPrompts
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, messages, createdAt, updatedAt
+        case selectedModelId, selectedModelName, selectedModelPath
+        case isThinkingEnabled, isAgentToolsEnabled
+        case queuedPrompts
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(UUID.self, forKey: .id)
+        self.title = try container.decode(String.self, forKey: .title)
+        self.messages = try container.decode([ChatMessage].self, forKey: .messages)
+        self.createdAt = try container.decode(Date.self, forKey: .createdAt)
+        self.updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+        self.selectedModelId = try container.decodeIfPresent(String.self, forKey: .selectedModelId)
+        self.selectedModelName = try container.decodeIfPresent(String.self, forKey: .selectedModelName)
+        self.selectedModelPath = try container.decodeIfPresent(String.self, forKey: .selectedModelPath)
+        self.isThinkingEnabled = try container.decodeIfPresent(Bool.self, forKey: .isThinkingEnabled)
+        self.isAgentToolsEnabled = try container.decodeIfPresent(Bool.self, forKey: .isAgentToolsEnabled)
+        self.queuedPrompts = try container.decodeIfPresent([QueuedPrompt].self, forKey: .queuedPrompts) ?? []
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(title, forKey: .title)
+        try container.encode(messages, forKey: .messages)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encode(updatedAt, forKey: .updatedAt)
+        try container.encodeIfPresent(selectedModelId, forKey: .selectedModelId)
+        try container.encodeIfPresent(selectedModelName, forKey: .selectedModelName)
+        try container.encodeIfPresent(selectedModelPath, forKey: .selectedModelPath)
+        try container.encodeIfPresent(isThinkingEnabled, forKey: .isThinkingEnabled)
+        try container.encodeIfPresent(isAgentToolsEnabled, forKey: .isAgentToolsEnabled)
+        try container.encode(queuedPrompts, forKey: .queuedPrompts)
     }
 }

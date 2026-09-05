@@ -8,7 +8,7 @@ DynaMoE is a high-performance native macOS application, local inference engine, 
 
 ## Inspiration & Acknowledgements
 
-This project was undertaken purely for the joy of exploration by someone who is not a software engineer or even a "real" developer. Just someone who is enjoying learning with the help of AI. I'm steering the ship, and Gemini (3.6, 3.7 and 3.8) have been implementing the ideas and pointing me in the right direction.
+This project was undertaken purely for the joy of exploration by someone who is not a software engineer. Just someone who is enjoying learning with the help of AI. I'm steering the ship, and Gemini (3.6, 3.7 and 3.8) have been implementing the ideas and pointing me in the right direction.
 
 Special thanks and acknowledgement to the open-source projects and research that inspired and influenced this architecture:
 * **JetSpec** (Hao AI Lab / UC San Diego — [arXiv:2606.18394](https://arxiv.org/html/2606.18394v2)): Causal parallel tree drafting and tree-causal attention verification for breakthrough speculative decoding throughput.
@@ -19,9 +19,13 @@ Special thanks and acknowledgement to the open-source projects and research that
 
 ## Supported Architectures & Models
 
+**To date, all development and validation has been done on a 2021 Macbook Pro with an M1 Pro CPU, 16 GB RAM and 512 GB SSD.**
+
 DynaMoE supports sparse Mixture-of-Experts, hybrid recurrent SSM/attention architectures, and dense autoregressive transformers with automatic model topology detection.
 
 **Status Update:** Both **Ornith 1.5 9B Dense** and **Qwen 3.8 Flash Next FP8 MoE** are fully operational with live prompt prefill, high-speed autoregressive decoding, NVMe SSD streaming, dynamic working set memory budgets, reasoning/thinking chains, and task-specific generation profiles ("Coder" & "Assistant").
+
+**Note:** I don't currently have enough disk space to fully repack Qwen3.8 Flash Next to test streaming optimizations. If anyone has the room to test speeds with full repacking, please do let me know. I will be able to conduct further tests once I get a new computer :)
 
 | Model / Family | Parameters | Active Parameters | Architecture Type | Quantization & Precision | Context Window |
 | :--- | :--- | :--- | :--- | :--- | :--- |

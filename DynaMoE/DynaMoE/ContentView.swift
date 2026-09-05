@@ -1042,6 +1042,15 @@ struct ContentView: View {
                     onStopGeneration: {
                         stopAutoregressiveGeneration()
                     },
+                    onQueuePrompt: { text in
+                        handleQueuePrompt(text)
+                    },
+                    onSendImmediate: { text in
+                        interruptAndSendMessage(text)
+                    },
+                    onRemoveQueuedPrompt: { id in
+                        handleRemoveQueuedPrompt(id: id)
+                    },
                     onSelectPromptStarter: { starter in
                         chatPromptText = starter
                         handleSendMessage(starter)
@@ -1229,6 +1238,47 @@ struct ContentView: View {
             SettingsWindowManager.shared.update {
                 buildSettingsSheetView()
             }
+        }
+    }
+
+    private func handleQueuePrompt(_ text: String) {
+        guard let currentSessionId = selectedSessionId ?? sessions.first?.id else { return }
+        guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        sessions[sessionIdx].queuedPrompts.append(QueuedPrompt(text: trimmed))
+    }
+
+    private func handleRemoveQueuedPrompt(id: UUID) {
+        guard let currentSessionId = selectedSessionId ?? sessions.first?.id else { return }
+        guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return }
+        sessions[sessionIdx].queuedPrompts.removeAll(where: { $0.id == id })
+    }
+
+    private func interruptAndSendMessage(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if isGeneratingText {
+            stopAutoregressiveGeneration()
+            Task { @MainActor in
+                // Brief yield to allow the cancelled generation task to release resources cleanly
+                try? await Task.sleep(nanoseconds: 60_000_000)
+                self.handleSendMessage(trimmed)
+            }
+        } else {
+            handleSendMessage(trimmed)
+        }
+    }
+
+    private func dequeueAndRunNextPromptIfNeeded(sessionId: UUID?) {
+        guard let currentSessionId = sessionId ?? selectedSessionId ?? sessions.first?.id else { return }
+        guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return }
+        guard !sessions[sessionIdx].queuedPrompts.isEmpty else { return }
+        let next = sessions[sessionIdx].queuedPrompts.removeFirst()
+        Task { @MainActor in
+            // Smooth transition to next turn
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            self.handleSendMessage(next.text)
         }
     }
 
@@ -8845,6 +8895,9 @@ struct ContentView: View {
                         self.sessions[sIdx].messages[mIdx].jetSpecDraftAccepted = (effectiveJetSpec && self.jetSpecTotalDraftAccepted > 0) ? self.jetSpecTotalDraftAccepted : nil
                     }
                 }
+                if !willContinueAgent {
+                    self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)
+                }
             }
 
             // Agent Harness Multi-Step Tool Execution
@@ -8983,6 +9036,7 @@ struct ContentView: View {
                             self.isGeneratingText = false
                             self.generationTask = nil
                             self.generationStatusText = anyCompleted ? "✨ Agent completed task." : "✨ Agent completed maximum allowed steps (\(self.maxAgentSteps))."
+                            self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)
                         }
                         return
                     }

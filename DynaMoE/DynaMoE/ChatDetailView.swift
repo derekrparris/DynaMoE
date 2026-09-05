@@ -28,6 +28,9 @@ struct ChatDetailView: View {
     var isAgentToolsEnabled: Bool = true
     var onSendMessage: (String) -> Void
     var onStopGeneration: () -> Void
+    var onQueuePrompt: ((String) -> Void)? = nil
+    var onSendImmediate: ((String) -> Void)? = nil
+    var onRemoveQueuedPrompt: ((UUID) -> Void)? = nil
     var onSelectPromptStarter: (String) -> Void
     var onSelectDiscoveredModel: ((DiscoveredModel) -> Void)? = nil
     var onOpenSettings: (() -> Void)? = nil
@@ -229,18 +232,143 @@ struct ChatDetailView: View {
 
             // Floating Bottom Composer (Antigravity Centered Constrained Width)
             VStack(spacing: 0) {
+                // Queued Prompts Card (Antigravity-Style)
+                if let queued = session?.queuedPrompts, !queued.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "tray.full.fill")
+                                .font(.system(size: max(9, 11 * zoomManager.zoomScale), weight: .semibold))
+                                .foregroundColor(.purple)
+                            Text("QUEUED")
+                                .font(.system(size: max(9, 10.5 * zoomManager.zoomScale), weight: .bold))
+                                .foregroundColor(.purple)
+                            Text("(\(queued.count))")
+                                .font(.system(size: max(9, 10.5 * zoomManager.zoomScale), weight: .semibold, design: .monospaced))
+                                .foregroundColor(.secondary)
+
+                            Spacer()
+
+                            Text(isGenerating ? "Will run automatically next turn" : "Waiting to send")
+                                .font(.system(size: max(8.5, 10 * zoomManager.zoomScale), weight: .medium))
+                                .foregroundColor(.secondary)
+                        }
+                        .padding(.horizontal, 4)
+
+                        ForEach(queued) { item in
+                            HStack(spacing: 8) {
+                                Text(item.text)
+                                    .font(.system(size: max(10, 12 * zoomManager.zoomScale)))
+                                    .foregroundColor(.primary)
+                                    .lineLimit(2)
+                                    .truncationMode(.tail)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                                HStack(spacing: 6) {
+                                    Button(action: {
+                                        let textToSend = item.text
+                                        onRemoveQueuedPrompt?(item.id)
+                                        if let immediate = onSendImmediate {
+                                            immediate(textToSend)
+                                        } else {
+                                            onSendMessage(textToSend)
+                                        }
+                                    }) {
+                                        HStack(spacing: 3) {
+                                            Image(systemName: "bolt.fill")
+                                                .font(.system(size: max(8.5, 9.5 * zoomManager.zoomScale)))
+                                            Text("Send Now")
+                                                .font(.system(size: max(9, 11 * zoomManager.zoomScale), weight: .medium))
+                                        }
+                                        .padding(.horizontal, 7)
+                                        .padding(.vertical, 3.5)
+                                        .background(Color.orange.opacity(0.15))
+                                        .foregroundColor(.orange)
+                                        .cornerRadius(6)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Send this message now (interrupts current turn)")
+
+                                    Button(action: {
+                                        promptText = item.text
+                                        onRemoveQueuedPrompt?(item.id)
+                                    }) {
+                                        Image(systemName: "pencil")
+                                            .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
+                                            .foregroundColor(.secondary)
+                                            .frame(width: max(18, 22 * zoomManager.zoomScale), height: max(18, 22 * zoomManager.zoomScale))
+                                            .background(Color.secondary.opacity(0.08))
+                                            .clipShape(Circle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Edit prompt in composer")
+
+                                    Button(action: {
+                                        onRemoveQueuedPrompt?(item.id)
+                                    }) {
+                                        Image(systemName: "xmark")
+                                            .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .bold))
+                                            .foregroundColor(.secondary)
+                                            .frame(width: max(18, 22 * zoomManager.zoomScale), height: max(18, 22 * zoomManager.zoomScale))
+                                            .background(Color.secondary.opacity(0.08))
+                                            .clipShape(Circle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Remove from queue")
+                                }
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 7)
+                            .background(Color.primary.opacity(0.04))
+                            .cornerRadius(10)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+                            )
+                        }
+                    }
+                    .padding(10)
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(14)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14)
+                            .stroke(Color.purple.opacity(0.2), lineWidth: 1)
+                    )
+                    .shadow(color: Color.black.opacity(0.04), radius: 6, x: 0, y: 2)
+                    .frame(maxWidth: max(600, 800 * zoomManager.zoomScale))
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 8)
+                    .transition(.asymmetric(insertion: .opacity.combined(with: .move(edge: .bottom)), removal: .opacity.combined(with: .scale(scale: 0.95))))
+                }
+
                 VStack(alignment: .leading, spacing: 10) {
                     // Multi-line Expanding Input
                     MacTextEditor(
                         text: $promptText,
-                        placeholder: "Ask DynaMoE anything... (Enter to send, Shift+Enter for newline)",
+                        placeholder: isGenerating ? "Ask a follow-up to queue (↵) or send now (⌘↵)..." : "Ask DynaMoE anything... (Enter to send, Shift+Enter for newline)",
                         zoomScale: zoomManager.zoomScale,
                         onCommit: {
                             let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
-                            if !trimmed.isEmpty && !isGenerating {
+                            guard !trimmed.isEmpty else { return }
+                            if isGenerating {
+                                if let queueAction = onQueuePrompt {
+                                    queueAction(trimmed)
+                                } else {
+                                    onSendMessage(trimmed)
+                                }
+                            } else {
                                 onSendMessage(trimmed)
-                                promptText = ""
                             }
+                            promptText = ""
+                        },
+                        onCommitImmediate: {
+                            let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !trimmed.isEmpty else { return }
+                            if let immediateAction = onSendImmediate {
+                                immediateAction(trimmed)
+                            } else {
+                                onSendMessage(trimmed)
+                            }
+                            promptText = ""
                         }
                     )
                     .frame(minHeight: max(32, 38 * zoomManager.zoomScale), maxHeight: max(100, 140 * zoomManager.zoomScale))
@@ -500,15 +628,56 @@ struct ChatDetailView: View {
                         }
                         .buttonStyle(.plain)
 
-                        // Send / Stop Button
+                        // Send / Stop / Queue Buttons
                         if isGenerating {
-                            Button(action: onStopGeneration) {
-                                Image(systemName: "stop.circle.fill")
-                                    .font(.system(size: max(20, 26 * zoomManager.zoomScale)))
-                                    .foregroundColor(.red)
+                            HStack(spacing: 8) {
+                                if !promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                    Button(action: {
+                                        let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
+                                        guard !trimmed.isEmpty else { return }
+                                        if let queueAction = onQueuePrompt {
+                                            queueAction(trimmed)
+                                        } else {
+                                            onSendMessage(trimmed)
+                                        }
+                                        promptText = ""
+                                    }) {
+                                        Image(systemName: "tray.and.arrow.down.fill")
+                                            .font(.system(size: max(11, 14 * zoomManager.zoomScale), weight: .semibold))
+                                            .foregroundColor(.purple)
+                                            .frame(width: max(20, 26 * zoomManager.zoomScale), height: max(20, 26 * zoomManager.zoomScale))
+                                            .background(Color.purple.opacity(0.12))
+                                            .clipShape(Circle())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Queue message for next turn (↵)")
+
+                                    Button(action: {
+                                        let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
+                                        guard !trimmed.isEmpty else { return }
+                                        if let immediateAction = onSendImmediate {
+                                            immediateAction(trimmed)
+                                        } else {
+                                            onSendMessage(trimmed)
+                                        }
+                                        promptText = ""
+                                    }) {
+                                        Image(systemName: "bolt.circle.fill")
+                                            .font(.system(size: max(20, 26 * zoomManager.zoomScale)))
+                                            .foregroundColor(.orange)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Interrupt and send immediately (⌘↵)")
+                                }
+
+                                Button(action: onStopGeneration) {
+                                    Image(systemName: "stop.circle.fill")
+                                        .font(.system(size: max(20, 26 * zoomManager.zoomScale)))
+                                        .foregroundColor(.red)
+                                }
+                                .buttonStyle(.plain)
+                                .help("Stop generating")
                             }
-                            .buttonStyle(.plain)
-                            .help("Stop generating")
                         } else {
                             Button(action: {
                                 let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -584,22 +753,62 @@ struct ChatDetailView: View {
     }
 }
 
+// MARK: - Custom Mac NSTextView Subclass
+final class ComposerTextView: NSTextView {
+    var onCommit: (() -> Void)?
+    var onCommitImmediate: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 36 && !hasMarkedText() { // Return key
+            if event.modifierFlags.contains(.shift) {
+                super.keyDown(with: event)
+                return
+            } else if event.modifierFlags.contains(.command) {
+                if let immediate = onCommitImmediate {
+                    immediate()
+                } else {
+                    onCommit?()
+                }
+                return
+            } else {
+                onCommit?()
+                return
+            }
+        }
+        super.keyDown(with: event)
+    }
+}
+
 // MARK: - Custom Mac NSTextView Wrapper
 struct MacTextEditor: NSViewRepresentable {
     @Binding var text: String
     var placeholder: String
     var zoomScale: CGFloat = 1.0
     var onCommit: () -> Void
+    var onCommitImmediate: (() -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSTextView.scrollableTextView()
-        guard let textView = scrollView.documentView as? NSTextView else { return scrollView }
+        let scrollView = NSScrollView()
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = false
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
 
+        let textStorage = NSTextStorage()
+        let layoutManager = NSLayoutManager()
+        textStorage.addLayoutManager(layoutManager)
+        let textContainer = NSTextContainer()
+        textContainer.widthTracksTextView = true
+        layoutManager.addTextContainer(textContainer)
+
+        let textView = ComposerTextView(frame: .zero, textContainer: textContainer)
         textView.delegate = context.coordinator
+        textView.onCommit = onCommit
+        textView.onCommitImmediate = onCommitImmediate
         textView.font = .systemFont(ofSize: max(10, 13.5 * zoomScale))
         textView.isRichText = false
         textView.drawsBackground = false
@@ -609,20 +818,18 @@ struct MacTextEditor: NSViewRepresentable {
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
-        textView.textContainer?.widthTracksTextView = true
         textView.textContainerInset = NSSize(width: 0, height: 4)
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
 
-        scrollView.hasVerticalScroller = false
-        scrollView.hasHorizontalScroller = false
-        scrollView.drawsBackground = false
-        scrollView.autohidesScrollers = true
+        scrollView.documentView = textView
         return scrollView
     }
 
     func updateNSView(_ nsView: NSScrollView, context: Context) {
-        guard let textView = nsView.documentView as? NSTextView else { return }
+        guard let textView = nsView.documentView as? ComposerTextView else { return }
+        textView.onCommit = onCommit
+        textView.onCommitImmediate = onCommitImmediate
         if textView.string != text {
             textView.string = text
         }
@@ -642,19 +849,6 @@ struct MacTextEditor: NSViewRepresentable {
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
             self.parent.text = textView.string
-        }
-
-        func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-                if let event = NSApp.currentEvent, event.modifierFlags.contains(.shift) {
-                    textView.insertNewlineIgnoringFieldEditor(nil)
-                    return true
-                } else {
-                    parent.onCommit()
-                    return true
-                }
-            }
-            return false
         }
     }
 }
