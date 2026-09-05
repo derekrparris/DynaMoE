@@ -137,7 +137,7 @@ public final class ShellRunTool: AgentTool {
             executableURL: URL(fileURLWithPath: "/bin/zsh"),
             arguments: ["-c", command],
             currentDirectory: targetDir,
-            timeoutSeconds: 180
+            timeoutSeconds: 120
         )
 
         let cleanStdout = AgentHarness.truncateText(AgentHarness.sanitizeText(stdout.trimmingCharacters(in: .whitespacesAndNewlines)), limit: maxOutputLength)
@@ -154,7 +154,8 @@ public final class ShellRunTool: AgentTool {
                 "exit_code": exitCode,
                 "stdout": cleanStdout
             ])
-            return (res, cleanStdout, cleanStderr, false)
+            let effectiveStderr = !cleanStderr.isEmpty ? cleanStderr : (!cleanStdout.isEmpty ? "Command exited with code \(exitCode): \(cleanStdout)" : "Command exited with error code \(exitCode)")
+            return (res, cleanStdout, effectiveStderr, false)
         }
     }
 }
@@ -1283,51 +1284,169 @@ public final class AgentHarness {
         executableURL: URL,
         arguments: [String],
         currentDirectory: URL,
-        timeoutSeconds: TimeInterval = 180
+        timeoutSeconds: TimeInterval = 120
     ) async throws -> (exitCode: Int32, stdout: String, stderr: String) {
-        return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let process = Process()
-                let stdoutPipe = Pipe()
-                let stderrPipe = Pipe()
+        let process = Process()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
 
-                process.executableURL = executableURL
-                process.arguments = arguments
-                process.currentDirectoryURL = currentDirectory
-                process.standardOutput = stdoutPipe
-                process.standardError = stderrPipe
+        // 1. Expand environment PATH for macOS GUI applications and set non-interactive flags
+        var env = ProcessInfo.processInfo.environment
+        let userHome = FileManager.default.homeDirectoryForCurrentUser.path
+        let currentPath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        let extraPaths = [
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",
+            "/usr/local/sbin",
+            "\(userHome)/.cargo/bin",
+            "\(userHome)/.local/bin"
+        ]
+        let fullPath = (extraPaths + [currentPath]).joined(separator: ":")
+        env["PATH"] = fullPath
+        env["HOMEBREW_NO_AUTO_UPDATE"] = "1"
+        env["HOMEBREW_NO_INSTALL_CLEANUP"] = "1"
+        env["HOMEBREW_NO_ENV_HINTS"] = "1"
+        env["CI"] = "1"
+        env["TERM"] = "dumb"
+        env["PAGER"] = "cat"
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["NONINTERACTIVE"] = "1"
+        env["DEBIAN_FRONTEND"] = "noninteractive"
 
-                var isDone = false
-                let lock = NSRecursiveLock()
+        process.environment = env
+        process.executableURL = executableURL
+        process.arguments = arguments
+        process.currentDirectoryURL = currentDirectory
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
 
-                do {
-                    try process.run()
+        final class ProcessState: @unchecked Sendable {
+            let lock = NSLock()
+            var stdoutData = Data()
+            var stderrData = Data()
+            var isFinished = false
+            var isTimedOut = false
+            var isCancelled = false
+            var timerWorkItem: DispatchWorkItem?
 
-                    let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-                    let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-                    process.waitUntilExit()
+            func cancelTimer() {
+                timerWorkItem?.cancel()
+                timerWorkItem = nil
+            }
+        }
 
-                    lock.lock()
-                    if !isDone {
-                        isDone = true
-                        lock.unlock()
-                        let stdoutStr = String(data: stdoutData, encoding: .utf8) ?? ""
-                        let stderrStr = String(data: stderrData, encoding: .utf8) ?? ""
-                        continuation.resume(returning: (process.terminationStatus, stdoutStr, stderrStr))
-                    } else {
-                        lock.unlock()
+        let state = ProcessState()
+
+        // Asynchronously drain stdout and stderr without blocking to prevent 64KB pipe buffer deadlocks
+        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if !chunk.isEmpty {
+                state.lock.lock()
+                state.stdoutData.append(chunk)
+                state.lock.unlock()
+            }
+        }
+
+        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if !chunk.isEmpty {
+                state.lock.lock()
+                state.stderrData.append(chunk)
+                state.lock.unlock()
+            }
+        }
+
+        let cleanupPipes: @Sendable () -> Void = {
+            stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            stderrPipe.fileHandleForReading.readabilityHandler = nil
+
+            let remOut = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            let remErr = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+
+            state.lock.lock()
+            state.stdoutData.append(remOut)
+            state.stderrData.append(remErr)
+            state.lock.unlock()
+        }
+
+        let killProcessTree: @Sendable () -> Void = {
+            let pid = process.processIdentifier
+            if pid > 0 {
+                kill(-pid, SIGTERM)
+                kill(pid, SIGTERM)
+            }
+            process.terminate()
+
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) {
+                if process.isRunning && pid > 0 {
+                    kill(-pid, SIGKILL)
+                    kill(pid, SIGKILL)
+                }
+            }
+        }
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if timeoutSeconds > 0 {
+                    let item = DispatchWorkItem {
+                        state.lock.lock()
+                        guard !state.isFinished else {
+                            state.lock.unlock()
+                            return
+                        }
+                        state.isTimedOut = true
+                        state.lock.unlock()
+
+                        killProcessTree()
                     }
-                } catch {
-                    lock.lock()
-                    if !isDone {
-                        isDone = true
-                        lock.unlock()
+                    state.timerWorkItem = item
+                    DispatchQueue.global().asyncAfter(deadline: .now() + timeoutSeconds, execute: item)
+                }
+
+                DispatchQueue.global(qos: .userInitiated).async {
+                    do {
+                        try process.run()
+                        process.waitUntilExit()
+
+                        state.cancelTimer()
+                        cleanupPipes()
+
+                        state.lock.lock()
+                        state.isFinished = true
+                        let timedOut = state.isTimedOut
+                        let cancelled = state.isCancelled
+                        let finalStdout = String(data: state.stdoutData, encoding: .utf8) ?? ""
+                        let finalStderr = String(data: state.stderrData, encoding: .utf8) ?? ""
+                        let exitCode = process.terminationStatus
+                        state.lock.unlock()
+
+                        if timedOut {
+                            let msg = "Command timed out after \(Int(timeoutSeconds)) seconds."
+                            continuation.resume(returning: (124, finalStdout, msg))
+                        } else if cancelled {
+                            continuation.resume(returning: (130, finalStdout, "Command was cancelled by user."))
+                        } else {
+                            continuation.resume(returning: (exitCode, finalStdout, finalStderr))
+                        }
+                    } catch {
+                        state.cancelTimer()
+                        cleanupPipes()
+
+                        state.lock.lock()
+                        state.isFinished = true
+                        state.lock.unlock()
+
                         continuation.resume(throwing: error)
-                    } else {
-                        lock.unlock()
                     }
                 }
             }
+        } onCancel: {
+            state.lock.lock()
+            state.isCancelled = true
+            state.lock.unlock()
+            killProcessTree()
         }
     }
 }

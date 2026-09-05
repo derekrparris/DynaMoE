@@ -8777,9 +8777,17 @@ struct ContentView: View {
             let finalTtft = firstTokenTimestamp.map { $0 - startTime }
             let finalThinkDuration = thinkingEndTimestamp.map { $0 - generationStartTime }
 
+            // Agent Harness Multi-Step Tool Check
+            let isAgentEnabled = (sessionId != nil) ? (self.sessions.first(where: { $0.id == sessionId })?.isAgentToolsEnabled ?? self.defaultAgentToolsEnabled) : self.defaultAgentToolsEnabled
+            let parsedResult = isAgentEnabled ? AgentHarness.shared.parseToolCalls(from: finalDecoded) : (calls: [], brokenFragments: [])
+            let hasUncalledIntent = isAgentEnabled && parsedResult.calls.isEmpty && (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink)
+            let willContinueAgent = (!parsedResult.calls.isEmpty || hasUncalledIntent)
+
             await MainActor.run {
-                self.isGeneratingText = false
-                self.generationTask = nil
+                if !willContinueAgent {
+                    self.isGeneratingText = false
+                    self.generationTask = nil
+                }
                 self.generatedStreamText = finalDecoded
                 self.thinkingText = finalThink
                 self.responseText = finalResp
@@ -8788,7 +8796,13 @@ struct ContentView: View {
                 self.generationElapsedMs = finalElapsedMs
                 self.generationSpeedTokPerSec = finalTokPerSec
                 let finalJetSpecBadge = effectiveJetSpec && self.jetSpecTotalDraftProposed > 0 ? " (JetSpec τ=\(String(format: "%.1f", self.jetSpecMeanTau)), \(self.jetSpecTotalDraftAccepted) draft tokens accepted)" : ""
-                self.generationStatusText = "✨ Generated \(tokensGenerated) tokens in \(String(format: "%.2f", finalElapsedMs)) ms (\(String(format: "%.1f", finalTokPerSec)) tok/s)\(finalJetSpecBadge)"
+                if !willContinueAgent {
+                    self.generationStatusText = "✨ Generated \(tokensGenerated) tokens in \(String(format: "%.2f", finalElapsedMs)) ms (\(String(format: "%.1f", finalTokPerSec)) tok/s)\(finalJetSpecBadge)"
+                } else if !parsedResult.calls.isEmpty {
+                    self.generationStatusText = "⚙️ Executing \(parsedResult.calls.count) tool call(s)..."
+                } else {
+                    self.generationStatusText = "🔄 Continuing agent multi-turn action..."
+                }
                 self.currentRssGB = finalRss
                 self.residentExpertCount = finalResCount
                 self.cacheHitRate = finalHitRate
@@ -8834,10 +8848,7 @@ struct ContentView: View {
             }
 
             // Agent Harness Multi-Step Tool Execution
-            let isAgentEnabled = (sessionId != nil) ? (self.sessions.first(where: { $0.id == sessionId })?.isAgentToolsEnabled ?? self.defaultAgentToolsEnabled) : self.defaultAgentToolsEnabled
-
             if isAgentEnabled {
-                let parsedResult = AgentHarness.shared.parseToolCalls(from: finalDecoded)
                 if !parsedResult.calls.isEmpty {
                     var initialRecords: [ToolCallRecord] = []
                     for call in parsedResult.calls {
@@ -8870,7 +8881,32 @@ struct ContentView: View {
                     var anyCompleted = false
 
                     for (idx, call) in parsedResult.calls.enumerated() {
+                        if Task.isCancelled {
+                            await MainActor.run {
+                                self.isGeneratingText = false
+                                self.generationTask = nil
+                                self.generationStatusText = "⏹ Tool execution stopped by user."
+                                if let sId = sessionId, let mId = messageId,
+                                   let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                                   let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }),
+                                   var currentCalls = self.sessions[sIdx].messages[mIdx].toolCalls {
+                                    for i in idx..<currentCalls.count {
+                                        if currentCalls[i].status == .running {
+                                            currentCalls[i].status = .error
+                                            currentCalls[i].error = "Cancelled by user."
+                                        }
+                                    }
+                                    self.sessions[sIdx].messages[mIdx].toolCalls = currentCalls
+                                }
+                            }
+                            return
+                        }
+
                         let recordId = initialRecords[idx].id
+                        await MainActor.run {
+                            self.generationStatusText = "⚙️ Executing [\(idx + 1)/\(parsedResult.calls.count)]: \(call.name)..."
+                        }
+
                         let execResult = await AgentHarness.shared.executeTool(
                             call: call,
                             workingDirectory: baseWdURL,
@@ -8895,6 +8931,15 @@ struct ContentView: View {
                                 self.sessions[sIdx].messages[mIdx].toolCalls = currentCalls
                             }
                         }
+                    }
+
+                    if Task.isCancelled {
+                        await MainActor.run {
+                            self.isGeneratingText = false
+                            self.generationTask = nil
+                            self.generationStatusText = "⏹ Generation stopped by user."
+                        }
+                        return
                     }
 
                     // If not finished and steps remaining, invoke next step
@@ -8932,8 +8977,25 @@ struct ContentView: View {
                             )
                         }
                         return
+                    } else {
+                        // All steps finished or complete tool called
+                        await MainActor.run {
+                            self.isGeneratingText = false
+                            self.generationTask = nil
+                            self.generationStatusText = anyCompleted ? "✨ Agent completed task." : "✨ Agent completed maximum allowed steps (\(self.maxAgentSteps))."
+                        }
+                        return
                     }
                 } else if (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink) {
+                    if Task.isCancelled {
+                        await MainActor.run {
+                            self.isGeneratingText = false
+                            self.generationTask = nil
+                            self.generationStatusText = "⏹ Generation stopped by user."
+                        }
+                        return
+                    }
+
                     let continuationTurn = AgentHarness.shared.formatActionContinuationTurn(
                         includeThinkSuffix: thinkingEnabled
                     )

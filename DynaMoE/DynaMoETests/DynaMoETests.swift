@@ -981,6 +981,41 @@ final class DynaMoETests: XCTestCase {
         XCTAssertTrue(nextTurn.hasSuffix("<|im_start|>assistant\n"))
     }
 
+    func testAgentHarnessProcessExecution() async throws {
+        let harness = AgentHarness.shared
+
+        // 1. Verify Homebrew is in PATH and accessible
+        let brewCall = ParsedToolCall(
+            name: "shell_run",
+            arguments: ["command": "which brew || true"],
+            rawArguments: "{\"command\": \"which brew || true\"}",
+            rawText: "<tool_call>{\"name\": \"shell_run\", \"arguments\": {\"command\": \"which brew || true\"}}</tool_call>"
+        )
+        let brewResult = await harness.executeTool(call: brewCall)
+        XCTAssertEqual(brewResult.record.status, ToolExecutionStatus.success)
+        XCTAssertTrue((brewResult.record.output ?? "").contains("brew"))
+
+        // 2. Verify Timeout Enforcement (sleep 10 with 1s timeout)
+        let (exitCode, _, stderr) = try await AgentHarness.runProcess(
+            executableURL: URL(fileURLWithPath: "/bin/zsh"),
+            arguments: ["-c", "sleep 10"],
+            currentDirectory: URL(fileURLWithPath: "/tmp"),
+            timeoutSeconds: 1
+        )
+        XCTAssertEqual(exitCode, 124)
+        XCTAssertTrue(stderr.contains("timed out"))
+
+        // 3. Verify Non-Zero Exit Code produces .error status
+        let failCall = ParsedToolCall(
+            name: "shell_run",
+            arguments: ["command": "false"],
+            rawArguments: "{\"command\": \"false\"}",
+            rawText: "<tool_call>{\"name\": \"shell_run\", \"arguments\": {\"command\": \"false\"}}</tool_call>"
+        )
+        let failResult = await harness.executeTool(call: failCall)
+        XCTAssertEqual(failResult.record.status, ToolExecutionStatus.error)
+    }
+
     func testRepackOrnithFP8() throws {
         let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--ornith-ai--Ornith-1.5-35B-A3B-FP8/snapshots/0e048080ccd0ccf4296bfea5638036c196dccc0c"
         guard FileManager.default.fileExists(atPath: snapshotDir) else {
