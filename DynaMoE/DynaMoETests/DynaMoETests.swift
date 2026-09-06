@@ -6544,6 +6544,141 @@ final class DynaMoETests: XCTestCase {
         XCTAssertTrue(result.resultJSON.contains("CacheManager.swift"))
         XCTAssertTrue(result.resultJSON.contains("allocateKVCache"))
     }
+
+    // MARK: - Option 2: Multi-Agent Subagent Delegation Harness Tests
+
+    func testSubagentManagerLifecycleAndStatusTransitions() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("SubagentLifecycleTest_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let dummyFile = tempDir.appendingPathComponent("MathLib.swift")
+        try "public struct MathLib { public static func add(_ a: Int, _ b: Int) -> Int { a + b } }".write(to: dummyFile, atomically: true, encoding: .utf8)
+
+        let manager = SubagentManager.shared
+        let subagent = manager.spawn(
+            role: "Codebase Researcher",
+            taskDescription: "Find MathLib implementation",
+            allowedTools: ["codebase_search", "file_read"],
+            contextSummary: "Focus on arithmetic utility functions",
+            workingDirectory: tempDir
+        )
+
+        XCTAssertNotNil(manager.getSubagent(byId: subagent.id))
+        XCTAssertEqual(subagent.role, "Codebase Researcher")
+        XCTAssertEqual(subagent.archetype, .codebaseResearcher)
+
+        // Wait for autonomous subagent pipeline to finish
+        let finalSummary = await subagent.waitForCompletion()
+        XCTAssertEqual(subagent.status, .completed)
+        XCTAssertFalse(finalSummary.isEmpty)
+        XCTAssertTrue(subagent.executionDurationSeconds >= 0)
+        XCTAssertGreaterThanOrEqual(subagent.transcript.count, 1)
+    }
+
+    func testSpawnSubagentSynchronousExecution() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("SubagentSyncTest_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let spawnTool = SpawnSubagentTool()
+        let result = try await spawnTool.execute(
+            arguments: [
+                "role": "Shader Optimizer",
+                "task_description": "Analyze vector alignment in compute kernel",
+                "run_in_background": false
+            ],
+            workingDirectory: tempDir,
+            maxOutputLength: 4000
+        )
+
+        XCTAssertFalse(result.isCompleted)
+        XCTAssertNotNil(result.stdout)
+        XCTAssertTrue(result.resultJSON.contains("completed"))
+        XCTAssertTrue(result.resultJSON.contains("subagent_id"))
+        XCTAssertTrue(result.stdout?.contains("Shader Optimization Analysis") == true)
+    }
+
+    func testSpawnSubagentAsynchronousBackgroundExecution() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("SubagentAsyncTest_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let spawnTool = SpawnSubagentTool()
+        let spawnResult = try await spawnTool.execute(
+            arguments: [
+                "role": "Test Runner",
+                "task_description": "Run unit test suite",
+                "run_in_background": true
+            ],
+            workingDirectory: tempDir,
+            maxOutputLength: 4000
+        )
+
+        XCTAssertFalse(spawnResult.isCompleted)
+        XCTAssertTrue(spawnResult.resultJSON.contains("running"))
+        XCTAssertTrue(spawnResult.resultJSON.contains("subagent_id"))
+
+        // Extract subagent UUID from manager
+        guard let subagent = SubagentManager.shared.allSubagents.first(where: { $0.role == "Test Runner" }) else {
+            XCTFail("Spawned subagent was not found in SubagentManager registry")
+            return
+        }
+
+        // Query status via GetSubagentStatusTool
+        let statusTool = GetSubagentStatusTool()
+        let statusResult = try await statusTool.execute(
+            arguments: ["subagent_id": subagent.id.uuidString],
+            workingDirectory: tempDir,
+            maxOutputLength: 4000
+        )
+
+        XCTAssertFalse(statusResult.isCompleted)
+        XCTAssertTrue(statusResult.resultJSON.contains(subagent.id.uuidString))
+        XCTAssertTrue(statusResult.stdout?.contains("Test Runner") == true)
+    }
+
+    func testInterAgentMessagingAndListTool() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("SubagentMessageTest_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let subagent = SubagentManager.shared.spawn(
+            role: "Documentation Writer",
+            taskDescription: "Draft architecture guide",
+            allowedTools: ["file_read"],
+            contextSummary: nil,
+            workingDirectory: tempDir
+        )
+
+        // Send directive message to subagent
+        let msgTool = SendSubagentMessageTool()
+        let msgResult = try await msgTool.execute(
+            arguments: [
+                "subagent_id": subagent.id.uuidString,
+                "message": "Include Mermaid diagrams for component interactions"
+            ],
+            workingDirectory: tempDir,
+            maxOutputLength: 2000
+        )
+
+        XCTAssertFalse(msgResult.isCompleted)
+        XCTAssertTrue(msgResult.resultJSON.contains("delivered"))
+        XCTAssertEqual(subagent.recordedMessages.count, 1)
+        XCTAssertEqual(subagent.recordedMessages.first?.content, "Include Mermaid diagrams for component interactions")
+
+        // Test ListSubagentsTool
+        let listTool = ListSubagentsTool()
+        let listResult = try await listTool.execute(
+            arguments: ["status_filter": "all"],
+            workingDirectory: tempDir,
+            maxOutputLength: 4000
+        )
+
+        XCTAssertFalse(listResult.isCompleted)
+        XCTAssertTrue(listResult.resultJSON.contains(subagent.id.uuidString))
+        XCTAssertTrue(listResult.stdout?.contains("Documentation Writer") == true)
+    }
 }
 
 

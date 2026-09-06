@@ -43,6 +43,7 @@ struct ChatDetailView: View {
     @State private var promptTokenCount: Int = 0
     @State private var tokenCountTask: Task<Void, Never>? = nil
     @AppStorage("dynamoe_agent_turbo_mode") private var isTurboModeEnabled: Bool = false
+    @ObservedObject private var subagentManager = SubagentManager.shared
 
     private func modelIconName(for name: String?) -> String {
         let lower = (name ?? "").lowercased()
@@ -61,115 +62,146 @@ struct ChatDetailView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Header Bar (Antigravity breadcrumb style)
-            HStack(spacing: 8) {
-                Button(action: {
-                    if let onToggleSidebar = onToggleSidebar {
-                        onToggleSidebar()
-                    } else {
-                        NSApp.keyWindow?.firstResponder?.tryToPerform(#selector(NSSplitViewController.toggleSidebar(_:)), with: nil)
-                    }
-                }) {
-                    Image(systemName: "sidebar.leading")
-                        .font(.system(size: max(11, 13 * zoomManager.zoomScale), weight: .medium))
-                        .foregroundColor(.secondary)
-                        .frame(width: max(22, 26 * zoomManager.zoomScale), height: max(22, 26 * zoomManager.zoomScale))
-                        .background(Color.secondary.opacity(0.08))
-                        .clipShape(RoundedRectangle(cornerRadius: 6))
-                }
-                .buttonStyle(.plain)
-                .help("Toggle Sidebar (⌘S)")
-
-                Text("DynaMoE")
-                    .font(.system(size: max(10, 13 * zoomManager.zoomScale), weight: .regular))
-                    .foregroundColor(.secondary)
-                
-                Text("/")
-                    .font(.system(size: max(10, 13 * zoomManager.zoomScale), weight: .regular))
-                    .foregroundColor(.secondary.opacity(0.4))
-                
-                Text(session?.title ?? "App")
-                    .font(.system(size: max(10, 13 * zoomManager.zoomScale), weight: .semibold))
-                    .foregroundColor(.primary)
-                    .lineLimit(1)
-                
-                Spacer()
-                
-                if let model = modelName {
-                    HStack(spacing: 6) {
-                        Image(systemName: modelIconName(for: model))
-                            .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .semibold))
-                            .foregroundColor(isGenerating ? (isStreamingOffDisk ? Color.orange : Color.green) : Color.purple)
-                        Text(model)
-                            .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
+        HStack(spacing: 0) {
+            VStack(spacing: 0) {
+                // Header Bar (Antigravity breadcrumb style)
+                HStack(spacing: 8) {
+                    Button(action: {
+                        if let onToggleSidebar = onToggleSidebar {
+                            onToggleSidebar()
+                        } else {
+                            NSApp.keyWindow?.firstResponder?.tryToPerform(#selector(NSSplitViewController.toggleSidebar(_:)), with: nil)
+                        }
+                    }) {
+                        Image(systemName: "sidebar.leading")
+                            .font(.system(size: max(11, 13 * zoomManager.zoomScale), weight: .medium))
                             .foregroundColor(.secondary)
-                        if isGenerating {
-                            Text("•")
+                            .frame(width: max(22, 26 * zoomManager.zoomScale), height: max(22, 26 * zoomManager.zoomScale))
+                            .background(Color.secondary.opacity(0.08))
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Toggle Sidebar (⌘S)")
+
+                    Text("DynaMoE")
+                        .font(.system(size: max(10, 13 * zoomManager.zoomScale), weight: .regular))
+                        .foregroundColor(.secondary)
+                    
+                    Text("/")
+                        .font(.system(size: max(10, 13 * zoomManager.zoomScale), weight: .regular))
+                        .foregroundColor(.secondary.opacity(0.4))
+                    
+                    Text(session?.title ?? "App")
+                        .font(.system(size: max(10, 13 * zoomManager.zoomScale), weight: .semibold))
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+                    
+                    Spacer()
+                    
+                    if let model = modelName {
+                        HStack(spacing: 6) {
+                            Image(systemName: modelIconName(for: model))
+                                .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .semibold))
+                                .foregroundColor(isGenerating ? (isStreamingOffDisk ? Color.orange : Color.green) : Color.purple)
+                            Text(model)
+                                .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
                                 .foregroundColor(.secondary)
-                            if let activePrefill = session?.messages.last?.prefillStatus {
-                                HStack(spacing: 4) {
-                                    Image(systemName: "arrow.down.circle.fill")
-                                        .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .bold))
-                                        .foregroundColor(.purple)
-                                    Text(activePrefill)
-                                        .font(.system(size: max(9, 11 * zoomManager.zoomScale), weight: .semibold, design: .monospaced))
-                                        .foregroundColor(.purple)
-                                }
-                            } else {
-                                HStack(spacing: 3) {
-                                    Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")
-                                        .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .bold))
-                                        .foregroundColor(isStreamingOffDisk ? .orange : .purple)
-                                    Text(String(format: "%.1f tok/s", generationSpeed))
-                                        .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
-                                        .fontWeight(.bold)
-                                        .foregroundColor(isStreamingOffDisk ? .orange : .purple)
-                                }
-                                if jetSpecEnabled && (jetSpecMeanTau > 1.0 || jetSpecDraftAccepted > 0) {
-                                    Text("•")
-                                        .foregroundColor(.secondary.opacity(0.6))
-                                    HStack(spacing: 3) {
-                                        Image(systemName: "bolt.badge.sparkle")
+                            if isGenerating {
+                                Text("•")
+                                    .foregroundColor(.secondary)
+                                if let activePrefill = session?.messages.last?.prefillStatus {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "arrow.down.circle.fill")
                                             .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .bold))
+                                            .foregroundColor(.purple)
+                                        Text(activePrefill)
+                                            .font(.system(size: max(9, 11 * zoomManager.zoomScale), weight: .semibold, design: .monospaced))
+                                            .foregroundColor(.purple)
+                                    }
+                                } else {
+                                    HStack(spacing: 3) {
+                                        Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")
+                                            .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .bold))
+                                            .foregroundColor(isStreamingOffDisk ? .orange : .purple)
+                                        Text(String(format: "%.1f tok/s", generationSpeed))
+                                            .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
+                                            .fontWeight(.bold)
+                                            .foregroundColor(isStreamingOffDisk ? .orange : .purple)
+                                    }
+                                    if jetSpecEnabled && (jetSpecMeanTau > 1.0 || jetSpecDraftAccepted > 0) {
+                                        Text("•")
+                                            .foregroundColor(.secondary.opacity(0.6))
+                                        HStack(spacing: 3) {
+                                            Image(systemName: "bolt.badge.sparkle")
+                                                .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .bold))
                                             .foregroundColor(.cyan)
-                                        Text(String(format: "🚀 JetSpec τ=%.1f", jetSpecMeanTau))
-                                            .font(.system(size: max(9, 11 * zoomManager.zoomScale), weight: .bold, design: .monospaced))
-                                            .foregroundColor(.cyan)
+                                            Text(String(format: "🚀 JetSpec τ=%.1f", jetSpecMeanTau))
+                                                .font(.system(size: max(9, 11 * zoomManager.zoomScale), weight: .bold, design: .monospaced))
+                                                .foregroundColor(.cyan)
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    .background(Color.secondary.opacity(0.06))
-                    .cornerRadius(8)
-                }
-                
-                if isGenerating {
-                    Button(action: onStopGeneration) {
-                        HStack(spacing: 4) {
-                            Image(systemName: "stop.fill")
-                                .font(.system(size: max(8, 10 * zoomManager.zoomScale)))
-                            Text("Stop")
-                                .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
-                                .fontWeight(.semibold)
-                        }
                         .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(Color.secondary.opacity(0.06))
+                        .cornerRadius(8)
+                    }
+                    
+                    if isGenerating {
+                        Button(action: onStopGeneration) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "stop.fill")
+                                    .font(.system(size: max(8, 10 * zoomManager.zoomScale)))
+                                Text("Stop")
+                                    .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
+                                    .fontWeight(.semibold)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(Color.red.opacity(0.12))
+                            .foregroundColor(.red)
+                            .cornerRadius(6)
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    // Background Subagents & Task Manager Toggle Button
+                    Button(action: {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            subagentManager.isDrawerOpen.toggle()
+                        }
+                    }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "square.2.layers.3d")
+                                .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .medium))
+                            Text("Tasks")
+                                .font(.system(size: max(9, 11 * zoomManager.zoomScale), weight: .medium))
+                            if subagentManager.activeSubagentsCount > 0 {
+                                Text("\(subagentManager.activeSubagentsCount)")
+                                    .font(.system(size: max(8, 9 * zoomManager.zoomScale), weight: .bold))
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1)
+                                    .background(Color.blue)
+                                    .foregroundColor(.white)
+                                    .clipShape(Capsule())
+                            }
+                        }
+                        .padding(.horizontal, 8)
                         .padding(.vertical, 5)
-                        .background(Color.red.opacity(0.12))
-                        .foregroundColor(.red)
+                        .background(subagentManager.isDrawerOpen ? Color.purple.opacity(0.15) : Color.secondary.opacity(0.08))
+                        .foregroundColor(subagentManager.isDrawerOpen ? .purple : .secondary)
                         .cornerRadius(6)
                     }
                     .buttonStyle(.plain)
+                    .help("Toggle Background Task Manager Drawer (⌘D)")
                 }
-            }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 12)
-            .background(Color(NSColor.windowBackgroundColor))
-            
-            Divider()
+                .padding(.horizontal, 24)
+                .padding(.vertical, 12)
+                .background(Color(NSColor.windowBackgroundColor))
+                
+                Divider()
 
             // Main Message Content or Empty State (Centered & Constrained to Max Width for Readability)
             ScrollViewReader { proxy in
@@ -738,6 +770,18 @@ struct ChatDetailView: View {
                 .frame(maxWidth: .infinity)
             }
             .background(Color(NSColor.windowBackgroundColor))
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            if subagentManager.isDrawerOpen {
+                Divider()
+                SubagentDrawerView(onClose: {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        subagentManager.isDrawerOpen = false
+                    }
+                })
+                .transition(.move(edge: .trailing))
+            }
         }
         .onAppear {
             updateTokenCount(for: promptText)
@@ -2264,6 +2308,11 @@ struct ToolCallCardView: View {
         case "grep_search": return "magnifyingglass"
         case "web_search": return "globe"
         case "web_fetch": return "arrow.down.doc.fill"
+        case "codebase_search": return "sparkle.magnifyingglass"
+        case "spawn_subagent": return "person.2.badge.gearshape"
+        case "get_subagent_status": return "clock.arrow.2.circlepath"
+        case "send_subagent_message": return "bubble.left.and.bubble.right.fill"
+        case "list_subagents": return "list.bullet.rectangle"
         case "complete": return "checkmark.seal.fill"
         default: return "wrench.and.screwdriver.fill"
         }
@@ -2289,6 +2338,16 @@ struct ToolCallCardView: View {
                 return (URL(string: url)?.host ?? url)
             }
             return call.rawArguments
+        case "codebase_search":
+            return "\"\(call.arguments["query"] ?? "")\""
+        case "spawn_subagent":
+            let role = call.arguments["role"] ?? "Subagent"
+            let task = call.arguments["task_description"] ?? ""
+            return "\(role): \(task.prefix(35))\(task.count > 35 ? "..." : "")"
+        case "get_subagent_status", "send_subagent_message":
+            return call.arguments["subagent_id"]?.prefix(8).description ?? call.rawArguments
+        case "list_subagents":
+            return "Filter: \(call.arguments["status_filter"] ?? "all")"
         case "complete":
             return call.arguments["summary"] ?? "Completed"
         default:
@@ -2412,6 +2471,27 @@ struct ToolCallCardView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(Color.secondary.opacity(0.04))
                         .cornerRadius(6)
+                    }
+
+                    if call.name == "spawn_subagent" {
+                        Button(action: {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                SubagentManager.shared.isDrawerOpen = true
+                            }
+                        }) {
+                            HStack(spacing: 5) {
+                                Image(systemName: "square.2.layers.3d")
+                                    .font(.system(size: 10, weight: .semibold))
+                                Text("Inspect Subagent in Task Manager Drawer")
+                                    .font(.system(size: 10.5, weight: .medium))
+                            }
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4)
+                            .background(Color.purple.opacity(0.12))
+                            .foregroundColor(.purple)
+                            .cornerRadius(6)
+                        }
+                        .buttonStyle(.plain)
                     }
 
                     // Stdout / Output

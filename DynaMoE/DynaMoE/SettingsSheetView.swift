@@ -1360,6 +1360,55 @@ struct SettingsSheetView: View {
             .background(Color.secondary.opacity(0.04))
             .cornerRadius(10)
 
+            // Subagent & Multi-Agent Delegation Card
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: "square.2.layers.3d")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundColor(.purple)
+                    Text("Multi-Agent Task Orchestration (spawn_subagent)")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                    Spacer()
+
+                    Button(action: {
+                        SubagentManager.shared.isDrawerOpen.toggle()
+                    }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "sidebar.trailing")
+                            Text(SubagentManager.shared.isDrawerOpen ? "Close Task Manager" : "Open Task Manager")
+                        }
+                        .font(.system(size: 11, weight: .medium))
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                Text("Enables the coordinator model to spawn dedicated child agents (e.g., Codebase Researcher, Test Runner, Shader Optimizer) with isolated context windows, inter-agent messaging, and unified summary synthesis.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+
+                HStack(spacing: 12) {
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(SubagentManager.shared.activeSubagentsCount > 0 ? Color.blue : Color.secondary.opacity(0.4))
+                            .frame(width: 8, height: 8)
+                        Text("\(SubagentManager.shared.activeSubagentsCount) Active Subagents")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(.primary)
+                    }
+
+                    Text("•")
+                        .foregroundColor(.secondary.opacity(0.5))
+
+                    Text("Total Spawned: \(SubagentManager.shared.subagents.count)")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                }
+            }
+            .padding(14)
+            .background(Color.secondary.opacity(0.04))
+            .cornerRadius(10)
+
             // Available Built-in Tools List
             VStack(alignment: .leading, spacing: 10) {
                 Text("Installed Tool Suite (\(AgentHarness.shared.availableToolDefinitions.count) Tools)")
@@ -1374,6 +1423,10 @@ struct SettingsSheetView: View {
                     toolSummaryCard(name: "find_files", icon: "folder.badge.gearshape", desc: "Discovers files and directories using glob matching and max depth.")
                     toolSummaryCard(name: "grep_search", icon: "magnifyingglass", desc: "Fast regex and literal text pattern search across files using ripgrep or grep.")
                     toolSummaryCard(name: "codebase_search", icon: "sparkle.magnifyingglass", desc: "Metal GPU vector search & BM25 hybrid retrieval across indexed codebase AST chunks.")
+                    toolSummaryCard(name: "spawn_subagent", icon: "person.2.badge.gearshape", desc: "Spawns isolated background subagents with dedicated roles (Codebase Researcher, Test Runner, Shader Optimizer).")
+                    toolSummaryCard(name: "get_subagent_status", icon: "clock.arrow.2.circlepath", desc: "Queries live execution status, transcript steps, and completed summary of a subagent.")
+                    toolSummaryCard(name: "send_subagent_message", icon: "bubble.left.and.bubble.right.fill", desc: "Sends instructions or updated directives to a running or completed child subagent.")
+                    toolSummaryCard(name: "list_subagents", icon: "list.bullet.rectangle", desc: "Lists all child subagents, their execution durations, and statuses.")
                     toolSummaryCard(name: "web_search", icon: "globe", desc: "Live web search via DuckDuckGo / Brave. Returns titles, URLs, and real-time snippets.")
                     toolSummaryCard(name: "web_fetch", icon: "arrow.down.doc.fill", desc: "Fetches and reads web pages with automatic HTML stripping and markdown extraction.")
                     toolSummaryCard(name: "complete", icon: "checkmark.seal.fill", desc: "Signals task completion with final structured summary.")

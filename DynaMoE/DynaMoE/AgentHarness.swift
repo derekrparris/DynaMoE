@@ -950,6 +950,261 @@ public final class CodebaseSearchTool: AgentTool {
     }
 }
 
+// MARK: - Subagent Delegation Tools
+
+public final class SpawnSubagentTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "spawn_subagent",
+        description: "Spawns an isolated background subagent with a dedicated role (e.g. Codebase Researcher, Test Runner, Shader Optimizer) to handle focused multi-step tasks without filling your primary context window.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "role": [
+                    "type": "string",
+                    "description": "Role title of the subagent (e.g. 'Codebase Researcher', 'Test Runner', 'Shader Optimizer', 'Documentation Writer')"
+                ],
+                "task_description": [
+                    "type": "string",
+                    "description": "Detailed, actionable instructions for what the subagent must execute and analyze."
+                ],
+                "allowed_tools": [
+                    "type": "array",
+                    "items": ["type": "string"],
+                    "description": "List of tools the subagent is permitted to call (optional). Defaults to safe read & research tools."
+                ],
+                "context_summary": [
+                    "type": "string",
+                    "description": "Optional context, constraints, or code references to seed the subagent's isolated context."
+                ],
+                "run_in_background": [
+                    "type": "boolean",
+                    "description": "Set true to execute asynchronously in the background task manager; set false (default) to wait for the subagent to complete and return its synthesized report."
+                ]
+            ]),
+            "required": AnyCodable(["role", "task_description"])
+        ]
+    )
+
+    public func execute(
+        arguments: [String: Any],
+        workingDirectory: URL?,
+        maxOutputLength: Int
+    ) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        guard let role = arguments["role"] as? String, !role.isEmpty else {
+            let err = "Missing or empty required argument: 'role'"
+            return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: err), nil, err, false)
+        }
+        guard let taskDesc = arguments["task_description"] as? String, !taskDesc.isEmpty else {
+            let err = "Missing or empty required argument: 'task_description'"
+            return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: err), nil, err, false)
+        }
+
+        var allowedTools: [String] = []
+        if let toolsArray = arguments["allowed_tools"] as? [String] {
+            allowedTools = toolsArray
+        }
+        let contextSummary = arguments["context_summary"] as? String
+        let runInBackground = (arguments["run_in_background"] as? Bool) ?? false
+
+        let subagent = SubagentManager.shared.spawn(
+            role: role,
+            taskDescription: taskDesc,
+            allowedTools: allowedTools,
+            contextSummary: contextSummary,
+            workingDirectory: workingDirectory
+        )
+
+        if runInBackground {
+            let msg = "Subagent [\(role)] spawned in background (ID: \(subagent.id.uuidString)). Monitor in Task Manager drawer or via get_subagent_status."
+            let res = AgentHarness.toolSuccessJSON(tool: "spawn_subagent", data: [
+                "subagent_id": subagent.id.uuidString,
+                "role": subagent.role,
+                "status": "running",
+                "run_in_background": true,
+                "message": msg
+            ])
+            return (res, msg, nil, false)
+        } else {
+            // Synchronous delegation: wait for subagent to finish
+            let summary = await subagent.waitForCompletion()
+            let cleanSummary = AgentHarness.truncateText(AgentHarness.sanitizeText(summary), limit: maxOutputLength)
+            let res = AgentHarness.toolSuccessJSON(tool: "spawn_subagent", data: [
+                "subagent_id": subagent.id.uuidString,
+                "role": subagent.role,
+                "status": subagent.status.rawValue,
+                "duration_seconds": subagent.executionDurationSeconds,
+                "summary": cleanSummary
+            ])
+            return (res, cleanSummary, nil, false)
+        }
+    }
+}
+
+public final class GetSubagentStatusTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "get_subagent_status",
+        description: "Checks the live execution status, step transcript, and final summary of a spawned subagent by its ID.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "subagent_id": [
+                    "type": "string",
+                    "description": "The UUID of the spawned subagent."
+                ]
+            ]),
+            "required": AnyCodable(["subagent_id"])
+        ]
+    )
+
+    public func execute(
+        arguments: [String: Any],
+        workingDirectory: URL?,
+        maxOutputLength: Int
+    ) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        guard let idStr = arguments["subagent_id"] as? String, let uuid = UUID(uuidString: idStr) else {
+            let err = "Invalid or missing 'subagent_id' UUID."
+            return (AgentHarness.toolErrorJSON(tool: "get_subagent_status", error: err), nil, err, false)
+        }
+
+        guard let subagent = SubagentManager.shared.getSubagent(byId: uuid) else {
+            let err = "Subagent with ID '\(idStr)' not found."
+            return (AgentHarness.toolErrorJSON(tool: "get_subagent_status", error: err), nil, err, false)
+        }
+
+        let stepsSummary = subagent.transcript.map {
+            "Step \($0.stepIndex): \($0.actionName) (\(String(format: "%.2f", $0.durationSeconds))s)"
+        }.joined(separator: "\n")
+
+        var readable = "Subagent: \(subagent.role) [\(subagent.status.displayName)]\n"
+        readable += "Status: \(subagent.liveStatusText)\n"
+        readable += "Steps Completed: \(subagent.transcript.count)\n"
+        if !subagent.finalSummary.isEmpty {
+            readable += "\nSummary:\n\(subagent.finalSummary)"
+        }
+
+        let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeText(readable), limit: maxOutputLength)
+        let res = AgentHarness.toolSuccessJSON(tool: "get_subagent_status", data: [
+            "subagent_id": subagent.id.uuidString,
+            "role": subagent.role,
+            "status": subagent.status.rawValue,
+            "live_status": subagent.liveStatusText,
+            "steps_count": subagent.transcript.count,
+            "steps_summary": stepsSummary,
+            "summary": subagent.finalSummary,
+            "duration_seconds": subagent.executionDurationSeconds
+        ])
+        return (res, cleanOut, nil, false)
+    }
+}
+
+public final class SendSubagentMessageTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "send_subagent_message",
+        description: "Sends a follow-up directive, instruction, or clarification to a running or completed subagent.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "subagent_id": [
+                    "type": "string",
+                    "description": "The UUID of the spawned subagent."
+                ],
+                "message": [
+                    "type": "string",
+                    "description": "The directive or message content to deliver to the subagent."
+                ]
+            ]),
+            "required": AnyCodable(["subagent_id", "message"])
+        ]
+    )
+
+    public func execute(
+        arguments: [String: Any],
+        workingDirectory: URL?,
+        maxOutputLength: Int
+    ) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        guard let idStr = arguments["subagent_id"] as? String, let uuid = UUID(uuidString: idStr) else {
+            let err = "Invalid or missing 'subagent_id' UUID."
+            return (AgentHarness.toolErrorJSON(tool: "send_subagent_message", error: err), nil, err, false)
+        }
+        guard let msg = arguments["message"] as? String, !msg.isEmpty else {
+            let err = "Missing or empty 'message'."
+            return (AgentHarness.toolErrorJSON(tool: "send_subagent_message", error: err), nil, err, false)
+        }
+
+        guard let subagent = SubagentManager.shared.getSubagent(byId: uuid) else {
+            let err = "Subagent with ID '\(idStr)' not found."
+            return (AgentHarness.toolErrorJSON(tool: "send_subagent_message", error: err), nil, err, false)
+        }
+
+        SubagentManager.shared.sendMessage(toSubagentId: uuid, sender: "coordinator", content: msg)
+        let readable = "Message delivered to subagent [\(subagent.role)] (ID: \(idStr))."
+        let res = AgentHarness.toolSuccessJSON(tool: "send_subagent_message", data: [
+            "subagent_id": idStr,
+            "role": subagent.role,
+            "delivered": true
+        ])
+        return (res, readable, nil, false)
+    }
+}
+
+public final class ListSubagentsTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "list_subagents",
+        description: "Lists all active and completed child subagents, their roles, IDs, statuses, and execution durations.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "status_filter": [
+                    "type": "string",
+                    "enum": ["all", "running", "completed", "failed"],
+                    "description": "Filter subagents: 'all' (default), 'running', 'completed', or 'failed'"
+                ]
+            ]),
+            "required": AnyCodable([])
+        ]
+    )
+
+    public func execute(
+        arguments: [String: Any],
+        workingDirectory: URL?,
+        maxOutputLength: Int
+    ) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        let filter = (arguments["status_filter"] as? String)?.lowercased() ?? "all"
+        let allSubagents = SubagentManager.shared.allSubagents
+
+        let filtered = allSubagents.filter { s in
+            if filter == "all" { return true }
+            if filter == "running" { return s.status == .running || s.status == .pending }
+            if filter == "completed" { return s.status == .completed }
+            if filter == "failed" { return s.status == .failed || s.status == .cancelled }
+            return true
+        }
+
+        var jsonList: [[String: Any]] = []
+        var readableLines: [String] = []
+
+        for s in filtered {
+            jsonList.append([
+                "id": s.id.uuidString,
+                "role": s.role,
+                "status": s.status.rawValue,
+                "duration_seconds": s.executionDurationSeconds,
+                "steps_count": s.transcript.count
+            ])
+            readableLines.append("- [\(s.role)] ID: \(s.id.uuidString) | Status: \(s.status.displayName) | Steps: \(s.transcript.count) | Duration: \(String(format: "%.2f", s.executionDurationSeconds))s")
+        }
+
+        let readable = readableLines.isEmpty ? "No subagents matching filter '\(filter)'." : readableLines.joined(separator: "\n")
+        let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeText(readable), limit: maxOutputLength)
+        let res = AgentHarness.toolSuccessJSON(tool: "list_subagents", data: [
+            "count": filtered.count,
+            "filter": filter,
+            "subagents": jsonList
+        ])
+        return (res, cleanOut, nil, false)
+    }
+}
+
 // MARK: - Agent Harness Coordinator
 
 public final class AgentHarness {
@@ -974,6 +1229,10 @@ public final class AgentHarness {
         registerTool(WebSearchTool())
         registerTool(WebFetchTool())
         registerTool(CodebaseSearchTool())
+        registerTool(SpawnSubagentTool())
+        registerTool(GetSubagentStatusTool())
+        registerTool(SendSubagentMessageTool())
+        registerTool(ListSubagentsTool())
         registerTool(CompleteTool())
         GrammarConstrainedSampler.shared.registerTools(availableToolDefinitions)
     }
