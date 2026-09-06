@@ -3018,13 +3018,15 @@ struct ContentView: View {
         generationStatusText = "⏹ Generation stopped by user."
     }
 
-    private func startAutoregressiveGeneration(customPrompt: String? = nil, sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, priorTokenCount: Int = 0) {
+    private func startAutoregressiveGeneration(customPrompt: String? = nil, sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0) {
         guard let summary = summary,
               let tokenizer = tokenizer,
               let device = MTLCreateSystemDefaultDevice(),
               let commandQueue = device.makeCommandQueue(),
               let defaultLibrary = device.makeDefaultLibrary() else {
             let err = "❌ Metal or Tokenizer not ready for text generation. Please load model and tokenizer in Settings."
+            isGeneratingText = false
+            generationTask = nil
             if let sId = sessionId, let mId = messageId {
                 if let sIdx = sessions.firstIndex(where: { $0.id == sId }),
                    let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
@@ -3045,6 +3047,8 @@ struct ContentView: View {
         }
         guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             let err = "⚠️ Please enter a prompt to generate text."
+            isGeneratingText = false
+            generationTask = nil
             gpuComputeOutput = err
             generationStatusText = err
             return
@@ -3082,8 +3086,13 @@ struct ContentView: View {
             if !cleanSystem.isEmpty && !prompt.contains("<|im_start|>system") {
                 p = "<|im_start|>system\n\(cleanSystem)<|im_end|>\n" + p
             }
-            if thinkingEnabled && p.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("<|im_start|>assistant") {
-                p = p.trimmingCharacters(in: .whitespacesAndNewlines) + "\n<think>\n"
+            let trimmed = p.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasSuffix("<|im_start|>assistant") {
+                if thinkingEnabled {
+                    p = trimmed + "\n<think>\n"
+                } else if modelSupportsThinking {
+                    p = trimmed + "\n<think>\n\n</think>\n\n"
+                }
             }
             formattedPrompt = p
         } else if !cleanSystem.isEmpty {
@@ -3097,6 +3106,8 @@ struct ContentView: View {
             promptTokenIds = try tokenizer.encode(text: formattedPrompt)
         } catch {
             let err = "❌ Tokenizer failed to encode prompt: \(error.localizedDescription)"
+            isGeneratingText = false
+            generationTask = nil
             gpuComputeOutput = err
             generationStatusText = err
             return
@@ -3104,6 +3115,8 @@ struct ContentView: View {
 
         guard !promptTokenIds.isEmpty else {
             let err = "⚠️ Prompt tokenization produced 0 tokens."
+            isGeneratingText = false
+            generationTask = nil
             gpuComputeOutput = err
             generationStatusText = err
             return
@@ -3743,21 +3756,21 @@ struct ContentView: View {
         let isFullRAM = (effMode == .residentRAM || self.memoryBudgetMode == .unrestricted)
         let budgetMode: MemoryBudgetMode = isFullRAM ? .unrestricted : self.memoryBudgetMode
 
-        let neededSeqLen = max(2048, min(32768, promptTokenIds.count + maxTokens + 256))
+        let isAgentSession = (sessionId != nil) ? (self.sessions.first(where: { $0.id == sessionId })?.isAgentToolsEnabled ?? self.defaultAgentToolsEnabled) : self.defaultAgentToolsEnabled
+        let minSeq = isAgentSession ? 8192 : 2048
+        let neededSeqLen = max(minSeq, min(32768, promptTokenIds.count + maxTokens + 512))
         let kvPrec = self.kvCachePrecision
-        if agentStep == 0 {
-            KVCacheManager.shared.reset(
-                device: device,
-                config: modelConfig,
-                actualLayers: actualLayers,
-                totalLoops: totalLoops,
-                numKvHeads: Int(numKvHeads),
-                headDim: Int(headDim),
-                maxSeqLen: neededSeqLen,
-                precision: kvPrec
-            )
-            GrammarConstrainedSampler.shared.reset()
-        }
+        KVCacheManager.shared.reset(
+            device: device,
+            config: modelConfig,
+            actualLayers: actualLayers,
+            totalLoops: totalLoops,
+            numKvHeads: Int(numKvHeads),
+            headDim: Int(headDim),
+            maxSeqLen: neededSeqLen,
+            precision: kvPrec
+        )
+        GrammarConstrainedSampler.shared.reset()
 
         isGeneratingText = true
         generatedStreamText = ""
@@ -8551,24 +8564,24 @@ struct ContentView: View {
             // Ingest prompt tokens into KV-cache and recurrent states
             let promptCount = promptTokenIds.count - 1
             if promptCount > 0 {
-                if agentStep > 0 && priorTokenCount > 0 && promptCount > priorTokenCount {
-                    // Incremental Prefill: KV cache is preserved in Unified Memory.
-                    // Only feed newly appended tool response delta tokens!
-                    let deltaTokens = Array(promptTokenIds[priorTokenCount..<promptCount])
-                    currentStep = UInt32(priorTokenCount)
-                    for dTok in deltaTokens {
-                        if Task.isCancelled { return }
-                        let ok = runTokenForward(tokenId: dTok, step: currentStep, computeLogits: false, wait: true)
-                        if !ok { return }
-                        currentStep += 1
+                let prefillTokens = Array(promptTokenIds.prefix(promptCount))
+                let ok = runLayerWisePrefill(promptTokens: prefillTokens)
+                if !ok {
+                    await MainActor.run {
+                        self.isGeneratingText = false
+                        self.generationTask = nil
+                        self.generationStatusText = Task.isCancelled ? "⏹ Generation stopped by user." : "❌ Ingestion failed during prefill."
+                        if let sId = sessionId, let mId = messageId,
+                           let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                           let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                            self.sessions[sIdx].messages[mIdx].prefillStatus = nil
+                            self.sessions[sIdx].messages[mIdx].isThinking = false
+                        }
                     }
-                } else {
-                    let prefillTokens = Array(promptTokenIds.prefix(promptCount))
-                    let ok = runLayerWisePrefill(promptTokens: prefillTokens)
-                    if !ok { return }
-                    currentStep = UInt32(promptCount)
-                    WorkingSetManager.shared.trimAfterPrefill(shardBuffers: buffers, mode: budgetMode)
+                    return
                 }
+                currentStep = UInt32(promptCount)
+                WorkingSetManager.shared.trimAfterPrefill(shardBuffers: buffers, mode: budgetMode)
 
                 // Clear prefill status once prefill completes
                 await MainActor.run {
@@ -8598,7 +8611,19 @@ struct ContentView: View {
                     jetSpecMeanTau = Double(jetSpecTotalDraftAccepted) / Double(max(jetSpecTotalDraftProposed, 1))
                 } else {
                     let ok = runTokenForward(tokenId: currentTokenId, step: currentStep, computeLogits: true, wait: true)
-                    if !ok { break }
+                    if !ok {
+                        await MainActor.run {
+                            self.isGeneratingText = false
+                            self.generationTask = nil
+                            self.generationStatusText = Task.isCancelled ? "⏹ Generation stopped by user." : "❌ Inference forward pass failed."
+                            if let sId = sessionId, let mId = messageId,
+                               let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                               let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                                self.sessions[sIdx].messages[mIdx].isThinking = false
+                            }
+                        }
+                        return
+                    }
                     currentStep += 1
 
                     // 4. Sample Next Token
@@ -8863,7 +8888,7 @@ struct ContentView: View {
             let finalThinkDuration = thinkingEndTimestamp.map { $0 - generationStartTime }
 
             // Agent Harness Multi-Step Tool Check
-            let parsedResult = isAgentEnabled ? AgentHarness.shared.parseToolCalls(from: finalDecoded) : (calls: [], brokenFragments: [])
+            let parsedResult = isAgentEnabled ? StreamingToolParser.shared.parseStreamingToolCalls(from: finalDecoded) : (calls: [], brokenFragments: [])
             let hasUncalledIntent = isAgentEnabled && parsedResult.calls.isEmpty && (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink)
             let willContinueAgent = (!parsedResult.calls.isEmpty || hasUncalledIntent)
 
@@ -9096,8 +9121,7 @@ struct ContentView: View {
                                 customPrompt: nextPrompt,
                                 sessionId: sessionId,
                                 messageId: nextAssistantMsgId,
-                                agentStep: agentStep + 1,
-                                priorTokenCount: Int(currentStep)
+                                agentStep: agentStep + 1
                             )
                         }
                         return
@@ -9149,8 +9173,7 @@ struct ContentView: View {
                             customPrompt: nextPrompt,
                             sessionId: sessionId,
                             messageId: nextAssistantMsgId,
-                            agentStep: agentStep + 1,
-                            priorTokenCount: Int(currentStep)
+                            agentStep: agentStep + 1
                         )
                     }
                     return

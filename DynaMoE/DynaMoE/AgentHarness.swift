@@ -1045,6 +1045,10 @@ public final class AgentHarness {
                     let args = (parsed["arguments"] as? [String: Any]) ?? [:]
                     let rawArgs = (parsed["arguments"] != nil) ? String(describing: parsed["arguments"]!) : ""
                     calls.append(ParsedToolCall(name: name, arguments: args, rawArguments: rawArgs, rawText: rawMatch))
+                } else if let name = parsed["tool"] as? String {
+                    let args = (parsed["parameters"] as? [String: Any]) ?? [:]
+                    let rawArgs = (parsed["parameters"] != nil) ? String(describing: parsed["parameters"]!) : ""
+                    calls.append(ParsedToolCall(name: name, arguments: args, rawArguments: rawArgs, rawText: rawMatch))
                 } else {
                     broken.append(innerText)
                 }
@@ -1100,21 +1104,29 @@ public final class AgentHarness {
             guard !fnName.isEmpty else { continue }
 
             var args: [String: Any] = [:]
-            let paramRegex = try? NSRegularExpression(pattern: "<parameter=([^>]+)>([\\s\\S]*?)(?:</parameter>|$)", options: [])
-            let nsBody = body as NSString
-            let pMatches = paramRegex?.matches(in: body, options: [], range: NSRange(location: 0, length: nsBody.length)) ?? []
+            let trimmedBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let data = trimmedBody.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                args = json
+            } else if let parsed = extractBalancedJSON(body) {
+                args = parsed
+            } else {
+                let paramRegex = try? NSRegularExpression(pattern: "<parameter=([^>]+)>([\\s\\S]*?)(?:</parameter>|$)", options: [])
+                let nsBody = body as NSString
+                let pMatches = paramRegex?.matches(in: body, options: [], range: NSRange(location: 0, length: nsBody.length)) ?? []
 
-            for pm in pMatches {
-                guard pm.numberOfRanges >= 3 else { continue }
-                let pName = nsBody.substring(with: pm.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
-                let pValStr = nsBody.substring(with: pm.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                for pm in pMatches {
+                    guard pm.numberOfRanges >= 3 else { continue }
+                    let pName = nsBody.substring(with: pm.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    let pValStr = nsBody.substring(with: pm.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
 
-                if let data = pValStr.data(using: .utf8),
-                   let jsonVal = try? JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed),
-                   (jsonVal is [String: Any] || jsonVal is [Any] || jsonVal is NSNumber) {
-                    args[pName] = jsonVal
-                } else {
-                    args[pName] = pValStr
+                    if let data = pValStr.data(using: .utf8),
+                       let jsonVal = try? JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed),
+                       (jsonVal is [String: Any] || jsonVal is [Any] || jsonVal is NSNumber) {
+                        args[pName] = jsonVal
+                    } else {
+                        args[pName] = pValStr
+                    }
                 }
             }
 

@@ -6400,6 +6400,33 @@ final class DynaMoETests: XCTestCase {
         let rejectResult = await rejectTask.value
         XCTAssertFalse(rejectResult)
     }
+
+    func testAgentMultiTurnToolCallParsingAndContinuation() {
+        // 1. Test XML function call with direct JSON payload
+        let xmlWithJson = "<tool_call><function=file_read>{\"path\": \"README.md\"}</function></tool_call>"
+        let parsedXml = AgentHarness.shared.parseToolCalls(from: xmlWithJson)
+        XCTAssertEqual(parsedXml.calls.count, 1)
+        XCTAssertEqual(parsedXml.calls.first?.name, "file_read")
+        XCTAssertEqual(parsedXml.calls.first?.arguments["path"] as? String, "README.md")
+
+        // 2. Test Hermetic JSON tool call
+        let hermeticJson = "<tool_call>{\"tool\": \"file_read\", \"parameters\": {\"path\": \"README.md\"}}</tool_call>"
+        let parsedHermetic = StreamingToolParser.shared.parseStreamingToolCalls(from: hermeticJson)
+        XCTAssertEqual(parsedHermetic.calls.count, 1)
+        XCTAssertEqual(parsedHermetic.calls.first?.name, "file_read")
+        XCTAssertEqual(parsedHermetic.calls.first?.arguments["path"] as? String, "README.md")
+
+        // 3. Test multi-turn tool response turn formatting
+        let responseTurn = AgentHarness.shared.formatToolResponseTurn(
+            responses: ["README.md contents: # DynaMoE"],
+            includeThinkSuffix: true
+        )
+        XCTAssertTrue(responseTurn.contains("<|im_start|>user"))
+        XCTAssertTrue(responseTurn.contains("<tool_response>"))
+        XCTAssertTrue(responseTurn.contains("# DynaMoE"))
+        XCTAssertTrue(responseTurn.contains("</tool_response>"))
+        XCTAssertTrue(responseTurn.contains("<|im_start|>assistant\n<think>"))
+    }
 }
 
 
