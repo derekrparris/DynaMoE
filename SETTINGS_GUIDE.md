@@ -26,7 +26,7 @@ A comprehensive, practical guide to configuring, tuning, and operating DynaMoE o
 5. [Tab 4: Agent & Tools](#5-tab-4-agent--tools)
    - [Global Agent Enablement & Sandbox Directory](#global-agent-enablement--sandbox-directory)
    - [Safety Limits (Max Output & Max Steps)](#safety-limits)
-   - [Search Integrations (DuckDuckGo & Brave Search)](#search-integrations)
+   - [Search Integrations (Headless Chrome & Brave Search)](#search-integrations)
    - [Built-In Local Tools Reference](#built-in-local-tools-reference)
 6. [Tab 5: Advanced Diagnostics](#6-tab-5-advanced-diagnostics)
    - [SafeTensors Sharded Metadata & Search](#safetensors-sharded-metadata--search)
@@ -289,7 +289,8 @@ The **Agent & Tools** tab configures DynaMoE's autonomous agent engine, tool-cal
 │  Max Agent Steps:          [15 steps ▾]                                │
 │                                                                        │
 │  Search Providers:                                                     │
-│  • DuckDuckGo: [Active - Zero Config, Privacy Preserving]               │
+│  • Headless Chrome: [Active - Local Browser Automation]                │
+│  • Custom Chrome Binary: [/Applications/Google Chrome.app/...]         │
 │  • Brave Search API Key: [••••••••••••••••••••••••••••••••]            │
 └────────────────────────────────────────────────────────────────────────┘
 ```
@@ -303,17 +304,22 @@ The **Agent & Tools** tab configures DynaMoE's autonomous agent engine, tool-cal
 - **Max Autonomous Steps**: Hard limit on sequential tool execution cycles (1 to 30 steps) per user prompt. Prevents infinite tool-calling loops.
 
 ### Search Integrations
-- **DuckDuckGo Web Search**: Built-in, privacy-preserving web search requiring **zero API keys or configuration**. Queries are dispatched directly from your device without user profiling or search history logging.
-- **Brave Search**: Optional enterprise search integration. Enter your Brave Search API key to access high-throughput structured web search results.
+- **Headless Chrome Web Search (De Facto Built-In)**: Built-in, privacy-preserving web search executed via a local sandboxed browser instance (`--headless=new --dump-dom`). Automatically executes client-side JavaScript, renders complex web pages, and extracts structured titles, URLs, and real-time snippets with **zero API keys or external tracking**. Automatically detects Google Chrome, Chromium, Brave, or Microsoft Edge, with an optional user override for custom binary paths.
+- **Brave Search API**: Optional cloud search integration. Enter your Brave Search API key to route queries through Brave's structured search API.
 
 ### Built-In Local Tools Reference
 DynaMoE equips models with the following native tools:
-1. `run_shell_command(command)`: Executes a shell command within the sandboxed working directory.
-2. `read_local_file(path, offset, limit)`: Reads text or code files line-by-line.
-3. `write_local_file(path, content)`: Creates or updates local project files.
-4. `search_local_directory(query, extension)`: Fast recursive file and content search.
-5. `web_search_duckduckgo(query)`: Private real-time internet search via DuckDuckGo.
-6. `web_search_brave(query)`: Web search via Brave Search API.
+1. `shell_run(command)`: Executes shell commands in the sandboxed directory with timeout and exit code monitoring.
+2. `file_read(path, start_line, end_line)`: Reads files line-by-line with bounds checking.
+3. `file_write(path, content)`: Creates or updates files with automated parent directory creation and compiler feedback.
+4. `file_edit(path, target_content, replacement_content)`: High-precision search-and-replace code editing with self-healing compiler feedback.
+5. `find_files(pattern, max_depth)` & `grep_search(query, regex)`: Fast glob discovery and ripgrep text/regex search.
+6. `codebase_search(query)`: Hybrid BM25 & Metal GPU vector embeddings search across AST code chunks.
+7. `spawn_subagent(role, goal)`: Spawns isolated background subagents for parallel research, test running, or optimization.
+8. `git_status`, `git_diff`, `git_commit`: Complete Git version control management.
+9. `lint_diagnostics(file_path)`: Native compiler error detection and self-healing diagnostics.
+10. `web_search(query)`: Live web search via local Headless Chrome browser automation (with Brave fallback).
+11. `web_fetch(url)`: Fetches web pages with client-side JavaScript execution via Headless Chrome DOM dumping and markdown extraction.
 
 ---
 

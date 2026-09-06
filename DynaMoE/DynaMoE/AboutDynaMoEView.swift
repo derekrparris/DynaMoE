@@ -135,15 +135,19 @@ struct AboutDynaMoEView: View {
             """
         ),
         ThirdPartyLicenseItem(
-            name: "DuckDuckGo Web Search Integration",
-            category: "Privacy Search & Information Retrieval",
-            licenseType: "Public Search API / Privacy Policy",
-            copyrightNotice: "Copyright © 2008-2026 DuckDuckGo, Inc. All rights reserved.",
-            url: "https://duckduckgo.com",
+            name: "Chromium / Headless Chrome Engine",
+            category: "Browser Automation & DOM Extraction",
+            licenseType: "BSD 3-Clause / Apache 2.0",
+            copyrightNotice: "Copyright © 2008-2026 The Chromium Authors & Google LLC. All rights reserved.",
+            url: "https://www.chromium.org",
             fullLicenseText: """
-            The DuckDuckGo web search plugin in DynaMoE provides on-demand, privacy-preserving web search directly from your device without user tracking, query profiling, or search history logging.
+            Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
 
-            DuckDuckGo is a registered trademark of DuckDuckGo, Inc. DynaMoE connects to DuckDuckGo in compliance with DuckDuckGo's public search and privacy standards.
+            1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+            2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+            3. Neither the name of Google LLC nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+            DynaMoE orchestrates local headless Chrome/Chromium instances (--headless=new --dump-dom) on macOS for real-time web search and JavaScript Single-Page Application rendering with zero cloud tracking and zero API keys.
             """
         )
     ]
@@ -378,11 +382,11 @@ struct AboutDynaMoEView: View {
                                 .font(.system(size: 11))
                                 .foregroundColor(.secondary)
 
-                            Text("• DynaMoE is an independent open-source inference engine and is not affiliated with or endorsed by Apple Inc., Hugging Face, DuckDuckGo, or the model creators.")
+                            Text("• DynaMoE is an independent open-source inference engine and is not affiliated with or endorsed by Apple Inc., Hugging Face, Google LLC, or the model creators.")
                                 .font(.system(size: 11))
                                 .foregroundColor(.secondary)
 
-                            Text("• DuckDuckGo is a registered trademark of DuckDuckGo, Inc. DynaMoE's web search capability provides private, zero-tracking web queries via DuckDuckGo.")
+                            Text("• Google Chrome and Chromium are trademarks or registered trademarks of Google LLC. DynaMoE's web search capability executes local sandboxed headless browser instances on your Mac.")
                                 .font(.system(size: 11))
                                 .foregroundColor(.secondary)
                         }

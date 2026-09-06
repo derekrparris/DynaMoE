@@ -469,12 +469,12 @@ struct HelpAndSettingsGuideView: View {
             VStack(alignment: .leading, spacing: 8) {
                 bulletPoint("Working Directory Sandbox", "All file read/write and shell execution operations are constrained to your designated working directory to protect system security.")
                 bulletPoint("Safety Limits", "Configure 'Max Tool Output Length' (to avoid blowing context limits) and 'Max Agent Steps' (to prevent runaway execution loops).")
-                bulletPoint("DuckDuckGo Web Search", "Zero-config, privacy-preserving real-time internet search directly from your Mac without API keys or tracking.")
+                bulletPoint("Headless Chrome Web Search", "Zero-config, real-time web search powered by a local headless Chrome/Chromium instance executing on your Mac with DOM extraction and JavaScript SPA rendering.")
                 bulletPoint("Brave Search API", "Optional enterprise search integration for high-volume structured search queries.")
             }
 
             infoBox(title: "Supported Local Tools", icon: "wrench.fill") {
-                Text("• run_shell_command: Runs terminal commands in the sandbox\n• read_local_file: Reads files line-by-line\n• write_local_file: Creates or modifies code files\n• search_local_directory: Fast recursive search\n• web_search_duckduckgo: Live private web search\n• web_search_brave: Search via Brave API")
+                Text("• shell_run: Runs terminal commands in the sandbox\n• file_read: Reads files line-by-line\n• file_write: Creates or modifies code files\n• file_edit: Precise anchor-based search-and-replace\n• find_files / grep_search: File discovery & regex pattern matching\n• codebase_search: GPU vector & BM25 hybrid semantic search\n• spawn_subagent / list_subagents: Background multi-agent swarm orchestration\n• git_status / git_diff / git_commit: Full Git version control workflow\n• lint_diagnostics: Native compiler self-healing checks\n• web_search: Live web search via Headless Chrome / Brave\n• web_fetch: Fetches and cleans web pages with DOM rendering")
                     .font(.system(size: 12, design: .monospaced))
                     .lineSpacing(3)
             }

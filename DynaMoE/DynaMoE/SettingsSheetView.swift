@@ -43,6 +43,7 @@ struct SettingsSheetView: View {
     @AppStorage("dynamoe_max_tool_output_length") private var maxToolOutputLength: Int = 4000
     @AppStorage("dynamoe_max_agent_steps") private var maxAgentSteps: Int = 15
     @AppStorage("dynamoe_brave_search_api_key") private var braveApiKey: String = ""
+    @AppStorage("dynamoe_chrome_binary_path") private var customChromeBinaryPath: String = ""
     @AppStorage("dynamoe_jetspec_enabled") private var jetSpecEnabled: Bool = false
     @AppStorage("dynamoe_jetspec_depth") private var jetSpecMaxDepth: Int = 3
     @AppStorage("dynamoe_jetspec_branching") private var jetSpecBranchingFactor: Int = 2
@@ -1251,24 +1252,67 @@ struct SettingsSheetView: View {
                         .font(.subheadline)
                         .fontWeight(.semibold)
                     Spacer()
-                    Text(braveApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "DuckDuckGo (Free & Built-in)" : "Brave Search API")
+                    let isChromeAvailable = HeadlessChromeSearchEngine.shared.resolveBinaryPath() != nil
+                    let activeEngineName: String = {
+                        if !braveApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            return "Brave Search API"
+                        } else if isChromeAvailable {
+                            return "Headless Chrome (Active Local Engine)"
+                        } else {
+                            return "Chrome Not Detected"
+                        }
+                    }()
+                    Text(activeEngineName)
                         .font(.caption)
                         .fontWeight(.medium)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 3)
-                        .background(braveApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.green.opacity(0.12) : Color.orange.opacity(0.12))
-                        .foregroundColor(braveApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .green : .orange)
+                        .background(!braveApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? Color.orange.opacity(0.12) : (isChromeAvailable ? Color.green.opacity(0.12) : Color.red.opacity(0.12)))
+                        .foregroundColor(!braveApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .orange : (isChromeAvailable ? .green : .red))
                         .cornerRadius(6)
                 }
 
+                if let detectedPath = HeadlessChromeSearchEngine.shared.resolveBinaryPath() {
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                            .font(.system(size: 11))
+                        Text("Detected browser: \(detectedPath)")
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                } else {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.orange)
+                            .font(.system(size: 11))
+                        Text("Chrome, Chromium, Brave, or Edge not found in standard paths. Specify custom binary below.")
+                            .font(.system(size: 10.5))
+                            .foregroundColor(.orange)
+                    }
+                }
+
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Brave Search API Key (Optional)")
+                    Text("Custom Chrome / Chromium Binary Path (Optional)")
+                        .font(.system(size: 12, weight: .medium))
+                    TextField("Default: /Applications/Google Chrome.app/Contents/MacOS/Google Chrome", text: $customChromeBinaryPath)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 11, design: .monospaced))
+                    Text("Local Headless Chrome executes with modern sandboxing (--headless=new --dump-dom) for live web search and JavaScript Single-Page App rendering with zero API keys.")
+                        .font(.system(size: 10.5))
+                        .foregroundColor(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Brave Search API Key (Optional Override)")
                         .font(.system(size: 12, weight: .medium))
                     SecureField("Paste Brave Search API token (e.g. BSA...)", text: $braveApiKey)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(size: 11, design: .monospaced))
 
-                    Text("DuckDuckGo HTML search is active by default with zero configuration or API keys needed. You can optionally paste a Brave Search API key for dedicated high-speed JSON queries.")
+                    Text("Optionally provide a Brave Search API key if you prefer remote JSON queries over local headless browser execution.")
                         .font(.system(size: 10.5))
                         .foregroundColor(.secondary)
                 }
@@ -1460,14 +1504,6 @@ struct SettingsSheetView: View {
                         .font(.subheadline)
                         .fontWeight(.semibold)
                     Spacer()
-
-                    Text("Option 4")
-                        .font(.system(size: 10, weight: .bold))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.purple.opacity(0.15))
-                        .foregroundColor(.purple)
-                        .cornerRadius(4)
                 }
 
                 Text("Validates real-world speedups from KV-cache prefix pinning, measures exact tokens/sec across multi-step developer tool turns, and exercises Turbo Mode compiler self-healing.")
@@ -1597,7 +1633,7 @@ struct SettingsSheetView: View {
                     toolSummaryCard(name: "find_symbol_definition", icon: "character.textbox", desc: "Locates symbol definitions (class, struct, func, kernel) with exact file coordinates.")
                     toolSummaryCard(name: "find_references", icon: "arrow.triangle.swap", desc: "Locates all call sites, references, and usages of a symbol across project files.")
                     toolSummaryCard(name: "lint_diagnostics", icon: "stethoscope", desc: "Runs native swiftc/metal/clang compiler checks for instant self-healing error reporting.")
-                    toolSummaryCard(name: "web_search", icon: "globe", desc: "Live web search via DuckDuckGo / Brave. Returns titles, URLs, and real-time snippets.")
+                    toolSummaryCard(name: "web_search", icon: "globe", desc: "Live web search via Headless Chrome / Brave. Returns titles, URLs, and real-time snippets.")
                     toolSummaryCard(name: "web_fetch", icon: "arrow.down.doc.fill", desc: "Fetches and reads web pages with automatic HTML stripping and markdown extraction.")
                     toolSummaryCard(name: "complete", icon: "checkmark.seal.fill", desc: "Signals task completion with final structured summary.")
                 }

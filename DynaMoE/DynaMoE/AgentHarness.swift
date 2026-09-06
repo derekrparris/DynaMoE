@@ -542,11 +542,219 @@ public final class GrepSearchTool: AgentTool {
     }
 }
 
-/// Tool 7: web_search — Performs live web search using DuckDuckGo / Brave
+/// Manages local Headless Chrome / Chromium browser execution for web search and DOM extraction
+public final class HeadlessChromeSearchEngine: @unchecked Sendable {
+    public static let shared = HeadlessChromeSearchEngine()
+
+    public static let knownBrowserPaths: [String] = [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
+    ]
+
+    /// Resolves the active browser binary path (from custom user preference, standard macOS paths, or PATH)
+    public func resolveBinaryPath() -> String? {
+        if let custom = UserDefaults.standard.string(forKey: "dynamoe_chrome_binary_path")?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !custom.isEmpty, FileManager.default.isExecutableFile(atPath: custom) {
+            return custom
+        }
+        for path in Self.knownBrowserPaths {
+            if FileManager.default.isExecutableFile(atPath: path) {
+                return path
+            }
+        }
+        // Fallback: check PATH using /usr/bin/which
+        for bin in ["google-chrome", "chromium", "chrome"] {
+            let proc = Process()
+            proc.executableURL = URL(fileURLWithPath: "/usr/bin/which")
+            proc.arguments = [bin]
+            let pipe = Pipe()
+            proc.standardOutput = pipe
+            if let _ = try? proc.run() {
+                proc.waitUntilExit()
+                if proc.terminationStatus == 0 {
+                    let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    if !out.isEmpty && FileManager.default.isExecutableFile(atPath: out) {
+                        return out
+                    }
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Executes headless Chrome to dump the rendered DOM of a URL to a temporary file, avoiding 64KB pipe buffer limits
+    public func dumpDOM(url: String, timeoutSeconds: Double = 15.0) async throws -> String {
+        guard let binaryPath = resolveBinaryPath() else {
+            throw NSError(domain: "HeadlessChromeSearchEngine", code: 404, userInfo: [
+                NSLocalizedDescriptionKey: "Headless Chrome / Chromium executable not found on macOS. Please install Google Chrome or specify the binary path in Settings."
+            ])
+        }
+
+        let tmpFile = FileManager.default.temporaryDirectory.appendingPathComponent("dynamoe_dom_\(UUID().uuidString).html")
+        FileManager.default.createFile(atPath: tmpFile.path, contents: nil)
+        let fileHandle = try FileHandle(forWritingTo: tmpFile)
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: binaryPath)
+        process.arguments = [
+            "--headless=new",
+            "--disable-gpu",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-sync",
+            "--disable-background-networking",
+            "--disable-component-update",
+            "--disable-features=Translate,OptimizationHints,MediaRouter",
+            "--disable-default-apps",
+            "--mute-audio",
+            "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "--dump-dom",
+            url
+        ]
+        process.standardOutput = fileHandle
+        process.standardError = FileHandle.nullDevice
+
+        return try await withCheckedThrowingContinuation { continuation in
+            var isResumed = false
+            let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
+            timer.schedule(deadline: .now() + timeoutSeconds)
+            timer.setEventHandler {
+                if !isResumed {
+                    isResumed = true
+                    process.terminate()
+                    try? fileHandle.close()
+                    try? FileManager.default.removeItem(at: tmpFile)
+                    continuation.resume(throwing: NSError(domain: "HeadlessChromeSearchEngine", code: 124, userInfo: [
+                        NSLocalizedDescriptionKey: "Headless Chrome timed out after \(timeoutSeconds) seconds."
+                    ]))
+                }
+            }
+            timer.resume()
+
+            process.terminationHandler = { proc in
+                timer.cancel()
+                if !isResumed {
+                    isResumed = true
+                    try? fileHandle.close()
+                    do {
+                        let html = try String(contentsOf: tmpFile, encoding: .utf8)
+                        try? FileManager.default.removeItem(at: tmpFile)
+                        continuation.resume(returning: html)
+                    } catch {
+                        try? FileManager.default.removeItem(at: tmpFile)
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+
+            do {
+                try process.run()
+            } catch {
+                timer.cancel()
+                if !isResumed {
+                    isResumed = true
+                    try? fileHandle.close()
+                    try? FileManager.default.removeItem(at: tmpFile)
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Performs live web search using Headless Chrome instance
+    public func search(query: String, maxResults: Int = 5) async throws -> [[String: String]] {
+        guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
+            return []
+        }
+        let searchURL = "https://search.yahoo.com/search?p=\(encoded)"
+        let html = try await dumpDOM(url: searchURL, timeoutSeconds: 15.0)
+
+        var results: [[String: String]] = []
+        var seenURLs = Set<String>()
+
+        // 1. First attempt: Parse structured search result items
+        let parts = html.components(separatedBy: "<li")
+        for part in parts {
+            guard part.contains("class=\"title") || part.contains("<h3") else { continue }
+
+            guard let urlRange = part.range(of: "href=\"(https?://[^\"]+)\"", options: .regularExpression) else { continue }
+            let rawUrl = String(part[urlRange])
+                .replacingOccurrences(of: "href=\"", with: "")
+                .replacingOccurrences(of: "\"", with: "")
+                .replacingOccurrences(of: "&amp;", with: "&")
+
+            guard !rawUrl.contains("yahoo.com") && !rawUrl.contains("yimg.com") && !seenURLs.contains(rawUrl) else { continue }
+
+            var title = ""
+            if let titleRange = part.range(of: "<h3[^>]*>([\\s\\S]*?)</h3>", options: .regularExpression) {
+                title = String(part[titleRange]).replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+            } else {
+                title = part.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+            }
+            title = stripHTML(title)
+            guard !title.isEmpty && title.count >= 3 else { continue }
+
+            var snippet = ""
+            if let snipRange = part.range(of: "<div class=\"compText[^\"]*\"[^>]*>([\\s\\S]*?)</div>", options: .regularExpression) {
+                snippet = stripHTML(String(part[snipRange]))
+            }
+
+            seenURLs.insert(rawUrl)
+            results.append([
+                "title": title,
+                "url": rawUrl,
+                "snippet": snippet
+            ])
+            if results.count >= maxResults { break }
+        }
+
+        // 2. Fallback: Parse organic <a> tags if list partition returned few results
+        if results.isEmpty {
+            let aPattern = #"<a\s+[^>]*href=\"(https?://[^\"]+)\"[^>]*>([\s\S]*?)</a>"#
+            if let regex = try? NSRegularExpression(pattern: aPattern) {
+                let nsHtml = html as NSString
+                let matches = regex.matches(in: html, range: NSRange(location: 0, length: nsHtml.length))
+                for m in matches {
+                    let u = nsHtml.substring(with: m.range(at: 1))
+                    let inner = nsHtml.substring(with: m.range(at: 2))
+                    let t = stripHTML(inner)
+                    if t.count > 10 && !u.contains("yahoo.com") && !u.contains("yimg.com") && !u.hasPrefix("#") && !seenURLs.contains(u) {
+                        seenURLs.insert(u)
+                        results.append([
+                            "title": t,
+                            "url": u,
+                            "snippet": ""
+                        ])
+                        if results.count >= maxResults { break }
+                    }
+                }
+            }
+        }
+
+        return results
+    }
+
+    private func stripHTML(_ input: String) -> String {
+        let withoutTags = input.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+        return withoutTags
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&#x27;", with: "'")
+            .replacingOccurrences(of: "&nbsp;", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+/// Tool 7: web_search — Performs live web search using Headless Chrome / Brave
 public final class WebSearchTool: AgentTool {
     public let definition = ToolDefinition(
         name: "web_search",
-        description: "Performs live web search for real-time information, documentation, libraries, news, and technical answers. Returns structured list of titles, URLs, and snippets.",
+        description: "Performs live web search using a local Headless Chrome browser instance for real-time information, documentation, libraries, news, and technical answers. Returns structured list of titles, URLs, and snippets.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
@@ -581,8 +789,9 @@ public final class WebSearchTool: AgentTool {
                 results = try await searchBrave(query: cleanQuery, apiKey: braveKey, maxResults: maxResults)
             }
 
+            // De facto search engine: Headless Chrome
             if results.isEmpty {
-                results = try await searchDuckDuckGo(query: cleanQuery, maxResults: maxResults)
+                results = try await HeadlessChromeSearchEngine.shared.search(query: cleanQuery, maxResults: maxResults)
             }
 
             if results.isEmpty {
@@ -616,68 +825,6 @@ public final class WebSearchTool: AgentTool {
             let err = "Web search failed: \(error.localizedDescription)"
             return (AgentHarness.toolErrorJSON(tool: "web_search", error: err), nil, err, false)
         }
-    }
-
-    private func searchDuckDuckGo(query: String, maxResults: Int) async throws -> [[String: String]] {
-        guard let encodedQuery = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let url = URL(string: "https://html.duckduckgo.com/html/?q=\(encodedQuery)") else {
-            return []
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.timeoutInterval = 10
-        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
-        request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
-        request.setValue("en-US,en;q=0.5", forHTTPHeaderField: "Accept-Language")
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200,
-              let html = String(data: data, encoding: .utf8) else {
-            return []
-        }
-
-        var results: [[String: String]] = []
-        let titlePattern = try NSRegularExpression(pattern: "<a[^>]+class=[\"']result__a[\"'][^>]+href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", options: [.dotMatchesLineSeparators])
-        let snippetPattern = try NSRegularExpression(pattern: "<a[^>]+class=[\"']result__snippet[\"'][^>]*>(.*?)</a>", options: [.dotMatchesLineSeparators])
-
-        let nsHtml = html as NSString
-        let titleMatches = titlePattern.matches(in: html, range: NSRange(location: 0, length: nsHtml.length))
-        let snippetMatches = snippetPattern.matches(in: html, range: NSRange(location: 0, length: nsHtml.length))
-
-        let count = min(titleMatches.count, snippetMatches.count, maxResults)
-        for i in 0..<count {
-            let tMatch = titleMatches[i]
-            let sMatch = snippetMatches[i]
-
-            let rawUrl = nsHtml.substring(with: tMatch.range(at: 1))
-            let rawTitle = nsHtml.substring(with: tMatch.range(at: 2))
-            let rawSnippet = nsHtml.substring(with: sMatch.range(at: 1))
-
-            var cleanUrl = rawUrl
-            if let uddgRange = cleanUrl.range(of: "uddg=") {
-                let substr = String(cleanUrl[uddgRange.upperBound...])
-                let endIdx = substr.firstIndex(of: "&") ?? substr.endIndex
-                let encoded = String(substr[..<endIdx])
-                if let decoded = encoded.removingPercentEncoding {
-                    cleanUrl = decoded
-                }
-            } else if cleanUrl.hasPrefix("//") {
-                cleanUrl = "https:" + cleanUrl
-            }
-
-            let cleanTitle = stripHTML(rawTitle)
-            let cleanSnippet = stripHTML(rawSnippet)
-
-            if !cleanUrl.isEmpty && !cleanTitle.isEmpty {
-                results.append([
-                    "title": cleanTitle,
-                    "url": cleanUrl,
-                    "snippet": cleanSnippet
-                ])
-            }
-        }
-        return results
     }
 
     private func searchBrave(query: String, apiKey: String, maxResults: Int) async throws -> [[String: String]] {
@@ -791,34 +938,48 @@ public final class WebFetchTool: AgentTool {
         let limit = customMax ?? maxOutputLength
 
         do {
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 15
-            request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
-            request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+            var html: String? = nil
+            // If headless Chrome is available, dump DOM to capture client-side JavaScript rendering
+            if HeadlessChromeSearchEngine.shared.resolveBinaryPath() != nil {
+                html = try? await HeadlessChromeSearchEngine.shared.dumpDOM(url: url.absoluteString, timeoutSeconds: 15.0)
+            }
 
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode),
-                  var html = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else {
-                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-                let err = "Failed to fetch webpage (HTTP status \(status))."
+            if html == nil {
+                var request = URLRequest(url: url)
+                request.timeoutInterval = 15
+                request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+                request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode),
+                      let fetched = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else {
+                    let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                    let err = "Failed to fetch webpage (HTTP status \(status))."
+                    return (AgentHarness.toolErrorJSON(tool: "web_fetch", error: err), nil, err, false)
+                }
+                html = fetched
+            }
+
+            guard var pageHtml = html else {
+                let err = "Failed to retrieve content for URL: \(url.absoluteString)"
                 return (AgentHarness.toolErrorJSON(tool: "web_fetch", error: err), nil, err, false)
             }
 
             var pageTitle = url.host ?? "Web Page"
-            if let titleRange = html.range(of: "<title[^>]*>(.*?)</title>", options: [.regularExpression, .caseInsensitive]) {
-                let rawTitle = String(html[titleRange])
+            if let titleRange = pageHtml.range(of: "<title[^>]*>(.*?)</title>", options: [.regularExpression, .caseInsensitive]) {
+                let rawTitle = String(pageHtml[titleRange])
                 pageTitle = stripHTML(rawTitle)
             }
 
             // Strip comments
-            html = html.replacingOccurrences(of: "(?s)<!--.*?-->", with: "", options: .regularExpression)
+            pageHtml = pageHtml.replacingOccurrences(of: "(?s)<!--.*?-->", with: "", options: .regularExpression)
             // Strip script, style, nav, header, footer, svg, noscript
-            html = html.replacingOccurrences(of: "(?s)<(script|style|nav|header|footer|svg|noscript)[^>]*>.*?</\\1>", with: "", options: .regularExpression)
+            pageHtml = pageHtml.replacingOccurrences(of: "(?s)<(script|style|nav|header|footer|svg|noscript)[^>]*>.*?</\\1>", with: "", options: .regularExpression)
             // Replace block tags with newline
-            html = html.replacingOccurrences(of: "(?i)</?(p|div|h1|h2|h3|h4|h5|h6|li|tr|article|section|blockquote|pre|code)[^>]*>", with: "\n", options: .regularExpression)
-            html = html.replacingOccurrences(of: "(?i)<br\\s*/?>", with: "\n", options: .regularExpression)
+            pageHtml = pageHtml.replacingOccurrences(of: "(?i)</?(p|div|h1|h2|h3|h4|h5|h6|li|tr|article|section|blockquote|pre|code)[^>]*>", with: "\n", options: .regularExpression)
+            pageHtml = pageHtml.replacingOccurrences(of: "(?i)<br\\s*/?>", with: "\n", options: .regularExpression)
 
-            let text = stripHTML(html)
+            let text = stripHTML(pageHtml)
             let lines = text.components(separatedBy: .newlines)
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }

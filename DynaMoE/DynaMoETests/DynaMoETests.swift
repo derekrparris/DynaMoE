@@ -7060,6 +7060,52 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
             }
         }
     }
+
+    func testHeadlessChromeBinaryResolution() {
+        let engine = HeadlessChromeSearchEngine.shared
+        let binaryPath = engine.resolveBinaryPath()
+        if FileManager.default.fileExists(atPath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome") {
+            XCTAssertNotNil(binaryPath, "Should resolve Google Chrome binary path")
+            XCTAssertTrue(FileManager.default.isExecutableFile(atPath: binaryPath!), "Resolved path must be executable")
+        }
+    }
+
+    func testHeadlessChromeWebSearchToolExecution() async throws {
+        let tool = WebSearchTool()
+        let result = try await tool.execute(
+            arguments: ["query": "Metal framework Apple Developer"],
+            workingDirectory: nil,
+            maxOutputLength: 4000
+        )
+
+        XCTAssertTrue(result.isCompleted, "Tool execution should complete")
+        XCTAssertFalse(result.resultJSON.isEmpty, "Result JSON should not be empty")
+
+        if let data = result.resultJSON.data(using: .utf8),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            XCTAssertNotNil(json["query"], "JSON should contain query")
+            let engine = json["engine"] as? String
+            XCTAssertTrue(engine == "headless_chrome" || engine == "brave_search", "Engine should be headless_chrome or brave_search")
+            if let results = json["results"] as? [[String: Any]] {
+                XCTAssertFalse(results.isEmpty, "Should find at least 1 search result")
+                if let first = results.first {
+                    XCTAssertNotNil(first["title"])
+                    XCTAssertNotNil(first["url"])
+                }
+            }
+        }
+    }
+
+    func testHeadlessChromeDOMExtractionFallback() async throws {
+        let tool = WebFetchTool()
+        let result = try await tool.execute(
+            arguments: ["url": "https://example.com"],
+            workingDirectory: nil,
+            maxOutputLength: 2000
+        )
+        XCTAssertTrue(result.isCompleted)
+        XCTAssertTrue(result.resultJSON.contains("Example") || result.resultJSON.contains("Domain"), "Should retrieve page content")
+    }
 }
 
 
