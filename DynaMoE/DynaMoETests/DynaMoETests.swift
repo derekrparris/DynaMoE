@@ -6679,6 +6679,229 @@ final class DynaMoETests: XCTestCase {
         XCTAssertTrue(listResult.resultJSON.contains(subagent.id.uuidString))
         XCTAssertTrue(listResult.stdout?.contains("Documentation Writer") == true)
     }
+
+    // MARK: - Option 3: Deep Developer Tooling (Git, Symbol Intelligence, & Self-Healing Diagnostics) Tests
+
+    func testGitStatusAndDiffTools() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("GitStatusDiffTest_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        // Initialize git repo in temp dir
+        let gitURL = URL(fileURLWithPath: "/usr/bin/git")
+        _ = try await AgentHarness.runProcess(executableURL: gitURL, arguments: ["init", "-b", "main"], currentDirectory: tempDir)
+        _ = try await AgentHarness.runProcess(executableURL: gitURL, arguments: ["config", "user.email", "agent@dynamoe.ai"], currentDirectory: tempDir)
+        _ = try await AgentHarness.runProcess(executableURL: gitURL, arguments: ["config", "user.name", "DynaMoE Agent"], currentDirectory: tempDir)
+
+        let fileA = tempDir.appendingPathComponent("App.swift")
+        try "import Foundation\nstruct App { let name = \"DynaMoE\" }\n".write(to: fileA, atomically: true, encoding: .utf8)
+
+        // 1. Verify git_status shows untracked file
+        let statusTool = GitStatusTool()
+        let statusRes = try await statusTool.execute(
+            arguments: [:],
+            workingDirectory: tempDir,
+            maxOutputLength: 4000
+        )
+        XCTAssertFalse(statusRes.isCompleted)
+        XCTAssertTrue(statusRes.resultJSON.contains("App.swift"))
+        XCTAssertTrue(statusRes.resultJSON.contains("main"))
+
+        // Stage file
+        _ = try await AgentHarness.runProcess(executableURL: gitURL, arguments: ["add", "App.swift"], currentDirectory: tempDir)
+
+        // 2. Verify git_diff shows staged diff
+        let diffTool = GitDiffTool()
+        let diffRes = try await diffTool.execute(
+            arguments: ["staged": true],
+            workingDirectory: tempDir,
+            maxOutputLength: 4000
+        )
+        XCTAssertFalse(diffRes.isCompleted)
+        XCTAssertTrue(diffRes.resultJSON.contains("App.swift") || (diffRes.stdout?.contains("App.swift") == true))
+        XCTAssertTrue(diffRes.stdout?.contains("+struct App") == true)
+    }
+
+    func testGitCommitToolAndSafetyRails() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("GitCommitSafetyTest_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let gitURL = URL(fileURLWithPath: "/usr/bin/git")
+        _ = try await AgentHarness.runProcess(executableURL: gitURL, arguments: ["init", "-b", "main"], currentDirectory: tempDir)
+        _ = try await AgentHarness.runProcess(executableURL: gitURL, arguments: ["config", "user.email", "agent@dynamoe.ai"], currentDirectory: tempDir)
+        _ = try await AgentHarness.runProcess(executableURL: gitURL, arguments: ["config", "user.name", "DynaMoE Agent"], currentDirectory: tempDir)
+
+        let fileA = tempDir.appendingPathComponent("Config.swift")
+        try "struct Config { static let version = \"1.0.0\" }".write(to: fileA, atomically: true, encoding: .utf8)
+
+        let commitTool = GitCommitTool()
+
+        // Safety Rail 1: Empty commit message must fail
+        let emptyRes = try await commitTool.execute(
+            arguments: ["message": "   "],
+            workingDirectory: tempDir,
+            maxOutputLength: 4000
+        )
+        XCTAssertTrue(emptyRes.resultJSON.contains("error"))
+        XCTAssertTrue(emptyRes.stderr?.contains("empty") == true)
+
+        // Safety Rail 2: Dangerous forbidden flag must fail
+        let flagRes = try await commitTool.execute(
+            arguments: ["message": "fix: bypass checks --no-verify"],
+            workingDirectory: tempDir,
+            maxOutputLength: 4000
+        )
+        XCTAssertTrue(flagRes.resultJSON.contains("error"))
+        XCTAssertTrue(flagRes.stderr?.contains("forbidden flag") == true)
+
+        // Safety Rail 3: Commit with no staged changes without stage_all must fail
+        let noStageRes = try await commitTool.execute(
+            arguments: ["message": "feat: initial commit", "stage_all": false],
+            workingDirectory: tempDir,
+            maxOutputLength: 4000
+        )
+        XCTAssertTrue(noStageRes.resultJSON.contains("error"))
+        XCTAssertTrue(noStageRes.stderr?.contains("No changes are staged") == true)
+
+        // Valid Commit: stage_all: true
+        let validRes = try await commitTool.execute(
+            arguments: ["message": "feat: initial commit", "stage_all": true],
+            workingDirectory: tempDir,
+            maxOutputLength: 4000
+        )
+        XCTAssertFalse(validRes.isCompleted)
+        XCTAssertTrue(validRes.resultJSON.contains("committed"))
+        XCTAssertTrue(validRes.resultJSON.contains("commit_hash"))
+        XCTAssertTrue(validRes.stdout?.contains("Committed") == true)
+    }
+
+    func testSymbolIntelligenceDefinitionAndReferences() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("SymbolIntelligenceTest_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let matrixFile = tempDir.appendingPathComponent("MatrixMath.swift")
+        try """
+        import Foundation
+
+        public struct Matrix4x4 {
+            public var values: [Float]
+            public init() { values = Array(repeating: 0.0, count: 16) }
+        }
+
+        public enum MatrixProjectionMode {
+            case orthographic
+            case perspective
+        }
+        """.write(to: matrixFile, atomically: true, encoding: .utf8)
+
+        let rendererFile = tempDir.appendingPathComponent("RenderPipeline.swift")
+        try """
+        import Foundation
+
+        final class RenderPipeline {
+            func renderFrame() {
+                let m = Matrix4x4()
+                let mode: MatrixProjectionMode = .perspective
+                print(m)
+            }
+        }
+        """.write(to: rendererFile, atomically: true, encoding: .utf8)
+
+        let metalFile = tempDir.appendingPathComponent("Shaders.metal")
+        try """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        kernel void compute_blur_kernel(device float* buffer [[buffer(0)]]) {
+            // kernel logic
+        }
+        """.write(to: metalFile, atomically: true, encoding: .utf8)
+
+        // 1. Find Definition of Swift Struct
+        let defTool = FindSymbolDefinitionTool()
+        let defRes = try await defTool.execute(
+            arguments: ["symbol_name": "Matrix4x4"],
+            workingDirectory: tempDir,
+            maxOutputLength: 4000
+        )
+        XCTAssertFalse(defRes.isCompleted)
+        XCTAssertTrue(defRes.resultJSON.contains("Matrix4x4"))
+        XCTAssertTrue(defRes.resultJSON.contains("struct"))
+        XCTAssertTrue(defRes.resultJSON.contains("MatrixMath.swift"))
+
+        // 2. Find Definition of Metal Kernel
+        let metalRes = try await defTool.execute(
+            arguments: ["symbol_name": "compute_blur_kernel"],
+            workingDirectory: tempDir,
+            maxOutputLength: 4000
+        )
+        XCTAssertFalse(metalRes.isCompleted)
+        XCTAssertTrue(metalRes.resultJSON.contains("compute_blur_kernel"))
+        XCTAssertTrue(metalRes.resultJSON.contains("kernel"))
+
+        // 3. Find References to Matrix4x4 in RenderPipeline
+        let refTool = FindReferencesTool()
+        let refRes = try await refTool.execute(
+            arguments: ["symbol_name": "Matrix4x4"],
+            workingDirectory: tempDir,
+            maxOutputLength: 4000
+        )
+        XCTAssertFalse(refRes.isCompleted)
+        XCTAssertTrue(refRes.resultJSON.contains("RenderPipeline.swift"))
+        XCTAssertTrue(refRes.stdout?.contains("let m = Matrix4x4()") == true)
+    }
+
+    func testLintDiagnosticsFeedbackLoop() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("LintFeedbackTest_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let targetFile = tempDir.appendingPathComponent("Component.swift")
+
+        // 1. Write clean file via FileWriteTool -> Diagnostics must be clean
+        let writeTool = FileWriteTool()
+        let cleanWriteRes = try await writeTool.execute(
+            arguments: [
+                "path": targetFile.path,
+                "content": "struct Component { let id: Int = 1 }\n"
+            ],
+            workingDirectory: tempDir,
+            maxOutputLength: 4000
+        )
+        XCTAssertFalse(cleanWriteRes.isCompleted)
+        XCTAssertTrue(cleanWriteRes.resultJSON.contains("written"))
+        XCTAssertFalse(cleanWriteRes.resultJSON.contains("written_with_syntax_errors"))
+
+        // 2. Edit file via FileEditTool with a syntax error -> Self-healing loop must report error!
+        let editTool = FileEditTool()
+        let syntaxErrRes = try await editTool.execute(
+            arguments: [
+                "path": targetFile.path,
+                "target_content": "let id: Int = 1",
+                "replacement_content": "let id: Int = "
+            ],
+            workingDirectory: tempDir,
+            maxOutputLength: 4000
+        )
+        XCTAssertFalse(syntaxErrRes.isCompleted)
+        XCTAssertTrue(syntaxErrRes.resultJSON.contains("syntax_errors_detected"))
+        XCTAssertTrue(syntaxErrRes.resultJSON.contains("self_healing_hint"))
+        XCTAssertTrue(syntaxErrRes.stdout?.contains("SELF-HEALING ACTION REQUIRED") == true)
+        XCTAssertTrue(syntaxErrRes.stdout?.contains("expected initial value") == true)
+
+        // 3. Test LintDiagnosticsTool directly on the file
+        let lintTool = LintDiagnosticsTool()
+        let lintRes = try await lintTool.execute(
+            arguments: ["path": targetFile.path],
+            workingDirectory: tempDir,
+            maxOutputLength: 4000
+        )
+        XCTAssertFalse(lintRes.isCompleted)
+        XCTAssertTrue(lintRes.resultJSON.contains("has_errors"))
+        XCTAssertTrue(lintRes.resultJSON.contains("expected initial value"))
+    }
 }
 
 

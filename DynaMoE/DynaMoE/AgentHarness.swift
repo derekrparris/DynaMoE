@@ -291,11 +291,29 @@ public final class FileWriteTool: AgentTool {
             try content.write(to: resolvedPath, atomically: true, encoding: .utf8)
 
             let byteCount = content.utf8.count
-            let msg = "Successfully wrote \(byteCount) bytes to \(resolvedPath.path)"
+            let report = await LintDiagnosticsEngine.checkFile(at: resolvedPath, workingDirectory: workingDirectory)
+
+            var msg = "Successfully wrote \(byteCount) bytes to \(resolvedPath.path)"
+            var status = "written"
+            if report.hasErrors {
+                status = "written_with_syntax_errors"
+                msg += "\n\n" + report.readableSummary + (report.selfHealingPrompt != nil ? "\n\n" + report.selfHealingPrompt! : "")
+            } else if report.hasWarnings {
+                status = "written_with_warnings"
+                msg += "\n\n" + report.readableSummary
+            }
+
             let res = AgentHarness.toolSuccessJSON(tool: "file_write", data: [
                 "path": resolvedPath.path,
                 "bytes_written": byteCount,
-                "status": "written"
+                "status": status,
+                "compiler_diagnostics": report.diagnostics.map { [
+                    "line": $0.line,
+                    "column": $0.column,
+                    "severity": $0.severity,
+                    "message": $0.message
+                ] },
+                "self_healing_hint": report.selfHealingPrompt ?? ""
             ])
             return (res, msg, nil, false)
         } catch {
@@ -366,11 +384,29 @@ public final class FileEditTool: AgentTool {
             let updated = existing.replacingCharacters(in: range, with: replacement)
             try updated.write(to: resolvedPath, atomically: true, encoding: .utf8)
 
-            let msg = "Successfully edited \(resolvedPath.lastPathComponent)"
+            let report = await LintDiagnosticsEngine.checkFile(at: resolvedPath, workingDirectory: workingDirectory)
+
+            var msg = "Successfully edited \(resolvedPath.lastPathComponent)"
+            var status = "success"
+            if report.hasErrors {
+                status = "syntax_errors_detected"
+                msg += "\n\n" + report.readableSummary + (report.selfHealingPrompt != nil ? "\n\n" + report.selfHealingPrompt! : "")
+            } else if report.hasWarnings {
+                status = "success_with_warnings"
+                msg += "\n\n" + report.readableSummary
+            }
+
             let res = AgentHarness.toolSuccessJSON(tool: "file_edit", data: [
                 "path": resolvedPath.path,
-                "status": "success",
-                "message": msg
+                "status": status,
+                "message": msg,
+                "compiler_diagnostics": report.diagnostics.map { [
+                    "line": $0.line,
+                    "column": $0.column,
+                    "severity": $0.severity,
+                    "message": $0.message
+                ] },
+                "self_healing_hint": report.selfHealingPrompt ?? ""
             ])
             return (res, msg, nil, false)
         } catch {
@@ -1205,6 +1241,378 @@ public final class ListSubagentsTool: AgentTool {
     }
 }
 
+// MARK: - Option 3: Deep Developer Tooling Tools
+
+/// Tool 15: git_status — Inspects repository working tree status, staged/unstaged changes, and branch tracking
+public final class GitStatusTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "git_status",
+        description: "Checks git repository status. Shows current branch, ahead/behind tracking, staged files, unstaged modifications, and untracked files.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "path": [
+                    "type": "string",
+                    "description": "Optional directory inside repository. Defaults to current workspace."
+                ]
+            ])
+        ]
+    )
+
+    public func execute(
+        arguments: [String: Any],
+        workingDirectory: URL?,
+        maxOutputLength: Int
+    ) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        let targetDir: URL
+        if let customPath = arguments["path"] as? String, !customPath.isEmpty {
+            targetDir = AgentHarness.resolvePath(customPath, workingDirectory: workingDirectory)
+        } else if let wd = workingDirectory {
+            targetDir = wd
+        } else {
+            targetDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        }
+
+        do {
+            let res = try await GitController.shared.status(workingDirectory: targetDir)
+            let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeText(res.summary), limit: maxOutputLength)
+            let json = AgentHarness.toolSuccessJSON(tool: "git_status", data: [
+                "branch": res.branch,
+                "upstream": res.upstream as Any,
+                "ahead": res.aheadCount,
+                "behind": res.behindCount,
+                "staged_count": res.stagedFiles.count,
+                "unstaged_count": res.unstagedFiles.count,
+                "untracked_count": res.untrackedFiles.count,
+                "has_changes": res.hasChanges,
+                "staged_files": res.stagedFiles.map { ["path": $0.path, "status": $0.statusCode] },
+                "unstaged_files": res.unstagedFiles.map { ["path": $0.path, "status": $0.statusCode] },
+                "untracked_files": res.untrackedFiles.map { ["path": $0.path] }
+            ])
+            return (json, cleanOut, nil, false)
+        } catch {
+            let err = error.localizedDescription
+            return (AgentHarness.toolErrorJSON(tool: "git_status", error: err), nil, err, false)
+        }
+    }
+}
+
+/// Tool 16: git_diff — Formats repository diffs for working tree, staged changes, or target branches
+public final class GitDiffTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "git_diff",
+        description: "Inspects file differences (git diff). Supports inspecting unstaged changes, staged changes, specific file paths, or diffs against a commit/branch.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "path": [
+                    "type": "string",
+                    "description": "Optional specific file or folder path to inspect."
+                ],
+                "staged": [
+                    "type": "boolean",
+                    "description": "If true, shows diff for staged changes (--staged). Default false."
+                ],
+                "target": [
+                    "type": "string",
+                    "description": "Optional commit hash or branch name to compare against (e.g. 'main', 'HEAD~1')."
+                ]
+            ])
+        ]
+    )
+
+    public func execute(
+        arguments: [String: Any],
+        workingDirectory: URL?,
+        maxOutputLength: Int
+    ) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        let baseDir = workingDirectory ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let path = arguments["path"] as? String
+        let staged = (arguments["staged"] as? Bool) ?? false
+        let target = arguments["target"] as? String
+
+        do {
+            let res = try await GitController.shared.diff(
+                workingDirectory: baseDir,
+                path: path,
+                staged: staged,
+                target: target,
+                maxLines: 500
+            )
+            let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeText(res.diff), limit: maxOutputLength)
+            let json = AgentHarness.toolSuccessJSON(tool: "git_diff", data: [
+                "target_path": res.targetPath as Any,
+                "is_staged": res.isStaged,
+                "line_count": res.lineCount,
+                "is_truncated": res.isTruncated,
+                "summary": res.summary
+            ])
+            return (json, cleanOut, nil, false)
+        } catch {
+            let err = error.localizedDescription
+            return (AgentHarness.toolErrorJSON(tool: "git_diff", error: err), nil, err, false)
+        }
+    }
+}
+
+/// Tool 17: git_commit — Stages files and creates a git commit with safety rails
+public final class GitCommitTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "git_commit",
+        description: "Creates a git commit with safety rails. Stages designated files or all tracked modifications and records commit with message.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "message": [
+                    "type": "string",
+                    "description": "Clear commit message describing the change."
+                ],
+                "stage_all": [
+                    "type": "boolean",
+                    "description": "If true, stages all changes (git add -A) before committing. Default false."
+                ],
+                "paths": [
+                    "type": "array",
+                    "items": ["type": "string"],
+                    "description": "Optional list of specific file paths to stage before committing."
+                ]
+            ]),
+            "required": AnyCodable(["message"])
+        ]
+    )
+
+    public func execute(
+        arguments: [String: Any],
+        workingDirectory: URL?,
+        maxOutputLength: Int
+    ) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        guard let message = arguments["message"] as? String, !message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            let err = "Error: missing or empty 'message' parameter in git_commit"
+            return (AgentHarness.toolErrorJSON(tool: "git_commit", error: err), nil, err, false)
+        }
+
+        let stageAll = (arguments["stage_all"] as? Bool) ?? false
+        let paths = arguments["paths"] as? [String]
+        let baseDir = workingDirectory ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+
+        do {
+            let res = try await GitController.shared.commit(
+                workingDirectory: baseDir,
+                message: message,
+                stageAll: stageAll,
+                paths: paths
+            )
+            let json = AgentHarness.toolSuccessJSON(tool: "git_commit", data: [
+                "commit_hash": res.commitHash,
+                "branch": res.branch,
+                "message": res.message,
+                "status": "committed"
+            ])
+            return (json, res.summary, nil, false)
+        } catch {
+            let err = error.localizedDescription
+            return (AgentHarness.toolErrorJSON(tool: "git_commit", error: err), nil, err, false)
+        }
+    }
+}
+
+/// Tool 18: find_symbol_definition — Locates declaration/definition of a symbol
+public final class FindSymbolDefinitionTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "find_symbol_definition",
+        description: "Locates where a symbol (class, struct, enum, protocol, func, kernel, typealias) is defined across the codebase with exact file and line coordinates.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "symbol_name": [
+                    "type": "string",
+                    "description": "Exact identifier or function name to locate definition for."
+                ],
+                "path": [
+                    "type": "string",
+                    "description": "Optional subdirectory or file to search within."
+                ],
+                "max_results": [
+                    "type": "integer",
+                    "description": "Maximum number of definition matches to return. Default 10."
+                ]
+            ]),
+            "required": AnyCodable(["symbol_name"])
+        ]
+    )
+
+    public func execute(
+        arguments: [String: Any],
+        workingDirectory: URL?,
+        maxOutputLength: Int
+    ) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        guard let symbolName = arguments["symbol_name"] as? String, !symbolName.isEmpty else {
+            let err = "Error: missing 'symbol_name' parameter in find_symbol_definition"
+            return (AgentHarness.toolErrorJSON(tool: "find_symbol_definition", error: err), nil, err, false)
+        }
+
+        let baseDir = workingDirectory ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let filterPath = arguments["path"] as? String
+        let maxResults = (arguments["max_results"] as? Int) ?? 10
+
+        let defs = await SymbolIntelligenceEngine.shared.findDefinition(
+            symbolName: symbolName,
+            inDirectory: baseDir,
+            filterPath: filterPath,
+            maxResults: maxResults
+        )
+
+        var lines: [String] = []
+        for d in defs {
+            let shortPath = d.filePath.replacingOccurrences(of: baseDir.path + "/", with: "")
+            lines.append("• [\(d.kind)] \(d.name) at \(shortPath):\(d.line):\(d.column)")
+            lines.append("  Signature: \(d.signature)")
+            lines.append("  ```\n\(d.snippet)\n  ```")
+        }
+
+        let readable = lines.isEmpty ? "No definitions found for symbol '\(symbolName)'." : lines.joined(separator: "\n")
+        let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeText(readable), limit: maxOutputLength)
+
+        let json = AgentHarness.toolSuccessJSON(tool: "find_symbol_definition", data: [
+            "symbol": symbolName,
+            "count": defs.count,
+            "definitions": defs.map { [
+                "name": $0.name,
+                "kind": $0.kind,
+                "file": $0.filePath,
+                "line": $0.line,
+                "column": $0.column,
+                "signature": $0.signature
+            ] }
+        ])
+        return (json, cleanOut, nil, false)
+    }
+}
+
+/// Tool 19: find_references — Locates all reference/call sites of a symbol across the project
+public final class FindReferencesTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "find_references",
+        description: "Finds all usages, references, and call sites of a symbol across the project.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "symbol_name": [
+                    "type": "string",
+                    "description": "Symbol name or function to find references for."
+                ],
+                "path": [
+                    "type": "string",
+                    "description": "Optional subdirectory or file to search within."
+                ],
+                "max_results": [
+                    "type": "integer",
+                    "description": "Maximum number of references to return. Default 30."
+                ]
+            ]),
+            "required": AnyCodable(["symbol_name"])
+        ]
+    )
+
+    public func execute(
+        arguments: [String: Any],
+        workingDirectory: URL?,
+        maxOutputLength: Int
+    ) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        guard let symbolName = arguments["symbol_name"] as? String, !symbolName.isEmpty else {
+            let err = "Error: missing 'symbol_name' parameter in find_references"
+            return (AgentHarness.toolErrorJSON(tool: "find_references", error: err), nil, err, false)
+        }
+
+        let baseDir = workingDirectory ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let filterPath = arguments["path"] as? String
+        let maxResults = (arguments["max_results"] as? Int) ?? 30
+
+        let refs = await SymbolIntelligenceEngine.shared.findReferences(
+            symbolName: symbolName,
+            inDirectory: baseDir,
+            filterPath: filterPath,
+            maxResults: maxResults
+        )
+
+        var lines: [String] = []
+        for r in refs {
+            let shortPath = r.filePath.replacingOccurrences(of: baseDir.path + "/", with: "")
+            let callMarker = r.isCallSite ? " [call site]" : ""
+            lines.append("• \(shortPath):\(r.line):\(r.column)\(callMarker): \(r.lineContent)")
+        }
+
+        let readable = lines.isEmpty ? "No references found for symbol '\(symbolName)'." : lines.joined(separator: "\n")
+        let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeText(readable), limit: maxOutputLength)
+
+        let json = AgentHarness.toolSuccessJSON(tool: "find_references", data: [
+            "symbol": symbolName,
+            "count": refs.count,
+            "references": refs.map { [
+                "file": $0.filePath,
+                "line": $0.line,
+                "column": $0.column,
+                "content": $0.lineContent,
+                "is_call_site": $0.isCallSite
+            ] }
+        ])
+        return (json, cleanOut, nil, false)
+    }
+}
+
+/// Tool 20: lint_diagnostics — Checks source files for syntax and compiler diagnostics
+public final class LintDiagnosticsTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "lint_diagnostics",
+        description: "Runs native compiler syntax diagnostics on a source file (.swift, .metal, .c, .cpp) to verify compilation and report errors.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "path": [
+                    "type": "string",
+                    "description": "Path to the source file to check."
+                ]
+            ]),
+            "required": AnyCodable(["path"])
+        ]
+    )
+
+    public func execute(
+        arguments: [String: Any],
+        workingDirectory: URL?,
+        maxOutputLength: Int
+    ) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        guard let rawPath = arguments["path"] as? String, !rawPath.isEmpty else {
+            let err = "Error: missing 'path' parameter in lint_diagnostics"
+            return (AgentHarness.toolErrorJSON(tool: "lint_diagnostics", error: err), nil, err, false)
+        }
+
+        let resolvedPath = AgentHarness.resolvePath(rawPath, workingDirectory: workingDirectory)
+        guard FileManager.default.fileExists(atPath: resolvedPath.path) else {
+            let err = "File not found at path: \(resolvedPath.path)"
+            return (AgentHarness.toolErrorJSON(tool: "lint_diagnostics", error: err), nil, err, false)
+        }
+
+        let report = await LintDiagnosticsEngine.checkFile(at: resolvedPath, workingDirectory: workingDirectory)
+        let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeText(report.readableSummary), limit: maxOutputLength)
+
+        let json = AgentHarness.toolSuccessJSON(tool: "lint_diagnostics", data: [
+            "path": report.filePath,
+            "has_errors": report.hasErrors,
+            "has_warnings": report.hasWarnings,
+            "diagnostics_count": report.diagnostics.count,
+            "diagnostics": report.diagnostics.map { [
+                "line": $0.line,
+                "column": $0.column,
+                "severity": $0.severity,
+                "message": $0.message
+            ] },
+            "self_healing_hint": report.selfHealingPrompt ?? ""
+        ])
+        return (json, cleanOut, nil, false)
+    }
+}
+
 // MARK: - Agent Harness Coordinator
 
 public final class AgentHarness {
@@ -1233,6 +1641,12 @@ public final class AgentHarness {
         registerTool(GetSubagentStatusTool())
         registerTool(SendSubagentMessageTool())
         registerTool(ListSubagentsTool())
+        registerTool(GitStatusTool())
+        registerTool(GitDiffTool())
+        registerTool(GitCommitTool())
+        registerTool(FindSymbolDefinitionTool())
+        registerTool(FindReferencesTool())
+        registerTool(LintDiagnosticsTool())
         registerTool(CompleteTool())
         GrammarConstrainedSampler.shared.registerTools(availableToolDefinitions)
     }
@@ -1243,7 +1657,7 @@ public final class AgentHarness {
     }
 
     public static func isStateChanging(toolName: String) -> Bool {
-        return toolName == "file_write" || toolName == "file_edit" || toolName == "shell_run"
+        return toolName == "file_write" || toolName == "file_edit" || toolName == "shell_run" || toolName == "git_commit"
     }
 
     public var availableToolDefinitions: [ToolDefinition] {

@@ -1409,6 +1409,45 @@ struct SettingsSheetView: View {
             .background(Color.secondary.opacity(0.04))
             .cornerRadius(10)
 
+            // Deep Developer Tooling (Native Git & SourceKit-LSP) Card
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundColor(.teal)
+                    Text("Deep Developer Tooling (Git & Code Intelligence)")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                    Spacer()
+
+                    Text("IDE Grade")
+                        .font(.system(size: 10, weight: .bold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.teal.opacity(0.15))
+                        .foregroundColor(.teal)
+                        .cornerRadius(4)
+                }
+
+                Text("Direct git version control (status, diff, commit with safety rails), AST & SourceKit code intelligence (find_symbol_definition, find_references), and automatic self-healing compiler feedback on file edits.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+
+                HStack(spacing: 12) {
+                    Label("Git Safety Rails Active", systemImage: "shield.lefthalf.filled")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundColor(.teal)
+                    Text("•")
+                        .foregroundColor(.secondary.opacity(0.5))
+                    Label("Compiler Self-Healing Loop", systemImage: "stethoscope")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundColor(.indigo)
+                }
+            }
+            .padding(14)
+            .background(Color.secondary.opacity(0.04))
+            .cornerRadius(10)
+
             // Available Built-in Tools List
             VStack(alignment: .leading, spacing: 10) {
                 Text("Installed Tool Suite (\(AgentHarness.shared.availableToolDefinitions.count) Tools)")
@@ -1418,8 +1457,8 @@ struct SettingsSheetView: View {
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
                     toolSummaryCard(name: "shell_run", icon: "terminal.fill", desc: "Runs native /bin/zsh shell commands with timeout, stdout/stderr capture, and exit codes.")
                     toolSummaryCard(name: "file_read", icon: "doc.text.fill", desc: "Reads text files with optional 1-indexed line ranges (start_line, end_line).")
-                    toolSummaryCard(name: "file_write", icon: "doc.badge.plus", desc: "Creates or overwrites files with automatic parent directory creation.")
-                    toolSummaryCard(name: "file_edit", icon: "square.and.pencil", desc: "Performs precise anchor string search-and-replace edits.")
+                    toolSummaryCard(name: "file_write", icon: "doc.badge.plus", desc: "Creates or overwrites files with automatic parent directory creation and compiler feedback.")
+                    toolSummaryCard(name: "file_edit", icon: "square.and.pencil", desc: "Performs precise anchor string search-and-replace edits with self-healing compiler diagnostics.")
                     toolSummaryCard(name: "find_files", icon: "folder.badge.gearshape", desc: "Discovers files and directories using glob matching and max depth.")
                     toolSummaryCard(name: "grep_search", icon: "magnifyingglass", desc: "Fast regex and literal text pattern search across files using ripgrep or grep.")
                     toolSummaryCard(name: "codebase_search", icon: "sparkle.magnifyingglass", desc: "Metal GPU vector search & BM25 hybrid retrieval across indexed codebase AST chunks.")
@@ -1427,6 +1466,12 @@ struct SettingsSheetView: View {
                     toolSummaryCard(name: "get_subagent_status", icon: "clock.arrow.2.circlepath", desc: "Queries live execution status, transcript steps, and completed summary of a subagent.")
                     toolSummaryCard(name: "send_subagent_message", icon: "bubble.left.and.bubble.right.fill", desc: "Sends instructions or updated directives to a running or completed child subagent.")
                     toolSummaryCard(name: "list_subagents", icon: "list.bullet.rectangle", desc: "Lists all child subagents, their execution durations, and statuses.")
+                    toolSummaryCard(name: "git_status", icon: "point.topleft.down.curvedto.point.bottomright.up", desc: "Inspects working tree status, branch tracking, staged files, and unstaged modifications.")
+                    toolSummaryCard(name: "git_diff", icon: "plus.forwardslash.minus", desc: "Inspects differences for working tree, staged changes, or across commit targets.")
+                    toolSummaryCard(name: "git_commit", icon: "arrow.triangle.branch", desc: "Stages files and commits changes with message validation and safety rails.")
+                    toolSummaryCard(name: "find_symbol_definition", icon: "character.textbox", desc: "Locates symbol definitions (class, struct, func, kernel) with exact file coordinates.")
+                    toolSummaryCard(name: "find_references", icon: "arrow.triangle.swap", desc: "Locates all call sites, references, and usages of a symbol across project files.")
+                    toolSummaryCard(name: "lint_diagnostics", icon: "stethoscope", desc: "Runs native swiftc/metal/clang compiler checks for instant self-healing error reporting.")
                     toolSummaryCard(name: "web_search", icon: "globe", desc: "Live web search via DuckDuckGo / Brave. Returns titles, URLs, and real-time snippets.")
                     toolSummaryCard(name: "web_fetch", icon: "arrow.down.doc.fill", desc: "Fetches and reads web pages with automatic HTML stripping and markdown extraction.")
                     toolSummaryCard(name: "complete", icon: "checkmark.seal.fill", desc: "Signals task completion with final structured summary.")

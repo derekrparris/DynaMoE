@@ -2313,6 +2313,12 @@ struct ToolCallCardView: View {
         case "get_subagent_status": return "clock.arrow.2.circlepath"
         case "send_subagent_message": return "bubble.left.and.bubble.right.fill"
         case "list_subagents": return "list.bullet.rectangle"
+        case "git_status": return "point.topleft.down.curvedto.point.bottomright.up"
+        case "git_diff": return "plus.forwardslash.minus"
+        case "git_commit": return "arrow.triangle.branch"
+        case "find_symbol_definition": return "character.textbox"
+        case "find_references": return "arrow.triangle.swap"
+        case "lint_diagnostics": return "stethoscope"
         case "complete": return "checkmark.seal.fill"
         default: return "wrench.and.screwdriver.fill"
         }
@@ -2322,7 +2328,7 @@ struct ToolCallCardView: View {
         switch call.name {
         case "shell_run":
             return call.arguments["command"] ?? call.rawArguments
-        case "file_read", "file_write", "file_edit":
+        case "file_read", "file_write", "file_edit", "lint_diagnostics":
             if let path = call.arguments["path"] {
                 return (path as NSString).lastPathComponent
             }
@@ -2348,11 +2354,28 @@ struct ToolCallCardView: View {
             return call.arguments["subagent_id"]?.prefix(8).description ?? call.rawArguments
         case "list_subagents":
             return "Filter: \(call.arguments["status_filter"] ?? "all")"
+        case "git_status":
+            return call.arguments["path"] ?? "working tree"
+        case "git_diff":
+            if let path = call.arguments["path"] {
+                return (path as NSString).lastPathComponent
+            }
+            return (call.arguments["staged"] == "true") ? "staged changes" : "working tree"
+        case "git_commit":
+            let msg = call.arguments["message"] ?? "Commit"
+            return "\"\(msg.prefix(30))\(msg.count > 30 ? "..." : "")\""
+        case "find_symbol_definition", "find_references":
+            return "\"\(call.arguments["symbol_name"] ?? call.rawArguments)\""
         case "complete":
             return call.arguments["summary"] ?? "Completed"
         default:
             return call.rawArguments
         }
+    }
+
+    private var hasSyntaxDiagnostics: Bool {
+        guard let out = call.output else { return false }
+        return out.contains("syntax_errors_detected") || out.contains("written_with_syntax_errors") || (call.name == "lint_diagnostics" && out.contains("\"has_errors\": true"))
     }
 
     var body: some View {
@@ -2393,14 +2416,25 @@ struct ToolCallCardView: View {
                                 .foregroundColor(.indigo)
                         }
                     case .success:
-                        HStack(spacing: 4) {
-                            Image(systemName: "checkmark.circle.fill")
-                                .font(.system(size: 11))
-                                .foregroundColor(.green)
-                            if let dur = call.executionDurationSeconds {
-                                Text(String(format: "%.2fs", dur))
-                                    .font(.system(size: 10, design: .monospaced))
-                                    .foregroundColor(.secondary)
+                        if hasSyntaxDiagnostics {
+                            HStack(spacing: 4) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.yellow)
+                                Text("Needs Healing")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .foregroundColor(.yellow)
+                            }
+                        } else {
+                            HStack(spacing: 4) {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.green)
+                                if let dur = call.executionDurationSeconds {
+                                    Text(String(format: "%.2fs", dur))
+                                        .font(.system(size: 10, design: .monospaced))
+                                        .foregroundColor(.secondary)
+                                }
                             }
                         }
                     case .error:
