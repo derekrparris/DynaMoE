@@ -133,11 +133,10 @@ public final class ShellRunTool: AgentTool {
             targetDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         }
 
-        let (exitCode, stdout, stderr) = try await AgentHarness.runProcess(
-            executableURL: URL(fileURLWithPath: "/bin/zsh"),
-            arguments: ["-c", command],
-            currentDirectory: targetDir,
-            timeoutSeconds: 120
+        let (stdout, stderr, exitCode) = try await ControlledProcessRunner.shared.runCommand(
+            command: command,
+            workingDirectory: targetDir,
+            timeoutSeconds: 120.0
         )
 
         let cleanStdout = AgentHarness.truncateText(AgentHarness.sanitizeText(stdout.trimmingCharacters(in: .whitespacesAndNewlines)), limit: maxOutputLength)
@@ -195,6 +194,25 @@ public final class FileReadTool: AgentTool {
         guard FileManager.default.fileExists(atPath: resolvedPath.path) else {
             let err = "File not found at path: \(resolvedPath.path)"
             return (AgentHarness.toolErrorJSON(tool: "file_read", error: err), nil, err, false)
+        }
+
+        if resolvedPath.pathExtension.lowercased() == "pdf" {
+            do {
+                let (title, chunks, totalChars) = try SemanticDocumentReader.shared.readDocument(at: resolvedPath, maxChunkLength: maxOutputLength)
+                let combined = chunks.map { "=== \($0.title) ===\n\($0.content)" }.joined(separator: "\n\n")
+                let truncated = AgentHarness.truncateText(AgentHarness.sanitizeText(combined), limit: maxOutputLength)
+                let res = AgentHarness.toolSuccessJSON(tool: "file_read", data: [
+                    "path": resolvedPath.path,
+                    "title": title,
+                    "total_characters": totalChars,
+                    "page_chunks": chunks.count,
+                    "content": truncated
+                ])
+                return (res, truncated, nil, false)
+            } catch {
+                let err = "Failed to parse PDF document: \(error.localizedDescription)"
+                return (AgentHarness.toolErrorJSON(tool: "file_read", error: err), nil, err, false)
+            }
         }
 
         do {
@@ -850,10 +868,16 @@ public final class AgentHarness {
         registerTool(WebSearchTool())
         registerTool(WebFetchTool())
         registerTool(CompleteTool())
+        GrammarConstrainedSampler.shared.registerTools(availableToolDefinitions)
     }
 
     public func registerTool(_ tool: AgentTool) {
         tools[tool.definition.function.name] = tool
+        GrammarConstrainedSampler.shared.registerTools(availableToolDefinitions)
+    }
+
+    public static func isStateChanging(toolName: String) -> Bool {
+        return toolName == "file_write" || toolName == "file_edit" || toolName == "shell_run"
     }
 
     public var availableToolDefinitions: [ToolDefinition] {

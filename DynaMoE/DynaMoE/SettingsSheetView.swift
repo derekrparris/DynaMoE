@@ -37,6 +37,8 @@ struct SettingsSheetView: View {
     @State private var repackError: String? = nil
     @ObservedObject var localModelManager: LocalModelManager = LocalModelManager.shared
     @AppStorage("dynamoe_agent_tools_enabled") private var isAgentToolsGloballyEnabled: Bool = true
+    @AppStorage("dynamoe_agent_turbo_mode") private var isTurboModeEnabled: Bool = false
+    @AppStorage("dynamoe_agent_grammar_masking") private var isGrammarMaskingEnabled: Bool = true
     @AppStorage("dynamoe_agent_working_directory") private var agentWorkingDirectory: String = ""
     @AppStorage("dynamoe_max_tool_output_length") private var maxToolOutputLength: Int = 4000
     @AppStorage("dynamoe_max_agent_steps") private var maxAgentSteps: Int = 15
@@ -1084,6 +1086,44 @@ struct SettingsSheetView: View {
                         Text("Enable Agent Tools by Default")
                             .font(.system(size: 13, weight: .medium))
                         Text("Equips models with shell execution, file reading/writing, and semantic search via ChatML <tool_call> tags.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+
+                Divider()
+
+                // Turbo Mode (Auto-Approve Mutations)
+                Toggle(isOn: $isTurboModeEnabled) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text("Agent Turbo Mode (Auto-Approve)")
+                                .font(.system(size: 13, weight: .medium))
+                            Image(systemName: "bolt.fill")
+                                .foregroundColor(.orange)
+                                .font(.system(size: 11))
+                        }
+                        Text("When enabled, file writes, edits, and shell commands execute automatically without individual authorization prompts (similar to Antigravity). When disabled, actions require explicit approval.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+
+                Divider()
+
+                // Grammar-Constrained Logit Masking
+                Toggle(isOn: $isGrammarMaskingEnabled) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text("Grammar-Constrained Tool Sampling")
+                                .font(.system(size: 13, weight: .medium))
+                            Image(systemName: "checkmark.shield.fill")
+                                .foregroundColor(.green)
+                                .font(.system(size: 11))
+                        }
+                        Text("Dynamically sets disallowed token logits to -Float.infinity during tool calls, mathematically preventing syntax and schema errors.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }

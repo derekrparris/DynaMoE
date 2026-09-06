@@ -2993,7 +2993,8 @@ struct ContentView: View {
         minP: Float,
         topK: Int,
         repetitionPenalty: Float,
-        presencePenalty: Float = 0.0
+        presencePenalty: Float = 0.0,
+        grammarMask: ((UnsafeMutablePointer<Float>, Int) -> Void)? = nil
     ) -> UInt32 {
         return InferenceEngine.sampleNextToken(
             logits: logits,
@@ -3004,7 +3005,8 @@ struct ContentView: View {
             minP: minP,
             topK: topK,
             repetitionPenalty: repetitionPenalty,
-            presencePenalty: presencePenalty
+            presencePenalty: presencePenalty,
+            grammarMask: grammarMask
         )
     }
 
@@ -3012,10 +3014,11 @@ struct ContentView: View {
         isGeneratingText = false
         generationTask?.cancel()
         generationTask = nil
+        ActionApprovalManager.shared.cancelAll()
         generationStatusText = "⏹ Generation stopped by user."
     }
 
-    private func startAutoregressiveGeneration(customPrompt: String? = nil, sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0) {
+    private func startAutoregressiveGeneration(customPrompt: String? = nil, sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, priorTokenCount: Int = 0) {
         guard let summary = summary,
               let tokenizer = tokenizer,
               let device = MTLCreateSystemDefaultDevice(),
@@ -3742,16 +3745,19 @@ struct ContentView: View {
 
         let neededSeqLen = max(2048, min(32768, promptTokenIds.count + maxTokens + 256))
         let kvPrec = self.kvCachePrecision
-        KVCacheManager.shared.reset(
-            device: device,
-            config: modelConfig,
-            actualLayers: actualLayers,
-            totalLoops: totalLoops,
-            numKvHeads: Int(numKvHeads),
-            headDim: Int(headDim),
-            maxSeqLen: neededSeqLen,
-            precision: kvPrec
-        )
+        if agentStep == 0 {
+            KVCacheManager.shared.reset(
+                device: device,
+                config: modelConfig,
+                actualLayers: actualLayers,
+                totalLoops: totalLoops,
+                numKvHeads: Int(numKvHeads),
+                headDim: Int(headDim),
+                maxSeqLen: neededSeqLen,
+                precision: kvPrec
+            )
+            GrammarConstrainedSampler.shared.reset()
+        }
 
         isGeneratingText = true
         generatedStreamText = ""
@@ -8537,6 +8543,7 @@ struct ContentView: View {
                 return (acceptedTokens: emittedTokens, newStep: step + UInt32(emittedTokens.count))
             }
 
+            let isAgentEnabled = (sessionId != nil) ? (self.sessions.first(where: { $0.id == sessionId })?.isAgentToolsEnabled ?? self.defaultAgentToolsEnabled) : self.defaultAgentToolsEnabled
             var generatedTokenIds: [UInt32] = []
             var accumulatedDecodedText = ""
             var lastUIUpdateTime = CFAbsoluteTimeGetCurrent()
@@ -8544,11 +8551,24 @@ struct ContentView: View {
             // Ingest prompt tokens into KV-cache and recurrent states
             let promptCount = promptTokenIds.count - 1
             if promptCount > 0 {
-                let prefillTokens = Array(promptTokenIds.prefix(promptCount))
-                let ok = runLayerWisePrefill(promptTokens: prefillTokens)
-                if !ok { return }
-                currentStep = UInt32(promptCount)
-                WorkingSetManager.shared.trimAfterPrefill(shardBuffers: buffers, mode: budgetMode)
+                if agentStep > 0 && priorTokenCount > 0 && promptCount > priorTokenCount {
+                    // Incremental Prefill: KV cache is preserved in Unified Memory.
+                    // Only feed newly appended tool response delta tokens!
+                    let deltaTokens = Array(promptTokenIds[priorTokenCount..<promptCount])
+                    currentStep = UInt32(priorTokenCount)
+                    for dTok in deltaTokens {
+                        if Task.isCancelled { return }
+                        let ok = runTokenForward(tokenId: dTok, step: currentStep, computeLogits: false, wait: true)
+                        if !ok { return }
+                        currentStep += 1
+                    }
+                } else {
+                    let prefillTokens = Array(promptTokenIds.prefix(promptCount))
+                    let ok = runLayerWisePrefill(promptTokens: prefillTokens)
+                    if !ok { return }
+                    currentStep = UInt32(promptCount)
+                    WorkingSetManager.shared.trimAfterPrefill(shardBuffers: buffers, mode: budgetMode)
+                }
 
                 // Clear prefill status once prefill completes
                 await MainActor.run {
@@ -8583,6 +8603,7 @@ struct ContentView: View {
 
                     // 4. Sample Next Token
                     let logitsPtr = logitsBuffer.contents().bindMemory(to: Float.self, capacity: Int(vocabSize))
+                    let isGrammarActive = isAgentEnabled && (UserDefaults.standard.object(forKey: "dynamoe_agent_grammar_masking") == nil ? true : UserDefaults.standard.bool(forKey: "dynamoe_agent_grammar_masking"))
                     let nextToken = sampleNextToken(
                         logits: logitsPtr,
                         vocabSize: Int(vocabSize),
@@ -8592,7 +8613,11 @@ struct ContentView: View {
                         minP: minPVal,
                         topK: topKVal,
                         repetitionPenalty: repPen,
-                        presencePenalty: presPen
+                        presencePenalty: presPen,
+                        grammarMask: isGrammarActive ? { maskLogits, maskVocab in
+                            GrammarConstrainedSampler.shared.updateState(emittedText: accumulatedDecodedText)
+                            GrammarConstrainedSampler.shared.applyLogitMask(logits: maskLogits, vocabSize: maskVocab, tokenDecoder: { try? tokenizer.decode(ids: [$0]) })
+                        } : nil
                     )
                     if tokensGenerated < 10 {
                         let tokText = (try? tokenizer.decode(ids: [nextToken])) ?? ""
@@ -8634,6 +8659,12 @@ struct ContentView: View {
                     accumulatedDecodedText += deltaText
 
                     if deltaText.contains("<|im_end|>") || deltaText.contains("<|endoftext|>") {
+                        shouldBreak = true
+                        break
+                    }
+
+                    // Pre-Execution Catching: Freeze decoding immediately when </tool_call> closes
+                    if isAgentEnabled && StreamingToolParser.shared.shouldFreezeGeneration(accumulatedText: accumulatedDecodedText, deltaText: deltaText) {
                         shouldBreak = true
                         break
                     }
@@ -8832,7 +8863,6 @@ struct ContentView: View {
             let finalThinkDuration = thinkingEndTimestamp.map { $0 - generationStartTime }
 
             // Agent Harness Multi-Step Tool Check
-            let isAgentEnabled = (sessionId != nil) ? (self.sessions.first(where: { $0.id == sessionId })?.isAgentToolsEnabled ?? self.defaultAgentToolsEnabled) : self.defaultAgentToolsEnabled
             let parsedResult = isAgentEnabled ? AgentHarness.shared.parseToolCalls(from: finalDecoded) : (calls: [], brokenFragments: [])
             let hasUncalledIntent = isAgentEnabled && parsedResult.calls.isEmpty && (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink)
             let willContinueAgent = (!parsedResult.calls.isEmpty || hasUncalledIntent)
@@ -8964,6 +8994,42 @@ struct ContentView: View {
                             self.generationStatusText = "⚙️ Executing [\(idx + 1)/\(parsedResult.calls.count)]: \(call.name)..."
                         }
 
+                        // Human-In-The-Loop (HITL) Safety & Turbo Mode
+                        let isTurbo = UserDefaults.standard.bool(forKey: "dynamoe_agent_turbo_mode")
+                        let isDestructive = AgentHarness.isStateChanging(toolName: call.name)
+
+                        if isDestructive && !isTurbo {
+                            await MainActor.run {
+                                if let sId = sessionId, let mId = messageId,
+                                   let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                                   let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }),
+                                   var currentCalls = self.sessions[sIdx].messages[mIdx].toolCalls,
+                                   let callIdx = currentCalls.firstIndex(where: { $0.id == recordId }) {
+                                    currentCalls[callIdx].status = .awaitingApproval
+                                    self.sessions[sIdx].messages[mIdx].toolCalls = currentCalls
+                                    self.generationStatusText = "🛡️ Action requires confirmation: \(call.name)"
+                                }
+                            }
+
+                            let approved = await ActionApprovalManager.shared.waitForApproval(id: recordId)
+                            if !approved {
+                                await MainActor.run {
+                                    if let sId = sessionId, let mId = messageId,
+                                       let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                                       let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }),
+                                       var currentCalls = self.sessions[sIdx].messages[mIdx].toolCalls,
+                                       let callIdx = currentCalls.firstIndex(where: { $0.id == recordId }) {
+                                        currentCalls[callIdx].status = .rejected
+                                        currentCalls[callIdx].error = "Action rejected by user."
+                                        self.sessions[sIdx].messages[mIdx].toolCalls = currentCalls
+                                    }
+                                }
+                                let rejectJSON = AgentHarness.toolErrorJSON(tool: call.name, error: "Action rejected by user.")
+                                toolResponses.append(rejectJSON)
+                                continue
+                            }
+                        }
+
                         let execResult = await AgentHarness.shared.executeTool(
                             call: call,
                             workingDirectory: baseWdURL,
@@ -9030,7 +9096,8 @@ struct ContentView: View {
                                 customPrompt: nextPrompt,
                                 sessionId: sessionId,
                                 messageId: nextAssistantMsgId,
-                                agentStep: agentStep + 1
+                                agentStep: agentStep + 1,
+                                priorTokenCount: Int(currentStep)
                             )
                         }
                         return
@@ -9082,7 +9149,8 @@ struct ContentView: View {
                             customPrompt: nextPrompt,
                             sessionId: sessionId,
                             messageId: nextAssistantMsgId,
-                            agentStep: agentStep + 1
+                            agentStep: agentStep + 1,
+                            priorTokenCount: Int(currentStep)
                         )
                     }
                     return

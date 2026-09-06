@@ -1041,7 +1041,8 @@ extension InferenceEngine {
         minP: Float,
         topK: Int,
         repetitionPenalty: Float,
-        presencePenalty: Float = 0.0
+        presencePenalty: Float = 0.0,
+        grammarMask: ((UnsafeMutablePointer<Float>, Int) -> Void)? = nil
     ) -> UInt32 {
         // 1. Direct repetition and presence penalties to recent context tokens (no Set lookup across 166k items)
         let recent = contextTokens.suffix(256)
@@ -1070,6 +1071,11 @@ extension InferenceEngine {
             for (v, orig) in origVals {
                 logits[v] = orig
             }
+        }
+
+        // Apply dynamic grammar/schema constraint mask if active
+        if let maskFn = grammarMask {
+            maskFn(logits, vocabSize)
         }
 
         // Hardware-Vectorized Greedy Fast Path (temperature <= 0.01) using vDSP_maxvi

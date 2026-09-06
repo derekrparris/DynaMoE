@@ -42,6 +42,7 @@ struct ChatDetailView: View {
     @State private var isReasoningExpanded: [UUID: Bool] = [:]
     @State private var promptTokenCount: Int = 0
     @State private var tokenCountTask: Task<Void, Never>? = nil
+    @AppStorage("dynamoe_agent_turbo_mode") private var isTurboModeEnabled: Bool = false
 
     private func modelIconName(for name: String?) -> String {
         let lower = (name ?? "").lowercased()
@@ -599,6 +600,33 @@ struct ChatDetailView: View {
                         .help(isAgentToolsEnabled ? "Agent mode is enabled: Model can run shell commands, inspect, and edit files" : "Agent mode is disabled")
                         .transition(.opacity.combined(with: .scale))
 
+                        // Turbo Mode (Auto-Approve) Toggle when tools are active
+                        if isAgentToolsEnabled {
+                            Button(action: {
+                                isTurboModeEnabled.toggle()
+                            }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: isTurboModeEnabled ? "bolt.fill" : "shield.lefthalf.filled")
+                                        .font(.system(size: max(8.5, 10 * zoomManager.zoomScale)))
+                                        .foregroundColor(isTurboModeEnabled ? .orange : .blue)
+                                    Text(isTurboModeEnabled ? "Turbo On" : "Safe Mode")
+                                        .font(.system(size: max(9.5, 11.5 * zoomManager.zoomScale), weight: .medium))
+                                        .foregroundColor(isTurboModeEnabled ? .orange : .primary)
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4.5)
+                                .background(isTurboModeEnabled ? Color.orange.opacity(0.12) : Color.blue.opacity(0.08))
+                                .cornerRadius(10)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10)
+                                        .stroke(isTurboModeEnabled ? Color.orange.opacity(0.35) : Color.blue.opacity(0.25), lineWidth: 1)
+                                )
+                            }
+                            .buttonStyle(.plain)
+                            .help(isTurboModeEnabled ? "Turbo Mode is ON: Model executes file writes and shell commands automatically without individual approval." : "Safe Mode: Requires confirmation before executing state-changing actions.")
+                            .transition(.opacity.combined(with: .scale))
+                        }
+
                         // Real-time Prompt Token Counter (to the right of Thinking toggle or Model selector)
                         if promptTokenCount > 0 {
                             HStack(spacing: 3.5) {
@@ -1027,9 +1055,9 @@ struct ChatMessageView: View {
                         }
                     }
 
-                    // Tool Calls Execution Cards (if any tool calls were issued)
+                    // Tool Calls Execution Cards & Sequential Timeline (if any tool calls were issued)
                     if let toolCalls = message.toolCalls, !toolCalls.isEmpty {
-                        ToolCallListView(toolCalls: toolCalls)
+                        ToolExecutionTimelineView(toolCalls: toolCalls)
                     }
 
                     // Main Response Text rendered via Rich Markdown Engine
@@ -2325,6 +2353,24 @@ struct ToolCallCardView: View {
                                 .font(.system(size: 10.5, weight: .medium))
                                 .foregroundColor(.red)
                         }
+                    case .awaitingApproval:
+                        HStack(spacing: 4) {
+                            Image(systemName: "shield.lefthalf.filled")
+                                .font(.system(size: 11))
+                                .foregroundColor(.orange)
+                            Text("Requires Approval")
+                                .font(.system(size: 10.5, weight: .bold))
+                                .foregroundColor(.orange)
+                        }
+                    case .rejected:
+                        HStack(spacing: 4) {
+                            Image(systemName: "xmark.circle")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                            Text("Rejected")
+                                .font(.system(size: 10.5, weight: .medium))
+                                .foregroundColor(.secondary)
+                        }
                     }
 
                     Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
@@ -2437,6 +2483,8 @@ struct ToolCallCardView: View {
         case .running: return .indigo
         case .success: return .green
         case .error: return .red
+        case .awaitingApproval: return .orange
+        case .rejected: return .secondary
         }
     }
 }

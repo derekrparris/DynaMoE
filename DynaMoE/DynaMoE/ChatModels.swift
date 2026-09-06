@@ -15,6 +15,8 @@ public enum ToolExecutionStatus: String, Codable, Equatable {
     case running
     case success
     case error
+    case awaitingApproval
+    case rejected
 }
 
 public struct ToolCallRecord: Identifiable, Codable, Equatable {

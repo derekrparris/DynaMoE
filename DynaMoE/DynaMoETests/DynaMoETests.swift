@@ -6274,7 +6274,134 @@ final class DynaMoETests: XCTestCase {
         }
         try? outReport.write(toFile: "/tmp/ornith_top_tokens.txt", atomically: true, encoding: .utf8)
     }
+
+    // MARK: - Native Tool Harness Unit Tests
+
+    func testTriePrefixMatching() {
+        let root = TokenTrieNode()
+        root.insert(word: "file_read", tokenId: 101)
+        root.insert(word: "file_write", tokenId: 102)
+        root.insert(word: "shell_run", tokenId: 103)
+
+        XCTAssertTrue(root.findNode(prefix: "file_") != nil)
+        XCTAssertTrue(root.findNode(prefix: "file_read")?.isTerminal == true)
+        XCTAssertTrue(root.findNode(prefix: "file_read")?.terminalTokenIds.contains(101) == true)
+        XCTAssertTrue(root.findNode(prefix: "invalid_tool") == nil)
+    }
+
+    func testStreamingToolParserPreExecutionCatching() {
+        let parser = StreamingToolParser.shared
+
+        // In-progress tool call: should not freeze
+        let partialText = "Let me check the file: <tool_call><function=file_read>{\"path\":\"main.swift\"}"
+        XCTAssertFalse(parser.shouldFreezeGeneration(accumulatedText: partialText, deltaText: "\"main.swift\"}"))
+
+        // Exact closing token emitted: should freeze generation instantly
+        let closedText = partialText + "</tool_call>"
+        XCTAssertTrue(parser.shouldFreezeGeneration(accumulatedText: closedText, deltaText: "</tool_call>"))
+    }
+
+    func testStreamingToolParserUniversalFormats() {
+        let parser = StreamingToolParser.shared
+
+        // Qwen XML format
+        let qwenText = "<tool_call><function=file_read>{\"path\": \"Sources/main.swift\"}</function></tool_call>"
+        let qwenCalls = parser.parseStreamingToolCalls(from: qwenText, format: .qwenXML)
+        XCTAssertEqual(qwenCalls.calls.count, 1)
+        XCTAssertEqual(qwenCalls.calls.first?.name, "file_read")
+        XCTAssertEqual(qwenCalls.calls.first?.arguments["path"] as? String, "Sources/main.swift")
+
+        // JSON Markdown format
+        let jsonText = "<tool_call>{\"tool\": \"shell_run\", \"parameters\": {\"command\": \"swift --version\"}}</tool_call>"
+        let jsonCalls = parser.parseStreamingToolCalls(from: jsonText, format: .hermeticJSON)
+        XCTAssertEqual(jsonCalls.calls.count, 1)
+        XCTAssertEqual(jsonCalls.calls.first?.name, "shell_run")
+        XCTAssertEqual(jsonCalls.calls.first?.arguments["command"] as? String, "swift --version")
+
+        // Llama 3 python tag format
+        let llamaText = "<|python_tag|>file_write(path=\"test.txt\", content=\"hello\")</|python_tag|>"
+        let llamaCalls = parser.parseStreamingToolCalls(from: llamaText, format: .llama3)
+        XCTAssertEqual(llamaCalls.calls.count, 1)
+        XCTAssertEqual(llamaCalls.calls.first?.name, "file_write")
+        XCTAssertEqual(llamaCalls.calls.first?.arguments["path"] as? String, "test.txt")
+    }
+
+    func testGrammarConstrainedStateTransitions() {
+        let sampler = GrammarConstrainedSampler.shared
+        sampler.reset()
+        sampler.registerTools(AgentHarness.shared.availableToolDefinitions)
+
+        XCTAssertEqual(sampler.currentState, .outsideToolCall)
+
+        sampler.updateState(emittedText: "I will use a tool: <tool_call><function=file")
+        if case .insideFunctionName(let name) = sampler.currentState {
+            XCTAssertEqual(name, "file")
+        } else {
+            XCTFail("Expected insideFunctionName state but got \(sampler.currentState)")
+        }
+
+        sampler.updateState(emittedText: "I will use a tool: <tool_call><function=file_read><parameter=path>test.txt")
+        if case .insideParameterValue(let tool, let param) = sampler.currentState {
+            XCTAssertEqual(tool, "file_read")
+            XCTAssertEqual(param, "path")
+        } else {
+            XCTFail("Expected insideParameterValue state but got \(sampler.currentState)")
+        }
+    }
+
+    func testControlledProcessRunner() async throws {
+        let runner = ControlledProcessRunner.shared
+        let res = try await runner.runCommand(command: "echo 'DynaMoE Harness Online'", workingDirectory: nil, timeoutSeconds: 5)
+        XCTAssertEqual(res.exitCode, 0)
+        XCTAssertTrue(res.stdout.contains("DynaMoE Harness Online"))
+    }
+
+    func testSemanticDocumentReaderChunking() {
+        let reader = SemanticDocumentReader.shared
+        let swiftCode = """
+        // Section 1
+        func testA() {
+            print("A")
+        }
+
+        // Section 2
+        func testB() {
+            print("B")
+        }
+        """
+        let tempURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("test_chunk.swift")
+        try? swiftCode.write(to: tempURL, atomically: true, encoding: .utf8)
+        let res = try? reader.readDocument(at: tempURL, maxChunkLength: 50)
+        XCTAssertTrue((res?.chunks.count ?? 0) > 0)
+        try? FileManager.default.removeItem(at: tempURL)
+    }
+
+    func testActionApprovalManagerContinuations() async {
+        let manager = ActionApprovalManager.shared
+        let testActionId = UUID()
+
+        // Test approve flow
+        let approveTask = Task {
+            await manager.waitForApproval(id: testActionId)
+        }
+        // Yield briefly so the continuation registers
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        manager.approve(id: testActionId)
+        let approveResult = await approveTask.value
+        XCTAssertTrue(approveResult)
+
+        // Test reject flow
+        let rejectActionId = UUID()
+        let rejectTask = Task {
+            await manager.waitForApproval(id: rejectActionId)
+        }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        manager.reject(id: rejectActionId)
+        let rejectResult = await rejectTask.value
+        XCTAssertFalse(rejectResult)
+    }
 }
+
 
 
 
