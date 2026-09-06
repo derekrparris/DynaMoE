@@ -97,8 +97,11 @@ final class KVCacheManager {
         numKvHeads: Int = 8,
         headDim: Int = 128,
         maxSeqLen: Int = 2048,
-        precision: KVCachePrecision = .fp16
+        precision: KVCachePrecision = .fp16,
+        preservePrefixCount: Int = 0
     ) {
+        let oldMaxSeq = self.allocatedSeqLen
+        let wasAllocated = (kCacheBuffer != nil)
         self.allocatedSeqLen = maxSeqLen
         self.activePrecision = precision
 
@@ -110,14 +113,44 @@ final class KVCacheManager {
         let elementBytes = precision.bytesPerElement
         let kvBytes = max(totalSlots, 44) * maxSeqLen * max(kvStride, 1024) * elementBytes
 
-        if kCacheBuffer == nil || allocatedKvBytes < kvBytes {
+        let oldK = self.kCacheBuffer
+        let oldV = self.vCacheBuffer
+        let needsRealloc = (kCacheBuffer == nil || allocatedKvBytes < kvBytes)
+
+        if needsRealloc {
             self.kCacheBuffer = device.makeBuffer(length: kvBytes, options: .storageModeShared)
             self.vCacheBuffer = device.makeBuffer(length: kvBytes, options: .storageModeShared)
             self.allocatedKvBytes = kvBytes
         }
 
-        if let kBuf = kCacheBuffer { memset(kBuf.contents(), 0, min(kvBytes, kBuf.length)) }
-        if let vBuf = vCacheBuffer { memset(vBuf.contents(), 0, min(kvBytes, vBuf.length)) }
+        if preservePrefixCount > 0 && wasAllocated {
+            let effectiveKvStride = max(kvStride, 1024)
+            for slot in 0..<totalSlots {
+                let newLayerByteOffset = slot * maxSeqLen * effectiveKvStride * elementBytes
+                let prefixBytes = min(preservePrefixCount, maxSeqLen) * effectiveKvStride * elementBytes
+
+                if needsRealloc, let oldKBuf = oldK, let oldVBuf = oldV, let newKBuf = kCacheBuffer, let newVBuf = vCacheBuffer {
+                    let oldLayerByteOffset = slot * oldMaxSeq * effectiveKvStride * elementBytes
+                    let copyBytes = min(prefixBytes, max(0, oldKBuf.length - oldLayerByteOffset), max(0, newKBuf.length - newLayerByteOffset))
+                    if copyBytes > 0 {
+                        memcpy(newKBuf.contents().advanced(by: newLayerByteOffset), oldKBuf.contents().advanced(by: oldLayerByteOffset), copyBytes)
+                        memcpy(newVBuf.contents().advanced(by: newLayerByteOffset), oldVBuf.contents().advanced(by: oldLayerByteOffset), copyBytes)
+                    }
+                }
+
+                let tailByteOffset = newLayerByteOffset + prefixBytes
+                let tailBytes = max(0, (maxSeqLen - preservePrefixCount) * effectiveKvStride * elementBytes)
+                if let kBuf = kCacheBuffer, tailByteOffset + tailBytes <= kBuf.length {
+                    memset(kBuf.contents().advanced(by: tailByteOffset), 0, tailBytes)
+                }
+                if let vBuf = vCacheBuffer, tailByteOffset + tailBytes <= vBuf.length {
+                    memset(vBuf.contents().advanced(by: tailByteOffset), 0, tailBytes)
+                }
+            }
+        } else {
+            if let kBuf = kCacheBuffer { memset(kBuf.contents(), 0, min(kvBytes, kBuf.length)) }
+            if let vBuf = vCacheBuffer { memset(vBuf.contents(), 0, min(kvBytes, vBuf.length)) }
+        }
 
         if precision == .fp8 {
             let scaleCount = max(totalSlots, 44) * maxSeqLen * kvHeads
@@ -126,8 +159,10 @@ final class KVCacheManager {
                 self.kScaleBuffer = device.makeBuffer(length: scaleBytes, options: .storageModeShared)
                 self.vScaleBuffer = device.makeBuffer(length: scaleBytes, options: .storageModeShared)
             }
-            if let ksBuf = kScaleBuffer { memset(ksBuf.contents(), 0, scaleBytes) }
-            if let vsBuf = vScaleBuffer { memset(vsBuf.contents(), 0, scaleBytes) }
+            if preservePrefixCount == 0 {
+                if let ksBuf = kScaleBuffer { memset(ksBuf.contents(), 0, scaleBytes) }
+                if let vsBuf = vScaleBuffer { memset(vsBuf.contents(), 0, scaleBytes) }
+            }
         }
 
         let linLayers = actualLayers
@@ -137,14 +172,18 @@ final class KVCacheManager {
         if linearStateBuffer == nil || linearStateBuffer!.length < linStateBytes {
             self.linearStateBuffer = device.makeBuffer(length: linStateBytes, options: .storageModeShared)
         }
-        if let sBuf = linearStateBuffer { memset(sBuf.contents(), 0, linStateBytes) }
+        if preservePrefixCount == 0 {
+            if let sBuf = linearStateBuffer { memset(sBuf.contents(), 0, linStateBytes) }
+        }
 
         let convChannels = max(10240, (config?.effectiveLinearNumValueHeads ?? 32) > 32 ? 10240 : 8192)
         let convBytes = max(linLayers, 48) * convChannels * 4 * MemoryLayout<Float>.stride
         if convStateBuffer == nil || convStateBuffer!.length < convBytes {
             self.convStateBuffer = device.makeBuffer(length: convBytes, options: .storageModeShared)
         }
-        if let cBuf = convStateBuffer { memset(cBuf.contents(), 0, convBytes) }
+        if preservePrefixCount == 0 {
+            if let cBuf = convStateBuffer { memset(cBuf.contents(), 0, convBytes) }
+        }
     }
 }
 
@@ -960,6 +999,7 @@ struct ContentView: View {
     }
 
     private func switchModel(to model: DiscoveredModel) {
+        PrefixCacheManager.shared.invalidate()
         loadAndBridgeToMetal(filePath: model.snapshotPath)
         activeLoadedModelPath = model.snapshotPath
         localModelManager.setLastUsedModel(id: model.id)
@@ -999,6 +1039,7 @@ struct ContentView: View {
                         }
                     },
                     onDeleteSession: { id in
+                        PrefixCacheManager.shared.invalidate(sessionId: id)
                         sessions.removeAll(where: { $0.id == id })
                         if sessions.isEmpty {
                             let defModel = localModelManager.getDefaultOrFirstModel()
@@ -3760,6 +3801,7 @@ struct ContentView: View {
         let minSeq = isAgentSession ? 8192 : 2048
         let neededSeqLen = max(minSeq, min(32768, promptTokenIds.count + maxTokens + 512))
         let kvPrec = self.kvCachePrecision
+        let prefixTokensReused = PrefixCacheManager.shared.findCommonPrefix(promptTokenIds: promptTokenIds, sessionId: sessionId)
         KVCacheManager.shared.reset(
             device: device,
             config: modelConfig,
@@ -3768,7 +3810,8 @@ struct ContentView: View {
             numKvHeads: Int(numKvHeads),
             headDim: Int(headDim),
             maxSeqLen: neededSeqLen,
-            precision: kvPrec
+            precision: kvPrec,
+            preservePrefixCount: prefixTokensReused
         )
         GrammarConstrainedSampler.shared.reset()
 
@@ -5639,7 +5682,7 @@ struct ContentView: View {
             }
 
             // Helper for Layer-Wise Streaming Prompt Prefill (O(Layers) SSD reads instead of O(Tokens * Layers))
-            func runLayerWisePrefill(promptTokens: [UInt32]) -> Bool {
+            func runLayerWisePrefill(promptTokens: [UInt32], startPos: UInt32 = 0) -> Bool {
                 let P = promptTokens.count
                 guard P > 0 else { return true }
 
@@ -5966,7 +6009,7 @@ struct ContentView: View {
                             layerEnc1.memoryBarrier(scope: .buffers)
 
                             if let ropePipe = ropePipeline {
-                                var pos: UInt32 = 0
+                                var pos: UInt32 = startPos
                                 var nQ = numHeads
                                 var nK = numKvHeads
                                 var hD = headDim
@@ -6002,11 +6045,11 @@ struct ContentView: View {
                                 let maxSeq = KVCacheManager.shared.allocatedSeqLen
                                 let prec = KVCacheManager.shared.activePrecision
                                 let layerByteOffset = slot * maxSeq * Int(kvStride) * prec.bytesPerElement
-                                var pos: UInt32 = 0
+                                var pos: UInt32 = startPos
                                 var nKv = numKvHeads
                                 var hD = headDim
                                 var nQ = numHeads
-                                var seqLen: UInt32 = 0
+                                var seqLen: UInt32 = (startPos > 0) ? (0x80000000 | startPos) : 0
 
                                 switch prec {
                                 case .fp16:
@@ -8561,24 +8604,27 @@ struct ContentView: View {
             var accumulatedDecodedText = ""
             var lastUIUpdateTime = CFAbsoluteTimeGetCurrent()
 
-            // Ingest prompt tokens into KV-cache and recurrent states
+            // Ingest prompt tokens into KV-cache and recurrent states (skipping pinned prefix)
             let promptCount = promptTokenIds.count - 1
             if promptCount > 0 {
-                let prefillTokens = Array(promptTokenIds.prefix(promptCount))
-                let ok = runLayerWisePrefill(promptTokens: prefillTokens)
-                if !ok {
-                    await MainActor.run {
-                        self.isGeneratingText = false
-                        self.generationTask = nil
-                        self.generationStatusText = Task.isCancelled ? "⏹ Generation stopped by user." : "❌ Ingestion failed during prefill."
-                        if let sId = sessionId, let mId = messageId,
-                           let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
-                           let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
-                            self.sessions[sIdx].messages[mIdx].prefillStatus = nil
-                            self.sessions[sIdx].messages[mIdx].isThinking = false
+                let startPos = min(prefixTokensReused, promptCount)
+                if startPos < promptCount {
+                    let prefillTokens = Array(promptTokenIds[startPos..<promptCount])
+                    let ok = runLayerWisePrefill(promptTokens: prefillTokens, startPos: UInt32(startPos))
+                    if !ok {
+                        await MainActor.run {
+                            self.isGeneratingText = false
+                            self.generationTask = nil
+                            self.generationStatusText = Task.isCancelled ? "⏹ Generation stopped by user." : "❌ Ingestion failed during prefill."
+                            if let sId = sessionId, let mId = messageId,
+                               let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                               let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                                self.sessions[sIdx].messages[mIdx].prefillStatus = nil
+                                self.sessions[sIdx].messages[mIdx].isThinking = false
+                            }
                         }
+                        return
                     }
-                    return
                 }
                 currentStep = UInt32(promptCount)
                 WorkingSetManager.shared.trimAfterPrefill(shardBuffers: buffers, mode: budgetMode)
@@ -8954,6 +9000,11 @@ struct ContentView: View {
                         self.sessions[sIdx].messages[mIdx].jetSpecDraftAccepted = (effectiveJetSpec && self.jetSpecTotalDraftAccepted > 0) ? self.jetSpecTotalDraftAccepted : nil
                     }
                 }
+                PrefixCacheManager.shared.recordTurn(
+                    promptTokenIds: promptTokenIds,
+                    generatedTokenIds: generatedTokenIds,
+                    sessionId: sessionId
+                )
                 if !willContinueAgent {
                     self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)
                 }

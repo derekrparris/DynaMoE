@@ -48,6 +48,8 @@ struct SettingsSheetView: View {
     @AppStorage("dynamoe_jetspec_branching") private var jetSpecBranchingFactor: Int = 2
     @AppStorage("dynamoe_jetspec_expert_cap") private var jetSpecMaxExpertCap: Int = 8
     @ObservedObject private var indexer = CodebaseIndexer.shared
+    @ObservedObject private var dogfoodRunner = ModelDogfoodBenchmarkRunner.shared
+    @State private var showDogfoodReportModal: Bool = false
 
     // Model Profile Management State
     @ObservedObject private var profileManager = ModelProfileManager.shared
@@ -1447,6 +1449,129 @@ struct SettingsSheetView: View {
             .padding(14)
             .background(Color.secondary.opacity(0.04))
             .cornerRadius(10)
+
+            // Live Model Dogfooding & Benchmarking Card
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: "gauge.with.dots.needle.bottom.50percent")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundColor(.purple)
+                    Text("Live Model Dogfooding & Multi-Turn Benchmark")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                    Spacer()
+
+                    Text("Option 4")
+                        .font(.system(size: 10, weight: .bold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.purple.opacity(0.15))
+                        .foregroundColor(.purple)
+                        .cornerRadius(4)
+                }
+
+                Text("Validates real-world speedups from KV-cache prefix pinning, measures exact tokens/sec across multi-step developer tool turns, and exercises Turbo Mode compiler self-healing.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+
+                HStack(spacing: 12) {
+                    Button(action: {
+                        Task {
+                            let modelName = localModelManager.discoveredModels.first(where: { $0.snapshotPath == activeModelPath })?.displayName ?? "Ornith-1.5-35B-A3B-FP8"
+                            _ = try? await dogfoodRunner.runBenchmark(modelName: modelName)
+                        }
+                    }) {
+                        HStack(spacing: 6) {
+                            if dogfoodRunner.isRunning {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Running Turn \(dogfoodRunner.currentTurn)/3...")
+                            } else {
+                                Image(systemName: "play.circle.fill")
+                                Text("Run Dogfood Benchmark")
+                            }
+                        }
+                        .font(.system(size: 11, weight: .medium))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.purple)
+                    .disabled(dogfoodRunner.isRunning)
+
+                    if let report = dogfoodRunner.latestReport {
+                        Button(action: {
+                            showDogfoodReportModal = true
+                        }) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "doc.text.magnifyingglass")
+                                Text("View Report")
+                            }
+                            .font(.system(size: 11))
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+
+                if let report = dogfoodRunner.latestReport {
+                    HStack(spacing: 8) {
+                        Text(String(format: "⚡ Prefill Speedup: %.2fx", report.prefixPinningSpeedup))
+                            .font(.system(size: 10, weight: .semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.green.opacity(0.15))
+                            .foregroundColor(.green)
+                            .cornerRadius(4)
+
+                        Text(String(format: "🚀 Avg Decode: %.1f tok/s", report.averageDecodeTokensPerSec))
+                            .font(.system(size: 10, weight: .semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.blue.opacity(0.15))
+                            .foregroundColor(.blue)
+                            .cornerRadius(4)
+
+                        Text(report.turboModeVerified ? "⚡ Turbo: PASS" : "⚡ Turbo: FAIL")
+                            .font(.system(size: 10, weight: .semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(report.turboModeVerified ? Color.orange.opacity(0.15) : Color.red.opacity(0.15))
+                            .foregroundColor(report.turboModeVerified ? .orange : .red)
+                            .cornerRadius(4)
+
+                        Text(report.selfHealingVerified ? "🩺 Self-Heal: PASS" : "🩺 Self-Heal: FAIL")
+                            .font(.system(size: 10, weight: .semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(report.selfHealingVerified ? Color.indigo.opacity(0.15) : Color.red.opacity(0.15))
+                            .foregroundColor(report.selfHealingVerified ? .indigo : .red)
+                            .cornerRadius(4)
+                    }
+                }
+            }
+            .padding(14)
+            .background(Color.secondary.opacity(0.04))
+            .cornerRadius(10)
+            .sheet(isPresented: $showDogfoodReportModal) {
+                if let report = dogfoodRunner.latestReport {
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack {
+                            Text("Dogfood Benchmark Report")
+                                .font(.headline)
+                            Spacer()
+                            Button("Done") {
+                                showDogfoodReportModal = false
+                            }
+                        }
+
+                        ScrollView {
+                            Text(report.summaryMarkdown)
+                                .font(.system(size: 11, design: .monospaced))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    .padding(20)
+                    .frame(width: 650, height: 480)
+                }
+            }
 
             // Available Built-in Tools List
             VStack(alignment: .leading, spacing: 10) {

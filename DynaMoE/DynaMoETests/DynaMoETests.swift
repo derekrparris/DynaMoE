@@ -6904,6 +6904,165 @@ final class DynaMoETests: XCTestCase {
     }
 }
 
+// MARK: - Option 4: Model Dogfooding & KV Prefix Pinning Tests
+
+final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
+
+    override func setUp() {
+        super.setUp()
+        PrefixCacheManager.shared.invalidate()
+    }
+
+    override func tearDown() {
+        PrefixCacheManager.shared.invalidate()
+        UserDefaults.standard.removeObject(forKey: "dynamoe_agent_turbo_mode")
+        super.tearDown()
+    }
+
+    func testPrefixCacheManagerPrefixDetectionAndRecording() {
+        let manager = PrefixCacheManager.shared
+        let sessionA = UUID()
+        let sessionB = UUID()
+
+        let turn1Prompt: [UInt32] = [100, 101, 102, 103, 104, 105]
+        let turn1Reused = manager.findCommonPrefix(promptTokenIds: turn1Prompt, sessionId: sessionA)
+        XCTAssertEqual(turn1Reused, 0, "First cold prompt should have 0 prefix reuse")
+
+        let generatedA: [UInt32] = [200, 201, 202]
+        manager.recordTurn(promptTokenIds: turn1Prompt, generatedTokenIds: generatedA, sessionId: sessionA)
+
+        // Turn 2 with sessionA retains prefix
+        var turn2Prompt: [UInt32] = [100, 101, 102, 103, 104, 105, 200, 201, 202]
+        turn2Prompt.append(contentsOf: [300, 301, 302])
+
+        let turn2Reused = manager.findCommonPrefix(promptTokenIds: turn2Prompt, sessionId: sessionA)
+        XCTAssertEqual(turn2Reused, 9, "Turn 2 should reuse all 9 tokens from turn 1 prompt + response")
+
+        // SessionB should be isolated and not match sessionA
+        let sessionBReused = manager.findCommonPrefix(promptTokenIds: turn2Prompt, sessionId: sessionB)
+        XCTAssertEqual(sessionBReused, 0, "Session B should have 0 reuse from Session A's cache")
+
+        // Telemetry metrics
+        let metrics = manager.metrics
+        XCTAssertGreaterThan(metrics.totalTokensRequested, 0)
+        XCTAssertGreaterThan(metrics.totalTokensReused, 0)
+        XCTAssertGreaterThan(metrics.hitRatePercent, 0.0)
+
+        // Invalidate sessionA
+        manager.invalidate(sessionId: sessionA)
+        let postInvalidationReused = manager.findCommonPrefix(promptTokenIds: turn2Prompt, sessionId: sessionA)
+        XCTAssertEqual(postInvalidationReused, 0, "After invalidation, reuse should be 0")
+    }
+
+    func testKVCacheManagerPrefixPreservation() {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("Metal is required for this test")
+            return
+        }
+
+        let kvManager = KVCacheManager.shared
+        let seqLen = 256
+        let actualLayers = 2
+        let loops = 1
+        let kvHeads = 8
+        let headDim = 128
+        let stride = max(kvHeads * headDim, 1024) // 1024 elements per token
+
+        // 1. Initial Reset (cold, preservePrefixCount: 0)
+        kvManager.reset(
+            device: device,
+            actualLayers: actualLayers,
+            totalLoops: loops,
+            numKvHeads: kvHeads,
+            headDim: headDim,
+            maxSeqLen: seqLen,
+            precision: .fp16,
+            preservePrefixCount: 0
+        )
+
+        guard let kBuf = kvManager.kCacheBuffer, let vBuf = kvManager.vCacheBuffer else {
+            XCTFail("KV Buffers failed to allocate")
+            return
+        }
+
+        let prefixToPreserve = 32
+        let elementsToFill = (prefixToPreserve + 10) * stride
+
+        // Fill with canary pattern: token t -> Float16(42.0 / 84.0)
+        let kPtr = kBuf.contents().bindMemory(to: Float16.self, capacity: kBuf.length / 2)
+        let vPtr = vBuf.contents().bindMemory(to: Float16.self, capacity: vBuf.length / 2)
+        for i in 0..<min(kBuf.length / 2, elementsToFill) {
+            kPtr[i] = Float16(42.0)
+            vPtr[i] = Float16(84.0)
+        }
+
+        // 2. Second Reset with preservePrefixCount: 32
+        kvManager.reset(
+            device: device,
+            actualLayers: actualLayers,
+            totalLoops: loops,
+            numKvHeads: kvHeads,
+            headDim: headDim,
+            maxSeqLen: seqLen,
+            precision: .fp16,
+            preservePrefixCount: prefixToPreserve
+        )
+
+        // Verify preserved prefix remains intact
+        let preservedKPtr = kvManager.kCacheBuffer!.contents().bindMemory(to: Float16.self, capacity: kvManager.kCacheBuffer!.length / 2)
+        let preservedVPtr = kvManager.vCacheBuffer!.contents().bindMemory(to: Float16.self, capacity: kvManager.vCacheBuffer!.length / 2)
+
+        XCTAssertEqual(preservedKPtr[0], Float16(42.0), "Token 0 should be preserved")
+        XCTAssertEqual(preservedKPtr[prefixToPreserve * stride - 1], Float16(42.0), "Token at end of prefix should be preserved")
+        XCTAssertEqual(preservedVPtr[0], Float16(84.0), "V-cache Token 0 should be preserved")
+        XCTAssertEqual(preservedVPtr[prefixToPreserve * stride - 1], Float16(84.0), "V-cache token at end of prefix should be preserved")
+
+        // Verify tail beyond prefix was zeroed
+        let tailOffset = (prefixToPreserve + 2) * stride
+        if tailOffset < seqLen * stride {
+            XCTAssertEqual(preservedKPtr[tailOffset], Float16(0.0), "Tail beyond preserved prefix should be zeroed")
+            XCTAssertEqual(preservedVPtr[tailOffset], Float16(0.0), "V-cache tail should be zeroed")
+        }
+    }
+
+    func testDogfoodBenchmarkRunnerMultiTurnExecution() async throws {
+        let runner = await ModelDogfoodBenchmarkRunner.shared
+
+        let report = try await runner.runBenchmark(
+            modelName: "Ornith-1.5-35B-A3B-FP8",
+            modelSnapshotPath: "/tmp/fake_snapshot"
+        )
+
+        XCTAssertTrue(report.isPassing, "Dogfood benchmark report must pass all criteria")
+        XCTAssertEqual(report.turns.count, 3, "Expected 3 full turns")
+        XCTAssertGreaterThan(report.prefixPinningSpeedup, 1.0, "Prefix pinning must yield speedup")
+        XCTAssertTrue(report.turboModeVerified, "Turbo mode should be verified")
+        XCTAssertTrue(report.selfHealingVerified, "Self-healing should catch and heal compiler errors")
+        XCTAssertTrue(report.summaryMarkdown.contains("Model Dogfooding & Benchmarking Report"))
+        XCTAssertTrue(report.summaryMarkdown.contains("TTFT Speedup Factor"))
+    }
+
+    func testLiveMoEWeightsCheckpointIntegrity() {
+        // Discovers real on-disk models if present on user system
+        let discovered = LocalModelManager.shared.discoveredModels
+        let ornith35B = discovered.first { $0.displayName.contains("35B") }
+        let ornith9B = discovered.first { $0.displayName.contains("9B") }
+
+        if let model = ornith35B ?? ornith9B {
+            let snapPath = model.snapshotPath
+            let fm = FileManager.default
+            XCTAssertTrue(fm.fileExists(atPath: snapPath), "Discovered snapshot path must exist")
+
+            let configPath = (snapPath as NSString).appendingPathComponent("config.json")
+            if fm.fileExists(atPath: configPath), let data = try? Data(contentsOf: URL(fileURLWithPath: configPath)) {
+                let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                XCTAssertNotNil(parsed, "config.json must be valid JSON")
+            }
+        }
+    }
+}
+
+
 
 
 

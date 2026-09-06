@@ -1705,7 +1705,7 @@ kernel void gqa_attention_decode_fused(
     float m = -1e20f; // running max score
     float l = 0.0f;   // running sum of exponents
 
-    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : seqLen;
+    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : ((seqLen & 0x80000000) ? ((seqLen & 0x7FFFFFFF) + tokenIdx + 1) : seqLen);
 
     for (uint32_t tau = 0; tau < currentSeqLen; tau++) {
         uint32_t kBase = (tau * kvStride) + kvHeadBase;
@@ -1779,7 +1779,7 @@ kernel void gqa_attention_decode_fused_f16(
     float l = 0.0f;   // running sum of exponents
 
     device const float4* qHeadVec = (device const float4*)(qGateVector + qHeadBase);
-    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : seqLen;
+    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : ((seqLen & 0x80000000) ? ((seqLen & 0x7FFFFFFF) + tokenIdx + 1) : seqLen);
 
     for (uint32_t tau = 0; tau < currentSeqLen; tau++) {
         uint32_t kBase = (tau * kvStride) + kvHeadBase;
@@ -1860,7 +1860,7 @@ kernel void gqa_attention_decode_fused_fp8(
     float l = 0.0f;
 
     device const float4* qHeadVec = (device const float4*)(qGateVector + qHeadBase);
-    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : seqLen;
+    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : ((seqLen & 0x80000000) ? ((seqLen & 0x7FFFFFFF) + tokenIdx + 1) : seqLen);
 
     for (uint32_t tau = 0; tau < currentSeqLen; tau++) {
         uint32_t scaleIdx = (tau * numKvHeads) + kvHeadIdx;
@@ -1947,7 +1947,7 @@ kernel void gqa_attention_decode_standard(
     float l = 0.0f;   // running sum of exponents
 
     device const float4* qHeadVec = (device const float4*)(qVector + qHeadBase);
-    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : seqLen;
+    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : ((seqLen & 0x80000000) ? ((seqLen & 0x7FFFFFFF) + tokenIdx + 1) : seqLen);
 
     for (uint32_t tau = 0; tau < currentSeqLen; tau++) {
         uint32_t kBase = (tau * kvStride) + kvHeadBase;
@@ -2021,7 +2021,7 @@ kernel void gqa_attention_decode_standard_f16(
     float l = 0.0f;   // running sum of exponents
 
     device const float4* qHeadVec = (device const float4*)(qVector + qHeadBase);
-    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : seqLen;
+    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : ((seqLen & 0x80000000) ? ((seqLen & 0x7FFFFFFF) + tokenIdx + 1) : seqLen);
 
     for (uint32_t tau = 0; tau < currentSeqLen; tau++) {
         uint32_t kBase = (tau * kvStride) + kvHeadBase;
@@ -2096,7 +2096,7 @@ kernel void gqa_attention_decode_standard_fp8(
     float l = 0.0f;
 
     device const float4* qHeadVec = (device const float4*)(qVector + qHeadBase);
-    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : seqLen;
+    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : ((seqLen & 0x80000000) ? ((seqLen & 0x7FFFFFFF) + tokenIdx + 1) : seqLen);
 
     for (uint32_t tau = 0; tau < currentSeqLen; tau++) {
         uint32_t scaleIdx = (tau * numKvHeads) + kvHeadIdx;
