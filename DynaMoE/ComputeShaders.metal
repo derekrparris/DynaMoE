@@ -5788,3 +5788,31 @@ kernel void compact_kv_cache_slots_f16(
     kCacheBuffer[dstOffset] = kCacheBuffer[srcOffset];
     vCacheBuffer[dstOffset] = vCacheBuffer[srcOffset];
 }
+
+/// MSL Kernel: Batched cosine similarity / dot product between a query vector and a matrix of corpus vectors (FP32)
+kernel void vector_cosine_similarity_fp32(
+    device const float* queryVector [[buffer(0)]],     // [dim] (normalized)
+    device const float* corpusVectors [[buffer(1)]],   // [numVectors * dim] (normalized)
+    device float* outputScores [[buffer(2)]],          // [numVectors]
+    constant uint32_t& dim [[buffer(3)]],
+    constant uint32_t& numVectors [[buffer(4)]],
+    uint vecIdx [[thread_position_in_grid]]
+) {
+    if (vecIdx >= numVectors) return;
+
+    device const float* vec = corpusVectors + (uint64_t(vecIdx) * uint64_t(dim));
+    float sum = 0.0f;
+    uint32_t dim4 = dim / 4;
+    device const float4* q4 = (device const float4*)queryVector;
+    device const float4* v4 = (device const float4*)vec;
+
+    for (uint32_t i = 0; i < dim4; i++) {
+        sum += dot(q4[i], v4[i]);
+    }
+    for (uint32_t r = dim4 * 4; r < dim; r++) {
+        sum += queryVector[r] * vec[r];
+    }
+
+    outputScores[vecIdx] = sum;
+}
+

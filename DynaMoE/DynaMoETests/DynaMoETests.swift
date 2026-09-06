@@ -6427,6 +6427,123 @@ final class DynaMoETests: XCTestCase {
         XCTAssertTrue(responseTurn.contains("</tool_response>"))
         XCTAssertTrue(responseTurn.contains("<|im_start|>assistant\n<think>"))
     }
+
+    func testCodebaseEmbeddingEngineAndMetalCosineSimilarity() {
+        let engine = CodebaseEmbeddingEngine.shared
+        guard engine.isAvailable else {
+            print("NLEmbedding not available on this test host, skipping vector search test.")
+            return
+        }
+
+        let query = "where is KV cache allocated?"
+        let docRelevant = "KVCacheManager allocates unified memory KV cache buffer for tokens."
+        let docIrrelevant = "How to make a delicious homemade chocolate chip cookie recipe."
+
+        guard let queryVec = engine.embed(text: query),
+              let relVec = engine.embed(text: docRelevant),
+              let irrelVec = engine.embed(text: docIrrelevant) else {
+            XCTFail("Failed to generate embedding vectors")
+            return
+        }
+
+        XCTAssertEqual(queryVec.count, CodebaseEmbeddingEngine.embeddingDimension)
+        XCTAssertEqual(relVec.count, CodebaseEmbeddingEngine.embeddingDimension)
+        XCTAssertEqual(irrelVec.count, CodebaseEmbeddingEngine.embeddingDimension)
+
+        let search = MetalVectorSearch.shared
+        let updateOk = search.updateCorpus(vectors: [docRelevant, docIrrelevant].compactMap { engine.embed(text: $0) })
+        XCTAssertTrue(updateOk)
+
+        let results = search.search(queryVector: queryVec, topK: 2)
+        XCTAssertEqual(results.count, 2)
+        XCTAssertEqual(results.first?.index, 0, "Relevant KV cache doc should rank higher than chocolate recipe")
+        XCTAssertGreaterThan(results[0].score, results[1].score)
+    }
+
+    func testBM25TokenizationAndScoring() {
+        let tokens = BM25Index.tokenize(text: "KVCacheManager allocates buffer_slot")
+        XCTAssertTrue(tokens.contains("kvcachemanager"))
+        XCTAssertTrue(tokens.contains("cache"))
+        XCTAssertTrue(tokens.contains("allocates"))
+
+        let bm25 = BM25Index()
+        let docs = [
+            "KVCacheManager allocates unified memory buffer for tokens",
+            "Metal compute pipeline state and shader compiler",
+            "SwiftUI view hierarchy and reactive state bindings"
+        ]
+        bm25.index(documents: docs)
+        XCTAssertEqual(bm25.numDocs, 3)
+
+        let results = bm25.search(query: "KVCacheManager allocation", topK: 2)
+        XCTAssertFalse(results.isEmpty)
+        XCTAssertEqual(results.first?.index, 0, "Doc 0 should be top result for KVCacheManager query")
+    }
+
+    func testHybridSearchFusionRRF() {
+        let denseResults: [(index: Int, score: Float)] = [
+            (index: 2, score: 0.85),
+            (index: 0, score: 0.72),
+            (index: 1, score: 0.50)
+        ]
+        let bm25Results: [(index: Int, score: Float)] = [
+            (index: 0, score: 12.5),
+            (index: 2, score: 8.2),
+            (index: 3, score: 4.1)
+        ]
+
+        let fused = HybridSearchFusion.fuse(
+            denseResults: denseResults,
+            bm25Results: bm25Results,
+            topK: 3
+        )
+
+        XCTAssertFalse(fused.isEmpty)
+        // Indices 0 and 2 appear in both and should rank at the top
+        let topIndices = Set(fused.prefix(2).map { $0.index })
+        XCTAssertTrue(topIndices.contains(0))
+        XCTAssertTrue(topIndices.contains(2))
+    }
+
+    func testCodebaseIndexerAndSearchTool() async throws {
+        // Create temporary workspace directory with test files
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("dynamoe_rag_test_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: tempDir)
+        }
+
+        let swiftFile = tempDir.appendingPathComponent("CacheManager.swift")
+        let swiftCode = """
+        // CacheManager.swift
+        public final class CacheManager {
+            public func allocateKVCache(tokens: Int) -> Bool {
+                // Allocates unified memory for KV cache
+                return true
+            }
+        }
+        """
+        try swiftCode.write(to: swiftFile, atomically: true, encoding: .utf8)
+
+        let indexer = CodebaseIndexer.shared
+        await indexer.performIndexWorkspace(url: tempDir, forceRebuild: true)
+        XCTAssertGreaterThan(indexer.indexedChunkCount, 0)
+
+        let tool = CodebaseSearchTool()
+        let result = try await tool.execute(
+            arguments: [
+                "query": "KV cache allocate unified memory",
+                "top_k": 3,
+                "search_mode": "hybrid"
+            ],
+            workingDirectory: tempDir,
+            maxOutputLength: 4000
+        )
+
+        XCTAssertFalse(result.isCompleted)
+        XCTAssertTrue(result.resultJSON.contains("CacheManager.swift"))
+        XCTAssertTrue(result.resultJSON.contains("allocateKVCache"))
+    }
 }
 
 

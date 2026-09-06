@@ -844,6 +844,112 @@ public final class CompleteTool: AgentTool {
     }
 }
 
+/// Tool 10: codebase_search — Hybrid Vector & Lexical search across codebase
+public final class CodebaseSearchTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "codebase_search",
+        description: "Semantically and lexically searches the indexed codebase using Metal-accelerated hybrid vector search (Dense Vector + BM25). Retrieves exact code snippets and AST chunks with file paths and line numbers without filling the context window.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "query": [
+                    "type": "string",
+                    "description": "The search query describing the functionality, concept, error, or identifier to find (e.g. 'where is KV cache allocated?', 'runTokenForward implementation')."
+                ],
+                "target_directory": [
+                    "type": "string",
+                    "description": "Optional subdirectory relative to the workspace to restrict the search."
+                ],
+                "file_extensions": [
+                    "type": "array",
+                    "items": ["type": "string"],
+                    "description": "Optional list of file extensions to filter by (e.g. ['swift', 'metal'])."
+                ],
+                "top_k": [
+                    "type": "integer",
+                    "description": "Number of snippets to retrieve (default 5, max 15)."
+                ],
+                "search_mode": [
+                    "type": "string",
+                    "enum": ["hybrid", "semantic", "keyword"],
+                    "description": "Search mode to use: 'hybrid' (combines BM25 and vector embeddings), 'semantic' (pure Metal vector search), or 'keyword' (BM25 keyword search)."
+                ]
+            ]),
+            "required": AnyCodable(["query"])
+        ]
+    )
+
+    public func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        guard let query = arguments["query"] as? String, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            let err = "Missing or empty 'query' parameter."
+            return (AgentHarness.toolErrorJSON(tool: "codebase_search", error: err), nil, err, false)
+        }
+
+        let targetDir = arguments["target_directory"] as? String
+        let fileExts = arguments["file_extensions"] as? [String]
+        let topK = min(15, max(1, (arguments["top_k"] as? Int) ?? 5))
+        let modeStr = (arguments["search_mode"] as? String)?.lowercased() ?? "hybrid"
+        let mode: SearchMode = modeStr == "semantic" ? .semantic : (modeStr == "keyword" ? .keyword : .hybrid)
+
+        let targetWorkspace: URL
+        if let wd = workingDirectory {
+            targetWorkspace = wd
+        } else {
+            targetWorkspace = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        }
+
+        let startTime = CFAbsoluteTimeGetCurrent()
+        let searchResults = await CodebaseIndexer.shared.search(
+            query: query,
+            workspace: targetWorkspace,
+            targetDirectory: targetDir,
+            fileExtensions: fileExts,
+            topK: topK,
+            mode: mode
+        )
+        let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
+
+        if searchResults.isEmpty {
+            let msg = "No codebase matches found for \"\(query)\"."
+            let res = AgentHarness.toolSuccessJSON(tool: "codebase_search", data: [
+                "query": query,
+                "count": 0,
+                "results": [],
+                "duration_ms": elapsedMs
+            ])
+            return (res, msg, nil, false)
+        }
+
+        var readableOutput = "Found \(searchResults.count) codebase result(s) for \"\(query)\" (\(String(format: "%.1f", elapsedMs)) ms, mode: \(mode.rawValue)):\n\n"
+        var jsonResults: [[String: Any]] = []
+
+        for (idx, r) in searchResults.enumerated() {
+            let snippet = AgentHarness.truncateText(r.chunk.content, limit: 1000)
+            readableOutput += "### [\(idx + 1)] \(r.chunk.filePath):\(r.chunk.startLine)-\(r.chunk.endLine) (score: \(String(format: "%.3f", r.score)))\n"
+            readableOutput += "```\((r.chunk.filePath as NSString).pathExtension)\n"
+            readableOutput += snippet + "\n"
+            readableOutput += "```\n\n"
+
+            jsonResults.append([
+                "file": r.chunk.filePath,
+                "lines": "L\(r.chunk.startLine)-L\(r.chunk.endLine)",
+                "title": r.chunk.title,
+                "score": r.score,
+                "snippet": snippet
+            ])
+        }
+
+        let cleanStdout = AgentHarness.truncateText(readableOutput.trimmingCharacters(in: .whitespacesAndNewlines), limit: maxOutputLength)
+        let res = AgentHarness.toolSuccessJSON(tool: "codebase_search", data: [
+            "query": query,
+            "count": searchResults.count,
+            "results": jsonResults,
+            "duration_ms": elapsedMs
+        ])
+        return (res, cleanStdout, nil, false)
+    }
+}
+
 // MARK: - Agent Harness Coordinator
 
 public final class AgentHarness {
@@ -867,6 +973,7 @@ public final class AgentHarness {
         registerTool(GrepSearchTool())
         registerTool(WebSearchTool())
         registerTool(WebFetchTool())
+        registerTool(CodebaseSearchTool())
         registerTool(CompleteTool())
         GrammarConstrainedSampler.shared.registerTools(availableToolDefinitions)
     }

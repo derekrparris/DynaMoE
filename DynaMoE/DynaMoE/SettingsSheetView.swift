@@ -47,6 +47,7 @@ struct SettingsSheetView: View {
     @AppStorage("dynamoe_jetspec_depth") private var jetSpecMaxDepth: Int = 3
     @AppStorage("dynamoe_jetspec_branching") private var jetSpecBranchingFactor: Int = 2
     @AppStorage("dynamoe_jetspec_expert_cap") private var jetSpecMaxExpertCap: Int = 8
+    @ObservedObject private var indexer = CodebaseIndexer.shared
 
     // Model Profile Management State
     @ObservedObject private var profileManager = ModelProfileManager.shared
@@ -1142,17 +1143,29 @@ struct SettingsSheetView: View {
 
                     HStack(spacing: 8) {
                         Image(systemName: "folder.fill")
-                            .foregroundColor(.secondary)
-                        Text(agentWorkingDirectory.isEmpty ? FileManager.default.currentDirectoryPath : agentWorkingDirectory)
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundColor(.primary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 6)
-                            .background(Color.secondary.opacity(0.06))
-                            .cornerRadius(6)
+                            .foregroundColor(agentWorkingDirectory.isEmpty ? .secondary : .accentColor)
+                        if agentWorkingDirectory.isEmpty {
+                            Text("No workspace selected (click Browse to choose your project folder)")
+                                .font(.system(size: 12))
+                                .foregroundColor(.secondary)
+                                .italic()
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 6)
+                                .background(Color.secondary.opacity(0.06))
+                                .cornerRadius(6)
+                        } else {
+                            Text(agentWorkingDirectory)
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundColor(.primary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 6)
+                                .background(Color.secondary.opacity(0.06))
+                                .cornerRadius(6)
+                        }
 
                         Button("Browse...") {
                             let panel = NSOpenPanel()
@@ -1160,6 +1173,7 @@ struct SettingsSheetView: View {
                             panel.canChooseDirectories = true
                             panel.allowsMultipleSelection = false
                             panel.canCreateDirectories = true
+                            panel.prompt = "Select Workspace"
                             if panel.runModal() == .OK, let url = panel.url {
                                 agentWorkingDirectory = url.path
                             }
@@ -1261,6 +1275,91 @@ struct SettingsSheetView: View {
             .background(Color.secondary.opacity(0.04))
             .cornerRadius(10)
 
+            // Semantic Codebase Indexing & Local RAG Configuration
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Image(systemName: "sparkle.magnifyingglass")
+                        .foregroundColor(.purple)
+                    Text("Semantic Codebase Indexing (Metal RAG)")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                    Spacer()
+                    if indexer.isIndexing {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Indexing...")
+                                .font(.caption)
+                                .foregroundColor(.purple)
+                        }
+                    } else {
+                        Text(indexer.indexedChunkCount > 0 ? "\(indexer.indexedChunkCount) Chunks" : "Not Indexed")
+                            .font(.caption)
+                            .fontWeight(.medium)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(indexer.indexedChunkCount > 0 ? Color.purple.opacity(0.12) : Color.secondary.opacity(0.12))
+                            .foregroundColor(indexer.indexedChunkCount > 0 ? .purple : .secondary)
+                            .cornerRadius(6)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(indexer.statusMessage)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.secondary)
+
+                    if indexer.isIndexing {
+                        ProgressView(value: indexer.indexingProgress, total: 1.0)
+                            .progressViewStyle(.linear)
+                            .tint(.purple)
+                    }
+
+                    HStack(spacing: 10) {
+                        Button(action: {
+                            if agentWorkingDirectory.isEmpty {
+                                let panel = NSOpenPanel()
+                                panel.canChooseFiles = false
+                                panel.canChooseDirectories = true
+                                panel.allowsMultipleSelection = false
+                                panel.canCreateDirectories = true
+                                panel.prompt = "Choose Project"
+                                panel.message = "Select your project root folder to index for Local RAG"
+                                if panel.runModal() == .OK, let url = panel.url {
+                                    agentWorkingDirectory = url.path
+                                    indexer.indexWorkspace(url: url, forceRebuild: true)
+                                }
+                            } else {
+                                let targetUrl = URL(fileURLWithPath: agentWorkingDirectory)
+                                indexer.indexWorkspace(url: targetUrl, forceRebuild: true)
+                            }
+                        }) {
+                            Label(
+                                agentWorkingDirectory.isEmpty ? "Choose & Index Project..." : (indexer.indexedChunkCount > 0 ? "Re-index Workspace" : "Index Workspace Now"),
+                                systemImage: agentWorkingDirectory.isEmpty ? "folder.badge.plus" : "arrow.clockwise"
+                            )
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.purple)
+                        .disabled(indexer.isIndexing)
+
+                        if indexer.isIndexing {
+                            Button("Cancel", role: .cancel) {
+                                indexer.cancelIndexing()
+                            }
+                            .buttonStyle(.bordered)
+                        }
+
+                        Text("Apple Silicon GPU Cosine Similarity + BM25 Hybrid Rank")
+                            .font(.system(size: 10.5))
+                            .foregroundColor(.secondary)
+                    }
+                }
+            }
+            .padding(14)
+            .background(Color.secondary.opacity(0.04))
+            .cornerRadius(10)
+
             // Available Built-in Tools List
             VStack(alignment: .leading, spacing: 10) {
                 Text("Installed Tool Suite (\(AgentHarness.shared.availableToolDefinitions.count) Tools)")
@@ -1274,6 +1373,7 @@ struct SettingsSheetView: View {
                     toolSummaryCard(name: "file_edit", icon: "square.and.pencil", desc: "Performs precise anchor string search-and-replace edits.")
                     toolSummaryCard(name: "find_files", icon: "folder.badge.gearshape", desc: "Discovers files and directories using glob matching and max depth.")
                     toolSummaryCard(name: "grep_search", icon: "magnifyingglass", desc: "Fast regex and literal text pattern search across files using ripgrep or grep.")
+                    toolSummaryCard(name: "codebase_search", icon: "sparkle.magnifyingglass", desc: "Metal GPU vector search & BM25 hybrid retrieval across indexed codebase AST chunks.")
                     toolSummaryCard(name: "web_search", icon: "globe", desc: "Live web search via DuckDuckGo / Brave. Returns titles, URLs, and real-time snippets.")
                     toolSummaryCard(name: "web_fetch", icon: "arrow.down.doc.fill", desc: "Fetches and reads web pages with automatic HTML stripping and markdown extraction.")
                     toolSummaryCard(name: "complete", icon: "checkmark.seal.fill", desc: "Signals task completion with final structured summary.")
