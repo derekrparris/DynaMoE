@@ -7220,6 +7220,126 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
 
         XCTAssertEqual(turn1System, turn2System, "System prompt prefix must remain 100% identical across conversation turns for KV-cache prefix hits")
     }
+
+    // MARK: - Web Search & Fetch Tooling Enhancements Tests
+
+    func testWebFetchHTMLTableToMarkdown() {
+        let sampleHTML = """
+        <html>
+        <body>
+        <main>
+        <h1>Mac Specifications</h1>
+        <table>
+            <tr>
+                <th>Model</th>
+                <th>Processor</th>
+                <th>Memory</th>
+            </tr>
+            <tr>
+                <td>Mac mini</td>
+                <td>Apple M4 Pro (12-core CPU, 16-core GPU)</td>
+                <td>24GB unified memory (273GB/s)</td>
+            </tr>
+            <tr>
+                <td>Mac Studio</td>
+                <td>Apple M2 Ultra (24-core CPU, 60-core GPU)</td>
+                <td>64GB unified memory (800GB/s)</td>
+            </tr>
+        </table>
+        </main>
+        </body>
+        </html>
+        """
+
+        let cleaned = WebFetchTool.cleanHTMLStructure(sampleHTML)
+        XCTAssertTrue(cleaned.contains("| Model | Processor | Memory |"), "Must contain Markdown table header row")
+        XCTAssertTrue(cleaned.contains("| --- | --- | --- |"), "Must contain Markdown table delimiter row")
+        XCTAssertTrue(cleaned.contains("| Mac mini | Apple M4 Pro (12-core CPU, 16-core GPU) | 24GB unified memory (273GB/s) |"), "Must format table data rows with pipes")
+        XCTAssertTrue(cleaned.contains("| Mac Studio | Apple M2 Ultra (24-core CPU, 60-core GPU) | 64GB unified memory (800GB/s) |"), "Must format table data rows with pipes")
+    }
+
+    func testWebFetchNoiseAndTemplateStripping() {
+        let dirtyHTML = """
+        <html>
+        <head><title>Compare Mac - Apple</title></head>
+        <body>
+        <nav><a href="/store">Store</a><a href="/mac">Mac</a></nav>
+        <select name="models">
+            <option value="mbn">MacBook Neo (A18 Pro)</option>
+            <option value="mba13">MacBook Air 13-in. (M5)</option>
+            <option value="mba15">MacBook Air 15-in. (M5)</option>
+        </select>
+        <div class="pricing">
+            {MBN_2026_MAIN}From $price.display.smart or $price.display.perMonth for $price.display.months mo.*
+        </div>
+        <form action="/newsletter"><button type="submit">Subscribe</button></form>
+        <main>
+            <h1>Mac mini Overview</h1>
+            <p>The new Mac mini with M4 and M4 Pro delivers monstrous performance in an impossibly small frame.</p>
+        </main>
+        <footer><p>Copyright 2026 Apple Inc.</p></footer>
+        </body>
+        </html>
+        """
+
+        let cleaned = WebFetchTool.cleanHTMLStructure(dirtyHTML)
+        XCTAssertFalse(cleaned.contains("MacBook Neo (A18 Pro)"), "Must strip <select> and <option> dropdown navigation clutter")
+        XCTAssertFalse(cleaned.contains("{MBN_2026_MAIN}"), "Must strip unrendered JavaScript template strings")
+        XCTAssertFalse(cleaned.contains("$price.display.smart"), "Must strip unhydrated template expressions")
+        XCTAssertFalse(cleaned.contains("Subscribe"), "Must strip form and button clutter")
+        XCTAssertTrue(cleaned.contains("Mac mini Overview"), "Must preserve primary article/main heading")
+        XCTAssertTrue(cleaned.contains("The new Mac mini with M4 and M4 Pro"), "Must preserve main content text")
+    }
+
+    func testWebFetchQueryTargetedExtraction() {
+        let fullPage = """
+        # Apple Hardware Overview
+
+        ### Design and Ports
+        The chassis features front USB-C ports, an audio jack, and rear Thunderbolt 5 ports.
+
+        ### Processor and Performance
+        The Mac mini is powered by the M4 Pro chip featuring a 14-core CPU, 20-core GPU, and 273GB/s memory bandwidth.
+        It outperforms previous generation M2 Pro desktops by over 1.8x in multi-threaded workflows.
+
+        ### Power and Environmental Specs
+        Constructed with over 50% recycled content and meets ENERGY STAR requirements.
+        """
+
+        let prioritized = WebFetchTool.filterContentByQuery(fullPage, query: "processor m4 pro gpu bandwidth", limit: 3000)
+        XCTAssertTrue(prioritized.contains("Key Sections Matching \"processor m4 pro gpu bandwidth\""), "Must contain matched section header")
+        XCTAssertTrue(prioritized.contains("14-core CPU, 20-core GPU, and 273GB/s memory bandwidth"), "Must prioritize processor section")
+    }
+
+    func testSearchEngineRedirectURLUnwrapping() {
+        // Yahoo redirect
+        let yahooRedirect = "https://r.search.yahoo.com/_ylt=Awr.123/RU=https%3a%2f%2fwww.apple.com%2fmac-mini%2fspecs%2f/RK=2/RS=xyz"
+        let unwrappedYahoo = HeadlessChromeSearchEngine.unwrapRedirectURL(yahooRedirect)
+        XCTAssertEqual(unwrappedYahoo, "https://www.apple.com/mac-mini/specs/", "Must unwrap Yahoo redirect to canonical target URL")
+
+        // Google redirect
+        let googleRedirect = "https://www.google.com/url?q=https://support.apple.com/kb/SP894&sa=U&ved=2ahUKEwi"
+        let unwrappedGoogle = HeadlessChromeSearchEngine.unwrapRedirectURL(googleRedirect)
+        XCTAssertEqual(unwrappedGoogle, "https://support.apple.com/kb/SP894", "Must unwrap Google redirect to canonical target URL")
+
+        // Direct URL untouched
+        let directURL = "https://en.wikipedia.org/wiki/Mac_Studio"
+        let unwrappedDirect = HeadlessChromeSearchEngine.unwrapRedirectURL(directURL)
+        XCTAssertEqual(unwrappedDirect, directURL, "Direct URLs must remain unchanged")
+    }
+
+    func testAgentHarnessWebResearchPromptGuardrails() {
+        let systemPrompt = AgentHarness.shared.buildSystemPrompt(
+            baseSystem: "Expert assistant.",
+            currentDate: Date()
+        )
+
+        XCTAssertTrue(systemPrompt.contains("Web Research & Grounding Guidelines"), "Must include research and grounding guidelines")
+        XCTAssertTrue(systemPrompt.contains("Neutral Queries First"), "Must instruct agent to use neutral queries")
+        XCTAssertTrue(systemPrompt.contains("Strict URL Grounding"), "Must instruct agent to strictly ground URLs from web_search")
+        XCTAssertTrue(systemPrompt.contains("Official vs. Speculative Rumors"), "Must instruct agent to differentiate shipping hardware from rumors")
+        XCTAssertTrue(systemPrompt.contains("Targeted In-Page Queries"), "Must instruct agent on using query parameter in web_fetch")
+    }
 }
 
 

@@ -663,6 +663,45 @@ public final class HeadlessChromeSearchEngine: @unchecked Sendable {
         }
     }
 
+    /// Unwraps search engine tracking redirects (such as Yahoo /RU=, Google /url?q=, DuckDuckGo /l/?uddg=) to direct canonical URLs
+    public static func unwrapRedirectURL(_ rawUrl: String) -> String {
+        var urlStr = rawUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Yahoo redirect: /RU=(encoded_url)/RK=
+        if let ruRange = urlStr.range(of: "/RU=", options: .caseInsensitive) {
+            let afterRU = String(urlStr[ruRange.upperBound...])
+            let encodedTarget: String
+            if let rkRange = afterRU.range(of: "/RK=", options: .caseInsensitive) {
+                encodedTarget = String(afterRU[..<rkRange.lowerBound])
+            } else if let slashRange = afterRU.range(of: "/") {
+                encodedTarget = String(afterRU[..<slashRange.lowerBound])
+            } else {
+                encodedTarget = afterRU
+            }
+            if let decoded = encodedTarget.removingPercentEncoding, decoded.hasPrefix("http") {
+                urlStr = decoded
+            }
+        }
+        // Google redirect: /url?q=(encoded_url)&
+        else if urlStr.contains("/url?") && urlStr.contains("q=") {
+            if let components = URLComponents(string: urlStr),
+               let qItem = components.queryItems?.first(where: { $0.name == "q" }),
+               let target = qItem.value, target.hasPrefix("http") {
+                urlStr = target
+            }
+        }
+        // DuckDuckGo redirect: /l/?uddg=(encoded_url)&
+        else if urlStr.contains("uddg=") {
+            if let components = URLComponents(string: urlStr),
+               let uddgItem = components.queryItems?.first(where: { $0.name == "uddg" }),
+               let target = uddgItem.value, target.hasPrefix("http") {
+                urlStr = target
+            }
+        }
+
+        return urlStr
+    }
+
     /// Performs live web search using Headless Chrome instance
     public func search(query: String, maxResults: Int = 5) async throws -> [[String: String]] {
         guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
@@ -685,7 +724,8 @@ public final class HeadlessChromeSearchEngine: @unchecked Sendable {
                 .replacingOccurrences(of: "\"", with: "")
                 .replacingOccurrences(of: "&amp;", with: "&")
 
-            guard !rawUrl.contains("yahoo.com") && !rawUrl.contains("yimg.com") && !seenURLs.contains(rawUrl) else { continue }
+            let cleanUrl = Self.unwrapRedirectURL(rawUrl)
+            guard !cleanUrl.contains("yahoo.com") && !cleanUrl.contains("yimg.com") && !seenURLs.contains(cleanUrl) else { continue }
 
             var title = ""
             if let titleRange = part.range(of: "<h3[^>]*>([\\s\\S]*?)</h3>", options: .regularExpression) {
@@ -699,12 +739,16 @@ public final class HeadlessChromeSearchEngine: @unchecked Sendable {
             var snippet = ""
             if let snipRange = part.range(of: "<div class=\"compText[^\"]*\"[^>]*>([\\s\\S]*?)</div>", options: .regularExpression) {
                 snippet = stripHTML(String(part[snipRange]))
+            } else if let snipRange = part.range(of: "<p[^>]*class=\"[^\"]*snippet[^\"]*\"[^>]*>([\\s\\S]*?)</p>", options: .regularExpression) {
+                snippet = stripHTML(String(part[snipRange]))
+            } else if let snipRange = part.range(of: "<p[^>]*>([\\s\\S]*?)</p>", options: .regularExpression) {
+                snippet = stripHTML(String(part[snipRange]))
             }
 
-            seenURLs.insert(rawUrl)
+            seenURLs.insert(cleanUrl)
             results.append([
                 "title": title,
-                "url": rawUrl,
+                "url": cleanUrl,
                 "snippet": snippet
             ])
             if results.count >= maxResults { break }
@@ -720,11 +764,12 @@ public final class HeadlessChromeSearchEngine: @unchecked Sendable {
                     let u = nsHtml.substring(with: m.range(at: 1))
                     let inner = nsHtml.substring(with: m.range(at: 2))
                     let t = stripHTML(inner)
-                    if t.count > 10 && !u.contains("yahoo.com") && !u.contains("yimg.com") && !u.hasPrefix("#") && !seenURLs.contains(u) {
-                        seenURLs.insert(u)
+                    let cleanU = Self.unwrapRedirectURL(u)
+                    if t.count > 10 && !cleanU.contains("yahoo.com") && !cleanU.contains("yimg.com") && !cleanU.hasPrefix("#") && !seenURLs.contains(cleanU) {
+                        seenURLs.insert(cleanU)
                         results.append([
                             "title": t,
-                            "url": u,
+                            "url": cleanU,
                             "snippet": ""
                         ])
                         if results.count >= maxResults { break }
@@ -909,7 +954,7 @@ public final class WebSearchTool: AgentTool {
 public final class WebFetchTool: AgentTool {
     public let definition = ToolDefinition(
         name: "web_fetch",
-        description: "Fetches and reads the textual content of a web page given a public URL. Automatically strips HTML markup, scripts, and navigation clutter into readable text/markdown.",
+        description: "Fetches and reads the textual content of a web page given a public URL. Automatically renders JavaScript via Headless Chrome, cleans out navigation/modals/templates, converts HTML tables into Markdown tables, and extracts primary article or specification content.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
@@ -917,9 +962,13 @@ public final class WebFetchTool: AgentTool {
                     "type": "string",
                     "description": "The absolute HTTP or HTTPS URL to fetch."
                 ],
+                "query": [
+                    "type": "string",
+                    "description": "Optional search keywords to filter and prioritize within the page (e.g. 'processor, memory, gpu'). When provided, matching sections and specification tables are prioritized first."
+                ],
                 "max_length": [
                     "type": "integer",
-                    "description": "Optional maximum character length of returned content (defaults to maxToolOutputLength)."
+                    "description": "Optional maximum character length of returned content (defaults to 6,000 characters, up to 20,000)."
                 ]
             ]),
             "required": AnyCodable(["url"])
@@ -934,8 +983,10 @@ public final class WebFetchTool: AgentTool {
             return (AgentHarness.toolErrorJSON(tool: "web_fetch", error: err), nil, err, false)
         }
 
+        let queryFilter = (arguments["query"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         let customMax = arguments["max_length"] as? Int
-        let limit = customMax ?? maxOutputLength
+        let defaultLimit = max(6000, maxOutputLength)
+        let limit = customMax.map { min(20000, max(500, $0)) } ?? defaultLimit
 
         do {
             var html: String? = nil
@@ -960,7 +1011,7 @@ public final class WebFetchTool: AgentTool {
                 html = fetched
             }
 
-            guard var pageHtml = html else {
+            guard let pageHtml = html else {
                 let err = "Failed to retrieve content for URL: \(url.absoluteString)"
                 return (AgentHarness.toolErrorJSON(tool: "web_fetch", error: err), nil, err, false)
             }
@@ -968,41 +1019,253 @@ public final class WebFetchTool: AgentTool {
             var pageTitle = url.host ?? "Web Page"
             if let titleRange = pageHtml.range(of: "<title[^>]*>(.*?)</title>", options: [.regularExpression, .caseInsensitive]) {
                 let rawTitle = String(pageHtml[titleRange])
-                pageTitle = stripHTML(rawTitle)
+                pageTitle = Self.stripHTML(rawTitle)
             }
 
-            // Strip comments
-            pageHtml = pageHtml.replacingOccurrences(of: "(?s)<!--.*?-->", with: "", options: .regularExpression)
-            // Strip script, style, nav, header, footer, svg, noscript
-            pageHtml = pageHtml.replacingOccurrences(of: "(?s)<(script|style|nav|header|footer|svg|noscript)[^>]*>.*?</\\1>", with: "", options: .regularExpression)
-            // Replace block tags with newline
-            pageHtml = pageHtml.replacingOccurrences(of: "(?i)</?(p|div|h1|h2|h3|h4|h5|h6|li|tr|article|section|blockquote|pre|code)[^>]*>", with: "\n", options: .regularExpression)
-            pageHtml = pageHtml.replacingOccurrences(of: "(?i)<br\\s*/?>", with: "\n", options: .regularExpression)
+            let fullCleaned = Self.cleanHTMLStructure(pageHtml)
+            var contentToReturn: String
 
-            let text = stripHTML(pageHtml)
-            let lines = text.components(separatedBy: .newlines)
-                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
-            var cleaned = lines.joined(separator: "\n")
-
-            if cleaned.count > limit {
-                cleaned = String(cleaned.prefix(limit)) + "\n\n... [Content truncated at \(limit) characters]"
+            if let q = queryFilter, !q.isEmpty {
+                contentToReturn = Self.filterContentByQuery(fullCleaned, query: q, limit: limit)
+            } else if fullCleaned.count > limit {
+                contentToReturn = String(fullCleaned.prefix(limit)) + "\n\n... [Content truncated at \(limit) characters]"
+            } else {
+                contentToReturn = fullCleaned
             }
 
             let res = AgentHarness.toolSuccessJSON(tool: "web_fetch", data: [
                 "url": url.absoluteString,
                 "title": pageTitle,
-                "length": cleaned.count,
-                "content": cleaned
+                "length": contentToReturn.count,
+                "content": contentToReturn
             ])
-            return (res, cleaned, nil, false)
+            return (res, contentToReturn, nil, false)
         } catch {
             let err = "Failed to fetch web content: \(error.localizedDescription)"
             return (AgentHarness.toolErrorJSON(tool: "web_fetch", error: err), nil, err, false)
         }
     }
 
-    private func stripHTML(_ input: String) -> String {
+    /// Converts HTML <table> elements into clean GitHub Flavored Markdown tables
+    public static func convertTablesToMarkdown(html: String) -> String {
+        let tablePattern = #"(?is)<table[^>]*>(.*?)</table>"#
+        guard let tableRegex = try? NSRegularExpression(pattern: tablePattern) else { return html }
+
+        let nsHtml = html as NSString
+        let matches = tableRegex.matches(in: html, range: NSRange(location: 0, length: nsHtml.length))
+        guard !matches.isEmpty else { return html }
+
+        let ms = NSMutableString(string: html)
+
+        for match in matches.reversed() {
+            let fullMatchRange = match.range
+            let innerTableHtml = nsHtml.substring(with: match.range(at: 1))
+
+            let rowPattern = #"(?is)<tr[^>]*>(.*?)</tr>"#
+            guard let rowRegex = try? NSRegularExpression(pattern: rowPattern) else { continue }
+            let nsInner = innerTableHtml as NSString
+            let rowMatches = rowRegex.matches(in: innerTableHtml, range: NSRange(location: 0, length: nsInner.length))
+            guard !rowMatches.isEmpty else { continue }
+
+            var markdownRows: [[String]] = []
+
+            for rowMatch in rowMatches {
+                let rowContent = nsInner.substring(with: rowMatch.range(at: 1))
+                let cellPattern = #"(?is)<(td|th)[^>]*>(.*?)</\1>"#
+                guard let cellRegex = try? NSRegularExpression(pattern: cellPattern) else { continue }
+                let nsRow = rowContent as NSString
+                let cellMatches = cellRegex.matches(in: rowContent, range: NSRange(location: 0, length: nsRow.length))
+                guard !cellMatches.isEmpty else { continue }
+
+                var cells: [String] = []
+                for cellMatch in cellMatches {
+                    let rawCell = nsRow.substring(with: cellMatch.range(at: 2))
+                    let cleanCell = rawCell
+                        .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+                        .replacingOccurrences(of: "\n", with: " ")
+                        .replacingOccurrences(of: "|", with: "\\|")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    cells.append(cleanCell.isEmpty ? "-" : cleanCell)
+                }
+                if !cells.isEmpty {
+                    markdownRows.append(cells)
+                }
+            }
+
+            guard !markdownRows.isEmpty else { continue }
+
+            let maxCols = markdownRows.map { $0.count }.max() ?? 0
+            guard maxCols > 0 else { continue }
+
+            var tableMd = "\n\n"
+            for (idx, row) in markdownRows.enumerated() {
+                var paddedRow = row
+                while paddedRow.count < maxCols {
+                    paddedRow.append("-")
+                }
+                let line = "| " + paddedRow.joined(separator: " | ") + " |"
+                tableMd += line + "\n"
+
+                if idx == 0 {
+                    let separator = "| " + Array(repeating: "---", count: maxCols).joined(separator: " | ") + " |"
+                    tableMd += separator + "\n"
+                }
+            }
+            tableMd += "\n"
+
+            ms.replaceCharacters(in: fullMatchRange, with: tableMd)
+        }
+
+        return String(ms)
+    }
+
+    /// Strips non-content markup, templates, dropdowns, forms, and scripts from page HTML into clean markdown/text
+    public static func cleanHTMLStructure(_ html: String) -> String {
+        var pageHtml = html
+
+        // Strip comments
+        pageHtml = pageHtml.replacingOccurrences(of: "(?s)<!--.*?-->", with: "", options: .regularExpression)
+
+        // Strip non-content / navigation / template tags:
+        // script, style, nav, header, footer, svg, noscript, select, option, form, button, template, dialog, aside, iframe
+        pageHtml = pageHtml.replacingOccurrences(
+            of: "(?is)<(script|style|nav|header|footer|svg|noscript|select|option|form|button|template|dialog|aside|iframe)[^>]*>.*?</\\1>",
+            with: "",
+            options: .regularExpression
+        )
+
+        // Strip standalone/void tags or leftover tags
+        pageHtml = pageHtml.replacingOccurrences(of: "(?is)<(input|meta|link|svg|path)[^>]*>", with: "", options: .regularExpression)
+
+        // Strip hidden elements: aria-hidden="true" or hidden attribute
+        pageHtml = pageHtml.replacingOccurrences(of: "(?is)<[^>]+aria-hidden=[\"']true[\"'][^>]*>.*?</[^>]+>", with: "", options: .regularExpression)
+
+        // Strip unhydrated JavaScript template tokens like {MBN_2026_MAIN}, {price.display.smart}, {{model.name}}, etc.
+        pageHtml = pageHtml.replacingOccurrences(of: #"\{[A-Za-z0-9_$.]+\}"#, with: "", options: .regularExpression)
+        pageHtml = pageHtml.replacingOccurrences(of: #"\{[A-Z0-9_]+_MAIN[^\}]*\}"#, with: "", options: .regularExpression)
+        pageHtml = pageHtml.replacingOccurrences(of: #"\{\{[^}]+\}\}"#, with: "", options: .regularExpression)
+
+        // Extract primary content body if <main>, <article>, or role="main" exists and is sufficiently rich
+        if let mainRange = pageHtml.range(of: "(?is)<(main|article)[^>]*>([\\s\\S]*?)</\\1>", options: .regularExpression) {
+            let mainSnippet = String(pageHtml[mainRange])
+            if mainSnippet.count > 300 {
+                pageHtml = mainSnippet
+            }
+        }
+
+        // Convert HTML tables to Markdown tables BEFORE stripping block tags
+        pageHtml = convertTablesToMarkdown(html: pageHtml)
+
+        // Convert headings to Markdown headings
+        pageHtml = pageHtml.replacingOccurrences(of: "(?i)<h1[^>]*>([\\s\\S]*?)</h1>", with: "\n\n# $1\n\n", options: .regularExpression)
+        pageHtml = pageHtml.replacingOccurrences(of: "(?i)<h2[^>]*>([\\s\\S]*?)</h2>", with: "\n\n## $1\n\n", options: .regularExpression)
+        pageHtml = pageHtml.replacingOccurrences(of: "(?i)<h3[^>]*>([\\s\\S]*?)</h3>", with: "\n\n### $1\n\n", options: .regularExpression)
+        pageHtml = pageHtml.replacingOccurrences(of: "(?i)<h[4-6][^>]*>([\\s\\S]*?)</h[4-6]>", with: "\n\n#### $1\n\n", options: .regularExpression)
+
+        // Convert list items
+        pageHtml = pageHtml.replacingOccurrences(of: "(?i)<li[^>]*>([\\s\\S]*?)</li>", with: "\n- $1", options: .regularExpression)
+
+        // Convert bold / strong
+        pageHtml = pageHtml.replacingOccurrences(of: "(?i)<(strong|b)[^>]*>([\\s\\S]*?)</\\1>", with: "**$2**", options: .regularExpression)
+
+        // Replace other block tags with newlines
+        pageHtml = pageHtml.replacingOccurrences(of: "(?i)</?(p|div|section|blockquote|pre|code)[^>]*>", with: "\n", options: .regularExpression)
+        pageHtml = pageHtml.replacingOccurrences(of: "(?i)<br\\s*/?>", with: "\n", options: .regularExpression)
+
+        // Strip remaining HTML tags
+        let text = stripHTML(pageHtml)
+
+        // Clean up excessive whitespace & blank lines
+        let lines = text.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        var resultLines: [String] = []
+        var consecutiveBlanks = 0
+        for line in lines {
+            if line.isEmpty {
+                consecutiveBlanks += 1
+                if consecutiveBlanks <= 1 {
+                    resultLines.append("")
+                }
+            } else {
+                consecutiveBlanks = 0
+                resultLines.append(line)
+            }
+        }
+
+        return resultLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Prioritizes content sections matching query keywords
+    public static func filterContentByQuery(_ content: String, query: String, limit: Int) -> String {
+        let cleanQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanQuery.isEmpty else {
+            return String(content.prefix(limit))
+        }
+
+        let terms = cleanQuery.lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { $0.count >= 2 }
+        guard !terms.isEmpty else {
+            return String(content.prefix(limit))
+        }
+
+        // Split content into blocks by double newlines or markdown headings
+        let rawBlocks = content.components(separatedBy: "\n\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        var scoredBlocks: [(block: String, score: Int)] = []
+        for block in rawBlocks {
+            let lower = block.lowercased()
+            var score = 0
+            for term in terms {
+                if lower.contains(term) {
+                    score += 10
+                    // Bonus if it's in a markdown table or heading
+                    if block.contains("|") || block.hasPrefix("#") {
+                        score += 5
+                    }
+                }
+            }
+            scoredBlocks.append((block, score))
+        }
+
+        let matching = scoredBlocks.filter { $0.score > 0 }.sorted { $0.score > $1.score }
+        let nonMatching = scoredBlocks.filter { $0.score == 0 }
+
+        if matching.isEmpty {
+            return String(content.prefix(limit))
+        }
+
+        var prioritized: [String] = []
+        prioritized.append("### Key Sections Matching \"\(cleanQuery)\":\n")
+        var currentLength = prioritized[0].count
+
+        for item in matching {
+            if currentLength + item.block.count + 2 > limit {
+                break
+            }
+            prioritized.append(item.block)
+            currentLength += item.block.count + 2
+        }
+
+        // Fill remaining budget with other context
+        if currentLength < limit && !nonMatching.isEmpty {
+            prioritized.append("\n### Additional Page Context:\n")
+            currentLength += prioritized.last!.count
+            for item in nonMatching {
+                if currentLength + item.block.count + 2 > limit {
+                    break
+                }
+                prioritized.append(item.block)
+                currentLength += item.block.count + 2
+            }
+        }
+
+        return prioritized.joined(separator: "\n\n")
+    }
+
+    public static func stripHTML(_ input: String) -> String {
         let withoutTags = input.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
         return withoutTags
             .replacingOccurrences(of: "&amp;", with: "&")
@@ -1899,6 +2162,12 @@ public final class AgentHarness {
         - You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
         - When the user asks to inspect, read, edit, modify, or process a file, or run terminal commands, you MUST call the function immediately without conversational promises
         - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+
+        Web Research & Grounding Guidelines:
+        - Neutral Queries First: When searching for current products, technical specs, or news, formulate objective, neutral queries (e.g. "Apple Mac mini official current specifications", NOT "Mac mini M5 Max 2025"). Never embed unverified chip numbers or future years into your initial queries.
+        - Strict URL Grounding: ONLY fetch URLs returned by `web_search`. NEVER invent, guess, or synthesize article numbers or support URLs (e.g., support.apple.com/en-us/104942), as they will lead to 404s or unrelated topics.
+        - Official vs. Speculative Rumors: Distinguish between official shipping hardware (on vendor domains like apple.com, official documentation, or verified reviews) versus speculative rumors ("rumored", "expected to", "leaks", "concept").
+        - Targeted In-Page Queries: Use `web_fetch(url: "...", query: "...")` with relevant keywords (e.g. `query: "processor, gpu, memory"`) to directly retrieve the exact specification tables or sections on dense pages.
         </IMPORTANT>
         """
 
