@@ -272,7 +272,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -e # Abort the build immediately if any command fails\n\n# 1. Xcode strips external paths. We must inject Cargo and Homebrew into the PATH.\nexport PATH=\"$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"\n\n# 2. Navigate to your Rust core directory\ncd \"$SRCROOT/../core\"\n\n# 3. Check if Xcode is building for Debug or Release\nif [ \"$CONFIGURATION\" = \"Release\" ]; then\n    CARGO_TARGET_DIR=\"release\"\n    CARGO_BUILD_FLAG=\"--release\"\nelse\n    CARGO_TARGET_DIR=\"debug\"\n    CARGO_BUILD_FLAG=\"\"\nfi\n\n# 4. Compile the Rust library\necho \"Compiling Rust Engine ($CONFIGURATION)...\"\ncargo build $CARGO_BUILD_FLAG\n\n# 5. Generate the UniFFI Swift Bindings\necho \"Generating Swift Bindings...\"\ncargo run --bin uniffi-bindgen generate \\\n    --library \"target/$CARGO_TARGET_DIR/libdynamoe_core.dylib\" \\\n    --language swift \\\n    --out-dir \"$SRCROOT/../GeneratedFFI\"\n";
+			shellScript = "set -e # Abort the build immediately if any command fails\n\n# 1. Xcode strips external paths. We must inject Cargo and Homebrew into the PATH.\nexport PATH=\"$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"\n\n# 2. Navigate to your Rust core directory\ncd \"$SRCROOT/../core\"\n\n# 3. Check if Xcode is building for Debug or Release\nif [ \"$CONFIGURATION\" = \"Release\" ]; then\n    CARGO_TARGET_DIR=\"release\"\n    CARGO_BUILD_FLAG=\"--release\"\nelse\n    CARGO_TARGET_DIR=\"debug\"\n    CARGO_BUILD_FLAG=\"\"\nfi\n\n# 4. Compile the Rust library\necho \"Compiling Rust Engine ($CONFIGURATION)...\"\ncargo build $CARGO_BUILD_FLAG\n\n# Ensure the library file referenced by Xcode is up-to-date with this configuration\nif [ \"$CONFIGURATION\" = \"Release\" ]; then\n    mkdir -p \"target/debug\"\n    cp -f \"target/release/libdynamoe_core.a\" \"target/debug/libdynamoe_core.a\" 2>/dev/null || true\n    cp -f \"target/release/libdynamoe_core.dylib\" \"target/debug/libdynamoe_core.dylib\" 2>/dev/null || true\nfi\n\n# 5. Generate the UniFFI Swift Bindings\necho \"Generating Swift Bindings...\"\ncargo run --bin uniffi-bindgen generate \\\n    --library \"target/$CARGO_TARGET_DIR/libdynamoe_core.dylib\" \\\n    --language swift \\\n    --out-dir \"$SRCROOT/../GeneratedFFI\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -320,6 +320,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
+				ARCHS = arm64;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
@@ -382,6 +383,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
+				ARCHS = arm64;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
@@ -435,11 +437,12 @@
 		AB4C57DE30324B5B0082A516 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = arm64;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				AUTOMATION_APPLE_EVENTS = NO;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = RMY84Y8G7M;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -454,6 +457,8 @@
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = "$(SRCROOT)/../GeneratedFFI";
+				INFOPLIST_KEY_CFBundleDisplayName = DynaMoE;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -468,7 +473,7 @@
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				LIBRARY_SEARCH_PATHS = "$(SRCROOT)/../core/target/debug";
-				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				MACOSX_DEPLOYMENT_TARGET = 15.6;
 				MARKETING_VERSION = 0.8.0;
 				PRODUCT_BUNDLE_IDENTIFIER = DRP.DynaMoE;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -481,14 +486,14 @@
 				RUNTIME_EXCEPTION_DISABLE_LIBRARY_VALIDATION = YES;
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SUPPORTED_PLATFORMS = macosx;
+				SUPPORTS_MACCATALYST = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = "DynaMoE-Bridging-Header.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2,7";
 				XROS_DEPLOYMENT_TARGET = 26.5;
 			};
 			name = Debug;
@@ -496,11 +501,12 @@
 		AB4C57DF30324B5B0082A516 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = arm64;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				AUTOMATION_APPLE_EVENTS = NO;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEVELOPMENT_TEAM = RMY84Y8G7M;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -515,6 +521,8 @@
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = "$(SRCROOT)/../GeneratedFFI";
+				INFOPLIST_KEY_CFBundleDisplayName = DynaMoE;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -528,8 +536,11 @@
 				IPHONEOS_DEPLOYMENT_TARGET = 26.5;
 				LD_RUNPATH_SEARCH_PATHS = "@executable_path/Frameworks";
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
-				LIBRARY_SEARCH_PATHS = "$(SRCROOT)/../core/target/debug";
-				MACOSX_DEPLOYMENT_TARGET = 26.5;
+				LIBRARY_SEARCH_PATHS = (
+					"$(SRCROOT)/../core/target/release",
+					"$(SRCROOT)/../core/target/debug",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 15.6;
 				MARKETING_VERSION = 0.8.0;
 				PRODUCT_BUNDLE_IDENTIFIER = DRP.DynaMoE;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -542,14 +553,14 @@
 				RUNTIME_EXCEPTION_DISABLE_LIBRARY_VALIDATION = YES;
 				SDKROOT = auto;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
-				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx xros xrsimulator";
+				SUPPORTED_PLATFORMS = macosx;
+				SUPPORTS_MACCATALYST = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = "DynaMoE-Bridging-Header.h";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
-				TARGETED_DEVICE_FAMILY = "1,2,7";
 				XROS_DEPLOYMENT_TARGET = 26.5;
 			};
 			name = Release;
@@ -557,6 +568,7 @@
 		AB4C57E130324B5B0082A516 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = arm64;
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
@@ -585,6 +597,7 @@
 		AB4C57E230324B5B0082A516 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = arm64;
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
@@ -613,6 +626,7 @@
 		AB4C57E430324B5B0082A516 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = arm64;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = RMY84Y8G7M;
@@ -638,6 +652,7 @@
 		AB4C57E530324B5B0082A516 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = arm64;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = RMY84Y8G7M;
