@@ -1827,13 +1827,48 @@ public final class AgentHarness {
 
     // MARK: - Prompt Formatting & ChatML Generation
 
-    public func buildSystemPrompt(baseSystem: String, modelName: String? = nil) -> String {
+    /// Formats the current date, time, and timezone context for temporal awareness in agent prompts.
+    public static func formattedDateTimeContext(date: Date = Date(), timeZone: TimeZone = .current) -> String {
+        let dateFormatter = DateFormatter()
+        dateFormatter.locale = Locale(identifier: "en_US")
+        dateFormatter.timeZone = timeZone
+        dateFormatter.dateFormat = "EEEE, MMMM d, yyyy 'at' h:mm a zzz"
+        let readableDateTime = dateFormatter.string(from: date)
+
+        let isoFormatter = ISO8601DateFormatter()
+        isoFormatter.timeZone = timeZone
+        let isoDateTime = isoFormatter.string(from: date)
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        let year = calendar.component(.year, from: date)
+
+        let tzName = timeZone.identifier
+        let tzAbbr = timeZone.abbreviation(for: date) ?? ""
+
+        return """
+        # Current Date & Time
+        - Reference Date & Time: \(readableDateTime) (\(isoDateTime))
+        - Current Year: \(year)
+        - Timezone: \(tzName)\(tzAbbr.isEmpty ? "" : " (\(tzAbbr))")
+        - Temporal Context: Today's reference date is \(readableDateTime). When conducting web research (`web_search`), fetching web pages (`web_fetch`), synthesizing recent developments, or reasoning about relative dates ("today", "yesterday", "recent", "this year"), always use \(year) and this reference timestamp.
+        """
+    }
+
+    public func buildSystemPrompt(baseSystem: String, modelName: String? = nil, currentDate: Date = Date()) -> String {
         var cleanBase = baseSystem.trimmingCharacters(in: .whitespacesAndNewlines)
         if cleanBase.isEmpty {
             cleanBase = "You are an expert AI software engineering and reasoning assistant with direct access to local macOS development tools."
         }
 
-        var prompt = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
+        var prompt = ""
+
+        // Inject Current Date & Time at the top if not already provided in baseSystem
+        if !cleanBase.contains("Current Date & Time") {
+            prompt += AgentHarness.formattedDateTimeContext(date: currentDate) + "\n\n"
+        }
+
+        prompt += "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
         for tool in availableToolDefinitions {
             if let data = try? JSONEncoder().encode(tool),
                let jsonStr = String(data: data, encoding: .utf8) {

@@ -565,21 +565,35 @@ public struct ModelConfig: Codable {
         config: ModelConfig?,
         summary: ModelSummary?,
         modelName: String? = nil,
-        modelPath: String? = nil
+        modelPath: String? = nil,
+        currentDate: Date? = nil
     ) -> String {
         let required = resolveRequiredSystemPrompt(config: config, summary: summary, modelName: modelName, modelPath: modelPath).trimmingCharacters(in: .whitespacesAndNewlines)
         let user = userPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
 
+        var combined: String
         if !required.isEmpty && !user.isEmpty {
             if user.contains(required) {
-                return user
+                combined = user
+            } else {
+                combined = "\(required)\n\n\(user)"
             }
-            return "\(required)\n\n\(user)"
         } else if !required.isEmpty {
-            return required
+            combined = required
         } else {
-            return user
+            combined = user
         }
+
+        if let date = currentDate, !combined.contains("Current Date & Time") {
+            let temporalContext = AgentHarness.formattedDateTimeContext(date: date)
+            if combined.isEmpty {
+                return temporalContext
+            } else {
+                return "\(temporalContext)\n\n\(combined)"
+            }
+        }
+
+        return combined
     }
 
     /// Determines whether a given model architecture/configuration supports native thinking / reasoning tokens

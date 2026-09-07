@@ -7106,6 +7106,120 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         XCTAssertTrue(result.isCompleted)
         XCTAssertTrue(result.resultJSON.contains("Example") || result.resultJSON.contains("Domain"), "Should retrieve page content")
     }
+
+    // MARK: - Current Date & Time System Prompt Tests
+
+    func testAgentHarnessCurrentDateTimeContextFormatting() {
+        var calendar = Calendar(identifier: .gregorian)
+        guard let tz = TimeZone(identifier: "America/New_York") else {
+            XCTFail("Could not create America/New_York timezone")
+            return
+        }
+        calendar.timeZone = tz
+        var components = DateComponents()
+        components.year = 2026
+        components.month = 9
+        components.day = 7
+        components.hour = 10
+        components.minute = 30
+        components.second = 0
+        guard let testDate = calendar.date(from: components) else {
+            XCTFail("Could not create test date")
+            return
+        }
+
+        let context = AgentHarness.formattedDateTimeContext(date: testDate, timeZone: tz)
+        XCTAssertTrue(context.contains("# Current Date & Time"))
+        XCTAssertTrue(context.contains("Monday, September 7, 2026"))
+        XCTAssertTrue(context.contains("10:30 AM"))
+        XCTAssertTrue(context.contains("Current Year: 2026"))
+        XCTAssertTrue(context.contains("2026-09-07"))
+        XCTAssertTrue(context.contains("America/New_York"))
+        XCTAssertTrue(context.contains("web_search"))
+        XCTAssertTrue(context.contains("web_fetch"))
+    }
+
+    func testAgentHarnessBuildSystemPromptIncludesDateTime() {
+        let harness = AgentHarness.shared
+        var calendar = Calendar(identifier: .gregorian)
+        let tz = TimeZone(identifier: "America/New_York")!
+        calendar.timeZone = tz
+        var components = DateComponents()
+        components.year = 2026
+        components.month = 9
+        components.day = 7
+        components.hour = 14
+        components.minute = 15
+        let testDate = calendar.date(from: components)!
+
+        let prompt = harness.buildSystemPrompt(
+            baseSystem: "You are an expert engineer.",
+            modelName: "TestModel",
+            currentDate: testDate
+        )
+
+        XCTAssertTrue(prompt.contains("# Current Date & Time"))
+        XCTAssertTrue(prompt.contains("September 7, 2026"))
+        XCTAssertTrue(prompt.contains("Current Year: 2026"))
+        XCTAssertTrue(prompt.contains("# Tools"))
+        XCTAssertTrue(prompt.contains("web_search"))
+        XCTAssertTrue(prompt.contains("<tool_call>"))
+        XCTAssertTrue(prompt.contains("You are an expert engineer."))
+    }
+
+    func testModelConfigBuildEffectiveSystemPromptWithDate() {
+        var calendar = Calendar(identifier: .gregorian)
+        let tz = TimeZone(identifier: "America/New_York")!
+        calendar.timeZone = tz
+        var components = DateComponents()
+        components.year = 2026
+        components.month = 9
+        components.day = 7
+        let testDate = calendar.date(from: components)!
+
+        let effective = ModelConfig.buildEffectiveSystemPrompt(
+            userPrompt: "You are a coding assistant.",
+            config: nil,
+            summary: nil,
+            currentDate: testDate
+        )
+
+        XCTAssertTrue(effective.contains("# Current Date & Time"))
+        XCTAssertTrue(effective.contains("September 7, 2026"))
+        XCTAssertTrue(effective.contains("You are a coding assistant."))
+
+        // Verify deduplication: Passing already-formatted prompt into AgentHarness doesn't duplicate header
+        let agentPrompt = AgentHarness.shared.buildSystemPrompt(baseSystem: effective, currentDate: testDate)
+        let occurrences = agentPrompt.components(separatedBy: "# Current Date & Time").count - 1
+        XCTAssertEqual(occurrences, 1, "Temporal context should only appear once in agent system prompt")
+    }
+
+    func testSystemPromptTemporalStabilityForKVCachePrefix() {
+        var calendar = Calendar(identifier: .gregorian)
+        let tz = TimeZone(identifier: "America/New_York")!
+        calendar.timeZone = tz
+        var components = DateComponents()
+        components.year = 2026
+        components.month = 9
+        components.day = 7
+        components.hour = 9
+        components.minute = 0
+        let sessionStartDate = calendar.date(from: components)!
+
+        // Turn 1
+        let turn1System = AgentHarness.shared.buildSystemPrompt(
+            baseSystem: "Autonomous reasoning assistant.",
+            currentDate: sessionStartDate
+        )
+
+        // Turn 2: Occurs 10 minutes later in conversation, but anchored to sessionStartDate
+        let turn2System = AgentHarness.shared.buildSystemPrompt(
+            baseSystem: "Autonomous reasoning assistant.",
+            currentDate: sessionStartDate
+        )
+
+        XCTAssertEqual(turn1System, turn2System, "System prompt prefix must remain 100% identical across conversation turns for KV-cache prefix hits")
+    }
 }
 
 

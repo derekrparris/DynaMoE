@@ -1334,6 +1334,7 @@ struct ContentView: View {
         if sessions[sessionIdx].messages.filter({ $0.role == .user }).count == 1 {
             let cleanTitle = text.prefix(28).trimmingCharacters(in: .whitespacesAndNewlines)
             sessions[sessionIdx].title = cleanTitle.isEmpty ? "Chat" : String(cleanTitle)
+            sessions[sessionIdx].createdAt = Date()
         }
         
         let modelSupportsThinking = activeModelSupportsThinking
@@ -1345,19 +1346,22 @@ struct ContentView: View {
         
         // Build prompt formatted with chat template
         var promptString = ""
+        let conversationDate = sessions[sessionIdx].createdAt
         var effectiveSystem = ModelConfig.buildEffectiveSystemPrompt(
             userPrompt: systemPrompt,
             config: modelConfig,
             summary: summary,
             modelName: activeModelDisplayName,
-            modelPath: activeLoadedModelPath
+            modelPath: activeLoadedModelPath,
+            currentDate: conversationDate
         ).trimmingCharacters(in: .whitespacesAndNewlines)
 
         let agentToolsEnabled = (sessions[sessionIdx].isAgentToolsEnabled ?? defaultAgentToolsEnabled)
         if agentToolsEnabled {
             effectiveSystem = AgentHarness.shared.buildSystemPrompt(
                 baseSystem: effectiveSystem,
-                modelName: activeModelDisplayName
+                modelName: activeModelDisplayName,
+                currentDate: conversationDate
             )
         }
 
@@ -3101,12 +3105,20 @@ struct ContentView: View {
                          (summary.tensors.contains(where: { $0.name.contains("dense_gate_up_proj") })) ||
                          (summary.tensors.contains(where: { $0.name.hasPrefix("model.layers.0.mlp.gate_proj") }) && summary.layerCount == 22)
 
+        let generationDate: Date
+        if let sId = sessionId, let sess = sessions.first(where: { $0.id == sId }) {
+            generationDate = sess.createdAt
+        } else {
+            generationDate = Date()
+        }
+
         let cleanSystem = ModelConfig.buildEffectiveSystemPrompt(
             userPrompt: systemPrompt,
             config: modelConfig,
             summary: summary,
             modelName: activeModelDisplayName,
-            modelPath: activeLoadedModelPath
+            modelPath: activeLoadedModelPath,
+            currentDate: generationDate
         ).trimmingCharacters(in: .whitespacesAndNewlines)
 
         let modelSupportsThinking = activeModelSupportsThinking
