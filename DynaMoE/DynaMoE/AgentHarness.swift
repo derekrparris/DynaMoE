@@ -844,28 +844,35 @@ public final class WebSearchTool: AgentTool {
             }
 
             if results.isEmpty {
-                let msg = "No web search results found for query: \"\(cleanQuery)\""
                 let res = AgentHarness.toolSuccessJSON(tool: "web_search", data: ["query": cleanQuery, "count": 0, "results": []])
-                return (res, msg, nil, false)
+                return (res, res, nil, false)
             }
 
-            var readableOutput = "Found \(results.count) web search results for \"\(cleanQuery)\":\n\n"
+            var enrichedResults: [[String: Any]] = []
             for (idx, item) in results.enumerated() {
-                readableOutput += "\(idx + 1). \(item["title"] ?? "Untitled")\n"
-                readableOutput += "   URL: \(item["url"] ?? "")\n"
+                let urlStr = item["url"] ?? ""
+                let host = URL(string: urlStr)?.host?.replacingOccurrences(of: "www.", with: "") ?? ""
+                let isOfficial = AgentHarness.isOfficialVendorDomain(host)
+                var entry: [String: Any] = [
+                    "position": idx + 1,
+                    "title": item["title"] ?? "Untitled",
+                    "url": urlStr,
+                    "domain": host,
+                    "is_official_domain": isOfficial
+                ]
                 if let snippet = item["snippet"], !snippet.isEmpty {
-                    readableOutput += "   Snippet: \(snippet)\n"
+                    let cleanSnippet = AgentHarness.sanitizeText(snippet.trimmingCharacters(in: .whitespacesAndNewlines))
+                    entry["snippet"] = cleanSnippet.count > 300 ? String(cleanSnippet.prefix(300)) + "..." : cleanSnippet
                 }
-                readableOutput += "\n"
+                enrichedResults.append(entry)
             }
 
-            let cleanStdout = AgentHarness.truncateText(AgentHarness.sanitizeText(readableOutput.trimmingCharacters(in: .whitespacesAndNewlines)), limit: maxOutputLength)
             let res = AgentHarness.toolSuccessJSON(tool: "web_search", data: [
                 "query": cleanQuery,
                 "count": results.count,
-                "results": results
+                "results": enrichedResults
             ])
-            return (res, cleanStdout, nil, false)
+            return (res, res, nil, false)
         } catch {
             let err = "Web search failed: \(error.localizedDescription)"
             return (AgentHarness.toolErrorJSON(tool: "web_search", error: err), nil, err, false)
@@ -1033,13 +1040,49 @@ public final class WebFetchTool: AgentTool {
                 contentToReturn = fullCleaned
             }
 
-            let res = AgentHarness.toolSuccessJSON(tool: "web_fetch", data: [
+            let domain = url.host?.replacingOccurrences(of: "www.", with: "") ?? ""
+            let isOfficial = AgentHarness.isOfficialVendorDomain(domain)
+
+            var detectedDate: String? = nil
+            if let dateRange = pageHtml.range(of: #"(?is)<time[^>]*>(.*?)</time>"#, options: .regularExpression) {
+                let rawDate = Self.stripHTML(String(pageHtml[dateRange])).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !rawDate.isEmpty && rawDate.count < 50 {
+                    detectedDate = rawDate
+                }
+            }
+            if detectedDate == nil, let metaRange = pageHtml.range(of: #"(?is)<meta[^>]+property=[\"']article:published_time[\"'][^>]+content=[\"']([^\"']+)[\"']"#, options: .regularExpression) {
+                let snippet = String(pageHtml[metaRange])
+                if let contentMatch = snippet.range(of: #"content=[\"']([^\"']+)[\"']"#, options: .regularExpression) {
+                    let rawContent = String(snippet[contentMatch])
+                        .replacingOccurrences(of: "content=\"", with: "")
+                        .replacingOccurrences(of: "content='", with: "")
+                        .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+                    if !rawContent.isEmpty {
+                        detectedDate = rawContent
+                    }
+                }
+            }
+            if detectedDate == nil {
+                let prefixText = String(fullCleaned.prefix(1500))
+                if let match = prefixText.range(of: #"(?i)(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+20\d{2}"#, options: .regularExpression) {
+                    detectedDate = String(prefixText[match])
+                }
+            }
+
+            var resultData: [String: Any] = [
                 "url": url.absoluteString,
+                "domain": domain,
+                "is_official_domain": isOfficial,
                 "title": pageTitle,
-                "length": contentToReturn.count,
+                "content_length": contentToReturn.count,
                 "content": contentToReturn
-            ])
-            return (res, contentToReturn, nil, false)
+            ]
+            if let pubDate = detectedDate {
+                resultData["published_date"] = pubDate
+            }
+
+            let res = AgentHarness.toolSuccessJSON(tool: "web_fetch", data: resultData)
+            return (res, res, nil, false)
         } catch {
             let err = "Failed to fetch web content: \(error.localizedDescription)"
             return (AgentHarness.toolErrorJSON(tool: "web_fetch", error: err), nil, err, false)
@@ -1137,8 +1180,28 @@ public final class WebFetchTool: AgentTool {
         // Strip standalone/void tags or leftover tags
         pageHtml = pageHtml.replacingOccurrences(of: "(?is)<(input|meta|link|svg|path)[^>]*>", with: "", options: .regularExpression)
 
-        // Strip hidden elements: aria-hidden="true" or hidden attribute
+        // Strip accessibility / visually-hidden elements (e.g. screen-reader text like "opens in new window")
+        pageHtml = pageHtml.replacingOccurrences(
+            of: #"(?is)<[^>]+class=[\"'][^\"']*(visually-hidden|sr-only|screen-reader-text|a11y-only)[^\"']*[\"'][^>]*>.*?</[^>]+>"#,
+            with: "",
+            options: .regularExpression
+        )
+
+        // Strip hidden elements: aria-hidden="true" or hidden attribute or presentation role
         pageHtml = pageHtml.replacingOccurrences(of: "(?is)<[^>]+aria-hidden=[\"']true[\"'][^>]*>.*?</[^>]+>", with: "", options: .regularExpression)
+        pageHtml = pageHtml.replacingOccurrences(of: #"(?is)<[^>]+role=[\"'](presentation|none)[\"'][^>]*>.*?</[^>]+>"#, with: "", options: .regularExpression)
+
+        // Strip common web scraper noise phrases
+        let noisePhrases = [
+            #"(?i)opens in (a )?new (window|tab)"#,
+            #"(?i)skip to (main )?content"#,
+            #"(?i)share this (article|page|story)"#,
+            #"(?i)cookie (settings|preferences|notice|policy)"#,
+            #"(?i)all rights reserved\."#
+        ]
+        for phrase in noisePhrases {
+            pageHtml = pageHtml.replacingOccurrences(of: phrase, with: "", options: .regularExpression)
+        }
 
         // Strip unhydrated JavaScript template tokens like {MBN_2026_MAIN}, {price.display.smart}, {{model.name}}, etc.
         pageHtml = pageHtml.replacingOccurrences(of: #"\{[A-Za-z0-9_$.]+\}"#, with: "", options: .regularExpression)
@@ -1150,6 +1213,11 @@ public final class WebFetchTool: AgentTool {
             let mainSnippet = String(pageHtml[mainRange])
             if mainSnippet.count > 300 {
                 pageHtml = mainSnippet
+            }
+        } else if let mainDivRange = pageHtml.range(of: #"(?is)<div[^>]+role=[\"']main[\"'][^>]*>([\s\S]*?)</div>"#, options: .regularExpression) {
+            let divSnippet = String(pageHtml[mainDivRange])
+            if divSnippet.count > 300 {
+                pageHtml = divSnippet
             }
         }
 
@@ -1175,20 +1243,32 @@ public final class WebFetchTool: AgentTool {
         // Strip remaining HTML tags
         let text = stripHTML(pageHtml)
 
-        // Clean up excessive whitespace & blank lines
+        // Clean up excessive whitespace, blank lines, and orphan markdown tokens
         let lines = text.components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespaces) }
         var resultLines: [String] = []
         var consecutiveBlanks = 0
         for line in lines {
-            if line.isEmpty {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            // Strip orphan markdown headers (e.g. line is just "#", "##", "###", "####")
+            let withoutHash = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "# \t"))
+            if withoutHash.isEmpty && trimmed.hasPrefix("#") {
+                continue
+            }
+            // Strip orphan bullet points (e.g. line is just "-", "*", "+", "•")
+            let withoutBullet = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "-*+• \t"))
+            if withoutBullet.isEmpty && (trimmed.hasPrefix("-") || trimmed.hasPrefix("*") || trimmed.hasPrefix("+") || trimmed.hasPrefix("•")) {
+                continue
+            }
+
+            if trimmed.isEmpty {
                 consecutiveBlanks += 1
                 if consecutiveBlanks <= 1 {
                     resultLines.append("")
                 }
             } else {
                 consecutiveBlanks = 0
-                resultLines.append(line)
+                resultLines.append(trimmed)
             }
         }
 
@@ -2164,6 +2244,11 @@ public final class AgentHarness {
         - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
 
         Web Research & Grounding Guidelines:
+        - Structured Tool Responses: Tools return structured JSON objects containing metadata (such as `domain`, `is_official_domain`, `published_date`, `title`) and `content`. Use these keys to evaluate source authority.
+        - Temporal Grounding & Live Reality: Your pre-training weights have a fixed past knowledge cutoff. You are operating live in real-time in the current year. Hardware chips (e.g. Apple Silicon M4, M5 Max, M5 Ultra), memory capacities (e.g. 512GB unified memory), operating system versions, and corporate executives (e.g. Apple's Johny Srouji, John Ternus, etc.) will frequently be newer than your pre-training weights.
+        - Authoritative Official Domain Reality: When content is retrieved from official vendor domains (e.g. apple.com, developer.apple.com, github.com) via `web_fetch` or `web_search`, TREAT IT AS GROUND-TRUTH FACTUAL REALITY.
+        - Never Reject Live Data: NEVER dismiss, ignore, or second-guess official web results as "hallucinated", "parody", "machine-generated", or "corrupted" simply because chip numbers, specifications, release dates, or executive names are newer than your internal knowledge base. Live web data always supersedes frozen pre-training memory.
+        - Press Releases & Marketing Phrasing: Vendor announcements often repeat key performance metrics across multiple sections (e.g. "up to 3.9x faster AI performance" in summaries, quotes, and comparison lists) and use idiomatic expressions (e.g. "rounds out connectivity"). Do not mistake marketing repetition or real executive quotes for machine errors.
         - Neutral Queries First: When searching for current products, technical specs, or news, formulate objective, neutral queries (e.g. "Apple Mac mini official current specifications", NOT "Mac mini M5 Max 2025"). Never embed unverified chip numbers or future years into your initial queries.
         - Strict URL Grounding: ONLY fetch URLs returned by `web_search`. NEVER invent, guess, or synthesize article numbers or support URLs (e.g., support.apple.com/en-us/104942), as they will lead to 404s or unrelated topics.
         - Official vs. Speculative Rumors: Distinguish between official shipping hardware (on vendor domains like apple.com, official documentation, or verified reviews) versus speculative rumors ("rumored", "expected to", "leaks", "concept").
@@ -2530,6 +2615,24 @@ public final class AgentHarness {
         let tail = text.suffix(tailCount)
         let truncated = text.count - (headCount + tailCount)
         return "\(head)\n\n... [truncated \(truncated) characters] ...\n\n\(tail)"
+    }
+
+    public static func isOfficialVendorDomain(_ host: String) -> Bool {
+        let h = host.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !h.isEmpty else { return false }
+        let officialSuffixes = [
+            "apple.com", "microsoft.com", "github.com", "google.com",
+            "openai.com", "anthropic.com", "nvidia.com", "meta.com",
+            "wikipedia.org", "w3.org", "ietf.org", "kernel.org",
+            "python.org", "rust-lang.org", "swift.org", "developer.apple.com"
+        ]
+        if officialSuffixes.contains(where: { h == $0 || h.hasSuffix("." + $0) }) {
+            return true
+        }
+        if h.hasSuffix(".gov") || h.hasSuffix(".edu") {
+            return true
+        }
+        return false
     }
 
     public static func toolSuccessJSON(tool: String, data: [String: Any]) -> String {

@@ -7340,6 +7340,58 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         XCTAssertTrue(systemPrompt.contains("Official vs. Speculative Rumors"), "Must instruct agent to differentiate shipping hardware from rumors")
         XCTAssertTrue(systemPrompt.contains("Targeted In-Page Queries"), "Must instruct agent on using query parameter in web_fetch")
     }
+
+    func testWebFetchAccessibilityAndOrphanCleaning() {
+        let pressReleaseHTML = """
+        <html>
+        <body>
+        <a href="https://example.com" target="_blank"><span class="visually-hidden">opens in new window</span></a>
+        <h1></h1>
+        <p>PRESS RELEASE</p>
+        <p>August 25, 2026</p>
+        <h2></h2>
+        <p>Apple introduces new Mac Studio with M5 Max and M5 Ultra — the ultimate desktop for on‑device AI.</p>
+        <ul>
+            <li></li>
+            <li></li>
+            <li></li>
+        </ul>
+        <p>Apple today announced the new Mac Studio, featuring M5 Max and the all-new M5 Ultra.</p>
+        </body>
+        </html>
+        """
+
+        let cleaned = WebFetchTool.cleanHTMLStructure(pressReleaseHTML)
+        XCTAssertFalse(cleaned.contains("opens in new window"), "Must strip screen-reader 'opens in new window' text")
+
+        let lines = cleaned.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }
+        for line in lines {
+            let withoutHash = line.trimmingCharacters(in: CharacterSet(charactersIn: "# \t"))
+            if withoutHash.isEmpty && line.hasPrefix("#") {
+                XCTFail("Must not contain orphan markdown header: '\(line)'")
+            }
+            let withoutBullet = line.trimmingCharacters(in: CharacterSet(charactersIn: "-*+• \t"))
+            if withoutBullet.isEmpty && (line.hasPrefix("-") || line.hasPrefix("*") || line.hasPrefix("+") || line.hasPrefix("•")) {
+                XCTFail("Must not contain orphan markdown bullet: '\(line)'")
+            }
+        }
+        XCTAssertTrue(cleaned.contains("Apple introduces new Mac Studio with M5 Max and M5 Ultra"), "Must preserve real text")
+    }
+
+    func testAgentHarnessTemporalGroundingAndVendorDomainValidation() {
+        XCTAssertTrue(AgentHarness.isOfficialVendorDomain("apple.com"))
+        XCTAssertTrue(AgentHarness.isOfficialVendorDomain("newsroom.apple.com"))
+        XCTAssertTrue(AgentHarness.isOfficialVendorDomain("developer.apple.com"))
+        XCTAssertTrue(AgentHarness.isOfficialVendorDomain("github.com"))
+        XCTAssertTrue(AgentHarness.isOfficialVendorDomain("nasa.gov"))
+        XCTAssertTrue(AgentHarness.isOfficialVendorDomain("mit.edu"))
+        XCTAssertFalse(AgentHarness.isOfficialVendorDomain("randomtechblog.xyz"))
+
+        let prompt = AgentHarness.shared.buildSystemPrompt(baseSystem: "", currentDate: Date())
+        XCTAssertTrue(prompt.contains("Temporal Grounding & Live Reality"), "Must include temporal grounding guidelines")
+        XCTAssertTrue(prompt.contains("Authoritative Official Domain Reality"), "Must instruct agent to trust official vendor domains as ground truth")
+        XCTAssertTrue(prompt.contains("Never Reject Live Data"), "Must explicitly tell agent not to reject newer hardware models or names as hallucinations")
+    }
 }
 
 
