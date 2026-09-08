@@ -971,11 +971,11 @@ public final class WebFetchTool: AgentTool {
                 ],
                 "query": [
                     "type": "string",
-                    "description": "Optional search keywords to filter and prioritize within the page (e.g. 'processor, memory, gpu'). When provided, matching sections and specification tables are prioritized first."
+                    "description": "Optional search keywords to filter sections on exceptionally large web pages (over 20,000 characters). Omit this parameter for standard articles and spec pages to receive the full, clean document in natural reading order."
                 ],
                 "max_length": [
                     "type": "integer",
-                    "description": "Optional maximum character length of returned content (defaults to 6,000 characters, up to 20,000)."
+                    "description": "Optional maximum character length of returned content (defaults to 16,000 characters, up to 30,000)."
                 ]
             ]),
             "required": AnyCodable(["url"])
@@ -992,8 +992,8 @@ public final class WebFetchTool: AgentTool {
 
         let queryFilter = (arguments["query"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         let customMax = arguments["max_length"] as? Int
-        let defaultLimit = max(6000, maxOutputLength)
-        let limit = customMax.map { min(20000, max(500, $0)) } ?? defaultLimit
+        let defaultLimit = max(16000, maxOutputLength)
+        let limit = customMax.map { min(30000, max(1000, $0)) } ?? defaultLimit
 
         do {
             var html: String? = nil
@@ -1032,12 +1032,16 @@ public final class WebFetchTool: AgentTool {
             let fullCleaned = Self.cleanHTMLStructure(pageHtml)
             var contentToReturn: String
 
-            if let q = queryFilter, !q.isEmpty {
-                contentToReturn = Self.filterContentByQuery(fullCleaned, query: q, limit: limit)
-            } else if fullCleaned.count > limit {
-                contentToReturn = String(fullCleaned.prefix(limit)) + "\n\n... [Content truncated at \(limit) characters]"
-            } else {
+            if fullCleaned.count <= limit {
+                // If the entire cleaned page fits within the budget, ALWAYS preserve full natural reading order.
+                // Never shuffle, slice, or fragment a document that fits in context.
                 contentToReturn = fullCleaned
+            } else if let q = queryFilter, !q.isEmpty {
+                // For oversized documents where a query was explicitly provided, extract matching sections
+                // while strictly preserving original sequential document order.
+                contentToReturn = Self.filterContentByQuery(fullCleaned, query: q, limit: limit)
+            } else {
+                contentToReturn = String(fullCleaned.prefix(limit)) + "\n\n... [Content truncated at \(limit) characters]"
             }
 
             let domain = url.host?.replacingOccurrences(of: "www.", with: "") ?? ""
@@ -1236,6 +1240,13 @@ public final class WebFetchTool: AgentTool {
         // Convert bold / strong
         pageHtml = pageHtml.replacingOccurrences(of: "(?i)<(strong|b)[^>]*>([\\s\\S]*?)</\\1>", with: "**$2**", options: .regularExpression)
 
+        // Convert definition lists <dt> and <dd>
+        pageHtml = pageHtml.replacingOccurrences(of: "(?i)<dt[^>]*>([\\s\\S]*?)</dt>", with: "\n\n### $1\n", options: .regularExpression)
+        pageHtml = pageHtml.replacingOccurrences(of: "(?i)</?dd[^>]*>", with: "\n", options: .regularExpression)
+
+        // Convert section heading containers (e.g., class="...section-header...", class="...section-title...", etc.)
+        pageHtml = pageHtml.replacingOccurrences(of: #"(?i)<div[^>]*class=[\"'][^\"']*(?:section-header|section-title|spec-header|headline-reduced|category-header)[^\"']*[\"'][^>]*>([\s\S]*?)</div>"#, with: "\n\n## $1\n\n", options: .regularExpression)
+
         // Replace other block tags with newlines
         pageHtml = pageHtml.replacingOccurrences(of: "(?i)</?(p|div|section|blockquote|pre|code)[^>]*>", with: "\n", options: .regularExpression)
         pageHtml = pageHtml.replacingOccurrences(of: "(?i)<br\\s*/?>", with: "\n", options: .regularExpression)
@@ -1275,7 +1286,7 @@ public final class WebFetchTool: AgentTool {
         return resultLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Prioritizes content sections matching query keywords
+    /// Extracts content sections matching query keywords while strictly preserving natural document order
     public static func filterContentByQuery(_ content: String, query: String, limit: Int) -> String {
         let cleanQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanQuery.isEmpty else {
@@ -1294,55 +1305,49 @@ public final class WebFetchTool: AgentTool {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
 
-        var scoredBlocks: [(block: String, score: Int)] = []
+        var matchingBlocks: [String] = []
+        var currentLength = 0
+        var lastHeading: String? = nil
+
+        let headerPrefix = "### Key Sections Matching \"\(cleanQuery)\":\n"
+        matchingBlocks.append(headerPrefix)
+        currentLength += headerPrefix.count
+
+        // Iterate through blocks in their ORIGINAL sequential document order.
+        // Never sort by keyword score, which destroys linear reading order and creates confusing permutations.
         for block in rawBlocks {
+            if block.hasPrefix("#") {
+                lastHeading = block
+            }
+
             let lower = block.lowercased()
-            var score = 0
-            for term in terms {
-                if lower.contains(term) {
-                    score += 10
-                    // Bonus if it's in a markdown table or heading
-                    if block.contains("|") || block.hasPrefix("#") {
-                        score += 5
+            let matches = terms.contains { lower.contains($0) }
+            if matches {
+                // If there's an associated parent heading we haven't included yet, prepend it
+                if let heading = lastHeading, !matchingBlocks.contains(heading) {
+                    if currentLength + heading.count + 2 <= limit {
+                        matchingBlocks.append(heading)
+                        currentLength += heading.count + 2
                     }
                 }
+
+                if !matchingBlocks.contains(block) {
+                    if currentLength + block.count + 2 > limit {
+                        matchingBlocks.append("... [Additional sections truncated to stay within character limit]")
+                        break
+                    }
+                    matchingBlocks.append(block)
+                    currentLength += block.count + 2
+                }
             }
-            scoredBlocks.append((block, score))
         }
 
-        let matching = scoredBlocks.filter { $0.score > 0 }.sorted { $0.score > $1.score }
-        let nonMatching = scoredBlocks.filter { $0.score == 0 }
-
-        if matching.isEmpty {
+        if matchingBlocks.count <= 1 {
+            // No matching blocks found
             return String(content.prefix(limit))
         }
 
-        var prioritized: [String] = []
-        prioritized.append("### Key Sections Matching \"\(cleanQuery)\":\n")
-        var currentLength = prioritized[0].count
-
-        for item in matching {
-            if currentLength + item.block.count + 2 > limit {
-                break
-            }
-            prioritized.append(item.block)
-            currentLength += item.block.count + 2
-        }
-
-        // Fill remaining budget with other context
-        if currentLength < limit && !nonMatching.isEmpty {
-            prioritized.append("\n### Additional Page Context:\n")
-            currentLength += prioritized.last!.count
-            for item in nonMatching {
-                if currentLength + item.block.count + 2 > limit {
-                    break
-                }
-                prioritized.append(item.block)
-                currentLength += item.block.count + 2
-            }
-        }
-
-        return prioritized.joined(separator: "\n\n")
+        return matchingBlocks.joined(separator: "\n\n")
     }
 
     public static func stripHTML(_ input: String) -> String {
@@ -2252,7 +2257,8 @@ public final class AgentHarness {
         - Neutral Queries First: When searching for current products, technical specs, or news, formulate objective, neutral queries (e.g. "Apple Mac mini official current specifications", NOT "Mac mini M5 Max 2025"). Never embed unverified chip numbers or future years into your initial queries.
         - Strict URL Grounding: ONLY fetch URLs returned by `web_search`. NEVER invent, guess, or synthesize article numbers or support URLs (e.g., support.apple.com/en-us/104942), as they will lead to 404s or unrelated topics.
         - Official vs. Speculative Rumors: Distinguish between official shipping hardware (on vendor domains like apple.com, official documentation, or verified reviews) versus speculative rumors ("rumored", "expected to", "leaks", "concept").
-        - Targeted In-Page Queries: Use `web_fetch(url: "...", query: "...")` with relevant keywords (e.g. `query: "processor, gpu, memory"`) to directly retrieve the exact specification tables or sections on dense pages.
+        - Natural Linear Fetching: When calling `web_fetch`, omit the `query` parameter to receive the full, clean document in natural top-to-bottom reading order.
+        - Multi-Category Technical Specifications: Official product spec sheets combine multiple hardware, software, physical, and environmental categories in a single document (such as CPU/GPU core configurations, unified memory bandwidth, video codecs like H.264/HEVC/ProRes/AV1, display protocols, Thunderbolt ports, storage operating temperatures down to –40°C, operating altitudes up to 16,400 ft, and recycled material percentages). Do not confuse environmental storage limits or altitudes with processor specs, and NEVER dismiss a multi-domain specification page as "garbled" or "parody" simply because it includes diverse environmental, physical, or audio/video standards. Extract the exact metrics requested by the user and summarize them cleanly.
         </IMPORTANT>
         """
 

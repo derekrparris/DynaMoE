@@ -7338,7 +7338,38 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         XCTAssertTrue(systemPrompt.contains("Neutral Queries First"), "Must instruct agent to use neutral queries")
         XCTAssertTrue(systemPrompt.contains("Strict URL Grounding"), "Must instruct agent to strictly ground URLs from web_search")
         XCTAssertTrue(systemPrompt.contains("Official vs. Speculative Rumors"), "Must instruct agent to differentiate shipping hardware from rumors")
-        XCTAssertTrue(systemPrompt.contains("Targeted In-Page Queries"), "Must instruct agent on using query parameter in web_fetch")
+        XCTAssertTrue(systemPrompt.contains("Natural Linear Fetching"), "Must instruct agent to use natural linear fetching")
+        XCTAssertTrue(systemPrompt.contains("Multi-Category Technical Specifications"), "Must instruct agent on multi-category spec sheets")
+    }
+
+    func testWebFetchPreservesStrictSequentialOrder() {
+        let sampleDoc = """
+        # Mac Studio - Technical Specifications
+
+        ## Chip
+        - Apple M5 Max chip with 18-core CPU and 40-core GPU
+
+        ## Memory
+        - 36GB unified memory, configurable to 128GB
+
+        ## Storage
+        - 512GB SSD or 1TB SSD
+
+        ## Environmental Requirements
+        - Operating temperature: 50° to 95° F
+        - Storage temperature: –40° to 116° F
+        - Operating altitude: up to 16,400 feet
+        """
+
+        let filtered = WebFetchTool.filterContentByQuery(sampleDoc, query: "storage m5 max", limit: 3000)
+        let chipIndex = filtered.range(of: "M5 Max chip")?.lowerBound
+        let envIndex = filtered.range(of: "Storage temperature")?.lowerBound
+        XCTAssertNotNil(chipIndex)
+        XCTAssertNotNil(envIndex)
+        if let ci = chipIndex, let ei = envIndex {
+            XCTAssertTrue(ci < ei, "Matching blocks must strictly maintain sequential document order (Chip before Storage temperature)")
+        }
+        XCTAssertFalse(filtered.contains("### Additional Page Context:"), "Must not duplicate page under Additional Page Context")
     }
 
     func testWebFetchAccessibilityAndOrphanCleaning() {
