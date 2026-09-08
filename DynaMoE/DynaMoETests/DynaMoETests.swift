@@ -7423,6 +7423,151 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         XCTAssertTrue(prompt.contains("Authoritative Official Domain Reality"), "Must instruct agent to trust official vendor domains as ground truth")
         XCTAssertTrue(prompt.contains("Never Reject Live Data"), "Must explicitly tell agent not to reject newer hardware models or names as hallucinations")
     }
+
+    func testWebFetchStructuredSectionsAndAriaGridExtraction() {
+        let sampleAppleHTML = """
+        <div class="techspecs-header-row visuallyhidden">
+            <div role="columnheader" class="techspecs-rowheader">&nbsp;</div>
+            <div role="columnheader" class="techspecs-columnheader">Mac Studio, Model1</div>
+            <div role="columnheader" class="techspecs-columnheader">Mac Studio, Model2</div>
+        </div>
+        <div class="techspecs-row" role="row">
+            <div class="techspecs-rowheader" role="rowheader">Finish</div>
+            <div class="techspecs-column" role="cell">Silver</div>
+        </div>
+        <div class="techspecs-row" role="row">
+            <div class="techspecs-rowheader" role="rowheader">Price</div>
+            <div class="techspecs-column" role="cell">$2499</div>
+            <div class="techspecs-column" role="cell">$5499</div>
+        </div>
+        <div class="techspecs-row" role="row">
+            <div class="techspecs-rowheader" role="rowheader">Chip</div>
+            <p class="techspecs-subheader">Apple M5 Max chip</p>
+            <ul>
+                <li>18-core CPU</li>
+                <li>32-core GPU</li>
+                <li>16-core Neural Engine</li>
+            </ul>
+        </div>
+        <figure class="techspecs-figure">
+            <picture><img src="diagram.png" alt="Dimensions"></picture>
+            <div class="caption-wrapper">
+                <p>Width: 7.7 inches (19.7 cm)</p>
+                <p>Height: 3.7 inches (9.5 cm)</p>
+            </div>
+        </figure>
+        <div class="techspecs-row" role="row">
+            <div class="techspecs-rowheader" role="rowheader">Size and Weight</div>
+            <ul>
+                <li>Height: 3.7 inches (9.5 cm)</li>
+                <li>Width: 7.7 inches (19.7 cm)</li>
+                <li>Depth: 7.7 inches (19.7 cm)</li>
+                <li>Weight: 6.0 pounds (2.7 kg)</li>
+            </ul>
+        </div>
+        """
+
+        let cleaned = WebFetchTool.cleanHTMLStructure(sampleAppleHTML)
+
+        // 1. Must strip Model1 / Model2 columnheader placeholders
+        XCTAssertFalse(cleaned.contains("Model1"), "Must strip Model1 accessibility columnheader")
+        XCTAssertFalse(cleaned.contains("Model2"), "Must strip Model2 accessibility columnheader")
+
+        // 2. Must format Price and Finish clearly
+        XCTAssertTrue(cleaned.contains("## Finish\nSilver"), "Must format Finish row cleanly")
+        XCTAssertTrue(cleaned.contains("Base (M5 Max): $2499"), "Must format base price")
+        XCTAssertTrue(cleaned.contains("High-End (M5 Ultra): $5499"), "Must format high-end price")
+
+        // 3. Must strip diagram pins from caption-wrapper & figure
+        let countWidth = cleaned.components(separatedBy: "Width: 7.7 inches").count - 1
+        XCTAssertEqual(countWidth, 1, "Must only contain Width dimension once (caption-wrapper duplicate stripped)")
+
+        // 4. Must convert headers
+        XCTAssertTrue(cleaned.contains("## Chip"), "Must convert techspecs-rowheader to ## Chip")
+        XCTAssertTrue(cleaned.contains("### Apple M5 Max chip"), "Must convert techspecs-subheader to ### Subheader")
+
+        // 5. Must extract structured sections
+        let sections = AgentHarness.extractStructuredSections(from: cleaned)
+        XCTAssertTrue(sections.count >= 4, "Must extract at least 4 structured sections")
+        let headings = sections.compactMap { $0["heading"] }
+        XCTAssertTrue(headings.contains("Finish"))
+        XCTAssertTrue(headings.contains("Price"))
+        XCTAssertTrue(headings.contains("Chip"))
+        XCTAssertTrue(headings.contains("Size and Weight"))
+
+        if let chipSection = sections.first(where: { $0["heading"] == "Chip" }) {
+            XCTAssertTrue(chipSection["details"]?.contains("18-core CPU") == true)
+            XCTAssertTrue(chipSection["details"]?.contains("32-core GPU") == true)
+        }
+    }
+
+    func testAgentHarnessStructuredSectionsAndReleaseCyclePromptGuardrails() {
+        let prompt = AgentHarness.shared.buildSystemPrompt(baseSystem: "", currentDate: Date())
+        XCTAssertTrue(prompt.contains("Structured Tool Responses"), "Must include structured tool responses in prompt")
+        XCTAssertTrue(prompt.contains("Hardware Model Numbering & Non-Linear Release Cycles"), "Must include release cycle guidance")
+        XCTAssertTrue(prompt.contains("Workstation Engineering Ratings"), "Must include workstation engineering ratings guidance")
+        XCTAssertTrue(prompt.contains("Real Executive Names & Official Quotes"), "Must include executive names guidance")
+        XCTAssertTrue(prompt.contains("Relative Benchmark Multipliers & Monthly Lease Pricing"), "Must include lease and benchmark guidance")
+    }
+
+    func testPressReleaseNoiseStrippingAndGroundTruthNotices() {
+        let rawNewsroomHTML = """
+        <article class="article">
+            <h1 class="hero-headline">Apple introduces new Mac Studio with M5 Max and M5 Ultra</h1>
+            <div class="article-subhead">Apple's most powerful Mac raises the bar for local AI</div>
+            <div class="pagebody-copy">CUPERTINO, CALIFORNIA Apple today announced the new Mac Studio...</div>
+            <h2>**A Monumental Step for AI**</h2>
+            <div class="pagebody-copy">"Mac Studio is at the forefront of AI," said Johny Srouji, Apple's senior vice president.</div>
+            <div class="pagebody-copy"><strong>Pricing and Availability</strong></div>
+            <div class="pagebody-copy">
+                <ul>
+                    <li>Mac Studio with M5 Max starts at $2,499.</li>
+                    <li>Lease with Apple Upgrade from $48.99 per month.</li>
+                </ul>
+            </div>
+            <div class="nr-article-share">
+                <div class="sharesheet component">
+                    <p>Share article</p>
+                </div>
+            </div>
+            <div class="docsanddownloads text component">
+                <p>Text of this article</p>
+                <div data-copy-content class="visuallyhidden" aria-hidden="true">
+                    <p>PRESS RELEASE Apple introduces new Mac Studio with M5 Max and M5 Ultra DUPLICATE COPY</p>
+                </div>
+            </div>
+            <div class="presscontacts component">
+                <p>Press Contacts: media.help@apple.com</p>
+            </div>
+        </article>
+        """
+
+        let cleaned = AgentHarness.cleanHTMLStructure(rawNewsroomHTML)
+        // Ensure all noise components and duplicate article clones were stripped
+        XCTAssertFalse(cleaned.contains("Share article"), "Must strip sharesheet")
+        XCTAssertFalse(cleaned.contains("Text of this article"), "Must strip docsanddownloads")
+        XCTAssertFalse(cleaned.contains("DUPLICATE COPY"), "Must strip data-copy-content clone")
+        XCTAssertFalse(cleaned.contains("media.help@apple.com"), "Must strip press contacts")
+
+        // Ensure real content is preserved
+        XCTAssertTrue(cleaned.contains("Johny Srouji"), "Must preserve Johny Srouji quote")
+        XCTAssertTrue(cleaned.contains("$48.99"), "Must preserve lease pricing")
+
+        // Check structured sections
+        let sections = AgentHarness.extractStructuredSections(from: cleaned)
+        let headings = sections.compactMap { $0["heading"] }
+        XCTAssertTrue(headings.contains("A Monumental Step for AI"), "Must clean asterisks from heading")
+        XCTAssertFalse(headings.contains("**A Monumental Step for AI**"), "Must not have raw markdown asterisks in heading name")
+        XCTAssertTrue(headings.contains("Pricing and Availability"), "Must extract Pricing and Availability as a structured heading")
+
+        // Check tool response framing
+        let mockOfficialTurn = AgentHarness.shared.formatToolResponseTurn(
+            responses: ["{\"status\": \"success\", \"is_official_domain\": true, \"result\": {}}"],
+            includeThinkSuffix: true
+        )
+        XCTAssertTrue(mockOfficialTurn.contains("SYSTEM NOTICE: Verified official vendor domain response"), "Must inject official domain ground truth notice")
+        XCTAssertTrue(mockOfficialTurn.hasSuffix("<think>\n"), "Must include think tag suffix")
+    }
 }
 
 
