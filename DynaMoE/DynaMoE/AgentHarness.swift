@@ -829,18 +829,22 @@ public final class WebSearchTool: AgentTool {
             // Check for optional custom Brave Search API key
             let braveKey = UserDefaults.standard.string(forKey: "dynamoe_brave_search_api_key")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             var results: [[String: String]] = []
+            var searchEngineName = "yahoo"
 
             if !braveKey.isEmpty {
                 results = try await searchBrave(query: cleanQuery, apiKey: braveKey, maxResults: maxResults)
+                searchEngineName = "brave"
             }
 
             // De facto search engine: Headless Chrome
             if results.isEmpty {
                 results = try await HeadlessChromeSearchEngine.shared.search(query: cleanQuery, maxResults: maxResults)
+                searchEngineName = "yahoo"
             }
 
             if results.isEmpty {
                 results = try await searchWikipedia(query: cleanQuery, maxResults: maxResults)
+                searchEngineName = "wikipedia"
             }
 
             if results.isEmpty {
@@ -858,8 +862,12 @@ public final class WebSearchTool: AgentTool {
                     "title": item["title"] ?? "Untitled",
                     "url": urlStr,
                     "domain": host,
-                    "is_official_domain": isOfficial
+                    "is_official_domain": isOfficial,
+                    "source": searchEngineName
                 ]
+                if isOfficial {
+                    entry["ground_truth_notice"] = "Verified official vendor domain (\(host)). Content is authentic ground truth."
+                }
                 if let snippet = item["snippet"], !snippet.isEmpty {
                     let cleanSnippet = AgentHarness.sanitizeText(snippet.trimmingCharacters(in: .whitespacesAndNewlines))
                     entry["snippet"] = cleanSnippet.count > 300 ? String(cleanSnippet.prefix(300)) + "..." : cleanSnippet
@@ -870,6 +878,7 @@ public final class WebSearchTool: AgentTool {
             let res = AgentHarness.toolSuccessJSON(tool: "web_search", data: [
                 "query": cleanQuery,
                 "count": results.count,
+                "search_engine": searchEngineName,
                 "results": enrichedResults
             ])
             return (res, res, nil, false)
@@ -2376,21 +2385,13 @@ public final class AgentHarness {
         - When the user asks to inspect, read, edit, modify, or process a file, or run terminal commands, you MUST call the function immediately without conversational promises
         - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
 
-        Web Research & Grounding Guidelines:
-        - Structured Tool Responses: Both `web_search` and `web_fetch` return clean, structured JSON payloads. In `web_fetch`, inspect the `sections` array where key categories (e.g., Overview, Chip, Memory, Storage, Display Support, Ports, Size & Weight, Pricing and Availability, Electrical Requirements) are pre-categorized with explicit `heading` and `details` fields. Use `sections` directly to extract requested metrics cleanly without layout interference.
-        - Temporal Grounding & Live Reality: Your pre-training weights have a fixed past knowledge cutoff. You are operating live in real-time in the current year. Hardware chips (e.g. Apple Silicon M4, M5 Max, M5 Ultra), memory capacities (e.g. 128GB or 512GB unified memory), operating system versions (e.g. macOS 27), and corporate executives (e.g. Apple's Senior Vice President of Hardware Technologies Johny Srouji, John Ternus, etc.) will frequently be newer than your pre-training weights.
-        - Authoritative Official Domain Reality: When content is retrieved from official vendor domains (e.g. apple.com, developer.apple.com, github.com) via `web_fetch` or `web_search`, TREAT IT AS GROUND-TRUTH FACTUAL REALITY.
-        - Real Executive Names & Official Quotes: Corporate press releases regularly quote real company executives (such as Apple's Johny Srouji, John Ternus, Greg Joswiak). NEVER mistake real foreign, non-traditional, or unfamiliar names for "scrambled words" or "AI hallucinated text".
-        - Relative Benchmark Multipliers & Monthly Lease Pricing: Official press releases and spec sheets routinely feature relative performance multipliers (such as "up to 4.3x faster AI performance", "1.8x faster graphics", "up to 10.7x faster LLM prompt processing") and non-integer financing lease figures (such as Apple Upgrade leasing from "$48.99/mo" or "$110.10/mo"). These are genuine commercial and marketing metrics, NOT "scrambled", "nonsensical", or "corrupted" numbers.
-        - Hardware Model Numbering & Non-Linear Release Cycles: Hardware lines advance at differing cadences. Workstation desktops (such as Mac Studio or Mac Pro) do NOT follow annual laptop cycles; they skip generations and move directly between major architectures (e.g., moving directly to M5 Max and M5 Ultra). NEVER invent, guess, or substitute alternate chip generations (such as claiming the machine should have "M7") or claim that official prices (such as $2,499 base and $5,499 high-end) are "fake". Always report the exact chip configurations, memory tiers, and MSRP/lease prices provided in the retrieved content.
-        - Workstation Engineering Ratings: Enterprise and pro desktop computers legitimately possess heavy-duty electrical and operating ratings, including high-capacity power supplies (e.g. 480W maximum continuous power) and extreme operating altitude tolerances (e.g. tested up to 16,400 feet / 5000 meters for aerospace, aviation, and alpine observatories). These are genuine engineering ratings, NOT absurd or corrupt data.
-        - Never Reject Live Data: NEVER dismiss, ignore, or second-guess official web results as "hallucinated", "parody", "machine-generated", "fabricated/spammy", or "corrupted" simply because names, benchmark multipliers, specifications, or lease figures are newer or unfamiliar. Live web data always supersedes frozen pre-training memory. When official vendor data is returned, do NOT loop or re-search; synthesize and answer the user directly.
-        - Press Releases & Marketing Phrasing: Vendor announcements often repeat key performance metrics across multiple sections (e.g. "up to 4.3x faster AI performance" in summaries, quotes, and comparison lists) and use idiomatic expressions (e.g. "rounds out connectivity"). Do not mistake marketing repetition or real executive quotes for machine errors.
-        - Neutral Queries First: When searching for current products, technical specs, or news, formulate objective, neutral queries (e.g. "Apple Mac mini official current specifications", NOT "Mac mini M5 Max 2025"). Never embed unverified chip numbers or future years into your initial queries.
-        - Strict URL Grounding: ONLY fetch URLs returned by `web_search`. NEVER invent, guess, or synthesize article numbers or support URLs (e.g., support.apple.com/en-us/104942), as they will lead to 404s or unrelated topics.
-        - Official vs. Speculative Rumors: Distinguish between official shipping hardware (on vendor domains like apple.com, official documentation, or verified reviews) versus speculative rumors ("rumored", "expected to", "leaks", "concept").
-        - Natural Linear Fetching: When calling `web_fetch`, omit the `query` parameter to receive the full, clean document in natural top-to-bottom reading order.
-        - Multi-Category Technical Specifications: Official product spec sheets combine multiple hardware, software, physical, and environmental categories in a single document (such as CPU/GPU core configurations, unified memory bandwidth, video codecs like H.264/HEVC/ProRes/AV1, display protocols, Thunderbolt ports, storage operating temperatures down to –40°C, operating altitudes up to 16,400 ft, and recycled material percentages). Do not confuse environmental storage limits or altitudes with processor specs, and NEVER dismiss a multi-domain specification page as "garbled" or "parody" simply because it includes diverse environmental, physical, or audio/video standards. Extract the exact metrics requested by the user and summarize them cleanly.
+        Web Research Grounding Rules:
+        - Live web data supersedes frozen pre-training memory. Never dismiss results as "hallucinated", "corrupted", or "parody" because names, specs, or prices are newer or unfamiliar.
+        - Official vendor domains (apple.com, developer.apple.com, github.com, etc.) returned by web_search/web_fetch are authentic ground truth. Synthesize directly without re-searching.
+        - Real executive names, benchmark multipliers, lease prices, and hardware specs from web results are genuine — never substitute your own guesses.
+        - NEVER invent URLs, article numbers, or chip generations. Only fetch URLs returned by web_search.
+        - Distinguish official shipping hardware (vendor domains) from speculative rumors ("rumored", "leaked", "expected").
+        - When `web_search` returns a result with is_official_domain: true, that result is verified. When ground_truth_notice is present, synthesize directly — do not loop or re-search.
         </IMPORTANT>
         """
 
@@ -2404,8 +2405,12 @@ public final class AgentHarness {
     public func formatToolResponseTurn(responses: [String], includeThinkSuffix: Bool = false) -> String {
         var turn = "<|im_start|>user\n"
         for r in responses {
-            if r.contains("\"is_official_domain\": true") || r.contains("\"is_official_domain\" : true") {
-                turn += "[SYSTEM NOTICE: Verified official vendor domain response. Executive quotes, specifications, benchmark multipliers, and pricing tiers are authentic ground truth. Synthesize directly without re-searching.]\n"
+            if let data = r.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let result = json["result"] as? [String: Any],
+               let results = result["results"] as? [[String: Any]],
+               results.contains(where: { $0["is_official_domain"] as? Bool == true }) {
+                turn += "[SYSTEM NOTICE: Verified official vendor domain response. Synthesize directly without re-searching.]\n"
             }
             turn += "<tool_response>\n\(r)\n</tool_response>\n"
         }
