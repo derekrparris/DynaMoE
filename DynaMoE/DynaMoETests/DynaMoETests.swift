@@ -981,6 +981,58 @@ final class DynaMoETests: XCTestCase {
         XCTAssertTrue(nextTurn.hasSuffix("<|im_start|>assistant\n"))
     }
 
+    func testToolDiscoverLoadUnloadLifecycle() async throws {
+        let harness = AgentHarness.shared
+        let previouslyLoaded = Set(harness.loadedTools.keys)
+
+        defer {
+            let toRemove = Set(harness.loadedTools.keys).subtracting(previouslyLoaded)
+            for name in toRemove { _ = try? harness.unloadTool(named: name) }
+            for name in previouslyLoaded where harness.loadedTools[name] == nil {
+                _ = try? harness.loadTool(named: name)
+            }
+        }
+
+        // 1. Core set is loaded up front; heavier tools are not
+        XCTAssertNotNil(harness.loadedTools["shell_run"])
+        XCTAssertNotNil(harness.loadedTools["grep_search"])
+        XCTAssertNotNil(harness.loadedTools["tools_discover"])
+        XCTAssertNil(harness.loadedTools["web_search"])
+        XCTAssertFalse(harness.availableToolDefinitions.contains { $0.function.name == "web_search" })
+        XCTAssertTrue(harness.allToolDefinitions.contains { $0.function.name == "web_search" })
+
+        // 2. tools_discover lists web_search in the catalog
+        let discover = ToolDiscoverTool()
+        let discoverResult = try await discover.execute(arguments: [:], workingDirectory: nil, maxOutputLength: 4000)
+        XCTAssertTrue(discoverResult.resultJSON.contains("web_search"))
+        XCTAssertTrue((discoverResult.stdout ?? "").contains("web_search"))
+
+        // 3. tools_load registers the schema and re-exposes it
+        let loader = ToolLoadTool()
+        let loadResult = try await loader.execute(arguments: ["name": "web_search"], workingDirectory: nil, maxOutputLength: 4000)
+        let loadJSON = try JSONSerialization.jsonObject(with: Data(loadResult.resultJSON.utf8)) as? [String: Any]
+        XCTAssertEqual((loadJSON?["result"] as? [String: Any])?["registration"] as? Bool, true)
+        XCTAssertNotNil(harness.loadedTools["web_search"])
+        XCTAssertTrue(harness.availableToolDefinitions.contains { $0.function.name == "web_search" })
+
+        // 4. formatToolResponseTurn injects the registration notice for the next assistant turn
+        let turn = harness.formatToolResponseTurn(responses: [loadResult.resultJSON])
+        XCTAssertTrue(turn.contains("[TOOL_REGISTRATION]"))
+        XCTAssertTrue(turn.contains("web_search"))
+
+        // 5. Fundamental tools are protected from unload
+        let unloader = ToolUnloadTool()
+        let protectResult = try await unloader.execute(arguments: ["name": "shell_run"], workingDirectory: nil, maxOutputLength: 4000)
+        XCTAssertTrue(protectResult.resultJSON.contains("\"error\""))
+        XCTAssertNotNil(harness.loadedTools["shell_run"])
+
+        // 6. Unload removes the loaded tool again
+        let unloadResult = try await unloader.execute(arguments: ["name": "web_search"], workingDirectory: nil, maxOutputLength: 4000)
+        let unloadJSON = try JSONSerialization.jsonObject(with: Data(unloadResult.resultJSON.utf8)) as? [String: Any]
+        XCTAssertEqual((unloadJSON?["result"] as? [String: Any])?["de_registration"] as? Bool, true)
+        XCTAssertNil(harness.loadedTools["web_search"])
+    }
+
     func testAgentHarnessProcessExecution() async throws {
         let harness = AgentHarness.shared
 
@@ -7162,7 +7214,9 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         XCTAssertTrue(prompt.contains("September 7, 2026"))
         XCTAssertTrue(prompt.contains("Current Year: 2026"))
         XCTAssertTrue(prompt.contains("# Tools"))
-        XCTAssertTrue(prompt.contains("web_search"))
+        XCTAssertTrue(prompt.contains("grep_search"))
+        XCTAssertTrue(prompt.contains("tools_discover"))
+        XCTAssertFalse(prompt.contains("web_search"), "Unloaded tools must not be advertised in the initial system prompt")
         XCTAssertTrue(prompt.contains("<tool_call>"))
         XCTAssertTrue(prompt.contains("You are an expert engineer."))
     }

@@ -95,6 +95,35 @@ public protocol AgentTool {
     func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool)
 }
 
+public extension AgentTool {
+    /// One-word classification used to group `tools_discover` results.
+    var catalogCategory: String { Self.category(for: definition.function.name) }
+
+    /// Short one-line synopsis shown in `tools_discover` listings.
+    var catalogSummary: String {
+        let d = definition.function.description
+        return d.count > 110 ? String(d.prefix(107)) + "..." : d
+    }
+
+    /// Estimated prompt tokens consumed when this tool's schema is loaded into context.
+    func approximatePromptTokens() -> Int {
+        guard let data = try? JSONEncoder().encode(definition) else { return 0 }
+        return max(1, data.count / 4)
+    }
+
+    static func category(for name: String) -> String {
+        switch name {
+        case "find_files", "grep_search", "codebase_search": return "search"
+        case "find_symbol_definition", "find_references": return "analysis"
+        case "web_search", "web_fetch": return "web"
+        case "git_status", "git_diff", "git_commit": return "git"
+        case "spawn_subagent", "get_subagent_status", "send_subagent_message", "list_subagents": return "subagents"
+        case "lint_diagnostics": return "quality"
+        default: return "core"
+        }
+    }
+}
+
 // MARK: - Core Coding & Shell Tool Implementations
 
 /// Tool 1: shell_run — Executes shell commands with working directory & timeout
@@ -1526,6 +1555,189 @@ public final class CompleteTool: AgentTool {
     }
 }
 
+// MARK: - Tool Registry Management (tools_discover / tools_load / tools_unload)
+
+/// Lists installed-but-unloaded tools grouped by category so the model can decide what to load.
+public final class ToolDiscoverTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "tools_discover",
+        description: "Lists additional tools that are installed but not currently loaded, grouped by category with estimated token cost. Call this to inspect what other capabilities are available, then use tools_load to activate one.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "category": [
+                    "type": "string",
+                    "enum": ["search", "analysis", "web", "git", "subagents", "quality"],
+                    "description": "Optional category filter; omit to list all groups."
+                ],
+                "query": [
+                    "type": "string",
+                    "description": "Optional keyword to filter tool names and descriptions."
+                ]
+            ]),
+            "required": AnyCodable([])
+        ]
+    )
+
+    public func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        let categoryFilter = (arguments["category"] as? String)?.lowercased()
+        let queryFilter = (arguments["query"] as? String)?.lowercased()
+        let harness = AgentHarness.shared
+
+        var groups: [String: [[String: Any]]] = [:]
+        for name in harness.tools.keys.sorted() {
+            guard let tool = harness.tools[name], harness.loadedTools[name] == nil else { continue }
+            let cat = tool.catalogCategory
+            if let cf = categoryFilter, !cf.isEmpty, cf != "all", cat != cf { continue }
+            let summary = tool.catalogSummary
+            if let qf = queryFilter, !qf.isEmpty, !(name.contains(qf) || summary.lowercased().contains(qf)) { continue }
+            groups[cat, default: []].append([
+                "name": name,
+                "summary": summary,
+                "estimated_prompt_tokens": tool.approximatePromptTokens()
+            ])
+        }
+
+        let order = ["search", "analysis", "web", "git", "subagents", "quality", "core"]
+        var lines: [String] = []
+        var total = 0
+        for cat in order {
+            guard let items = groups[cat], !items.isEmpty else { continue }
+            lines.append("## \(cat)")
+            for item in items {
+                guard let n = item["name"] as? String,
+                      let s = item["summary"] as? String,
+                      let t = item["estimated_prompt_tokens"] as? Int else { continue }
+                lines.append("- \(n) (~\(t) tokens): \(s)")
+                total += 1
+            }
+        }
+        let readable = lines.isEmpty ? "All installed tools are currently loaded. Nothing to discover." : lines.joined(separator: "\n")
+
+        var groupsJSON: [[String: Any]] = []
+        for cat in order {
+            if let items = groups[cat], !items.isEmpty {
+                groupsJSON.append(["category": cat, "tools": items])
+            }
+        }
+
+        let res = AgentHarness.toolSuccessJSON(tool: "tools_discover", data: [
+            "installed_count": harness.tools.count,
+            "loaded_count": harness.loadedTools.count,
+            "available_count": total,
+            "groups": groupsJSON
+        ])
+        return (res, readable, nil, false)
+    }
+}
+
+/// Loads an installed tool's schema into context so the model may call it directly.
+public final class ToolLoadTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "tools_load",
+        description: "Loads an installed tool's full schema into context so it can be called directly. Use tools_discover to list available tools first. Idempotent: loading an already-loaded tool is a no-op success.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "name": [
+                    "type": "string",
+                    "description": "Exact name of the tool to load (e.g. 'web_search', 'git_diff')."
+                ]
+            ]),
+            "required": AnyCodable(["name"])
+        ]
+    )
+
+    public func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        guard let rawName = arguments["name"] as? String,
+              let name = (rawName as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !name.isEmpty else {
+            let err = "Missing or empty 'name' parameter in tools_load. Run tools_discover to list available tools."
+            return (AgentHarness.toolErrorJSON(tool: "tools_load", error: err), nil, err, false)
+        }
+
+        let harness = AgentHarness.shared
+        if harness.loadedTools[name] != nil {
+            let msg = "Tool '\(name)' is already loaded."
+            let res = AgentHarness.toolSuccessJSON(tool: "tools_load", data: [
+                "tool_name": name,
+                "registration": false,
+                "already_loaded": true,
+                "loaded_count": harness.loadedTools.count,
+                "message": msg
+            ])
+            return (res, msg, nil, false)
+        }
+
+        do {
+            let definition = try harness.loadTool(named: name)
+            let schemaData = try? JSONEncoder().encode(definition)
+            let schemaString = schemaData.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            let msg = "Tool '\(name)' loaded. You may now call it directly using the provided schema."
+            let res = AgentHarness.toolSuccessJSON(tool: "tools_load", data: [
+                "tool_name": name,
+                "registration": true,
+                "schema": schemaString,
+                "loaded_count": harness.loadedTools.count,
+                "message": msg
+            ])
+            return (res, msg, nil, false)
+        } catch {
+            let err = "Failed to load tool '\(name)': \(error.localizedDescription)"
+            return (AgentHarness.toolErrorJSON(tool: "tools_load", error: err), nil, err, false)
+        }
+    }
+}
+
+/// Unloads a loaded tool's schema from context, freeing prompt tokens.
+public final class ToolUnloadTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "tools_unload",
+        description: "Removes a loaded tool's schema from context to free prompt tokens. Fundamental tools (shell_run, file_read, file_edit, file_write, complete, tools_*) cannot be unloaded. Use tools_load to re-enable a tool later.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "name": [
+                    "type": "string",
+                    "description": "Exact name of the loaded tool to unload (e.g. 'web_fetch')."
+                ]
+            ]),
+            "required": AnyCodable(["name"])
+        ]
+    )
+
+    public func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        guard let rawName = arguments["name"] as? String,
+              let name = (rawName as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !name.isEmpty else {
+            let err = "Missing or empty 'name' parameter in tools_unload."
+            return (AgentHarness.toolErrorJSON(tool: "tools_unload", error: err), nil, err, false)
+        }
+
+        let harness = AgentHarness.shared
+        do {
+            let result = try harness.unloadTool(named: name)
+            let msg: String
+            if result.wasLoaded {
+                msg = "Tool '\(name)' unloaded. Call tools_load to re-enable it later."
+            } else {
+                msg = "Tool '\(name)' was not loaded; nothing to unload."
+            }
+            let res = AgentHarness.toolSuccessJSON(tool: "tools_unload", data: [
+                "tool_name": name,
+                "de_registration": result.wasLoaded,
+                "was_loaded": result.wasLoaded,
+                "loaded_count": harness.loadedTools.count,
+                "message": msg
+            ])
+            return (res, msg, nil, false)
+        } catch {
+            let err = "Failed to unload tool '\(name)': \(error.localizedDescription)"
+            return (AgentHarness.toolErrorJSON(tool: "tools_unload", error: err), nil, err, false)
+        }
+    }
+}
+
 /// Tool 10: codebase_search — Hybrid Vector & Lexical search across codebase
 public final class CodebaseSearchTool: AgentTool {
     public let definition = ToolDefinition(
@@ -2264,10 +2476,26 @@ public final class LintDiagnosticsTool: AgentTool {
 public final class AgentHarness {
     public static let shared = AgentHarness()
 
+    /// Every installed tool, whether loaded or not. This is the searchable catalog.
     public private(set) var tools: [String: AgentTool] = [:]
+    /// Subset of `tools` currently exposed to the model in the prompt and grammar.
+    public private(set) var loadedTools: [String: AgentTool] = [:]
     public var defaultWorkingDirectory: URL? = nil
     public var maxToolOutputLength: Int = 4000
     public var maxAgentSteps: Int = 15
+
+    /// Tools seeded into the prompt on startup — the "fundamental" set.
+    public static let coreLoadedToolNames: Set<String> = [
+        "shell_run", "file_read", "file_edit", "file_write",
+        "find_files", "grep_search", "complete",
+        "tools_discover", "tools_load", "tools_unload"
+    ]
+
+    /// Tools the model may never unload through `tools_unload`.
+    public static let nonUnloadableToolNames: Set<String> = [
+        "shell_run", "file_read", "file_edit", "file_write", "complete",
+        "tools_discover", "tools_load", "tools_unload"
+    ]
 
     private init() {
         registerDefaultTools()
@@ -2294,11 +2522,82 @@ public final class AgentHarness {
         registerTool(FindReferencesTool())
         registerTool(LintDiagnosticsTool())
         registerTool(CompleteTool())
-        GrammarConstrainedSampler.shared.registerTools(availableToolDefinitions)
+        registerTool(ToolDiscoverTool())
+        registerTool(ToolLoadTool())
+        registerTool(ToolUnloadTool())
+
+        // Seed the fundamental core set into the active prompt/grammar.
+        for name in Self.coreLoadedToolNames where tools[name] != nil {
+            loadedTools[name] = tools[name]
+        }
+        syncGrammar()
     }
 
     public func registerTool(_ tool: AgentTool) {
         tools[tool.definition.function.name] = tool
+        // Re-registering an already-loaded tool keeps it loaded.
+        if loadedTools[tool.definition.function.name] != nil {
+            loadedTools[tool.definition.function.name] = tool
+        }
+        syncGrammar()
+    }
+
+    // MARK: - Tool Loading Lifecycle
+
+    public enum ToolLoadError: LocalizedError {
+        case unknownTool(String)
+        case nonUnloadable(String)
+
+        public var errorDescription: String? {
+            switch self {
+            case .unknownTool(let name):
+                return "Unknown tool '\(name)'. Call tools_discover to see available installed tools."
+            case .nonUnloadable(let name):
+                return "Tool '\(name)' is a fundamental tool and cannot be unloaded."
+            }
+        }
+    }
+
+    /// Moves an installed tool into the loaded set and re-syncs the grammar sampler.
+    @discardableResult
+    public func loadTool(named name: String) throws -> ToolDefinition {
+        guard let tool = tools[name] else {
+            throw ToolLoadError.unknownTool(name)
+        }
+        let didChange = loadedTools[name] == nil
+        loadedTools[name] = tool
+        if didChange {
+            syncGrammar()
+        }
+        return tool.definition
+    }
+
+    /// Moves a loaded tool back into the catalog and re-syncs the grammar sampler.
+    @discardableResult
+    public func unloadTool(named name: String) throws -> (name: String, wasLoaded: Bool) {
+        guard tools[name] != nil else {
+            throw ToolLoadError.unknownTool(name)
+        }
+        guard !Self.nonUnloadableToolNames.contains(name) else {
+            throw ToolLoadError.nonUnloadable(name)
+        }
+        let wasLoaded = loadedTools.removeValue(forKey: name) != nil
+        if wasLoaded {
+            syncGrammar()
+        }
+        return (name, wasLoaded)
+    }
+
+    /// Resets the loaded set back to the fundamental core tools.
+    public func resetLoadedToolsToCore() {
+        loadedTools.removeAll()
+        for name in Self.coreLoadedToolNames where tools[name] != nil {
+            loadedTools[name] = tools[name]
+        }
+        syncGrammar()
+    }
+
+    private func syncGrammar() {
         GrammarConstrainedSampler.shared.registerTools(availableToolDefinitions)
     }
 
@@ -2306,8 +2605,14 @@ public final class AgentHarness {
         return toolName == "file_write" || toolName == "file_edit" || toolName == "shell_run" || toolName == "git_commit"
     }
 
+    /// Definitions currently exposed to the model (drives the prompt AND the grammar mask).
     public var availableToolDefinitions: [ToolDefinition] {
-        return Array(tools.values.map { $0.definition })
+        return loadedTools.keys.sorted().compactMap { loadedTools[$0]?.definition }
+    }
+
+    /// Full catalog of every installed tool.
+    public var allToolDefinitions: [ToolDefinition] {
+        return tools.keys.sorted().compactMap { tools[$0]?.definition }
     }
 
     // MARK: - Prompt Formatting & ChatML Generation
@@ -2353,7 +2658,7 @@ public final class AgentHarness {
             prompt += AgentHarness.formattedDateTimeContext(date: currentDate) + "\n\n"
         }
 
-        prompt += "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
+        prompt += "# Tools\n\nOnly the following functions are currently loaded and callable:\n\n<tools>\n"
         for tool in availableToolDefinitions {
             if let data = try? JSONEncoder().encode(tool),
                let jsonStr = String(data: data, encoding: .utf8) {
@@ -2361,6 +2666,20 @@ public final class AgentHarness {
             }
         }
         prompt += "</tools>\n\n"
+
+        let unloadedCount = tools.count - loadedTools.count
+        if unloadedCount > 0 {
+            prompt += """
+            NOTE: \(unloadedCount) additional tool(s) are installed but NOT loaded, so their schemas are not shown above and they cannot currently be called.
+
+            To discover what else you can do:
+            - Call `tools_discover` to list unloaded tools grouped by category (with estimated token cost).
+            - Call `tools_load` with the exact tool name to register its schema into context, after which you may call it directly.
+            - Call `tools_unload` to free context when a loaded tool is no longer needed.
+
+            """
+        }
+
         prompt += """
         If you choose to call a function ONLY reply in the following format with NO suffix:
 
@@ -2412,13 +2731,37 @@ public final class AgentHarness {
                results.contains(where: { $0["is_official_domain"] as? Bool == true }) {
                 turn += "[SYSTEM NOTICE: Verified official vendor domain response. Synthesize directly without re-searching.]\n"
             }
+            if let registration = Self.toolRegistrationNotice(for: r) {
+                turn += registration + "\n"
+            }
             turn += "<tool_response>\n\(r)\n</tool_response>\n"
         }
         turn += "<|im_end|>\n<|im_start|>assistant\n"
         if includeThinkSuffix {
-            turn += "<think>\n"
+            turn += " thinking\n"
         }
         return turn
+    }
+
+    /// Turns a `tools_load` / `tools_unload` result into an explicit context registration notice
+    /// so the newly enabled (or disabled) schema is visible to the model before its next response.
+    private static func toolRegistrationNotice(for responseJSON: String) -> String? {
+        guard let data = responseJSON.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let result = json["result"] as? [String: Any] else { return nil }
+
+        if result["registration"] as? Bool == true,
+           let name = result["tool_name"] as? String {
+            if let schema = result["schema"] as? String, !schema.isEmpty {
+                return "[TOOL_REGISTRATION] Tool \"\(name)\" is now loaded and may be called directly. Schema:\n\(schema)"
+            }
+            return "[TOOL_REGISTRATION] Tool \"\(name)\" is now loaded and may be called directly."
+        }
+        if result["de_registration"] as? Bool == true,
+           let name = result["tool_name"] as? String {
+            return "[TOOL_DEREGISTRATION] Tool \"\(name)\" has been unloaded and may no longer be called. Call tools_load to re-enable it."
+        }
+        return nil
     }
 
     public func detectUncalledActionIntent(content: String, thinking: String?) -> Bool {
@@ -2481,7 +2824,7 @@ public final class AgentHarness {
 
     public func formatActionContinuationTurn(includeThinkSuffix: Bool = false) -> String {
         var turn = "<|im_start|>user\n"
-        turn += "Please call the function now using <tool_call><function=...><parameter=...>...</parameter></function></tool_call> to execute your action.\n"
+        turn += "If you intended to take an action, execute it now using <tool_call><function=...><parameter=...>...</parameter></function></tool_call>. Otherwise, just reply to the user and end your turn.\n"
         turn += "<|im_end|>\n<|im_start|>assistant\n"
         if includeThinkSuffix {
             turn += "<think>\n"
@@ -2553,7 +2896,7 @@ public final class AgentHarness {
 
         // 4. Fallback: Check if output contains raw JSON with a recognized tool name
         if calls.isEmpty {
-            let knownToolNames = Set(availableToolDefinitions.map { $0.function.name })
+            let knownToolNames = Set(allToolDefinitions.map { $0.function.name })
             if let parsed = extractBalancedJSON(text), let name = parsed["name"] as? String {
                 if knownToolNames.contains(name) {
                     let args = (parsed["arguments"] as? [String: Any]) ?? [:]

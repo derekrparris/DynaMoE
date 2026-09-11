@@ -1611,7 +1611,7 @@ struct SettingsSheetView: View {
 
             // Available Built-in Tools List
             VStack(alignment: .leading, spacing: 10) {
-                Text("Installed Tool Suite (\(AgentHarness.shared.availableToolDefinitions.count) Tools)")
+                Text("Installed Tool Suite (\(AgentHarness.shared.loadedTools.count) Loaded / \(AgentHarness.shared.tools.count) Installed)")
                     .font(.subheadline)
                     .fontWeight(.semibold)
 

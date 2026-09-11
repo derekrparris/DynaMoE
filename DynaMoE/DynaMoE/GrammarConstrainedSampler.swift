@@ -78,6 +78,7 @@ public final class GrammarConstrainedSampler {
     private var registeredToolNames: Set<String> = []
     private var toolParameterKeys: [String: Set<String>] = [:]
     private var toolTrie = TokenTrieNode()
+    private let registrationLock = NSLock()
 
     // Structural Tag constants
     private let toolCallOpen = "<tool_call>"
@@ -92,6 +93,7 @@ public final class GrammarConstrainedSampler {
     // MARK: - Schema Registration
 
     public func registerTools(_ tools: [ToolDefinition]) {
+        registrationLock.lock()
         registeredToolNames.removeAll()
         toolParameterKeys.removeAll()
         toolTrie = TokenTrieNode()
@@ -109,6 +111,7 @@ public final class GrammarConstrainedSampler {
             }
             toolParameterKeys[name] = paramKeys
         }
+        registrationLock.unlock()
     }
 
     public func reset() {

@@ -9603,7 +9603,7 @@ struct ContentView: View {
 
             // Agent Harness Multi-Step Tool Check
             let parsedResult = isAgentEnabled ? StreamingToolParser.shared.parseStreamingToolCalls(from: finalDecoded) : (calls: [], brokenFragments: [])
-            let hasUncalledIntent = isAgentEnabled && parsedResult.calls.isEmpty && (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink)
+            let hasUncalledIntent = isAgentEnabled && parsedResult.calls.isEmpty && agentStep == 0 && (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink)
             let willContinueAgent = (!parsedResult.calls.isEmpty || hasUncalledIntent)
 
             await MainActor.run {
@@ -9855,7 +9855,7 @@ struct ContentView: View {
                         }
                         return
                     }
-                } else if (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink) {
+                } else if agentStep == 0 && (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink) {
                     if Task.isCancelled {
                         await MainActor.run {
                             self.isGeneratingText = false
