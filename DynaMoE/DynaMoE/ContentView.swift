@@ -3171,7 +3171,7 @@ struct ContentView: View {
         generationStatusText = "⏹ Generation stopped by user."
     }
 
-    private func startAutoregressiveGeneration(customPrompt: String? = nil, sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0) {
+    private func startAutoregressiveGeneration(customPrompt: String? = nil, sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false) {
         guard let summary = summary,
               let tokenizer = tokenizer,
               let device = MTLCreateSystemDefaultDevice(),
@@ -9676,6 +9676,31 @@ struct ContentView: View {
                 if !willContinueAgent {
                     self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)
                 }
+            }
+
+            // Recovery: the model emitted only its reasoning block and stopped (empty reply).
+            // Regenerate the whole turn from scratch so it can answer cleanly — grafting onto a
+            // reconstructed " response" prefix produced duplicate reply text.
+            if thinkingEnabled && !isInThinkingContinuation && !finalThink.isEmpty && finalResp.isEmpty && !Task.isCancelled {
+                await MainActor.run {
+                    if let sId = sessionId,
+                       let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                       let mId = messageId,
+                       let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                        self.sessions[sIdx].messages[mIdx].thinkingContent = nil
+                        self.sessions[sIdx].messages[mIdx].content = ""
+                        self.sessions[sIdx].messages[mIdx].tokenCount = 0
+                        self.sessions[sIdx].messages[mIdx].isThinking = thinkingEnabled
+                    }
+                    self.startAutoregressiveGeneration(
+                        customPrompt: formattedPrompt,
+                        sessionId: sessionId,
+                        messageId: messageId,
+                        agentStep: agentStep,
+                        isInThinkingContinuation: true
+                    )
+                }
+                return
             }
 
             // Agent Harness Multi-Step Tool Execution
