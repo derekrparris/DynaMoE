@@ -147,6 +147,18 @@ public struct NestedTextConfig: Codable {
     public var indexerHeadDim: Int?
     public var attnOutputGate: Bool?
     public var outputGateType: String?
+    public var routedScalingFactor: Double?
+    public var nGroup: Int?
+    public var topkGroup: Int?
+    public var kdaLowerBound: Float?
+    public var qLoraRank: Int?
+    public var kvLoraRank: Int?
+    public var qkRopeHeadDim: Int?
+    public var qkNopeHeadDim: Int?
+    public var vHeadDim: Int?
+    public var moeSharedExpertIntermediateSize: Int?
+    public var moeRouterEnableExpertBias: Bool?
+    public var ropeInterleave: Bool?
 
     enum CodingKeys: String, CodingKey {
         case hiddenSize = "hidden_size"
@@ -183,6 +195,18 @@ public struct NestedTextConfig: Codable {
         case indexerHeadDim = "indexer_head_dim"
         case attnOutputGate = "attn_output_gate"
         case outputGateType = "output_gate_type"
+        case routedScalingFactor = "routed_scaling_factor"
+        case nGroup = "n_group"
+        case topkGroup = "topk_group"
+        case kdaLowerBound = "kda_lower_bound"
+        case qLoraRank = "q_lora_rank"
+        case kvLoraRank = "kv_lora_rank"
+        case qkRopeHeadDim = "qk_rope_head_dim"
+        case qkNopeHeadDim = "qk_nope_head_dim"
+        case vHeadDim = "v_head_dim"
+        case moeSharedExpertIntermediateSize = "moe_shared_expert_intermediate_size"
+        case moeRouterEnableExpertBias = "moe_router_enable_expert_bias"
+        case ropeInterleave = "rope_interleave"
     }
 }
 
@@ -223,6 +247,18 @@ public struct ModelConfig: Codable {
     public var indexerHeadDim: Int?
     public var attnOutputGate: Bool?
     public var outputGateType: String?
+    public var routedScalingFactor: Double?
+    public var nGroup: Int?
+    public var topkGroup: Int?
+    public var kdaLowerBound: Float?
+    public var qLoraRank: Int?
+    public var kvLoraRank: Int?
+    public var qkRopeHeadDim: Int?
+    public var qkNopeHeadDim: Int?
+    public var vHeadDim: Int?
+    public var moeSharedExpertIntermediateSize: Int?
+    public var moeRouterEnableExpertBias: Bool?
+    public var ropeInterleave: Bool?
     public var textConfig: NestedTextConfig?
 
     enum CodingKeys: String, CodingKey {
@@ -262,6 +298,18 @@ public struct ModelConfig: Codable {
         case indexerHeadDim = "indexer_head_dim"
         case attnOutputGate = "attn_output_gate"
         case outputGateType = "output_gate_type"
+        case routedScalingFactor = "routed_scaling_factor"
+        case nGroup = "n_group"
+        case topkGroup = "topk_group"
+        case kdaLowerBound = "kda_lower_bound"
+        case qLoraRank = "q_lora_rank"
+        case kvLoraRank = "kv_lora_rank"
+        case qkRopeHeadDim = "qk_rope_head_dim"
+        case qkNopeHeadDim = "qk_nope_head_dim"
+        case vHeadDim = "v_head_dim"
+        case moeSharedExpertIntermediateSize = "moe_shared_expert_intermediate_size"
+        case moeRouterEnableExpertBias = "moe_router_enable_expert_bias"
+        case ropeInterleave = "rope_interleave"
         case textConfig = "text_config"
     }
 
@@ -332,10 +380,12 @@ public struct ModelConfig: Codable {
     }
 
     public var effectiveEosTokenId: Int {
+        if isLingModel { return 156895 }
         return textConfig?.eosTokenId?.single ?? eosTokenId?.single ?? 248044
     }
 
     public var effectiveEosTokenIds: [Int] {
+        if isLingModel { return [156895, 156892] }
         if let textArray = textConfig?.eosTokenId?.array, !textArray.isEmpty {
             return textArray
         }
@@ -399,6 +449,67 @@ public struct ModelConfig: Codable {
         return textConfig?.outputGateType ?? outputGateType ?? "silu"
     }
 
+    public var effectiveRoutedScalingFactor: Double {
+        return textConfig?.routedScalingFactor ?? routedScalingFactor ?? 2.5
+    }
+
+    public var effectiveNGroup: Int {
+        return textConfig?.nGroup ?? nGroup ?? 8
+    }
+
+    public var effectiveTopkGroup: Int {
+        return textConfig?.topkGroup ?? topkGroup ?? 4
+    }
+
+    public var effectiveKdaLowerBound: Float {
+        return textConfig?.kdaLowerBound ?? kdaLowerBound ?? -5.0
+    }
+
+    public var effectiveQLoraRank: Int {
+        return textConfig?.qLoraRank ?? qLoraRank ?? 256
+    }
+
+    public var effectiveKvLoraRank: Int {
+        return textConfig?.kvLoraRank ?? kvLoraRank ?? 512
+    }
+
+    public var effectiveQkRopeHeadDim: Int {
+        return textConfig?.qkRopeHeadDim ?? qkRopeHeadDim ?? 64
+    }
+
+    public var effectiveQkNopeHeadDim: Int {
+        return textConfig?.qkNopeHeadDim ?? qkNopeHeadDim ?? 128
+    }
+
+    public var effectiveVHeadDim: Int {
+        return textConfig?.vHeadDim ?? vHeadDim ?? 128
+    }
+
+    public var effectiveMoeSharedExpertIntermediateSize: Int {
+        return textConfig?.moeSharedExpertIntermediateSize ?? moeSharedExpertIntermediateSize ?? 512
+    }
+
+    public var effectiveMoeRouterEnableExpertBias: Bool {
+        return textConfig?.moeRouterEnableExpertBias ?? moeRouterEnableExpertBias ?? false
+    }
+
+    public var effectiveRopeInterleave: Bool {
+        return textConfig?.ropeInterleave ?? ropeInterleave ?? false
+    }
+
+    public var isLingModel: Bool {
+        let rawType = (modelType ?? "").lowercased()
+        let archs = architectures?.map { $0.lowercased() } ?? []
+        return rawType.contains("bailing") || rawType.contains("ling") || archs.contains(where: { $0.contains("bailing") || $0.contains("ling") })
+    }
+
+    public var hasLinearRecurrence: Bool {
+        if isLingModel { return true }
+        let rawType = (modelType ?? "").lowercased()
+        let archs = architectures?.map { $0.lowercased() } ?? []
+        return rawType.contains("qwen3_5") || rawType.contains("ornith") || rawType.contains("deltanet") || rawType.contains("mamba") || archs.contains(where: { $0.contains("qwen3_5") || $0.contains("deltanet") || $0.contains("ornith") })
+    }
+
     /// Auto-detect the architecture type from config and topology summary
     public func resolveArchitectureType(summary: ModelSummary?) -> ModelArchitectureType {
         let rawType = (modelType ?? (textConfig != nil ? "qwen3_5_moe" : "")).lowercased()
@@ -409,7 +520,7 @@ public struct ModelConfig: Codable {
             return .qwen38FlashNext
         }
 
-        let isSsmModel = rawType.contains("qwen3_5") || rawType.contains("ornith") || rawType.contains("deltanet") || rawType.contains("mamba") || archs.contains(where: { $0.contains("qwen3_5") || $0.contains("deltanet") || $0.contains("ornith") })
+        let isSsmModel = rawType.contains("qwen3_5") || rawType.contains("ornith") || rawType.contains("deltanet") || rawType.contains("mamba") || rawType.contains("bailing") || rawType.contains("ling") || archs.contains(where: { $0.contains("qwen3_5") || $0.contains("deltanet") || $0.contains("ornith") || $0.contains("bailing") || $0.contains("ling") })
         let hasMoEExperts = effectiveNumExperts > 1 || (summary != nil && summary!.maxExpertId > 0)
 
         if isSsmModel && hasMoEExperts {

@@ -75,6 +75,12 @@ public final class ExpertRepacker {
               let size = attrs[.size] as? UInt64, size > 1024 * 1024 else {
             return false
         }
+        guard let lData = try? Data(contentsOf: layoutJson),
+              let layout = try? JSONDecoder().decode(FlashMoELayout.self, from: lData),
+              layout.expert_size > 0,
+              !layout.components.isEmpty else {
+            return false
+        }
         return true
     }
 
@@ -166,15 +172,22 @@ public final class ExpertRepacker {
         try manifestData.write(to: outputDir.appendingPathComponent("model_weights.json"))
 
         // 2. Repack Per-Layer Experts -> packed_experts/layer_XX.bin
-        progress(0.20, "Repacking 40 layers of expert weights...")
+        progress(0.20, "Repacking \(numLayers) layers of expert weights...")
 
-        // Dynamically discover component suffixes from Layer 0 Expert 0
-        let l0e0Tensors = summary.tensors.filter { $0.layerIndex == 0 && $0.expertId == 0 }
+        // Dynamically discover component suffixes from the first available routed expert
+        let allExpertTensors = summary.tensors.filter { $0.expertId != nil && $0.layerIndex != nil }
+        guard let firstLayer = allExpertTensors.compactMap({ $0.layerIndex }).min(),
+              let sampleExpertTensor = allExpertTensors.first(where: { $0.layerIndex == firstLayer && $0.expertId == 0 }) ?? allExpertTensors.first(where: { $0.layerIndex == firstLayer }),
+              let sampleExpId = sampleExpertTensor.expertId else {
+            throw ExpertRepackerError.writeFailed("No MoE expert tensors found in model summary.")
+        }
+
+        let sampleExpertTensors = summary.tensors.filter { $0.layerIndex == firstLayer && $0.expertId == sampleExpId }
         var componentSuffixes: [String] = []
 
         let projPrefixes = ["gate_proj", "up_proj", "down_proj"]
         for prefix in projPrefixes {
-            let matching = l0e0Tensors.filter { $0.name.contains(prefix) }
+            let matching = sampleExpertTensors.filter { $0.name.contains(prefix) }
             // Sort: weight first, then scales/scale/weight_scale, then biases/bias
             let sorted = matching.sorted { t1, t2 in
                 func priority(_ name: String) -> Int {
@@ -204,7 +217,7 @@ public final class ExpertRepacker {
         }
 
         var expertTensorMap: [String: TensorMetadata] = [:]
-        expertTensorMap.reserveCapacity(numLayers * numExperts * componentSuffixes.count)
+        expertTensorMap.reserveCapacity(numLayers * numExperts * max(componentSuffixes.count, 1))
         for t in summary.tensors {
             if let l = t.layerIndex, let e = t.expertId {
                 for suffix in componentSuffixes {
@@ -219,10 +232,10 @@ public final class ExpertRepacker {
         var layoutComponents: [FlashMoELayout.Component] = []
         var singleExpertSize: UInt64 = 0
 
-        // Calculate offsets and single expert size
+        // Calculate offsets and single expert size using sample layer and expert
         var componentOffset: UInt64 = 0
         for suffix in componentSuffixes {
-            if let t = expertTensorMap["0_0_\(suffix)"] {
+            if let t = expertTensorMap["\(firstLayer)_\(sampleExpId)_\(suffix)"] {
                 let size = t.offsetEnd - t.offsetStart
                 layoutComponents.append(FlashMoELayout.Component(
                     name: suffix,
@@ -236,9 +249,23 @@ public final class ExpertRepacker {
         }
         singleExpertSize = componentOffset
 
+        guard singleExpertSize > 0, !layoutComponents.isEmpty else {
+            throw ExpertRepackerError.writeFailed("Failed to resolve expert layout components (singleExpertSize=0).")
+        }
+
         // Repack each layer
         for l in 0..<numLayers {
             let layerBinUrl = packedExpertsDir.appendingPathComponent(String(format: "layer_%02d.bin", l))
+
+            // Check if this layer has any routed experts
+            let layerHasExperts = (0..<numExperts).contains { expertTensorMap["\(l)_\($0)_\(layoutComponents[0].name)"] != nil }
+            guard layerHasExperts else {
+                // If a stale or zero-length binary exists from an earlier failed run, remove it
+                try? FileManager.default.removeItem(at: layerBinUrl)
+                print("ℹ️ [ExpertRepacker] Skipping layer \(l) (no routed experts detected, dense MLP).")
+                continue
+            }
+
             guard let layerHandle = fopen(layerBinUrl.path, "wb") else {
                 throw ExpertRepackerError.writeFailed("Cannot open layer_\(l).bin for writing")
             }

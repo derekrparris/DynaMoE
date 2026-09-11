@@ -105,84 +105,102 @@ final class KVCacheManager {
         self.allocatedSeqLen = maxSeqLen
         self.activePrecision = precision
 
+        let isLing = (config?.isLingModel == true)
         let loops = max(totalLoops, config?.effectiveNumLoops ?? 1)
         let kvHeads = max(numKvHeads, config?.effectiveNumKeyValueHeads ?? 8)
         let hDim = max(headDim, config?.effectiveHeadDim ?? 128)
-        let totalSlots = actualLayers * loops
+        let totalSlots = isLing ? (6 * loops) : (actualLayers * loops)
+        let actualSlotCapacity = isLing ? totalSlots : max(totalSlots, 44)
         let kvStride = kvHeads * hDim
+        let isMla = (isLing || config?.kvLoraRank != nil)
+        let effectiveKvStride = isMla ? 4096 : max(kvStride, 1024)
         let elementBytes = precision.bytesPerElement
-        let kvBytes = max(totalSlots, 44) * maxSeqLen * max(kvStride, 1024) * elementBytes
+
+        // For Ling MLA, K stride is 16 heads * 192 = 3072 halfs, V stride is 16 heads * 128 = 2048 halfs
+        let kStride = isLing ? 3072 : effectiveKvStride
+        let vStride = isLing ? 2048 : effectiveKvStride
+        let kBytes = actualSlotCapacity * maxSeqLen * kStride * elementBytes
+        let vBytes = actualSlotCapacity * maxSeqLen * vStride * elementBytes
+        let requiredKvBytes = max(kBytes, vBytes)
 
         let oldK = self.kCacheBuffer
         let oldV = self.vCacheBuffer
-        let needsRealloc = (kCacheBuffer == nil || allocatedKvBytes < kvBytes)
+        let needsRealloc = (kCacheBuffer == nil || vCacheBuffer == nil || allocatedKvBytes < requiredKvBytes)
 
         if needsRealloc {
-            self.kCacheBuffer = device.makeBuffer(length: kvBytes, options: .storageModeShared)
-            self.vCacheBuffer = device.makeBuffer(length: kvBytes, options: .storageModeShared)
-            self.allocatedKvBytes = kvBytes
+            self.kCacheBuffer = device.makeBuffer(length: kBytes, options: .storageModeShared)
+            self.vCacheBuffer = device.makeBuffer(length: vBytes, options: .storageModeShared)
+            self.allocatedKvBytes = requiredKvBytes
         }
 
         if preservePrefixCount > 0 && wasAllocated {
-            let effectiveKvStride = max(kvStride, 1024)
             for slot in 0..<totalSlots {
-                let newLayerByteOffset = slot * maxSeqLen * effectiveKvStride * elementBytes
-                let prefixBytes = min(preservePrefixCount, maxSeqLen) * effectiveKvStride * elementBytes
+                let newKLayerByteOffset = slot * maxSeqLen * kStride * elementBytes
+                let newVLayerByteOffset = slot * maxSeqLen * vStride * elementBytes
+                let prefixKBytes = min(preservePrefixCount, maxSeqLen) * kStride * elementBytes
+                let prefixVBytes = min(preservePrefixCount, maxSeqLen) * vStride * elementBytes
 
                 if needsRealloc, let oldKBuf = oldK, let oldVBuf = oldV, let newKBuf = kCacheBuffer, let newVBuf = vCacheBuffer {
-                    let oldLayerByteOffset = slot * oldMaxSeq * effectiveKvStride * elementBytes
-                    let copyBytes = min(prefixBytes, max(0, oldKBuf.length - oldLayerByteOffset), max(0, newKBuf.length - newLayerByteOffset))
-                    if copyBytes > 0 {
-                        memcpy(newKBuf.contents().advanced(by: newLayerByteOffset), oldKBuf.contents().advanced(by: oldLayerByteOffset), copyBytes)
-                        memcpy(newVBuf.contents().advanced(by: newLayerByteOffset), oldVBuf.contents().advanced(by: oldLayerByteOffset), copyBytes)
+                    let oldKLayerByteOffset = slot * oldMaxSeq * kStride * elementBytes
+                    let oldVLayerByteOffset = slot * oldMaxSeq * vStride * elementBytes
+                    let copyKBytes = min(prefixKBytes, max(0, oldKBuf.length - oldKLayerByteOffset), max(0, newKBuf.length - newKLayerByteOffset))
+                    let copyVBytes = min(prefixVBytes, max(0, oldVBuf.length - oldVLayerByteOffset), max(0, newVBuf.length - newVLayerByteOffset))
+                    if copyKBytes > 0 {
+                        memcpy(newKBuf.contents().advanced(by: newKLayerByteOffset), oldKBuf.contents().advanced(by: oldKLayerByteOffset), copyKBytes)
+                    }
+                    if copyVBytes > 0 {
+                        memcpy(newVBuf.contents().advanced(by: newVLayerByteOffset), oldVBuf.contents().advanced(by: oldVLayerByteOffset), copyVBytes)
                     }
                 }
 
-                let tailByteOffset = newLayerByteOffset + prefixBytes
-                let tailBytes = max(0, (maxSeqLen - preservePrefixCount) * effectiveKvStride * elementBytes)
-                if let kBuf = kCacheBuffer, tailByteOffset + tailBytes <= kBuf.length {
-                    memset(kBuf.contents().advanced(by: tailByteOffset), 0, tailBytes)
+                let tailKByteOffset = newKLayerByteOffset + prefixKBytes
+                let tailKBytes = max(0, (maxSeqLen - preservePrefixCount) * kStride * elementBytes)
+                if let kBuf = kCacheBuffer, tailKByteOffset + tailKBytes <= kBuf.length {
+                    memset(kBuf.contents().advanced(by: tailKByteOffset), 0, tailKBytes)
                 }
-                if let vBuf = vCacheBuffer, tailByteOffset + tailBytes <= vBuf.length {
-                    memset(vBuf.contents().advanced(by: tailByteOffset), 0, tailBytes)
+
+                let tailVByteOffset = newVLayerByteOffset + prefixVBytes
+                let tailVBytes = max(0, (maxSeqLen - preservePrefixCount) * vStride * elementBytes)
+                if let vBuf = vCacheBuffer, tailVByteOffset + tailVBytes <= vBuf.length {
+                    memset(vBuf.contents().advanced(by: tailVByteOffset), 0, tailVBytes)
                 }
             }
         } else {
-            if let kBuf = kCacheBuffer { memset(kBuf.contents(), 0, min(kvBytes, kBuf.length)) }
-            if let vBuf = vCacheBuffer { memset(vBuf.contents(), 0, min(kvBytes, vBuf.length)) }
+            if let kBuf = kCacheBuffer { memset(kBuf.contents(), 0, min(kBytes, kBuf.length)) }
+            if let vBuf = vCacheBuffer { memset(vBuf.contents(), 0, min(vBytes, vBuf.length)) }
         }
 
         if precision == .fp8 {
-            let scaleCount = max(totalSlots, 44) * maxSeqLen * kvHeads
+            let scaleCount = actualSlotCapacity * maxSeqLen * kvHeads
             let scaleBytes = scaleCount * MemoryLayout<UInt16>.stride // half precision per-head scales
             if kScaleBuffer == nil || kScaleBuffer!.length < scaleBytes {
                 self.kScaleBuffer = device.makeBuffer(length: scaleBytes, options: .storageModeShared)
                 self.vScaleBuffer = device.makeBuffer(length: scaleBytes, options: .storageModeShared)
             }
             if preservePrefixCount == 0 {
-                if let ksBuf = kScaleBuffer { memset(ksBuf.contents(), 0, scaleBytes) }
-                if let vsBuf = vScaleBuffer { memset(vsBuf.contents(), 0, scaleBytes) }
+                if let ksBuf = kScaleBuffer { memset(ksBuf.contents(), 0, min(scaleBytes, ksBuf.length)) }
+                if let vsBuf = vScaleBuffer { memset(vsBuf.contents(), 0, min(scaleBytes, vsBuf.length)) }
             }
         }
 
-        let linLayers = actualLayers
-        let linValHeads = max(48, config?.effectiveLinearNumValueHeads ?? 32)
+        let linLayers = isLing ? 18 : actualLayers
+        let linValHeads = isLing ? 16 : max(48, config?.effectiveLinearNumValueHeads ?? 32)
         let linHeadDim = max(128, config?.effectiveLinearValueHeadDim ?? 128)
-        let linStateBytes = max(linLayers, 48) * linValHeads * linHeadDim * linHeadDim * MemoryLayout<Float>.stride
+        let linStateBytes = (isLing ? linLayers : max(linLayers, 48)) * linValHeads * linHeadDim * linHeadDim * MemoryLayout<Float>.stride
         if linearStateBuffer == nil || linearStateBuffer!.length < linStateBytes {
             self.linearStateBuffer = device.makeBuffer(length: linStateBytes, options: .storageModeShared)
         }
-        if preservePrefixCount == 0 {
-            if let sBuf = linearStateBuffer { memset(sBuf.contents(), 0, linStateBytes) }
+        if isLing || config?.hasLinearRecurrence == true || preservePrefixCount == 0 {
+            if let sBuf = linearStateBuffer { memset(sBuf.contents(), 0, min(linStateBytes, sBuf.length)) }
         }
 
-        let convChannels = max(10240, (config?.effectiveLinearNumValueHeads ?? 32) > 32 ? 10240 : 8192)
-        let convBytes = max(linLayers, 48) * convChannels * 4 * MemoryLayout<Float>.stride
+        let convChannels = isLing ? 6144 : max(10240, (config?.effectiveLinearNumValueHeads ?? 32) > 32 ? 10240 : 8192)
+        let convBytes = (isLing ? linLayers : max(linLayers, 48)) * convChannels * 4 * MemoryLayout<Float>.stride
         if convStateBuffer == nil || convStateBuffer!.length < convBytes {
             self.convStateBuffer = device.makeBuffer(length: convBytes, options: .storageModeShared)
         }
-        if preservePrefixCount == 0 {
-            if let cBuf = convStateBuffer { memset(cBuf.contents(), 0, convBytes) }
+        if isLing || config?.hasLinearRecurrence == true || preservePrefixCount == 0 {
+            if let cBuf = convStateBuffer { memset(cBuf.contents(), 0, min(convBytes, cBuf.length)) }
         }
     }
 }
@@ -486,12 +504,8 @@ final class WorkingSetManager {
     }
 
     func preFaultAll(shardBuffers: [UInt32: MTLBuffer], summary: ModelSummary) {
-        for shard in summary.shards {
-            if let buf = shardBuffers[shard.index] {
-                madvise(buf.contents(), Int(shard.length), MADV_WILLNEED)
-            }
-        }
         lock.lock()
+        let fds = self.shardFDs
         for key in expertSlices.keys {
             residentExperts.insert(key)
         }
@@ -499,6 +513,46 @@ final class WorkingSetManager {
             sum + pair.value.reduce(0) { $0 + $1.length }
         }
         lock.unlock()
+
+        let shards = summary.shards
+        let pageSize = Int(vm_page_size) // 16384 bytes on Apple Silicon
+
+        // Fast parallel sequential priming across CPU cores
+        DispatchQueue.concurrentPerform(iterations: shards.count) { i in
+            let shard = shards[i]
+            let len = Int(shard.length)
+            guard len > 0 else { return }
+
+            if let fd = fds[shard.index] {
+                // 1. Advise kernel of full sequential readahead
+                var radv = radvisory(ra_offset: 0, ra_count: Int32(len))
+                _ = fcntl(fd, F_RDADVISE, &radv)
+
+                // 2. Coordinated parallel pread DMA transfers in 1 MB blocks
+                let chunkSize = min(len, 1048576)
+                var scratch = [UInt8](repeating: 0, count: chunkSize)
+                var bytesRead = 0
+                while bytesRead < len {
+                    let toRead = min(len - bytesRead, chunkSize)
+                    let n = pread(fd, &scratch, toRead, off_t(bytesRead))
+                    if n <= 0 { break }
+                    bytesRead += n
+                }
+            }
+
+            // 3. Stride touch through mmap MTLBuffer to map hardware page tables directly
+            if let buf = shardBuffers[shard.index] {
+                let rawPtr = buf.contents()
+                posix_madvise(rawPtr, len, POSIX_MADV_WILLNEED)
+                let bytePtr = rawPtr.assumingMemoryBound(to: UInt8.self)
+                var dummy: UInt64 = 0
+                for off in stride(from: 0, to: len, by: pageSize) {
+                    dummy &+= UInt64(bytePtr[off])
+                }
+                dummy &+= UInt64(bytePtr[len - 1])
+                OSAtomicAdd64(Int64(bitPattern: dummy), &WorkingSetManager.pageFaultSink)
+            }
+        }
     }
 
     func flushAllExperts(shardBuffers: [UInt32: MTLBuffer]) {
@@ -1167,6 +1221,14 @@ struct ContentView: View {
         .onChange(of: activeLoadedModelPath) { _ in
             syncSettingsWindowIfNeeded()
         }
+        .onChange(of: memoryExecutionMode) { newMode in
+            applyMemoryExecutionMode(newMode)
+            syncSettingsWindowIfNeeded()
+        }
+        .onChange(of: memoryBudgetMode) { newBudget in
+            applyMemoryBudgetMode(newBudget)
+            syncSettingsWindowIfNeeded()
+        }
         .onAppear {
             if selectedSessionId == nil {
                 selectedSessionId = sessions.first?.id
@@ -1365,68 +1427,114 @@ struct ContentView: View {
             )
         }
 
-        if !effectiveSystem.isEmpty {
-            promptString += "<|im_start|>system\n\(effectiveSystem)<|im_end|>\n"
-        }
-        for msg in sessions[sessionIdx].messages.dropLast() {
-            let cleanMsg = msg.content
-                .replacingOccurrences(of: "<|im_end|>", with: "")
-                .replacingOccurrences(of: "<|im_start|>", with: "")
-                .replacingOccurrences(of: "<|endoftext|>", with: "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let hasTools = (msg.toolCalls != nil && !msg.toolCalls!.isEmpty)
-            guard !cleanMsg.isEmpty || (msg.thinkingContent != nil && !msg.thinkingContent!.isEmpty) || hasTools else { continue }
+        let isLing = (modelConfig?.isLingModel == true)
+        if isLing {
+            let thinkingOption = thinkingEnabled ? "on" : "off"
+            if !effectiveSystem.isEmpty {
+                promptString += "<role>SYSTEM</role>\(effectiveSystem)\ndetailed thinking \(thinkingOption)<|role_end|>"
+            } else {
+                promptString += "<role>SYSTEM</role>detailed thinking \(thinkingOption)<|role_end|>"
+            }
+            for msg in sessions[sessionIdx].messages.dropLast() {
+                let cleanMsg = msg.content
+                    .replacingOccurrences(of: "<|role_end|>", with: "")
+                    .replacingOccurrences(of: "<role>", with: "")
+                    .replacingOccurrences(of: "</role>", with: "")
+                    .replacingOccurrences(of: "<|im_end|>", with: "")
+                    .replacingOccurrences(of: "<|im_start|>", with: "")
+                    .replacingOccurrences(of: "<|endoftext|>", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let hasTools = (msg.toolCalls != nil && !msg.toolCalls!.isEmpty)
+                guard !cleanMsg.isEmpty || (msg.thinkingContent != nil && !msg.thinkingContent!.isEmpty) || hasTools else { continue }
 
-            if msg.role == .user {
-                promptString += "<|im_start|>user\n\(cleanMsg)<|im_end|>\n"
-            } else if msg.role == .assistant {
-                var assistantBody = ""
-                if modelSupportsThinking {
+                if msg.role == .user {
+                    promptString += "<role>HUMAN</role>\(cleanMsg)<|role_end|>"
+                } else if msg.role == .assistant {
+                    var assistantBody = ""
                     if let think = msg.thinkingContent, !think.isEmpty {
                         let cleanThink = think
                             .replacingOccurrences(of: "<think>", with: "")
                             .replacingOccurrences(of: "</think>", with: "")
                             .trimmingCharacters(in: .whitespacesAndNewlines)
-                        assistantBody += "<think>\n\(cleanThink)\n</think>\n\n"
+                        assistantBody += "\n<think>\(cleanThink)</think>"
                     } else {
-                        assistantBody += "<think>\n\n</think>\n\n"
+                        assistantBody += "\n<think></think>"
                     }
-                }
-                if !cleanMsg.isEmpty {
-                    assistantBody += cleanMsg + "\n"
-                }
-                if let calls = msg.toolCalls, !calls.isEmpty {
-                    for call in calls {
-                        assistantBody += "<tool_call>\n<function=\(call.name)>\n"
-                        for (k, v) in call.arguments {
-                            assistantBody += "<parameter=\(k)>\n\(v)\n</parameter>\n"
-                        }
-                        assistantBody += "</function>\n</tool_call>\n"
+                    if !cleanMsg.isEmpty {
+                        assistantBody += cleanMsg
                     }
+                    promptString += "<role>ASSISTANT</role>\(assistantBody)<|role_end|>"
                 }
-                promptString += "<|im_start|>assistant\n\(assistantBody.trimmingCharacters(in: .whitespacesAndNewlines))<|im_end|>\n"
+            }
+            if thinkingEnabled {
+                promptString += "<role>ASSISTANT</role>\n<think>"
+            } else {
+                promptString += "<role>ASSISTANT</role>\n<think></think>"
+            }
+        } else {
+            if !effectiveSystem.isEmpty {
+                promptString += "<|im_start|>system\n\(effectiveSystem)<|im_end|>\n"
+            }
+            for msg in sessions[sessionIdx].messages.dropLast() {
+                let cleanMsg = msg.content
+                    .replacingOccurrences(of: "<|im_end|>", with: "")
+                    .replacingOccurrences(of: "<|im_start|>", with: "")
+                    .replacingOccurrences(of: "<|endoftext|>", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let hasTools = (msg.toolCalls != nil && !msg.toolCalls!.isEmpty)
+                guard !cleanMsg.isEmpty || (msg.thinkingContent != nil && !msg.thinkingContent!.isEmpty) || hasTools else { continue }
 
-                if let calls = msg.toolCalls, !calls.isEmpty {
-                    var outputs: [String] = []
-                    for call in calls {
-                        if let out = call.output ?? call.error {
-                            outputs.append(out)
+                if msg.role == .user {
+                    promptString += "<|im_start|>user\n\(cleanMsg)<|im_end|>\n"
+                } else if msg.role == .assistant {
+                    var assistantBody = ""
+                    if modelSupportsThinking {
+                        if let think = msg.thinkingContent, !think.isEmpty {
+                            let cleanThink = think
+                                .replacingOccurrences(of: "<think>", with: "")
+                                .replacingOccurrences(of: "</think>", with: "")
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                            assistantBody += "<think>\n\(cleanThink)\n</think>\n\n"
+                        } else {
+                            assistantBody += "<think>\n\n</think>\n\n"
                         }
                     }
-                    if !outputs.isEmpty {
-                        promptString += AgentHarness.shared.formatToolResponseTurn(responses: outputs, includeThinkSuffix: false)
+                    if !cleanMsg.isEmpty {
+                        assistantBody += cleanMsg + "\n"
+                    }
+                    if let calls = msg.toolCalls, !calls.isEmpty {
+                        for call in calls {
+                            assistantBody += "<tool_call>\n<function=\(call.name)>\n"
+                            for (k, v) in call.arguments {
+                                assistantBody += "<parameter=\(k)>\n\(v)\n</parameter>\n"
+                            }
+                            assistantBody += "</function>\n</tool_call>\n"
+                        }
+                    }
+                    promptString += "<|im_start|>assistant\n\(assistantBody.trimmingCharacters(in: .whitespacesAndNewlines))<|im_end|>\n"
+
+                    if let calls = msg.toolCalls, !calls.isEmpty {
+                        var outputs: [String] = []
+                        for call in calls {
+                            if let out = call.output ?? call.error {
+                                outputs.append(out)
+                            }
+                        }
+                        if !outputs.isEmpty {
+                            promptString += AgentHarness.shared.formatToolResponseTurn(responses: outputs, includeThinkSuffix: false)
+                        }
                     }
                 }
             }
-        }
-        if thinkingEnabled {
-            promptString += "<|im_start|>assistant\n<think>\n"
-        } else if modelSupportsThinking {
-            // Prefill an empty closed <think>\n\n</think>\n\n block to guarantee reasoning models
-            // (Nanbeige, DeepSeek-R1, QwQ) bypass reasoning entirely and output the direct answer!
-            promptString += "<|im_start|>assistant\n<think>\n\n</think>\n\n"
-        } else {
-            promptString += "<|im_start|>assistant\n"
+            if thinkingEnabled {
+                promptString += "<|im_start|>assistant\n<think>\n"
+            } else if modelSupportsThinking {
+                // Prefill an empty closed <think>\n\n</think>\n\n block to guarantee reasoning models
+                // (Nanbeige, DeepSeek-R1, QwQ) bypass reasoning entirely and output the direct answer!
+                promptString += "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            } else {
+                promptString += "<|im_start|>assistant\n"
+            }
         }
         
         startAutoregressiveGeneration(customPrompt: promptString, sessionId: currentSessionId, messageId: assistantMsgId)
@@ -1470,7 +1578,7 @@ struct ContentView: View {
         do {
             guard let embedWeight = summary.tensors.first(where: {
                 !$0.name.contains("visual") && !$0.name.contains("mtp") &&
-                ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.contains("wte")) &&
+                ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.contains("wte") || $0.name.contains("word_embeddings") || $0.category == "Embedding") &&
                 $0.name.contains("weight") && !$0.name.contains("scale")
             }) else {
                 gpuComputeOutput = "❌ Couldn't locate embedding weight tensor."
@@ -2885,7 +2993,7 @@ struct ContentView: View {
             $0.name == "model.lm_head.weight" ||
             $0.name == "lm_head"
         }) ?? summary.tensors.first(where: {
-            $0.name.hasSuffix("embed_tokens.weight") || $0.name == "embed_tokens"
+            $0.name.hasSuffix("embed_tokens.weight") || $0.name == "embed_tokens" || $0.name.contains("word_embeddings") || $0.category == "Embedding"
         }), let lmHeadShardBuffer = shardBuffers[lmHeadTensor.shardIndex] else {
             gpuComputeOutput = "❌ LM Head weight not found."
             return
@@ -3133,8 +3241,18 @@ struct ContentView: View {
             thinkSuffix = ""
         }
 
+        let isLing = (modelConfig?.isLingModel == true)
         let formattedPrompt: String
-        if prompt.contains("<|im_start|>") {
+        if isLing {
+            if prompt.contains("<role>") {
+                formattedPrompt = prompt
+            } else {
+                let lingThinking = thinkingEnabled ? "detailed thinking on" : "detailed thinking off"
+                let sysPart = cleanSystem.isEmpty ? lingThinking : "\(cleanSystem)\n\(lingThinking)"
+                let thinkTag = thinkingEnabled ? "\n<think>" : "\n<think></think>"
+                formattedPrompt = "<role>SYSTEM</role>\(sysPart)<|role_end|><role>HUMAN</role>\(prompt)<|role_end|><role>ASSISTANT</role>\(thinkTag)"
+            }
+        } else if prompt.contains("<|im_start|>") {
             var p = prompt
             if !cleanSystem.isEmpty && !prompt.contains("<|im_start|>system") {
                 p = "<|im_start|>system\n\(cleanSystem)<|im_end|>\n" + p
@@ -3178,7 +3296,7 @@ struct ContentView: View {
         // Find Embedding Weight & Affine Scales/Biases
         guard let embedWeight = summary.tensors.first(where: {
             !$0.name.contains("visual") && !$0.name.contains("mtp") &&
-            ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.contains("wte")) &&
+            ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.contains("wte") || $0.name.contains("word_embeddings") || $0.category == "Embedding") &&
             !$0.name.contains("scale") && !$0.name.contains("scales") &&
             !$0.name.contains("bias") && !$0.name.contains("biases")
         }), let embedShardBuffer = shardBuffers[embedWeight.shardIndex] else {
@@ -3190,12 +3308,12 @@ struct ContentView: View {
 
         let embedScale = summary.tensors.first(where: {
             !$0.name.contains("visual") && !$0.name.contains("mtp") &&
-            ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.contains("wte")) &&
+            ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.contains("wte") || $0.name.contains("word_embeddings") || $0.category == "Embedding") &&
             ($0.name.contains("scale") || $0.name.contains("scales"))
         })
         let embedBias = summary.tensors.first(where: {
             !$0.name.contains("visual") && !$0.name.contains("mtp") &&
-            ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.contains("wte")) &&
+            ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.contains("wte") || $0.name.contains("word_embeddings") || $0.category == "Embedding") &&
             ($0.name.contains("bias") || $0.name.contains("biases"))
         })
 
@@ -3357,6 +3475,13 @@ struct ContentView: View {
         let fp8BlockDownBatchedPipeline: MTLComputePipelineState?
         let bf16GateUpBatchedPipeline: MTLComputePipelineState?
         let bf16DownBatchedPipeline: MTLComputePipelineState?
+        let kdaLinearAttnStepPipeline: MTLComputePipelineState?
+        let ropeInterleavedPipeline: MTLComputePipelineState?
+        let routerBailingPipeline: MTLComputePipelineState?
+        let storeMlaKvCachePipeline: MTLComputePipelineState?
+        let storeMlaKvCacheF16Pipeline: MTLComputePipelineState?
+        let mlaAttentionDecodePipeline: MTLComputePipelineState?
+        let mlaAttentionDecodeF16Pipeline: MTLComputePipelineState?
 
         do {
             embedPipeline = try device.makeComputePipelineState(function: embedBF16Function)
@@ -3701,6 +3826,34 @@ struct ContentView: View {
             if let bf16DownBatchedFunc = defaultLibrary.makeFunction(name: "bf16_down_proj_accumulate_batched") {
                 bf16DownBatchedPipeline = try device.makeComputePipelineState(function: bf16DownBatchedFunc)
             } else { bf16DownBatchedPipeline = nil }
+
+            if let kdaFunc = defaultLibrary.makeFunction(name: "kda_linear_attention_recurrent_step") {
+                kdaLinearAttnStepPipeline = try device.makeComputePipelineState(function: kdaFunc)
+            } else { kdaLinearAttnStepPipeline = nil }
+
+            if let ropeInterFunc = defaultLibrary.makeFunction(name: "apply_rope_interleaved") {
+                ropeInterleavedPipeline = try device.makeComputePipelineState(function: ropeInterFunc)
+            } else { ropeInterleavedPipeline = nil }
+
+            if let routerBailingFunc = defaultLibrary.makeFunction(name: "moe_router_bailing_topk_bf16") {
+                routerBailingPipeline = try device.makeComputePipelineState(function: routerBailingFunc)
+            } else { routerBailingPipeline = nil }
+
+            if let storeMlaFunc = defaultLibrary.makeFunction(name: "store_mla_kv_cache") {
+                storeMlaKvCachePipeline = try device.makeComputePipelineState(function: storeMlaFunc)
+            } else { storeMlaKvCachePipeline = nil }
+
+            if let storeMlaF16Func = defaultLibrary.makeFunction(name: "store_mla_kv_cache_f16") {
+                storeMlaKvCacheF16Pipeline = try device.makeComputePipelineState(function: storeMlaF16Func)
+            } else { storeMlaKvCacheF16Pipeline = nil }
+
+            if let mlaDecodeFunc = defaultLibrary.makeFunction(name: "mla_attention_decode") {
+                mlaAttentionDecodePipeline = try device.makeComputePipelineState(function: mlaDecodeFunc)
+            } else { mlaAttentionDecodePipeline = nil }
+
+            if let mlaDecodeF16Func = defaultLibrary.makeFunction(name: "mla_attention_decode_f16") {
+                mlaAttentionDecodeF16Pipeline = try device.makeComputePipelineState(function: mlaDecodeF16Func)
+            } else { mlaAttentionDecodeF16Pipeline = nil }
         } catch {
             let err = "❌ Failed to create compute pipelines: \(error.localizedDescription)"
             gpuComputeOutput = err
@@ -3764,17 +3917,40 @@ struct ContentView: View {
 
         let maxInterDim = cachedLayers.map { $0.intermediateDim }.max() ?? 512
 
+        var loadedLayout: FlashMoELayout? = nil
+        let packedExpertsDir: URL?
+        if let modelPath = activeLoadedModelPath {
+            var isDir: ObjCBool = false
+            FileManager.default.fileExists(atPath: modelPath, isDirectory: &isDir)
+            let baseDir = isDir.boolValue ? URL(fileURLWithPath: modelPath) : URL(fileURLWithPath: modelPath).deletingLastPathComponent()
+            let pDir = baseDir.appendingPathComponent("packed_experts")
+            let layoutFile = pDir.appendingPathComponent("layout.json")
+            if FileManager.default.fileExists(atPath: layoutFile.path),
+               let lData = try? Data(contentsOf: layoutFile),
+               let lay = try? JSONDecoder().decode(FlashMoELayout.self, from: lData) {
+                packedExpertsDir = pDir
+                loadedLayout = lay
+                ExpertIOThreadPool.shared.initialize(numThreads: 8)
+            } else {
+                packedExpertsDir = nil
+            }
+        } else {
+            packedExpertsDir = nil
+        }
+
+        let expertStagingSize = max(16 * 4194304, 16 * Int(loadedLayout?.expert_size ?? 4718592))
+
         // Allocate Shared Scratch Buffers (Reused across all generation steps)
         guard let singleTokenBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared),
               let hCurrBuffer = device.makeBuffer(length: Int(hiddenDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let hNextBuffer = device.makeBuffer(length: Int(hiddenDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let xNorm1Buffer = device.makeBuffer(length: Int(hiddenDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let qGateBuffer = device.makeBuffer(length: max(Int(qOutDim), 10240) * MemoryLayout<Float>.stride, options: .storageModeShared),
-              let kVectorBuffer = device.makeBuffer(length: max(Int(kvOutDim), 2048) * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let kVectorBuffer = device.makeBuffer(length: max(Int(kvOutDim), 4096) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let vVectorBuffer = device.makeBuffer(length: max(Int(kvOutDim), 6144) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let zGateBuffer = device.makeBuffer(length: 8192 * MemoryLayout<Float>.stride, options: .storageModeShared),
-              let aVectorBuffer = device.makeBuffer(length: 64 * MemoryLayout<Float>.stride, options: .storageModeShared),
-              let bVectorBuffer = device.makeBuffer(length: 64 * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let aVectorBuffer = device.makeBuffer(length: max(2048, Int(hiddenDim)) * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let bVectorBuffer = device.makeBuffer(length: max(2048, Int(hiddenDim)) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let attnCtxBuffer = device.makeBuffer(length: max(Int(attnCtxDim), 8192) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let attnOutBuffer = device.makeBuffer(length: Int(hiddenDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let hMidBuffer = device.makeBuffer(length: Int(hiddenDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
@@ -3784,7 +3960,7 @@ struct ContentView: View {
               let routerWeightsBuffer = device.makeBuffer(length: 16 * MemoryLayout<Float>.stride, options: .storageModeShared),
               let sharedScoreBuffer = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared),
               let interBuffer = device.makeBuffer(length: max(Int(maxInterDim), 512) * MemoryLayout<Float>.stride, options: .storageModeShared),
-              let expertStagingBuffer = device.makeBuffer(length: 16 * 4194304, options: .storageModeShared),
+              let expertStagingBuffer = device.makeBuffer(length: expertStagingSize, options: .storageModeShared),
               let hcStreamsBuffer = device.makeBuffer(length: max(4 * Int(hiddenDim), 10240) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let hcNormedBuffer = device.makeBuffer(length: max(4 * Int(hiddenDim), 10240) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let hcBottleneckBuffer = device.makeBuffer(length: 512 * MemoryLayout<Float>.stride, options: .storageModeShared),
@@ -3813,7 +3989,8 @@ struct ContentView: View {
         let minSeq = isAgentSession ? 8192 : 2048
         let neededSeqLen = max(minSeq, min(32768, promptTokenIds.count + maxTokens + 512))
         let kvPrec = self.kvCachePrecision
-        let prefixTokensReused = PrefixCacheManager.shared.findCommonPrefix(promptTokenIds: promptTokenIds, sessionId: sessionId)
+        let hasRecurrence = (modelConfig?.isLingModel == true || modelConfig?.hasLinearRecurrence == true || cachedLayers.contains { $0.attentionType == .linearAttention })
+        let prefixTokensReused = hasRecurrence ? 0 : PrefixCacheManager.shared.findCommonPrefix(promptTokenIds: promptTokenIds, sessionId: sessionId)
         KVCacheManager.shared.reset(
             device: device,
             config: modelConfig,
@@ -3847,27 +4024,6 @@ struct ContentView: View {
                 priorContent = sessions[sIdx].messages[mIdx].content
                 sessions[sIdx].messages[mIdx].isThinking = thinkingEnabled
             }
-        }
-
-        var loadedLayout: FlashMoELayout? = nil
-        let packedExpertsDir: URL?
-        if let modelPath = activeLoadedModelPath {
-            var isDir: ObjCBool = false
-            FileManager.default.fileExists(atPath: modelPath, isDirectory: &isDir)
-            let baseDir = isDir.boolValue ? URL(fileURLWithPath: modelPath) : URL(fileURLWithPath: modelPath).deletingLastPathComponent()
-            let pDir = baseDir.appendingPathComponent("packed_experts")
-            let layoutFile = pDir.appendingPathComponent("layout.json")
-            if FileManager.default.fileExists(atPath: layoutFile.path),
-               let lData = try? Data(contentsOf: layoutFile),
-               let lay = try? JSONDecoder().decode(FlashMoELayout.self, from: lData) {
-                packedExpertsDir = pDir
-                loadedLayout = lay
-                ExpertIOThreadPool.shared.initialize(numThreads: 8)
-            } else {
-                packedExpertsDir = nil
-            }
-        } else {
-            packedExpertsDir = nil
         }
 
         generationTask = Task.detached(priority: .userInitiated) {
@@ -4447,6 +4603,7 @@ struct ContentView: View {
                                 layerEnc1.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 4)
                                 layerEnc1.setBytes(&tokCount, length: MemoryLayout<UInt32>.stride, index: 5)
                                 layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), embedPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                layerEnc1.memoryBarrier(scope: .buffers)
                             }
                             if (cachedLayers.first?.attnHcDownWeight != nil), let initStreams = fusedInit4StreamsPipeline {
                                 layerEnc1.memoryBarrier(scope: .buffers)
@@ -4541,7 +4698,162 @@ struct ContentView: View {
                         }
 
                         // Step 2: Attention Computation
-                        if layer.attentionType == .fullAttention {
+                        if layer.isMLA {
+                            layerEnc1.setComputePipelineState(clearPipeline)
+                            layerEnc1.setBuffer(attnOutBuffer, offset: 0, index: 0)
+                            layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                            layerEnc1.memoryBarrier(scope: .buffers)
+
+                            // 1. Q projection: hiddenDim (1536) -> q_lora_rank (256) into kVectorBuffer
+                            dispatchLinear(enc: layerEnc1, weight: layer.mlaQAProj, scale: nil, bias: nil, inBuf: xNorm1Buffer, outBuf: kVectorBuffer, inDim: hiddenDim, outDim: 256)
+                            layerEnc1.memoryBarrier(scope: .buffers)
+
+                            // 2. Q LayerNorm (RMSNorm 256) in-place on kVectorBuffer
+                            if let qALN = layer.mlaQALayernorm, let qALNRaw = buffers[qALN.shardIndex] {
+                                var qLNGammaOff = qALN.offsetStart
+                                var qLNDim: UInt32 = 256
+                                var epsVal = eps
+                                layerEnc1.setComputePipelineState(rmsnormPipeline)
+                                layerEnc1.setBuffer(kVectorBuffer, offset: 0, index: 0)
+                                layerEnc1.setBuffer(qALNRaw, offset: 0, index: 1)
+                                layerEnc1.setBuffer(kVectorBuffer, offset: 0, index: 2)
+                                layerEnc1.setBytes(&qLNGammaOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                                layerEnc1.setBytes(&qLNDim, length: MemoryLayout<UInt32>.stride, index: 4)
+                                layerEnc1.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 5)
+                                layerEnc1.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
+                                layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(qLNDim)), height: 1, depth: 1))
+                                layerEnc1.memoryBarrier(scope: .buffers)
+                            }
+
+                            // 3. Q_B projection: 256 -> 3072 (16 heads x 192) into qGateBuffer
+                            dispatchLinear(enc: layerEnc1, weight: layer.mlaQBProj, scale: nil, bias: nil, inBuf: kVectorBuffer, outBuf: qGateBuffer, inDim: 256, outDim: 3072)
+                            layerEnc1.memoryBarrier(scope: .buffers)
+
+                            // 4. Apply interleaved RoPE to Q rotary part (elements 128..191 of each 192-dim head in qGateBuffer)
+                            if let ropePipe = ropeInterleavedPipeline {
+                                var pos = UInt32(step)
+                                var nHeads: UInt32 = 16
+                                var hDimTotal: UInt32 = 192
+                                var rotDim: UInt32 = 64
+                                var hStride: UInt32 = 192
+                                var thetaVal: Float = Float(modelConfig?.ropeTheta ?? 10000.0)
+                                var qRopeOffset: UInt32 = 128
+                                layerEnc1.setComputePipelineState(ropePipe)
+                                layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                                layerEnc1.setBytes(&pos, length: MemoryLayout<UInt32>.stride, index: 1)
+                                layerEnc1.setBytes(&nHeads, length: MemoryLayout<UInt32>.stride, index: 2)
+                                layerEnc1.setBytes(&hDimTotal, length: MemoryLayout<UInt32>.stride, index: 3)
+                                layerEnc1.setBytes(&rotDim, length: MemoryLayout<UInt32>.stride, index: 4)
+                                layerEnc1.setBytes(&hStride, length: MemoryLayout<UInt32>.stride, index: 5)
+                                layerEnc1.setBytes(&thetaVal, length: MemoryLayout<Float>.stride, index: 6)
+                                layerEnc1.setBytes(&qRopeOffset, length: MemoryLayout<UInt32>.stride, index: 7)
+                                layerEnc1.dispatchThreads(MTLSize(width: Int(nHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(32, Int(nHeads)), height: 1, depth: 1))
+                                layerEnc1.memoryBarrier(scope: .buffers)
+                            }
+
+                            // 5. KV_A projection with MQA: hiddenDim (1536) -> 576 (512 compressed KV + 64 k_rope) into kVectorBuffer
+                            dispatchLinear(enc: layerEnc1, weight: layer.mlaKVAProjWithMqa, scale: nil, bias: nil, inBuf: xNorm1Buffer, outBuf: kVectorBuffer, inDim: hiddenDim, outDim: 576)
+                            layerEnc1.memoryBarrier(scope: .buffers)
+
+                            // 6. Apply interleaved RoPE to K rotary part (elements 512..575 of kVectorBuffer)
+                            if let ropePipe = ropeInterleavedPipeline {
+                                var pos = UInt32(step)
+                                var nHeads: UInt32 = 1
+                                var hDimTotal: UInt32 = 64
+                                var rotDim: UInt32 = 64
+                                var hStride: UInt32 = 64
+                                var thetaVal: Float = Float(modelConfig?.ropeTheta ?? 10000.0)
+                                var kRopeOffset: UInt32 = 512
+                                layerEnc1.setComputePipelineState(ropePipe)
+                                layerEnc1.setBuffer(kVectorBuffer, offset: 0, index: 0)
+                                layerEnc1.setBytes(&pos, length: MemoryLayout<UInt32>.stride, index: 1)
+                                layerEnc1.setBytes(&nHeads, length: MemoryLayout<UInt32>.stride, index: 2)
+                                layerEnc1.setBytes(&hDimTotal, length: MemoryLayout<UInt32>.stride, index: 3)
+                                layerEnc1.setBytes(&rotDim, length: MemoryLayout<UInt32>.stride, index: 4)
+                                layerEnc1.setBytes(&hStride, length: MemoryLayout<UInt32>.stride, index: 5)
+                                layerEnc1.setBytes(&thetaVal, length: MemoryLayout<Float>.stride, index: 6)
+                                layerEnc1.setBytes(&kRopeOffset, length: MemoryLayout<UInt32>.stride, index: 7)
+                                layerEnc1.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+                                layerEnc1.memoryBarrier(scope: .buffers)
+                            }
+
+                            // 7. KV LayerNorm (RMSNorm 512) on first 512 elements of kVectorBuffer into zGateBuffer
+                            if let kvALN = layer.mlaKVALayernorm, let kvALNRaw = buffers[kvALN.shardIndex] {
+                                var kvLNGammaOff = kvALN.offsetStart
+                                var kvLNDim: UInt32 = 512
+                                var epsVal = eps
+                                layerEnc1.setComputePipelineState(rmsnormPipeline)
+                                layerEnc1.setBuffer(kVectorBuffer, offset: 0, index: 0)
+                                layerEnc1.setBuffer(kvALNRaw, offset: 0, index: 1)
+                                layerEnc1.setBuffer(zGateBuffer, offset: 0, index: 2)
+                                layerEnc1.setBytes(&kvLNGammaOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                                layerEnc1.setBytes(&kvLNDim, length: MemoryLayout<UInt32>.stride, index: 4)
+                                layerEnc1.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 5)
+                                layerEnc1.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
+                                layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(kvLNDim)), height: 1, depth: 1))
+                                layerEnc1.memoryBarrier(scope: .buffers)
+                            }
+
+                            // 8. KV_B projection: 512 (zGateBuffer) -> 4096 (16 heads x (128 k_nope + 128 v)) into vVectorBuffer
+                            dispatchLinear(enc: layerEnc1, weight: layer.mlaKVBProj, scale: nil, bias: nil, inBuf: zGateBuffer, outBuf: vVectorBuffer, inDim: 512, outDim: 4096)
+                            layerEnc1.memoryBarrier(scope: .buffers)
+
+                            // 9. Store into MLA KV cache (F16)
+                            let isLingMla = (modelConfig?.isLingModel == true)
+                            let slot = isLingMla ? ((loopIdx * 6) + layer.fullAttnIndex) : ((loopIdx * actualLayers) + layer.fullAttnIndex)
+                            let maxSeq = KVCacheManager.shared.allocatedSeqLen
+                            let kStride = isLingMla ? 3072 : 4096
+                            let vStride = isLingMla ? 2048 : 4096
+                            let kLayerByteOffset = slot * maxSeq * kStride * MemoryLayout<UInt16>.stride
+                            let vLayerByteOffset = slot * maxSeq * vStride * MemoryLayout<UInt16>.stride
+                            if let storePipe = storeMlaKvCacheF16Pipeline,
+                               let kCache = KVCacheManager.shared.kCacheBuffer,
+                               let vCache = KVCacheManager.shared.vCacheBuffer {
+                                var pos = UInt32(step)
+                                var nHeads: UInt32 = 16
+                                layerEnc1.setComputePipelineState(storePipe)
+                                layerEnc1.setBuffer(vVectorBuffer, offset: 0, index: 0)
+                                layerEnc1.setBuffer(kVectorBuffer, offset: 512 * MemoryLayout<Float>.stride, index: 1)
+                                layerEnc1.setBuffer(kCache, offset: kLayerByteOffset, index: 2)
+                                layerEnc1.setBuffer(vCache, offset: vLayerByteOffset, index: 3)
+                                layerEnc1.setBytes(&pos, length: MemoryLayout<UInt32>.stride, index: 4)
+                                layerEnc1.setBytes(&nHeads, length: MemoryLayout<UInt32>.stride, index: 5)
+                                layerEnc1.dispatchThreads(MTLSize(width: Int(nHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(32, Int(nHeads)), height: 1, depth: 1))
+                                layerEnc1.memoryBarrier(scope: .buffers)
+                            }
+
+                            // 10. Gate projection (hiddenDim -> 16 heads) into bVectorBuffer
+                            if let gateProj = layer.mlaGateProj {
+                                dispatchLinear(enc: layerEnc1, weight: gateProj, scale: nil, bias: nil, inBuf: xNorm1Buffer, outBuf: bVectorBuffer, inDim: hiddenDim, outDim: 16)
+                                layerEnc1.memoryBarrier(scope: .buffers)
+                            }
+
+                            // 11. MLA Attention Decode (F16)
+                            if let mlaPipe = mlaAttentionDecodeF16Pipeline,
+                               let kCache = KVCacheManager.shared.kCacheBuffer,
+                               let vCache = KVCacheManager.shared.vCacheBuffer {
+                                var seqLen = UInt32(step + 1)
+                                var nHeads: UInt32 = 16
+                                var qkHeadDim: UInt32 = 192
+                                var vDim: UInt32 = 128
+                                layerEnc1.setComputePipelineState(mlaPipe)
+                                layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                                layerEnc1.setBuffer(kCache, offset: kLayerByteOffset, index: 1)
+                                layerEnc1.setBuffer(vCache, offset: vLayerByteOffset, index: 2)
+                                layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 3)
+                                layerEnc1.setBuffer(bVectorBuffer, offset: 0, index: 4)
+                                layerEnc1.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 5)
+                                layerEnc1.setBytes(&nHeads, length: MemoryLayout<UInt32>.stride, index: 6)
+                                layerEnc1.setBytes(&qkHeadDim, length: MemoryLayout<UInt32>.stride, index: 7)
+                                layerEnc1.setBytes(&vDim, length: MemoryLayout<UInt32>.stride, index: 8)
+                                layerEnc1.dispatchThreads(MTLSize(width: Int(nHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(32, Int(nHeads)), height: 1, depth: 1))
+                                layerEnc1.memoryBarrier(scope: .buffers)
+                            }
+
+                            // 12. Output projection: 2048 (16 heads x 128 v_dim) -> hiddenDim (1536) into attnOutBuffer
+                            dispatchLinear(enc: layerEnc1, weight: layer.oProjTensor, scale: nil, bias: nil, inBuf: attnCtxBuffer, outBuf: attnOutBuffer, inDim: 2048, outDim: hiddenDim)
+                            layerEnc1.memoryBarrier(scope: .buffers)
+                        } else if layer.attentionType == .fullAttention {
                             layerEnc1.setComputePipelineState(clearPipeline)
                             layerEnc1.setBuffer(attnOutBuffer, offset: 0, index: 0)
                             layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
@@ -4797,6 +5109,119 @@ struct ContentView: View {
 
                             // Attention Output Projection (o_proj)
                             dispatchLinear(enc: layerEnc1, weight: layer.oProjTensor, scale: layer.oScaleTensor, bias: layer.oBiasTensor, inBuf: attnCtxBuffer, outBuf: attnOutBuffer, inDim: attnCtxDim, outDim: hiddenDim)
+                            layerEnc1.memoryBarrier(scope: .buffers)
+                        } else if layer.isKDA {
+                            // KDA Linear Attention (Key-Decay Attention with recurrent associative state)
+                            layerEnc1.setComputePipelineState(clearPipeline)
+                            layerEnc1.setBuffer(attnOutBuffer, offset: 0, index: 0)
+                            layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                            layerEnc1.memoryBarrier(scope: .buffers)
+
+                            // 1. Q, K, V projections (hiddenDim 1536 -> 2048)
+                            dispatchLinear(enc: layerEnc1, weight: layer.kdaQProj ?? layer.qProjTensor, scale: nil, bias: nil, inBuf: xNorm1Buffer, outBuf: qGateBuffer, inDim: hiddenDim, outDim: 2048)
+                            dispatchLinear(enc: layerEnc1, weight: layer.kdaKProj ?? layer.kProjTensor, scale: nil, bias: nil, inBuf: xNorm1Buffer, outBuf: kVectorBuffer, inDim: hiddenDim, outDim: 2048)
+                            dispatchLinear(enc: layerEnc1, weight: layer.kdaVProj ?? layer.vProjTensor, scale: nil, bias: nil, inBuf: xNorm1Buffer, outBuf: vVectorBuffer, inDim: hiddenDim, outDim: 2048)
+                            layerEnc1.memoryBarrier(scope: .buffers)
+
+                            // 2. Causal 1D Convolutions with SiLU
+                            let linIdx = layer.linAttnIndex
+                            if let convPipe = causalConv1dPipeline, let convState = KVCacheManager.shared.convStateBuffer {
+                                var numChan: UInt32 = 2048
+                                // Q conv
+                                if let qc = layer.kdaQConv1d, let qcRaw = buffers[qc.shardIndex] {
+                                    var cOff = qc.offsetStart
+                                    let qStateOffset = (linIdx * 6144 + 0) * 4 * MemoryLayout<Float>.stride
+                                    layerEnc1.setComputePipelineState(convPipe)
+                                    layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                                    layerEnc1.setBuffer(qcRaw, offset: 0, index: 1)
+                                    layerEnc1.setBuffer(convState, offset: qStateOffset, index: 2)
+                                    layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 3)
+                                    layerEnc1.setBytes(&cOff, length: MemoryLayout<UInt64>.stride, index: 4)
+                                    layerEnc1.setBytes(&numChan, length: MemoryLayout<UInt32>.stride, index: 5)
+                                    layerEnc1.dispatchThreads(MTLSize(width: 2048, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, convPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    layerEnc1.memoryBarrier(scope: .buffers)
+                                }
+                                // K conv
+                                if let kc = layer.kdaKConv1d, let kcRaw = buffers[kc.shardIndex] {
+                                    var cOff = kc.offsetStart
+                                    let kStateOffset = (linIdx * 6144 + 2048) * 4 * MemoryLayout<Float>.stride
+                                    layerEnc1.setComputePipelineState(convPipe)
+                                    layerEnc1.setBuffer(kVectorBuffer, offset: 0, index: 0)
+                                    layerEnc1.setBuffer(kcRaw, offset: 0, index: 1)
+                                    layerEnc1.setBuffer(convState, offset: kStateOffset, index: 2)
+                                    layerEnc1.setBuffer(kVectorBuffer, offset: 0, index: 3)
+                                    layerEnc1.setBytes(&cOff, length: MemoryLayout<UInt64>.stride, index: 4)
+                                    layerEnc1.setBytes(&numChan, length: MemoryLayout<UInt32>.stride, index: 5)
+                                    layerEnc1.dispatchThreads(MTLSize(width: 2048, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, convPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    layerEnc1.memoryBarrier(scope: .buffers)
+                                }
+                                // V conv
+                                if let vc = layer.kdaVConv1d, let vcRaw = buffers[vc.shardIndex] {
+                                    var cOff = vc.offsetStart
+                                    let vStateOffset = (linIdx * 6144 + 4096) * 4 * MemoryLayout<Float>.stride
+                                    layerEnc1.setComputePipelineState(convPipe)
+                                    layerEnc1.setBuffer(vVectorBuffer, offset: 0, index: 0)
+                                    layerEnc1.setBuffer(vcRaw, offset: 0, index: 1)
+                                    layerEnc1.setBuffer(convState, offset: vStateOffset, index: 2)
+                                    layerEnc1.setBuffer(vVectorBuffer, offset: 0, index: 3)
+                                    layerEnc1.setBytes(&cOff, length: MemoryLayout<UInt64>.stride, index: 4)
+                                    layerEnc1.setBytes(&numChan, length: MemoryLayout<UInt32>.stride, index: 5)
+                                    layerEnc1.dispatchThreads(MTLSize(width: 2048, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, convPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    layerEnc1.memoryBarrier(scope: .buffers)
+                                }
+                            }
+
+                            // 3. F, B, G projections
+                            // F projection: decay gate (2048) into aVectorBuffer
+                            dispatchLinear(enc: layerEnc1, weight: layer.inProjA, scale: nil, bias: nil, inBuf: xNorm1Buffer, outBuf: aVectorBuffer, inDim: hiddenDim, outDim: 2048)
+                            // B projection: beta gate (16) into bVectorBuffer
+                            dispatchLinear(enc: layerEnc1, weight: layer.inProjB, scale: nil, bias: nil, inBuf: xNorm1Buffer, outBuf: bVectorBuffer, inDim: hiddenDim, outDim: 16)
+                            // G projection: output gate (2048) into zGateBuffer
+                            dispatchLinear(enc: layerEnc1, weight: layer.inProjZ, scale: nil, bias: nil, inBuf: xNorm1Buffer, outBuf: zGateBuffer, inDim: hiddenDim, outDim: 2048)
+                            layerEnc1.memoryBarrier(scope: .buffers)
+
+                            // 4. KDA Recurrent Step
+                            if let kdaPipe = kdaLinearAttnStepPipeline,
+                               let sBuf = KVCacheManager.shared.linearStateBuffer,
+                               let aLog = layer.aLogTensor, let aLogRaw = buffers[aLog.shardIndex],
+                               let dtBias = layer.dtBiasTensor, let dtBiasRaw = buffers[dtBias.shardIndex],
+                               let oNorm = layer.linearNormTensor, let oNormRaw = buffers[oNorm.shardIndex] {
+                                let stateByteOffset = linIdx * Int(16 * 128 * 128) * MemoryLayout<Float>.stride
+                                var aLogOff = aLog.offsetStart
+                                var dtBiasOff = dtBias.offsetStart
+                                var oNormOff = oNorm.offsetStart
+                                var numHeads: UInt32 = 16
+                                var headDim: UInt32 = 128
+                                var lowerBound: Float = Float(modelConfig?.kdaLowerBound ?? -5.0)
+                                var epsVal = eps
+                                var isF32Params: UInt32 = (aLog.dtype.contains("F32") || (aLog.dtype.contains("FLOAT") && !aLog.dtype.contains("BF16"))) ? 1 : 0
+
+                                layerEnc1.setComputePipelineState(kdaPipe)
+                                layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                                layerEnc1.setBuffer(kVectorBuffer, offset: 0, index: 1)
+                                layerEnc1.setBuffer(vVectorBuffer, offset: 0, index: 2)
+                                layerEnc1.setBuffer(aVectorBuffer, offset: 0, index: 3)
+                                layerEnc1.setBuffer(bVectorBuffer, offset: 0, index: 4)
+                                layerEnc1.setBuffer(zGateBuffer, offset: 0, index: 5)
+                                layerEnc1.setBuffer(aLogRaw, offset: 0, index: 6)
+                                layerEnc1.setBuffer(dtBiasRaw, offset: 0, index: 7)
+                                layerEnc1.setBuffer(oNormRaw, offset: 0, index: 8)
+                                layerEnc1.setBuffer(sBuf, offset: stateByteOffset, index: 9)
+                                layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 10)
+                                layerEnc1.setBytes(&aLogOff, length: MemoryLayout<UInt64>.stride, index: 11)
+                                layerEnc1.setBytes(&dtBiasOff, length: MemoryLayout<UInt64>.stride, index: 12)
+                                layerEnc1.setBytes(&oNormOff, length: MemoryLayout<UInt64>.stride, index: 13)
+                                layerEnc1.setBytes(&numHeads, length: MemoryLayout<UInt32>.stride, index: 14)
+                                layerEnc1.setBytes(&headDim, length: MemoryLayout<UInt32>.stride, index: 15)
+                                layerEnc1.setBytes(&lowerBound, length: MemoryLayout<Float>.stride, index: 16)
+                                layerEnc1.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 17)
+                                layerEnc1.setBytes(&isF32Params, length: MemoryLayout<UInt32>.stride, index: 18)
+                                layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                layerEnc1.memoryBarrier(scope: .buffers)
+                            }
+
+                            // 5. Output projection: 2048 -> hiddenDim (1536) into attnOutBuffer
+                            dispatchLinear(enc: layerEnc1, weight: layer.linearOutProjTensor ?? layer.oProjTensor, scale: nil, bias: nil, inBuf: attnCtxBuffer, outBuf: attnOutBuffer, inDim: 2048, outDim: hiddenDim)
                             layerEnc1.memoryBarrier(scope: .buffers)
                         } else {
                             // Linear Attention (GatedDeltaNet Recurrent State)
@@ -5108,6 +5533,28 @@ struct ContentView: View {
                                         layerEnc1.setBytes(&nExp, length: MemoryLayout<UInt32>.stride, index: 6)
                                         layerEnc1.setBytes(&kVal, length: MemoryLayout<UInt32>.stride, index: 7)
                                         layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                                    } else if let rBias = layer.routerExpertBias, let rBiasRaw = buffers[rBias.shardIndex],
+                                               let bailingPipe = routerBailingPipeline {
+                                        var bOffset = rBias.offsetStart
+                                        var nGrp: UInt32 = UInt32(modelConfig?.nGroup ?? 8)
+                                        var topkGrp: UInt32 = UInt32(modelConfig?.topkGroup ?? 4)
+                                        var scaleFactor: Float = Float(modelConfig?.routedScalingFactor ?? 2.5)
+
+                                        layerEnc1.setComputePipelineState(bailingPipe)
+                                        layerEnc1.setBuffer(routerRaw, offset: 0, index: 0)
+                                        layerEnc1.setBuffer(rBiasRaw, offset: 0, index: 1)
+                                        layerEnc1.setBuffer(xNorm2Buffer, offset: 0, index: 2)
+                                        layerEnc1.setBuffer(routerIndicesBuffer, offset: 0, index: 3)
+                                        layerEnc1.setBuffer(routerWeightsBuffer, offset: 0, index: 4)
+                                        layerEnc1.setBytes(&rOffset, length: MemoryLayout<UInt64>.stride, index: 5)
+                                        layerEnc1.setBytes(&bOffset, length: MemoryLayout<UInt64>.stride, index: 6)
+                                        layerEnc1.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 7)
+                                        layerEnc1.setBytes(&nExp, length: MemoryLayout<UInt32>.stride, index: 8)
+                                        layerEnc1.setBytes(&kVal, length: MemoryLayout<UInt32>.stride, index: 9)
+                                        layerEnc1.setBytes(&nGrp, length: MemoryLayout<UInt32>.stride, index: 10)
+                                        layerEnc1.setBytes(&topkGrp, length: MemoryLayout<UInt32>.stride, index: 11)
+                                        layerEnc1.setBytes(&scaleFactor, length: MemoryLayout<Float>.stride, index: 12)
+                                        layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: Int(numExperts), height: 1, depth: 1))
                                     } else {
                                         layerEnc1.setComputePipelineState(routerPipeline)
                                         layerEnc1.setBuffer(routerRaw, offset: 0, index: 0)
@@ -5171,6 +5618,10 @@ struct ContentView: View {
                             layerEnc1.endEncoding()
                             activeCmd.commit()
                             activeCmd.waitUntilCompleted()
+                            if let err = activeCmd.error {
+                                print("❌ [METAL ERROR] activeCmd failed at layer \(l): \(err)")
+                                return false
+                            }
 
                             var activeExperts: [(id: Int, weight: Float)] = []
                             let topKCount = Int(modelConfig?.effectiveNumExpertsPerTok ?? (numExperts >= 512 ? 10 : 8))
@@ -5236,6 +5687,8 @@ struct ContentView: View {
                                 let compDownW = loadedLayout?.components.first(where: { $0.name.contains("down_proj") && $0.name.contains("weight") && !$0.name.contains("scale") && !$0.name.contains("bias") })
                                 let compDownS = loadedLayout?.components.first(where: { $0.name.contains("down_proj") && ($0.name.contains("scale") || $0.name.contains("scales")) })
                                 let compDownB = loadedLayout?.components.first(where: { $0.name.contains("down_proj") && ($0.name.contains("bias") || $0.name.contains("biases")) })
+
+                                let isQuantizedAffine = (compGateB != nil || compGateW?.name.contains("Q4") == true || compGateW?.name.contains("Q8") == true || compGateW?.dtype.contains("Q4") == true || compGateW?.dtype.contains("Q8") == true || (compGateS != nil && !isFP8Layout))
 
                                 // 1. Fast parallel pread the active experts directly into unified staging MTLBuffer
                                 var tasks: [ExpertPreadTask] = []
@@ -5315,7 +5768,8 @@ struct ContentView: View {
                                             layerEnc2.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                                             layerEnc2.memoryBarrier(scope: .buffers)
                                         }
-                                    } else if let q4GatePipe = q4GateUpPipeline,
+                                    } else if isQuantizedAffine,
+                                               let q4GatePipe = q4GateUpPipeline,
                                                let q4DownPipe = q4DownPipeline {
                                         var gWOffU = gWOff
                                         var gSOffU = gSOff
@@ -5368,6 +5822,37 @@ struct ContentView: View {
                                         layerEnc2.setBytes(&pkVal, length: 4, index: 12)
                                         layerEnc2.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                                         layerEnc2.memoryBarrier(scope: .buffers)
+                                    } else if let gateSimd = bf16GateUpSimdPipeline,
+                                               let downSimd = bf16DownSimdPipeline {
+                                        var gWOffU = gWOff
+                                        var uWOffU = uWOff
+                                        var dWOffU = dWOff
+                                        var hDimVal: UInt32 = UInt32(hiddenDim)
+                                        var interDimVal: UInt32 = UInt32(intermediateDim)
+                                        var pkVal = pk
+
+                                        layerEnc2.setComputePipelineState(gateSimd)
+                                        layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 0)
+                                        layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 1)
+                                        layerEnc2.setBuffer(xNorm2Buffer, offset: 0, index: 2)
+                                        layerEnc2.setBuffer(interBuffer, offset: 0, index: 3)
+                                        layerEnc2.setBytes(&gWOffU, length: 8, index: 4)
+                                        layerEnc2.setBytes(&uWOffU, length: 8, index: 5)
+                                        layerEnc2.setBytes(&hDimVal, length: 4, index: 6)
+                                        layerEnc2.setBytes(&interDimVal, length: 4, index: 7)
+                                        layerEnc2.dispatchThreadgroups(MTLSize(width: Int(intermediateDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                        layerEnc2.memoryBarrier(scope: .buffers)
+
+                                        layerEnc2.setComputePipelineState(downSimd)
+                                        layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 0)
+                                        layerEnc2.setBuffer(interBuffer, offset: 0, index: 1)
+                                        layerEnc2.setBuffer(hMlpBuffer, offset: 0, index: 2)
+                                        layerEnc2.setBytes(&dWOffU, length: 8, index: 3)
+                                        layerEnc2.setBytes(&interDimVal, length: 4, index: 4)
+                                        layerEnc2.setBytes(&hDimVal, length: 4, index: 5)
+                                        layerEnc2.setBytes(&pkVal, length: 4, index: 6)
+                                        layerEnc2.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                        layerEnc2.memoryBarrier(scope: .buffers)
                                     } else if let gateUnq = bf16GateUpPipeline,
                                                let downUnq = bf16DownPipeline {
                                         var gWOffU = gWOff
@@ -5386,7 +5871,7 @@ struct ContentView: View {
                                         layerEnc2.setBytes(&uWOffU, length: 8, index: 5)
                                         layerEnc2.setBytes(&hDimVal, length: 4, index: 6)
                                         layerEnc2.setBytes(&interDimVal, length: 4, index: 7)
-                                        layerEnc2.dispatchThreadgroups(MTLSize(width: Int(intermediateDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                        layerEnc2.dispatchThreads(MTLSize(width: Int(intermediateDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(intermediateDim), gateUnq.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                                         layerEnc2.memoryBarrier(scope: .buffers)
 
                                         layerEnc2.setComputePipelineState(downUnq)
@@ -5397,7 +5882,7 @@ struct ContentView: View {
                                         layerEnc2.setBytes(&interDimVal, length: 4, index: 4)
                                         layerEnc2.setBytes(&hDimVal, length: 4, index: 5)
                                         layerEnc2.setBytes(&pkVal, length: 4, index: 6)
-                                        layerEnc2.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                        layerEnc2.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), downUnq.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                                         layerEnc2.memoryBarrier(scope: .buffers)
                                     }
                                 }
@@ -5456,6 +5941,10 @@ struct ContentView: View {
                                 layerEnc2.endEncoding()
                                 moeCmd.commit()
                                 moeCmd.waitUntilCompleted()
+                                if let err = moeCmd.error {
+                                    print("❌ [METAL ERROR] moeCmd (packed) failed at layer \(l): \(err)")
+                                    return false
+                                }
                             } else {
                                 guard let moeCmd = commandQueue.makeCommandBuffer(),
                                       let layerEnc2 = moeCmd.makeComputeCommandEncoder() else { return false }
@@ -5556,6 +6045,10 @@ struct ContentView: View {
                                 layerEnc2.endEncoding()
                                 moeCmd.commit()
                                 moeCmd.waitUntilCompleted()
+                                if let err = moeCmd.error {
+                                    print("❌ [METAL ERROR] moeCmd (unpacked) failed at layer \(l): \(err)")
+                                    return false
+                                }
                             }
 
                             guard let nextCmd = commandQueue.makeCommandBuffer() else { return false }
@@ -5601,6 +6094,10 @@ struct ContentView: View {
                 guard computeLogits else {
                     activeCmd.commit()
                     activeCmd.waitUntilCompleted()
+                    if let err = activeCmd.error {
+                        print("❌ [METAL ERROR] activeCmd (prefill) failed: \(err)")
+                        return false
+                    }
                     return true
                 }
 
@@ -5688,6 +6185,10 @@ struct ContentView: View {
                 activeCmd.commit()
                 if wait {
                     activeCmd.waitUntilCompleted()
+                    if let err = activeCmd.error {
+                        print("❌ [METAL ERROR] activeCmd (decode) failed: \(err)")
+                        return false
+                    }
                 }
 
                 return true
@@ -6602,6 +7103,33 @@ struct ContentView: View {
                                         layerEnc1.setBytes(&nExp, length: MemoryLayout<UInt32>.stride, index: 6)
                                         layerEnc1.setBytes(&kVal, length: MemoryLayout<UInt32>.stride, index: 7)
                                         layerEnc1.dispatchThreadgroups(MTLSize(width: P, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                                    } else if let rBias = layer.routerExpertBias, let rBiasRaw = buffers[rBias.shardIndex],
+                                               let bailingPipe = routerBailingPipeline {
+                                        var bOffset = rBias.offsetStart
+                                        var nGrp: UInt32 = UInt32(modelConfig?.nGroup ?? 8)
+                                        var topkGrp: UInt32 = UInt32(modelConfig?.topkGroup ?? 4)
+                                        var scaleFactor: Float = Float(modelConfig?.routedScalingFactor ?? 2.5)
+
+                                        for p in 0..<P {
+                                            let tokenOffset = p * Int(hiddenDim) * MemoryLayout<Float>.stride
+                                            let rIndexOffset = p * topKCount * MemoryLayout<UInt32>.stride
+                                            let rWeightOffset = p * topKCount * MemoryLayout<Float>.stride
+                                            layerEnc1.setComputePipelineState(bailingPipe)
+                                            layerEnc1.setBuffer(routerRaw, offset: 0, index: 0)
+                                            layerEnc1.setBuffer(rBiasRaw, offset: 0, index: 1)
+                                            layerEnc1.setBuffer(xNorm2Buffer_all, offset: tokenOffset, index: 2)
+                                            layerEnc1.setBuffer(routerIndicesBuffer_all, offset: rIndexOffset, index: 3)
+                                            layerEnc1.setBuffer(routerWeightsBuffer_all, offset: rWeightOffset, index: 4)
+                                            layerEnc1.setBytes(&rOffset, length: MemoryLayout<UInt64>.stride, index: 5)
+                                            layerEnc1.setBytes(&bOffset, length: MemoryLayout<UInt64>.stride, index: 6)
+                                            layerEnc1.setBytes(&hDim, length: MemoryLayout<UInt32>.stride, index: 7)
+                                            layerEnc1.setBytes(&nExp, length: MemoryLayout<UInt32>.stride, index: 8)
+                                            layerEnc1.setBytes(&kVal, length: MemoryLayout<UInt32>.stride, index: 9)
+                                            layerEnc1.setBytes(&nGrp, length: MemoryLayout<UInt32>.stride, index: 10)
+                                            layerEnc1.setBytes(&topkGrp, length: MemoryLayout<UInt32>.stride, index: 11)
+                                            layerEnc1.setBytes(&scaleFactor, length: MemoryLayout<Float>.stride, index: 12)
+                                            layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: Int(numExperts), height: 1, depth: 1))
+                                        }
                                     } else {
                                         for p in 0..<P {
                                             let tokenOffset = p * Int(hiddenDim) * MemoryLayout<Float>.stride
@@ -7951,6 +8479,33 @@ struct ContentView: View {
                                         layerEnc.setBytes(&nExp, length: MemoryLayout<UInt32>.stride, index: 6)
                                         layerEnc.setBytes(&kVal, length: MemoryLayout<UInt32>.stride, index: 7)
                                         layerEnc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+                                    } else if let rBias = layer.routerExpertBias, let rBiasRaw = buffers[rBias.shardIndex],
+                                               let bailingPipe = routerBailingPipeline {
+                                        var bOffset = rBias.offsetStart
+                                        var nGrp: UInt32 = UInt32(modelConfig?.nGroup ?? 8)
+                                        var topkGrp: UInt32 = UInt32(modelConfig?.topkGroup ?? 4)
+                                        var scaleFactor: Float = Float(modelConfig?.routedScalingFactor ?? 2.5)
+
+                                        for n in 0..<N {
+                                            let tokenOffset = n * Int(hiddenDim) * MemoryLayout<Float>.stride
+                                            let rIndexOffset = n * topKCount * MemoryLayout<UInt32>.stride
+                                            let rWeightOffset = n * topKCount * MemoryLayout<Float>.stride
+                                            layerEnc.setComputePipelineState(bailingPipe)
+                                            layerEnc.setBuffer(routerRaw, offset: 0, index: 0)
+                                            layerEnc.setBuffer(rBiasRaw, offset: 0, index: 1)
+                                            layerEnc.setBuffer(jb.treeXNorm2Buffer, offset: tokenOffset, index: 2)
+                                            layerEnc.setBuffer(jb.treeRouterIndicesBuffer, offset: rIndexOffset, index: 3)
+                                            layerEnc.setBuffer(jb.treeRouterWeightsBuffer, offset: rWeightOffset, index: 4)
+                                            layerEnc.setBytes(&rOffset, length: MemoryLayout<UInt64>.stride, index: 5)
+                                            layerEnc.setBytes(&bOffset, length: MemoryLayout<UInt64>.stride, index: 6)
+                                            layerEnc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 7)
+                                            layerEnc.setBytes(&nExp, length: MemoryLayout<UInt32>.stride, index: 8)
+                                            layerEnc.setBytes(&kVal, length: MemoryLayout<UInt32>.stride, index: 9)
+                                            layerEnc.setBytes(&nGrp, length: MemoryLayout<UInt32>.stride, index: 10)
+                                            layerEnc.setBytes(&topkGrp, length: MemoryLayout<UInt32>.stride, index: 11)
+                                            layerEnc.setBytes(&scaleFactor, length: MemoryLayout<Float>.stride, index: 12)
+                                            layerEnc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: Int(numExperts), height: 1, depth: 1))
+                                        }
                                     } else {
                                         layerEnc.setComputePipelineState(routerPipeline)
                                         layerEnc.setBuffer(routerRaw, offset: 0, index: 0)
@@ -8053,6 +8608,8 @@ struct ContentView: View {
                                 let compDownS = loadedLayout?.components.first(where: { $0.name.contains("down_proj") && ($0.name.contains("scale") || $0.name.contains("scales")) })
                                 let compDownB = loadedLayout?.components.first(where: { $0.name.contains("down_proj") && ($0.name.contains("bias") || $0.name.contains("biases")) })
 
+                                let isQuantizedAffine = (compGateB != nil || compGateW?.name.contains("Q4") == true || compGateW?.name.contains("Q8") == true || compGateW?.dtype.contains("Q4") == true || compGateW?.dtype.contains("Q8") == true || (compGateS != nil && !isFP8Layout))
+
                                 for n in activeNodeIndices {
                                     let inOff = n * Int(hiddenDim) * MemoryLayout<Float>.stride
                                     let interOff = n * Int(layer.intermediateDim) * MemoryLayout<Float>.stride
@@ -8120,7 +8677,7 @@ struct ContentView: View {
                                                 moeEnc.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                                                 moeEnc.memoryBarrier(scope: .buffers)
                                             }
-                                        } else if let q4GatePipe = q4GateUpPipeline, let q4DownPipe = q4DownPipeline {
+                                        } else if isQuantizedAffine, let q4GatePipe = q4GateUpPipeline, let q4DownPipe = q4DownPipeline {
                                             var gWOffU = gWOff
                                             var gSOffU = gSOff
                                             var gBOffU = gBOff
@@ -8172,6 +8729,36 @@ struct ContentView: View {
                                             moeEnc.setBytes(&pkVal, length: 4, index: 12)
                                             moeEnc.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                                             moeEnc.memoryBarrier(scope: .buffers)
+                                        } else if let gateSimd = bf16GateUpSimdPipeline, let downSimd = bf16DownSimdPipeline {
+                                            var gWOffU = gWOff
+                                            var uWOffU = uWOff
+                                            var dWOffU = dWOff
+                                            var hDimVal: UInt32 = UInt32(hiddenDim)
+                                            var interDimVal: UInt32 = UInt32(layer.intermediateDim)
+                                            var pkVal = p_k
+
+                                            moeEnc.setComputePipelineState(gateSimd)
+                                            moeEnc.setBuffer(expertStagingBuffer, offset: 0, index: 0)
+                                            moeEnc.setBuffer(expertStagingBuffer, offset: 0, index: 1)
+                                            moeEnc.setBuffer(jb.treeXNorm2Buffer, offset: inOff, index: 2)
+                                            moeEnc.setBuffer(jb.treeInterBuffer, offset: interOff, index: 3)
+                                            moeEnc.setBytes(&gWOffU, length: 8, index: 4)
+                                            moeEnc.setBytes(&uWOffU, length: 8, index: 5)
+                                            moeEnc.setBytes(&hDimVal, length: 4, index: 6)
+                                            moeEnc.setBytes(&interDimVal, length: 4, index: 7)
+                                            moeEnc.dispatchThreadgroups(MTLSize(width: Int(layer.intermediateDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                            moeEnc.memoryBarrier(scope: .buffers)
+
+                                            moeEnc.setComputePipelineState(downSimd)
+                                            moeEnc.setBuffer(expertStagingBuffer, offset: 0, index: 0)
+                                            moeEnc.setBuffer(jb.treeInterBuffer, offset: interOff, index: 1)
+                                            moeEnc.setBuffer(jb.treeHMlpBuffer, offset: accumOff, index: 2)
+                                            moeEnc.setBytes(&dWOffU, length: 8, index: 3)
+                                            moeEnc.setBytes(&interDimVal, length: 4, index: 4)
+                                            moeEnc.setBytes(&hDimVal, length: 4, index: 5)
+                                            moeEnc.setBytes(&pkVal, length: 4, index: 6)
+                                            moeEnc.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                            moeEnc.memoryBarrier(scope: .buffers)
                                         } else if let gateUnq = bf16GateUpPipeline, let downUnq = bf16DownPipeline {
                                             var gWOffU = gWOff
                                             var uWOffU = uWOff
@@ -8189,7 +8776,7 @@ struct ContentView: View {
                                             moeEnc.setBytes(&uWOffU, length: 8, index: 5)
                                             moeEnc.setBytes(&hDimVal, length: 4, index: 6)
                                             moeEnc.setBytes(&interDimVal, length: 4, index: 7)
-                                            moeEnc.dispatchThreadgroups(MTLSize(width: Int(layer.intermediateDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                            moeEnc.dispatchThreads(MTLSize(width: Int(layer.intermediateDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(layer.intermediateDim), gateUnq.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                                             moeEnc.memoryBarrier(scope: .buffers)
 
                                             moeEnc.setComputePipelineState(downUnq)
@@ -8200,7 +8787,7 @@ struct ContentView: View {
                                             moeEnc.setBytes(&interDimVal, length: 4, index: 4)
                                             moeEnc.setBytes(&hDimVal, length: 4, index: 5)
                                             moeEnc.setBytes(&pkVal, length: 4, index: 6)
-                                            moeEnc.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                            moeEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), downUnq.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                                             moeEnc.memoryBarrier(scope: .buffers)
                                         }
                                     }
@@ -8616,13 +9203,75 @@ struct ContentView: View {
             var accumulatedDecodedText = ""
             var lastUIUpdateTime = CFAbsoluteTimeGetCurrent()
 
+            if isFullRAM && WorkingSetManager.shared.residentExpertsCount < WorkingSetManager.shared.totalExpertKeysCount {
+                await MainActor.run {
+                    self.generationStatusText = "⚡ Priming resident weights into RAM..."
+                }
+                WorkingSetManager.shared.preFaultAll(shardBuffers: buffers, summary: summary)
+            }
+
             // Ingest prompt tokens into KV-cache and recurrent states (skipping pinned prefix)
             let promptCount = promptTokenIds.count - 1
             if promptCount > 0 {
                 let startPos = min(prefixTokensReused, promptCount)
                 if startPos < promptCount {
                     let prefillTokens = Array(promptTokenIds[startPos..<promptCount])
-                    let ok = runLayerWisePrefill(promptTokens: prefillTokens, startPos: UInt32(startPos))
+                    let ok: Bool
+                    if modelConfig?.isLingModel == true {
+                        var prefillSuccess = true
+                        let prefillStartTime = CFAbsoluteTimeGetCurrent()
+                        var lastPrefillUIUpdateTime = prefillStartTime
+                        let totalTokens = prefillTokens.count
+
+                        let initialPrefillStr = "Ingesting prompt: Token 1/\(totalTokens) (0%) • Initializing..."
+                        Task { @MainActor in
+                            self.generationStatusText = "📥 " + initialPrefillStr
+                            if let sId = sessionId, let mId = messageId,
+                               let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                               let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                                self.sessions[sIdx].messages[mIdx].prefillStatus = initialPrefillStr
+                            }
+                        }
+
+                        for (idx, pTok) in prefillTokens.enumerated() {
+                            if Task.isCancelled { prefillSuccess = false; break }
+                            let stepOk = autoreleasepool {
+                                runTokenForward(tokenId: pTok, step: UInt32(startPos + idx), computeLogits: false)
+                            }
+                            if !stepOk {
+                                prefillSuccess = false
+                                break
+                            }
+
+                            let now = CFAbsoluteTimeGetCurrent()
+                            if now - lastPrefillUIUpdateTime >= 0.08 || idx == totalTokens - 1 {
+                                lastPrefillUIUpdateTime = now
+                                let elapsed = max(0.001, now - prefillStartTime)
+                                let promptSpeed = Double(idx + 1) / elapsed
+                                let pct = Int((Double(idx + 1) / Double(totalTokens)) * 100)
+                                let remaining = totalTokens - (idx + 1)
+                                let etaSec = Double(remaining) * (elapsed / Double(idx + 1))
+                                let etaStr = etaSec >= 60 ? String(format: "%dm %02ds", Int(etaSec) / 60, Int(etaSec) % 60) : String(format: "%.0fs", etaSec)
+                                let speedStr = promptSpeed >= 10 ? String(format: "%.0f", promptSpeed) : String(format: "%.1f", promptSpeed)
+                                let prefillStr = "Ingesting prompt: Token \(idx + 1)/\(totalTokens) (\(pct)%) • \(speedStr) tok/s • ETA: \(etaStr)"
+                                let currentRss = WorkingSetManager.shared.effectiveResidentMemoryGB
+
+                                Task { @MainActor in
+                                    self.generationSpeedTokPerSec = promptSpeed
+                                    self.generationStatusText = "📥 " + prefillStr
+                                    self.currentRssGB = currentRss
+                                    if let sId = sessionId, let mId = messageId,
+                                       let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                                       let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                                        self.sessions[sIdx].messages[mIdx].prefillStatus = prefillStr
+                                    }
+                                }
+                            }
+                        }
+                        ok = prefillSuccess
+                    } else {
+                        ok = runLayerWisePrefill(promptTokens: prefillTokens, startPos: UInt32(startPos))
+                    }
                     if !ok {
                         await MainActor.run {
                             self.isGeneratingText = false
@@ -8668,7 +9317,9 @@ struct ContentView: View {
                     jetSpecTotalDraftProposed += 1
                     jetSpecMeanTau = Double(jetSpecTotalDraftAccepted) / Double(max(jetSpecTotalDraftProposed, 1))
                 } else {
-                    let ok = runTokenForward(tokenId: currentTokenId, step: currentStep, computeLogits: true, wait: true)
+                    let ok = autoreleasepool {
+                        runTokenForward(tokenId: currentTokenId, step: currentStep, computeLogits: true, wait: true)
+                    }
                     if !ok {
                         await MainActor.run {
                             self.isGeneratingText = false
@@ -8712,7 +9363,8 @@ struct ContentView: View {
                 var shouldBreak = false
                 for nextToken in acceptedBatch {
                     // 5. Check EOS
-                    if nextToken == eosTokenId || nextToken == 248044 || nextToken == 248046 || nextToken == 166101 || nextToken == 166102 {
+                    let isLingEos = (modelConfig?.isLingModel == true) && (nextToken == 156895 || nextToken == 156892)
+                    if nextToken == eosTokenId || nextToken == 248044 || nextToken == 248046 || nextToken == 166101 || nextToken == 166102 || isLingEos {
                         shouldBreak = true
                         break
                     }
@@ -8741,7 +9393,7 @@ struct ContentView: View {
                     }
                     accumulatedDecodedText += deltaText
 
-                    if deltaText.contains("<|im_end|>") || deltaText.contains("<|endoftext|>") {
+                    if deltaText.contains("<|im_end|>") || deltaText.contains("<|endoftext|>") || deltaText.contains("<|role_end|>") {
                         shouldBreak = true
                         break
                     }
@@ -8802,6 +9454,7 @@ struct ContentView: View {
                         .replacingOccurrences(of: "<|im_end|>", with: "")
                         .replacingOccurrences(of: "<|endoftext|>", with: "")
                         .replacingOccurrences(of: "<|im_start|>", with: "")
+                        .replacingOccurrences(of: "<|role_end|>", with: "")
                         .trimmingCharacters(in: .whitespacesAndNewlines)
                     activeThink = false
                 } else if containsThinkOpen || promptRequestsThinking {
@@ -8818,6 +9471,7 @@ struct ContentView: View {
                         .replacingOccurrences(of: "<|im_end|>", with: "")
                         .replacingOccurrences(of: "<|endoftext|>", with: "")
                         .replacingOccurrences(of: "<|im_start|>", with: "")
+                        .replacingOccurrences(of: "<|role_end|>", with: "")
                 }
 
                 let liveTtft = firstTokenTimestamp.map { $0 - startTime }
@@ -8927,6 +9581,7 @@ struct ContentView: View {
                     .replacingOccurrences(of: "<|im_end|>", with: "")
                     .replacingOccurrences(of: "<|endoftext|>", with: "")
                     .replacingOccurrences(of: "<|im_start|>", with: "")
+                    .replacingOccurrences(of: "<|role_end|>", with: "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
             } else if finalContainsThinkOpen || promptRequestsThinkingFinal {
                 let openTag = finalDecoded.contains("<|thought|>") ? "<|thought|>" : (finalDecoded.contains("<thought>") ? "<thought>" : "<think>")
@@ -8939,6 +9594,7 @@ struct ContentView: View {
                     .replacingOccurrences(of: "<|im_end|>", with: "")
                     .replacingOccurrences(of: "<|endoftext|>", with: "")
                     .replacingOccurrences(of: "<|im_start|>", with: "")
+                    .replacingOccurrences(of: "<|role_end|>", with: "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
             }
 
@@ -9160,8 +9816,9 @@ struct ContentView: View {
                             includeThinkSuffix: thinkingEnabled
                         )
                         var assistantTurnText = finalDecoded
-                        if !assistantTurnText.contains("<|im_end|>") {
-                            assistantTurnText += "<|im_end|>"
+                        let endTag = (modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>"
+                        if !assistantTurnText.contains(endTag) {
+                            assistantTurnText += endTag
                         }
                         let nextPrompt = formattedPrompt + assistantTurnText + "\n" + toolResponseTurn
                         await MainActor.run {
@@ -9212,8 +9869,9 @@ struct ContentView: View {
                         includeThinkSuffix: thinkingEnabled
                     )
                     var assistantTurnText = finalDecoded
-                    if !assistantTurnText.contains("<|im_end|>") {
-                        assistantTurnText += "<|im_end|>"
+                    let endTag = (modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>"
+                    if !assistantTurnText.contains(endTag) {
+                        assistantTurnText += endTag
                     }
                     let nextPrompt = formattedPrompt + assistantTurnText + "\n" + continuationTurn
                     await MainActor.run {
@@ -9278,8 +9936,15 @@ struct ContentView: View {
         let mappedGB = summary.sizeGb
         let eff = mode.resolveEffectiveMode(modelFootprintGB: mappedGB)
         if eff == .residentRAM {
-            WorkingSetManager.shared.preFaultAll(shardBuffers: shardBuffers, summary: summary)
-            pagingStatusMessage = "⚡ Operating in Full RAM Resident Mode (Zero Disk Paging)"
+            pagingStatusMessage = "⚡ Priming resident weights into RAM..."
+            DispatchQueue.global(qos: .userInitiated).async {
+                WorkingSetManager.shared.preFaultAll(shardBuffers: self.shardBuffers, summary: summary)
+                Task { @MainActor in
+                    self.pagingStatusMessage = "⚡ Operating in Full RAM Resident Mode (Zero Disk Paging)"
+                    self.updatePagingStats()
+                    self.syncSettingsWindowIfNeeded()
+                }
+            }
         } else {
             let dirUrl: URL? = activeLoadedModelPath != nil ? {
                 let p = activeLoadedModelPath!
@@ -9289,8 +9954,14 @@ struct ContentView: View {
             }() : nil
             WorkingSetManager.shared.initialize(summary: summary, shardBuffers: shardBuffers, mode: memoryBudgetMode, modelDir: dirUrl)
             pagingStatusMessage = "🌊 Operating in Dynamic SSD Streaming Mode"
+            updatePagingStats()
+            syncSettingsWindowIfNeeded()
         }
-        updatePagingStats()
+    }
+
+    private func applyMemoryBudgetMode(_ budget: MemoryBudgetMode) {
+        applyMemoryBudget(budget)
+        syncSettingsWindowIfNeeded()
     }
 
     private func loadAndBridgeToMetal(filePath: String) {
@@ -9346,6 +10017,10 @@ struct ContentView: View {
                     let address = UInt(shard.baseAddress)
                     guard let pointer = UnsafeMutableRawPointer(bitPattern: address) else { continue }
                     let length = Int(shard.length)
+                    guard length > 0 else {
+                        print("ℹ️ [Metal] Skipping zero-length shard #\(shard.index) (\(shard.filename)).")
+                        continue
+                    }
                     guard length <= Int(device.maxBufferLength) else {
                         print("⚠️ [Metal Warning] Shard #\(shard.index) (\(shard.filename)) size \(Double(length) / (1024*1024*1024)) GB exceeds device maxBufferLength (\(Double(device.maxBufferLength) / (1024*1024*1024)) GB). Skipping single-buffer mapping.")
                         continue
@@ -9361,11 +10036,10 @@ struct ContentView: View {
                 if isFlashMoE {
                     ExpertIOThreadPool.shared.initialize(numThreads: 8)
                 } else {
+                    WorkingSetManager.shared.initialize(summary: loadedSummary, shardBuffers: buffers, mode: memoryBudgetMode, modelDir: dirUrl)
                     let effMode = memoryExecutionMode.resolveEffectiveMode(modelFootprintGB: mappedGB)
                     if effMode == .residentRAM {
                         WorkingSetManager.shared.preFaultAll(shardBuffers: buffers, summary: loadedSummary)
-                    } else {
-                        WorkingSetManager.shared.initialize(summary: loadedSummary, shardBuffers: buffers, mode: memoryBudgetMode, modelDir: dirUrl)
                     }
                 }
                 

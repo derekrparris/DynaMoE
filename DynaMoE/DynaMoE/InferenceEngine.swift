@@ -154,6 +154,26 @@ public struct EngineCachedLayer {
     public let mlpHcDownWeight: TensorMetadata?
     public let mlpHcUpWeight: TensorMetadata?
     public let mlpHcInjectWeight: TensorMetadata?
+
+    // KDA Disaggregated Projections & Short Convolutions (Ling-3.0-tiny)
+    public let kdaQProj: TensorMetadata?
+    public let kdaKProj: TensorMetadata?
+    public let kdaVProj: TensorMetadata?
+    public let kdaQConv1d: TensorMetadata?
+    public let kdaKConv1d: TensorMetadata?
+    public let kdaVConv1d: TensorMetadata?
+
+    // Multi-Head Latent Attention (MLA) Tensors (Ling-3.0-tiny)
+    public let mlaQAProj: TensorMetadata?
+    public let mlaQALayernorm: TensorMetadata?
+    public let mlaQBProj: TensorMetadata?
+    public let mlaKVAProjWithMqa: TensorMetadata?
+    public let mlaKVALayernorm: TensorMetadata?
+    public let mlaKVBProj: TensorMetadata?
+    public let mlaGateProj: TensorMetadata?
+
+    // MoE Router Expert Bias (Ling-3.0-tiny)
+    public let routerExpertBias: TensorMetadata?
 }
 
 public final class InferenceEngine {
@@ -225,6 +245,8 @@ public final class InferenceEngine {
     public var mxfp8DownSimdPipeline: MTLComputePipelineState?
     public var bf16GateUpPipeline: MTLComputePipelineState?
     public var bf16DownPipeline: MTLComputePipelineState?
+    public var bf16GateUpSimdPipeline: MTLComputePipelineState?
+    public var bf16DownSimdPipeline: MTLComputePipelineState?
     public var fp8GateUpBatchedPipeline: MTLComputePipelineState?
     public var fp8DownBatchedPipeline: MTLComputePipelineState?
     public var fp8BlockGateUpBatchedPipeline: MTLComputePipelineState?
@@ -454,6 +476,12 @@ public final class InferenceEngine {
         if let bf16DownFunc = defaultLib.makeFunction(name: "bf16_down_proj_accumulate") {
             bf16DownPipeline = try device.makeComputePipelineState(function: bf16DownFunc)
         }
+        if let bf16GateUpSimdFunc = defaultLib.makeFunction(name: "bf16_swiglu_gate_up_simd") {
+            bf16GateUpSimdPipeline = try device.makeComputePipelineState(function: bf16GateUpSimdFunc)
+        }
+        if let bf16DownSimdFunc = defaultLib.makeFunction(name: "bf16_down_proj_accumulate_simd") {
+            bf16DownSimdPipeline = try device.makeComputePipelineState(function: bf16DownSimdFunc)
+        }
         if let fp8GateBatchedFunc = defaultLib.makeFunction(name: "fp8_swiglu_gate_up_batched") {
             fp8GateUpBatchedPipeline = try device.makeComputePipelineState(function: fp8GateBatchedFunc)
         }
@@ -595,7 +623,8 @@ public final class InferenceEngine {
             // Router
             let router = layerTensors.first(where: { ($0.category == "MoE Router" || ($0.name.contains("mlp.gate") && !$0.name.contains("switch_mlp") && !$0.name.contains("proj") && !$0.name.contains("shared"))) && !$0.name.contains("scale") && !$0.name.contains("bias") })
             let routerScale = layerTensors.first(where: { ($0.category == "MoE Router" || ($0.name.contains("mlp.gate") && !$0.name.contains("switch_mlp") && !$0.name.contains("proj") && !$0.name.contains("shared"))) && ($0.name.contains("scale") || $0.name.contains("scales")) })
-            let routerBias = layerTensors.first(where: { ($0.category == "MoE Router" || ($0.name.contains("mlp.gate") && !$0.name.contains("switch_mlp") && !$0.name.contains("proj") && !$0.name.contains("shared"))) && ($0.name.contains("bias") || $0.name.contains("biases")) })
+            let routerBias = layerTensors.first(where: { ($0.category == "MoE Router" || ($0.name.contains("mlp.gate") && !$0.name.contains("switch_mlp") && !$0.name.contains("proj") && !$0.name.contains("shared"))) && ($0.name.contains("bias") || $0.name.contains("biases")) && !$0.name.contains("expert_bias") })
+            let routerExpBias = layerTensors.first(where: { $0.name.contains("mlp.gate.expert_bias") || ($0.category == "MoE Router" && $0.name.contains("expert_bias")) })
 
             // Shared Gate
             let sharedGate = layerTensors.first(where: { ($0.category == "Shared Expert Gate" || $0.name.contains("shared_expert_gate")) && !$0.name.contains("scale") && !$0.name.contains("bias") })
@@ -631,7 +660,7 @@ public final class InferenceEngine {
             let qNorm = layerTensors.first(where: { $0.name.contains("self_attn.q_norm") })
             let kNorm = layerTensors.first(where: { $0.name.contains("self_attn.k_norm") })
 
-            let oProj = layerTensors.first(where: { ($0.name.contains("self_attn.o_proj") || $0.name.contains("linear_attn.out_proj") || $0.name.contains("o_proj") || $0.name.contains("out_proj")) && !$0.name.contains("scale") && !$0.name.contains("bias") })
+            let oProj = layerTensors.first(where: { ($0.name.contains("self_attn.o_proj") || $0.name.contains("linear_attn.out_proj") || $0.name.contains("o_proj") || $0.name.contains("out_proj") || $0.name.contains("dense")) && !$0.name.contains("scale") && !$0.name.contains("bias") })
             let oScale = layerTensors.first(where: { ($0.name.contains("self_attn.o_proj") || $0.name.contains("o_proj") || $0.name.contains("out_proj")) && ($0.name.contains("scale") || $0.name.contains("scales")) })
             let oBias = layerTensors.first(where: { ($0.name.contains("self_attn.o_proj") || $0.name.contains("o_proj") || $0.name.contains("out_proj")) && ($0.name.contains("bias") || $0.name.contains("biases")) })
 
@@ -642,25 +671,42 @@ public final class InferenceEngine {
 
             let conv1d = layerTensors.first(where: { $0.name.contains("linear_attn.conv1d.weight") || $0.name.contains("conv1d.weight") })
 
-            let inZ = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_z") && !$0.name.contains("scale") && !$0.name.contains("bias") })
+            let inZ = layerTensors.first(where: { ($0.name.contains("linear_attn.in_proj_z") || ($0.name.contains("attention.g_proj") && attnType == .linearAttention)) && !$0.name.contains("scale") && !$0.name.contains("bias") })
             let inZScale = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_z") && ($0.name.contains("scale") || $0.name.contains("scales")) })
             let inZBias = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_z") && ($0.name.contains("bias") || $0.name.contains("biases")) })
 
-            let inA = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_a") && !$0.name.contains("scale") && !$0.name.contains("bias") })
+            let inA = layerTensors.first(where: { ($0.name.contains("linear_attn.in_proj_a") || $0.name.contains("attention.f_proj")) && !$0.name.contains("scale") && !$0.name.contains("bias") })
             let inAScale = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_a") && ($0.name.contains("scale") || $0.name.contains("scales")) })
             let inABias = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_a") && ($0.name.contains("bias") || $0.name.contains("biases")) })
 
-            let inB = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_b") && !$0.name.contains("scale") && !$0.name.contains("bias") })
+            let inB = layerTensors.first(where: { ($0.name.contains("linear_attn.in_proj_b") || $0.name.contains("attention.b_proj")) && !$0.name.contains("scale") && !$0.name.contains("bias") })
             let inBScale = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_b") && ($0.name.contains("scale") || $0.name.contains("scales")) })
             let inBBias = layerTensors.first(where: { $0.name.contains("linear_attn.in_proj_b") && ($0.name.contains("bias") || $0.name.contains("biases")) })
 
             let aLog = layerTensors.first(where: { $0.name.lowercased().contains("linear_attn.a_log") || $0.name.contains("A_log") || $0.name.contains("a_log") })
             let dtBias = layerTensors.first(where: { $0.name.lowercased().contains("linear_attn.dt_bias") || $0.name.contains("dt_bias") })
-            let linNorm = layerTensors.first(where: { $0.name.lowercased().contains("linear_attn.norm") || $0.name.contains("linear_attn_norm") })
+            let linNorm = layerTensors.first(where: { $0.name.lowercased().contains("linear_attn.norm") || $0.name.contains("linear_attn_norm") || $0.name.contains("attention.o_norm") })
 
-            let linOut = layerTensors.first(where: { ($0.name.contains("linear_attn.out_proj") || $0.name.contains("linear_attn.o_proj")) && !$0.name.contains("scale") && !$0.name.contains("bias") })
-            let linOutScale = layerTensors.first(where: { ($0.name.contains("linear_attn.out_proj") || $0.name.contains("linear_attn.o_proj")) && ($0.name.contains("scale") || $0.name.contains("scales")) })
-            let linOutBias = layerTensors.first(where: { ($0.name.contains("linear_attn.out_proj") || $0.name.contains("linear_attn.o_proj")) && ($0.name.contains("bias") || $0.name.contains("biases")) })
+            let linOut = layerTensors.first(where: { ($0.name.contains("linear_attn.out_proj") || $0.name.contains("linear_attn.o_proj") || $0.name.contains("attention.o_proj")) && !$0.name.contains("scale") && !$0.name.contains("bias") })
+            let linOutScale = layerTensors.first(where: { ($0.name.contains("linear_attn.out_proj") || $0.name.contains("linear_attn.o_proj") || $0.name.contains("attention.o_proj")) && ($0.name.contains("scale") || $0.name.contains("scales")) })
+            let linOutBias = layerTensors.first(where: { ($0.name.contains("linear_attn.out_proj") || $0.name.contains("linear_attn.o_proj") || $0.name.contains("attention.o_proj")) && ($0.name.contains("bias") || $0.name.contains("biases")) })
+
+            // KDA Disaggregated Projections & Short Convolutions (Ling-3.0-tiny)
+            let kdaQ = layerTensors.first(where: { $0.name.contains("attention.q_proj") && !$0.name.contains("conv") })
+            let kdaK = layerTensors.first(where: { $0.name.contains("attention.k_proj") && !$0.name.contains("conv") })
+            let kdaV = layerTensors.first(where: { $0.name.contains("attention.v_proj") && !$0.name.contains("conv") })
+            let kdaQC = layerTensors.first(where: { $0.name.contains("attention.q_conv1d") })
+            let kdaKC = layerTensors.first(where: { $0.name.contains("attention.k_conv1d") })
+            let kdaVC = layerTensors.first(where: { $0.name.contains("attention.v_conv1d") })
+
+            // MLA Multi-Head Latent Attention Tensors (Ling-3.0-tiny)
+            let mlaQA = layerTensors.first(where: { $0.name.contains("attention.q_a_proj") })
+            let mlaQALN = layerTensors.first(where: { $0.name.contains("attention.q_a_layernorm") })
+            let mlaQB = layerTensors.first(where: { $0.name.contains("attention.q_b_proj") })
+            let mlaKVA = layerTensors.first(where: { $0.name.contains("attention.kv_a_proj_with_mqa") })
+            let mlaKVALN = layerTensors.first(where: { $0.name.contains("attention.kv_a_layernorm") })
+            let mlaKVB = layerTensors.first(where: { $0.name.contains("attention.kv_b_proj") })
+            let mlaGate = layerTensors.first(where: { $0.name.contains("attention.g_proj") && attnType == .fullAttention })
 
             // Shared Expert
             let sharedGateW = layerTensors.first(where: { $0.name.contains("shared_expert") && $0.name.contains("gate_proj") && !$0.name.contains("scale") && !$0.name.contains("bias") })
@@ -819,7 +865,21 @@ public final class InferenceEngine {
                 mlpHcNorm: mlpHcNorm,
                 mlpHcDownWeight: mlpHcDown,
                 mlpHcUpWeight: mlpHcUp,
-                mlpHcInjectWeight: mlpHcInject
+                mlpHcInjectWeight: mlpHcInject,
+                kdaQProj: kdaQ,
+                kdaKProj: kdaK,
+                kdaVProj: kdaV,
+                kdaQConv1d: kdaQC,
+                kdaKConv1d: kdaKC,
+                kdaVConv1d: kdaVC,
+                mlaQAProj: mlaQA,
+                mlaQALayernorm: mlaQALN,
+                mlaQBProj: mlaQB,
+                mlaKVAProjWithMqa: mlaKVA,
+                mlaKVALayernorm: mlaKVALN,
+                mlaKVBProj: mlaKVB,
+                mlaGateProj: mlaGate,
+                routerExpertBias: routerExpBias
             ))
         }
 
@@ -830,6 +890,14 @@ public final class InferenceEngine {
 extension EngineCachedLayer {
     public var isFullAttention: Bool {
         return attentionType == .fullAttention
+    }
+
+    public var isKDA: Bool {
+        return kdaQProj != nil || kdaQConv1d != nil
+    }
+
+    public var isMLA: Bool {
+        return mlaQAProj != nil || mlaKVAProjWithMqa != nil
     }
 
     public var backboneTensors: [TensorMetadata] {
@@ -857,7 +925,12 @@ extension EngineCachedLayer {
             sharedUpWeight, sharedUpScale, sharedUpBias,
             sharedDownWeight, sharedDownScale, sharedDownBias,
             attnHcNorm, attnHcDownWeight, attnHcUpWeight, attnHcInjectWeight,
-            mlpHcNorm, mlpHcDownWeight, mlpHcUpWeight, mlpHcInjectWeight
+            mlpHcNorm, mlpHcDownWeight, mlpHcUpWeight, mlpHcInjectWeight,
+            kdaQProj, kdaKProj, kdaVProj,
+            kdaQConv1d, kdaKConv1d, kdaVConv1d,
+            mlaQAProj, mlaQALayernorm, mlaQBProj,
+            mlaKVAProjWithMqa, mlaKVALayernorm, mlaKVBProj,
+            mlaGateProj, routerExpertBias
         ]
         for c in candidates {
             if let t = c {

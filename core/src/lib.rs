@@ -247,7 +247,7 @@ fn parse_layer_and_expert(name: &str) -> (String, Option<u32>, Option<u32>) {
         }
     }
 
-    let category = if name.contains("embed_tokens") || name.contains("wte") {
+    let category = if name.contains("embed_tokens") || name.contains("wte") || name.contains("word_embeddings") {
         "Embedding".to_string()
     } else if name.contains("ngram_embedding") || name.contains(".ple.") || name.contains("ple_embedding") {
         "N-Gram Predictive Local Embedding".to_string()
@@ -257,13 +257,17 @@ fn parse_layer_and_expert(name: &str) -> (String, Option<u32>, Option<u32>) {
         "Hyper-Connection Residual".to_string()
     } else if name.contains("linear_attn") {
         "Linear Attention (GDN)".to_string()
+    } else if name.contains("A_log") || name.contains("dt_bias") || (name.contains("conv1d") && name.contains("attention")) || (name.contains("b_proj") && name.contains("attention")) || (name.contains("f_proj") && name.contains("attention")) {
+        "Linear Attention (KDA)".to_string()
+    } else if name.contains("q_a_proj") || name.contains("q_b_proj") || name.contains("kv_a_proj") || name.contains("kv_b_proj") {
+        "Multi-Head Latent Attention (MLA)".to_string()
     } else if name.contains("self_attn") || name.contains("attention") || name.contains("qsa") || name.contains("sparse_attn") {
         "Self-Attention (QSA)".to_string()
     } else if name.contains("shared_expert_gate") {
         "Shared Expert Gate".to_string()
     } else if (name.contains("mlp.gate.") || name.ends_with("mlp.gate")) && !name.contains("switch_mlp") && !name.contains("shared") && !name.contains("proj") {
         "MoE Router".to_string()
-    } else if name.contains("shared_expert") {
+    } else if name.contains("shared_expert") || name.contains("shared_experts") {
         "Shared Expert".to_string()
     } else if expert_idx.is_some() || name.contains("experts") || name.contains("switch_mlp") {
         if let Some(exp) = expert_idx {
@@ -376,11 +380,22 @@ fn try_load_flash_moe(search_path: &Path) -> Option<(Vec<ShardHandle>, Vec<Tenso
             if layout_json_path.is_file() {
                 if let Ok(layout_data) = std::fs::read_to_string(&layout_json_path) {
                     if let Ok(layout) = serde_json::from_str::<FlashMoELayoutJson>(&layout_data) {
+                        if layout.expert_size == 0 || layout.components.is_empty() {
+                            return None;
+                        }
                         for l in 0..layout.num_layers {
                             let layer_bin_name = format!("layer_{:02}.bin", l);
                             let layer_bin_path = packed_experts_dir.join(&layer_bin_name);
                             if let Ok(file_l) = File::open(&layer_bin_path) {
+                                if let Ok(meta) = file_l.metadata() {
+                                    if meta.len() == 0 {
+                                        continue;
+                                    }
+                                }
                                 if let Ok(mmap_l) = unsafe { MmapOptions::new().map(&file_l) } {
+                                    if mmap_l.len() == 0 {
+                                        continue;
+                                    }
                                     let shard_idx = shard_handles.len() as u32;
                                     shard_handles.push(ShardHandle {
                                         filename: format!("packed_experts/{}", layer_bin_name),
@@ -1932,5 +1947,123 @@ mod tests {
 
         let (cat_mtp, _, _) = parse_layer_and_expert("mtp.layers.0.mlp.gate_proj.weight");
         assert_eq!(cat_mtp, "Multi-Token Prediction");
+    }
+
+    #[test]
+    fn test_ling_3_tiny_tensor_parsing() {
+        // Embeddings and Norm
+        let (cat_emb, _, _) = parse_layer_and_expert("model.word_embeddings.weight");
+        assert_eq!(cat_emb, "Embedding");
+
+        let (cat_norm, _, _) = parse_layer_and_expert("model.norm.weight");
+        assert_eq!(cat_norm, "LayerNorm");
+
+        let (cat_lm, _, _) = parse_layer_and_expert("lm_head.weight");
+        assert_eq!(cat_lm, "LM Head");
+
+        // Layer 0 KDA Linear Attention
+        let (cat_kda_q, l_q, _) = parse_layer_and_expert("model.layers.0.attention.q_proj.weight");
+        assert_eq!(cat_kda_q, "Self-Attention (QSA)");
+        assert_eq!(l_q, Some(0));
+
+        let (cat_kda_conv, l_conv, _) = parse_layer_and_expert("model.layers.0.attention.q_conv1d.weight");
+        assert_eq!(cat_kda_conv, "Linear Attention (KDA)");
+        assert_eq!(l_conv, Some(0));
+
+        let (cat_kda_alog, l_alog, _) = parse_layer_and_expert("model.layers.0.attention.A_log");
+        assert_eq!(cat_kda_alog, "Linear Attention (KDA)");
+        assert_eq!(l_alog, Some(0));
+
+        let (cat_kda_dt, l_dt, _) = parse_layer_and_expert("model.layers.0.attention.dt_bias");
+        assert_eq!(cat_kda_dt, "Linear Attention (KDA)");
+        assert_eq!(l_dt, Some(0));
+
+        let (cat_kda_b, l_b, _) = parse_layer_and_expert("model.layers.0.attention.b_proj.weight");
+        assert_eq!(cat_kda_b, "Linear Attention (KDA)");
+        assert_eq!(l_b, Some(0));
+
+        let (cat_kda_f, l_f, _) = parse_layer_and_expert("model.layers.0.attention.f_proj.weight");
+        assert_eq!(cat_kda_f, "Linear Attention (KDA)");
+        assert_eq!(l_f, Some(0));
+
+        // Layer 3 MLA Attention
+        let (cat_mla_qa, l_qa, _) = parse_layer_and_expert("model.layers.3.attention.q_a_proj.weight");
+        assert_eq!(cat_mla_qa, "Multi-Head Latent Attention (MLA)");
+        assert_eq!(l_qa, Some(3));
+
+        let (cat_mla_kva, l_kva, _) = parse_layer_and_expert("model.layers.3.attention.kv_a_proj_with_mqa.weight");
+        assert_eq!(cat_mla_kva, "Multi-Head Latent Attention (MLA)");
+        assert_eq!(l_kva, Some(3));
+
+        // Layer 1 MoE Router, Shared Expert, and Routed Experts
+        let (cat_router, l_r, _) = parse_layer_and_expert("model.layers.1.mlp.gate.weight");
+        assert_eq!(cat_router, "MoE Router");
+        assert_eq!(l_r, Some(1));
+
+        let (cat_bias, l_b_exp, _) = parse_layer_and_expert("model.layers.1.mlp.gate.expert_bias");
+        assert_eq!(cat_bias, "MoE Router");
+        assert_eq!(l_b_exp, Some(1));
+
+        let (cat_shared, l_s, _) = parse_layer_and_expert("model.layers.1.mlp.shared_experts.gate_proj.weight");
+        assert_eq!(cat_shared, "Shared Expert");
+        assert_eq!(l_s, Some(1));
+
+        let (cat_exp127, l_e, e_id) = parse_layer_and_expert("model.layers.1.mlp.experts.127.down_proj.weight");
+        assert_eq!(cat_exp127, "Routed Expert #127");
+        assert_eq!(l_e, Some(1));
+        assert_eq!(e_id, Some(127));
+    }
+
+    #[test]
+    fn test_real_ling_3_tiny_snapshot() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/derekparris".to_string());
+        let snapshot_dir = std::path::PathBuf::from(home)
+            .join(".cache/huggingface/hub/models--inclusionAI--Ling-3.0-tiny/snapshots/e3a47d5b986e7141b6efd62597d598ebb392060d");
+
+        if !snapshot_dir.exists() {
+            println!("Skipping test_real_ling_3_tiny_snapshot because snapshot directory is not present.");
+            return;
+        }
+
+        let engine = DynaMoeEngine::new(snapshot_dir.to_string_lossy().to_string()).expect("Failed to initialize engine for Ling-3.0-tiny");
+        let summary = engine.get_summary().expect("Failed to get summary");
+
+        println!("Loaded Ling-3.0-tiny Model Summary: size={:.2} GB, total_tensors={}, layers={}", summary.size_gb, summary.tensor_count, summary.layers.len());
+        assert_eq!(summary.layers.len(), 24, "Expected 24 layers in Ling-3.0-tiny");
+
+        // Verify embedding tensor
+        let embed = summary.tensors.iter().find(|t| t.name == "model.word_embeddings.weight").unwrap();
+        assert_eq!(embed.category, "Embedding");
+        assert_eq!(embed.shape_display, "[157184, 1536]");
+
+        // Verify Layer 0 has dense SwiGLU (no routed experts)
+        assert_eq!(summary.layers[0].routed_expert_count, 0, "Layer 0 should be dense (0 routed experts)");
+
+        // Verify Layers 1..23 each have 128 routed experts
+        for l in &summary.layers[1..] {
+            assert_eq!(l.routed_expert_count, 128, "Layer {} should have 128 routed experts", l.layer_index);
+        }
+
+        // Verify MoE router and expert bias on Layer 1
+        let router_1 = summary.tensors.iter().find(|t| t.name == "model.layers.1.mlp.gate.weight").unwrap();
+        assert_eq!(router_1.category, "MoE Router");
+
+        let bias_1 = summary.tensors.iter().find(|t| t.name == "model.layers.1.mlp.gate.expert_bias").unwrap();
+        assert_eq!(bias_1.category, "MoE Router");
+
+        // Verify Shared Expert on Layer 1
+        let shared_gate_1 = summary.tensors.iter().find(|t| t.name == "model.layers.1.mlp.shared_experts.gate_proj.weight").unwrap();
+        assert_eq!(shared_gate_1.category, "Shared Expert");
+
+        // Verify Layer 0 KDA components
+        let kda_conv_0 = summary.tensors.iter().find(|t| t.name == "model.layers.0.attention.q_conv1d.weight").unwrap();
+        assert_eq!(kda_conv_0.category, "Linear Attention (KDA)");
+
+        let kda_alog_0 = summary.tensors.iter().find(|t| t.name == "model.layers.0.attention.A_log").unwrap();
+        assert_eq!(kda_alog_0.category, "Linear Attention (KDA)");
+
+        // Verify Layer 3 MLA components
+        let mla_qa_3 = summary.tensors.iter().find(|t| t.name == "model.layers.3.attention.q_a_proj.weight").unwrap();
+        assert_eq!(mla_qa_3.category, "Multi-Head Latent Attention (MLA)");
     }
 }

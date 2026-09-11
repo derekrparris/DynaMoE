@@ -54,6 +54,11 @@ inline uint32_t read_u32_unaligned(device const uchar* p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+inline float read_f32_unaligned(device const uchar* p) {
+    uint32_t bits = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    return as_type<float>(bits);
+}
+
 /// MSL Kernel: Dequantizes per-row scaled FP8 weights for preview
 kernel void dequantize_fp8_row_scaled(
     device const uchar* rawBaseBuffer [[buffer(0)]],
@@ -264,6 +269,155 @@ kernel void moe_router_topk_bf16(
         for (uint32_t i = 0; i < k; i++) {
             tokenOutIndices[i] = topIndices[i];
             tokenOutWeights[i] = exps[i] * invSum;
+        }
+    }
+}
+
+/// MSL Kernel: Bailing MoE Top-K Router (Ling-3.0-tiny)
+/// Computes expert gating logits (z = W_gate * h), un-biased sigmoid scores, adds learned expert_bias for group-limited Top-K (8 groups of 16, top 4 groups selected, top 8 experts chosen),
+/// gathers unbiased scores, normalizes across selected experts, and scales by routed_scaling_factor (e.g. 2.5).
+kernel void moe_router_bailing_topk_bf16(
+    device const ushort* rawBaseBuffer [[buffer(0)]],
+    device const float* expertBiasBuffer [[buffer(1)]],
+    device const float* inputHiddenState [[buffer(2)]],
+    device uint32_t* outExpertIndices [[buffer(3)]],
+    device float* outRoutingWeights [[buffer(4)]],
+    constant uint64_t& gateWeightOffset [[buffer(5)]],
+    constant uint64_t& expertBiasOffset [[buffer(6)]],
+    constant uint32_t& hiddenDim [[buffer(7)]],
+    constant uint32_t& numExperts [[buffer(8)]],
+    constant uint32_t& topK [[buffer(9)]],
+    constant uint32_t& nGroup [[buffer(10)]],
+    constant uint32_t& topkGroup [[buffer(11)]],
+    constant float& routedScalingFactor [[buffer(12)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tokenIdx [[threadgroup_position_in_grid]]
+) {
+    threadgroup float sharedScores[256];
+    threadgroup float sharedRoutingScores[256];
+
+    if (tid < numExperts && tid < 256) {
+        uint64_t baseUshortOffset = gateWeightOffset / 2;
+        uint64_t rowOffset = baseUshortOffset + ((uint64_t)tid * (uint64_t)hiddenDim);
+        device const float* tokenH = inputHiddenState + (tokenIdx * hiddenDim);
+        device const ushort* wRow = rawBaseBuffer + rowOffset;
+
+        float sum0 = 0.0f;
+        float sum1 = 0.0f;
+        uint32_t num4 = hiddenDim / 4;
+        for (uint32_t i = 0; i < num4; i++) {
+            uint32_t d = i * 4;
+            sum0 += bf16_to_fp32(wRow[d + 0]) * tokenH[d + 0];
+            sum0 += bf16_to_fp32(wRow[d + 1]) * tokenH[d + 1];
+            sum1 += bf16_to_fp32(wRow[d + 2]) * tokenH[d + 2];
+            sum1 += bf16_to_fp32(wRow[d + 3]) * tokenH[d + 3];
+        }
+        float logit = sum0 + sum1;
+        float score = 1.0f / (1.0f + exp(-logit));
+        float bias = 0.0f;
+        if (expertBiasBuffer != nullptr) {
+            device const uchar* rawBiasBytes = (device const uchar*)expertBiasBuffer;
+            bias = read_f32_unaligned(rawBiasBytes + expertBiasOffset + ((uint64_t)tid * 4));
+        }
+        sharedScores[tid] = score;
+        sharedRoutingScores[tid] = score + bias;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        uint32_t validExperts = min(numExperts, (uint32_t)256);
+        uint32_t ng = max(nGroup, (uint32_t)1);
+        uint32_t expPerGroup = validExperts / ng;
+
+        // 1. Compute group scores by summing top-2 per group
+        float groupScores[16];
+        uint32_t groupIndices[16];
+        uint32_t totalGroups = min(ng, (uint32_t)16);
+
+        for (uint32_t g = 0; g < totalGroups; g++) {
+            float m0 = -INFINITY;
+            float m1 = -INFINITY;
+            uint32_t startExp = g * expPerGroup;
+            uint32_t endExp = min(startExp + expPerGroup, validExperts);
+
+            for (uint32_t e = startExp; e < endExp; e++) {
+                float val = sharedRoutingScores[e];
+                if (val > m0) {
+                    m1 = m0;
+                    m0 = val;
+                } else if (val > m1) {
+                    m1 = val;
+                }
+            }
+            groupScores[g] = m0 + m1;
+            groupIndices[g] = g;
+        }
+
+        // Rank groups to pick topkGroup
+        uint32_t topGroupsCount = min(topkGroup, totalGroups);
+        for (uint32_t i = 0; i < topGroupsCount; i++) {
+            for (uint32_t j = i + 1; j < totalGroups; j++) {
+                if (groupScores[j] > groupScores[i]) {
+                    float tmpS = groupScores[i];
+                    groupScores[i] = groupScores[j];
+                    groupScores[j] = tmpS;
+                    uint32_t tmpI = groupIndices[i];
+                    groupIndices[i] = groupIndices[j];
+                    groupIndices[j] = tmpI;
+                }
+            }
+        }
+
+        bool groupMask[16] = { false };
+        for (uint32_t i = 0; i < topGroupsCount; i++) {
+            groupMask[groupIndices[i]] = true;
+        }
+
+        // 2. Select top-K experts from masked groups
+        uint32_t k = min(topK, (uint32_t)32);
+        uint32_t topIndices[32];
+        float topRoutingVals[32];
+        for (uint32_t i = 0; i < k; i++) {
+            topRoutingVals[i] = -INFINITY;
+            topIndices[i] = 0;
+        }
+
+        for (uint32_t e = 0; e < validExperts; e++) {
+            uint32_t g = e / expPerGroup;
+            if (g < totalGroups && !groupMask[g]) {
+                continue; // Masked out of top-K groups
+            }
+            float val = sharedRoutingScores[e];
+            if (val > topRoutingVals[k - 1]) {
+                int insertPos = (int)k - 1;
+                while (insertPos > 0 && val > topRoutingVals[insertPos - 1]) {
+                    topRoutingVals[insertPos] = topRoutingVals[insertPos - 1];
+                    topIndices[insertPos] = topIndices[insertPos - 1];
+                    insertPos--;
+                }
+                topRoutingVals[insertPos] = val;
+                topIndices[insertPos] = e;
+            }
+        }
+
+        // 3. Gather UNBIASED sigmoid scores, normalize, and scale by routedScalingFactor
+        float sumWeights = 0.0f;
+        float unscaledWeights[32];
+        for (uint32_t i = 0; i < k; i++) {
+            float s = sharedScores[topIndices[i]];
+            unscaledWeights[i] = s;
+            sumWeights += s;
+        }
+
+        float factor = (sumWeights > 1e-9f) ? (routedScalingFactor / sumWeights) : 0.0f;
+
+        device uint32_t* tokenOutIndices = outExpertIndices + (tokenIdx * topK);
+        device float* tokenOutWeights = outRoutingWeights + (tokenIdx * topK);
+
+        for (uint32_t i = 0; i < k; i++) {
+            tokenOutIndices[i] = topIndices[i];
+            tokenOutWeights[i] = unscaledWeights[i] * factor;
         }
     }
 }
@@ -1566,6 +1720,46 @@ kernel void apply_rope_qwen(
 
         qkVector[idx0] = v0 * cosVal - v1 * sinVal;
         qkVector[idx1] = v0 * sinVal + v1 * cosVal;
+    }
+}
+
+/// MSL Kernel: Fused Interleaved Rotary Position Embeddings (RoPE) for Ling-3.0-tiny / MLA (2D Grid Aware)
+kernel void apply_rope_interleaved(
+    device float* qkVector [[buffer(0)]],
+    constant uint32_t& tokenPos [[buffer(1)]],
+    constant uint32_t& numHeads [[buffer(2)]],
+    constant uint32_t& headDim [[buffer(3)]],
+    constant uint32_t& rotaryDim [[buffer(4)]],
+    constant uint32_t& headStride [[buffer(5)]],
+    constant float& ropeTheta [[buffer(6)]],
+    constant uint32_t& ropeOffset [[buffer(7)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint headIdx = pos.x;
+    uint tokenIdx = pos.y;
+    if (headIdx >= numHeads) return;
+
+    uint32_t effectivePos = tokenPos + tokenIdx;
+    uint64_t headBase = (uint64_t)tokenIdx * ((uint64_t)numHeads * headStride) + ((uint64_t)headIdx * headStride) + (uint64_t)ropeOffset;
+    uint32_t halfRotary = rotaryDim / 2;
+
+    float tempRot[64];
+    for (uint32_t i = 0; i < halfRotary && i < 32; i++) {
+        float exponent = (2.0f * (float)i) / (float)rotaryDim;
+        float freq = 1.0f / pow(ropeTheta, exponent);
+        float angle = (float)effectivePos * freq;
+        float cosVal = cos(angle);
+        float sinVal = sin(angle);
+
+        float v0 = qkVector[headBase + (i * 2)];
+        float v1 = qkVector[headBase + (i * 2 + 1)];
+
+        tempRot[i] = v0 * cosVal - v1 * sinVal;
+        tempRot[halfRotary + i] = v0 * sinVal + v1 * cosVal;
+    }
+
+    for (uint32_t d = 0; d < rotaryDim && d < 64; d++) {
+        qkVector[headBase + d] = tempRot[d];
     }
 }
 
@@ -4677,6 +4871,137 @@ kernel void gdn_linear_attention_recurrent_step_sigmoid(
     }
 }
 
+/// MSL Kernel: Kimi Delta Attention (KDA) Recurrent Step for 16 Value Heads / 16 Key Heads (Head Dim 128)
+/// Implements: alpha_j = exp(lower_bound * sigmoid(exp(A_log) * (f_j + dt_bias_j)))
+///             beta = sigmoid(b)
+///             Sk = (S * alpha) * k
+///             S_new = S * alpha + (beta * (v - Sk)) (x) k
+///             y = (S_new * q) / sqrt(128)
+///             out = RMSNorm(y) * o_norm * sigmoid(g)
+kernel void kda_linear_attention_recurrent_step(
+    device const float* qVector [[buffer(0)]],       // [2048] = 16 heads x 128
+    device const float* kVector [[buffer(1)]],       // [2048] = 16 heads x 128
+    device const float* vVector [[buffer(2)]],       // [2048] = 16 heads x 128
+    device const float* fVector [[buffer(3)]],       // [2048] = 16 heads x 128 (decay proj)
+    device const float* bVector [[buffer(4)]],       // [16]   = 16 heads (beta proj)
+    device const float* gVector [[buffer(5)]],       // [2048] = 16 heads x 128 (output gate)
+    device const uchar* aLogBuf [[buffer(6)]],       // [16] (F32/BF16)
+    device const uchar* dtBiasBuf [[buffer(7)]],     // [2048] (F32/BF16)
+    device const uchar* normBuf [[buffer(8)]],       // [128] (BF16)
+    device float* stateMatrix [[buffer(9)]],         // [16 heads, 128 valDim, 128 keyDim]
+    device float* outputVector [[buffer(10)]],       // [2048]
+    constant uint64_t& aLogOffset [[buffer(11)]],
+    constant uint64_t& dtBiasOffset [[buffer(12)]],
+    constant uint64_t& normOffset [[buffer(13)]],
+    constant uint32_t& numHeads [[buffer(14)]],      // 16
+    constant uint32_t& headDim [[buffer(15)]],       // 128
+    constant float& lowerBound [[buffer(16)]],       // -5.0f
+    constant float& eps [[buffer(17)]],              // 1e-6f
+    constant uint32_t& isFloat32Params [[buffer(18)]],// 1 for F32 (Ling-3.0), 0 for BF16
+    uint headIdx [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    if (headIdx >= numHeads) return;
+
+    uint32_t headBase = headIdx * headDim;
+    uint32_t stateBase = headIdx * headDim * headDim;
+
+    float aLogVal = (isFloat32Params == 1)
+        ? read_f32_unaligned(aLogBuf + aLogOffset + ((uint64_t)headIdx * 4))
+        : read_bf16_unaligned(aLogBuf + aLogOffset + ((uint64_t)headIdx * 2));
+    float expALog = exp(aLogVal);
+
+    float bVal = bVector[headIdx];
+    float beta = 1.0f / (1.0f + exp(-bVal));
+
+    threadgroup float alpha_arr[128];
+    threadgroup float alpha_k[128];
+    threadgroup float q_normed[128];
+    threadgroup float k_normed[128];
+
+    float q_local_sum = 0.0f;
+    float k_local_sum = 0.0f;
+    for (uint32_t j = laneId; j < headDim; j += 32) {
+        float q_val = qVector[headBase + j];
+        float k_val = kVector[headBase + j];
+        q_normed[j] = q_val;
+        k_normed[j] = k_val;
+        q_local_sum += q_val * q_val;
+        k_local_sum += k_val * k_val;
+    }
+    float q_inv_norm = rsqrt(simd_sum(q_local_sum) + 1e-6f);
+    float k_inv_norm = rsqrt(simd_sum(k_local_sum) + 1e-6f);
+
+    for (uint32_t j = laneId; j < headDim; j += 32) {
+        float q_j = q_normed[j] * q_inv_norm;
+        float k_j = k_normed[j] * k_inv_norm;
+        q_normed[j] = q_j;
+        k_normed[j] = k_j;
+
+        float f_j = fVector[headBase + j];
+        float dt_j = (isFloat32Params == 1)
+            ? read_f32_unaligned(dtBiasBuf + dtBiasOffset + ((uint64_t)(headBase + j) * 4))
+            : read_bf16_unaligned(dtBiasBuf + dtBiasOffset + ((uint64_t)(headBase + j) * 2));
+        float x_j = expALog * (f_j + dt_j);
+        float sig_x = 1.0f / (1.0f + exp(-x_j));
+        float g_j = lowerBound * sig_x;
+        float a_j = exp(g_j);
+
+        alpha_arr[j] = a_j;
+        alpha_k[j] = a_j * k_j;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float y_local[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    uint32_t row_indices[4];
+    uint32_t numLocalRows = 0;
+    float localSumSq = 0.0f;
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    for (uint32_t i = laneId; i < headDim; i += 32) {
+        row_indices[numLocalRows] = i;
+        uint32_t sRowBase = stateBase + (i * headDim);
+        device float* sRow = stateMatrix + sRowBase;
+
+        // 1. Sk_i = sum_j (S[i, j] * alpha[j] * k[j])
+        float Sk_i = 0.0f;
+        for (uint32_t j = 0; j < headDim; j++) {
+            Sk_i += sRow[j] * alpha_k[j];
+        }
+
+        // 2. delta_v_i = beta * (v[i] - Sk_i)
+        float v_val = vVector[headBase + i];
+        float delta_v_i = beta * (v_val - Sk_i);
+
+        // 3. Update state and accumulate y_i
+        float y_i = 0.0f;
+        for (uint32_t j = 0; j < headDim; j++) {
+            float s_new = (sRow[j] * alpha_arr[j]) + (delta_v_i * k_normed[j]);
+            sRow[j] = s_new;
+            y_i += s_new * q_normed[j];
+        }
+        y_i *= invSqrtHeadDim;
+
+        y_local[numLocalRows] = y_i;
+        localSumSq += y_i * y_i;
+        numLocalRows++;
+    }
+
+    // 4. Threadgroup RMSNorm
+    float headSumSq = simd_sum(localSumSq);
+    float rms = rsqrt((headSumSq / (float)headDim) + eps);
+
+    // 5. Output RMSNorm * gamma * sigmoid(g)
+    for (uint32_t r = 0; r < numLocalRows; r++) {
+        uint32_t i = row_indices[r];
+        float gamma = read_bf16_unaligned(normBuf + normOffset + ((uint64_t)i * 2));
+        float yNorm = y_local[r] * rms * gamma;
+        float g_val = gVector[headBase + i];
+        float sig_g = 1.0f / (1.0f + exp(-g_val));
+        outputVector[headBase + i] = yNorm * sig_g;
+    }
+}
+
 /// MSL Kernel: Qwen Sparse Attention (QSA) - Micro-Block Scoring Pass (Stage A)
 /// Groups KV keys into 64-token micro-blocks, scores them with 4 MQA Query heads, and outputs block scores.
 kernel void qsa_mqa_indexer_score_blocks(
@@ -5814,5 +6139,215 @@ kernel void vector_cosine_similarity_fp32(
     }
 
     outputScores[vecIdx] = sum;
+}
+
+/// MSL Kernel: Stores MLA K [numHeads * qkHeadDim] and V [numHeads * vHeadDim] into KV-cache (FP32)
+kernel void store_mla_kv_cache(
+    device const float* kVector [[buffer(0)]],
+    device const float* vVector [[buffer(1)]],
+    device float* kCacheBuffer [[buffer(2)]],
+    device float* vCacheBuffer [[buffer(3)]],
+    constant uint32_t& tokenPos [[buffer(4)]],
+    constant uint32_t& numHeads [[buffer(5)]],
+    constant uint32_t& qkHeadDim [[buffer(6)]],
+    constant uint32_t& vHeadDim [[buffer(7)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint headIdx = pos.x;
+    uint tokenIdx = pos.y;
+    if (headIdx >= numHeads) return;
+
+    uint32_t effectivePos = tokenPos + tokenIdx;
+    uint32_t kHeadStride = numHeads * qkHeadDim;
+    uint32_t vHeadStride = numHeads * vHeadDim;
+
+    // Store K
+    uint32_t kSrcBase = (tokenIdx * kHeadStride) + (headIdx * qkHeadDim);
+    uint32_t kDstBase = (effectivePos * kHeadStride) + (headIdx * qkHeadDim);
+    for (uint32_t d = 0; d < qkHeadDim; d++) {
+        kCacheBuffer[kDstBase + d] = kVector[kSrcBase + d];
+    }
+
+    // Store V
+    uint32_t vSrcBase = (tokenIdx * vHeadStride) + (headIdx * vHeadDim);
+    uint32_t vDstBase = (effectivePos * vHeadStride) + (headIdx * vHeadDim);
+    for (uint32_t d = 0; d < vHeadDim; d++) {
+        vCacheBuffer[vDstBase + d] = vVector[vSrcBase + d];
+    }
+}
+
+/// MSL Kernel: Stores Ling MLA K (128 nope + 64 rot = 192) and V (128) into KV-cache (FP16)
+kernel void store_mla_kv_cache_f16(
+    device const float* kvBVector [[buffer(0)]],       // [numHeads * 256]: 128 k_nope + 128 v per head
+    device const float* kRotVector [[buffer(1)]],      // [64]: k_rot (shared for all heads)
+    device half* kCacheBuffer [[buffer(2)]],           // [maxSeq * numHeads * 192]
+    device half* vCacheBuffer [[buffer(3)]],           // [maxSeq * numHeads * 128]
+    constant uint32_t& tokenPos [[buffer(4)]],
+    constant uint32_t& numHeads [[buffer(5)]],         // 16
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint headIdx = pos.x;
+    uint tokenIdx = pos.y;
+    if (headIdx >= numHeads) return;
+
+    uint32_t effectivePos = tokenPos + tokenIdx;
+    uint32_t kDstBase = (effectivePos * numHeads * 192) + (headIdx * 192);
+    uint32_t vDstBase = (effectivePos * numHeads * 128) + (headIdx * 128);
+    uint32_t kvBSrcBase = (tokenIdx * numHeads * 256) + (headIdx * 256);
+
+    // 1. Copy 128 k_nope to kCacheBuffer
+    for (uint32_t d = 0; d < 128; d++) {
+        kCacheBuffer[kDstBase + d] = half(kvBVector[kvBSrcBase + d]);
+    }
+    // 2. Copy 64 k_rot to kCacheBuffer
+    for (uint32_t d = 0; d < 64; d++) {
+        kCacheBuffer[kDstBase + 128 + d] = half(kRotVector[d]);
+    }
+    // 3. Copy 128 v to vCacheBuffer
+    for (uint32_t d = 0; d < 128; d++) {
+        vCacheBuffer[vDstBase + d] = half(kvBVector[kvBSrcBase + 128 + d]);
+    }
+}
+
+/// MSL Kernel: Multi-Head Latent Attention (MLA) Autoregressive Decoding with Online Softmax & Head Gating (FP32)
+kernel void mla_attention_decode(
+    device const float* qVector [[buffer(0)]],       // [numHeads * qkHeadDim]
+    device const float* kCacheBuffer [[buffer(1)]],  // [maxSeq * numHeads * qkHeadDim]
+    device const float* vCacheBuffer [[buffer(2)]],  // [maxSeq * numHeads * vHeadDim]
+    device float* attnOutBuffer [[buffer(3)]],      // [numHeads * vHeadDim]
+    device const float* gateVector [[buffer(4)]],    // optional gate [numHeads] or null
+    constant uint32_t& seqLen [[buffer(5)]],
+    constant uint32_t& numHeads [[buffer(6)]],       // 16
+    constant uint32_t& qkHeadDim [[buffer(7)]],      // 192
+    constant uint32_t& vHeadDim [[buffer(8)]],       // 128
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint headIdx = pos.x;
+    uint tokenIdx = pos.y;
+    if (headIdx >= numHeads) return;
+
+    uint32_t qBase = (tokenIdx * numHeads * qkHeadDim) + (headIdx * qkHeadDim);
+    uint32_t kStride = numHeads * qkHeadDim;
+    uint32_t vStride = numHeads * vHeadDim;
+    uint32_t kHeadBase = headIdx * qkHeadDim;
+    uint32_t vHeadBase = headIdx * vHeadDim;
+
+    float invSqrtScale = rsqrt((float)qkHeadDim);
+
+    // Online Softmax Accumulator
+    float acc[128];
+    for (uint32_t d = 0; d < vHeadDim && d < 128; d++) {
+        acc[d] = 0.0f;
+    }
+
+    float m = -1e20f;
+    float l = 0.0f;
+
+    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : ((seqLen & 0x80000000) ? ((seqLen & 0x7FFFFFFF) + tokenIdx + 1) : seqLen);
+
+    for (uint32_t tau = 0; tau < currentSeqLen; tau++) {
+        uint32_t kBase = (tau * kStride) + kHeadBase;
+        float dot_val = 0.0f;
+        for (uint32_t d = 0; d < qkHeadDim; d++) {
+            dot_val += qVector[qBase + d] * kCacheBuffer[kBase + d];
+        }
+        float score = dot_val * invSqrtScale;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+        float exp_score = exp(score - m);
+        float alpha = exp(m_prev - m);
+        l = (l * alpha) + exp_score;
+
+        uint32_t vBase = (tau * vStride) + vHeadBase;
+        for (uint32_t d = 0; d < vHeadDim && d < 128; d++) {
+            acc[d] = (acc[d] * alpha) + (exp_score * vCacheBuffer[vBase + d]);
+        }
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    float headGate = 1.0f;
+    if (gateVector != nullptr) {
+        float gVal = gateVector[headIdx];
+        headGate = 1.0f / (1.0f + exp(-gVal));
+    }
+
+    uint32_t outBase = (tokenIdx * numHeads * vHeadDim) + (headIdx * vHeadDim);
+    for (uint32_t d = 0; d < vHeadDim && d < 128; d++) {
+        attnOutBuffer[outBase + d] = acc[d] * invL * headGate;
+    }
+}
+
+/// MSL Kernel: Multi-Head Latent Attention (MLA) Autoregressive Decoding with Online Softmax & Head Gating (FP16)
+kernel void mla_attention_decode_f16(
+    device const float* qVector [[buffer(0)]],       // [numHeads * qkHeadDim]
+    device const half* kCacheBuffer [[buffer(1)]],   // [maxSeq * numHeads * qkHeadDim]
+    device const half* vCacheBuffer [[buffer(2)]],   // [maxSeq * numHeads * vHeadDim]
+    device float* attnOutBuffer [[buffer(3)]],      // [numHeads * vHeadDim]
+    device const float* gateVector [[buffer(4)]],    // optional gate [numHeads] or null
+    constant uint32_t& seqLen [[buffer(5)]],
+    constant uint32_t& numHeads [[buffer(6)]],       // 16
+    constant uint32_t& qkHeadDim [[buffer(7)]],      // 192
+    constant uint32_t& vHeadDim [[buffer(8)]],       // 128
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint headIdx = pos.x;
+    uint tokenIdx = pos.y;
+    if (headIdx >= numHeads) return;
+
+    uint32_t qBase = (tokenIdx * numHeads * qkHeadDim) + (headIdx * qkHeadDim);
+    uint32_t kStride = numHeads * qkHeadDim;
+    uint32_t vStride = numHeads * vHeadDim;
+    uint32_t kHeadBase = headIdx * qkHeadDim;
+    uint32_t vHeadBase = headIdx * vHeadDim;
+
+    float invSqrtScale = rsqrt((float)qkHeadDim);
+
+    // Online Softmax Accumulator
+    float acc[128];
+    for (uint32_t d = 0; d < vHeadDim && d < 128; d++) {
+        acc[d] = 0.0f;
+    }
+
+    float m = -1e20f;
+    float l = 0.0f;
+
+    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : ((seqLen & 0x80000000) ? ((seqLen & 0x7FFFFFFF) + tokenIdx + 1) : seqLen);
+
+    for (uint32_t tau = 0; tau < currentSeqLen; tau++) {
+        uint32_t kBase = (tau * kStride) + kHeadBase;
+        float dot_val = 0.0f;
+        for (uint32_t d = 0; d < qkHeadDim; d++) {
+            dot_val += qVector[qBase + d] * float(kCacheBuffer[kBase + d]);
+        }
+        float score = dot_val * invSqrtScale;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+        float exp_score = exp(score - m);
+        float alpha = exp(m_prev - m);
+        l = (l * alpha) + exp_score;
+
+        uint32_t vBase = (tau * vStride) + vHeadBase;
+        for (uint32_t d = 0; d < vHeadDim && d < 128; d++) {
+            acc[d] = (acc[d] * alpha) + (exp_score * float(vCacheBuffer[vBase + d]));
+        }
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    float headGate = 1.0f;
+    if (gateVector != nullptr) {
+        float gVal = gateVector[headIdx];
+        headGate = 1.0f / (1.0f + exp(-gVal));
+    }
+
+    uint32_t outBase = (tokenIdx * numHeads * vHeadDim) + (headIdx * vHeadDim);
+    for (uint32_t d = 0; d < vHeadDim && d < 128; d++) {
+        attnOutBuffer[outBase + d] = acc[d] * invL * headGate;
+    }
 }
 

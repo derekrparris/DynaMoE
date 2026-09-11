@@ -7568,6 +7568,262 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         XCTAssertTrue(mockOfficialTurn.contains("SYSTEM NOTICE: Verified official vendor domain response"), "Must inject official domain ground truth notice")
         XCTAssertTrue(mockOfficialTurn.hasSuffix("<think>\n"), "Must include think tag suffix")
     }
+
+    func testLingFlashMoERepackAndLoad() throws {
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--inclusionAI--Ling-3.0-tiny/snapshots/e3a47d5b986e7141b6efd62597d598ebb392060d"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            print("Ling snapshot not found, skipping.")
+            return
+        }
+        let url = URL(fileURLWithPath: snapshotDir)
+
+        print("🔍 Testing Ling-3.0 FlashMoE repacking...")
+        let repacker = ExpertRepacker.shared
+        try repacker.repackSafetensors(sourceDir: url, outputDir: url) { prog, msg in
+            if Int(prog * 100) % 20 == 0 || prog >= 0.99 {
+                print(String(format: "Repack [%.0f%%]: %@", prog * 100, msg))
+            }
+        }
+
+        XCTAssertTrue(ExpertRepacker.isPackedFormat(dir: url), "isPackedFormat must return true after repacking")
+
+        let packedDir = url.appendingPathComponent("packed_experts")
+        let layoutJson = packedDir.appendingPathComponent("layout.json")
+        let lData = try Data(contentsOf: layoutJson)
+        let layout = try JSONDecoder().decode(FlashMoELayout.self, from: lData)
+
+        print("✅ Packed layout: expert_size=\(layout.expert_size), layers=\(layout.num_layers), experts=\(layout.num_experts), components=\(layout.components.count)")
+        XCTAssertGreaterThan(layout.expert_size, 0, "expert_size must be greater than 0")
+        XCTAssertEqual(layout.components.count, 3, "Ling has 3 components: gate, up, down")
+
+        // Verify layer 0 binary was skipped (dense SwiGLU)
+        let layer0Bin = packedDir.appendingPathComponent("layer_00.bin")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: layer0Bin.path), "Layer 0 has no experts and should not produce layer_00.bin")
+
+        // Verify layer 1 binary exists and has non-zero size
+        let layer1Bin = packedDir.appendingPathComponent("layer_01.bin")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: layer1Bin.path), "Layer 1 should produce layer_01.bin")
+        let layer1Attrs = try FileManager.default.attributesOfItem(atPath: layer1Bin.path)
+        let layer1Size = layer1Attrs[.size] as? UInt64 ?? 0
+        XCTAssertGreaterThan(layer1Size, 100 * 1024 * 1024, "Layer 1 binary should be > 100 MB")
+        print(String(format: "✅ Layer 1 binary size: %.2f MB", Double(layer1Size) / (1024 * 1024)))
+
+        // Test loading the repacked model with DynaMoeEngine and bridging to Metal
+        print("🔍 Loading repacked Ling model via DynaMoeEngine...")
+        let engine = try DynaMoeEngine(filePath: snapshotDir)
+        let summary = try engine.getSummary()
+        print("✅ Engine loaded: \(summary.shards.count) shards, \(summary.tensors.count) tensors")
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let address = UInt(shard.baseAddress)
+            guard let ptr = UnsafeMutableRawPointer(bitPattern: address) else { continue }
+            let len = Int(shard.length)
+            guard len > 0 else { continue }
+            if let buf = device.makeBuffer(bytesNoCopy: ptr, length: len, options: .storageModeShared, deallocator: nil) {
+                buffers[shard.index] = buf
+            }
+        }
+        print("✅ Successfully mapped \(buffers.count) Metal buffers without zero-length assertion crash!")
+    }
+
+    func testLingFlashMoELayer1Forward() throws {
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--inclusionAI--Ling-3.0-tiny/snapshots/e3a47d5b986e7141b6efd62597d598ebb392060d"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            print("Snapshot not found, skipping.")
+            return
+        }
+        let engine = try DynaMoeEngine(filePath: snapshotDir)
+        let summary = try engine.getSummary()
+
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let cmdQueue = device.makeCommandQueue() else {
+            XCTFail("No Metal device or command queue")
+            return
+        }
+
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let address = UInt(shard.baseAddress)
+            guard let ptr = UnsafeMutableRawPointer(bitPattern: address) else { continue }
+            let len = Int(shard.length)
+            guard len > 0 else { continue }
+            if let buf = device.makeBuffer(bytesNoCopy: ptr, length: len, options: .storageModeShared, deallocator: nil) {
+                buffers[shard.index] = buf
+            }
+        }
+
+        let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir))
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+        let cachedLayers = inference.buildCachedLayers(summary: summary, config: config, targetLayerCount: 24)
+
+        XCTAssertTrue(cachedLayers.count >= 2, "Expected at least 2 layers")
+        let layer1 = cachedLayers[1]
+
+        let hiddenDim = 1536
+        let intermediateDim = 512
+        let expertSize = 4718592
+        let packedDir = URL(fileURLWithPath: snapshotDir).appendingPathComponent("packed_experts")
+
+        let pool = ExpertIOThreadPool.shared
+        pool.initialize(numThreads: 8)
+
+        guard let fd = pool.getOrOpenLayerFD(layerIndex: 1, packedExpertsDir: packedDir) else {
+            XCTFail("Could not open layer_01.bin")
+            return
+        }
+
+        guard let expertStagingBuffer = device.makeBuffer(length: 16 * expertSize, options: .storageModeShared),
+              let xNorm2Buffer = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let interBuffer = device.makeBuffer(length: intermediateDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let hMlpBuffer = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let hMidBuffer = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let nextH = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+            XCTFail("Could not allocate buffers")
+            return
+        }
+
+        // Initialize xNorm2Buffer with dummy float values
+        let xNormPtr = xNorm2Buffer.contents().bindMemory(to: Float.self, capacity: hiddenDim)
+        for i in 0..<hiddenDim { xNormPtr[i] = 0.01 * Float(i % 10) }
+
+        // Top-8 active experts
+        let activeExperts: [(id: Int, weight: Float)] = [
+            (id: 0, weight: 0.25),
+            (id: 1, weight: 0.20),
+            (id: 2, weight: 0.15),
+            (id: 3, weight: 0.10),
+            (id: 4, weight: 0.10),
+            (id: 5, weight: 0.08),
+            (id: 6, weight: 0.07),
+            (id: 7, weight: 0.05)
+        ]
+
+        var tasks: [ExpertPreadTask] = []
+        let rawStagingPtr = expertStagingBuffer.contents()
+        for (slot, exp) in activeExperts.enumerated() {
+            let offset = off_t(exp.id * expertSize)
+            let dst = rawStagingPtr.advanced(by: slot * expertSize)
+            tasks.append(ExpertPreadTask(fd: fd, dst: dst, offset: offset, size: expertSize))
+        }
+        pool.dispatchSync(tasks: &tasks)
+        print("✅ pread completed for 8 experts")
+
+        guard let clearPipe = inference.clearPipeline,
+              let addPipe = inference.addPipeline,
+              let bf16GateSimdPipe = inference.bf16GateUpSimdPipeline,
+              let bf16DownSimdPipe = inference.bf16DownSimdPipeline else {
+            XCTFail("Failed to load Metal pipelines from InferenceEngine")
+            return
+        }
+
+        print("Testing with SIMD pipelines...")
+        let t0 = CFAbsoluteTimeGetCurrent()
+        guard let moeCmd = cmdQueue.makeCommandBuffer(),
+              let enc = moeCmd.makeComputeCommandEncoder() else {
+            XCTFail("Failed to make command buffer")
+            return
+        }
+
+        enc.setComputePipelineState(clearPipe)
+        enc.setBuffer(hMlpBuffer, offset: 0, index: 0)
+        enc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.memoryBarrier(scope: .buffers)
+
+        for (slot, exp) in activeExperts.enumerated() {
+            let slotOffset = UInt64(slot * expertSize)
+            var gWOff = slotOffset + 0
+            var uWOff = slotOffset + 1572864
+            var dWOff = slotOffset + 3145728
+            var hDim = UInt32(hiddenDim)
+            var interDim = UInt32(intermediateDim)
+            var pk = exp.weight
+
+            enc.setComputePipelineState(bf16GateSimdPipe)
+            enc.setBuffer(expertStagingBuffer, offset: 0, index: 0)
+            enc.setBuffer(expertStagingBuffer, offset: 0, index: 1)
+            enc.setBuffer(xNorm2Buffer, offset: 0, index: 2)
+            enc.setBuffer(interBuffer, offset: 0, index: 3)
+            enc.setBytes(&gWOff, length: 8, index: 4)
+            enc.setBytes(&uWOff, length: 8, index: 5)
+            enc.setBytes(&hDim, length: 4, index: 6)
+            enc.setBytes(&interDim, length: 4, index: 7)
+            enc.dispatchThreadgroups(MTLSize(width: intermediateDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+
+            enc.setComputePipelineState(bf16DownSimdPipe)
+            enc.setBuffer(expertStagingBuffer, offset: 0, index: 0)
+            enc.setBuffer(interBuffer, offset: 0, index: 1)
+            enc.setBuffer(hMlpBuffer, offset: 0, index: 2)
+            enc.setBytes(&dWOff, length: 8, index: 3)
+            enc.setBytes(&interDim, length: 4, index: 4)
+            enc.setBytes(&hDim, length: 4, index: 5)
+            enc.setBytes(&pk, length: 4, index: 6)
+            enc.dispatchThreadgroups(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+        }
+
+        // Shared expert
+        if let gateW = layer1.sharedGateWeight,
+           let upW = layer1.sharedUpWeight,
+           let downW = layer1.sharedDownWeight,
+           let gRaw = buffers[gateW.shardIndex],
+           let uRaw = buffers[upW.shardIndex],
+           let dRaw = buffers[downW.shardIndex] {
+            var gWOff = gateW.offsetStart
+            var uWOff = upW.offsetStart
+            var dWOff = downW.offsetStart
+            var hDimVal = UInt32(hiddenDim)
+            var interDimVal = UInt32(intermediateDim)
+            var pk: Float = 1.0
+
+            enc.setComputePipelineState(bf16GateSimdPipe)
+            enc.setBuffer(gRaw, offset: 0, index: 0)
+            enc.setBuffer(uRaw, offset: 0, index: 1)
+            enc.setBuffer(xNorm2Buffer, offset: 0, index: 2)
+            enc.setBuffer(interBuffer, offset: 0, index: 3)
+            enc.setBytes(&gWOff, length: 8, index: 4)
+            enc.setBytes(&uWOff, length: 8, index: 5)
+            enc.setBytes(&hDimVal, length: 4, index: 6)
+            enc.setBytes(&interDimVal, length: 4, index: 7)
+            enc.dispatchThreadgroups(MTLSize(width: intermediateDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+
+            enc.setComputePipelineState(bf16DownSimdPipe)
+            enc.setBuffer(dRaw, offset: 0, index: 0)
+            enc.setBuffer(interBuffer, offset: 0, index: 1)
+            enc.setBuffer(hMlpBuffer, offset: 0, index: 2)
+            enc.setBytes(&dWOff, length: 8, index: 3)
+            enc.setBytes(&interDimVal, length: 4, index: 4)
+            enc.setBytes(&hDimVal, length: 4, index: 5)
+            enc.setBytes(&pk, length: 4, index: 6)
+            enc.dispatchThreadgroups(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+        }
+
+        var hDim = UInt32(hiddenDim)
+        enc.setComputePipelineState(addPipe)
+        enc.setBuffer(hMidBuffer, offset: 0, index: 0)
+        enc.setBuffer(hMlpBuffer, offset: 0, index: 1)
+        enc.setBuffer(nextH, offset: 0, index: 2)
+        enc.setBytes(&hDim, length: 4, index: 3)
+        enc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        enc.memoryBarrier(scope: .buffers)
+
+        enc.endEncoding()
+        moeCmd.commit()
+        moeCmd.waitUntilCompleted()
+
+        let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
+        XCTAssertNil(moeCmd.error, "moeCmd failed with error: \(String(describing: moeCmd.error))")
+        print(String(format: "✅ moeCmd completed successfully in %.2f ms!", elapsed))
+    }
 }
 
 
