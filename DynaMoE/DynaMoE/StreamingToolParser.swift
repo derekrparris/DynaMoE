@@ -71,11 +71,59 @@ public final class StreamingToolParser {
         }
     }
 
+    /// Rewrites the model's native Qwen-native argument dialect into the canonical internal
+    /// <parameter=k>v</parameter> form. Some checkpoints emit <arg_key>name</arg_key> followed by
+    /// <arg_value>value</arg_value> (possibly with newlines/comments between them) instead of
+    /// the parameter= form that AgentHarness.parseToolCalls recognizes; previously such calls
+    /// were silently dropped and only the surrounding prose appeared in the reply. This pass
+    /// converts every completed pair into a single parameter block and also defends against a
+    /// trailing ech(<arg_value>…</arg_value>) whose key never arrived on the current buffer.
+    public static func normalizeArgKeyDialect(_ raw: String) -> String {
+        guard raw.contains("arg_key") || raw.contains("arg_value") else { return raw }
+        var out = raw
+        // Collapse each <arg_key>k</arg_key> ... <arg_value>v</arg_value> pair into one block.
+        // Pair might span newlines and contain inner whitespace/comments; match loosely.
+        let pairPattern = "<arg_key>\\s*([^<]+?)\\s*</arg_key>\\s*<arg_value>\\s*([\\s\\S]*?)\\s*</arg_value>"
+        if let re = try? NSRegularExpression(pattern: pairPattern, options: []) {
+            let ns = out as NSString
+            let all = re.matches(in: out, options: [], range: NSRange(location: 0, length: ns.length))
+            for m in all.reversed() {
+                guard m.numberOfRanges >= 3 else { continue }
+                let key = ns.substring(with: m.range(at: 1))
+                let val = ns.substring(with: m.range(at: 2))
+                out = (out as NSString).replacingCharacters(in: m.range(at: 0),
+                    with: "<parameter=\(key)>\(val)</parameter>")
+            }
+        }
+        // Any <arg_value>v</arg_value> that lost its key (very deep stream buffering) folds
+        // into a position-independent parameter named by its value only — the tolerant parser
+        // will still match <function=name>… with at least one usable parameter.
+        let orphanPattern = "<arg_value>\\s*([\\s\\S]*?)\\s*</arg_value>"
+        if let re2 = try? NSRegularExpression(pattern: orphanPattern, options: []) {
+            let ns = out as NSString
+            let orphan = re2.matches(in: out, options: [], range: NSRange(location: 0, length: ns.length))
+            for m in orphan.reversed() {
+                guard m.numberOfRanges >= 2 else { continue }
+                let val = ns.substring(with: m.range(at: 1))
+                out = (out as NSString).replacingCharacters(in: m.range(at: 0),
+                    with: "<parameter=value>\(val)</parameter>")
+            }
+        }
+        return out
+    }
+
     /// Parses all completed tool calls from the stream text across supported formats.
     public func parseStreamingToolCalls(
         from text: String,
         format: ToolCallFormat = .qwenXML
     ) -> (calls: [ParsedToolCall], brokenFragments: [String]) {
+        // 0. Dialect normalization: some models emit native Qwen argument XML inside the
+        //    function body using <arg_key>k</arg_key> / <arg_value>v</arg_value> pairs instead
+        //    of the internal <parameter=k>v</parameter> form. Rewrite those into canonical
+        //    <parameter=...> blocks so the tolerant parser actually executes the call instead
+        //    of silently dropping it (which previously left only prose in the reply).
+        var text = Self.normalizeArgKeyDialect(text)
+
         // 1. Check for Qwen XML with JSON arguments body: <function=name>{"arg": "val"}</function>
         let fnRegex = try? NSRegularExpression(pattern: "<function=([^>]+)>([\\s\\S]*?)</function>", options: [])
         let nsText = text as NSString

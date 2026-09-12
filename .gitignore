@@ -78,3 +78,4 @@ build/
 *.p12
 *.cer
 /config.local.json
+DynaMoE Architectural Overview.md

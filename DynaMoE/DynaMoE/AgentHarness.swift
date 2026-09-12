@@ -2484,6 +2484,44 @@ public final class AgentHarness {
     public var maxToolOutputLength: Int = 4000
     public var maxAgentSteps: Int = 15
 
+    // MARK: - Web Search Loop Guard
+    // Termination for tool loops is structural, not a matter of model capability: `web_search`
+    // never sets `isCompleted`, so the only non-cap exit is the model deciding to stop calling
+    // tools. These guards escalate repeated identical queries and runaway search budgets so any
+    // model (weak or strong) is reeled in.
+
+    public enum WebSearchGuardAction {
+        case none
+        case answerNowDirective
+        case forceSynthesis
+    }
+
+    /// Normalized query → number of times it has been issued in the current run.
+    public private(set) var webSearchQueryCount: [String: Int] = [:]
+    /// Total web_search calls in the current run.
+    public private(set) var totalSearchesInRun: Int = 0
+    /// Once true, `web_search` is unloaded from the prompt/grammar and every further call is a
+    /// hard stop that forces a final synthesis turn.
+    public private(set) var webSearchDisabled = false
+    /// Action decided for the most recently executed tool call.
+    public private(set) var lastSearchGuardAction: WebSearchGuardAction = .none
+    /// Max distinct-ish web_search calls allowed per run before disabling further searches.
+    public var searchBudgetPerRun: Int = 6
+    /// Issuing the same normalized query this many times triggers the repeat guard.
+    public var searchRepeatLimit: Int = 2
+
+    /// Resets guard state at the start of a new task and re-exposes `web_search` in case a
+    /// previous run unloaded it.
+    public func beginAgentSearchGuard() {
+        webSearchQueryCount.removeAll()
+        totalSearchesInRun = 0
+        webSearchDisabled = false
+        lastSearchGuardAction = .none
+        if tools["web_search"] != nil && loadedTools["web_search"] == nil {
+            _ = try? loadTool(named: "web_search")
+        }
+    }
+
     /// Tools seeded into the prompt on startup — the "fundamental" set.
     public static let coreLoadedToolNames: Set<String> = [
         "shell_run", "file_read", "file_edit", "file_write",
@@ -2738,7 +2776,7 @@ public final class AgentHarness {
         }
         turn += "<|im_end|>\n<|im_start|>assistant\n"
         if includeThinkSuffix {
-            turn += " thinking\n"
+            turn += "<think>\n"
         }
         return turn
     }
@@ -2824,7 +2862,7 @@ public final class AgentHarness {
 
     public func formatActionContinuationTurn(includeThinkSuffix: Bool = false) -> String {
         var turn = "<|im_start|>user\n"
-        turn += "If you intended to take an action, execute it now using <tool_call><function=...><parameter=...>...</parameter></function></tool_call>. Otherwise, just reply to the user and end your turn.\n"
+        turn += "If you intended to take an action, execute it now by emitting a complete tool call like <tool_call><function=file_read><parameter=path>/Users/example.txt</parameter></function></tool_call>. Do not echo the schema template itself. Otherwise, just reply to the user and end your turn.\n"
         turn += "<|im_end|>\n<|im_start|>assistant\n"
         if includeThinkSuffix {
             turn += "<think>\n"
@@ -3041,7 +3079,23 @@ public final class AgentHarness {
         }
 
         do {
-            let (json, stdout, stderr, isCompleted) = try await tool.execute(arguments: call.arguments, workingDirectory: wd, maxOutputLength: effectiveMaxLen)
+            let baseResult: (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool)
+            if call.name == "web_search" {
+                let raw = try await tool.execute(arguments: call.arguments, workingDirectory: wd, maxOutputLength: effectiveMaxLen)
+                baseResult = await applyWebSearchLoopGuard(
+                    query: (call.arguments["query"] as? String) ?? "",
+                    baseJSON: raw.resultJSON,
+                    baseStdout: raw.stdout,
+                    baseStderr: raw.stderr,
+                    baseIsCompleted: raw.isCompleted
+                )
+            } else {
+                baseResult = try await tool.execute(arguments: call.arguments, workingDirectory: wd, maxOutputLength: effectiveMaxLen)
+            }
+            let json = baseResult.resultJSON
+            let stdout = baseResult.stdout
+            let stderr = baseResult.stderr
+            let isCompleted = baseResult.isCompleted
             let duration = CFAbsoluteTimeGetCurrent() - startTime
             let status: ToolExecutionStatus = (stderr != nil && !stderr!.isEmpty) ? .error : .success
 
@@ -3070,6 +3124,87 @@ public final class AgentHarness {
             )
             return (json, rec, false)
         }
+    }
+
+    // MARK: - Web Search Loop Guard Logic
+
+    /// Runs after the raw `web_search` tool result is produced. Detects repeated identical
+    /// queries and runaway search budgets, escalates via a `guardrail` directive embedded in the
+    /// tool JSON, unloads `web_search` from the prompt/grammar once the model is refusing to
+    /// answer, and finally hard-stops (sets `isCompleted`) so the harness runs a forced synthesis
+    /// turn instead of spinning forever.
+    private func applyWebSearchLoopGuard(query: String, baseJSON: String, baseStdout: String?, baseStderr: String?, baseIsCompleted: Bool) async -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        let clean = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else {
+            lastSearchGuardAction = .none
+            return (baseJSON, baseStdout, baseStderr, baseIsCompleted)
+        }
+
+        let normalized = clean.lowercased()
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let prior = webSearchQueryCount[normalized] ?? 0
+        let issuedNow = prior + 1
+        webSearchQueryCount[normalized] = issuedNow
+        totalSearchesInRun += 1
+
+        var action: WebSearchGuardAction = .none
+        var notice: String? = nil
+        var isCompleted = baseIsCompleted
+
+        if webSearchDisabled {
+            // The model kept searching after being told to stop — end the run decisively.
+            action = .forceSynthesis
+            isCompleted = true
+            notice = "[guardrail] Web search is DISABLED for this task. You already have the complete set of search results in the conversation above. Do NOT issue any further tool calls. Compose your full final answer now, using only the results already gathered."
+        } else if issuedNow >= searchRepeatLimit {
+            webSearchDisabled = true
+            _ = try? unloadTool(named: "web_search")
+            action = .answerNowDirective
+            notice = "[guardrail] You have already searched this exact query \(issuedNow) times in this task; re-searching cannot produce new information. Web search is now DISABLED. Produce your final answer immediately from the results already in the conversation."
+        } else if totalSearchesInRun >= searchBudgetPerRun {
+            webSearchDisabled = true
+            _ = try? unloadTool(named: "web_search")
+            action = .answerNowDirective
+            notice = "[guardrail] Search budget exhausted (limit \(searchBudgetPerRun) per task). Web search is now DISABLED. Produce your final answer immediately from the results already in the conversation."
+        } else if hasOfficialGroundTruth(in: baseJSON) {
+            action = .answerNowDirective
+            notice = "[guardrail] These results include verified official vendor ground truth and are authentic and authoritative. Do not search again — compose your final answer now from them."
+        }
+
+        lastSearchGuardAction = action
+
+        guard let notice = notice else {
+            return (baseJSON, baseStdout, baseStderr, isCompleted)
+        }
+
+        var augmented = baseJSON
+        if var obj = try? JSONSerialization.jsonObject(with: Data(baseJSON.utf8)) as? [String: Any] {
+            var result = (obj["result"] as? [String: Any]) ?? [:]
+            result["guardrail"] = notice
+            let actionName: String
+            switch action {
+            case .none: actionName = "none"
+            case .answerNowDirective: actionName = "answer_now"
+            case .forceSynthesis: actionName = "force_synthesis"
+            }
+            result["guardrail_action"] = actionName
+            obj["result"] = result
+            if let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]),
+               let str = String(data: data, encoding: .utf8) {
+                augmented = str
+            }
+        }
+        return (augmented, baseStdout, baseStderr, isCompleted)
+    }
+
+    /// True when the `web_search` result JSON contains at least one official vendor / .gov / .edu
+    /// domain, i.e. authentic ground truth that means further searching is pointless.
+    private func hasOfficialGroundTruth(in resultJSON: String) -> Bool {
+        guard let obj = try? JSONSerialization.jsonObject(with: Data(resultJSON.utf8)) as? [String: Any],
+              let result = obj["result"] as? [String: Any],
+              let results = result["results"] as? [[String: Any]] else { return false }
+        return results.contains { ($0["is_official_domain"] as? Bool) == true }
     }
 
     // MARK: - Helpers & Utilities

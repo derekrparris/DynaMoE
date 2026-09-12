@@ -4,6 +4,17 @@ import Metal
 import Foundation
 import Accelerate
 
+/// Central gate for chat-tab diagnostic logging. Off by default; enable individual flags from
+/// the Debug pane (or `defaults write`) to re-enable the corresponding console output.
+enum DebugFlags {
+    /// Per-token `[Autoregressive] Step N: nextToken=...` console lines during generation.
+    static var tokenStepLogging: Bool {
+        UserDefaults.standard.object(forKey: "dynamoe_debug_token_logging") != nil
+            ? UserDefaults.standard.bool(forKey: "dynamoe_debug_token_logging")
+            : false
+    }
+}
+
 struct ExpertRoutingBadgeView: View {
     let rank: Int
     let expertId: Int
@@ -1537,6 +1548,7 @@ struct ContentView: View {
             }
         }
         
+        AgentHarness.shared.beginAgentSearchGuard()
         startAutoregressiveGeneration(customPrompt: promptString, sessionId: currentSessionId, messageId: assistantMsgId)
     }
 
@@ -3171,7 +3183,7 @@ struct ContentView: View {
         generationStatusText = "⏹ Generation stopped by user."
     }
 
-    private func startAutoregressiveGeneration(customPrompt: String? = nil, sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false) {
+    private func startAutoregressiveGeneration(customPrompt: String? = nil, sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false, forceSynthesis: Bool = false) {
         guard let summary = summary,
               let tokenizer = tokenizer,
               let device = MTLCreateSystemDefaultDevice(),
@@ -9198,7 +9210,7 @@ struct ContentView: View {
                 return (acceptedTokens: emittedTokens, newStep: step + UInt32(emittedTokens.count))
             }
 
-            let isAgentEnabled = (sessionId != nil) ? (self.sessions.first(where: { $0.id == sessionId })?.isAgentToolsEnabled ?? self.defaultAgentToolsEnabled) : self.defaultAgentToolsEnabled
+            let runAgentTools = !forceSynthesis && ((sessionId != nil) ? (self.sessions.first(where: { $0.id == sessionId })?.isAgentToolsEnabled ?? self.defaultAgentToolsEnabled) : self.defaultAgentToolsEnabled)
             var generatedTokenIds: [UInt32] = []
             var accumulatedDecodedText = ""
             var lastUIUpdateTime = CFAbsoluteTimeGetCurrent()
@@ -9337,7 +9349,7 @@ struct ContentView: View {
 
                     // 4. Sample Next Token
                     let logitsPtr = logitsBuffer.contents().bindMemory(to: Float.self, capacity: Int(vocabSize))
-                    let isGrammarActive = isAgentEnabled && (UserDefaults.standard.object(forKey: "dynamoe_agent_grammar_masking") == nil ? true : UserDefaults.standard.bool(forKey: "dynamoe_agent_grammar_masking"))
+                    let isGrammarActive = runAgentTools && (UserDefaults.standard.object(forKey: "dynamoe_agent_grammar_masking") == nil ? true : UserDefaults.standard.bool(forKey: "dynamoe_agent_grammar_masking"))
                     let nextToken = sampleNextToken(
                         logits: logitsPtr,
                         vocabSize: Int(vocabSize),
@@ -9353,7 +9365,7 @@ struct ContentView: View {
                             GrammarConstrainedSampler.shared.applyLogitMask(logits: maskLogits, vocabSize: maskVocab, tokenDecoder: { try? tokenizer.decode(ids: [$0]) })
                         } : nil
                     )
-                    if tokensGenerated < 10 {
+                    if tokensGenerated < 10 && DebugFlags.tokenStepLogging {
                         let tokText = (try? tokenizer.decode(ids: [nextToken])) ?? ""
                         print("[Autoregressive] Step \(tokensGenerated): nextToken=\(nextToken) ('\(tokText)') logits[nextToken]=\(logitsPtr[Int(nextToken)])")
                     }
@@ -9399,7 +9411,7 @@ struct ContentView: View {
                     }
 
                     // Pre-Execution Catching: Freeze decoding immediately when </tool_call> closes
-                    if isAgentEnabled && StreamingToolParser.shared.shouldFreezeGeneration(accumulatedText: accumulatedDecodedText, deltaText: deltaText) {
+                    if runAgentTools && StreamingToolParser.shared.shouldFreezeGeneration(accumulatedText: accumulatedDecodedText, deltaText: deltaText) {
                         shouldBreak = true
                         break
                     }
@@ -9426,54 +9438,28 @@ struct ContentView: View {
                 var activeThink = false
 
                 let promptTrimmed = formattedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-                let promptRequestsThinking = promptTrimmed.hasSuffix("<think>") && !promptTrimmed.hasSuffix("</think>")
+                let promptRequestsThinking = (promptTrimmed.hasSuffix("<think>") || promptTrimmed.hasSuffix("<thought>") || promptTrimmed.hasSuffix("<|thought|>")) && !promptTrimmed.hasSuffix("</think>") && !promptTrimmed.hasSuffix("</thought>") && !promptTrimmed.hasSuffix("</|thought|>")
 
-                let containsThinkOpen = updatedRaw.contains("<think>") || updatedRaw.contains("<|thought|>") || updatedRaw.contains("<thought>")
-                let containsThinkClose = updatedRaw.contains("</think>") || updatedRaw.contains("</|thought|>") || updatedRaw.contains("</thought>")
+                let thinkSplit = Self.splitThinkingAndResponse(raw: updatedRaw, promptRequestsThinking: promptRequestsThinking)
 
-                if containsThinkClose {
+                if thinkSplit.thinkClose {
                     if thinkingEndTimestamp == nil {
                         thinkingEndTimestamp = CFAbsoluteTimeGetCurrent()
                     }
-                    let delimiter: String
-                    let openTag: String
-                    if updatedRaw.contains("</think>") {
-                        delimiter = "</think>"
-                        openTag = "<think>"
-                    } else if updatedRaw.contains("</|thought|>") {
-                        delimiter = "</|thought|>"
-                        openTag = "<|thought|>"
-                    } else {
-                        delimiter = "</thought>"
-                        openTag = "<thought>"
-                    }
-                    let parts = updatedRaw.components(separatedBy: delimiter)
-                    thinkPart = parts[0].replacingOccurrences(of: openTag, with: "").trimmingCharacters(in: .whitespacesAndNewlines)
-                    let rawResp = parts.dropFirst().joined(separator: delimiter)
-                    respPart = rawResp
-                        .replacingOccurrences(of: "<|im_end|>", with: "")
-                        .replacingOccurrences(of: "<|endoftext|>", with: "")
-                        .replacingOccurrences(of: "<|im_start|>", with: "")
-                        .replacingOccurrences(of: "<|role_end|>", with: "")
-                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    thinkPart = thinkSplit.think
+                    respPart = thinkSplit.resp
                     activeThink = false
-                } else if containsThinkOpen || promptRequestsThinking {
-                    // Inside the thinking block before </think> arrives
-                    let openTag = updatedRaw.contains("<|thought|>") ? "<|thought|>" : (updatedRaw.contains("<thought>") ? "<thought>" : "<think>")
-                    thinkPart = updatedRaw.replacingOccurrences(of: openTag, with: "").trimmingCharacters(in: .whitespaces)
+                } else if thinkSplit.thinkOpen {
+                    // Inside the thinking block before the response boundary arrives
+                    thinkPart = thinkSplit.think
                     activeThink = true
                     respPart = ""
                 } else {
                     // Normal direct response without think tags
                     thinkPart = ""
                     activeThink = false
-                    respPart = updatedRaw
-                        .replacingOccurrences(of: "<|im_end|>", with: "")
-                        .replacingOccurrences(of: "<|endoftext|>", with: "")
-                        .replacingOccurrences(of: "<|im_start|>", with: "")
-                        .replacingOccurrences(of: "<|role_end|>", with: "")
+                    respPart = thinkSplit.resp
                 }
-
                 let liveTtft = firstTokenTimestamp.map { $0 - startTime }
                 let liveThinkDuration = thinkingEndTimestamp.map { $0 - generationStartTime }
 
@@ -9553,57 +9539,28 @@ struct ContentView: View {
             var finalThink = ""
             var finalResp = ""
             let promptTrimmedFinal = formattedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-            let promptRequestsThinkingFinal = promptTrimmedFinal.hasSuffix("<think>") && !promptTrimmedFinal.hasSuffix("</think>")
+            let promptRequestsThinkingFinal = (promptTrimmedFinal.hasSuffix("<think>") || promptTrimmedFinal.hasSuffix("<thought>") || promptTrimmedFinal.hasSuffix("<|thought|>")) && !promptTrimmedFinal.hasSuffix("</think>") && !promptTrimmedFinal.hasSuffix("</thought>") && !promptTrimmedFinal.hasSuffix("</|thought|>")
 
-            let finalContainsThinkClose = finalDecoded.contains("</think>") || finalDecoded.contains("</|thought|>") || finalDecoded.contains("</thought>")
-            let finalContainsThinkOpen = finalDecoded.contains("<think>") || finalDecoded.contains("<|thought|>") || finalDecoded.contains("<thought>")
-
-            if finalContainsThinkClose {
+            let finalSplit = Self.splitThinkingAndResponse(raw: finalDecoded, promptRequestsThinking: promptRequestsThinkingFinal)
+            if finalSplit.thinkClose {
                 if thinkingEndTimestamp == nil {
                     thinkingEndTimestamp = CFAbsoluteTimeGetCurrent()
                 }
-                let delimiter: String
-                let openTag: String
-                if finalDecoded.contains("</think>") {
-                    delimiter = "</think>"
-                    openTag = "<think>"
-                } else if finalDecoded.contains("</|thought|>") {
-                    delimiter = "</|thought|>"
-                    openTag = "<|thought|>"
-                } else {
-                    delimiter = "</thought>"
-                    openTag = "<thought>"
-                }
-                let parts = finalDecoded.components(separatedBy: delimiter)
-                finalThink = parts[0].replacingOccurrences(of: openTag, with: "").trimmingCharacters(in: .whitespacesAndNewlines)
-                let rawFinalResp = parts.dropFirst().joined(separator: delimiter)
-                finalResp = rawFinalResp
-                    .replacingOccurrences(of: "<|im_end|>", with: "")
-                    .replacingOccurrences(of: "<|endoftext|>", with: "")
-                    .replacingOccurrences(of: "<|im_start|>", with: "")
-                    .replacingOccurrences(of: "<|role_end|>", with: "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-            } else if finalContainsThinkOpen || promptRequestsThinkingFinal {
-                let openTag = finalDecoded.contains("<|thought|>") ? "<|thought|>" : (finalDecoded.contains("<thought>") ? "<thought>" : "<think>")
-                finalThink = finalDecoded.replacingOccurrences(of: openTag, with: "").trimmingCharacters(in: .whitespaces)
+                finalThink = finalSplit.think
+                finalResp = finalSplit.resp
+            } else if finalSplit.thinkOpen {
+                finalThink = finalSplit.think
                 finalResp = ""
             } else {
                 finalThink = ""
-                finalResp = finalDecoded
-                    .replacingOccurrences(of: "<think>", with: "")
-                    .replacingOccurrences(of: "<|im_end|>", with: "")
-                    .replacingOccurrences(of: "<|endoftext|>", with: "")
-                    .replacingOccurrences(of: "<|im_start|>", with: "")
-                    .replacingOccurrences(of: "<|role_end|>", with: "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                finalResp = finalSplit.resp
             }
-
             let finalTtft = firstTokenTimestamp.map { $0 - startTime }
             let finalThinkDuration = thinkingEndTimestamp.map { $0 - generationStartTime }
 
             // Agent Harness Multi-Step Tool Check
-            let parsedResult = isAgentEnabled ? StreamingToolParser.shared.parseStreamingToolCalls(from: finalDecoded) : (calls: [], brokenFragments: [])
-            let hasUncalledIntent = isAgentEnabled && parsedResult.calls.isEmpty && agentStep == 0 && (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink)
+            let parsedResult = runAgentTools ? StreamingToolParser.shared.parseStreamingToolCalls(from: finalDecoded) : (calls: [], brokenFragments: [])
+            let hasUncalledIntent = runAgentTools && parsedResult.calls.isEmpty && agentStep == 0 && (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink)
             let willContinueAgent = (!parsedResult.calls.isEmpty || hasUncalledIntent)
 
             await MainActor.run {
@@ -9680,8 +9637,10 @@ struct ContentView: View {
 
             // Recovery: the model emitted only its reasoning block and stopped (empty reply).
             // Regenerate the whole turn from scratch so it can answer cleanly — grafting onto a
-            // reconstructed " response" prefix produced duplicate reply text.
-            if thinkingEnabled && !isInThinkingContinuation && !finalThink.isEmpty && finalResp.isEmpty && !Task.isCancelled {
+            // reconstructed " response" prefix produced duplicate reply text. Never applies when
+            // there are parsed tool calls (or uncalled action intent): those turns must run the
+            // agent harness, otherwise an identical deterministic replay is triggered.
+            if thinkingEnabled && !isInThinkingContinuation && !willContinueAgent && !finalThink.isEmpty && finalResp.isEmpty && !Task.isCancelled {
                 await MainActor.run {
                     if let sId = sessionId,
                        let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
@@ -9704,7 +9663,7 @@ struct ContentView: View {
             }
 
             // Agent Harness Multi-Step Tool Execution
-            if isAgentEnabled {
+            if runAgentTools {
                 if !parsedResult.calls.isEmpty {
                     var initialRecords: [ToolCallRecord] = []
                     for call in parsedResult.calls {
@@ -9735,6 +9694,7 @@ struct ContentView: View {
                     let baseWdURL = self.agentWorkingDirectory.isEmpty ? nil : URL(fileURLWithPath: self.agentWorkingDirectory)
                     var toolResponses: [String] = []
                     var anyCompleted = false
+                    var ranCompleteTool = false
 
                     for (idx, call) in parsedResult.calls.enumerated() {
                         if Task.isCancelled {
@@ -9808,6 +9768,9 @@ struct ContentView: View {
                         if execResult.isCompleted {
                             anyCompleted = true
                         }
+                        if call.name == "complete" {
+                            ranCompleteTool = true
+                        }
 
                         // Update ToolCallRecord in ChatMessage
                         await MainActor.run {
@@ -9871,7 +9834,51 @@ struct ContentView: View {
                         }
                         return
                     } else {
-                        // All steps finished or complete tool called
+                        // All steps finished or complete tool called. If the search loop guard
+                        // hard-stopped the run, give the model one final synthesis turn with
+                        // tool calling disabled so it actually answers instead of spinning.
+                        if AgentHarness.shared.lastSearchGuardAction == .forceSynthesis && !ranCompleteTool {
+                            let endTag = (modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>"
+                            var assistantTurnText = finalDecoded
+                            if !assistantTurnText.contains(endTag) {
+                                assistantTurnText += endTag
+                            }
+                            let toolResponseContext = toolResponses.joined(separator: "\n")
+                            let synthesisDirective = """
+                            \n\n<system>
+                            IMPORTANT: All tool use is now DISABLED for this task. You consumed your search budget by repeatedly searching instead of answering, and the run was forcibly ended to protect the conversation from looping.
+                            Using ONLY the search results and tool outputs already shown above in this conversation, now write your complete, self-contained final answer to the user's original question.
+                            Do not emit any tool calls. Do not search again. Just answer.
+                            </system>
+                            """
+                            let synthesisPrompt = formattedPrompt + assistantTurnText + "\n" + toolResponseContext + synthesisDirective
+                            await MainActor.run {
+                                let synthesisMsgId = UUID()
+                                if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
+                                    if let mId = messageId, let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                                        self.sessions[sIdx].messages[mIdx].isThinking = false
+                                        self.sessions[sIdx].messages[mIdx].prefillStatus = nil
+                                    }
+                                    let synthMsg = ChatMessage(
+                                        id: synthesisMsgId,
+                                        role: .assistant,
+                                        content: "",
+                                        thinkingContent: nil,
+                                        isThinking: thinkingEnabled
+                                    )
+                                    self.sessions[sIdx].messages.append(synthMsg)
+                                }
+                                self.generationStatusText = "🛡️ Search guard hit — forcing final answer..."
+                                self.startAutoregressiveGeneration(
+                                    customPrompt: synthesisPrompt,
+                                    sessionId: sessionId,
+                                    messageId: synthesisMsgId,
+                                    agentStep: agentStep + 1,
+                                    forceSynthesis: true
+                                )
+                            }
+                            return
+                        }
                         await MainActor.run {
                             self.isGeneratingText = false
                             self.generationTask = nil
@@ -9926,6 +9933,98 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    // MARK: - Thinking / Response Boundary Splitting (whitespace tolerant)
+
+    /// Reasoning open/close marker tags used across model families (Qwen, DeepSeek, Ornith, etc.).
+    private static let openTags = ["<think>", "<thought>", "<|thought|>"]
+    private static let closeTags = ["</think>", "</thought>", "</|thought|>"]
+
+    /// Matches a free-standing "response" word preceded by whitespace or a dot, e.g.
+    /// "\nresponseHello" or "helpfully.responseHello!". The trailing lookbehind-ish guard
+    /// (next char not a lowercase letter / digit / '@' / '_' / '.') prevents matching within
+    /// words like "responses" or "response." used as plain prose.
+    private static let responseBoundaryRegex: NSRegularExpression? = {
+        try? NSRegularExpression(pattern: "(?<=[\\s.])response(?![a-z@_.0-9])", options: [])
+    }()
+
+    /// Matches a "response" marker on its own line ("\n response \n"). Delimiter emitted
+    /// during agent continuations or templates without XML tags (such as Ling 3.0).
+    private static let standaloneResponseRegex: NSRegularExpression? = {
+        try? NSRegularExpression(pattern: "(?m)^\\s*response\\s*$", options: [])
+    }()
+
+    /// Locates the thinking->response boundary in streamed text, or nil when absent.
+    static func locateThinkingBoundary(in raw: String, promptRequestsThinking: Bool) -> NSRange? {
+        let nsRaw = raw as NSString
+        // 1. Explicit formal closing tags first (unambiguous delimiter emitted by models)
+        for tag in Self.closeTags {
+            let r = nsRaw.range(of: tag)
+            if r.location != NSNotFound { return r }
+        }
+        // 2. Standalone response marker on its own line (for Ling 3.0 / templates without XML tags)
+        if let standalone = Self.standaloneResponseRegex {
+            var last: NSRange?
+            standalone.enumerateMatches(in: raw, options: [], range: NSRange(location: 0, length: nsRaw.length)) { m, _, _ in
+                if let m { last = m.range }
+            }
+            if let last { return last }
+        }
+        let expectsThinking = Self.openTags.contains { raw.contains($0) }
+        guard expectsThinking || promptRequestsThinking else { return nil }
+        // 3. Whitespace-tolerant fallback for models that could not emit the special marker token
+        if let re = Self.responseBoundaryRegex {
+            var last: NSRange?
+            re.enumerateMatches(in: raw, options: [], range: NSRange(location: 0, length: nsRaw.length)) { m, _, _ in
+                if let m { last = m.range }
+            }
+            if let last { return last }
+        }
+        return nil
+    }
+
+    /// Splits accumulated output into thinking and response halves using a whitespace-tolerant
+    /// boundary. `thinkClose` is true when a boundary was found; `thinkOpen` when still inside a
+    /// thinking block with no boundary yet.
+    static func splitThinkingAndResponse(raw: String, promptRequestsThinking: Bool) -> (think: String, resp: String, openTag: String, thinkOpen: Bool, thinkClose: Bool) {
+        let nsRaw = raw as NSString
+        let openTag: String = Self.openTags.first { raw.contains($0) } ?? "<think>"
+
+        if let boundary = locateThinkingBoundary(in: raw, promptRequestsThinking: promptRequestsThinking) {
+            var thinking = nsRaw.substring(to: boundary.location)
+            for tag in Self.openTags {
+                thinking = thinking.replacingOccurrences(of: tag, with: "")
+            }
+            thinking = thinking.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            let response = nsRaw.substring(from: boundary.location + boundary.length)
+                .replacingOccurrences(of: "<|im_end|>", with: "")
+                .replacingOccurrences(of: "<|endoftext|>", with: "")
+                .replacingOccurrences(of: "<|im_start|>", with: "")
+                .replacingOccurrences(of: "<|role_end|>", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return (thinking, response, openTag, false, true)
+        }
+
+        if Self.openTags.contains(where: { raw.contains($0) }) || promptRequestsThinking {
+            var thinking = raw
+            for tag in Self.openTags {
+                thinking = thinking.replacingOccurrences(of: tag, with: "")
+            }
+            thinking = thinking.trimmingCharacters(in: .whitespaces)
+            return (thinking, "", openTag, true, false)
+        }
+
+        var response = raw
+        for tag in Self.openTags { response = response.replacingOccurrences(of: tag, with: "") }
+        response = response
+            .replacingOccurrences(of: "<|im_end|>", with: "")
+            .replacingOccurrences(of: "<|endoftext|>", with: "")
+            .replacingOccurrences(of: "<|im_start|>", with: "")
+            .replacingOccurrences(of: "<|role_end|>", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return ("", response, openTag, false, false)
     }
 
     private func updatePagingStats() {

@@ -7878,6 +7878,76 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         XCTAssertNil(moeCmd.error, "moeCmd failed with error: \(String(describing: moeCmd.error))")
         print(String(format: "✅ moeCmd completed successfully in %.2f ms!", elapsed))
     }
+
+    func testThinkingAndResponseBoundarySplitting() {
+        // Scenario 1: Screenshot Turn 1 (Prompt prefilled <think>, model emits reasoning then \n</think>\n then response and tool_call)
+        let turn1Raw = """
+        The user is asking about newly announced Apple Mac Studios. Let me search the web for the latest information.
+        </think>
+
+        I'll search for the latest information on Apple's recently announced Mac Studios.
+
+        <tool_call>
+        <function=web_search>
+        <parameter=query>
+        Apple Mac Studio new announcement 2026 specifications price
+        </parameter>
+        </function>
+        </tool_call>
+        """
+        let split1 = ContentView.splitThinkingAndResponse(raw: turn1Raw, promptRequestsThinking: true)
+        XCTAssertFalse(split1.thinkOpen, "Thinking must be closed")
+        XCTAssertTrue(split1.thinkClose, "Thinking close delimiter must be detected")
+        XCTAssertEqual(split1.think, "The user is asking about newly announced Apple Mac Studios. Let me search the web for the latest information.")
+        XCTAssertFalse(split1.think.contains("</think>"), "Thinking must not contain literal </think> tag")
+        XCTAssertFalse(split1.think.contains("tool_call"), "Thinking must not contain tool_call block")
+        XCTAssertTrue(split1.resp.contains("I'll search for the latest information"))
+        XCTAssertTrue(split1.resp.contains("<tool_call>"), "Response must contain tool_call block")
+
+        // Scenario 2: Turn 2 Tool Response prompt formatting must suffix <think>\n
+        let toolTurn = AgentHarness.shared.formatToolResponseTurn(
+            responses: ["{\"status\": \"success\", \"result\": \"Mac Studio announced with M4 Max\"}"],
+            includeThinkSuffix: true
+        )
+        XCTAssertTrue(toolTurn.hasSuffix("<think>\n"), "AgentHarness tool response turn must suffix <think>\\n when includeThinkSuffix is true")
+        XCTAssertTrue(toolTurn.contains("<|im_start|>assistant\n<think>\n"))
+
+        // Scenario 3: Mid-stream reasoning (tokens arriving, </think> not yet emitted)
+        let midStreamRaw = "The web_search returned a single combined result set. Let me synthesize..."
+        let splitMid = ContentView.splitThinkingAndResponse(raw: midStreamRaw, promptRequestsThinking: true)
+        XCTAssertTrue(splitMid.thinkOpen, "Thinking must be open while generating before </think>")
+        XCTAssertFalse(splitMid.thinkClose, "Thinking close must be false while generating")
+        XCTAssertEqual(splitMid.think, midStreamRaw)
+        XCTAssertEqual(splitMid.resp, "", "Response must be empty while thinking is still open")
+
+        // Scenario 4: Screenshot Turn 2 completion (Prompt requested thinking, model finished reasoning, closed </think>, and gave final answer)
+        let turn2Raw = """
+        The web_search returned a single combined result set. Let me synthesize the specs.
+        </think>
+
+        Apple has announced the new Mac Studio with M4 Max and M4 Ultra chips starting at $1,999.
+        """
+        let split2 = ContentView.splitThinkingAndResponse(raw: turn2Raw, promptRequestsThinking: true)
+        XCTAssertFalse(split2.thinkOpen)
+        XCTAssertTrue(split2.thinkClose)
+        XCTAssertEqual(split2.think, "The web_search returned a single combined result set. Let me synthesize the specs.")
+        XCTAssertEqual(split2.resp, "Apple has announced the new Mac Studio with M4 Max and M4 Ultra chips starting at $1,999.")
+
+        // Scenario 5: Non-thinking model or thinking disabled (promptRequestsThinking: false, no think tags)
+        let directRaw = "Here is the direct answer without any reasoning block."
+        let splitDirect = ContentView.splitThinkingAndResponse(raw: directRaw, promptRequestsThinking: false)
+        XCTAssertFalse(splitDirect.thinkOpen)
+        XCTAssertFalse(splitDirect.thinkClose)
+        XCTAssertEqual(splitDirect.think, "")
+        XCTAssertEqual(splitDirect.resp, directRaw)
+
+        // Scenario 6: Alternative tag formats (<thought> and <|thought|>)
+        let thoughtRaw = "<thought>\nSome internal thought.\n</thought>\nFinal output."
+        let splitThought = ContentView.splitThinkingAndResponse(raw: thoughtRaw, promptRequestsThinking: false)
+        XCTAssertTrue(splitThought.thinkClose)
+        XCTAssertEqual(splitThought.think, "Some internal thought.")
+        XCTAssertEqual(splitThought.resp, "Final output.")
+    }
 }
 
 
