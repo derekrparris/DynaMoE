@@ -167,6 +167,7 @@ public final class ControlledProcessRunner {
         let errPipe = Pipe()
         process.standardOutput = outPipe
         process.standardError = errPipe
+        process.standardInput = FileHandle.nullDevice
 
         return try await withCheckedThrowingContinuation { continuation in
             var isResumed = false
