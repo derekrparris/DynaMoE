@@ -2133,10 +2133,157 @@ private func parseMarkdownTable(lines: [String], startIndex: Int) -> (table: Mar
         curIdx += 1
     }
 
-    return (MarkdownTableData(headers: headers, alignments: alignments, rows: rows), curIdx)
+    return (MarkdownTableData(
+        headers: headers.map { EmojiShortcodeResolver.resolve($0) },
+        alignments: alignments,
+        rows: rows.map { $0.map { EmojiShortcodeResolver.resolve($0) } }
+    ), curIdx)
 }
 
 // MARK: - Full Markdown Block Parsing Engine
+
+// MARK: - Emoji Shortcode Resolution
+
+/// Resolves GitHub-style emoji shortcodes (`:tada:`) to native Unicode emoji (🎉).
+/// Native emoji in message text already render via Text; this covers the shortcode
+/// form that models frequently emit. Never applied inside code blocks.
+public enum EmojiShortcodeResolver {
+    /// Precomputed regex matching `:x:` / `:word:` / `:word_word2:` / `:+1:` style tokens.
+    private static let shortcodeRegex = try? NSRegularExpression(
+        pattern: ":[a-zA-Z0-9_+\\-]{1,40}:",
+        options: []
+    )
+
+    /// Common shortcodes models actually emit. Kept deliberately focused; unknown
+    /// shortcodes are left as literal text rather than guessed.
+    private static let map: [String: String] = [
+        ":+1:": "👍", ":-1:": "👎", ":100:": "💯", ":tada:": "🎉",
+        ":rocket:": "🚀", ":fire:": "🔥", ":sparkles:": "✨", ":star:": "⭐",
+        ":star2:": "🌟", ":warning:": "⚠️", ":bulb:": "💡", ":zap:": "⚡",
+        ":bug:": "🐛", ":wrench:": "🔧", ":hammer:": "🔨", ":gear:": "⚙️",
+        ":mag:": "🔍", ":mag_right:": "🔎", ":eyes:": "👀", ":lock:": "🔒",
+        ":unlock:": "🔓", ":key:": "🔑", ":shield:": "🛡️", ":link:": "🔗",
+        ":package:": "📦", ":books:": "📚", ":book:": "📖", ":memo:": "📝",
+        ":pencil:": "✏️", ":pencil2:": "✏️", ":page_facing_up:": "📄",
+        ":clipboard:": "📋", ":pushpin:": "📌", ":paperclip:": "📎",
+        ":calendar:": "📅", ":clock:": "🕐", ":hourglass:": "⏳",
+        ":dart:": "🎯", ":goal_net:": "🥅", ":trophy:": "🏆", ":medal:": "🏅",
+        ":checkered_flag:": "🏁", ":white_check_mark:": "✅", ":check:": "☑️",
+        ":x:": "❌", ":no_entry:": "⛔", ":prohibited:": "🚫", ":stop_sign:": "🛑",
+        ":heavy_plus_sign:": "➕", ":heavy_minus_sign:": "➖",
+        ":heavy_division_sign:": "➗", ":heavy_multiplication_x:": "✖️",
+        ":question:": "❓", ":exclamation:": "❗", ":grey_question:": "❔",
+        ":information_source:": "ℹ️", ":soon:": "🔜", ":ok:": "🆗",
+        ":new:": "🆕", ":up:": "🆙", ":top:": "🔝", ":cool:": "🆒",
+        ":arrow_up:": "⬆️", ":arrow_down:": "⬇️", ":arrow_left:": "⬅️",
+        ":arrow_right:": "➡️", ":arrows_counterclockwise:": "🔄",
+        ":repeat:": "🔁", ":recycle:": "♻️", ":fast_forward:": "⏩",
+        ":rewind:": "⏪", ":play_or_pause_button:": "⏯️",
+        ":phone:": "📱", ":computer:": "💻", ":desktop_computer:": "🖥️",
+        ":keyboard:": "⌨️", ":floppy_disk:": "💾", ":cd:": "💿",
+        ":envelope:": "✉️", ":inbox_tray:": "📥", ":outbox_tray:": "📤",
+        ":thought_balloon:": "💭", ":speech_balloon:": "💬", ":smile:": "😄",
+        ":grin:": "😁", ":joy:": "😂", ":wink:": "😉", ":thinking:": "🤔",
+        ":sunglasses:": "😎", ":slightly_smiling_face:": "🙂",
+        ":neutral_face:": "😐", ":confused:": "😕", ":cry:": "😢",
+        ":scream:": "😱", ":heart:": "❤️", ":blue_heart:": "💙",
+        ":green_heart:": "💚", ":purple_heart:": "💜", ":yellow_heart:": "💛",
+        ":broken_heart:": "💔", ":seedling:": "🌱", ":herb:": "🌿",
+        ":tree:": "🌳", ":cactus:": "🌵", ":sun:": "☀️", ":moon:": "🌙",
+        ":rainbow:": "🌈", ":snowflake:": "❄️", ":umbrella:": "☔",
+        ":coffee:": "☕", ":tea:": "🍵", ":pizza:": "🍕", ":cake:": "🍰",
+        ":beer:": "🍺", ":beers:": "🍻", ":clap:": "👏", ":wave:": "👋",
+        ":pray:": "🙏", ":muscle:": "💪", ":point_up:": "☝️",
+        ":point_right:": "👉", ":point_left:": "👈", ":point_down:": "👇",
+        ":raised_hands:": "🙌", ":handshake:": "🤝", ":ok_hand:": "👌",
+        ":v:": "✌️", ":crossed_fingers:": "🤞", ":brain:": "🧠",
+        ":robot:": "🤖", ":ghost:": "👻", ":skull:": "💀", ":alien:": "👽",
+        ":crown:": "👑", ":gem:": "💎", ":moneybag:": "💰", ":chart_with_upwards_trend:": "📈",
+        ":chart_with_downwards_trend:": "📉", ":bar_chart:": "📊",
+        ":clipboard_copy:": "📋", ":test_tube:": "🧪", ":microscope:": "🔬",
+        ":telescope:": "🔭", ":satellite:": "📡", ":battery:": "🔋",
+        ":plug:": "🔌", ":bell:": "🔔", ":mega:": "📣", ":loudspeaker:": "📢",
+        ":mute:": "🔇", ":speaker:": "🔊", ":musical_note:": "🎵",
+        ":art:": "🎨", ":clapper:": "🎬", ":camera:": "📷", ":video_camera:": "📹",
+        ":film_strip:": "🎞️", ":balloon:": "🎈", ":gift:": "🎁",
+        ":cupid:": "💘", ":sparkling_heart:": "💖", ":snowman:": "⛄",
+        ":zap_face:": "⚡", ":dizzy:": "💫", ":boom:": "💥", ":collision:": "💥",
+        ":anger:": "💢", ":bomb:": "💣", ":poop:": "💩", ":hankey:": "💩",
+        ":sunny:": "☀️", ":tornado:": "🌪️", ":fog:": "🌫️",
+        ":airplane:": "✈️", ":car:": "🚗", ":ship:": "🚢", ":house:": "🏠",
+        ":office:": "🏢", ":hospital:": "🏥", ":school:": "🏫",
+        ":world_map:": "🗺️", ":globe_with_meridians:": "🌐", ":earth_americas:": "🌎",
+        ":earth_asia:": "🌏", ":earth_africa:": "🌍", ":compass:": "🧭",
+        ":apple:": "🍎", ":green_apple:": "🍏", ":lemon:": "🍋", ":banana:": "🍌",
+        ":watermelon:": "🍉", ":grapes:": "🍇", ":strawberry:": "🍓",
+        ":peach:": "🍑", ":cherry_blossom:": "🌸", ":rose:": "🌹",
+        ":hibiscus:": "🌺", ":sunflower:": "🌻", ":tulip:": "🌷",
+        ":four_leaf_clover:": "🍀", ":maple_leaf:": "🍁", ":leaves:": "🍃"
+    ]
+
+    /// Replaces `:shortcode:` tokens with their emoji equivalents. Text inside
+    /// backticks is left untouched so inline code is never mangled.
+    public static func resolve(_ text: String) -> String {
+        guard text.contains(":") else { return text }
+
+        // Split on inline code spans so shortcodes inside `...` are preserved.
+        let segments = splitPreservingInlineCode(text)
+        guard segments.count > 1 || !segments[0].isCode else {
+            return replaceOutside(text)
+        }
+        var result = ""
+        for segment in segments {
+            result += segment.isCode ? segment.text : replaceOutside(segment.text)
+        }
+        return result
+    }
+
+    private static func replaceOutside(_ text: String) -> String {
+        guard let regex = shortcodeRegex else { return text }
+        let ns = text as NSString
+        let matches = regex.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length))
+        guard !matches.isEmpty else { return text }
+        var rebuilt = ""
+        var lastEnd = 0
+        for match in matches {
+            if match.range.location > lastEnd {
+                rebuilt += ns.substring(with: NSRange(location: lastEnd, length: match.range.location - lastEnd))
+            }
+            let raw = ns.substring(with: match.range).lowercased()
+            rebuilt += map[raw] ?? ns.substring(with: match.range)
+            lastEnd = match.range.location + match.range.length
+        }
+        if lastEnd < ns.length {
+            rebuilt += ns.substring(from: lastEnd)
+        }
+        return rebuilt
+    }
+
+    private struct CodeSegment {
+        let text: String
+        let isCode: Bool
+    }
+
+    private static func splitPreservingInlineCode(_ text: String) -> [CodeSegment] {
+        var segments: [CodeSegment] = []
+        var current = ""
+        var inCode = false
+        var i = text.startIndex
+        while i < text.endIndex {
+            let ch = text[i]
+            if ch == "`" {
+                if !current.isEmpty { segments.append(CodeSegment(text: current, isCode: inCode)); current = "" }
+                inCode.toggle()
+                current.append(ch)
+            } else {
+                current.append(ch)
+            }
+            i = text.index(after: i)
+        }
+        if !current.isEmpty { segments.append(CodeSegment(text: current, isCode: inCode)) }
+        return segments
+    }
+}
 
 public func parseMarkdownBlocks(_ raw: String) -> [MarkdownBlock] {
     let normalized = normalizeMarkdownText(raw)
@@ -2151,7 +2298,7 @@ public func parseMarkdownBlocks(_ raw: String) -> [MarkdownBlock] {
 
     func flushParagraph() {
         if !paragraphLines.isEmpty {
-            let combined = paragraphLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            let combined = EmojiShortcodeResolver.resolve(paragraphLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines))
             if !combined.isEmpty {
                 blocks.append(.paragraph(text: combined))
             }
@@ -2201,7 +2348,7 @@ public func parseMarkdownBlocks(_ raw: String) -> [MarkdownBlock] {
         if trimmed.hasPrefix("#") {
             flushParagraph()
             let hashCount = trimmed.prefix(while: { $0 == "#" }).count
-            let headerText = String(trimmed.dropFirst(hashCount)).trimmingCharacters(in: .whitespaces)
+            let headerText = EmojiShortcodeResolver.resolve(String(trimmed.dropFirst(hashCount)).trimmingCharacters(in: .whitespaces))
             blocks.append(.heading(level: hashCount, text: headerText))
             i += 1
             continue
@@ -2223,7 +2370,7 @@ public func parseMarkdownBlocks(_ raw: String) -> [MarkdownBlock] {
                     break
                 }
             }
-            blocks.append(.blockquote(text: quoteLines.joined(separator: "\n")))
+            blocks.append(.blockquote(text: EmojiShortcodeResolver.resolve(quoteLines.joined(separator: "\n"))))
             continue
         }
 
@@ -2240,9 +2387,9 @@ public func parseMarkdownBlocks(_ raw: String) -> [MarkdownBlock] {
             flushParagraph()
             let itemText: String
             if trimmed.hasPrefix("• ") {
-                itemText = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+                itemText = EmojiShortcodeResolver.resolve(String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces))
             } else {
-                itemText = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+                itemText = EmojiShortcodeResolver.resolve(String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces))
             }
             blocks.append(.listItem(number: nil, text: itemText))
             i += 1
@@ -2252,7 +2399,7 @@ public func parseMarkdownBlocks(_ raw: String) -> [MarkdownBlock] {
         // 7. Numbered list item
         if let match = trimmed.range(of: #"^\d+\.\s+"#, options: .regularExpression) {
             flushParagraph()
-            let itemText = String(trimmed[match.upperBound...]).trimmingCharacters(in: .whitespaces)
+            let itemText = EmojiShortcodeResolver.resolve(String(trimmed[match.upperBound...]).trimmingCharacters(in: .whitespaces))
             let numStr = String(trimmed[..<match.upperBound]).trimmingCharacters(in: .whitespaces.union(CharacterSet(charactersIn: ".")))
             blocks.append(.listItem(number: Int(numStr), text: itemText))
             i += 1

@@ -9411,22 +9411,29 @@ struct ContentView: View {
                         firstTokenTimestamp = CFAbsoluteTimeGetCurrent()
                     }
 
-                    // 6. Incremental Stream Token Decoding (O(1) per step)
-                    let deltaText: String
-                    if generatedTokenIds.count > 1 {
-                        let slice = Array(generatedTokenIds.suffix(2))
-                        let sliceText = (try? tokenizer.decode(ids: slice)) ?? ""
-                        let prev1 = (try? tokenizer.decode(ids: [generatedTokenIds[generatedTokenIds.count - 2]])) ?? ""
-                        if sliceText.hasPrefix(prev1) {
-                            deltaText = String(sliceText.dropFirst(prev1.count))
-                        } else {
-                            deltaText = (try? tokenizer.decode(ids: [nextToken])) ?? ""
-                        }
-                    } else {
-                        deltaText = (try? tokenizer.decode(ids: [nextToken])) ?? ""
+                    // 6. Incremental Stream Token Decoding (UTF-8 safe)
+                    // Re-decoding the full id sequence each step guarantees multi-byte
+                    // characters (e.g. 4-byte astral emoji like 🚀) split across BPE token
+                    // boundaries are assembled from complete bytes. A partial sequence
+                    // lossily decodes to U+FFFD; when the completing token arrives the
+                    // full decode changes that character, so we adopt the new text
+                    // wholesale (the UI re-renders the full string each frame) instead of
+                    // freezing on a stale prefix. A trailing U+FFFD is held back one frame
+                    // so the placeholder never flashes mid-stream.
+                    let fullDecoded = (try? tokenizer.decode(ids: generatedTokenIds)) ?? ""
+                    var emittable = fullDecoded
+                    if emittable.hasSuffix("\u{FFFD}") {
+                        emittable = String(emittable.dropLast())
                     }
-                    accumulatedDecodedText += deltaText
-
+                    let deltaText: String
+                    if emittable.hasPrefix(accumulatedDecodedText) {
+                        deltaText = String(emittable.dropFirst(accumulatedDecodedText.count))
+                    } else {
+                        // Earlier partial bytes completed into a different character;
+                        // the full-text re-render repairs it retroactively.
+                        deltaText = ""
+                    }
+                    accumulatedDecodedText = emittable
                     if deltaText.contains("<|im_end|>") || deltaText.contains("<|endoftext|>") || deltaText.contains("<|role_end|>") {
                         shouldBreak = true
                         break
