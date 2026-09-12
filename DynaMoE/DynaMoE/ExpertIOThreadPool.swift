@@ -9,6 +9,7 @@
 
 import Foundation
 import Metal
+import Darwin
 
 public struct ExpertPreadTask {
     public var fd: Int32
@@ -32,7 +33,7 @@ public final class ExpertIOThreadPool {
     public static let defaultNumThreads: Int = 8
 
     // Cached open file descriptors: layerIndex -> open fd
-    private var layerFDs: [Int: Int32] = [:]
+    public internal(set) var layerFDs: [Int: Int32] = [:]
     private var layerFDLock = NSRecursiveLock()
 
     private init() {}
@@ -81,7 +82,7 @@ public final class ExpertIOThreadPool {
 
         let fd = open(filePath, O_RDONLY | O_CLOEXEC)
         if fd >= 0 {
-            // Allows OS page cache to be used without aggressive prefetching
+            // Enable OS page cache for these file descriptors
             _ = fcntl(fd, F_NOCACHE, 0)
             layerFDs[layerIndex] = fd
             return fd

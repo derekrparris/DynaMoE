@@ -136,9 +136,16 @@ final class KVCacheManager {
 
         let oldK = self.kCacheBuffer
         let oldV = self.vCacheBuffer
-        let needsRealloc = (kCacheBuffer == nil || vCacheBuffer == nil || allocatedKvBytes < requiredKvBytes)
+        // Lazy commit: a fresh MTLBuffer is zero-filled by the OS on demand, so pages the
+        // model never touches are never committed to RAM. Releasing and reallocating is
+        // far cheaper than memset-ing every page, which commits them all up front and
+        // invites eviction + KV-cache paging thrash at long context.
+        let forceFreshAlloc = (preservePrefixCount == 0)
+        let needsRealloc = forceFreshAlloc || (kCacheBuffer == nil || vCacheBuffer == nil || allocatedKvBytes < requiredKvBytes)
 
         if needsRealloc {
+            self.kCacheBuffer = nil
+            self.vCacheBuffer = nil
             self.kCacheBuffer = device.makeBuffer(length: kBytes, options: .storageModeShared)
             self.vCacheBuffer = device.makeBuffer(length: vBytes, options: .storageModeShared)
             self.allocatedKvBytes = requiredKvBytes
@@ -177,8 +184,12 @@ final class KVCacheManager {
                 }
             }
         } else {
-            if let kBuf = kCacheBuffer { memset(kBuf.contents(), 0, min(kBytes, kBuf.length)) }
-            if let vBuf = vCacheBuffer { memset(vBuf.contents(), 0, min(vBytes, vBuf.length)) }
+            // Freshly allocated shared MTLBuffers are zero-filled by the VM on demand;
+            // no memset needed. Only memset when reusing a buffer that held prior data.
+            if !forceFreshAlloc, !needsRealloc {
+                if let kBuf = kCacheBuffer { memset(kBuf.contents(), 0, min(kBytes, kBuf.length)) }
+                if let vBuf = vCacheBuffer { memset(vBuf.contents(), 0, min(vBytes, vBuf.length)) }
+            }
         }
 
         if precision == .fp8 {
@@ -324,7 +335,7 @@ final class WorkingSetManager {
     private var prefetchedKeys: Set<ExpertKey> = []
     private var accessOrder: [ExpertKey: UInt64] = [:]
     private var accessCounter: UInt64 = 0
-    private let prefetchQueue = DispatchQueue(label: "com.dynamoe.prefetch", qos: .userInitiated)
+    private let prefetchQueue = DispatchQueue(label: "com.dynamoe.prefetch", qos: .userInitiated, attributes: .concurrent)
     private let evictionQueue = DispatchQueue(label: "com.dynamoe.eviction", qos: .utility)
     private var prefetchedBackboneLayers: Set<UInt32> = []
     public let transitionTracker = ExpertTransitionTracker()
@@ -406,20 +417,17 @@ final class WorkingSetManager {
             DispatchQueue.concurrentPerform(iterations: slices.count) { i in
                 let slice = slices[i]
                 guard let fd = fds[slice.shardIndex] else { return }
+                guard let buf = shardBuffers[slice.shardIndex] else { return }
                 let len = Int(slice.length)
                 let offset = off_t(slice.offset)
                 guard len > 0 else { return }
 
-                // 1. Issue kernel readahead advisory for the entire contiguous slice
-                var radv = radvisory(ra_offset: offset, ra_count: Int32(len))
-                _ = fcntl(fd, F_RDADVISE, &radv)
-
-                // 2. Synchronously pread in 256KB chunks to populate the macOS Unified Buffer Cache
-                var scratch = [UInt8](repeating: 0, count: min(len, 262144))
+                // Directly pread from file into MTLBuffer contents, eliminating scratch copy
+                let bufPtr = buf.contents().advanced(by: Int(slice.offset))
                 var bytesRead = 0
                 while bytesRead < len {
-                    let toRead = min(len - bytesRead, scratch.count)
-                    let n = pread(fd, &scratch, toRead, offset + off_t(bytesRead))
+                    let toRead = min(len - bytesRead, 262144)
+                    let n = pread(fd, bufPtr.advanced(by: bytesRead), toRead, offset + off_t(bytesRead))
                     if n <= 0 { break }
                     bytesRead += n
                 }
@@ -535,23 +543,20 @@ final class WorkingSetManager {
             guard len > 0 else { return }
 
             if let fd = fds[shard.index] {
-                // 1. Advise kernel of full sequential readahead
-                var radv = radvisory(ra_offset: 0, ra_count: Int32(len))
-                _ = fcntl(fd, F_RDADVISE, &radv)
-
-                // 2. Coordinated parallel pread DMA transfers in 1 MB blocks
-                let chunkSize = min(len, 1048576)
-                var scratch = [UInt8](repeating: 0, count: chunkSize)
-                var bytesRead = 0
-                while bytesRead < len {
-                    let toRead = min(len - bytesRead, chunkSize)
-                    let n = pread(fd, &scratch, toRead, off_t(bytesRead))
-                    if n <= 0 { break }
-                    bytesRead += n
+                // Directly pread from file into MTLBuffer contents, eliminating scratch copy
+                if let buf = shardBuffers[shard.index] {
+                    let bufPtr = buf.contents()
+                    var bytesRead = 0
+                    while bytesRead < len {
+                        let toRead = min(len - bytesRead, 262144)
+                        let n = pread(fd, bufPtr.advanced(by: bytesRead), toRead, off_t(bytesRead))
+                        if n <= 0 { break }
+                        bytesRead += n
+                    }
                 }
             }
 
-            // 3. Stride touch through mmap MTLBuffer to map hardware page tables directly
+            // Stride touch through mmap MTLBuffer to map hardware page tables directly
             if let buf = shardBuffers[shard.index] {
                 let rawPtr = buf.contents()
                 posix_madvise(rawPtr, len, POSIX_MADV_WILLNEED)
@@ -726,14 +731,10 @@ final class WorkingSetManager {
         }
         lock.unlock()
 
-        if !demandSlices.isEmpty {
-            let t0 = CFAbsoluteTimeGetCurrent()
-            primeSlices(demandSlices, shardBuffers: shardBuffers)
-            let lat = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0
-            lock.lock()
-            lastPagingLatencyMs = lat
-            lock.unlock()
-        }
+        // primeSlices intentionally bypassed: ExpertIOThreadPool.dispatchSync in the
+        // forward pass handles the same pread directly into staging buffers,
+        // making touchAndEvict's duplicate read redundant.
+        // Cache tracking and LRU state are still updated above.
     }
 
     func setBudgetMode(mode: MemoryBudgetMode, shardBuffers: [UInt32: MTLBuffer], summary: ModelSummary) {
@@ -4508,6 +4509,11 @@ struct ContentView: View {
             // Helper for Single Token Forward Pass
             var previousLayerActiveExperts: [Int: [Int]] = [:]
             func runTokenForward(tokenId: UInt32, step: UInt32, computeLogits: Bool, wait: Bool = true) -> Bool {
+                let tTokenStart = CFAbsoluteTimeGetCurrent()
+                var diagRouterGpuMs: Double = 0
+                var diagIoMs: Double = 0
+                var diagMoeGpuMs: Double = 0
+                var diagOtherMs: Double = 0
                 let singleTokenPtr = singleTokenBuffer.contents().bindMemory(to: UInt32.self, capacity: 1)
                 singleTokenPtr[0] = tokenId
                 var hDim = hiddenDim
@@ -5628,8 +5634,10 @@ struct ContentView: View {
                             }
 
                             layerEnc1.endEncoding()
+                            let tRouterGpuStart = CFAbsoluteTimeGetCurrent()
                             activeCmd.commit()
                             activeCmd.waitUntilCompleted()
+                            diagRouterGpuMs += (CFAbsoluteTimeGetCurrent() - tRouterGpuStart) * 1000.0
                             if let err = activeCmd.error {
                                 print("❌ [METAL ERROR] activeCmd failed at layer \(l): \(err)")
                                 return false
@@ -5703,6 +5711,7 @@ struct ContentView: View {
                                 let isQuantizedAffine = (compGateB != nil || compGateW?.name.contains("Q4") == true || compGateW?.name.contains("Q8") == true || compGateW?.dtype.contains("Q4") == true || compGateW?.dtype.contains("Q8") == true || (compGateS != nil && !isFP8Layout))
 
                                 // 1. Fast parallel pread the active experts directly into unified staging MTLBuffer
+                                let tIoStart = CFAbsoluteTimeGetCurrent()
                                 var tasks: [ExpertPreadTask] = []
                                 let rawStagingPtr = expertStagingBuffer.contents()
                                 for (slot, exp) in activeExperts.enumerated() {
@@ -5711,6 +5720,9 @@ struct ContentView: View {
                                     tasks.append(ExpertPreadTask(fd: fd, dst: dst, offset: offset, size: expertSize))
                                 }
                                 ExpertIOThreadPool.shared.dispatchSync(tasks: &tasks)
+                                let tIoElapsed = (CFAbsoluteTimeGetCurrent() - tIoStart) * 1000.0
+                                diagIoMs += tIoElapsed
+                                print("[DIAG] Layer \(l): IO=\(String(format: "%.1f", tIoElapsed))ms")
 
                                 guard let moeCmd = commandQueue.makeCommandBuffer(),
                                       let layerEnc2 = moeCmd.makeComputeCommandEncoder() else { return false }
@@ -5951,8 +5963,10 @@ struct ContentView: View {
                                 }
 
                                 layerEnc2.endEncoding()
+                                let tMoeGpuStart = CFAbsoluteTimeGetCurrent()
                                 moeCmd.commit()
                                 moeCmd.waitUntilCompleted()
+                                diagMoeGpuMs += (CFAbsoluteTimeGetCurrent() - tMoeGpuStart) * 1000.0
                                 if let err = moeCmd.error {
                                     print("❌ [METAL ERROR] moeCmd (packed) failed at layer \(l): \(err)")
                                     return false
@@ -6055,8 +6069,10 @@ struct ContentView: View {
                                 }
 
                                 layerEnc2.endEncoding()
+                                let tMoeGpuStart2 = CFAbsoluteTimeGetCurrent()
                                 moeCmd.commit()
                                 moeCmd.waitUntilCompleted()
+                                diagMoeGpuMs += (CFAbsoluteTimeGetCurrent() - tMoeGpuStart2) * 1000.0
                                 if let err = moeCmd.error {
                                     print("❌ [METAL ERROR] moeCmd (unpacked) failed at layer \(l): \(err)")
                                     return false
@@ -6201,6 +6217,12 @@ struct ContentView: View {
                         print("❌ [METAL ERROR] activeCmd (decode) failed: \(err)")
                         return false
                     }
+                }
+
+                if computeLogits {
+                    let tTokenElapsed = (CFAbsoluteTimeGetCurrent() - tTokenStart) * 1000.0
+                    diagOtherMs = tTokenElapsed - diagRouterGpuMs - diagIoMs - diagMoeGpuMs
+                    print("[DIAG] Token \(step) total=\(String(format: "%.1f", tTokenElapsed))ms | RouterGPU=\(String(format: "%.1f", diagRouterGpuMs))ms | IO=\(String(format: "%.1f", diagIoMs))ms | MoEGPU=\(String(format: "%.1f", diagMoeGpuMs))ms | Other=\(String(format: "%.1f", diagOtherMs))ms")
                 }
 
                 return true
