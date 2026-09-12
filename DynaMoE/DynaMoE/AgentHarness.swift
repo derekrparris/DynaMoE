@@ -1561,7 +1561,7 @@ public final class CompleteTool: AgentTool {
 public final class ToolDiscoverTool: AgentTool {
     public let definition = ToolDefinition(
         name: "tools_discover",
-        description: "Lists additional tools that are installed but not currently loaded, grouped by category with estimated token cost. Call this to inspect what other capabilities are available, then use tools_load to activate one.",
+        description: "Lists additional tools that are installed but not currently loaded, grouped by category with estimated token cost. Call this to inspect what other capabilities are available, then use tools_load (with a batched 'names' array) to activate the ones a task needs.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
@@ -1635,57 +1635,95 @@ public final class ToolDiscoverTool: AgentTool {
 public final class ToolLoadTool: AgentTool {
     public let definition = ToolDefinition(
         name: "tools_load",
-        description: "Loads an installed tool's full schema into context so it can be called directly. Use tools_discover to list available tools first. Idempotent: loading an already-loaded tool is a no-op success.",
+        description: "Loads installed tools' full schemas into context so they can be called directly. Use tools_discover to list available tools first. Accepts a single 'name' or a 'names' array. Idempotent: loading an already-loaded tool is a no-op success. Prefer loading all tools needed for a task in ONE call (a single 'names' array), since each load event rewrites the tool block and triggers a context re-prefill.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
                 "name": [
                     "type": "string",
-                    "description": "Exact name of the tool to load (e.g. 'web_search', 'git_diff')."
+                    "description": "Exact name of a single tool to load (e.g. 'web_search', 'git_diff')."
+                ],
+                "names": [
+                    "type": "array",
+                    "items": ["type": "string"],
+                    "description": "Batch load: exact names of multiple tools to load in one call. Preferred over repeated single-name calls."
                 ]
             ]),
-            "required": AnyCodable(["name"])
+            "required": AnyCodable([])
         ]
     )
 
     public func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
-        guard let rawName = arguments["name"] as? String,
-              let name = (rawName as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !name.isEmpty else {
-            let err = "Missing or empty 'name' parameter in tools_load. Run tools_discover to list available tools."
-            return (AgentHarness.toolErrorJSON(tool: "tools_load", error: err), nil, err, false)
-        }
-
         let harness = AgentHarness.shared
-        if harness.loadedTools[name] != nil {
-            let msg = "Tool '\(name)' is already loaded."
-            let res = AgentHarness.toolSuccessJSON(tool: "tools_load", data: [
-                "tool_name": name,
-                "registration": false,
-                "already_loaded": true,
-                "loaded_count": harness.loadedTools.count,
-                "message": msg
-            ])
-            return (res, msg, nil, false)
-        }
 
-        do {
-            let definition = try harness.loadTool(named: name)
-            let schemaData = try? JSONEncoder().encode(definition)
-            let schemaString = schemaData.flatMap { String(data: $0, encoding: .utf8) } ?? ""
-            let msg = "Tool '\(name)' loaded. You may now call it directly using the provided schema."
-            let res = AgentHarness.toolSuccessJSON(tool: "tools_load", data: [
-                "tool_name": name,
-                "registration": true,
-                "schema": schemaString,
-                "loaded_count": harness.loadedTools.count,
-                "message": msg
-            ])
-            return (res, msg, nil, false)
-        } catch {
-            let err = "Failed to load tool '\(name)': \(error.localizedDescription)"
+        // Resolve batch ('names') or single ('name') form.
+        var names: [String] = []
+        if let batch = arguments["names"] as? [String] {
+            names = batch.compactMap { ($0 as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        }
+        if let single = arguments["name"] as? String {
+            let trimmed = single.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { names.append(trimmed) }
+        }
+        if names.isEmpty {
+            let err = "Missing 'name' or 'names' parameter in tools_load. Run tools_discover to list available tools."
             return (AgentHarness.toolErrorJSON(tool: "tools_load", error: err), nil, err, false)
         }
+
+        var loadedResults: [[String: Any]] = []
+        var schemas: [String: String] = [:]
+        var errors: [String] = []
+        for name in names {
+            if harness.loadedTools[name] != nil {
+                loadedResults.append([
+                    "tool_name": name,
+                    "registration": false,
+                    "already_loaded": true
+                ])
+                continue
+            }
+            do {
+                let definition = try harness.loadTool(named: name)
+                let schemaData = try? JSONEncoder().encode(definition)
+                schemas[name] = schemaData.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                loadedResults.append([
+                    "tool_name": name,
+                    "registration": true,
+                    "already_loaded": false
+                ])
+            } catch {
+                errors.append("Failed to load tool '\(name)': \(error.localizedDescription)")
+            }
+        }
+
+        if loadedResults.isEmpty {
+            let err = errors.joined(separator: "; ")
+            return (AgentHarness.toolErrorJSON(tool: "tools_load", error: err), nil, err, false)
+        }
+
+        let newlyLoaded = loadedResults.filter { ($0["registration"] as? Bool) == true }.map { $0["tool_name"] as? String ?? "" }
+        let msg: String
+        if newlyLoaded.count == 1, let only = newlyLoaded.first {
+            msg = "Tool '\(only)' loaded. You may now call it directly using the provided schema."
+        } else if newlyLoaded.count > 1 {
+            msg = "Tools \(newlyLoaded.map { "'\($0)'" }.joined(separator: ", ")) loaded. You may now call them directly using the provided schemas."
+        } else {
+            msg = "All requested tools were already loaded."
+        }
+
+        var data: [String: Any] = [
+            "tools": loadedResults,
+            "loaded_count": harness.loadedTools.count,
+            "message": msg
+        ]
+        if !schemas.isEmpty {
+            data["schemas"] = schemas
+        }
+        if !errors.isEmpty {
+            data["errors"] = errors
+        }
+        let res = AgentHarness.toolSuccessJSON(tool: "tools_load", data: data)
+        return (res, msg, errors.isEmpty ? nil : errors.joined(separator: "; "), false)
     }
 }
 
@@ -1693,7 +1731,7 @@ public final class ToolLoadTool: AgentTool {
 public final class ToolUnloadTool: AgentTool {
     public let definition = ToolDefinition(
         name: "tools_unload",
-        description: "Removes a loaded tool's schema from context to free prompt tokens. Fundamental tools (shell_run, file_read, file_edit, file_write, complete, tools_*) cannot be unloaded. Use tools_load to re-enable a tool later.",
+        description: "Removes a loaded tool's schema from context to free prompt tokens. Fundamental tools (shell_run, complete, tools_*) cannot be unloaded. Use sparingly: like tools_load, unloading rewrites the tool block and triggers a context re-prefill, so prefer unloading at task boundaries rather than between individual steps. Use tools_load to re-enable a tool later.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
@@ -2523,15 +2561,17 @@ public final class AgentHarness {
     }
 
     /// Tools seeded into the prompt on startup — the "fundamental" set.
+    /// Kept minimal: every schema here costs prefill tokens on every turn, and each
+    /// load/unload event invalidates the KV-cache prefix (full re-prefill). The model
+    /// discovers and loads everything else on demand via tools_discover/tools_load.
     public static let coreLoadedToolNames: Set<String> = [
-        "shell_run", "file_read", "file_edit", "file_write",
-        "find_files", "grep_search", "complete",
+        "shell_run", "complete",
         "tools_discover", "tools_load", "tools_unload"
     ]
 
     /// Tools the model may never unload through `tools_unload`.
     public static let nonUnloadableToolNames: Set<String> = [
-        "shell_run", "file_read", "file_edit", "file_write", "complete",
+        "shell_run", "complete",
         "tools_discover", "tools_load", "tools_unload"
     ]
 
@@ -2712,8 +2752,7 @@ public final class AgentHarness {
 
             To discover what else you can do:
             - Call `tools_discover` to list unloaded tools grouped by category (with estimated token cost).
-            - Call `tools_load` with the exact tool name to register its schema into context, after which you may call it directly.
-            - Call `tools_unload` to free context when a loaded tool is no longer needed.
+            - Call `tools_load` with a `names` array to register multiple tool schemas into context in ONE call. IMPORTANT: every load/unload rewrites the tool block and triggers a re-prefill of the conversation, so decide up front which tools a task needs and load them all in a single batched call. Avoid loading tools one per step or unloading mid-task.
 
             """
         }
