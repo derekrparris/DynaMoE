@@ -350,7 +350,16 @@ fn try_load_flash_moe(search_path: &Path) -> Option<(Vec<ShardHandle>, Vec<Tenso
 
             // Shard 0: model_weights.bin
             let file0 = File::open(&weights_bin_path).ok()?;
-            let mmap0 = unsafe { MmapOptions::new().map(&file0) }.ok()?;
+            let mmap0 = unsafe { MmapOptions::new().map(&file0) };
+            if mmap0.is_err() {
+                eprintln!(
+                    "⚠️ [FlashMoE] Failed to mmap {} ({} bytes): {:?}. Falling back to raw safetensors load — expert streaming and packed offsets will be unavailable.",
+                    weights_bin_path.display(),
+                    file0.metadata().map(|m| m.len()).unwrap_or(0),
+                    mmap0.as_ref().err()
+                );
+            }
+            let mmap0 = mmap0.ok()?;
             shard_handles.push(ShardHandle {
                 filename: "model_weights.bin".to_string(),
                 mmap: mmap0,

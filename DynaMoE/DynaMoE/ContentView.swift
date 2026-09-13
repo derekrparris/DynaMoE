@@ -4001,7 +4001,15 @@ struct ContentView: View {
         let isAgentSession = (sessionId != nil) ? (self.sessions.first(where: { $0.id == sessionId })?.isAgentToolsEnabled ?? self.defaultAgentToolsEnabled) : self.defaultAgentToolsEnabled
         let minSeq = isAgentSession ? 8192 : 2048
         let neededSeqLen = max(minSeq, min(32768, promptTokenIds.count + maxTokens + 512))
-        let kvPrec = self.kvCachePrecision
+        var kvPrec = self.kvCachePrecision
+        if modelConfig?.isLingModel == true && kvPrec != .fp16 {
+            // Ling MLA KV store/decode kernels are F16-only and their byte-offset math
+            // hardcodes MemoryLayout<UInt16>.stride (see the MLA branch in runTokenForward).
+            // A lower-precision allocation addresses half the bytes, so the slot-3 offset
+            // runs exactly one buffer past the end -> Metal setBuffer assertion at layer 15.
+            print("⚠️ [KVCACHE] Ling MLA models require FP16 KV cache — overriding \(kvPrec) -> fp16")
+            kvPrec = .fp16
+        }
         let hasRecurrence = (modelConfig?.isLingModel == true || modelConfig?.hasLinearRecurrence == true || cachedLayers.contains { $0.attentionType == .linearAttention })
         let prefixTokensReused = hasRecurrence ? 0 : PrefixCacheManager.shared.findCommonPrefix(promptTokenIds: promptTokenIds, sessionId: sessionId)
         KVCacheManager.shared.reset(
@@ -4824,6 +4832,10 @@ struct ContentView: View {
                             let vStride = isLingMla ? 2048 : 4096
                             let kLayerByteOffset = slot * maxSeq * kStride * MemoryLayout<UInt16>.stride
                             let vLayerByteOffset = slot * maxSeq * vStride * MemoryLayout<UInt16>.stride
+                            if let kvLenCheck = KVCacheManager.shared.kCacheBuffer, kLayerByteOffset + maxSeq * kStride * 2 > kvLenCheck.length {
+                                print("❌ [KVCACHE] MLA K-cache overflow: layer \(l) slot \(slot) offset \(kLayerByteOffset) + span \(maxSeq * kStride * 2) > buffer \(kvLenCheck.length) bytes | maxSeq=\(maxSeq) kStride=\(kStride) precision=\(KVCacheManager.shared.activePrecision)")
+                                return false
+                            }
                             if let storePipe = storeMlaKvCacheF16Pipeline,
                                let kCache = KVCacheManager.shared.kCacheBuffer,
                                let vCache = KVCacheManager.shared.vCacheBuffer {
@@ -9273,6 +9285,7 @@ struct ContentView: View {
                                 runTokenForward(tokenId: pTok, step: UInt32(startPos + idx), computeLogits: false)
                             }
                             if !stepOk {
+                                print("❌ [PREFILL] Token \(idx + 1)/\(totalTokens) (id=\(pTok), step=\(startPos + idx)) forward pass failed — see prior diagnostics for the failing layer/buffer.")
                                 prefillSuccess = false
                                 break
                             }

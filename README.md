@@ -2,13 +2,21 @@
 
 *Dynamic, SSD-Streamed Mixture-of-Experts, Hybrid Attention, JetSpec Speculative Tree Acceleration, and Native Autonomous Coding Agent on Apple Silicon.*
 
-DynaMoE is a high-performance native macOS application, local inference engine, and autonomous developer assistant. Engineered specifically for Apple Silicon's Unified Memory Architecture (UMA), DynaMoE runs massive Mixture-of-Experts (MoE), cutting-edge hybrid attention architectures (Qwen 3.8 Flash Next), and dense language models that exceed physical system RAM by dynamically memory-mapping and streaming weights directly from high-speed NVMe storage to the GPU.
+DynaMoE is a high-performance native macOS application, local inference engine, and autonomous developer assistant.
+
+Engineered specifically for Apple Silicon's Unified Memory Architecture (UMA), DynaMoE runs massive Mixture-of-Experts (MoE) and cutting-edge hybrid attention architectures that exceed physical system RAM by dynamically memory-mapping and streaming weights directly from high-speed NVMe storage to the GPU. It also runs dense language models.
 
 ---
 
 ## Inspiration & Acknowledgements
 
-This project was undertaken purely for the joy of exploration by someone who is not a software engineer. Just someone who is enjoying learning with the help of AI. I'm steering the ship, and Gemini (3.6, 3.7 and 3.8) have been implementing the ideas and pointing me in the right direction.
+This project was undertaken purely for the joy of exploration by someone who is not a software engineer. Just someone who is enjoying learning with the help of AI.
+
+The following AI models have been used to code DynaMoE:
+* Gemini 3.6 Thinking, 3.7 Flash and 3.8 Flash
+* Ling 3.0 Flash Fin Free (Opencode)
+* GLM 5.3 Flash
+* Big Pickle (Opencode)
 
 Special thanks and acknowledgement to the open-source projects and research that inspired and influenced this architecture:
 * **JetSpec** (Hao AI Lab / UC San Diego — [arXiv:2606.18394](https://arxiv.org/html/2606.18394v2)): Causal parallel tree drafting and tree-causal attention verification for breakthrough speculative decoding throughput.
@@ -23,16 +31,16 @@ Special thanks and acknowledgement to the open-source projects and research that
 
 DynaMoE supports sparse Mixture-of-Experts, hybrid recurrent SSM/attention architectures, and dense autoregressive transformers with automatic model topology detection.
 
-**Status Update:** Both **Ornith 1.5 9B Dense** and **Qwen 3.8 Flash Next FP8 MoE** are fully operational with live prompt prefill, high-speed autoregressive decoding, NVMe SSD streaming, dynamic working set memory budgets, reasoning/thinking chains, task-specific generation profiles ("Coder" & "Assistant"), and an autonomous multi-agent developer harness.
+**The following models have been tested:**
+
+* **Ornith 1.5 9B Dense**
+* **Ornith 1.5 35B A3B**
+* **Ling 3.0 Tiny**
+* **Qwen 3.8 Flash Next FP8 MoE**
 
 **Note:** I don't currently have enough disk space to fully repack Qwen3.8 Flash Next to test streaming optimizations. If anyone has the room to test speeds with full repacking, please do let me know. I will be able to conduct further tests once I get a new computer :)
 
-| Model / Family | Parameters | Active Parameters | Architecture Type | Quantization & Precision | Context Window |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Ornith 1.5 9B Dense** | 9B Dense | 9B | Hybrid GatedDeltaNet + GQA | 8-Bit Affine / BF16 / FP16 | 131,072 |
-| **Qwen 3.8 Flash Next** | ~180B (512 Experts + 51B PLE) | ~6B (10 Active + Shared) | Hybrid GatedDeltaNet + QSA Sparse Attention + Gated Residuals | FP8 (MXFP8) / BF16 / NVFP4 | 131,072 / 262,144 |
-| **Ornith 1.5 35B A3B** | 35B (256 Experts) | ~3B (8 Active + Shared) | Hybrid GatedDeltaNet + GQA | Q4 Affine / Q8 / BF16 / FP8 (MXFP8) | 262,144 (Native) / 1M+ (YaRN) |
-| **Standard Dense LLMs** | 3B – 32B | Full Layer Width | Dense Transformer (LLaMA / Qwen 2.5 / Nanbeige) | Q4 / Q8 / BF16 / FP16 | Model Default |
+---
 
 ### Key Architectural Strengths:
 * **Hybrid Recurrent SSM + Sparse/Full Attention**: GatedDeltaNet linear recurrent attention layers ($O(1)$ constant-memory recurrent state updates) with Sigmoid output gating interleaved 3:1 with Qwen Sparse Attention (QSA) or Grouped-Query Attention (GQA).
