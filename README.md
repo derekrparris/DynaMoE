@@ -33,7 +33,6 @@ DynaMoE supports sparse Mixture-of-Experts, hybrid recurrent SSM/attention archi
 
 **The following models have been tested:**
 
-* **Ornith 1.5 9B Dense**
 * **Ornith 1.5 35B A3B**
 * **Ling 3.0 Tiny**
 * **Qwen 3.8 Flash Next FP8 MoE**
@@ -345,6 +344,8 @@ xcodebuild test -scheme DynaMoE -destination 'platform=macOS' \
 
 ## Getting Started
 
+If you're interested in building and running the app in your own development environment:
+
 ### Prerequisites
 * macOS 14.0+ (Sonoma or Sequoia recommended)
 * Apple Silicon Mac (M1/M2/M3/M4/M5/M6, 16 GB+ Unified Memory recommended)
@@ -368,6 +369,11 @@ xcodebuild test -scheme DynaMoE -destination 'platform=macOS' \
 4. Press **Cmd + R** to build and launch DynaMoE.
 5. On startup, DynaMoE automatically scans your `~/.cache/huggingface/hub` directory for downloaded models. Open **Settings (⌘,) $\to$ Models** to select your default model, or select any discovered model directly from the chat dropdown!
 6. For detailed explanations of every setting, sampling formulas, and hardware presets, consult the [**DynaMoE Settings & User Guide**](SETTINGS_GUIDE.md) or open it directly in the app via **Help $\to$ DynaMoE Help & Settings Guide** (`⌘?`).
+
+If you want to help test beta releases of the app, check the releases section. use the in-app documentation for guidance on using the various settings.
+
+Additional things to be aware of:
+
 
 ---
 
