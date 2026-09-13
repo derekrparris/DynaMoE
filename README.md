@@ -275,22 +275,22 @@ flowchart TD
 - [x] **Performance Benchmarking & Validation**: Verified on Apple Silicon with Ornith 1.5 9B OptiQ-4bit (1.182s) and Qwen 3.8 Flash Next under SSD streaming (5.968s).
 
 ### Phase 6: Developer Agent & Multi-Agent Swarm 🚀 *(Completed & Fully Verified)*
-- [x] **Option 1: Semantic Codebase Indexing & Metal Vector Search (Local RAG)**:
+- [x] **Semantic Codebase Indexing & Metal Vector Search (Local RAG)**:
   - Background sentence embedding generation via `NaturalLanguage` on detached threads (`Task.detached`).
   - Metal GPU dot-product cosine similarity kernel (`vector_cosine_similarity_fp32`) for sub-millisecond ranking across large codebases.
   - Okapi BM25 inverted keyword index with snake_case/camelCase identifier tokenization.
   - Reciprocal Rank Fusion ($k=60$) combining semantic dense matches and exact keyword hits into formatted context.
   - Non-blocking filesystem watcher (`CodebaseFileWatcher`) with strict system root path protection.
-- [x] **Option 2: Subagent & Multi-Agent Delegation Harness (`spawn_subagent`)**:
+- [x] **Subagent & Multi-Agent Delegation Harness (`spawn_subagent`)**:
   - `SubagentManager` coordinator managing isolated context windows for child agents.
   - Specialized role archetypes: `Codebase Researcher`, `Test Runner`, `Shader Optimizer`, and `Custom Agent`.
   - Four agent delegation tools: `spawn_subagent`, `get_subagent_status`, `send_subagent_message`, `list_subagents`.
   - Slide-over Task Manager UI drawer (`SubagentDrawerView`) with live badge counters and step transcripts.
-- [x] **Option 3: Deep Developer Tooling & Compiler Self-Healing Feedback Loop**:
+- [x] **Deep Developer Tooling & Compiler Self-Healing Feedback Loop**:
   - In-process Git version control (`git_status`, `git_diff`, `git_commit`) with strict safety rails blocking empty commits and dangerous flags.
   - AST Symbol Intelligence Engine (`find_symbol_definition`, `find_symbol_references`) resolving definitions across Swift, Metal, Rust, Python, and C/C++.
   - Compiler Self-Healing Loop (`LintDiagnosticsEngine`): Runs `swiftc -parse` and `metal -fsyntax-only` upon file edits to detect syntax errors and automatically re-prompt the model with diagnostic hints for instant repair.
-- [x] **Option 4: Live End-to-End Model Dogfooding & KV Prefix Pinning**:
+- [x] **Live End-to-End Model Dogfooding & KV Prefix Pinning**:
   - Thread-safe prompt prefix cache (`PrefixCacheManager`) detecting common token prefixes across turns.
   - Prefix-aware Metal GQA decode/prefill kernels using bit-31 delta sequence offsets (`0x80000000 | startPos`), delivering $2.0\times - 3.5\times$ TTFT speedup.
   - Multi-turn stress test runner (`ModelDogfoodBenchmarkRunner`) exercising real Git operations, symbol queries, Turbo Mode, and compiler self-healing against loaded on-device MoE checkpoints.
@@ -298,11 +298,9 @@ flowchart TD
 
 ---
 
-### Phase 7: Local Server & Ecosystem Integration ⏳ *(In Progress)*
-- [ ] Embedded OpenAI-compatible HTTP server (`/v1/chat/completions`, `/v1/models`).
-- [ ] Native Model Context Protocol (MCP) server for local tool execution and agent integration.
+### Phase 7: Odds & Ends ⏳ *(In Progress)*
 - [ ] Configurable YaRN RoPE scaling UI toggle for long-context execution up to 1M tokens.
-- [ ] Real-time SSD read bandwidth, GPU compute utilization, and memory pressure diagnostics.
+- [ ] UI/UX refinement
 
 ---
 
