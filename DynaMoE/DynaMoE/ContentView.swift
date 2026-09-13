@@ -3167,6 +3167,7 @@ struct ContentView: View {
         topK: Int,
         repetitionPenalty: Float,
         presencePenalty: Float = 0.0,
+        eosTokenIds: [UInt32] = [],
         grammarMask: ((UnsafeMutablePointer<Float>, Int) -> Void)? = nil
     ) -> UInt32 {
         return InferenceEngine.sampleNextToken(
@@ -3179,6 +3180,7 @@ struct ContentView: View {
             topK: topK,
             repetitionPenalty: repetitionPenalty,
             presencePenalty: presencePenalty,
+            eosTokenIds: eosTokenIds,
             grammarMask: grammarMask
         )
     }
@@ -9404,6 +9406,7 @@ struct ContentView: View {
                         topK: topKVal,
                         repetitionPenalty: repPen,
                         presencePenalty: presPen,
+                        eosTokenIds: modelConfig?.effectiveEosTokenIds.map { UInt32($0) } ?? [eosTokenId],
                         grammarMask: isGrammarActive ? { maskLogits, maskVocab in
                             GrammarConstrainedSampler.shared.updateState(emittedText: accumulatedDecodedText)
                             GrammarConstrainedSampler.shared.applyLogitMask(logits: maskLogits, vocabSize: maskVocab, tokenDecoder: { try? tokenizer.decode(ids: [$0]) })
@@ -9428,6 +9431,30 @@ struct ContentView: View {
                     generatedTokenIds.append(nextToken)
                     contextTokens.append(nextToken)
                     tokensGenerated += 1
+
+                    // Degenerate-loop guard: models occasionally fall into verbatim
+                    // token cycles (the same 1-8 tokens repeating forever, EOS never
+                    // sampled). Stop cleanly once the tail is an exact repeating
+                    // cycle. Period-1 runs need 32 repeats so legitimate whitespace
+                    // runs in code are never caught.
+                    if generatedTokenIds.count >= 8 {
+                        let tail = Array(generatedTokenIds.suffix(40))
+                        for period in 1...8 {
+                            let minCycles = (period == 1) ? 32 : 4
+                            let needed = period * minCycles
+                            if tail.count < needed { continue }
+                            var isCycle = true
+                            for i in period..<tail.count where tail[i] != tail[i - period] {
+                                isCycle = false
+                                break
+                            }
+                            if isCycle {
+                                shouldBreak = true
+                                break
+                            }
+                        }
+                        if shouldBreak { break }
+                    }
 
                     if tokensGenerated == 1 {
                         firstTokenTimestamp = CFAbsoluteTimeGetCurrent()
@@ -9686,12 +9713,15 @@ struct ContentView: View {
                 }
             }
 
-            // Recovery: the model emitted only its reasoning block and stopped (empty reply).
-            // Regenerate the whole turn from scratch so it can answer cleanly — grafting onto a
+            // Recovery: the model emitted only its reasoning block and stopped (empty reply),
+            // or produced nothing at all (empty think block + immediate turn end). Regenerate
+            // the whole turn from scratch so it can answer cleanly — grafting onto a
             // reconstructed " response" prefix produced duplicate reply text. Never applies when
             // there are parsed tool calls (or uncalled action intent): those turns must run the
             // agent harness, otherwise an identical deterministic replay is triggered.
-            if thinkingEnabled && !isInThinkingContinuation && !willContinueAgent && !finalThink.isEmpty && finalResp.isEmpty && !Task.isCancelled {
+            let emptyReplyAfterThinking = !finalThink.isEmpty && finalResp.isEmpty
+            let fullyEmptyTurn = finalThink.isEmpty && finalResp.isEmpty && tokensGenerated <= 24
+            if !isInThinkingContinuation && !willContinueAgent && (emptyReplyAfterThinking || fullyEmptyTurn) && !Task.isCancelled {
                 await MainActor.run {
                     if let sId = sessionId,
                        let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
@@ -10069,6 +10099,7 @@ struct ContentView: View {
 
         var response = raw
         for tag in Self.openTags { response = response.replacingOccurrences(of: tag, with: "") }
+        for tag in Self.closeTags { response = response.replacingOccurrences(of: tag, with: "") }
         response = response
             .replacingOccurrences(of: "<|im_end|>", with: "")
             .replacingOccurrences(of: "<|endoftext|>", with: "")

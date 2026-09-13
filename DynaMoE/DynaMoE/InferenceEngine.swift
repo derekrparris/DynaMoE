@@ -1115,6 +1115,7 @@ extension InferenceEngine {
         topK: Int,
         repetitionPenalty: Float,
         presencePenalty: Float = 0.0,
+        eosTokenIds: [UInt32] = [],
         grammarMask: ((UnsafeMutablePointer<Float>, Int) -> Void)? = nil
     ) -> UInt32 {
         // 1. Direct repetition and presence penalties to recent context tokens (no Set lookup across 166k items)
@@ -1149,6 +1150,20 @@ extension InferenceEngine {
         // Apply dynamic grammar/schema constraint mask if active
         if let maskFn = grammarMask {
             maskFn(logits, vocabSize)
+        }
+
+        // Snapshot stop-token logits AFTER penalties and grammar masking, but BEFORE
+        // the logits are restored below. These are injected into the candidate set
+        // after top-K truncation so the model can always emit EOS and end its turn,
+        // even when the stop token ranks outside the top-K window.
+        var eosCandidates: [(id: Int, logit: Float)] = []
+        if temperature > 0.01 {
+            for eosId in eosTokenIds {
+                let v = Int(eosId)
+                if v < vocabSize {
+                    eosCandidates.append((id: v, logit: logits[v]))
+                }
+            }
         }
 
         // Hardware-Vectorized Greedy Fast Path (temperature <= 0.01) using vDSP_maxvi
@@ -1227,13 +1242,27 @@ extension InferenceEngine {
         let candidates = heap.sorted(by: { $0.logit > $1.logit })
         guard let first = candidates.first else { return 0 }
 
-        let count = candidates.count
-        var logitVec = candidates.map { $0.logit }
+        // Always-admit stop tokens: without this, a stop token ranked outside the
+        // top-K window (e.g. topK=20) is permanently unreachable and the model
+        // can never end its turn — manifesting as infinite paraphrase loops.
+        var fullCandidates = candidates
+        if !eosCandidates.isEmpty {
+            let candidateIds = Set(candidates.map { $0.id })
+            for eos in eosCandidates where !candidateIds.contains(eos.id) {
+                fullCandidates.append(eos)
+            }
+            fullCandidates.sort { $0.logit > $1.logit }
+        }
+        let candidatesFinal = fullCandidates
+        guard let firstFinal = candidatesFinal.first else { return UInt32(first.id) }
+
+        let count = candidatesFinal.count
+        var logitVec = candidatesFinal.map { $0.logit }
         var scaledLogits = [Float](repeating: 0, count: count)
         var probs = [Float](repeating: 0, count: count)
 
         let invTemp = 1.0 / max(temperature, 0.01)
-        let maxLogit = first.logit
+        let maxLogit = firstFinal.logit
 
         // Vectorized: (logits - maxLogit) * invTemp using Accelerate vDSP
         var negMaxLogit = -maxLogit
@@ -1250,7 +1279,7 @@ extension InferenceEngine {
         vDSP_sve(probs, 1, &expSum, vDSP_Length(count))
 
         if expSum <= 0.0 {
-            return UInt32(first.id)
+            return UInt32(firstFinal.id)
         }
 
         // Vectorized normalization: probs = probs / expSum
@@ -1286,11 +1315,11 @@ extension InferenceEngine {
         for i in 0...cutoffIndex {
             runningSum += probs[i]
             if runningSum >= randomVal {
-                return UInt32(candidates[i].id)
+                return UInt32(candidatesFinal[i].id)
             }
         }
 
-        return UInt32(candidates[0].id)
+        return UInt32(candidatesFinal[0].id)
     }
 }
 
