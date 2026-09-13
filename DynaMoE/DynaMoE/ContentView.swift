@@ -851,6 +851,7 @@ struct ContentView: View {
     @AppStorage("dynamoe_max_tokens") private var maxNewTokens: Int = 8192
     @State private var activeProfile: ModelProfileType = .coder
     @State private var isGeneratingText: Bool = false
+    @State private var generatingSessionId: UUID? = nil
     @State private var generatedStreamText: String = ""
     @State private var thinkingText: String = ""
     @State private var responseText: String = ""
@@ -1065,6 +1066,12 @@ struct ContentView: View {
     }
 
     private func switchModel(to model: DiscoveredModel) {
+        // Never swap the engine/buffers out from under an in-flight generation:
+        // its mmaps are unmapped when the old engine releases, which would fault
+        // any GPU work still in progress.
+        if isGeneratingText {
+            stopAutoregressiveGeneration()
+        }
         PrefixCacheManager.shared.invalidate()
         loadAndBridgeToMetal(filePath: model.snapshotPath)
         activeLoadedModelPath = model.snapshotPath
@@ -1127,7 +1134,7 @@ struct ContentView: View {
                 ChatDetailView(
                     session: activeSessionBinding,
                     promptText: $chatPromptText,
-                    isGenerating: isGeneratingText,
+                    isGenerating: isGeneratingText && (generatingSessionId == (selectedSessionId ?? sessions.first?.id)),
                     isStreamingOffDisk: isStreamingOffDisk,
                     generationSpeed: generationSpeedTokPerSec,
                     generationTokens: generationTotalTokens,
@@ -4026,6 +4033,8 @@ struct ContentView: View {
         GrammarConstrainedSampler.shared.reset()
 
         isGeneratingText = true
+        generatingSessionId = sessionId ?? selectedSessionId ?? sessions.first?.id
+        AgentHarness.shared.currentSessionId = generatingSessionId
         generatedStreamText = ""
         thinkingText = ""
         responseText = ""
@@ -10139,6 +10148,10 @@ struct ContentView: View {
         let currentSystemPrompt = self.systemPrompt
 
         Task.detached(priority: .userInitiated) {
+            // Drop file descriptors cached from a previously loaded model; they are
+            // keyed by layerIndex only, so a new model with the same layer numbering
+            // would otherwise pread the old model's packed expert files.
+            ExpertIOThreadPool.shared.closeAllLayerFDs()
             do {
                 let loadedEngine = try DynaMoeEngine(filePath: filePath)
                 let loadedSummary = try loadedEngine.getSummary()

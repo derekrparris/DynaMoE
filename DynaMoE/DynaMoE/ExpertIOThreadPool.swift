@@ -43,7 +43,8 @@ public final class ExpertIOThreadPool {
     }
 
     public func initialize(numThreads: Int = 8) {
-        // GCD manages thread pool automatically
+        // Reset any descriptors cached by a previously loaded packed model
+        closeAllLayerFDs()
     }
 
     /// Synchronously dispatches pread tasks in parallel across all CPU cores via GCD

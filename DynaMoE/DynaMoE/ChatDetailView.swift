@@ -178,8 +178,8 @@ struct ChatDetailView: View {
                                 .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .medium))
                             Text("Tasks")
                                 .font(.system(size: max(9, 11 * zoomManager.zoomScale), weight: .medium))
-                            if subagentManager.activeSubagentsCount > 0 {
-                                Text("\(subagentManager.activeSubagentsCount)")
+                            if subagentManager.activeSubagentsCount(forSession: session?.id) > 0 {
+                                Text("\(subagentManager.activeSubagentsCount(forSession: session?.id))")
                                     .font(.system(size: max(8, 9 * zoomManager.zoomScale), weight: .bold))
                                     .padding(.horizontal, 5)
                                     .padding(.vertical, 1)

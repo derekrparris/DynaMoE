@@ -558,6 +558,16 @@ public final class SubagentManager: ObservableObject {
         return subagentsOrder.filter { $0.status == .running || $0.status == .pending }.count
     }
 
+    /// Count of running/pending subagents belonging to a specific chat session.
+    public func activeSubagentsCount(forSession sessionId: UUID?) -> Int {
+        guard let sessionId else { return 0 }
+        lock.lock()
+        defer { lock.unlock() }
+        return subagentsOrder.filter {
+            $0.parentSessionId == sessionId && ($0.status == .running || $0.status == .pending)
+        }.count
+    }
+
     public var allSubagents: [SubagentInstance] {
         lock.lock()
         defer { lock.unlock() }

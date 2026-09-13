@@ -1943,6 +1943,7 @@ public final class SpawnSubagentTool: AgentTool {
             taskDescription: taskDesc,
             allowedTools: allowedTools,
             contextSummary: contextSummary,
+            parentSessionId: AgentHarness.shared.currentSessionId,
             workingDirectory: workingDirectory
         )
 
@@ -2521,6 +2522,8 @@ public final class AgentHarness {
     public var defaultWorkingDirectory: URL? = nil
     public var maxToolOutputLength: Int = 4000
     public var maxAgentSteps: Int = 15
+    /// Session that owns the in-flight agent run; stamped onto spawned subagents.
+    public var currentSessionId: UUID? = nil
 
     // MARK: - Web Search Loop Guard
     // Termination for tool loops is structural, not a matter of model capability: `web_search`
