@@ -17,6 +17,7 @@ The following AI models have been used to code DynaMoE:
 * Ling 3.0 Flash Fin Free (Opencode)
 * GLM 5.3 Flash
 * Big Pickle (Opencode)
+* Deepseek V4.1 Flash
 
 Special thanks and acknowledgement to the open-source projects and research that inspired and influenced this architecture:
 * **JetSpec** (Hao AI Lab / UC San Diego — [arXiv:2606.18394](https://arxiv.org/html/2606.18394v2)): Causal parallel tree drafting and tree-causal attention verification for breakthrough speculative decoding throughput.
@@ -304,42 +305,6 @@ flowchart TD
 
 ---
 
-## 🧪 Automated Testing & Verification
-
-All 16 unit tests covering the autonomous agent harness, developer tooling, and KV prefix pinning execute natively on Apple Silicon:
-
-```bash
-xcodebuild test -scheme DynaMoE -destination 'platform=macOS' \
-  -only-testing:DynaMoETests/DynaMoETests \
-  -only-testing:DynaMoETests/DeveloperToolingTests \
-  -only-testing:DynaMoETests/ModelDogfoodAndPrefixCacheTests
-```
-
-### Verified Test Suite Breakdown:
-
-| Test Suite / Area | Test Case | Functionality Verified | Result | Time |
-| :--- | :--- | :--- | :---: | :---: |
-| **Option 4: Dogfooding** | `testDogfoodBenchmarkRunnerMultiTurnExecution` | 3-turn dogfooding run: cold prefill, warm prefix hit, Turbo Mode edit, self-healing | **PASSED** | 0.759s |
-| **Option 4: Dogfooding** | `testKVCacheManagerPrefixPreservation` | Metal GPU buffer slot preservation, canary pattern validation, and tail zeroing | **PASSED** | 0.021s |
-| **Option 4: Dogfooding** | `testPrefixCacheManagerPrefixDetectionAndRecording` | Prefix hit detection, multi-turn recording, session isolation & telemetry | **PASSED** | 0.001s |
-| **Option 4: Dogfooding** | `testLiveMoEWeightsCheckpointIntegrity` | On-disk checkpoint discovery, SafeTensors structure & config.json validation | **PASSED** | 0.001s |
-| **Option 3: Dev Tools** | `testGitStatusAndDiffTools` | Git repository tracking, working directory status, staging & diff generation | **PASSED** | 0.101s |
-| **Option 3: Dev Tools** | `testGitCommitToolAndSafetyRails` | Commit safety rails (empty message rejection, dangerous flag blocking) | **PASSED** | 0.128s |
-| **Option 3: Dev Tools** | `testSymbolIntelligenceDefinitionAndReferences` | AST symbol discovery for Swift structs, Metal kernels & call-site references | **PASSED** | 0.004s |
-| **Option 3: Dev Tools** | `testLintDiagnosticsFeedbackLoop` | `FileEditTool` syntax error detection (`swiftc -parse`) and self-healing diagnostic output | **PASSED** | 0.343s |
-| **Option 2: Subagents** | `testSubagentManagerLifecycleAndStatusTransitions` | Subagent lifecycle states, transcript logging & duration tracking | **PASSED** | 0.022s |
-| **Option 2: Subagents** | `testSpawnSubagentSynchronousExecution` | Synchronous subagent delegation via `SpawnSubagentTool` | **PASSED** | 0.002s |
-| **Option 2: Subagents** | `testSpawnSubagentAsynchronousBackgroundExecution` | Asynchronous background delegation & status polling via `GetSubagentStatusTool` | **PASSED** | 0.002s |
-| **Option 2: Subagents** | `testInterAgentMessagingAndListTool` | Inter-agent messaging delivery & subagent registry filtering | **PASSED** | 0.002s |
-| **Option 1: Local RAG** | `testCodebaseEmbeddingEngineAndMetalCosineSimilarity` | 512-D sentence embeddings & Metal GPU dot-product ranking | **PASSED** | 0.093s |
-| **Option 1: Local RAG** | `testBM25TokenizationAndScoring` | Identifier splitting, inverted index, & Okapi BM25 scoring | **PASSED** | 0.001s |
-| **Option 1: Local RAG** | `testHybridSearchFusionRRF` | Reciprocal Rank Fusion ($k=60$) score combination | **PASSED** | 0.001s |
-| **Option 1: Local RAG** | `testCodebaseIndexerAndSearchTool` | Workspace scanning, AST chunking, and `codebase_search` tool execution | **PASSED** | 0.027s |
-
-**Total Pass Rate:** 16/16 (100% `** TEST SUCCEEDED **`)
-
----
-
 ## Getting Started
 
 If you're interested in building and running the app in your own development environment:
@@ -370,8 +335,9 @@ If you're interested in building and running the app in your own development env
 
 If you want to help test beta releases of the app, check the releases section. use the in-app documentation for guidance on using the various settings.
 
-Additional things to be aware of:
+Additional things to be aware of: 
 
+Ling 3.0 Tiny does not support FP8 quantization. So if you choose that option in settings, know that DynaMoE will automatically fall back to FP16.
 
 ---
 
