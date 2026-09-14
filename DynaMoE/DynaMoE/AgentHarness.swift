@@ -1948,7 +1948,7 @@ public final class SpawnSubagentTool: AgentTool {
         )
 
         if runInBackground {
-            let msg = "Subagent [\(role)] spawned in background (ID: \(subagent.id.uuidString)). Monitor in Task Manager drawer or via get_subagent_status."
+            let msg = "Subagent [\(role)] spawned in background (ID: \(subagent.id.uuidString)). You are responsible for its outcome: when you need its results, call get_subagent_status with wait=true, then present the report to the user in your reply. The user never contacts the subagent directly."
             let res = AgentHarness.toolSuccessJSON(tool: "spawn_subagent", data: [
                 "subagent_id": subagent.id.uuidString,
                 "role": subagent.role,
@@ -1960,13 +1960,15 @@ public final class SpawnSubagentTool: AgentTool {
         } else {
             // Synchronous delegation: wait for subagent to finish
             let summary = await subagent.waitForCompletion()
+            await MainActor.run { subagent.isSummaryRelayed = true }
             let cleanSummary = AgentHarness.truncateText(AgentHarness.sanitizeText(summary), limit: maxOutputLength)
             let res = AgentHarness.toolSuccessJSON(tool: "spawn_subagent", data: [
                 "subagent_id": subagent.id.uuidString,
                 "role": subagent.role,
                 "status": subagent.status.rawValue,
                 "duration_seconds": subagent.executionDurationSeconds,
-                "summary": cleanSummary
+                "summary": cleanSummary,
+                "directive": "Present this report to the user now, then answer their original question with it."
             ])
             return (res, cleanSummary, nil, false)
         }
@@ -1976,13 +1978,21 @@ public final class SpawnSubagentTool: AgentTool {
 public final class GetSubagentStatusTool: AgentTool {
     public let definition = ToolDefinition(
         name: "get_subagent_status",
-        description: "Checks the live execution status, step transcript, and final summary of a spawned subagent by its ID.",
+        description: "Checks the live execution status, step transcript, and final summary of a spawned subagent by its ID. Returns immediately by default; set wait=true to block until the subagent reaches a terminal state (recommended before presenting a background subagent's results to the user).",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
                 "subagent_id": [
                     "type": "string",
                     "description": "The UUID of the spawned subagent."
+                ],
+                "wait": [
+                    "type": "boolean",
+                    "description": "Set true to block until the subagent completes (or times out) instead of returning the current snapshot immediately."
+                ],
+                "timeout_seconds": [
+                    "type": "number",
+                    "description": "Max seconds to wait when wait=true. Default 120, capped at 300."
                 ]
             ]),
             "required": AnyCodable(["subagent_id"])
@@ -2004,19 +2014,42 @@ public final class GetSubagentStatusTool: AgentTool {
             return (AgentHarness.toolErrorJSON(tool: "get_subagent_status", error: err), nil, err, false)
         }
 
+        // Optional blocking wait for terminal state (used for background subagents).
+        let shouldWait = (arguments["wait"] as? Bool) ?? false
+        if shouldWait {
+            let requestedTimeout = (arguments["timeout_seconds"] as? Double) ?? 120.0
+            let timeout = min(max(requestedTimeout, 1.0), 300.0)
+            let deadline = Date().addingTimeInterval(timeout)
+            while !Task.isCancelled {
+                let s = subagent.status
+                if s == .completed || s == .failed || s == .cancelled { break }
+                if Date() >= deadline { break }
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+
         let stepsSummary = subagent.transcript.map {
             "Step \($0.stepIndex): \($0.actionName) (\(String(format: "%.2f", $0.durationSeconds))s)"
         }.joined(separator: "\n")
 
+        let isTerminal = subagent.status == .completed || subagent.status == .failed || subagent.status == .cancelled
         var readable = "Subagent: \(subagent.role) [\(subagent.status.displayName)]\n"
         readable += "Status: \(subagent.liveStatusText)\n"
         readable += "Steps Completed: \(subagent.transcript.count)\n"
         if !subagent.finalSummary.isEmpty {
-            readable += "\nSummary:\n\(subagent.finalSummary)"
+            readable += "\nSummary:\n\(subagent.finalSummary)\n"
+        }
+        if isTerminal {
+            if subagent.isSummaryRelayed {
+                readable += "\nThis report has already been delivered into the conversation; present it to the user and answer their question with it.\n"
+            } else {
+                readable += "\nIMPORTANT: Relay these results to the user now in your reply — the user cannot see this tool output or the subagent directly.\n"
+            }
+        } else if !shouldWait {
+            readable += "\nStill running. Call again with wait=true to block until it finishes, then present its results to the user.\n"
         }
 
-        let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeText(readable), limit: maxOutputLength)
-        let res = AgentHarness.toolSuccessJSON(tool: "get_subagent_status", data: [
+        var data: [String: Any] = [
             "subagent_id": subagent.id.uuidString,
             "role": subagent.role,
             "status": subagent.status.rawValue,
@@ -2025,7 +2058,17 @@ public final class GetSubagentStatusTool: AgentTool {
             "steps_summary": stepsSummary,
             "summary": subagent.finalSummary,
             "duration_seconds": subagent.executionDurationSeconds
-        ])
+        ]
+        if isTerminal {
+            data["directive"] = "Present this report to the user in your reply, then answer their original question with it. Do not end your turn without delivering these results."
+        }
+
+        let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeText(readable), limit: maxOutputLength)
+        let res = AgentHarness.toolSuccessJSON(tool: "get_subagent_status", data: data)
+
+        if isTerminal && !subagent.finalSummary.isEmpty {
+            await MainActor.run { subagent.isSummaryRelayed = true }
+        }
         return (res, cleanOut, nil, false)
     }
 }
@@ -2033,7 +2076,7 @@ public final class GetSubagentStatusTool: AgentTool {
 public final class SendSubagentMessageTool: AgentTool {
     public let definition = ToolDefinition(
         name: "send_subagent_message",
-        description: "Sends a follow-up directive, instruction, or clarification to a running or completed subagent.",
+        description: "Sends a follow-up directive, instruction, or clarification to a running or completed subagent. The subagent consumes directives between execution steps: file paths in a directive are read, shell commands in a directive are run, and the results are folded into its final report.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
@@ -2814,6 +2857,18 @@ public final class AgentHarness {
 
             """
         }
+
+        prompt += """
+
+        # Subagent Result Delivery Policy
+
+        You are the COORDINATOR of the multi-agent system. Subagents are workers you delegate to — the user only talks to you, and subagents never talk to the user.
+
+        - After spawning a subagent, YOU are responsible for retrieving its final report (via `get_subagent_status`, or the `[SUBAGENT_RESULT]` blocks the harness injects after tool turns) and presenting the results to the user in your own words. Never tell the user to "wait for the subagent", "monitor the drawer", or check anything themselves.
+        - A subagent run is NOT finished work. Your turn is only complete once you have relayed the substance of its report (findings, summary, answer) in a reply addressed to the user.
+        - Use `get_subagent_status` with `wait: true` to block until a background subagent finishes, then present its results. Use `send_subagent_message` to redirect a subagent that has drifted from its goal.
+        - When you relay a subagent's results, always end with a final answer to the user. Do not end your turn after spawning, checking, or acknowledging a subagent — the task is only done when the user has received the outcome.
+        """
 
         if isLingModel {
             prompt += """

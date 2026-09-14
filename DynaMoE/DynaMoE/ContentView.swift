@@ -1404,6 +1404,53 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Subagent Result Auto-Relay
+
+    /// Collects final reports from this session's completed subagents that have not yet been
+    /// surfaced into the conversation. The harness injects these as `[SUBAGENT_RESULT]` blocks
+    /// after tool turns so the coordinator model can present them to the user — subagents run
+    /// in isolation and the user has no other way to receive their results.
+    private func gatherCompletedSubagentRelayResponses(forSession sessionId: UUID?) -> [String] {
+        guard let sessionId else { return [] }
+        let pending = SubagentManager.shared.allSubagents.filter {
+            $0.parentSessionId == sessionId
+                && ($0.status == .completed || $0.status == .failed || $0.status == .cancelled)
+                && !$0.isSummaryRelayed
+                && !$0.finalSummary.isEmpty
+        }
+        guard !pending.isEmpty else { return [] }
+        return pending.map { s in
+            let clean = AgentHarness.truncateText(AgentHarness.sanitizeText(s.finalSummary), limit: self.maxToolOutputLength)
+            return "[SUBAGENT_RESULT] role=\(s.role) id=\(s.id.uuidString) status=\(s.status.rawValue)\n\(clean)"
+        }
+    }
+
+    /// Marks the given subagent summaries as delivered so the auto-relay does not inject
+    /// them into the conversation twice.
+    private func markSubagentSummariesRelayed(_ responses: [String]) {
+        guard !responses.isEmpty else { return }
+        for s in SubagentManager.shared.allSubagents {
+            if responses.contains(where: { $0.contains(s.id.uuidString) }) {
+                s.isSummaryRelayed = true
+            }
+        }
+    }
+
+    /// Blocks until every running/pending subagent for the session reaches a terminal state
+    /// or the timeout elapses. Called off the main actor during agent-run teardown so the
+    /// coordinator's run can pick up results it would otherwise drop.
+    private func waitForSessionSubagents(sessionId: UUID?, timeout: TimeInterval) {
+        guard let sessionId else { return }
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let stillRunning = SubagentManager.shared.allSubagents.contains {
+                $0.parentSessionId == sessionId && ($0.status == .running || $0.status == .pending)
+            }
+            if !stillRunning { return }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+    }
+
     private func handleSendMessage(_ text: String) {
         guard let currentSessionId = selectedSessionId ?? sessions.first?.id else { return }
         guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return }
@@ -9978,15 +10025,25 @@ struct ContentView: View {
 
                     // If not finished and steps remaining, invoke next step
                     if !anyCompleted && (agentStep + 1 < self.maxAgentSteps) {
+                        // Auto-relay: completed background subagents whose final reports have
+                        // not yet reached the conversation get injected as SUBAGENT_RESULT
+                        // blocks here, so the coordinator can present them to the user.
+                        let relayResponses = await MainActor.run {
+                            let r = self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
+                            self.markSubagentSummariesRelayed(r)
+                            return r
+                        }
+                        let allResponses = toolResponses + relayResponses
+
                         let toolResponseTurn: String
                         if modelConfig?.isLingModel == true {
                             toolResponseTurn = AgentHarness.shared.formatLingToolResponseTurn(
-                                responses: toolResponses,
+                                responses: allResponses,
                                 thinkingEnabled: thinkingEnabled
                             )
                         } else {
                             toolResponseTurn = AgentHarness.shared.formatToolResponseTurn(
-                                responses: toolResponses,
+                                responses: allResponses,
                                 includeThinkSuffix: thinkingEnabled
                             )
                         }
@@ -10068,6 +10125,61 @@ struct ContentView: View {
                             }
                             return
                         }
+
+                        // Result-delivery relay: the run is ending, but this session still has
+                        // completed subagents whose final reports never reached the conversation
+                        // (e.g. the model spawned a background subagent and then stopped without
+                        // polling). Wait briefly for in-flight subagents, then inject their
+                        // reports and run ONE tools-disabled turn so the coordinator presents
+                        // them to the user instead of dropping them.
+                        if !ranCompleteTool {
+                            self.waitForSessionSubagents(sessionId: sessionId, timeout: 120)
+                            let pendingRelay = await MainActor.run {
+                                let r = self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
+                                self.markSubagentSummariesRelayed(r)
+                                return r
+                            }
+                            if !pendingRelay.isEmpty {
+                                let endTag = (modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>"
+                                var assistantTurnText = finalDecoded
+                                if !assistantTurnText.contains(endTag) {
+                                    assistantTurnText += endTag
+                                }
+                                let relayContext = pendingRelay.joined(separator: "\n\n")
+                                let relayDirective = """
+                                \n\n<system>
+                                A delegated subagent has finished its work. Its final report is below. You are the coordinator: the user only talks to you, and you are responsible for presenting subagent results.
+                                Using the report below, write your complete final answer to the user's original question NOW. Do not emit any tool calls.
+
+                                \(relayContext)
+                                </system>
+                                """
+                                let relayPrompt = formattedPrompt + assistantTurnText + relayDirective
+                                await MainActor.run {
+                                    let relayMsgId = UUID()
+                                    if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
+                                        let relayMsg = ChatMessage(
+                                            id: relayMsgId,
+                                            role: .assistant,
+                                            content: "",
+                                            thinkingContent: nil,
+                                            isThinking: thinkingEnabled
+                                        )
+                                        self.sessions[sIdx].messages.append(relayMsg)
+                                    }
+                                    self.generationStatusText = "📨 Subagent report ready — relaying results to user..."
+                                    self.startAutoregressiveGeneration(
+                                        customPrompt: relayPrompt,
+                                        sessionId: sessionId,
+                                        messageId: relayMsgId,
+                                        agentStep: agentStep + 1,
+                                        forceSynthesis: true
+                                    )
+                                }
+                                return
+                            }
+                        }
+
                         await MainActor.run {
                             self.isGeneratingText = false
                             self.generationTask = nil

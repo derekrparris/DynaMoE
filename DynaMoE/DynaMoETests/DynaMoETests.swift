@@ -6757,6 +6757,40 @@ final class DynaMoETests: XCTestCase {
         XCTAssertGreaterThanOrEqual(subagent.transcript.count, 1)
     }
 
+    func testSubagentGenericPipelineProducesRealFileResults() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("SubagentGroundingTest_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let secretMarker = "QUANTUM_RELAY_SEQUENCE_8842"
+        let docContent = """
+        # Project Orion Brief
+        \(secretMarker)
+        The relay sequence drives the antenna calibration loop.
+        ## Calibration
+        Phase offsets are recomputed every 250ms.
+        """
+        let docFile = tempDir.appendingPathComponent("OrionBrief.txt")
+        try docContent.write(to: docFile, atomically: true, encoding: .utf8)
+
+        let subagent = SubagentManager.shared.spawn(
+            role: "Document Summarizer",
+            taskDescription: "Read and summarize the document at \(docFile.path)",
+            allowedTools: ["file_read", "find_files"],
+            workingDirectory: tempDir
+        )
+
+        let summary = await subagent.waitForCompletion()
+        XCTAssertEqual(subagent.status, .completed)
+
+        // The report must be grounded in the REAL file content, not fabricated.
+        XCTAssertTrue(summary.contains("OrionBrief.txt"), "Report should name the real file read")
+        XCTAssertTrue(summary.contains("total_lines") || summary.contains("lines"), "Report should carry real file stats")
+        XCTAssertTrue(summary.contains("Project Orion Brief"), "Report should include real heading structure")
+        XCTAssertTrue(summary.contains(secretMarker), "Report must contain actual document content, not a fabricated summary")
+        XCTAssertTrue(summary.contains("file_read"), "Report should trace findings to real tool executions")
+    }
+
     func testSpawnSubagentSynchronousExecution() async throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("SubagentSyncTest_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
