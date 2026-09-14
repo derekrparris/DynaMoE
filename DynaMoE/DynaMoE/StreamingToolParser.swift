@@ -71,6 +71,63 @@ public final class StreamingToolParser {
         }
     }
 
+    /// Rewrites Ling/Bailing-3.0-native tool calls into the canonical internal
+    /// `<tool_call><function=name>...</function></tool_call>` shape so the rest of the parser
+    /// pipeline (and any downstream grammar/recovery logic) can execute them.
+    ///
+    /// Ling emits the function name directly after the opening tag, followed by
+    /// `<arg_key>k</arg_key>` / `<arg_value>v</arg_value>` pairs with no `<function=...>` wrapper:
+    ///
+    ///     <tool_call>shell_run
+    ///     <arg_key>command</arg_key>
+    ///     <arg_value>ls -la</arg_value>
+    ///     </tool_call>
+    ///
+    /// Blocks that already carry a `<function=...>` wrapper (Qwen XML) or a JSON payload
+    /// (hermetic JSON) are left untouched. A bare-name block is only rewritten when what follows
+    /// the name is empty, starts with JSON, or contains arg_key/arg_value pairs — prose inside a
+    /// stray `<tool_call>` tag is still reported as a broken fragment instead of a phantom tool.
+    /// Truncated blocks (no closing tag) are handled too, since generation may freeze mid-stream.
+    public static func normalizeBareNameToolCalls(_ raw: String) -> String {
+        guard raw.contains(qwenToolCallOpen) else { return raw }
+        let blockPattern = "<tool_call>([\\s\\S]*?)(</tool_call>|$)"
+        guard let blockRegex = try? NSRegularExpression(pattern: blockPattern, options: []),
+              let nameRegex = try? NSRegularExpression(pattern: "^\\s*([A-Za-z_][A-Za-z0-9_.\\-]*)", options: []) else {
+            return raw
+        }
+
+        var out = raw
+        let ns = out as NSString
+        let matches = blockRegex.matches(in: out, options: [], range: NSRange(location: 0, length: ns.length))
+        for m in matches.reversed() {
+            guard m.numberOfRanges >= 3 else { continue }
+            let body = ns.substring(with: m.range(at: 1))
+            guard !body.contains("<function=") else { continue }
+
+            let nsBody = body as NSString
+            guard let nameMatch = nameRegex.firstMatch(in: body, options: [], range: NSRange(location: 0, length: nsBody.length)),
+                  nameMatch.numberOfRanges >= 2 else { continue }
+            let name = nsBody.substring(with: nameMatch.range(at: 1))
+            let remainder = nsBody.substring(from: nameMatch.range(at: 0).length)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
+            let trimmedRemainder = remainder.trimmingCharacters(in: .whitespacesAndNewlines)
+            let looksLikeArguments = trimmedRemainder.isEmpty
+                || trimmedRemainder.hasPrefix("{")
+                || trimmedRemainder.hasPrefix("[")
+                || trimmedRemainder.contains("<arg_key")
+                || trimmedRemainder.contains("<arg_value")
+            guard looksLikeArguments else { continue }
+
+            let closing = ns.substring(with: m.range(at: 2))
+            let wrappedBody = remainder.isEmpty
+                ? "<tool_call>\n<function=\(name)>\n</function>\n\(closing)"
+                : "<tool_call>\n<function=\(name)>\n\(remainder)\n</function>\n\(closing)"
+            out = (out as NSString).replacingCharacters(in: m.range(at: 0), with: wrappedBody)
+        }
+        return out
+    }
+
     /// Rewrites the model's native Qwen-native argument dialect into the canonical internal
     /// <parameter=k>v</parameter> form. Some checkpoints emit <arg_key>name</arg_key> followed by
     /// <arg_value>value</arg_value> (possibly with newlines/comments between them) instead of
@@ -78,9 +135,12 @@ public final class StreamingToolParser {
     /// were silently dropped and only the surrounding prose appeared in the reply. This pass
     /// converts every completed pair into a single parameter block and also defends against a
     /// trailing ech(<arg_value>…</arg_value>) whose key never arrived on the current buffer.
+    ///
+    /// Ling/Bailing 3.0 emits its function name directly after `<tool_call>` with no
+    /// `<function=...>` wrapper, so `normalizeBareNameToolCalls` runs first to rewrap those blocks.
     public static func normalizeArgKeyDialect(_ raw: String) -> String {
-        guard raw.contains("arg_key") || raw.contains("arg_value") else { return raw }
-        var out = raw
+        var out = normalizeBareNameToolCalls(raw)
+        guard out.contains("arg_key") || out.contains("arg_value") else { return out }
         // Collapse each <arg_key>k</arg_key> ... <arg_value>v</arg_value> pair into one block.
         // Pair might span newlines and contain inner whitespace/comments; match loosely.
         let pairPattern = "<arg_key>\\s*([^<]+?)\\s*</arg_key>\\s*<arg_value>\\s*([\\s\\S]*?)\\s*</arg_value>"
@@ -110,6 +170,23 @@ public final class StreamingToolParser {
             }
         }
         return out
+    }
+
+    /// Decodes a canonical `<parameter=...>` value the same way `AgentHarness.parseAllXMLFunctionCalls`
+    /// does: JSON objects, arrays, and numbers become structured values, everything else stays a
+    /// plain string. Required for Ling's template, which JSON-encodes non-string argument values
+    /// (e.g. arrays for `tools_load`'s `names`, booleans for flags, numbers for counts).
+    private static func decodeParameterValue(_ rawValue: String) -> Any {
+        var value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") {
+            value = String(value.dropFirst().dropLast())
+        }
+        if let data = value.data(using: .utf8),
+           let jsonVal = try? JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed),
+           (jsonVal is [String: Any] || jsonVal is [Any] || jsonVal is NSNumber) {
+            return jsonVal
+        }
+        return value
     }
 
     /// Parses all completed tool calls from the stream text across supported formats.
@@ -143,6 +220,68 @@ public final class StreamingToolParser {
         }
         if !fnCalls.isEmpty {
             return (calls: fnCalls, brokenFragments: [])
+        }
+
+        // 1.5. <function=name> bodies carrying parameter dialects the canonical parser
+        //      doesn't recognize: either the generic-instruct shape
+        //      <parameter>key</parameter> value </parameter> or the canonical
+        //      <parameter=key>value</parameter>. Previously such calls parsed as
+        //      name-only with empty arguments and were rejected as degenerate.
+        if fnCalls.isEmpty && !fnMatches.isEmpty {
+            var dialectCalls: [ParsedToolCall] = []
+            for m in fnMatches {
+                guard m.numberOfRanges >= 3 else { continue }
+                let name = nsText.substring(with: m.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+                let body = nsText.substring(with: m.range(at: 2))
+                let rawMatch = nsText.substring(with: m.range(at: 0))
+                guard !name.isEmpty else { continue }
+                var args: [String: Any] = [:]
+                var rawParts: [String] = []
+                // Parameters are terminated by </parameter>; split and pair each
+                // opening marker with the value text that follows it.
+                let chunks = body.components(separatedBy: "</parameter>")
+                var pendingKey: String? = nil
+                for chunk in chunks {
+                    let trimmedChunk = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let key = pendingKey {
+                        if !key.isEmpty && !trimmedChunk.isEmpty {
+                            args[key] = Self.decodeParameterValue(trimmedChunk)
+                        }
+                        pendingKey = nil
+                    }
+                    if let eqRange = chunk.range(of: "<parameter=") {
+                        // Canonical dialect: <parameter=key>value (value may be inline
+                        // or arrive in the next chunk before the closing delimiter).
+                        let afterEq = chunk[eqRange.upperBound...]
+                        if let gt = afterEq.range(of: ">") {
+                            let key = String(afterEq[..<gt.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                            let inlineValue = String(afterEq[gt.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !key.isEmpty, !inlineValue.isEmpty {
+                                args[key] = Self.decodeParameterValue(inlineValue)
+                            } else if !key.isEmpty {
+                                pendingKey = key
+                            }
+                        }
+                    } else if let openRange = chunk.range(of: "<parameter>") {
+                        // Key-only dialect: the key runs to the end of this chunk and
+                        // its value arrives in the next chunk.
+                        let key = String(chunk[openRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !key.isEmpty { pendingKey = key }
+                    }
+                }
+                if !args.isEmpty {
+                    rawParts.append(body)
+                    dialectCalls.append(ParsedToolCall(
+                        name: name,
+                        arguments: args,
+                        rawArguments: rawParts.joined(separator: "\n"),
+                        rawText: rawMatch
+                    ))
+                }
+            }
+            if !dialectCalls.isEmpty {
+                return (calls: dialectCalls, brokenFragments: [])
+            }
         }
 
         // 2. First try standard AgentHarness XML parser

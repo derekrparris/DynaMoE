@@ -1442,7 +1442,8 @@ struct ContentView: View {
             effectiveSystem = AgentHarness.shared.buildSystemPrompt(
                 baseSystem: effectiveSystem,
                 modelName: activeModelDisplayName,
-                currentDate: conversationDate
+                currentDate: conversationDate,
+                isLingModel: modelConfig?.isLingModel == true
             )
         }
 
@@ -1482,7 +1483,34 @@ struct ContentView: View {
                     if !cleanMsg.isEmpty {
                         assistantBody += cleanMsg
                     }
+                    // History reconstruction: if the stored content no longer carries the raw
+                    // Ling-native call text, rebuild it from the structured ToolCallRecords.
+                    if let calls = msg.toolCalls, !calls.isEmpty, !cleanMsg.contains("<tool_call>") {
+                        for call in calls {
+                            assistantBody += "\n<tool_call>\(call.name)"
+                            for (k, v) in call.arguments {
+                                assistantBody += "\n<arg_key>\(k)</arg_key>\n<arg_value>\(v)</arg_value>"
+                            }
+                            assistantBody += "\n</tool_call>"
+                        }
+                    }
                     promptString += "<role>ASSISTANT</role>\(assistantBody)<|role_end|>"
+
+                    if let calls = msg.toolCalls, !calls.isEmpty {
+                        var outputs: [String] = []
+                        for call in calls {
+                            if let out = call.output ?? call.error {
+                                outputs.append(out)
+                            }
+                        }
+                        if !outputs.isEmpty {
+                            promptString += AgentHarness.shared.formatLingToolResponseTurn(
+                                responses: outputs,
+                                thinkingEnabled: thinkingEnabled,
+                                includeAssistantPrefix: false
+                            )
+                        }
+                    }
                 }
             }
             if thinkingEnabled {
@@ -9640,6 +9668,14 @@ struct ContentView: View {
             let parsedResult = runAgentTools ? StreamingToolParser.shared.parseStreamingToolCalls(from: finalDecoded) : (calls: [], brokenFragments: [])
             let hasUncalledIntent = runAgentTools && parsedResult.calls.isEmpty && agentStep == 0 && (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink)
             let willContinueAgent = (!parsedResult.calls.isEmpty || hasUncalledIntent)
+            // Collapse guard: the agent run ended with no tool calls and no usable answer,
+            // but this run saw repeated degenerate (empty-argument) tool calls — force one
+            // final synthesis turn (tools disabled) so the model answers instead of ending
+            // in tag noise.
+            let shouldForceSynthesis = runAgentTools && !willContinueAgent && !Task.isCancelled
+                && AgentHarness.shared.consecutiveEmptyToolCalls >= 2
+                && finalResp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && (priorContent ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
             await MainActor.run {
                 if !willContinueAgent {
@@ -9708,7 +9744,44 @@ struct ContentView: View {
                     generatedTokenIds: generatedTokenIds,
                     sessionId: sessionId
                 )
-                if !willContinueAgent {
+                if shouldForceSynthesis {
+                    let endTag = (modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>"
+                    var assistantTurnText = finalDecoded
+                    if !assistantTurnText.contains(endTag) {
+                        assistantTurnText += endTag
+                    }
+                    let synthesisDirective = """
+                    \n\n<system>
+                    IMPORTANT: All tool use is now DISABLED for this task. Your recent tool calls carried empty arguments and could not be executed, and the run was forcibly ended to protect the conversation from looping.
+                    Using ONLY the tool outputs already shown above in this conversation — plus your own knowledge — now write your complete, self-contained final answer to the user's original question.
+                    Do not emit any tool calls. Do not search again. Just answer.
+                    </system>
+                    """
+                    let synthesisPrompt = formattedPrompt + assistantTurnText + synthesisDirective
+                    let synthesisMsgId = UUID()
+                    if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
+                        if let mId = messageId, let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                            self.sessions[sIdx].messages[mIdx].isThinking = false
+                            self.sessions[sIdx].messages[mIdx].prefillStatus = nil
+                        }
+                        let synthMsg = ChatMessage(
+                            id: synthesisMsgId,
+                            role: .assistant,
+                            content: "",
+                            thinkingContent: nil,
+                            isThinking: thinkingEnabled
+                        )
+                        self.sessions[sIdx].messages.append(synthMsg)
+                    }
+                    self.generationStatusText = "🛡️ Tool loop guard hit — forcing final answer..."
+                    self.startAutoregressiveGeneration(
+                        customPrompt: synthesisPrompt,
+                        sessionId: sessionId,
+                        messageId: synthesisMsgId,
+                        agentStep: agentStep + 1,
+                        forceSynthesis: true
+                    )
+                } else if !willContinueAgent {
                     self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)
                 }
             }
@@ -9721,7 +9794,7 @@ struct ContentView: View {
             // agent harness, otherwise an identical deterministic replay is triggered.
             let emptyReplyAfterThinking = !finalThink.isEmpty && finalResp.isEmpty
             let fullyEmptyTurn = finalThink.isEmpty && finalResp.isEmpty && tokensGenerated <= 24
-            if !isInThinkingContinuation && !willContinueAgent && (emptyReplyAfterThinking || fullyEmptyTurn) && !Task.isCancelled {
+            if !isInThinkingContinuation && !willContinueAgent && !shouldForceSynthesis && (emptyReplyAfterThinking || fullyEmptyTurn) && !Task.isCancelled {
                 await MainActor.run {
                     if let sId = sessionId,
                        let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
@@ -9804,6 +9877,31 @@ struct ContentView: View {
                             self.generationStatusText = "⚙️ Executing [\(idx + 1)/\(parsedResult.calls.count)]: \(call.name)..."
                         }
 
+                        // Degenerate-call guard: reject tool calls whose required arguments
+                        // are all empty WITHOUT executing (and without a HITL prompt), so a
+                        // broken scaffold never burns an execution step or an approval.
+                        if AgentHarness.hasEmptyRequiredArguments(toolName: call.name, arguments: call.arguments) {
+                            AgentHarness.shared.recordToolCallValidity(false)
+                            await MainActor.run {
+                                if let sId = sessionId, let mId = messageId,
+                                   let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                                   let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }),
+                                   var currentCalls = self.sessions[sIdx].messages[mIdx].toolCalls,
+                                   let callIdx = currentCalls.firstIndex(where: { $0.id == recordId }) {
+                                    currentCalls[callIdx].status = .error
+                                    currentCalls[callIdx].error = "Rejected: required arguments were empty."
+                                    self.sessions[sIdx].messages[mIdx].toolCalls = currentCalls
+                                }
+                            }
+                            let emptyArgJSON = AgentHarness.toolErrorJSON(
+                                tool: call.name,
+                                error: "Empty arguments — this call carried no usable parameters and was not executed. Either provide real arguments, or stop calling tools and answer the user directly from what you already know."
+                            )
+                            toolResponses.append(emptyArgJSON)
+                            continue
+                        }
+                        AgentHarness.shared.recordToolCallValidity(true)
+
                         // Human-In-The-Loop (HITL) Safety & Turbo Mode
                         let isTurbo = UserDefaults.standard.bool(forKey: "dynamoe_agent_turbo_mode")
                         let isDestructive = AgentHarness.isStateChanging(toolName: call.name)
@@ -9880,10 +9978,18 @@ struct ContentView: View {
 
                     // If not finished and steps remaining, invoke next step
                     if !anyCompleted && (agentStep + 1 < self.maxAgentSteps) {
-                        let toolResponseTurn = AgentHarness.shared.formatToolResponseTurn(
-                            responses: toolResponses,
-                            includeThinkSuffix: thinkingEnabled
-                        )
+                        let toolResponseTurn: String
+                        if modelConfig?.isLingModel == true {
+                            toolResponseTurn = AgentHarness.shared.formatLingToolResponseTurn(
+                                responses: toolResponses,
+                                thinkingEnabled: thinkingEnabled
+                            )
+                        } else {
+                            toolResponseTurn = AgentHarness.shared.formatToolResponseTurn(
+                                responses: toolResponses,
+                                includeThinkSuffix: thinkingEnabled
+                            )
+                        }
                         var assistantTurnText = finalDecoded
                         let endTag = (modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>"
                         if !assistantTurnText.contains(endTag) {
@@ -9916,9 +10022,11 @@ struct ContentView: View {
                         return
                     } else {
                         // All steps finished or complete tool called. If the search loop guard
-                        // hard-stopped the run, give the model one final synthesis turn with
+                        // hard-stopped the run — or the model kept emitting tool calls with
+                        // empty arguments — give the model one final synthesis turn with
                         // tool calling disabled so it actually answers instead of spinning.
-                        if AgentHarness.shared.lastSearchGuardAction == .forceSynthesis && !ranCompleteTool {
+                        let escalateToSynthesis = AgentHarness.shared.consecutiveEmptyToolCalls >= 2
+                        if (AgentHarness.shared.lastSearchGuardAction == .forceSynthesis || escalateToSynthesis) && !ranCompleteTool {
                             let endTag = (modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>"
                             var assistantTurnText = finalDecoded
                             if !assistantTurnText.contains(endTag) {
@@ -9927,8 +10035,8 @@ struct ContentView: View {
                             let toolResponseContext = toolResponses.joined(separator: "\n")
                             let synthesisDirective = """
                             \n\n<system>
-                            IMPORTANT: All tool use is now DISABLED for this task. You consumed your search budget by repeatedly searching instead of answering, and the run was forcibly ended to protect the conversation from looping.
-                            Using ONLY the search results and tool outputs already shown above in this conversation, now write your complete, self-contained final answer to the user's original question.
+                            IMPORTANT: All tool use is now DISABLED for this task. You consumed your search budget by repeatedly searching, or your recent tool calls carried empty arguments and could not be executed. The run was forcibly ended to protect the conversation from looping.
+                            Using ONLY the search results and tool outputs already shown above in this conversation — plus your own knowledge — now write your complete, self-contained final answer to the user's original question.
                             Do not emit any tool calls. Do not search again. Just answer.
                             </system>
                             """
@@ -9949,7 +10057,7 @@ struct ContentView: View {
                                     )
                                     self.sessions[sIdx].messages.append(synthMsg)
                                 }
-                                self.generationStatusText = "🛡️ Search guard hit — forcing final answer..."
+                                self.generationStatusText = "🛡️ Tool loop guard hit — forcing final answer..."
                                 self.startAutoregressiveGeneration(
                                     customPrompt: synthesisPrompt,
                                     sessionId: sessionId,
@@ -9978,9 +10086,16 @@ struct ContentView: View {
                         return
                     }
 
-                    let continuationTurn = AgentHarness.shared.formatActionContinuationTurn(
-                        includeThinkSuffix: thinkingEnabled
-                    )
+                    let continuationTurn: String
+                    if modelConfig?.isLingModel == true {
+                        continuationTurn = AgentHarness.shared.formatLingActionContinuationTurn(
+                            thinkingEnabled: thinkingEnabled
+                        )
+                    } else {
+                        continuationTurn = AgentHarness.shared.formatActionContinuationTurn(
+                            includeThinkSuffix: thinkingEnabled
+                        )
+                    }
                     var assistantTurnText = finalDecoded
                     let endTag = (modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>"
                     if !assistantTurnText.contains(endTag) {
@@ -10054,7 +10169,16 @@ struct ContentView: View {
         }
         let expectsThinking = Self.openTags.contains { raw.contains($0) }
         guard expectsThinking || promptRequestsThinking else { return nil }
-        // 3. Whitespace-tolerant fallback for models that could not emit the special marker token
+        // 3. Implicit boundary: a tool call emitted while the thinking block is still open means
+        //    the model skipped its closing delimiter (Ling 3.0 frequently does). Treat the opening
+        //    <tool_call> as the boundary so the call lands in the response half — parsed and
+        //    rendered as a tool card — instead of leaking raw XML into the thinking accordion.
+        //    A zero-length range keeps the tag itself in the response half.
+        let toolCallRange = nsRaw.range(of: StreamingToolParser.qwenToolCallOpen)
+        if toolCallRange.location != NSNotFound {
+            return NSRange(location: toolCallRange.location, length: 0)
+        }
+        // 4. Whitespace-tolerant fallback for models that could not emit the special marker token
         if let re = Self.responseBoundaryRegex {
             var last: NSRange?
             re.enumerateMatches(in: raw, options: [], range: NSRange(location: 0, length: nsRaw.length)) { m, _, _ in

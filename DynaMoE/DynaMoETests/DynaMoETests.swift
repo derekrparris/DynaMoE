@@ -6378,6 +6378,135 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(llamaCalls.calls.first?.arguments["path"] as? String, "test.txt")
     }
 
+    func testStreamingToolParserLingNativeArgKeyFormat() {
+        let parser = StreamingToolParser.shared
+
+        // Exact Ling-3.0-tiny output shape: bare function name after <tool_call>,
+        // then <arg_key>/<arg_value> pairs with no <function=...> wrapper.
+        let lingText = """
+        Let me search for this.
+        <tool_call>shell_run
+        <arg_key>command</arg_key>
+        <arg_value>curl -s "https://www.google.com/search?q=import+BYD+vehicles+US+legal+regulations" 2>/dev/null || echo "No direct access"</arg_value>
+        </tool_call>
+        """
+        let parsed = parser.parseStreamingToolCalls(from: lingText)
+        XCTAssertEqual(parsed.calls.count, 1)
+        XCTAssertEqual(parsed.calls.first?.name, "shell_run")
+        XCTAssertEqual(
+            parsed.calls.first?.arguments["command"] as? String,
+            "curl -s \"https://www.google.com/search?q=import+BYD+vehicles+US+legal+regulations\" 2>/dev/null || echo \"No direct access\""
+        )
+
+        // Multiple native calls in one turn, including a JSON-valued argument payload.
+        let multiText = """
+        <tool_call>shell_run
+        <arg_key>command</arg_key>
+        <arg_value>echo hello</arg_value>
+        </tool_call>  <tool_call>tools_discover
+        <arg_key>category</arg_key>
+        <arg_value>{"query": "import BYD vehicles to US"}</arg_value>
+        </tool_call>
+        """
+        let multi = parser.parseStreamingToolCalls(from: multiText)
+        XCTAssertEqual(multi.calls.count, 2)
+        XCTAssertEqual(multi.calls.first?.name, "shell_run")
+        XCTAssertEqual(multi.calls.first?.arguments["command"] as? String, "echo hello")
+        XCTAssertEqual(multi.calls.last?.name, "tools_discover")
+        let jsonArg = multi.calls.last?.arguments["category"] as? [String: Any]
+        XCTAssertEqual(jsonArg?["query"] as? String, "import BYD vehicles to US")
+
+        // Zero-argument native call.
+        let bare = parser.parseStreamingToolCalls(from: "Checking now.<tool_call>tools_discover</tool_call>")
+        XCTAssertEqual(bare.calls.count, 1)
+        XCTAssertEqual(bare.calls.first?.name, "tools_discover")
+
+        // Ling JSON-encodes non-string argument values; arrays/bools must stay structured.
+        let arrayArg = parser.parseStreamingToolCalls(from: "<tool_call>tools_load\n<arg_key>names</arg_key>\n<arg_value>[\"web_search\", \"web_fetch\"]</arg_value>\n</tool_call>")
+        XCTAssertEqual(arrayArg.calls.first?.arguments["names"] as? [String], ["web_search", "web_fetch"])
+        let boolArg = parser.parseStreamingToolCalls(from: "<tool_call>git_diff\n<arg_key>staged</arg_key>\n<arg_value>true</arg_value>\n</tool_call>")
+        XCTAssertEqual(boolArg.calls.first?.arguments["staged"] as? Bool, true)
+
+        // Prose inside a stray <tool_call> must never become a phantom tool.
+        let prose = parser.parseStreamingToolCalls(from: "<tool_call>Let me think about it</tool_call>")
+        XCTAssertTrue(prose.calls.isEmpty)
+
+        // Canonical Qwen XML keeps working and is not double-wrapped.
+        let qwen = "<tool_call><function=file_read><parameter=path>README.md</parameter></function></tool_call>"
+        let qwenParsed = parser.parseStreamingToolCalls(from: qwen)
+        XCTAssertEqual(qwenParsed.calls.count, 1)
+        XCTAssertEqual(qwenParsed.calls.first?.name, "file_read")
+        XCTAssertEqual(qwenParsed.calls.first?.arguments["path"] as? String, "README.md")
+    }
+
+    func testLingUnclosedThinkingToolCallBoundary() {
+        // Ling 3.0 often emits a tool call without closing its <think> block. The implicit
+        // boundary must keep the call out of the thinking half so the card renders and the
+        // raw XML never leaks into the reasoning accordion.
+        let raw = """
+        The user wants current information. Let me search.
+        <tool_call>web_search
+        <arg_key>query</arg_key>
+        <arg_value>import BYD vehicles to US</arg_value>
+        </tool_call>
+        """
+        let split = ContentView.splitThinkingAndResponse(raw: raw, promptRequestsThinking: true)
+        XCTAssertTrue(split.thinkClose)
+        XCTAssertFalse(split.thinkOpen)
+        XCTAssertEqual(split.think, "The user wants current information. Let me search.")
+        XCTAssertTrue(split.resp.hasPrefix("<tool_call>"))
+        XCTAssertTrue(split.resp.contains("</tool_call>"))
+
+        // The same raw text parses to an executable call.
+        let parsed = StreamingToolParser.shared.parseStreamingToolCalls(from: raw)
+        XCTAssertEqual(parsed.calls.count, 1)
+        XCTAssertEqual(parsed.calls.first?.name, "web_search")
+        XCTAssertEqual(parsed.calls.first?.arguments["query"] as? String, "import BYD vehicles to US")
+    }
+
+    func testLingNativePromptAndToolResponseFormatting() {
+        let harness = AgentHarness.shared
+
+        // Ling system prompt must advertise the native <arg_key>/<arg_value> dialect.
+        let lingPrompt = harness.buildSystemPrompt(baseSystem: "You are an assistant.", isLingModel: true)
+        XCTAssertTrue(lingPrompt.contains("<arg_key>example_parameter_1</arg_key>"))
+        XCTAssertTrue(lingPrompt.contains("<arg_value>value_1</arg_value>"))
+        XCTAssertFalse(lingPrompt.contains("<function=example_function_name>"))
+
+        // Default (Qwen) prompt is unchanged.
+        let qwenPrompt = harness.buildSystemPrompt(baseSystem: "You are an assistant.")
+        XCTAssertTrue(qwenPrompt.contains("<function=example_function_name>"))
+        XCTAssertFalse(qwenPrompt.contains("<arg_key>"))
+
+        // Ling tool-response turn uses OBSERVATION / role_end boundaries and opens a fresh assistant turn.
+        let turn = harness.formatLingToolResponseTurn(
+            responses: ["{\"result\": {\"stdout\": \"hello\"}}"],
+            thinkingEnabled: true
+        )
+        XCTAssertTrue(turn.contains("<role>OBSERVATION</role>"))
+        XCTAssertTrue(turn.contains("<tool_response>"))
+        XCTAssertTrue(turn.contains("hello"))
+        XCTAssertTrue(turn.contains("</tool_response>"))
+        XCTAssertTrue(turn.contains("<|role_end|>"))
+        XCTAssertTrue(turn.hasSuffix("<role>ASSISTANT</role>\n<think>"))
+        XCTAssertFalse(turn.contains("<|im_start|>"))
+
+        // History-embedding form omits the trailing assistant opener.
+        let historyTurn = harness.formatLingToolResponseTurn(
+            responses: ["{\"result\": {\"stdout\": \"hello\"}}"],
+            thinkingEnabled: true,
+            includeAssistantPrefix: false
+        )
+        XCTAssertTrue(historyTurn.hasSuffix("<|role_end|>"))
+        XCTAssertFalse(historyTurn.contains("<role>ASSISTANT</role>"))
+
+        // Ling action continuation nudges with the native call shape.
+        let continuation = harness.formatLingActionContinuationTurn(thinkingEnabled: true)
+        XCTAssertTrue(continuation.contains("<role>HUMAN</role>"))
+        XCTAssertTrue(continuation.contains("<arg_key>path</arg_key>"))
+        XCTAssertTrue(continuation.hasSuffix("<role>ASSISTANT</role>\n<think>"))
+    }
+
     func testGrammarConstrainedStateTransitions() {
         let sampler = GrammarConstrainedSampler.shared
         sampler.reset()

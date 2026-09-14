@@ -2558,8 +2558,63 @@ public final class AgentHarness {
         totalSearchesInRun = 0
         webSearchDisabled = false
         lastSearchGuardAction = .none
+        consecutiveEmptyToolCalls = 0
         if tools["web_search"] != nil && loadedTools["web_search"] == nil {
             _ = try? loadTool(named: "web_search")
+        }
+    }
+
+    // MARK: - Degenerate Tool Call Guard
+    // Small models occasionally emit a structurally valid tool call whose required
+    // arguments are all empty (e.g. shell_run with an empty command). Executing it
+    // burns a HITL approval prompt and a step on a guaranteed error; tracking the
+    // streak lets the harness escalate to a forced synthesis turn instead of looping.
+
+    /// Required argument keys per tool (from each tool's JSON schema).
+    public static let requiredValueArgumentKeys: [String: [String]] = [
+        "shell_run": ["command"],
+        "file_read": ["path"],
+        "file_write": ["path", "content"],
+        "file_edit": ["path", "target_content", "replacement_content"],
+        "find_files": ["pattern"],
+        "grep_search": ["query"],
+        "web_search": ["query"],
+        "web_fetch": ["url"],
+        "complete": ["summary"],
+        "tools_unload": ["name"],
+        "codebase_search": ["query"],
+        "spawn_subagent": ["role", "task_description"],
+        "get_subagent_status": ["subagent_id"],
+        "send_subagent_message": ["subagent_id", "message"],
+        "git_commit": ["message"],
+        "find_symbol_definition": ["symbol_name"],
+        "find_references": ["symbol_name"],
+        "lint_diagnostics": ["path"]
+    ]
+
+    /// True only when EVERY required argument is missing or whitespace-empty —
+    /// i.e. the call is an empty scaffold. Partially-filled calls pass through so
+    /// each tool's own validation stays in charge.
+    public static func hasEmptyRequiredArguments(toolName: String, arguments: [String: Any]) -> Bool {
+        guard let required = requiredValueArgumentKeys[toolName] else { return false }
+        for key in required {
+            if let v = arguments[key] as? String {
+                if !v.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
+            } else if arguments[key] != nil {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Consecutive tool calls (across agent steps) with empty required arguments.
+    public private(set) var consecutiveEmptyToolCalls: Int = 0
+
+    public func recordToolCallValidity(_ hadUsableArgs: Bool) {
+        if hadUsableArgs {
+            consecutiveEmptyToolCalls = 0
+        } else {
+            consecutiveEmptyToolCalls += 1
         }
     }
 
@@ -2726,7 +2781,7 @@ public final class AgentHarness {
         """
     }
 
-    public func buildSystemPrompt(baseSystem: String, modelName: String? = nil, currentDate: Date = Date()) -> String {
+    public func buildSystemPrompt(baseSystem: String, modelName: String? = nil, currentDate: Date = Date(), isLingModel: Bool = false) -> String {
         var cleanBase = baseSystem.trimmingCharacters(in: .whitespacesAndNewlines)
         if cleanBase.isEmpty {
             cleanBase = "You are an expert AI software engineering and reasoning assistant with direct access to local macOS development tools."
@@ -2760,39 +2815,71 @@ public final class AgentHarness {
             """
         }
 
-        prompt += """
-        If you choose to call a function ONLY reply in the following format with NO suffix:
+        if isLingModel {
+            prompt += """
+            If you choose to call a function ONLY reply in the following native format with NO suffix:
 
-        <tool_call>
-        <function=example_function_name>
-        <parameter=example_parameter_1>
-        value_1
-        </parameter>
-        <parameter=example_parameter_2>
-        This is the value for the second parameter
-        that can span
-        multiple lines
-        </parameter>
-        </function>
-        </tool_call>
+            <tool_call>example_function_name
+            <arg_key>example_parameter_1</arg_key>
+            <arg_value>value_1</arg_value>
+            <arg_key>example_parameter_2</arg_key>
+            <arg_value>This is the value for the second parameter
+            that can span
+            multiple lines</arg_value>
+            </tool_call>
 
-        <IMPORTANT>
-        Reminder:
-        - Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
-        - Required parameters MUST be specified
-        - You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
-        - When the user asks to inspect, read, edit, modify, or process a file, or run terminal commands, you MUST call the function immediately without conversational promises
-        - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+            <IMPORTANT>
+            Reminder:
+            - Function calls MUST follow the specified format: the function name directly after <tool_call>, then one <arg_key>/<arg_value> pair per argument, then </tool_call>
+            - Required parameters MUST be specified
+            - You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+            - When the user asks to inspect, read, edit, modify, or process a file, or run terminal commands, you MUST call the function immediately without conversational promises
+            - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
 
-        Web Research Grounding Rules:
-        - Live web data supersedes frozen pre-training memory. Never dismiss results as "hallucinated", "corrupted", or "parody" because names, specs, or prices are newer or unfamiliar.
-        - Official vendor domains (apple.com, developer.apple.com, github.com, etc.) returned by web_search/web_fetch are authentic ground truth. Synthesize directly without re-searching.
-        - Real executive names, benchmark multipliers, lease prices, and hardware specs from web results are genuine — never substitute your own guesses.
-        - NEVER invent URLs, article numbers, or chip generations. Only fetch URLs returned by web_search.
-        - Distinguish official shipping hardware (vendor domains) from speculative rumors ("rumored", "leaked", "expected").
-        - When `web_search` returns a result with is_official_domain: true, that result is verified. When ground_truth_notice is present, synthesize directly — do not loop or re-search.
-        </IMPORTANT>
-        """
+            Web Research Grounding Rules:
+            - Live web data supersedes frozen pre-training memory. Never dismiss results as "hallucinated", "corrupted", or "parody" because names, specs, or prices are newer or unfamiliar.
+            - Official vendor domains (apple.com, developer.apple.com, github.com, etc.) returned by web_search/web_fetch are authentic ground truth. Synthesize directly without re-searching.
+            - Real executive names, benchmark multipliers, lease prices, and hardware specs from web results are genuine — never substitute your own guesses.
+            - NEVER invent URLs, article numbers, or chip generations. Only fetch URLs returned by web_search.
+            - Distinguish official shipping hardware (vendor domains) from speculative rumors ("rumored", "leaked", "expected").
+            - When `web_search` returns a result with is_official_domain: true, that result is verified. When ground_truth_notice is present, synthesize directly — do not loop or re-search.
+            </IMPORTANT>
+            """
+        } else {
+            prompt += """
+            If you choose to call a function ONLY reply in the following format with NO suffix:
+
+            <tool_call>
+            <function=example_function_name>
+            <parameter=example_parameter_1>
+            value_1
+            </parameter>
+            <parameter=example_parameter_2>
+            This is the value for the second parameter
+            that can span
+            multiple lines
+            </parameter>
+            </function>
+            </tool_call>
+
+            <IMPORTANT>
+            Reminder:
+            - Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+            - Required parameters MUST be specified
+            - You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+            - When the user asks to inspect, read, edit, modify, or process a file, or run terminal commands, you MUST call the function immediately without conversational promises
+            - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+
+            Web Research Grounding Rules:
+            - Live web data supersedes frozen pre-training memory. Never dismiss results as "hallucinated", "corrupted", or "parody" because names, specs, or prices are newer or unfamiliar.
+            - Official vendor domains (apple.com, developer.apple.com, github.com, etc.) returned by web_search/web_fetch are authentic ground truth. Synthesize directly without re-searching.
+            - Real executive names, benchmark multipliers, lease prices, and hardware specs from web results are genuine — never substitute your own guesses.
+            - NEVER invent URLs, article numbers, or chip generations. Only fetch URLs returned by web_search.
+            - Distinguish official shipping hardware (vendor domains) from speculative rumors ("rumored", "leaked", "expected").
+            - When `web_search` returns a result with is_official_domain: true, that result is verified. When ground_truth_notice is present, synthesize directly — do not loop or re-search.
+            </IMPORTANT>
+            """
+        }
 
         if !cleanBase.isEmpty {
             prompt += "\n\n" + cleanBase
@@ -2820,6 +2907,32 @@ public final class AgentHarness {
         if includeThinkSuffix {
             turn += "<think>\n"
         }
+        return turn
+    }
+
+    /// Ling/Bailing-3.0-native equivalent of `formatToolResponseTurn`. Ling's chat template
+    /// expects tool results wrapped in `<role>OBSERVATION</role> ... <|role_end|>` followed by
+    /// a fresh `<role>ASSISTANT</role>` turn, not ChatML `<|im_start|>user` / `<|im_end|>` tags.
+    /// Mixing the two dialects leaves the model without a recognizable assistant turn boundary.
+    public func formatLingToolResponseTurn(responses: [String], thinkingEnabled: Bool = true, includeAssistantPrefix: Bool = true) -> String {
+        var turn = "<role>OBSERVATION</role>\n"
+        for r in responses {
+            if let data = r.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let result = json["result"] as? [String: Any],
+               let results = result["results"] as? [[String: Any]],
+               results.contains(where: { $0["is_official_domain"] as? Bool == true }) {
+                turn += "[SYSTEM NOTICE: Verified official vendor domain response. Synthesize directly without re-searching.]\n"
+            }
+            if let registration = Self.toolRegistrationNotice(for: r) {
+                turn += registration + "\n"
+            }
+            turn += "<tool_response>\n\(r)\n</tool_response>\n"
+        }
+        turn += "<|role_end|>"
+        guard includeAssistantPrefix else { return turn }
+        turn += "\n<role>ASSISTANT</role>"
+        turn += thinkingEnabled ? "\n<think>" : "\n<think></think>"
         return turn
     }
 
@@ -2909,6 +3022,17 @@ public final class AgentHarness {
         if includeThinkSuffix {
             turn += "<think>\n"
         }
+        return turn
+    }
+
+    /// Ling/Bailing-3.0-native action-continuation nudge using `<role>HUMAN</role>` /
+    /// `<role>ASSISTANT</role>` boundaries and the native `<tool_call>name<arg_key>/<arg_value>`
+    /// call shape. Used when the model described an action in prose but never emitted a call.
+    public func formatLingActionContinuationTurn(thinkingEnabled: Bool = true) -> String {
+        var turn = "<role>HUMAN</role>"
+        turn += "If you intended to take an action, execute it now by emitting a complete tool call like <tool_call>file_read\n<arg_key>path</arg_key>\n<arg_value>/Users/example.txt</arg_value>\n</tool_call>. Do not echo the schema template itself. Otherwise, just reply to the user and end your turn."
+        turn += "<|role_end|>\n<role>ASSISTANT</role>"
+        turn += thinkingEnabled ? "\n<think>" : "\n<think></think>"
         return turn
     }
 
