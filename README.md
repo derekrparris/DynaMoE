@@ -17,6 +17,7 @@ The following AI models have been used to code DynaMoE:
 * Ling 3.0 Flash Fin Free (Opencode)
 * GLM 5.3 Flash
 * Big Pickle (Opencode)
+* Deepseek V4.1 Flash
 
 Special thanks and acknowledgement to the open-source projects and research that inspired and influenced this architecture:
 * **JetSpec** (Hao AI Lab / UC San Diego — [arXiv:2606.18394](https://arxiv.org/html/2606.18394v2)): Causal parallel tree drafting and tree-causal attention verification for breakthrough speculative decoding throughput.
