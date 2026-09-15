@@ -42,6 +42,12 @@ DynaMoE supports sparse Mixture-of-Experts, hybrid recurrent SSM/attention archi
 
 ---
 
+<img width="1918" height="1080" alt="Screenshot 2026-09-14 at 5 15 50 PM" src="https://github.com/user-attachments/assets/59e68a69-fd98-4d79-bc05-3ef804fcede8" />  
+*screenshot from version 0.8.2 depicting results from a file read done by a subagent*
+
+
+---
+
 ### Key Architectural Strengths:
 * **Hybrid Recurrent SSM + Sparse/Full Attention**: GatedDeltaNet linear recurrent attention layers ($O(1)$ constant-memory recurrent state updates) with Sigmoid output gating interleaved 3:1 with Qwen Sparse Attention (QSA) or Grouped-Query Attention (GQA).
 * **Massive Fine-Grained Sparsity & High-Throughput Routing**: 256–512 routed experts per layer (Top-8 / Top-10 activated per token) plus dedicated Sigmoid-gated shared experts with zero-copy NVMe streaming.
@@ -302,6 +308,7 @@ flowchart TD
 ---
 
 ### Phase 7: Odds & Ends ⏳ *(In Progress)*
+- [ ] Support for Ornith 1.5 vision capabilities
 - [ ] Configurable YaRN RoPE scaling UI toggle for long-context execution up to 1M tokens.
 - [ ] UI/UX refinement
 
