@@ -244,36 +244,111 @@ public final class FileReadTool: AgentTool {
             }
         }
 
+        // Known binary formats surface as a structured "unsupported type" result instead
+        // of a generic UTF-8 decode error, so the model knows the read never happened.
+        if let fileKind = AgentHarness.binaryFileKind(at: resolvedPath) {
+            let err = "file_read cannot display binary content (detected: \(fileKind))."
+            let res = AgentHarness.toolErrorJSON(tool: "file_read", error: err, extra: [
+                "file_kind": fileKind,
+                "hint": "Use shell_run with `file \"\(resolvedPath.path)\"` to identify the format, or a format-specific command to extract text."
+            ])
+            return (res, nil, err, false)
+        }
+
         do {
-            let content = try String(contentsOf: resolvedPath, encoding: .utf8)
+            let data = try Data(contentsOf: resolvedPath)
+            let isUTF8 = String(data: data, encoding: .utf8) != nil
+            guard let content = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else {
+                let err = "Failed to decode file as text (neither UTF-8 nor Latin-1). It is likely binary."
+                return (AgentHarness.toolErrorJSON(tool: "file_read", error: err), nil, err, false)
+            }
             let lines = content.components(separatedBy: "\n")
             let totalLines = lines.count
 
             var startLine = 1
             if let s = arguments["start_line"] as? Int {
                 startLine = max(1, min(s, totalLines))
+            } else if let s = arguments["start_line"], let si = Int(String(describing: s)) {
+                startLine = max(1, min(si, totalLines))
             }
 
             var endLine = totalLines
             if let e = arguments["end_line"] as? Int {
                 endLine = max(startLine, min(e, totalLines))
+            } else if let e = arguments["end_line"], let ei = Int(String(describing: e)) {
+                endLine = max(startLine, min(ei, totalLines))
             }
 
-            var numberedLines: [String] = []
-            for idx in (startLine - 1)..<endLine {
-                numberedLines.append("\(idx + 1): \(lines[idx])")
+            // Head-heavy line-budget slicing: show as many leading lines as the character
+            // budget allows, keep a short tail for orientation, and mark everything in
+            // between with an explicit marker plus a paging hint the model can act on.
+            let charBudget = max(400, maxOutputLength)
+            let tailLineCount = (endLine - startLine + 1) > 2 ? 2 : 0
+            let tailStartIdx = max(startLine - 1, endLine - tailLineCount)
+
+            var tailLines: [String] = []
+            for idx in tailStartIdx..<endLine {
+                var lineText = "\(idx + 1): \(lines[idx])"
+                if lineText.utf8.count > 600 {
+                    lineText = String(lineText.prefix(600)) + " <<<LINE TRUNCATED>>>"
+                }
+                tailLines.append(lineText)
+            }
+            let tailText = tailLines.joined(separator: "\n")
+            let tailCost = tailText.utf8.count + 72
+
+            var bodyLines: [String] = []
+            var usedBytes = 0
+            var lastIncludedIdx = startLine - 2
+
+            for idx in (startLine - 1)..<tailStartIdx {
+                let lineText = "\(idx + 1): \(lines[idx])"
+                let cost = lineText.utf8.count + 1
+                if usedBytes + cost > charBudget - tailCost { break }
+                bodyLines.append(lineText)
+                usedBytes += cost
+                lastIncludedIdx = idx
             }
 
-            let slicedText = numberedLines.joined(separator: "\n")
-            let sanitized = AgentHarness.truncateText(AgentHarness.sanitizeText(slicedText), limit: maxOutputLength)
+            if bodyLines.isEmpty && tailStartIdx > startLine - 1 {
+                var lineText = "\(startLine): \(lines[startLine - 1])"
+                if lineText.utf8.count > max(80, charBudget / 2) {
+                    lineText = String(lineText.prefix(max(80, charBudget / 2))) + " <<<LINE TRUNCATED>>>"
+                }
+                bodyLines.append(lineText)
+                lastIncludedIdx = startLine - 1
+            }
 
-            let res = AgentHarness.toolSuccessJSON(tool: "file_read", data: [
+            let omittedCount = max(0, tailStartIdx - lastIncludedIdx - 1)
+            var contentParts: [String] = []
+            if !bodyLines.isEmpty { contentParts.append(bodyLines.joined(separator: "\n")) }
+            if omittedCount > 0 {
+                contentParts.append("<<<TRUNCATED: lines \(lastIncludedIdx + 2)-\(tailStartIdx) of \(totalLines) omitted>>>")
+            }
+            if !tailText.isEmpty && tailStartIdx > lastIncludedIdx { contentParts.append(tailText) }
+
+            let slicedText = contentParts.joined(separator: "\n")
+            let sanitized = AgentHarness.sanitizeText(slicedText)
+
+            var resultData: [String: Any] = [
                 "path": resolvedPath.path,
                 "total_lines": totalLines,
                 "start_line": startLine,
                 "end_line": endLine,
                 "content": sanitized
-            ])
+            ]
+            if !isUTF8 {
+                resultData["encoding_note"] = "File is not valid UTF-8; decoded as ISO Latin-1 (some bytes may display incorrectly)."
+            }
+            if omittedCount > 0 {
+                let nextStart = lastIncludedIdx + 2
+                resultData["truncated"] = true
+                resultData["omitted_lines"] = omittedCount
+                resultData["next_start_line"] = nextStart
+                resultData["continuation_hint"] = "Call file_read again with start_line=\(nextStart) to read the next chunk."
+            }
+
+            let res = AgentHarness.toolSuccessJSON(tool: "file_read", data: resultData)
             return (res, sanitized, nil, false)
         } catch {
             let err = "Failed to read file: \(error.localizedDescription)"
@@ -1013,7 +1088,7 @@ public final class WebFetchTool: AgentTool {
                 ],
                 "max_length": [
                     "type": "integer",
-                    "description": "Optional maximum character length of returned content (defaults to 16,000 characters, up to 30,000)."
+                    "description": "Optional maximum character length of returned content (defaults to the configured tool-output token budget, up to 30,000 characters)."
                 ]
             ]),
             "required": AnyCodable(["url"])
@@ -1030,7 +1105,9 @@ public final class WebFetchTool: AgentTool {
 
         let queryFilter = (arguments["query"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         let customMax = arguments["max_length"] as? Int
-        let defaultLimit = max(24000, maxOutputLength)
+        // Respect the configured token budget (passed in as a character budget), with a
+        // floor for usable research snippets and the historical 24k-char ceiling.
+        let defaultLimit = max(4000, min(24000, maxOutputLength))
         let limit = customMax.map { min(40000, max(1000, $0)) } ?? defaultLimit
 
         do {
@@ -1118,14 +1195,18 @@ public final class WebFetchTool: AgentTool {
                 }
             }
 
+            let sanitizedContent = AgentHarness.sanitizeText(contentToReturn)
+            let sanitizedTitle = AgentHarness.sanitizeText(pageTitle)
             var resultData: [String: Any] = [
                 "url": url.absoluteString,
                 "domain": domain,
                 "is_official_domain": isOfficial,
-                "title": pageTitle,
+                "title": sanitizedTitle,
                 "content_length": contentToReturn.count,
-                "sections": WebFetchTool.extractStructuredSections(from: contentToReturn),
-                "content": contentToReturn
+                // Headings only — the full body already ships in `content`; duplicating
+                // section bodies doubled every fetch's context cost.
+                "section_headings": WebFetchTool.sectionHeadings(from: contentToReturn),
+                "content": sanitizedContent
             ]
             if let pubDate = detectedDate {
                 resultData["published_date"] = pubDate
@@ -1450,6 +1531,15 @@ public final class WebFetchTool: AgentTool {
         }
 
         return sections
+    }
+
+    /// Extracts just the markdown headings of a cleaned page — a compact table of contents
+    /// that does not duplicate the body content.
+    public static func sectionHeadings(from markdown: String) -> [String] {
+        markdown.components(separatedBy: .newlines)
+            .filter { $0.hasPrefix("## ") || $0.hasPrefix("# ") }
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "#* \t")) }
+            .filter { !$0.isEmpty }
     }
 
     /// Extracts content sections matching query keywords while strictly preserving natural document order
@@ -2563,6 +2653,8 @@ public final class AgentHarness {
     /// Subset of `tools` currently exposed to the model in the prompt and grammar.
     public private(set) var loadedTools: [String: AgentTool] = [:]
     public var defaultWorkingDirectory: URL? = nil
+    /// Token budget for a single tool result (converted to characters conservatively
+    /// via `charBudget(forTokenBudget:)` before tools truncate their output).
     public var maxToolOutputLength: Int = 4000
     public var maxAgentSteps: Int = 15
     /// Session that owns the in-flight agent run; stamped onto spawned subagents.
@@ -2870,6 +2962,17 @@ public final class AgentHarness {
         - When you relay a subagent's results, always end with a final answer to the user. Do not end your turn after spawning, checking, or acknowledging a subagent — the task is only done when the user has received the outcome.
         """
 
+        prompt += """
+
+        # Tool Result Format & Reading Guidance
+
+        Tool results are delivered as PLAIN TEXT, not JSON: a `[tool_name] status` header line, `key: value` metadata lines, and one or more `--- field ---` sections containing the raw content verbatim. Read the `--- content ---` section as the actual file/page text.
+
+        Truncation markers (`<<<TRUNCATED: ... omitted>>>`, `<<<LINE TRUNCATED>>>`) mark spans cut for context budget — they are harness annotations, NOT file content. When a result reports `next_start_line` or `continuation_hint`, call the tool again with that `start_line` to page through the rest instead of assuming the document is broken.
+
+        Documents exported from editors often contain harmless artifacts that are NOT corruption: image placeholders like `![][image12]` (missing embedded images/formulas), citation footnote digits glued to sentence ends (e.g. "hardware1", "clusters1"), and escaped punctuation (`\\_`, `\\~`, `\\=`, `\\-`). Also ignore `[inline base64 data omitted ...]` placeholders where binary images were stripped. Interpret these as export artifacts and read the text around them; never conclude that a product, file, or document "is corrupted", "is not real", or "does not exist" because of them.
+        """
+
         if isLingModel {
             prompt += """
             If you choose to call a function ONLY reply in the following native format with NO suffix:
@@ -2956,7 +3059,7 @@ public final class AgentHarness {
             if let registration = Self.toolRegistrationNotice(for: r) {
                 turn += registration + "\n"
             }
-            turn += "<tool_response>\n\(r)\n</tool_response>\n"
+            turn += "<tool_response>\n\(Self.renderToolResultForModel(r))\n</tool_response>\n"
         }
         turn += "<|im_end|>\n<|im_start|>assistant\n"
         if includeThinkSuffix {
@@ -2982,7 +3085,7 @@ public final class AgentHarness {
             if let registration = Self.toolRegistrationNotice(for: r) {
                 turn += registration + "\n"
             }
-            turn += "<tool_response>\n\(r)\n</tool_response>\n"
+            turn += "<tool_response>\n\(Self.renderToolResultForModel(r))\n</tool_response>\n"
         }
         turn += "<|role_end|>"
         guard includeAssistantPrefix else { return turn }
@@ -3282,7 +3385,10 @@ public final class AgentHarness {
         let startTime = CFAbsoluteTimeGetCurrent()
         let wd = workingDirectory ?? defaultWorkingDirectory
         let strArgs = call.arguments.mapValues { String(describing: $0) }
-        let effectiveMaxLen = maxOutputLength ?? self.maxToolOutputLength
+        // maxOutputLength (and maxToolOutputLength) is a TOKEN budget; tools work in
+        // characters, so convert with a conservative chars-per-token estimate.
+        let tokenBudget = maxOutputLength ?? self.maxToolOutputLength
+        let effectiveMaxLen = AgentHarness.charBudget(forTokenBudget: tokenBudget)
 
         guard let tool = tools[call.name] else {
             let err = "Unknown tool '\(call.name)'"
@@ -3292,7 +3398,7 @@ public final class AgentHarness {
                 arguments: strArgs,
                 rawArguments: call.rawArguments,
                 status: .error,
-                output: nil,
+                output: AgentHarness.renderToolResultForModel(json),
                 error: err,
                 executionDurationSeconds: CFAbsoluteTimeGetCurrent() - startTime
             )
@@ -3320,12 +3426,15 @@ public final class AgentHarness {
             let duration = CFAbsoluteTimeGetCurrent() - startTime
             let status: ToolExecutionStatus = (stderr != nil && !stderr!.isEmpty) ? .error : .success
 
+            // Store the exact model-facing rendering so history reconstruction embeds
+            // byte-identical context (live turn and rebuilt turn always agree).
+            let rendered = AgentHarness.renderToolResultForModel(json)
             let rec = ToolCallRecord(
                 name: call.name,
                 arguments: strArgs,
                 rawArguments: call.rawArguments,
                 status: status,
-                output: stdout,
+                output: rendered,
                 error: stderr,
                 executionDurationSeconds: duration
             )
@@ -3339,7 +3448,7 @@ public final class AgentHarness {
                 arguments: strArgs,
                 rawArguments: call.rawArguments,
                 status: .error,
-                output: nil,
+                output: AgentHarness.renderToolResultForModel(json),
                 error: err,
                 executionDurationSeconds: duration
             )
@@ -3441,6 +3550,65 @@ public final class AgentHarness {
         return URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(expanded)
     }
 
+    /// Identifies files that cannot be meaningfully rendered as text, so tools can return
+    /// a structured "unsupported type" result instead of a generic decoding error.
+    /// Returns a short human-readable kind name (e.g. "PNG image"), or nil when the file
+    /// looks like readable text.
+    public static func binaryFileKind(at url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let prefix = try? handle.read(upToCount: 8192), !prefix.isEmpty else { return nil }
+        let bytes = [UInt8](prefix)
+
+        let signatures: [([UInt8], String)] = [
+            ([0x25, 0x50, 0x44, 0x46], "PDF document"),
+            ([0x50, 0x4B, 0x03, 0x04], "ZIP archive (.zip/.docx/.xlsx/.pptx/.jar)"),
+            ([0x50, 0x4B, 0x05, 0x06], "ZIP archive (.zip/.docx/.xlsx/.pptx/.jar)"),
+            ([0x89, 0x50, 0x4E, 0x47], "PNG image"),
+            ([0xFF, 0xD8, 0xFF], "JPEG image"),
+            ([0x47, 0x49, 0x46, 0x38], "GIF image"),
+            ([0x42, 0x4D], "BMP image"),
+            ([0x52, 0x49, 0x46, 0x46], "RIFF container (WAV/AVI/WebP)"),
+            ([0x49, 0x44, 0x33], "MP3 audio"),
+            ([0x4F, 0x67, 0x67, 0x53], "Ogg media"),
+            ([0x66, 0x4C, 0x61, 0x43], "FLAC audio"),
+            ([0xD0, 0xCF, 0x11, 0xE0], "Legacy Microsoft Office document (.doc/.xls/.ppt)"),
+            ([0x7F, 0x45, 0x4C, 0x46], "ELF binary"),
+            ([0x4D, 0x5A], "Windows executable"),
+            ([0xCA, 0xFE, 0xBA, 0xBE], "Java class / Mach-O fat binary"),
+            ([0xFE, 0xED, 0xFA, 0xCE], "Mach-O binary"),
+            ([0xCF, 0xFA, 0xED, 0xFE], "Mach-O binary"),
+            ([0x1F, 0x8B], "gzip archive"),
+            ([0x42, 0x5A, 0x68], "bzip2 archive"),
+            ([0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00], "xz archive"),
+            ([0x28, 0xB5, 0x2F, 0xFD], "zstd archive"),
+            ([0x04, 0x22, 0x4D, 0x18], "lz4 archive"),
+            ([0x53, 0x51, 0x4C, 0x69], "SQLite database"),
+            ([0x00, 0x61, 0x73, 0x6D], "WebAssembly binary")
+        ]
+        for (sig, kind) in signatures where bytes.count >= sig.count && Array(bytes.prefix(sig.count)) == sig {
+            return kind
+        }
+
+        // Heuristic: NUL bytes, or dense control characters, mean non-text content.
+        let sampled = bytes.prefix(4096)
+        if sampled.contains(0x00) { return "binary data" }
+        let controlCount = sampled.filter { $0 < 0x20 && $0 != 0x09 && $0 != 0x0A && $0 != 0x0D && $0 != 0x1B }.count
+        if controlCount > sampled.count / 4 { return "binary data" }
+        return nil
+    }
+
+    /// Matches inline `data:...;base64,...` payloads of 256+ base64 characters.
+    private static let inlineBase64Regex: NSRegularExpression? = {
+        try? NSRegularExpression(pattern: "data:[a-zA-Z0-9.+/-]{1,64};base64,([A-Za-z0-9+/=]{256,})", options: [])
+    }()
+
+    /// Matches standalone base64 runs of 768+ characters (embedded binary blobs that
+    /// no model can read and that otherwise flood the truncation tail with gibberish).
+    private static let longBase64Regex: NSRegularExpression? = {
+        try? NSRegularExpression(pattern: "[A-Za-z0-9+/=]{768,}", options: [])
+    }()
+
     public static func sanitizeText(_ text: String) -> String {
         var s = text
         s = s.replacingOccurrences(of: "<|im_start|>", with: "[im_start]")
@@ -3449,17 +3617,82 @@ public final class AgentHarness {
         s = s.replacingOccurrences(of: "</tool_call>", with: "[/tool_call]")
         s = s.replacingOccurrences(of: "<tool_response>", with: "[tool_response]")
         s = s.replacingOccurrences(of: "</tool_response>", with: "[/tool_response]")
+        // Scrub inline base64 (data URIs first, then any remaining standalone run)
+        // so binary payloads become compact placeholders instead of garbling context.
+        if let re = Self.inlineBase64Regex {
+            let ns = NSMutableString(string: s)
+            for m in re.matches(in: s as String, options: [], range: NSRange(location: 0, length: ns.length)).reversed() {
+                let b64Len = m.range(at: 1).length
+                ns.replaceCharacters(in: m.range, with: "[inline base64 data omitted (\(b64Len) chars)]")
+            }
+            s = ns as String
+        }
+        if let re2 = Self.longBase64Regex {
+            let ns2 = NSMutableString(string: s)
+            for m2 in re2.matches(in: s as String, options: [], range: NSRange(location: 0, length: ns2.length)).reversed() {
+                ns2.replaceCharacters(in: m2.range, with: "[long base64 run omitted (\(m2.range.length) chars)]")
+            }
+            s = ns2 as String
+        }
         return s
     }
 
+    /// Conservative characters-per-token estimate for mixed prose/code output.
+    /// Used to convert the token-based tool-output budget into a character budget.
+    public static func charBudget(forTokenBudget tokens: Int) -> Int {
+        max(600, tokens * 5 / 2)
+    }
+
+    /// Truncates oversized text for the model context. The head keeps as much as the
+    /// budget allows (cut at a line boundary when possible), a short tail preserves
+    /// the end of the output, and the splice is wrapped in an unambiguous marker that
+    /// cannot be mistaken for file content.
     public static func truncateText(_ text: String, limit: Int) -> String {
-        guard text.count > limit else { return text }
-        let headCount = max(100, limit - 400)
-        let tailCount = 300
-        let head = text.prefix(headCount)
-        let tail = text.suffix(tailCount)
-        let truncated = text.count - (headCount + tailCount)
-        return "\(head)\n\n... [truncated \(truncated) characters] ...\n\n\(tail)"
+        let byteLimit = max(200, limit)
+        guard text.utf8.count > byteLimit else { return text }
+
+        let headBudget = max(100, byteLimit - 400)
+        let tailBudget = min(300, max(0, byteLimit / 4))
+        let utf8 = text.utf8
+
+        // Head: end after the last newline within budget (single-line fallback: hard cut).
+        let hardHeadEnd = utf8.index(utf8.startIndex, offsetBy: min(headBudget, utf8.count), limitedBy: utf8.endIndex) ?? utf8.endIndex
+        var headEnd = hardHeadEnd
+        if headEnd < utf8.endIndex {
+            var search = headEnd
+            while search > utf8.startIndex {
+                search = utf8.index(before: search)
+                if utf8[search] == 0x0A {
+                    headEnd = utf8.index(after: search)
+                    break
+                }
+            }
+        }
+
+        // Tail: start right after the first newline at/after the tail lower bound.
+        var tailStart = utf8.endIndex
+        if tailBudget > 0 {
+            let lower = utf8.index(utf8.endIndex, offsetBy: -min(tailBudget, utf8.count), limitedBy: utf8.startIndex) ?? utf8.startIndex
+            var search = lower
+            while search < utf8.endIndex {
+                if utf8[search] == 0x0A {
+                    search = utf8.index(after: search)
+                    break
+                }
+                search = utf8.index(after: search)
+            }
+            tailStart = search
+        }
+
+        let head = String(decoding: utf8[utf8.startIndex..<headEnd], as: UTF8.self)
+        let tail = String(decoding: utf8[tailStart..<utf8.endIndex], as: UTF8.self)
+
+        if headEnd >= tailStart {
+            let omitted = text.utf8.count - head.utf8.count
+            return head + "\n<<<TRUNCATED: \(omitted) characters omitted>>>"
+        }
+        let omitted = text.utf8.count - head.utf8.count - tail.utf8.count
+        return head + "\n<<<TRUNCATED: \(omitted) characters omitted>>>\n" + tail
     }
 
     public static func isOfficialVendorDomain(_ host: String) -> Bool {
@@ -3515,6 +3748,143 @@ public final class AgentHarness {
             return str
         }
         return "{\"status\": \"error\", \"tool\": \"\(tool)\", \"error\": \"\(error)\"}"
+    }
+
+    // MARK: - Tool Result Rendering (model-facing observations)
+
+    /// Renders a tool result JSON into the plain, human-readable form the model should see.
+    /// Observations are emitted as text rather than JSON so file content (HTML, code, CSV)
+    /// reaches the model without `\"` / `\/` / literal-`\n` escaping — the leading cause of
+    /// "garbled" reads on anything quote-dense.
+    ///
+    /// Idempotent: input that is not a tool-result JSON object (already-rendered text,
+    /// plain prose) is returned unchanged, so results can be stored rendered and re-embedded.
+    public static func renderToolResultForModel(_ resultJSON: String) -> String {
+        guard let data = resultJSON.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let toolName = obj["tool"] as? String, !toolName.isEmpty else {
+            return resultJSON
+        }
+        let status = (obj["status"] as? String) ?? "success"
+        var lines: [String] = []
+
+        guard let result = obj["result"] as? [String: Any] else {
+            if status == "error" {
+                lines.append("[\(toolName)] ERROR: \(obj["error"] as? String ?? "unknown error")")
+            } else {
+                lines.append("[\(toolName)] \(status)")
+            }
+            for (k, v) in obj.sorted(by: { $0.key < $1.key }) where k != "status" && k != "tool" && k != "error" {
+                Self.appendRendered(key: k, value: v, indent: 0, to: &lines)
+            }
+            return lines.joined(separator: "\n")
+        }
+
+        if status == "error" {
+            lines.append("[\(toolName)] ERROR: \(obj["error"] as? String ?? result["error"] as? String ?? "unknown error")")
+        } else {
+            lines.append("[\(toolName)] success")
+        }
+        // Metadata first (short values), long text bodies last, in stable key order.
+        let bodyKeys = result.keys.filter { Self.isLongTextValue(result[$0]) }.sorted()
+        let metaKeys = result.keys.filter { !Self.isLongTextValue(result[$0]) }.sorted()
+        for k in metaKeys {
+            Self.appendRendered(key: k, value: result[k], indent: 0, to: &lines)
+        }
+        for k in bodyKeys {
+            guard let v = result[k] else { continue }
+            lines.append("")
+            lines.append("--- \(k) ---")
+            Self.appendLongBody(value: v, indent: 0, to: &lines)
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func isLongTextValue(_ value: Any?) -> Bool {
+        guard let s = value as? String else { return false }
+        return s.contains("\n") || s.count > 240
+    }
+
+    private static func appendRendered(key: String, value: Any?, indent: Int, to lines: inout [String]) {
+        let pad = String(repeating: "  ", count: indent)
+        switch value {
+        case .none:
+            lines.append("\(pad)\(key): (nil)")
+        case let n as NSNumber:
+            // NSNumber bridges BOTH integers and booleans; distinguish via CFBoolean so
+            // `start_line: 1` does not render as `start_line: true`.
+            if CFGetTypeID(n) == CFBooleanGetTypeID() {
+                lines.append("\(pad)\(key): \(n.boolValue ? "true" : "false")")
+            } else {
+                lines.append("\(pad)\(key): \(n.stringValue)")
+            }
+        case let s as String:
+            if s.contains("\n") || s.count > 240 {
+                lines.append("\(pad)\(key):")
+                Self.appendLongBody(value: s, indent: indent + 1, to: &lines)
+            } else {
+                lines.append("\(pad)\(key): \(s.isEmpty ? "(empty)" : s)")
+            }
+        case let a as [Any]:
+            if a.isEmpty {
+                lines.append("\(pad)\(key): (none)")
+            } else if a.allSatisfy({ Self.isCompactScalar($0) }) {
+                lines.append("\(pad)\(key): \(a.map { Self.renderCompact($0) }.joined(separator: ", "))")
+            } else if let dicts = a as? [[String: Any]] {
+                for (i, d) in dicts.enumerated() {
+                    lines.append("\(pad)\(key) #\(i + 1):")
+                    for (k, v) in d.sorted(by: { $0.key < $1.key }) {
+                        Self.appendRendered(key: k, value: v, indent: indent + 1, to: &lines)
+                    }
+                }
+            } else {
+                lines.append("\(pad)\(key): \(Self.renderCompact(a))")
+            }
+        case let d as [String: Any]:
+            lines.append("\(pad)\(key):")
+            for (k, v) in d.sorted(by: { $0.key < $1.key }) {
+                Self.appendRendered(key: k, value: v, indent: indent + 1, to: &lines)
+            }
+        default:
+            lines.append("\(pad)\(key): \(String(describing: value))")
+        }
+    }
+
+    private static func appendLongBody(value: Any, indent: Int, to lines: inout [String]) {
+        let pad = String(repeating: "  ", count: indent)
+        if let s = value as? String {
+            let clean = Self.sanitizeText(s)
+            if indent == 0 {
+                lines.append(clean)
+            } else {
+                lines.append(clean.components(separatedBy: "\n").map { pad + $0 }.joined(separator: "\n"))
+            }
+        } else {
+            lines.append(pad + Self.renderCompact(value))
+        }
+    }
+
+    private static func isCompactScalar(_ value: Any) -> Bool {
+        value is String || value is NSNumber
+    }
+
+    private static func renderCompact(_ value: Any) -> String {
+        switch value {
+        case let s as String:
+            return s
+        case let n as NSNumber:
+            if CFGetTypeID(n) == CFBooleanGetTypeID() {
+                return n.boolValue ? "true" : "false"
+            }
+            return n.stringValue
+        default:
+            if JSONSerialization.isValidJSONObject([value]),
+               let data = try? JSONSerialization.data(withJSONObject: [value], options: [.sortedKeys, .withoutEscapingSlashes]),
+               let str = String(data: data, encoding: .utf8) {
+                return truncateText(String(str.dropFirst(1).dropLast(2)), limit: 2000)
+            }
+            return String(describing: value)
+        }
     }
 
     public static func runProcess(

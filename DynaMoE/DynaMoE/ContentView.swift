@@ -1420,7 +1420,7 @@ struct ContentView: View {
         }
         guard !pending.isEmpty else { return [] }
         return pending.map { s in
-            let clean = AgentHarness.truncateText(AgentHarness.sanitizeText(s.finalSummary), limit: self.maxToolOutputLength)
+            let clean = AgentHarness.truncateText(AgentHarness.sanitizeText(s.finalSummary), limit: AgentHarness.charBudget(forTokenBudget: self.maxToolOutputLength))
             return "[SUBAGENT_RESULT] role=\(s.role) id=\(s.id.uuidString) status=\(s.status.rawValue)\n\(clean)"
         }
     }
@@ -9945,6 +9945,18 @@ struct ContentView: View {
                                 error: "Empty arguments — this call carried no usable parameters and was not executed. Either provide real arguments, or stop calling tools and answer the user directly from what you already know."
                             )
                             toolResponses.append(emptyArgJSON)
+                            if !emptyArgJSON.isEmpty {
+                                // Keep record output identical to what the model sees in the
+                                // live observation turn so history reconstruction agrees.
+                                if let sId = sessionId, let mId = messageId,
+                                   let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                                   let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }),
+                                   var currentCalls = self.sessions[sIdx].messages[mIdx].toolCalls,
+                                   let callIdx = currentCalls.firstIndex(where: { $0.id == recordId }) {
+                                    currentCalls[callIdx].output = AgentHarness.renderToolResultForModel(emptyArgJSON)
+                                    self.sessions[sIdx].messages[mIdx].toolCalls = currentCalls
+                                }
+                            }
                             continue
                         }
                         AgentHarness.shared.recordToolCallValidity(true)
@@ -9981,6 +9993,14 @@ struct ContentView: View {
                                 }
                                 let rejectJSON = AgentHarness.toolErrorJSON(tool: call.name, error: "Action rejected by user.")
                                 toolResponses.append(rejectJSON)
+                                if let sId = sessionId, let mId = messageId,
+                                   let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                                   let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }),
+                                   var currentCalls = self.sessions[sIdx].messages[mIdx].toolCalls,
+                                   let callIdx = currentCalls.firstIndex(where: { $0.id == recordId }) {
+                                    currentCalls[callIdx].output = AgentHarness.renderToolResultForModel(rejectJSON)
+                                    self.sessions[sIdx].messages[mIdx].toolCalls = currentCalls
+                                }
                                 continue
                             }
                         }
@@ -10089,7 +10109,7 @@ struct ContentView: View {
                             if !assistantTurnText.contains(endTag) {
                                 assistantTurnText += endTag
                             }
-                            let toolResponseContext = toolResponses.joined(separator: "\n")
+                            let toolResponseContext = toolResponses.map { AgentHarness.renderToolResultForModel($0) }.joined(separator: "\n")
                             let synthesisDirective = """
                             \n\n<system>
                             IMPORTANT: All tool use is now DISABLED for this task. You consumed your search budget by repeatedly searching, or your recent tool calls carried empty arguments and could not be executed. The run was forcibly ended to protect the conversation from looping.

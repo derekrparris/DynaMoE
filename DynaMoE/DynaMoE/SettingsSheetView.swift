@@ -1199,14 +1199,14 @@ struct SettingsSheetView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Max Tool Output Length")
+                            Text("Max Tool Output (tokens)")
                                 .font(.system(size: 13, weight: .medium))
-                            Text("Protects context window from large outputs via intelligent head/tail truncation.")
+                            Text("Token budget per tool result. Observations are rendered as plain text and truncated head/tail at line boundaries.")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
                         Spacer()
-                        Text("\(maxToolOutputLength) chars")
+                        Text("\(maxToolOutputLength) tokens")
                             .font(.system(.caption, design: .monospaced))
                             .foregroundColor(.purple)
                     }
