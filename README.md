@@ -220,24 +220,6 @@ DynaMoE/
 
 ## Project Roadmap & Status
 
-```mermaid
-flowchart TD
-    A["Phase 1: Ingestion & Zero-Copy ✅"] --> B["Phase 2: MoE Layer Compute ✅"]
-    B --> C["Phase 3: Generation & Memory Optimization ✅"]
-    C --> D["Phase 4: Multi-Session Chat & Rich UX ✅"]
-    D --> E["Phase 5: JetSpec Speculative Tree Engine ✅"]
-    E --> F["Phase 6: Developer Agent & Multi-Agent Swarm ✅"]
-    F --> G["Phase 7: Local Server & Ecosystem Integration ⏳ (In Progress)"]
-    
-    style A fill:#4CAF50,stroke:#388E3C,stroke-width:2px,color:#fff
-    style B fill:#4CAF50,stroke:#388E3C,stroke-width:2px,color:#fff
-    style C fill:#4CAF50,stroke:#388E3C,stroke-width:2px,color:#fff
-    style D fill:#4CAF50,stroke:#388E3C,stroke-width:2px,color:#fff
-    style E fill:#4CAF50,stroke:#388E3C,stroke-width:2px,color:#fff
-    style F fill:#4CAF50,stroke:#388E3C,stroke-width:2px,color:#fff
-    style G fill:#2196F3,stroke:#1976D2,stroke-width:2px,color:#fff
-```
-
 ### Phase 1: Foundation & Zero-Copy Ingestion ✅ *(Completed)*
 - [x] Project architecture, licensing, and repository setup.
 - [x] Automated Rust $\leftrightarrow$ Swift UniFFI compilation pipeline integrated into Xcode build phases.
@@ -309,6 +291,8 @@ flowchart TD
 
 ### Phase 7: Odds & Ends ⏳ *(In Progress)*
 - [ ] Support for Ornith 1.5 vision capabilities
+- [ ] Support Apple Foundation Models
+- [ ] Use Apple Foundation Model (AFM) to compact conversations
 - [ ] Configurable YaRN RoPE scaling UI toggle for long-context execution up to 1M tokens.
 - [ ] UI/UX refinement
 
