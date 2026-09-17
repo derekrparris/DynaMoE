@@ -5,7 +5,7 @@ edition = "2021"
 
 [lib]
 name = "dynamoe_core"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 memmap2 = "0.9"

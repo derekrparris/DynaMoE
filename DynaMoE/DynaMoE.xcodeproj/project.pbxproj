@@ -272,7 +272,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -e # Abort the build immediately if any command fails\n\n# 1. Xcode strips external paths. We must inject Cargo and Homebrew into the PATH.\nexport PATH=\"$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"\n\n# 2. Navigate to your Rust core directory\ncd \"$SRCROOT/../core\"\n\n# 3. Check if Xcode is building for Debug or Release\nif [ \"$CONFIGURATION\" = \"Release\" ]; then\n    CARGO_TARGET_DIR=\"release\"\n    CARGO_BUILD_FLAG=\"--release\"\nelse\n    CARGO_TARGET_DIR=\"debug\"\n    CARGO_BUILD_FLAG=\"\"\nfi\n\n# 4. Compile the Rust library\necho \"Compiling Rust Engine ($CONFIGURATION)...\"\ncargo build $CARGO_BUILD_FLAG\n\n# Ensure the library file referenced by Xcode is up-to-date with this configuration\nif [ \"$CONFIGURATION\" = \"Release\" ]; then\n    mkdir -p \"target/debug\"\n    cp -f \"target/release/libdynamoe_core.a\" \"target/debug/libdynamoe_core.a\" 2>/dev/null || true\n    cp -f \"target/release/libdynamoe_core.dylib\" \"target/debug/libdynamoe_core.dylib\" 2>/dev/null || true\nfi\n\n# 5. Generate the UniFFI Swift Bindings\necho \"Generating Swift Bindings...\"\ncargo run --bin uniffi-bindgen generate \\\n    --library \"target/$CARGO_TARGET_DIR/libdynamoe_core.dylib\" \\\n    --language swift \\\n    --out-dir \"$SRCROOT/../GeneratedFFI\"\n";
+			shellScript = "set -e # Abort the build immediately if any command fails\n\n# 1. Xcode strips external paths. We must inject Cargo and Homebrew into the PATH.\nexport PATH=\"$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"\n\n# 2. Navigate to your Rust core directory\ncd \"$SRCROOT/../core\"\n\n# 3. Check if Xcode is building for Debug or Release\nif [ \"$CONFIGURATION\" = \"Release\" ]; then\n    CARGO_TARGET_DIR=\"release\"\n    CARGO_BUILD_FLAG=\"--release\"\nelse\n    CARGO_TARGET_DIR=\"debug\"\n    CARGO_BUILD_FLAG=\"\"\nfi\n\n# 4. Compile the Rust library\necho \"Compiling Rust Engine ($CONFIGURATION)...\"\ncargo build $CARGO_BUILD_FLAG\n\n# Clean up any leftover dylibs and ensure static archive is ready\nrm -f target/*/libdynamoe_core.dylib\nif [ \"$CONFIGURATION\" = \"Release\" ]; then\n    mkdir -p \"target/debug\"\n    cp -f \"target/release/libdynamoe_core.a\" \"target/debug/libdynamoe_core.a\" 2>/dev/null || true\nfi\n\n# 5. Generate the UniFFI Swift Bindings\necho \"Generating Swift Bindings...\"\ncargo run --bin uniffi-bindgen generate \\\n    --library \"target/$CARGO_TARGET_DIR/libdynamoe_core.a\" \\\n    --language swift \\\n    --out-dir \"$SRCROOT/../GeneratedFFI\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -474,7 +474,8 @@
 				"LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]" = "@executable_path/../Frameworks";
 				LIBRARY_SEARCH_PATHS = "$(SRCROOT)/../core/target/debug";
 				MACOSX_DEPLOYMENT_TARGET = 15.6;
-				MARKETING_VERSION = 0.8.3;
+				MARKETING_VERSION = 0.8.4;
+				OTHER_LDFLAGS = "-lc++";
 				PRODUCT_BUNDLE_IDENTIFIER = DRP.DynaMoE;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
@@ -541,7 +542,8 @@
 					"$(SRCROOT)/../core/target/debug",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 15.6;
-				MARKETING_VERSION = 0.8.3;
+				MARKETING_VERSION = 0.8.4;
+				OTHER_LDFLAGS = "-lc++";
 				PRODUCT_BUNDLE_IDENTIFIER = DRP.DynaMoE;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;

@@ -240,7 +240,7 @@ fileprivate enum UniffiInternalError: LocalizedError {
     }
 }
 
-fileprivate extension NSRecursiveLock {
+fileprivate extension NSLock {
     func withLock<T>(f: () throws -> T) rethrows -> T {
         self.lock()
         defer { self.unlock() }
@@ -354,7 +354,7 @@ private func uniffiTraitInterfaceCallWithError<T, E>(
 }
 fileprivate class UniffiHandleMap<T> {
     private var map: [UInt64: T] = [:]
-    private let lock = NSRecursiveLock()
+    private let lock = NSLock()
     private var currentHandle: UInt64 = 1
 
     func insert(obj: T) -> UInt64 {

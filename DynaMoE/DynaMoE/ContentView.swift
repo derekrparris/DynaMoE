@@ -1494,8 +1494,77 @@ struct ContentView: View {
             )
         }
 
+        let isSpark = (modelConfig?.isSparkModel == true)
         let isLing = (modelConfig?.isLingModel == true)
-        if isLing {
+        if isSpark {
+            // Spark 2.5 DeepSeek-style dialect:
+            // <｜start▁of▁sentence｜><|System|>\n...<｜end▁of▁sentence｜>
+            // <｜start▁of▁sentence｜><|User|>...<｜end▁of▁sentence｜>
+            // <｜start▁of▁sentence｜><|Bot|></think> / <think>
+            if effectiveSystem.isEmpty {
+                promptString += "<｜start▁of▁sentence｜><|System|>\nyou are a helpful assistant.<｜end▁of▁sentence｜>"
+            } else {
+                promptString += "<｜start▁of▁sentence｜><|System|>\n\(effectiveSystem)<｜end▁of▁sentence｜>"
+            }
+            for msg in sessions[sessionIdx].messages.dropLast() {
+                let cleanMsg = msg.content
+                    .replacingOccurrences(of: "<｜end▁of▁sentence｜>", with: "")
+                    .replacingOccurrences(of: "<｜start▁of▁sentence｜>", with: "")
+                    .replacingOccurrences(of: "<|im_end|>", with: "")
+                    .replacingOccurrences(of: "<|im_start|>", with: "")
+                    .replacingOccurrences(of: "<think>", with: "")
+                    .replacingOccurrences(of: "</think>", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let hasTools = (msg.toolCalls != nil && !msg.toolCalls!.isEmpty)
+                guard !cleanMsg.isEmpty || (msg.thinkingContent != nil && !msg.thinkingContent!.isEmpty) || hasTools else { continue }
+
+                if msg.role == .user {
+                    promptString += "<｜start▁of▁sentence｜><|User|>\(cleanMsg)<｜end▁of▁sentence｜>"
+                } else if msg.role == .assistant {
+                    var assistantBody = ""
+                    if let think = msg.thinkingContent, !think.isEmpty {
+                        let cleanThink = think
+                            .replacingOccurrences(of: "<think>", with: "")
+                            .replacingOccurrences(of: "</think>", with: "")
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        assistantBody += "<think>\(cleanThink)</think>"
+                    } else {
+                        assistantBody += "</think>"
+                    }
+                    if !cleanMsg.isEmpty {
+                        assistantBody += cleanMsg
+                    }
+                    // History reconstruction in Spark's native function-call dialect
+                    if let calls = msg.toolCalls, !calls.isEmpty, !cleanMsg.contains("tool_call>") {
+                        for call in calls {
+                            assistantBody += "\n<tool_call>\(call.name)"
+                            for (k, v) in call.arguments {
+                                assistantBody += "<arg_key>\(k)</arg_key><arg_value>\(v)</arg_value>"
+                                }
+                            assistantBody += "\n</tool_call>"
+                        }
+                    }
+                    promptString += "<｜start▁of▁sentence｜><|Bot|>\(assistantBody)<｜end▁of▁sentence｜>"
+
+                    if let calls = msg.toolCalls, !calls.isEmpty {
+                        var outputs: [String] = []
+                        for call in calls {
+                            if let out = call.output ?? call.error {
+                                outputs.append(out)
+                            }
+                        }
+                        if !outputs.isEmpty {
+                            promptString += AgentHarness.shared.formatSparkToolResponseTurn(responses: outputs)
+                        }
+                    }
+                }
+            }
+            if thinkingEnabled {
+                promptString += "<｜start▁of▁sentence｜><|Bot|><think>"
+            } else {
+                promptString += "<｜start▁of▁sentence｜><|Bot|></think>"
+            }
+        } else if isLing {
             let thinkingOption = thinkingEnabled ? "on" : "off"
             if !effectiveSystem.isEmpty {
                 promptString += "<role>SYSTEM</role>\(effectiveSystem)\ndetailed thinking \(thinkingOption)<|role_end|>"
@@ -3349,6 +3418,22 @@ struct ContentView: View {
                 let thinkTag = thinkingEnabled ? "\n<think>" : "\n<think></think>"
                 formattedPrompt = "<role>SYSTEM</role>\(sysPart)<|role_end|><role>HUMAN</role>\(prompt)<|role_end|><role>ASSISTANT</role>\(thinkTag)"
             }
+        } else if modelConfig?.isSparkModel == true {
+            // Spark 2.5 DeepSeek-style dialect
+            if prompt.contains("<|Bot|>") || prompt.contains("<|User|>") || prompt.contains("<|System|>") {
+                formattedPrompt = prompt
+            } else {
+                var p = ""
+                if cleanSystem.isEmpty {
+                    p += "<｜start▁of▁sentence｜><|System|>\nYou are a helpful assistant.<｜end▁of▁sentence｜>"
+                } else {
+                    p += "<｜start▁of▁sentence｜><|System|>\n\(cleanSystem)<｜end▁of▁sentence｜>"
+                }
+                p += "<｜start▁of▁sentence｜><|User|>\(prompt)<｜end▁of▁sentence｜>"
+                let sparkThink = thinkingEnabled ? "<think>" : "<think></think>"
+                p += "<｜start▁of▁sentence｜><|Bot|>\(sparkThink)"
+                formattedPrompt = p
+            }
         } else if prompt.contains("<|im_start|>") {
             var p = prompt
             if !cleanSystem.isEmpty && !prompt.contains("<|im_start|>system") {
@@ -3393,7 +3478,7 @@ struct ContentView: View {
         // Find Embedding Weight & Affine Scales/Biases
         guard let embedWeight = summary.tensors.first(where: {
             !$0.name.contains("visual") && !$0.name.contains("mtp") &&
-            ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.contains("wte") || $0.name.contains("word_embeddings") || $0.category == "Embedding") &&
+            ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.hasSuffix("embedding.weight") || $0.name.contains("wte") || $0.name.contains("word_embeddings") || $0.category == "Embedding") &&
             !$0.name.contains("scale") && !$0.name.contains("scales") &&
             !$0.name.contains("bias") && !$0.name.contains("biases")
         }), let embedShardBuffer = shardBuffers[embedWeight.shardIndex] else {
@@ -3405,12 +3490,12 @@ struct ContentView: View {
 
         let embedScale = summary.tensors.first(where: {
             !$0.name.contains("visual") && !$0.name.contains("mtp") &&
-            ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.contains("wte") || $0.name.contains("word_embeddings") || $0.category == "Embedding") &&
+            ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.hasSuffix("embedding.weight") || $0.name.contains("wte") || $0.name.contains("word_embeddings") || $0.category == "Embedding") &&
             ($0.name.contains("scale") || $0.name.contains("scales"))
         })
         let embedBias = summary.tensors.first(where: {
             !$0.name.contains("visual") && !$0.name.contains("mtp") &&
-            ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.contains("wte") || $0.name.contains("word_embeddings") || $0.category == "Embedding") &&
+            ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.hasSuffix("embedding.weight") || $0.name.contains("wte") || $0.name.contains("word_embeddings") || $0.category == "Embedding") &&
             ($0.name.contains("bias") || $0.name.contains("biases"))
         })
 
@@ -3534,6 +3619,12 @@ struct ContentView: View {
         let gqaStandardPipeline: MTLComputePipelineState?
         let gqaStandardF16Pipeline: MTLComputePipelineState?
         let gqaStandardFP8Pipeline: MTLComputePipelineState?
+        let gqaHeadGatePipeline: MTLComputePipelineState?
+        let gqaHeadGateF16Pipeline: MTLComputePipelineState?
+        let gqaHeadGateFP8Pipeline: MTLComputePipelineState?
+        let bf16GeluGateUpPipeline: MTLComputePipelineState?
+        let bf16GeluGateUpSimdPipeline: MTLComputePipelineState?
+        let bf16GeluGateUpBatchedPipeline: MTLComputePipelineState?
         let causalConv1dPipeline: MTLComputePipelineState?
         let l2NormQkPipeline: MTLComputePipelineState?
         let linearAttnStepPipeline: MTLComputePipelineState?
@@ -3596,6 +3687,30 @@ struct ContentView: View {
             if let rmsOffsetF16Func = defaultLibrary.makeFunction(name: "rmsnorm_offset_f16") {
                 rmsnormOffsetF16Pipeline = try device.makeComputePipelineState(function: rmsOffsetF16Func)
             } else { rmsnormOffsetF16Pipeline = nil }
+
+            if let gqaHeadGateFunc = defaultLibrary.makeFunction(name: "gqa_attention_decode_headgate") {
+                gqaHeadGatePipeline = try device.makeComputePipelineState(function: gqaHeadGateFunc)
+            } else { gqaHeadGatePipeline = nil }
+
+            if let gqaHeadGateF16Func = defaultLibrary.makeFunction(name: "gqa_attention_decode_headgate_f16") {
+                gqaHeadGateF16Pipeline = try device.makeComputePipelineState(function: gqaHeadGateF16Func)
+            } else { gqaHeadGateF16Pipeline = nil }
+
+            if let gqaHeadGateFP8Func = defaultLibrary.makeFunction(name: "gqa_attention_decode_headgate_fp8") {
+                gqaHeadGateFP8Pipeline = try device.makeComputePipelineState(function: gqaHeadGateFP8Func)
+            } else { gqaHeadGateFP8Pipeline = nil }
+
+            if let geluGateUpFunc = defaultLibrary.makeFunction(name: "bf16_gelu_gate_up") {
+                bf16GeluGateUpPipeline = try device.makeComputePipelineState(function: geluGateUpFunc)
+            } else { bf16GeluGateUpPipeline = nil }
+
+            if let geluGateUpSimdFunc = defaultLibrary.makeFunction(name: "bf16_gelu_gate_up_simd") {
+                bf16GeluGateUpSimdPipeline = try device.makeComputePipelineState(function: geluGateUpSimdFunc)
+            } else { bf16GeluGateUpSimdPipeline = nil }
+
+            if let geluGateUpBatchedFunc = defaultLibrary.makeFunction(name: "bf16_gelu_gate_up_batched") {
+                bf16GeluGateUpBatchedPipeline = try device.makeComputePipelineState(function: geluGateUpBatchedFunc)
+            } else { bf16GeluGateUpBatchedPipeline = nil }
             gemvBF16Pipeline = try device.makeComputePipelineState(function: gemvBF16Function)
             addPipeline = try device.makeComputePipelineState(function: addFunction)
             clearPipeline = try device.makeComputePipelineState(function: clearFunction)
@@ -4154,7 +4269,8 @@ struct ContentView: View {
                 groupSize: UInt32 = 64,
                 inOffset: Int = 0,
                 outOffset: Int = 0,
-                batchSize: Int = 1
+                batchSize: Int = 1,
+                weightOffsetAdd: UInt64 = 0
             ) {
                 // Split oversized batched GEMVs into short dispatches. Each row is independent,
                 // so slicing is mathematically identical while letting the GPU scheduler
@@ -4171,14 +4287,15 @@ struct ContentView: View {
                             groupSize: groupSize,
                             inOffset: inOffset + sliceStart * Int(inDim) * MemoryLayout<Float>.stride,
                             outOffset: outOffset + sliceStart * Int(outDim) * MemoryLayout<Float>.stride,
-                            batchSize: rows
+                            batchSize: rows,
+                            weightOffsetAdd: weightOffsetAdd
                         )
                         sliceStart += rows
                     }
                     return
                 }
                 guard let w = weight, let wRaw = buffers[w.shardIndex] else { return }
-                var wOff = w.offsetStart
+                var wOff = w.offsetStart + weightOffsetAdd
                 var inD = inDim
                 var outD = outDim
                 var grp = groupSize
@@ -4999,9 +5116,19 @@ struct ContentView: View {
                             let currentQDim = isStandardGqa ? (numHeads * headDim) : (numHeads * headDim * 2)
                             let currentKvDim = kvStride
 
-                            dispatchLinear(enc: layerEnc1, weight: layer.qProjTensor, scale: layer.qScaleTensor, bias: layer.qBiasTensor, inBuf: xNorm1Buffer, outBuf: qGateBuffer, inDim: hiddenDim, outDim: currentQDim)
-                            dispatchLinear(enc: layerEnc1, weight: layer.kProjTensor, scale: layer.kScaleTensor, bias: layer.kBiasTensor, inBuf: xNorm1Buffer, outBuf: kVectorBuffer, inDim: hiddenDim, outDim: currentKvDim)
-                            dispatchLinear(enc: layerEnc1, weight: layer.vProjTensor, scale: layer.vScaleTensor, bias: layer.vBiasTensor, inBuf: xNorm1Buffer, outBuf: vVectorBuffer, inDim: hiddenDim, outDim: currentKvDim)
+                            if let fusedQKV = layer.fusedQKVTensor {
+                                // Spark 2.5: single fused q_k_v_proj [qDim + 2*kvDim, hiddenDim]
+                                dispatchLinear(enc: layerEnc1, weight: fusedQKV, scale: nil, bias: nil, inBuf: xNorm1Buffer, outBuf: qGateBuffer, inDim: hiddenDim, outDim: currentQDim)
+                                dispatchLinear(enc: layerEnc1, weight: fusedQKV, scale: nil, bias: nil, inBuf: xNorm1Buffer, outBuf: kVectorBuffer, inDim: hiddenDim, outDim: currentKvDim, weightOffsetAdd: UInt64(currentQDim) * UInt64(hiddenDim) * 2)
+                                dispatchLinear(enc: layerEnc1, weight: fusedQKV, scale: nil, bias: nil, inBuf: xNorm1Buffer, outBuf: vVectorBuffer, inDim: hiddenDim, outDim: currentKvDim, weightOffsetAdd: (UInt64(currentQDim) + UInt64(currentKvDim)) * UInt64(hiddenDim) * 2)
+                                if let gateProj = layer.attnGateProjTensor {
+                                    dispatchLinear(enc: layerEnc1, weight: gateProj, scale: nil, bias: nil, inBuf: xNorm1Buffer, outBuf: bVectorBuffer, inDim: hiddenDim, outDim: numHeads)
+                                }
+                            } else {
+                                dispatchLinear(enc: layerEnc1, weight: layer.qProjTensor, scale: layer.qScaleTensor, bias: layer.qBiasTensor, inBuf: xNorm1Buffer, outBuf: qGateBuffer, inDim: hiddenDim, outDim: currentQDim)
+                                dispatchLinear(enc: layerEnc1, weight: layer.kProjTensor, scale: layer.kScaleTensor, bias: layer.kBiasTensor, inBuf: xNorm1Buffer, outBuf: kVectorBuffer, inDim: hiddenDim, outDim: currentKvDim)
+                                dispatchLinear(enc: layerEnc1, weight: layer.vProjTensor, scale: layer.vScaleTensor, bias: layer.vBiasTensor, inBuf: xNorm1Buffer, outBuf: vVectorBuffer, inDim: hiddenDim, outDim: currentKvDim)
+                            }
                             layerEnc1.memoryBarrier(scope: .buffers)
 
                             // Q-Norm (if present)
@@ -5066,10 +5193,10 @@ struct ContentView: View {
                                 var nQ = numHeads
                                 var nK = numKvHeads
                                 var hD = headDim
-                                var rD = rotaryDim
+                                var rD = UInt32(modelConfig?.effectiveRotaryDim(layerIndex: l, headDim: Int(headDim)) ?? Int(rotaryDim))
                                 var qStr: UInt32 = isStandardGqa ? headDim : (headDim * 2)
                                 var kStr = headDim
-                                var theta = thetaVal
+                                var theta = modelConfig?.effectiveRopeTheta(layerIndex: l) ?? thetaVal
 
                                 layerEnc1.setComputePipelineState(ropePipe)
                                 layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
@@ -5119,7 +5246,22 @@ struct ContentView: View {
                                         layerEnc1.dispatchThreads(MTLSize(width: Int(kvStride), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(kvStride), storePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                                     }
 
-                                    if isStandardGqa, let gqaStdPipe = gqaStandardF16Pipeline ?? gqaStandardPipeline {
+                                    if layer.attnGateProjTensor != nil, let headGatePipe = gqaHeadGateF16Pipeline ?? gqaHeadGatePipeline {
+                                        // Spark 2.5: per-head sigmoid output gate + optional sliding window
+                                        var windowSize: UInt32 = layer.isSlidingAttention ? UInt32(modelConfig?.effectiveSlidingWindow ?? 0) : 0
+                                        layerEnc1.setComputePipelineState(headGatePipe)
+                                        layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                                        layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                        layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                        layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 3)
+                                        layerEnc1.setBuffer(bVectorBuffer, offset: 0, index: 4)
+                                        layerEnc1.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 5)
+                                        layerEnc1.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 6)
+                                        layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 7)
+                                        layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 8)
+                                        layerEnc1.setBytes(&windowSize, length: MemoryLayout<UInt32>.stride, index: 9)
+                                        layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), headGatePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    } else if isStandardGqa, let gqaStdPipe = gqaStandardF16Pipeline ?? gqaStandardPipeline {
                                         layerEnc1.setComputePipelineState(gqaStdPipe)
                                         layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
                                         layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
@@ -5175,7 +5317,24 @@ struct ContentView: View {
 
                                     if let kScale = KVCacheManager.shared.kScaleBuffer,
                                        let vScale = KVCacheManager.shared.vScaleBuffer {
-                                        if isStandardGqa, let gqaStdPipe = gqaStandardFP8Pipeline {
+                                        if layer.attnGateProjTensor != nil, let headGatePipe = gqaHeadGateFP8Pipeline {
+                                            // Spark 2.5: per-head sigmoid output gate + optional sliding window (FP8 KV)
+                                            var windowSize: UInt32 = layer.isSlidingAttention ? UInt32(modelConfig?.effectiveSlidingWindow ?? 0) : 0
+                                            layerEnc1.setComputePipelineState(headGatePipe)
+                                            layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                                            layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                            layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                            layerEnc1.setBuffer(kScale, offset: scaleByteOffset, index: 3)
+                                            layerEnc1.setBuffer(vScale, offset: scaleByteOffset, index: 4)
+                                            layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 5)
+                                            layerEnc1.setBuffer(bVectorBuffer, offset: 0, index: 6)
+                                            layerEnc1.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 7)
+                                            layerEnc1.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 8)
+                                            layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 9)
+                                            layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 10)
+                                            layerEnc1.setBytes(&windowSize, length: MemoryLayout<UInt32>.stride, index: 11)
+                                            layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), headGatePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                        } else if isStandardGqa, let gqaStdPipe = gqaStandardFP8Pipeline {
                                             layerEnc1.setComputePipelineState(gqaStdPipe)
                                             layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
                                             layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
@@ -5217,7 +5376,22 @@ struct ContentView: View {
                                         layerEnc1.dispatchThreads(MTLSize(width: Int(kvStride), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(kvStride), storePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                                     }
 
-                                    if isStandardGqa, let gqaStdPipe = gqaStandardPipeline {
+                                    if layer.attnGateProjTensor != nil, let headGatePipe = gqaHeadGatePipeline {
+                                        // Spark 2.5: per-head sigmoid output gate + optional sliding window
+                                        var windowSize: UInt32 = layer.isSlidingAttention ? UInt32(modelConfig?.effectiveSlidingWindow ?? 0) : 0
+                                        layerEnc1.setComputePipelineState(headGatePipe)
+                                        layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                                        layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                        layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                        layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 3)
+                                        layerEnc1.setBuffer(bVectorBuffer, offset: 0, index: 4)
+                                        layerEnc1.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 5)
+                                        layerEnc1.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 6)
+                                        layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 7)
+                                        layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 8)
+                                        layerEnc1.setBytes(&windowSize, length: MemoryLayout<UInt32>.stride, index: 9)
+                                        layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), headGatePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    } else if isStandardGqa, let gqaStdPipe = gqaStandardPipeline {
                                         layerEnc1.setComputePipelineState(gqaStdPipe)
                                         layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
                                         layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
@@ -5570,24 +5744,74 @@ struct ContentView: View {
                                 let downS = layer.denseDownScale
                                 let downB = layer.denseDownBias
 
-                                dispatchExpertMlp(
-                                    enc: layerEnc1,
-                                    gateW: gateW,
-                                    gateS: gateS,
-                                    gateB: gateB,
-                                    upW: upW,
-                                    upS: upS,
-                                    upB: upB,
-                                    downW: downW,
-                                    downS: downS,
-                                    downB: downB,
-                                    inBuf: xNorm2Buffer,
-                                    interBuf: interBuffer,
-                                    accumBuf: hMlpBuffer,
-                                    inDim: hiddenDim,
-                                    interDim: intermediateDim,
-                                    routingWeight: 1.0
-                                )
+                                if modelConfig?.isSparkModel == true,
+                                   let dRaw = buffers[downW.shardIndex],
+                                   let geluSimd = bf16GeluGateUpSimdPipeline ?? bf16GeluGateUpPipeline {
+                                    // Spark 2.5: GeGLU (exact GeLU gate * up) + down-projection accumulate
+                                    var gWOff = gateW.offsetStart
+                                    var uWOff = upW.offsetStart
+                                    var dWOff = downW.offsetStart
+                                    var hDimVal = hiddenDim
+                                    var interDimVal = intermediateDim
+                                    var pkVal: Float = 1.0
+
+                                    layerEnc1.setComputePipelineState(geluSimd)
+                                    layerEnc1.setBuffer(buffers[gateW.shardIndex]!, offset: 0, index: 0)
+                                    layerEnc1.setBuffer(buffers[upW.shardIndex]!, offset: 0, index: 1)
+                                    layerEnc1.setBuffer(xNorm2Buffer, offset: 0, index: 2)
+                                    layerEnc1.setBuffer(interBuffer, offset: 0, index: 3)
+                                    layerEnc1.setBytes(&gWOff, length: MemoryLayout<UInt64>.stride, index: 4)
+                                    layerEnc1.setBytes(&uWOff, length: MemoryLayout<UInt64>.stride, index: 5)
+                                    layerEnc1.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 6)
+                                    layerEnc1.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 7)
+                                    if bf16GeluGateUpSimdPipeline != nil {
+                                        layerEnc1.dispatchThreadgroups(MTLSize(width: Int(intermediateDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                    } else {
+                                        layerEnc1.dispatchThreads(MTLSize(width: Int(intermediateDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(intermediateDim), geluSimd.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    }
+                                    layerEnc1.memoryBarrier(scope: .buffers)
+
+                                    if let downSimd = bf16DownSimdPipeline {
+                                        layerEnc1.setComputePipelineState(downSimd)
+                                        layerEnc1.setBuffer(dRaw, offset: 0, index: 0)
+                                        layerEnc1.setBuffer(interBuffer, offset: 0, index: 1)
+                                        layerEnc1.setBuffer(hMlpBuffer, offset: 0, index: 2)
+                                        layerEnc1.setBytes(&dWOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                                        layerEnc1.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 4)
+                                        layerEnc1.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 5)
+                                        layerEnc1.setBytes(&pkVal, length: MemoryLayout<Float>.stride, index: 6)
+                                        layerEnc1.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                    } else if let downUnq = bf16DownPipeline {
+                                        layerEnc1.setComputePipelineState(downUnq)
+                                        layerEnc1.setBuffer(dRaw, offset: 0, index: 0)
+                                        layerEnc1.setBuffer(interBuffer, offset: 0, index: 1)
+                                        layerEnc1.setBuffer(hMlpBuffer, offset: 0, index: 2)
+                                        layerEnc1.setBytes(&dWOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                                        layerEnc1.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 4)
+                                        layerEnc1.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 5)
+                                        layerEnc1.setBytes(&pkVal, length: MemoryLayout<Float>.stride, index: 6)
+                                        layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), downUnq.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    }
+                                } else {
+                                    dispatchExpertMlp(
+                                        enc: layerEnc1,
+                                        gateW: gateW,
+                                        gateS: gateS,
+                                        gateB: gateB,
+                                        upW: upW,
+                                        upS: upS,
+                                        upB: upB,
+                                        downW: downW,
+                                        downS: downS,
+                                        downB: downB,
+                                        inBuf: xNorm2Buffer,
+                                        interBuf: interBuffer,
+                                        accumBuf: hMlpBuffer,
+                                        inDim: hiddenDim,
+                                        interDim: intermediateDim,
+                                        routingWeight: 1.0
+                                    )
+                                }
                                 layerEnc1.memoryBarrier(scope: .buffers)
                             }
 
@@ -6628,9 +6852,19 @@ struct ContentView: View {
                             let currentQDim = isStandardGqa ? (numHeads * headDim) : (numHeads * headDim * 2)
                             let currentKvDim = kvStride
 
-                            dispatchLinear(enc: layerEnc1, weight: layer.qProjTensor, scale: layer.qScaleTensor, bias: layer.qBiasTensor, inBuf: xNorm1Buffer_all, outBuf: qGateBuffer_all, inDim: hiddenDim, outDim: currentQDim, batchSize: P)
-                            dispatchLinear(enc: layerEnc1, weight: layer.kProjTensor, scale: layer.kScaleTensor, bias: layer.kBiasTensor, inBuf: xNorm1Buffer_all, outBuf: kVectorBuffer_all, inDim: hiddenDim, outDim: currentKvDim, batchSize: P)
-                            dispatchLinear(enc: layerEnc1, weight: layer.vProjTensor, scale: layer.vScaleTensor, bias: layer.vBiasTensor, inBuf: xNorm1Buffer_all, outBuf: vVectorBuffer_all, inDim: hiddenDim, outDim: currentKvDim, batchSize: P)
+                            if let fusedQKV = layer.fusedQKVTensor {
+                                // Spark 2.5: single fused q_k_v_proj [qDim + 2*kvDim, hiddenDim]
+                                dispatchLinear(enc: layerEnc1, weight: fusedQKV, scale: nil, bias: nil, inBuf: xNorm1Buffer_all, outBuf: qGateBuffer_all, inDim: hiddenDim, outDim: currentQDim, batchSize: P)
+                                dispatchLinear(enc: layerEnc1, weight: fusedQKV, scale: nil, bias: nil, inBuf: xNorm1Buffer_all, outBuf: kVectorBuffer_all, inDim: hiddenDim, outDim: currentKvDim, batchSize: P, weightOffsetAdd: UInt64(currentQDim) * UInt64(hiddenDim) * 2)
+                                dispatchLinear(enc: layerEnc1, weight: fusedQKV, scale: nil, bias: nil, inBuf: xNorm1Buffer_all, outBuf: vVectorBuffer_all, inDim: hiddenDim, outDim: currentKvDim, batchSize: P, weightOffsetAdd: (UInt64(currentQDim) + UInt64(currentKvDim)) * UInt64(hiddenDim) * 2)
+                                if let gateProj = layer.attnGateProjTensor {
+                                    dispatchLinear(enc: layerEnc1, weight: gateProj, scale: nil, bias: nil, inBuf: xNorm1Buffer_all, outBuf: bVectorBuffer_all, inDim: hiddenDim, outDim: numHeads, batchSize: P)
+                                }
+                            } else {
+                                dispatchLinear(enc: layerEnc1, weight: layer.qProjTensor, scale: layer.qScaleTensor, bias: layer.qBiasTensor, inBuf: xNorm1Buffer_all, outBuf: qGateBuffer_all, inDim: hiddenDim, outDim: currentQDim, batchSize: P)
+                                dispatchLinear(enc: layerEnc1, weight: layer.kProjTensor, scale: layer.kScaleTensor, bias: layer.kBiasTensor, inBuf: xNorm1Buffer_all, outBuf: kVectorBuffer_all, inDim: hiddenDim, outDim: currentKvDim, batchSize: P)
+                                dispatchLinear(enc: layerEnc1, weight: layer.vProjTensor, scale: layer.vScaleTensor, bias: layer.vBiasTensor, inBuf: xNorm1Buffer_all, outBuf: vVectorBuffer_all, inDim: hiddenDim, outDim: currentKvDim, batchSize: P)
+                            }
                             layerEnc1.memoryBarrier(scope: .buffers)
 
                             if let qNorm = layer.qNormTensor, let qNormRaw = buffers[qNorm.shardIndex] {
@@ -6691,10 +6925,10 @@ struct ContentView: View {
                                 var nQ = numHeads
                                 var nK = numKvHeads
                                 var hD = headDim
-                                var rD = rotaryDim
+                                var rD = UInt32(modelConfig?.effectiveRotaryDim(layerIndex: l, headDim: Int(headDim)) ?? Int(rotaryDim))
                                 var qStr: UInt32 = isStandardGqa ? headDim : (headDim * 2)
                                 var kStr = headDim
-                                var theta = thetaVal
+                                var theta = modelConfig?.effectiveRopeTheta(layerIndex: l) ?? thetaVal
 
                                 layerEnc1.setComputePipelineState(ropePipe)
                                 layerEnc1.setBuffer(qGateBuffer_all, offset: 0, index: 0)
@@ -6739,6 +6973,7 @@ struct ContentView: View {
                                         let kVecOff = sliceStart16 * Int(kvStride) * MemoryLayout<Float>.stride
                                         let qOff = sliceStart16 * Int(gqaQDim) * MemoryLayout<Float>.stride
                                         let ctxOff = sliceStart16 * Int(numHeads) * Int(headDim) * MemoryLayout<Float>.stride
+                                        let gateOff = sliceStart16 * Int(numHeads) * MemoryLayout<Float>.stride
                                         let sliceBase = startPos + UInt32(sliceStart16)
                                         var slicePos: UInt32 = sliceBase
                                         var sliceSeq: UInt32 = (sliceBase > 0) ? (0x80000000 | sliceBase) : 0
@@ -6756,7 +6991,22 @@ struct ContentView: View {
 
                                         layerEnc1.memoryBarrier(scope: .buffers)
 
-                                        if isStandardGqa, let gqaStdPipe = gqaStandardF16Pipeline ?? gqaStandardPipeline {
+                                        if layer.attnGateProjTensor != nil, let headGatePipe = gqaHeadGateF16Pipeline ?? gqaHeadGatePipeline {
+                                            // Spark 2.5: per-head sigmoid output gate + optional sliding window
+                                            var windowSize: UInt32 = layer.isSlidingAttention ? UInt32(modelConfig?.effectiveSlidingWindow ?? 0) : 0
+                                            layerEnc1.setComputePipelineState(headGatePipe)
+                                            layerEnc1.setBuffer(qGateBuffer_all, offset: qOff, index: 0)
+                                            layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                            layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                            layerEnc1.setBuffer(attnCtxBuffer_all, offset: ctxOff, index: 3)
+                                            layerEnc1.setBuffer(bVectorBuffer_all, offset: gateOff, index: 4)
+                                            layerEnc1.setBytes(&sliceSeq, length: MemoryLayout<UInt32>.stride, index: 5)
+                                            layerEnc1.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 6)
+                                            layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 7)
+                                            layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 8)
+                                            layerEnc1.setBytes(&windowSize, length: MemoryLayout<UInt32>.stride, index: 9)
+                                            layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: sliceRows, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), headGatePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                        } else if isStandardGqa, let gqaStdPipe = gqaStandardF16Pipeline ?? gqaStandardPipeline {
                                             layerEnc1.setComputePipelineState(gqaStdPipe)
                                             layerEnc1.setBuffer(qGateBuffer_all, offset: qOff, index: 0)
                                             layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
@@ -6790,6 +7040,7 @@ struct ContentView: View {
                                         let kVecOff = sliceStart8 * Int(kvStride) * MemoryLayout<Float>.stride
                                         let qOff = sliceStart8 * Int(gqaQDim) * MemoryLayout<Float>.stride
                                         let ctxOff = sliceStart8 * Int(numHeads) * Int(headDim) * MemoryLayout<Float>.stride
+                                        let gateOff = sliceStart8 * Int(numHeads) * MemoryLayout<Float>.stride
                                         let sliceBase = startPos + UInt32(sliceStart8)
                                         var slicePos: UInt32 = sliceBase
                                         var sliceSeq: UInt32 = (sliceBase > 0) ? (0x80000000 | sliceBase) : 0
@@ -6815,7 +7066,24 @@ struct ContentView: View {
 
                                         if let kScale = KVCacheManager.shared.kScaleBuffer,
                                            let vScale = KVCacheManager.shared.vScaleBuffer {
-                                            if isStandardGqa, let gqaStdPipe = gqaStandardFP8Pipeline {
+                                            if layer.attnGateProjTensor != nil, let headGatePipe = gqaHeadGateFP8Pipeline {
+                                                // Spark 2.5: per-head sigmoid output gate + optional sliding window (FP8 KV)
+                                                var windowSize: UInt32 = layer.isSlidingAttention ? UInt32(modelConfig?.effectiveSlidingWindow ?? 0) : 0
+                                                layerEnc1.setComputePipelineState(headGatePipe)
+                                                layerEnc1.setBuffer(qGateBuffer_all, offset: qOff, index: 0)
+                                                layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                                layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                                layerEnc1.setBuffer(kScale, offset: scaleByteOffset, index: 3)
+                                                layerEnc1.setBuffer(vScale, offset: scaleByteOffset, index: 4)
+                                                layerEnc1.setBuffer(attnCtxBuffer_all, offset: ctxOff, index: 5)
+                                                layerEnc1.setBuffer(bVectorBuffer_all, offset: gateOff, index: 6)
+                                                layerEnc1.setBytes(&sliceSeq, length: MemoryLayout<UInt32>.stride, index: 7)
+                                                layerEnc1.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 8)
+                                                layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 9)
+                                                layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 10)
+                                                layerEnc1.setBytes(&windowSize, length: MemoryLayout<UInt32>.stride, index: 11)
+                                                layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: sliceRows, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), headGatePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                            } else if isStandardGqa, let gqaStdPipe = gqaStandardFP8Pipeline {
                                                 layerEnc1.setComputePipelineState(gqaStdPipe)
                                                 layerEnc1.setBuffer(qGateBuffer_all, offset: qOff, index: 0)
                                                 layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
@@ -6853,6 +7121,7 @@ struct ContentView: View {
                                         let kVecOff = sliceStart32 * Int(kvStride) * MemoryLayout<Float>.stride
                                         let qOff = sliceStart32 * Int(gqaQDim) * MemoryLayout<Float>.stride
                                         let ctxOff = sliceStart32 * Int(numHeads) * Int(headDim) * MemoryLayout<Float>.stride
+                                        let gateOff = sliceStart32 * Int(numHeads) * MemoryLayout<Float>.stride
                                         let sliceBase = startPos + UInt32(sliceStart32)
                                         var slicePos: UInt32 = sliceBase
                                         var sliceSeq: UInt32 = (sliceBase > 0) ? (0x80000000 | sliceBase) : 0
@@ -6870,7 +7139,22 @@ struct ContentView: View {
 
                                         layerEnc1.memoryBarrier(scope: .buffers)
 
-                                        if isStandardGqa, let gqaStdPipe = gqaStandardPipeline {
+                                        if layer.attnGateProjTensor != nil, let headGatePipe = gqaHeadGatePipeline {
+                                            // Spark 2.5: per-head sigmoid output gate + optional sliding window
+                                            var windowSize: UInt32 = layer.isSlidingAttention ? UInt32(modelConfig?.effectiveSlidingWindow ?? 0) : 0
+                                            layerEnc1.setComputePipelineState(headGatePipe)
+                                            layerEnc1.setBuffer(qGateBuffer_all, offset: qOff, index: 0)
+                                            layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                            layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                            layerEnc1.setBuffer(attnCtxBuffer_all, offset: ctxOff, index: 3)
+                                            layerEnc1.setBuffer(bVectorBuffer_all, offset: gateOff, index: 4)
+                                            layerEnc1.setBytes(&sliceSeq, length: MemoryLayout<UInt32>.stride, index: 5)
+                                            layerEnc1.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 6)
+                                            layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 7)
+                                            layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 8)
+                                            layerEnc1.setBytes(&windowSize, length: MemoryLayout<UInt32>.stride, index: 9)
+                                            layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: sliceRows, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), headGatePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                        } else if isStandardGqa, let gqaStdPipe = gqaStandardPipeline {
                                             layerEnc1.setComputePipelineState(gqaStdPipe)
                                             layerEnc1.setBuffer(qGateBuffer_all, offset: qOff, index: 0)
                                             layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
@@ -7118,7 +7402,37 @@ struct ContentView: View {
                                 let isBlockScale = (gateS != nil) && (gateS!.name.contains("scale_inv") || ((gateS!.offsetEnd - gateS!.offsetStart) < UInt64(intermediateDim * 2)))
                                 let isQuantizedAffine = (layer.denseGateBias != nil || gateW.dtype.contains("Q4") || gateW.dtype.contains("Q8") || (gateS != nil && !isBlockScale))
 
-                                if isBlockScale,
+                                if modelConfig?.isSparkModel == true,
+                                   let geluBatched = bf16GeluGateUpBatchedPipeline,
+                                   let downBatched = bf16DownBatchedPipeline {
+                                    // Spark 2.5: GeGLU (exact GeLU gate * up), batched across all P tokens
+                                    layerEnc1.setComputePipelineState(geluBatched)
+                                    layerEnc1.setBuffer(gRaw, offset: 0, index: 0)
+                                    layerEnc1.setBuffer(uRaw, offset: 0, index: 1)
+                                    layerEnc1.setBuffer(xNorm2Buffer_all, offset: 0, index: 2)
+                                    layerEnc1.setBuffer(interBuffer_all, offset: 0, index: 3)
+                                    layerEnc1.setBytes(&gWOff, length: 8, index: 4)
+                                    layerEnc1.setBytes(&uWOff, length: 8, index: 5)
+                                    layerEnc1.setBytes(&hDimVal, length: 4, index: 6)
+                                    layerEnc1.setBytes(&interDimVal, length: 4, index: 7)
+                                    layerEnc1.setBuffer(denseActiveTokensBuffer, offset: 0, index: 8)
+                                    layerEnc1.dispatchThreadgroups(MTLSize(width: Int(intermediateDim), height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                    layerEnc1.memoryBarrier(scope: .buffers)
+
+                                    layerEnc1.setComputePipelineState(downBatched)
+                                    layerEnc1.setBuffer(dRaw, offset: 0, index: 0)
+                                    layerEnc1.setBuffer(interBuffer_all, offset: 0, index: 1)
+                                    layerEnc1.setBuffer(hMlpBuffer_all, offset: 0, index: 2)
+                                    layerEnc1.setBytes(&dWOff, length: 8, index: 3)
+                                    layerEnc1.setBytes(&interDimVal, length: 4, index: 4)
+                                    layerEnc1.setBytes(&hDimVal, length: 4, index: 5)
+                                    var pkVal: Float = 1.0
+                                    layerEnc1.setBytes(&pkVal, length: 4, index: 6)
+                                    layerEnc1.setBuffer(denseActiveTokensBuffer, offset: 0, index: 7)
+                                    layerEnc1.setBuffer(denseActiveWeightsBuffer, offset: 0, index: 8)
+                                    layerEnc1.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                    layerEnc1.memoryBarrier(scope: .buffers)
+                                } else if isBlockScale,
                                    let gateBatched = fp8BlockGateUpBatchedPipeline ?? fp8BlockGateUpSimdPipeline ?? fp8GateUpBatchedPipeline,
                                    let downBatched = fp8BlockDownBatchedPipeline ?? fp8BlockDownSimdPipeline ?? fp8DownBatchedPipeline,
                                    let gsRaw = gateS != nil ? buffers[gateS!.shardIndex] : nil,
@@ -7193,6 +7507,41 @@ struct ContentView: View {
                                     for p in 0..<P {
                                         let tokenOffset = p * Int(hiddenDim) * MemoryLayout<Float>.stride
                                         let interTokenOffset = p * Int(intermediateDim) * MemoryLayout<Float>.stride
+
+                                        if modelConfig?.isSparkModel == true,
+                                           let geluPipe = bf16GeluGateUpSimdPipeline ?? bf16GeluGateUpPipeline,
+                                           let downPipe = bf16DownSimdPipeline ?? bf16DownPipeline {
+                                            // Spark 2.5: GeGLU per-token fallback
+                                            layerEnc1.setComputePipelineState(geluPipe)
+                                            layerEnc1.setBuffer(gRaw, offset: 0, index: 0)
+                                            layerEnc1.setBuffer(uRaw, offset: 0, index: 1)
+                                            layerEnc1.setBuffer(xNorm2Buffer_all, offset: tokenOffset, index: 2)
+                                            layerEnc1.setBuffer(interBuffer_all, offset: interTokenOffset, index: 3)
+                                            layerEnc1.setBytes(&gWOff, length: 8, index: 4)
+                                            layerEnc1.setBytes(&uWOff, length: 8, index: 5)
+                                            layerEnc1.setBytes(&hDimVal, length: 4, index: 6)
+                                            layerEnc1.setBytes(&interDimVal, length: 4, index: 7)
+                                            if bf16GeluGateUpSimdPipeline != nil {
+                                                layerEnc1.dispatchThreadgroups(MTLSize(width: Int(intermediateDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                            } else {
+                                                layerEnc1.dispatchThreads(MTLSize(width: Int(intermediateDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(intermediateDim), geluPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                            }
+                                            layerEnc1.memoryBarrier(scope: .buffers)
+
+                                            layerEnc1.setComputePipelineState(downPipe)
+                                            layerEnc1.setBuffer(dRaw, offset: 0, index: 0)
+                                            layerEnc1.setBuffer(interBuffer_all, offset: interTokenOffset, index: 1)
+                                            layerEnc1.setBuffer(hMlpBuffer_all, offset: tokenOffset, index: 2)
+                                            layerEnc1.setBytes(&dWOff, length: 8, index: 3)
+                                            layerEnc1.setBytes(&interDimVal, length: 4, index: 4)
+                                            layerEnc1.setBytes(&hDimVal, length: 4, index: 5)
+                                            var pkVal: Float = 1.0
+                                            layerEnc1.setBytes(&pkVal, length: 4, index: 6)
+                                            layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), downPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                            layerEnc1.memoryBarrier(scope: .buffers)
+                                            continue
+                                        }
+
                                         dispatchExpertMlp(
                                             enc: layerEnc1,
                                             gateW: gateW,
@@ -8117,7 +8466,7 @@ struct ContentView: View {
             // hybrid models (maintaining continuous causal convolution and O(1) recurrent states)
             // execute via the direct single-token path for maximum throughput and state integrity.
             let hasLinearRecurrence = cachedLayers.contains { $0.attentionType == .linearAttention }
-            let effectiveJetSpec = jetSpecEnabled && !hasLinearRecurrence
+            let effectiveJetSpec = jetSpecEnabled && !hasLinearRecurrence && (modelConfig?.isSparkModel != true)
             let effectiveInterDim = modelConfig?.intermediateSize ?? Int(cachedLayers.first?.intermediateDim ?? 14336)
             let effectiveQkvDim = Int(max(hiddenDim * 2, 8192))
             let effectiveZDim = Int(max(hiddenDim * 2, 8192))
@@ -9461,7 +9810,7 @@ struct ContentView: View {
                 if startPos < promptCount {
                     let prefillTokens = Array(promptTokenIds[startPos..<promptCount])
                     let ok: Bool
-                    if modelConfig?.isLingModel == true {
+                    if modelConfig?.isLingModel == true || modelConfig?.isSparkModel == true {
                         var prefillSuccess = true
                         let prefillStartTime = CFAbsoluteTimeGetCurrent()
                         var lastPrefillUIUpdateTime = prefillStartTime
@@ -9610,7 +9959,8 @@ struct ContentView: View {
                 for nextToken in acceptedBatch {
                     // 5. Check EOS
                     let isLingEos = (modelConfig?.isLingModel == true) && (nextToken == 156895 || nextToken == 156892)
-                    if nextToken == eosTokenId || nextToken == 248044 || nextToken == 248046 || nextToken == 166101 || nextToken == 166102 || isLingEos {
+                    let isSparkEos = (modelConfig?.isSparkModel == true) && (nextToken == 1 || nextToken == 2)
+                    if nextToken == eosTokenId || nextToken == 248044 || nextToken == 248046 || nextToken == 166101 || nextToken == 166102 || isLingEos || isSparkEos {
                         shouldBreak = true
                         break
                     }
@@ -9904,7 +10254,7 @@ struct ContentView: View {
                     sessionId: sessionId
                 )
                 if shouldForceSynthesis {
-                    let endTag = (modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>"
+                    let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
                     var assistantTurnText = finalDecoded
                     if !assistantTurnText.contains(endTag) {
                         assistantTurnText += endTag
@@ -10173,6 +10523,10 @@ struct ContentView: View {
                                 responses: allResponses,
                                 thinkingEnabled: thinkingEnabled
                             )
+                        } else if modelConfig?.isSparkModel == true {
+                            toolResponseTurn = AgentHarness.shared.formatSparkToolResponseTurn(
+                                responses: allResponses
+                            )
                         } else {
                             toolResponseTurn = AgentHarness.shared.formatToolResponseTurn(
                                 responses: allResponses,
@@ -10180,7 +10534,7 @@ struct ContentView: View {
                             )
                         }
                         var assistantTurnText = finalDecoded
-                        let endTag = (modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>"
+                        let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
                         if !assistantTurnText.contains(endTag) {
                             assistantTurnText += endTag
                         }
@@ -10216,7 +10570,7 @@ struct ContentView: View {
                         // tool calling disabled so it actually answers instead of spinning.
                         let escalateToSynthesis = AgentHarness.shared.consecutiveEmptyToolCalls >= 2
                         if (AgentHarness.shared.lastSearchGuardAction == .forceSynthesis || escalateToSynthesis) && !ranCompleteTool {
-                            let endTag = (modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>"
+                            let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
                             var assistantTurnText = finalDecoded
                             if !assistantTurnText.contains(endTag) {
                                 assistantTurnText += endTag
@@ -10272,7 +10626,7 @@ struct ContentView: View {
                                 return r
                             }
                             if !pendingRelay.isEmpty {
-                                let endTag = (modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>"
+                                let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
                                 var assistantTurnText = finalDecoded
                                 if !assistantTurnText.contains(endTag) {
                                     assistantTurnText += endTag
@@ -10341,7 +10695,7 @@ struct ContentView: View {
                         )
                     }
                     var assistantTurnText = finalDecoded
-                    let endTag = (modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>"
+                    let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
                     if !assistantTurnText.contains(endTag) {
                         assistantTurnText += endTag
                     }

@@ -83,6 +83,16 @@ public struct RopeParametersConfig: Codable {
     }
 }
 
+public struct SlidingAttentionRopeParameters: Codable {
+    public var fullAttention: RopeParametersConfig?
+    public var slidingAttention: RopeParametersConfig?
+
+    enum CodingKeys: String, CodingKey {
+        case fullAttention = "full_attention"
+        case slidingAttention = "sliding_attention"
+    }
+}
+
 public struct TokenIdOrArray: Codable {
     public var single: Int?
     public var array: [Int]?
@@ -259,7 +269,15 @@ public struct ModelConfig: Codable {
     public var moeSharedExpertIntermediateSize: Int?
     public var moeRouterEnableExpertBias: Bool?
     public var ropeInterleave: Bool?
+    public var slidingWindow: Int?
+    public var headwiseAttnOutputGate: Bool?
+    public var gateAttnActMode: String?
     public var textConfig: NestedTextConfig?
+
+    /// Per-layer-type RoPE parameters for hybrid sliding/full attention models (e.g. Spark 2.5).
+    /// NOT decoded via CodingKeys — populated manually in `load(fromFilePath:)` because the
+    /// top-level "rope_parameters" key may either be a flat object or a per-type dictionary.
+    public var ropeParametersByLayerType: SlidingAttentionRopeParameters?
 
     enum CodingKeys: String, CodingKey {
         case architectures
@@ -310,6 +328,9 @@ public struct ModelConfig: Codable {
         case moeSharedExpertIntermediateSize = "moe_shared_expert_intermediate_size"
         case moeRouterEnableExpertBias = "moe_router_enable_expert_bias"
         case ropeInterleave = "rope_interleave"
+        case slidingWindow = "sliding_window"
+        case headwiseAttnOutputGate = "headwise_attn_output_gate"
+        case gateAttnActMode = "gate_attn_act_mode"
         case textConfig = "text_config"
     }
 
@@ -503,6 +524,73 @@ public struct ModelConfig: Codable {
         return rawType.contains("bailing") || rawType.contains("ling") || archs.contains(where: { $0.contains("bailing") || $0.contains("ling") })
     }
 
+    public var isSparkModel: Bool {
+        let rawType = (modelType ?? "").lowercased()
+        let archs = architectures?.map { $0.lowercased() } ?? []
+        return rawType.contains("spark") || archs.contains(where: { $0.contains("spark") })
+    }
+
+    /// Raw layer-type string for a layer index (e.g. "sliding_attention" / "full_attention")
+    public func layerTypeString(at layerIndex: Int) -> String? {
+        guard let types = effectiveLayerTypesStrings, layerIndex >= 0, layerIndex < types.count else { return nil }
+        return types[layerIndex].lowercased()
+    }
+
+    /// Whether the layer at the given index uses a sliding attention window
+    public func isSlidingAttentionLayer(at layerIndex: Int) -> Bool {
+        return layerTypeString(at: layerIndex)?.contains("sliding") ?? false
+    }
+
+    /// Sliding window size (nil = full attention everywhere)
+    public var effectiveSlidingWindow: Int? {
+        return slidingWindow
+    }
+
+    /// Resolves the RoPE theta for a specific layer, honoring per-layer-type
+    /// rope_parameters (Spark 2.5 hybrid: full_attention theta=5e6, sliding theta=1e4)
+    public func effectiveRopeTheta(layerIndex: Int) -> Float {
+        let lt = layerTypeString(at: layerIndex)
+        if let params = ropeParametersByLayerType {
+            if (lt?.contains("sliding") ?? false) {
+                if let theta = params.slidingAttention?.ropeTheta { return theta }
+            } else if let theta = params.fullAttention?.ropeTheta {
+                return theta
+            }
+        }
+        return effectiveRopeTheta
+    }
+
+    /// Resolves the rotary dimension for a specific layer, honoring per-layer-type
+    /// partial_rotary_factor (Spark 2.5: full=0.25, sliding=1.0)
+    public func effectiveRotaryDim(layerIndex: Int, headDim: Int) -> Int {
+        let hd = headDim > 0 ? headDim : 128
+        let lt = layerTypeString(at: layerIndex)
+        var factor: Float? = nil
+        if let params = ropeParametersByLayerType {
+            if (lt?.contains("sliding") ?? false) {
+                factor = params.slidingAttention?.partialRotaryFactor
+            } else {
+                factor = params.fullAttention?.partialRotaryFactor
+            }
+        }
+        if factor == nil {
+            factor = textConfig?.partialRotaryFactor ?? partialRotaryFactor ?? textConfig?.ropeParameters?.partialRotaryFactor ?? ropeParameters?.partialRotaryFactor
+        }
+        if let f = factor {
+            return max(32, Int(Float(hd) * f))
+        }
+        if textConfig != nil || (modelType ?? "").contains("qwen") || (modelType ?? "").contains("ornith") {
+            return max(32, Int(Float(hd) * 0.25))
+        }
+        return hd
+    }
+
+    /// Whether full attention layers use Spark-style fused q_k_v_proj with a separate
+    /// headwise output gate projection (g_proj) activated by sigmoid
+    public var effectiveHeadwiseAttnOutputGate: Bool {
+        return headwiseAttnOutputGate ?? (isSparkModel && effectiveNumExperts == 0)
+    }
+
     public var hasLinearRecurrence: Bool {
         if isLingModel { return true }
         let rawType = (modelType ?? "").lowercased()
@@ -541,7 +629,12 @@ public struct ModelConfig: Codable {
                 if l < types.count {
                     let str = types[l].lowercased()
                     if str.contains("linear") { return .linearAttention }
-                    if str.contains("full") || str.contains("attn") { return .fullAttention }
+                    // NOTE: "sliding_attention" (Spark 2.5 / Gemma-style hybrid) is REAL full attention
+                    // with a window mask — it must map to .fullAttention. "attention" does NOT contain
+                    // the substring "attn", so match on "attention"/"sliding" too, otherwise these
+                    // layers fall through to the l % 4 default and get misclassified as linear
+                    // attention, which routes the engine down the GDN state path and destroys output.
+                    if str.contains("full") || str.contains("sliding") || str.contains("attn") || str.contains("attention") { return .fullAttention }
                 }
                 return (l % 4 == 3) ? .fullAttention : .linearAttention
             }
@@ -566,7 +659,22 @@ public struct ModelConfig: Codable {
     public static func load(fromFilePath path: String) -> ModelConfig? {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return nil }
         let decoder = JSONDecoder()
-        return try? decoder.decode(ModelConfig.self, from: data)
+        var config = try? decoder.decode(ModelConfig.self, from: data)
+
+        // Manually decode the per-layer-type rope_parameters dictionary (Spark 2.5 hybrid):
+        // the top-level "rope_parameters" key can be a nested {full_attention, sliding_attention}
+        // object which the flat RopeParametersConfig decode silently drops.
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let ropeParams = json["rope_parameters"] as? [String: Any] {
+            if let nested = try? JSONSerialization.data(withJSONObject: ropeParams),
+               let byType = try? decoder.decode(SlidingAttentionRopeParameters.self, from: nested) {
+                if byType.fullAttention != nil || byType.slidingAttention != nil {
+                    config?.ropeParametersByLayerType = byType
+                }
+            }
+        }
+
+        return config
     }
 
     /// Whether the model architecture uses 0-mean unit-offset RMSNorm weights (output = x * (1 + weight))

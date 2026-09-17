@@ -1060,6 +1060,52 @@ kernel void bf16_swiglu_gate_up(
     intermediateOutput[r] = silu_gate * up_dot;
 }
 
+static inline float erf_approx(float x) {
+    float sign = (x < 0.0f) ? -1.0f : 1.0f;
+    x = fabs(x);
+    float t = 1.0f / (1.0f + 0.3275911f * x);
+    float y = 1.0f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t - 0.284496736f) * t + 0.254829592f) * t * exp(-x * x);
+    return sign * y;
+}
+
+/// MSL Kernel: Fused BF16 GeGLU Gate & Up Projections (Spark 2.5: exact GeLU activation)
+kernel void bf16_gelu_gate_up(
+    device const ushort* rawGateBuffer [[buffer(0)]],
+    device const ushort* rawUpBuffer [[buffer(1)]],
+    device const float* inputVector [[buffer(2)]],
+    device float* intermediateOutput [[buffer(3)]],
+    constant uint64_t& gateWeightOffset [[buffer(4)]],
+    constant uint64_t& upWeightOffset [[buffer(5)]],
+    constant uint32_t& hiddenDim [[buffer(6)]],
+    constant uint32_t& intermediateDim [[buffer(7)]],
+    uint r [[thread_position_in_grid]]
+) {
+    if (r >= intermediateDim) return;
+
+    uint64_t gateRowStart = (gateWeightOffset / 2) + ((uint64_t)r * hiddenDim);
+    uint64_t upRowStart   = (upWeightOffset / 2) + ((uint64_t)r * hiddenDim);
+
+    float gate_dot = 0.0f;
+    float up_dot   = 0.0f;
+
+    uint32_t num4 = hiddenDim / 4;
+    for (uint32_t i = 0; i < num4; i++) {
+        uint32_t d = i * 4;
+        gate_dot += bf16_to_fp32(rawGateBuffer[gateRowStart + d + 0]) * inputVector[d + 0];
+        gate_dot += bf16_to_fp32(rawGateBuffer[gateRowStart + d + 1]) * inputVector[d + 1];
+        gate_dot += bf16_to_fp32(rawGateBuffer[gateRowStart + d + 2]) * inputVector[d + 2];
+        gate_dot += bf16_to_fp32(rawGateBuffer[gateRowStart + d + 3]) * inputVector[d + 3];
+
+        up_dot += bf16_to_fp32(rawUpBuffer[upRowStart + d + 0]) * inputVector[d + 0];
+        up_dot += bf16_to_fp32(rawUpBuffer[upRowStart + d + 1]) * inputVector[d + 1];
+        up_dot += bf16_to_fp32(rawUpBuffer[upRowStart + d + 2]) * inputVector[d + 2];
+        up_dot += bf16_to_fp32(rawUpBuffer[upRowStart + d + 3]) * inputVector[d + 3];
+    }
+
+    float gelu_gate = 0.5f * gate_dot * (1.0f + erf_approx(gate_dot * 0.70710678118654752440f));
+    intermediateOutput[r] = gelu_gate * up_dot;
+}
+
 /// MSL Kernel: BF16 Down-Projection with Weighted Accumulation
 kernel void bf16_down_proj_accumulate(
     device const ushort* rawDownBuffer [[buffer(0)]],
@@ -2337,6 +2383,251 @@ kernel void gqa_attention_decode_standard_fp8(
     }
 }
 
+/// MSL Kernel: GQA Autoregressive Decoding with Headwise Sigmoid Output Gate (Spark 2.5) + Optional Sliding Window (FP8 Quantized KV-Cache, 2D Grid Aware)
+kernel void gqa_attention_decode_headgate_fp8(
+    device const float* qVector [[buffer(0)]],     // [numQHeads * headDim]
+    device const char* kCacheBuffer [[buffer(1)]],
+    device const char* vCacheBuffer [[buffer(2)]],
+    device const half* kScaleBuffer [[buffer(3)]],
+    device const half* vScaleBuffer [[buffer(4)]],
+    device float* attnOutBuffer [[buffer(5)]],     // [numQHeads * headDim]
+    device const float* gateVector [[buffer(6)]],  // [numQHeads] per-head gate logits
+    constant uint32_t& seqLen [[buffer(7)]],
+    constant uint32_t& numQHeads [[buffer(8)]],
+    constant uint32_t& numKvHeads [[buffer(9)]],
+    constant uint32_t& headDim [[buffer(10)]],
+    constant uint32_t& slidingWindow [[buffer(11)]], // 0 = full attention
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint qHeadIdx = pos.x;
+    uint tokenIdx = pos.y;
+    if (qHeadIdx >= numQHeads) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+
+    uint32_t qHeadBase = (tokenIdx * numQHeads * headDim) + (qHeadIdx * headDim);
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    float4 acc[64];
+    uint32_t headDimVec = headDim / 4;
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        acc[d] = float4(0.0f);
+    }
+
+    float m = -1e20f;
+    float l = 0.0f;
+
+    device const float4* qHeadVec = (device const float4*)(qVector + qHeadBase);
+    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : ((seqLen & 0x80000000) ? ((seqLen & 0x7FFFFFFF) + tokenIdx + 1) : seqLen);
+    uint32_t windowStart = (slidingWindow > 0 && currentSeqLen > slidingWindow) ? (currentSeqLen - slidingWindow) : 0;
+
+    for (uint32_t tau = windowStart; tau < currentSeqLen; tau++) {
+        uint32_t scaleIdx = (tau * numKvHeads) + kvHeadIdx;
+        float kScale = float(kScaleBuffer[scaleIdx]);
+        float vScale = float(vScaleBuffer[scaleIdx]);
+
+        uint32_t kBase = (tau * kvStride) + kvHeadBase;
+        device const char4* kVec4 = (device const char4*)(kCacheBuffer + kBase);
+
+        float dot_raw = 0.0f;
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            char4 k = kVec4[d];
+            float4 kVec = float4(float(k.x), float(k.y), float(k.z), float(k.w));
+            dot_raw += dot(qHeadVec[d], kVec);
+        }
+        float score = (dot_raw * kScale) * invSqrtHeadDim;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+
+        l = (l * alpha) + beta;
+
+        uint32_t vBase = (tau * kvStride) + kvHeadBase;
+        device const char4* vVec4 = (device const char4*)(vCacheBuffer + vBase);
+        float beta_vScale = beta * vScale;
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            char4 v = vVec4[d];
+            float4 vVec = float4(float(v.x), float(v.y), float(v.z), float(v.w));
+            acc[d] = (acc[d] * alpha) + (beta_vScale * vVec);
+        }
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    float gateLogit = gateVector[(tokenIdx * numQHeads) + qHeadIdx];
+    float sigGate = 1.0f / (1.0f + exp(-gateLogit));
+    uint32_t outOffset = (tokenIdx * numQHeads * headDim) + (qHeadIdx * headDim);
+    device float4* outVec = (device float4*)(attnOutBuffer + outOffset);
+
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        outVec[d] = acc[d] * invL * sigGate;
+    }
+}
+
+/// MSL Kernel: GQA Autoregressive Decoding with Headwise Sigmoid Output Gate (Spark 2.5) + Optional Sliding Window (FP32 KV-Cache, 2D Grid Aware)
+kernel void gqa_attention_decode_headgate(
+    device const float* qVector [[buffer(0)]],     // [numQHeads * headDim]
+    device const float* kCacheBuffer [[buffer(1)]],
+    device const float* vCacheBuffer [[buffer(2)]],
+    device float* attnOutBuffer [[buffer(3)]],     // [numQHeads * headDim]
+    device const float* gateVector [[buffer(4)]],  // [numQHeads] per-head gate logits
+    constant uint32_t& seqLen [[buffer(5)]],
+    constant uint32_t& numQHeads [[buffer(6)]],
+    constant uint32_t& numKvHeads [[buffer(7)]],
+    constant uint32_t& headDim [[buffer(8)]],
+    constant uint32_t& slidingWindow [[buffer(9)]], // 0 = full attention
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint qHeadIdx = pos.x;
+    uint tokenIdx = pos.y;
+    if (qHeadIdx >= numQHeads) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+
+    uint32_t qHeadBase = (tokenIdx * numQHeads * headDim) + (qHeadIdx * headDim);
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    float4 acc[64];
+    uint32_t headDimVec = headDim / 4;
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        acc[d] = float4(0.0f);
+    }
+
+    float m = -1e20f;
+    float l = 0.0f;
+
+    device const float4* qHeadVec = (device const float4*)(qVector + qHeadBase);
+    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : ((seqLen & 0x80000000) ? ((seqLen & 0x7FFFFFFF) + tokenIdx + 1) : seqLen);
+    uint32_t windowStart = (slidingWindow > 0 && currentSeqLen > slidingWindow) ? (currentSeqLen - slidingWindow) : 0;
+
+    for (uint32_t tau = windowStart; tau < currentSeqLen; tau++) {
+        uint32_t kBase = (tau * kvStride) + kvHeadBase;
+        device const float4* kVec = (device const float4*)(kCacheBuffer + kBase);
+
+        float dot_val = 0.0f;
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            dot_val += dot(qHeadVec[d], kVec[d]);
+        }
+        float score = dot_val * invSqrtHeadDim;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+
+        l = (l * alpha) + beta;
+
+        uint32_t vBase = (tau * kvStride) + kvHeadBase;
+        device const float4* vVec = (device const float4*)(vCacheBuffer + vBase);
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            acc[d] = (acc[d] * alpha) + (beta * vVec[d]);
+        }
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    float gateLogit = gateVector[(tokenIdx * numQHeads) + qHeadIdx];
+    float sigGate = 1.0f / (1.0f + exp(-gateLogit));
+    uint32_t outOffset = (tokenIdx * numQHeads * headDim) + (qHeadIdx * headDim);
+    device float4* outVec = (device float4*)(attnOutBuffer + outOffset);
+
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        outVec[d] = acc[d] * invL * sigGate;
+    }
+}
+
+/// MSL Kernel: GQA Autoregressive Decoding with Headwise Sigmoid Output Gate (Spark 2.5) + Optional Sliding Window (FP16 KV-Cache, 2D Grid Aware)
+kernel void gqa_attention_decode_headgate_f16(
+    device const float* qVector [[buffer(0)]],     // [numQHeads * headDim]
+    device const half* kCacheBuffer [[buffer(1)]],
+    device const half* vCacheBuffer [[buffer(2)]],
+    device float* attnOutBuffer [[buffer(3)]],     // [numQHeads * headDim]
+    device const float* gateVector [[buffer(4)]],  // [numQHeads] per-head gate logits
+    constant uint32_t& seqLen [[buffer(5)]],
+    constant uint32_t& numQHeads [[buffer(6)]],
+    constant uint32_t& numKvHeads [[buffer(7)]],
+    constant uint32_t& headDim [[buffer(8)]],
+    constant uint32_t& slidingWindow [[buffer(9)]], // 0 = full attention
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint qHeadIdx = pos.x;
+    uint tokenIdx = pos.y;
+    if (qHeadIdx >= numQHeads) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+
+    uint32_t qHeadBase = (tokenIdx * numQHeads * headDim) + (qHeadIdx * headDim);
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    float4 acc[64];
+    uint32_t headDimVec = headDim / 4;
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        acc[d] = float4(0.0f);
+    }
+
+    float m = -1e20f;
+    float l = 0.0f;
+
+    device const float4* qHeadVec = (device const float4*)(qVector + qHeadBase);
+    uint32_t currentSeqLen = (seqLen == 0) ? (tokenIdx + 1) : ((seqLen & 0x80000000) ? ((seqLen & 0x7FFFFFFF) + tokenIdx + 1) : seqLen);
+    uint32_t windowStart = (slidingWindow > 0 && currentSeqLen > slidingWindow) ? (currentSeqLen - slidingWindow) : 0;
+
+    for (uint32_t tau = windowStart; tau < currentSeqLen; tau++) {
+        uint32_t kBase = (tau * kvStride) + kvHeadBase;
+        device const half4* kVec = (device const half4*)(kCacheBuffer + kBase);
+
+        float dot_val = 0.0f;
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            dot_val += dot(qHeadVec[d], float4(kVec[d]));
+        }
+        float score = dot_val * invSqrtHeadDim;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+
+        l = (l * alpha) + beta;
+
+        uint32_t vBase = (tau * kvStride) + kvHeadBase;
+        device const half4* vVec = (device const half4*)(vCacheBuffer + vBase);
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            acc[d] = (acc[d] * alpha) + (beta * float4(vVec[d]));
+        }
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    float gateLogit = gateVector[(tokenIdx * numQHeads) + qHeadIdx];
+    float sigGate = 1.0f / (1.0f + exp(-gateLogit));
+    uint32_t outOffset = (tokenIdx * numQHeads * headDim) + (qHeadIdx * headDim);
+    device float4* outVec = (device float4*)(attnOutBuffer + outOffset);
+
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        outVec[d] = acc[d] * invL * sigGate;
+    }
+}
+
 ///// MSL Kernel: Causal 1D Convolution with Shift Register State & SiLU Activation
 /// Used in Ornith Gated DeltaNet recurrent layer prefix
 kernel void causal_conv1d_silu(
@@ -3005,6 +3296,70 @@ kernel void bf16_swiglu_gate_up_simd(
     }
 }
 
+/// MSL Kernel: 32-Thread SIMDgroup Cooperative BF16 GeGLU Gate & Up Projections (Spark 2.5: exact GeLU activation)
+kernel void bf16_gelu_gate_up_simd(
+    device const ushort* rawGateBuffer [[buffer(0)]],
+    device const ushort* rawUpBuffer [[buffer(1)]],
+    device const float* inputVector [[buffer(2)]],
+    device float* intermediateOutput [[buffer(3)]],
+    constant uint64_t& gateWeightOffset [[buffer(4)]],
+    constant uint64_t& upWeightOffset [[buffer(5)]],
+    constant uint32_t& hiddenDim [[buffer(6)]],
+    constant uint32_t& intermediateDim [[buffer(7)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint r = tgPos.x;
+    if (r >= intermediateDim) return;
+
+    uint64_t gateRowStart = (gateWeightOffset / 2) + ((uint64_t)r * hiddenDim);
+    uint64_t upRowStart   = (upWeightOffset / 2) + ((uint64_t)r * hiddenDim);
+
+    device const ushort4* g4 = (device const ushort4*)(rawGateBuffer + gateRowStart);
+    device const ushort4* u4 = (device const ushort4*)(rawUpBuffer + upRowStart);
+    device const float4* in4 = (device const float4*)inputVector;
+
+    float gate_dot = 0.0f;
+    float up_dot   = 0.0f;
+
+    uint32_t numChunks = hiddenDim / 8;
+    for (uint32_t c = laneId; c < numChunks; c += 32) {
+        ushort4 g_lo = g4[c * 2 + 0];
+        ushort4 g_hi = g4[c * 2 + 1];
+        ushort4 u_lo = u4[c * 2 + 0];
+        ushort4 u_hi = u4[c * 2 + 1];
+
+        float4 in_lo = in4[c * 2 + 0];
+        float4 in_hi = in4[c * 2 + 1];
+
+        gate_dot += (bf16_to_fp32(g_lo.x) * in_lo.x) +
+                    (bf16_to_fp32(g_lo.y) * in_lo.y) +
+                    (bf16_to_fp32(g_lo.z) * in_lo.z) +
+                    (bf16_to_fp32(g_lo.w) * in_lo.w) +
+                    (bf16_to_fp32(g_hi.x) * in_hi.x) +
+                    (bf16_to_fp32(g_hi.y) * in_hi.y) +
+                    (bf16_to_fp32(g_hi.z) * in_hi.z) +
+                    (bf16_to_fp32(g_hi.w) * in_hi.w);
+
+        up_dot   += (bf16_to_fp32(u_lo.x) * in_lo.x) +
+                    (bf16_to_fp32(u_lo.y) * in_lo.y) +
+                    (bf16_to_fp32(u_lo.z) * in_lo.z) +
+                    (bf16_to_fp32(u_lo.w) * in_lo.w) +
+                    (bf16_to_fp32(u_hi.x) * in_hi.x) +
+                    (bf16_to_fp32(u_hi.y) * in_hi.y) +
+                    (bf16_to_fp32(u_hi.z) * in_hi.z) +
+                    (bf16_to_fp32(u_hi.w) * in_hi.w);
+    }
+
+    gate_dot = simd_sum(gate_dot);
+    up_dot   = simd_sum(up_dot);
+
+    if (laneId == 0) {
+        float gelu_gate = 0.5f * gate_dot * (1.0f + erf_approx(gate_dot * 0.70710678118654752440f));
+        intermediateOutput[r] = gelu_gate * up_dot;
+    }
+}
+
 /// MSL Kernel: 32-Thread SIMDgroup Cooperative BF16 SwiGLU Gate & Up Projections (Batched with Token Index Buffer)
 kernel void bf16_swiglu_gate_up_batched(
     device const ushort* rawGateBuffer [[buffer(0)]],
@@ -3070,6 +3425,74 @@ kernel void bf16_swiglu_gate_up_batched(
     if (laneId == 0) {
         float silu_gate = gate_dot / (1.0f + exp(-gate_dot));
         intermediateOutput[((uint64_t)tokenIdx * intermediateDim) + r] = silu_gate * up_dot;
+    }
+}
+
+/// MSL Kernel: 32-Thread SIMDgroup Cooperative BF16 GeGLU Gate & Up Projections, Batched with Token Index Buffer (Spark 2.5: exact GeLU activation)
+kernel void bf16_gelu_gate_up_batched(
+    device const ushort* rawGateBuffer [[buffer(0)]],
+    device const ushort* rawUpBuffer [[buffer(1)]],
+    device const float* inputVector [[buffer(2)]],
+    device float* intermediateOutput [[buffer(3)]],
+    constant uint64_t& gateWeightOffset [[buffer(4)]],
+    constant uint64_t& upWeightOffset [[buffer(5)]],
+    constant uint32_t& hiddenDim [[buffer(6)]],
+    constant uint32_t& intermediateDim [[buffer(7)]],
+    device const uint32_t* activeTokens [[buffer(8)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint r = tgPos.x;
+    uint batchIdx = tgPos.y;
+    if (r >= intermediateDim) return;
+
+    uint tokenIdx = activeTokens[batchIdx];
+
+    uint64_t gateRowStart = (gateWeightOffset / 2) + ((uint64_t)r * hiddenDim);
+    uint64_t upRowStart   = (upWeightOffset / 2) + ((uint64_t)r * hiddenDim);
+
+    device const ushort4* g4 = (device const ushort4*)(rawGateBuffer + gateRowStart);
+    device const ushort4* u4 = (device const ushort4*)(rawUpBuffer + upRowStart);
+    device const float4* in4 = (device const float4*)(inputVector + ((uint64_t)tokenIdx * hiddenDim));
+
+    float gate_dot = 0.0f;
+    float up_dot   = 0.0f;
+
+    uint32_t numChunks = hiddenDim / 8;
+    for (uint32_t c = laneId; c < numChunks; c += 32) {
+        ushort4 g_lo = g4[c * 2 + 0];
+        ushort4 g_hi = g4[c * 2 + 1];
+        ushort4 u_lo = u4[c * 2 + 0];
+        ushort4 u_hi = u4[c * 2 + 1];
+
+        float4 in_lo = in4[c * 2 + 0];
+        float4 in_hi = in4[c * 2 + 1];
+
+        gate_dot += (bf16_to_fp32(g_lo.x) * in_lo.x) +
+                    (bf16_to_fp32(g_lo.y) * in_lo.y) +
+                    (bf16_to_fp32(g_lo.z) * in_lo.z) +
+                    (bf16_to_fp32(g_lo.w) * in_lo.w) +
+                    (bf16_to_fp32(g_hi.x) * in_hi.x) +
+                    (bf16_to_fp32(g_hi.y) * in_hi.y) +
+                    (bf16_to_fp32(g_hi.z) * in_hi.z) +
+                    (bf16_to_fp32(g_hi.w) * in_hi.w);
+
+        up_dot   += (bf16_to_fp32(u_lo.x) * in_lo.x) +
+                    (bf16_to_fp32(u_lo.y) * in_lo.y) +
+                    (bf16_to_fp32(u_lo.z) * in_lo.z) +
+                    (bf16_to_fp32(u_lo.w) * in_lo.w) +
+                    (bf16_to_fp32(u_hi.x) * in_hi.x) +
+                    (bf16_to_fp32(u_hi.y) * in_hi.y) +
+                    (bf16_to_fp32(u_hi.z) * in_hi.z) +
+                    (bf16_to_fp32(u_hi.w) * in_hi.w);
+    }
+
+    gate_dot = simd_sum(gate_dot);
+    up_dot   = simd_sum(up_dot);
+
+    if (laneId == 0) {
+        float gelu_gate = 0.5f * gate_dot * (1.0f + erf_approx(gate_dot * 0.70710678118654752440f));
+        intermediateOutput[((uint64_t)tokenIdx * intermediateDim) + r] = gelu_gate * up_dot;
     }
 }
 

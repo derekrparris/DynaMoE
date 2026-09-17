@@ -90,6 +90,11 @@ public struct EngineCachedLayer {
     public let vProjTensor: TensorMetadata?
     public let vScaleTensor: TensorMetadata?
     public let vBiasTensor: TensorMetadata?
+    // Spark 2.5-style fused QKV projection (q_k_v_proj) and headwise output gate (g_proj)
+    public let fusedQKVTensor: TensorMetadata?
+    public let attnGateProjTensor: TensorMetadata?
+    // Sliding attention flag (Spark 2.5 hybrid sliding/full attention)
+    public let isSlidingAttention: Bool
     public let qNormTensor: TensorMetadata?
     public let kNormTensor: TensorMetadata?
     public let oProjTensor: TensorMetadata?
@@ -207,6 +212,12 @@ public final class InferenceEngine {
     public var gqaStandardPipeline: MTLComputePipelineState?
     public var gqaStandardF16Pipeline: MTLComputePipelineState?
     public var gqaStandardFP8Pipeline: MTLComputePipelineState?
+    public var gqaHeadGatePipeline: MTLComputePipelineState?
+    public var gqaHeadGateF16Pipeline: MTLComputePipelineState?
+    public var gqaHeadGateFP8Pipeline: MTLComputePipelineState?
+    public var bf16GeluGateUpPipeline: MTLComputePipelineState?
+    public var bf16GeluGateUpSimdPipeline: MTLComputePipelineState?
+    public var bf16GeluGateUpBatchedPipeline: MTLComputePipelineState?
     public var causalConv1dPipeline: MTLComputePipelineState?
     public var l2NormQkPipeline: MTLComputePipelineState?
     public var linearAttnStepPipeline: MTLComputePipelineState?
@@ -367,6 +378,24 @@ public final class InferenceEngine {
         }
         if let gqaStdFP8Func = defaultLib.makeFunction(name: "gqa_attention_decode_standard_fp8") {
             gqaStandardFP8Pipeline = try device.makeComputePipelineState(function: gqaStdFP8Func)
+        }
+        if let gqaHeadGateFunc = defaultLib.makeFunction(name: "gqa_attention_decode_headgate") {
+            gqaHeadGatePipeline = try device.makeComputePipelineState(function: gqaHeadGateFunc)
+        }
+        if let gqaHeadGateF16Func = defaultLib.makeFunction(name: "gqa_attention_decode_headgate_f16") {
+            gqaHeadGateF16Pipeline = try device.makeComputePipelineState(function: gqaHeadGateF16Func)
+        }
+        if let gqaHeadGateFP8Func = defaultLib.makeFunction(name: "gqa_attention_decode_headgate_fp8") {
+            gqaHeadGateFP8Pipeline = try device.makeComputePipelineState(function: gqaHeadGateFP8Func)
+        }
+        if let geluGateUpFunc = defaultLib.makeFunction(name: "bf16_gelu_gate_up") {
+            bf16GeluGateUpPipeline = try device.makeComputePipelineState(function: geluGateUpFunc)
+        }
+        if let geluGateUpSimdFunc = defaultLib.makeFunction(name: "bf16_gelu_gate_up_simd") {
+            bf16GeluGateUpSimdPipeline = try device.makeComputePipelineState(function: geluGateUpSimdFunc)
+        }
+        if let geluGateUpBatchedFunc = defaultLib.makeFunction(name: "bf16_gelu_gate_up_batched") {
+            bf16GeluGateUpBatchedPipeline = try device.makeComputePipelineState(function: geluGateUpBatchedFunc)
         }
         if let convFunc = defaultLib.makeFunction(name: "causal_conv1d_silu") {
             causalConv1dPipeline = try device.makeComputePipelineState(function: convFunc)
@@ -660,6 +689,11 @@ public final class InferenceEngine {
             let qNorm = layerTensors.first(where: { $0.name.contains("self_attn.q_norm") })
             let kNorm = layerTensors.first(where: { $0.name.contains("self_attn.k_norm") })
 
+            // Spark 2.5: fused QKV projection (q_k_v_proj) and headwise attention output gate (g_proj)
+            let fusedQKV = layerTensors.first(where: { $0.name.contains("self_attn.q_k_v_proj") && !$0.name.contains("scale") && !$0.name.contains("bias") })
+            let attnGateProj = layerTensors.first(where: { $0.name.contains("self_attn.g_proj") && !$0.name.contains("scale") && !$0.name.contains("bias") })
+            let isSlidingAttn = config?.isSlidingAttentionLayer(at: l) ?? false
+
             let oProj = layerTensors.first(where: { ($0.name.contains("self_attn.o_proj") || $0.name.contains("linear_attn.out_proj") || $0.name.contains("o_proj") || $0.name.contains("out_proj") || $0.name.contains("dense")) && !$0.name.contains("scale") && !$0.name.contains("bias") })
             let oScale = layerTensors.first(where: { ($0.name.contains("self_attn.o_proj") || $0.name.contains("o_proj") || $0.name.contains("out_proj")) && ($0.name.contains("scale") || $0.name.contains("scales")) })
             let oBias = layerTensors.first(where: { ($0.name.contains("self_attn.o_proj") || $0.name.contains("o_proj") || $0.name.contains("out_proj")) && ($0.name.contains("bias") || $0.name.contains("biases")) })
@@ -812,6 +846,9 @@ public final class InferenceEngine {
                 vProjTensor: vProj,
                 vScaleTensor: vScale,
                 vBiasTensor: vBias,
+                fusedQKVTensor: fusedQKV,
+                attnGateProjTensor: attnGateProj,
+                isSlidingAttention: isSlidingAttn,
                 qNormTensor: qNorm,
                 kNormTensor: kNorm,
                 oProjTensor: oProj,
@@ -912,6 +949,7 @@ extension EngineCachedLayer {
             qProjTensor, qScaleTensor, qBiasTensor,
             kProjTensor, kScaleTensor, kBiasTensor,
             vProjTensor, vScaleTensor, vBiasTensor,
+            fusedQKVTensor, attnGateProjTensor,
             qNormTensor, kNormTensor,
             oProjTensor, oScaleTensor, oBiasTensor,
             inProjQKV, inProjQKVScale, inProjQKVBias,

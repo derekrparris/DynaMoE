@@ -3094,6 +3094,16 @@ public final class AgentHarness {
         return turn
     }
 
+    /// Spark 2.5 (DeepSeek-style) tool response turn: <｜start▁of▁sentence｜><|Tool|> <tool_response>{result}</tool_response> per result, ending with <｜end▁of▁sentence｜>
+    public func formatSparkToolResponseTurn(responses: [String]) -> String {
+        var turn = "<｜start▁of▁sentence｜><|Tool|>"
+        for r in responses {
+            turn += "<tool_response>\(Self.renderToolResultForModel(r))</tool_response>"
+        }
+        turn += "<｜end▁of▁sentence｜>"
+        return turn
+    }
+
     /// Turns a `tools_load` / `tools_unload` result into an explicit context registration notice
     /// so the newly enabled (or disabled) schema is visible to the model before its next response.
     private static func toolRegistrationNotice(for responseJSON: String) -> String? {

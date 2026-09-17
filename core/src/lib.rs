@@ -2075,4 +2075,27 @@ mod tests {
         let mla_qa_3 = summary.tensors.iter().find(|t| t.name == "model.layers.3.attention.q_a_proj.weight").unwrap();
         assert_eq!(mla_qa_3.category, "Multi-Head Latent Attention (MLA)");
     }
+
+    #[test]
+    fn test_spark_x25_tokenizer_special_tokens() {
+        let snap = "/Users/derekparris/.cache/huggingface/hub/models--XHToken--Spark-X2.5-4B/snapshots/0bcb35678590218655dff3765b9e61c83b35e9c4";
+        let tok_path = format!("{}/tokenizer.json", snap);
+        if !PathBuf::from(&tok_path).exists() {
+            println!("Spark tokenizer snapshot not present; skipping");
+            return;
+        }
+        let tok = DynaMoeTokenizer::new(tok_path).unwrap();
+        let bos = "<｜start▁of▁sentence｜>";
+        let eos = "<｜end▁of▁sentence｜>";
+        let think = "<think>";
+        let s = format!("{bos}<|System|>\nYou are a helpful assistant.{eos}{bos}<|User|>Hello{eos}{bos}<|Bot|>{think}");
+        let ids = tok.encode(s).unwrap();
+        println!("SPARK TOKEN IDS: {:?}", &ids[..ids.len().min(14)]);
+        assert_eq!(ids[0], 0, "BOS token id 0");
+        assert!(ids.contains(&1), "EOS token id 1 present");
+        assert!(ids.contains(&3), "think-open token id 3 present");
+        assert!(ids.contains(&130976), "<|Bot|> token id present");
+        assert!(ids.contains(&130973), "<|User|> token id present");
+        assert!(ids.contains(&130972), "<|System|> token id present");
+    }
 }
