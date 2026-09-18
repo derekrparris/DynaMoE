@@ -8,6 +8,23 @@
 import SwiftUI
 import SwiftData
 import Combine
+import Sparkle
+
+final class UpdaterViewModel: ObservableObject {
+    private let updaterController: SPUStandardUpdaterController
+
+    init(startUpdater: Bool = true) {
+        updaterController = SPUStandardUpdaterController(startingUpdater: startUpdater, updaterDelegate: nil, userDriverDelegate: nil)
+    }
+
+    var canCheckForUpdates: Bool {
+        updaterController.updater.canCheckForUpdates
+    }
+
+    func checkForUpdates() {
+        updaterController.checkForUpdates(nil)
+    }
+}
 
 final class AppZoomManager: ObservableObject {
     static let shared = AppZoomManager()
@@ -80,6 +97,7 @@ private extension CGFloat {
 struct DynaMoEApp: App {
     @ObservedObject private var zoomManager = AppZoomManager.shared
     @Environment(\.openWindow) private var openWindow
+    @StateObject private var updaterViewModel = UpdaterViewModel(startUpdater: ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil && NSClassFromString("XCTestCase") == nil)
 
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
@@ -114,6 +132,13 @@ struct DynaMoEApp: App {
                 Button("About DynaMoE") {
                     openWindow(id: "about-dynamoe")
                 }
+            }
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") {
+                    updaterViewModel.checkForUpdates()
+                }
+                .keyboardShortcut("u", modifiers: .command)
+                .disabled(!updaterViewModel.canCheckForUpdates)
             }
             CommandGroup(replacing: .appSettings) {
                 Button("Settings…") {

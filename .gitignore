@@ -79,3 +79,15 @@ build/
 *.cer
 /config.local.json
 DynaMoE Architectural Overview.md
+
+# ==========================================
+# Sparkle auto-update tooling
+# ==========================================
+# Local cache of the Sparkle CLI tools (sign_update), fetched on demand
+Tools/sparkle-bin/
+# Remembers the last CFBundleVersion served to users
+Tools/appcast/.last_bundle_version
+# Sparkle private EdDSA key, if ever exported as a file (normally in Keychain)
+sparkle_private.key
+eddsa_priv.pem
+eddsa_pub.pem
