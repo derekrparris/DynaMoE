@@ -2,12 +2,15 @@
 #
 # Sparkle release helper for DynaMoE.
 #
-#   Tools/sparkle-release.sh <version> [--app <path-to-notarized.app>] [--dmg <path-to-stapled-dmg>]
+#   Tools/sparkle-release.sh <version> [--app <path-to-notarized.app>]
+#                                        [--archive <path-to-premade-archive>]
+#                                        [--dmg <path-to-stapled-dmg>]
 #
 # What it does:
 #   1. Takes your Developer ID-signed, notarized, stapled .app (from Xcode
 #      Archive/Export) — or falls back to building via xcodebuild (dev-only)
-#   2. Packs DynaMoE-<version>.app.tar.xz (the Sparkle update enclosure)
+#   2. Packs DynaMoE-<version>.app.tar.xz (the Sparkle update enclosure),
+#      unless you supply a pre-made archive via --archive
 #   3. EdDSA-signs the archive (private key lives in your login Keychain)
 #   4. Adds an <item> to Tools/appcast/items/ and regenerates appcast.xml
 #   5. Prints the `gh release create` command to publish everything
@@ -21,7 +24,6 @@
 set -eu
 
 REPO_SLUG="derekrparris/DynaMoE"
-APPCAST_BASE="https://derekrparris.github.io/DynaMoE"
 RELEASES_BASE="https://github.com/${REPO_SLUG}/releases/download"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
@@ -33,7 +35,7 @@ ITEMS_DIR="$SCRIPT_DIR/appcast/items"
 APPCAST_FILE="$SCRIPT_DIR/appcast/appcast.xml"
 
 if [ $# -eq 0 ]; then
-    echo "usage: $0 <version> [--app <path>] [--dmg <path>]" >&2
+    echo "usage: $0 <version> [--app <path>] [--archive <path>] [--dmg <path>]" >&2
     exit 1
 fi
 
@@ -41,10 +43,12 @@ VERSION="$1"
 shift
 
 APP_PATH=""
+ARCHIVE_PATH=""
 DMG_PATH=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --app) APP_PATH="$2"; shift 2 ;;
+        --archive) ARCHIVE_PATH="$2"; shift 2 ;;
         --dmg) DMG_PATH="$2"; shift 2 ;;
         *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
@@ -101,20 +105,41 @@ if [ "$SHORT_VERSION" != "$VERSION" ]; then
     echo "warning: requested version '$VERSION' but built app is '$SHORT_VERSION'" >&2
 fi
 
-PREV_VERSION_FILE="$ITEMS_DIR/.last_bundle_version"
-if [ -f "$PREV_VERSION_FILE" ] && [ "$(cat "$PREV_VERSION_FILE")" = "$BUNDLE_VERSION" ]; then
-    echo "error: CFBundleVersion ($BUNDLE_VERSION) was already served to users." >&2
-    echo "       Bump CURRENT_PROJECT_VERSION in the Xcode project before releasing." >&2
-    exit 1
-fi
+# Guard against re-serving a CFBundleVersion: check every recorded item
+# (committed in Tools/appcast/items/), not just the most recent one, so the
+# guard survives fresh checkouts and is authoritative once an item is committed.
+for ITEM_FILE in "$ITEMS_DIR"/*.xml; do
+    [ -f "$ITEM_FILE" ] || continue
+    SERVED="$(sed -n 's/.*<sparkle:version>\(.*\)<\/sparkle:version>.*/\1/p' "$ITEM_FILE")"
+    if [ "$SERVED" = "$BUNDLE_VERSION" ]; then
+        echo "error: CFBundleVersion ($BUNDLE_VERSION) already appears in $(basename "$ITEM_FILE")." >&2
+        echo "       Bump CURRENT_PROJECT_VERSION in the Xcode project before releasing." >&2
+        exit 1
+    fi
+done
 
-# 2. Pack the app archive
-echo "==> Packing app archive..."
-ARCHIVE_NAME="DynaMoE-$VERSION.app.tar.xz"
-APP_DIR_PATH="$(dirname "$APP_PATH")"
-cd "$APP_DIR_PATH"
-ditto -c -k --sequesterRsrc --keepParent "$(basename "$APP_PATH")" "$OUT_DIR/$ARCHIVE_NAME"
-cd "$OUT_DIR"
+# 2. Obtain the update archive (pre-made via --archive, or pack the app)
+if [ -n "$ARCHIVE_PATH" ]; then
+    if [ ! -f "$ARCHIVE_PATH" ]; then
+        echo "error: archive not found at $ARCHIVE_PATH" >&2
+        exit 1
+    fi
+    echo "==> Using provided archive: $ARCHIVE_PATH"
+    ARCHIVE_NAME="$(basename "$ARCHIVE_PATH")"
+    case "$ARCHIVE_NAME" in
+        *.tar.xz|*.tar.gz|*.tar.bz2|*.zip|*.dmg) ;;
+        *) echo "warning: '$ARCHIVE_NAME' has an unrecognized extension." >&2
+           echo "         Sparkle selects its extractor by file extension." >&2 ;;
+    esac
+    cp "$ARCHIVE_PATH" "$OUT_DIR/$ARCHIVE_NAME"
+else
+    echo "==> Packing app archive..."
+    ARCHIVE_NAME="DynaMoE-$VERSION.app.tar.xz"
+    APP_DIR_PATH="$(dirname "$APP_PATH")"
+    cd "$APP_DIR_PATH"
+    tar --no-xattrs -cJf "$OUT_DIR/$ARCHIVE_NAME" "$(basename "$APP_PATH")"
+    cd "$OUT_DIR"
+fi
 
 # 3. Sign
 echo "==> Signing with EdDSA..."
@@ -143,7 +168,7 @@ cat > "$ITEMS_DIR/$VERSION.xml" <<EOF
             <title>Version $VERSION</title>
             <sparkle:version>$BUNDLE_VERSION</sparkle:version>
             <sparkle:shortVersionString>$VERSION</sparkle:shortVersionString>
-            <link>${APPCAST_BASE}/releases/v${VERSION}.html</link>
+            <link>https://github.com/${REPO_SLUG}/releases/tag/v${VERSION}</link>
             <description><![CDATA[DynaMoE $VERSION]]></description>
             <pubDate>$PUB_DATE</pubDate>
             <enclosure
@@ -154,8 +179,6 @@ cat > "$ITEMS_DIR/$VERSION.xml" <<EOF
             />
         </item>
 EOF
-
-echo "$BUNDLE_VERSION" > "$PREV_VERSION_FILE"
 
 # Assemble the feed
 "$SCRIPT_DIR/generate-appcast.sh"

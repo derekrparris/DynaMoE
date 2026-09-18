@@ -14,14 +14,23 @@ final class UpdaterViewModel: ObservableObject {
     static let shared = UpdaterViewModel()
 
     private let updaterController: SPUStandardUpdaterController
+    private var stateCancellable: AnyCancellable?
+
+    // Mirrors SPUUpdater.canCheckForUpdates (KVO-observable) so views can react to it
+    @Published private(set) var canCheckForUpdates: Bool = false
 
     private init() {
         let isTesting = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil || NSClassFromString("XCTestCase") != nil
         updaterController = SPUStandardUpdaterController(startingUpdater: !isTesting, updaterDelegate: nil, userDriverDelegate: nil)
-    }
 
-    var canCheckForUpdates: Bool {
-        updaterController.updater.canCheckForUpdates
+        if !isTesting {
+            stateCancellable = updaterController.updater.publisher(for: \.canCheckForUpdates)
+                .removeDuplicates()
+                .receive(on: RunLoop.main)
+                .sink { [weak self] value in
+                    self?.canCheckForUpdates = value
+                }
+        }
     }
 
     var automaticallyChecksForUpdates: Bool {

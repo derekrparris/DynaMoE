@@ -52,6 +52,7 @@ struct SettingsSheetView: View {
     @AppStorage("dynamoe_jetspec_expert_cap") private var jetSpecMaxExpertCap: Int = 8
     @ObservedObject private var indexer = CodebaseIndexer.shared
     @ObservedObject private var dogfoodRunner = ModelDogfoodBenchmarkRunner.shared
+    @ObservedObject private var updaterViewModel = UpdaterViewModel.shared
     @State private var showDogfoodReportModal: Bool = false
 
     // Model Profile Management State
@@ -250,7 +251,7 @@ struct SettingsSheetView: View {
                             .font(.system(size: 12, weight: .medium))
                     }
                     .buttonStyle(.bordered)
-                    .disabled(!UpdaterViewModel.shared.canCheckForUpdates)
+                    .disabled(!updaterViewModel.canCheckForUpdates)
                     .help("Check for updates now (⌘U)")
                 }
 
