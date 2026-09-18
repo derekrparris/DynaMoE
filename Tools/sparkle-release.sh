@@ -102,7 +102,9 @@ SHORT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' 
 BUNDLE_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_PATH/Contents/Info.plist")"
 
 if [ "$SHORT_VERSION" != "$VERSION" ]; then
-    echo "warning: requested version '$VERSION' but built app is '$SHORT_VERSION'" >&2
+    echo "error: requested version '$VERSION' but the app reports '$SHORT_VERSION'." >&2
+    echo "       Rerun with the matching version, or rebuild with updated MARKETING_VERSION." >&2
+    exit 1
 fi
 
 # Guard against re-serving a CFBundleVersion: check every recorded item
