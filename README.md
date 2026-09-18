@@ -291,6 +291,7 @@ DynaMoE/
 ---
 
 ### Phase 7: Odds & Ends ⏳ *(In Progress)*
+- [x] Add auto-update capability (Sparkle)
 - [ ] Support for Ornith 1.5 vision capabilities
 - [ ] Support Apple Foundation Models
 - [ ] Use Apple Foundation Model (AFM) to compact conversations

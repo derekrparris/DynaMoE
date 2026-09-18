@@ -8,6 +8,40 @@
 import SwiftUI
 import SwiftData
 import Combine
+import Sparkle
+
+final class UpdaterViewModel: ObservableObject {
+    static let shared = UpdaterViewModel()
+
+    private let updaterController: SPUStandardUpdaterController
+    private var stateCancellable: AnyCancellable?
+
+    // Mirrors SPUUpdater.canCheckForUpdates (KVO-observable) so views can react to it
+    @Published private(set) var canCheckForUpdates: Bool = false
+
+    private init() {
+        let isTesting = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil || NSClassFromString("XCTestCase") != nil
+        updaterController = SPUStandardUpdaterController(startingUpdater: !isTesting, updaterDelegate: nil, userDriverDelegate: nil)
+
+        if !isTesting {
+            stateCancellable = updaterController.updater.publisher(for: \.canCheckForUpdates)
+                .removeDuplicates()
+                .receive(on: RunLoop.main)
+                .sink { [weak self] value in
+                    self?.canCheckForUpdates = value
+                }
+        }
+    }
+
+    var automaticallyChecksForUpdates: Bool {
+        get { updaterController.updater.automaticallyChecksForUpdates }
+        set { updaterController.updater.automaticallyChecksForUpdates = newValue }
+    }
+
+    func checkForUpdates() {
+        updaterController.checkForUpdates(nil)
+    }
+}
 
 final class AppZoomManager: ObservableObject {
     static let shared = AppZoomManager()
@@ -80,6 +114,7 @@ private extension CGFloat {
 struct DynaMoEApp: App {
     @ObservedObject private var zoomManager = AppZoomManager.shared
     @Environment(\.openWindow) private var openWindow
+    @StateObject private var updaterViewModel = UpdaterViewModel.shared
 
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
@@ -114,6 +149,13 @@ struct DynaMoEApp: App {
                 Button("About DynaMoE") {
                     openWindow(id: "about-dynamoe")
                 }
+            }
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") {
+                    updaterViewModel.checkForUpdates()
+                }
+                .keyboardShortcut("u", modifiers: .command)
+                .disabled(!updaterViewModel.canCheckForUpdates)
             }
             CommandGroup(replacing: .appSettings) {
                 Button("Settings…") {

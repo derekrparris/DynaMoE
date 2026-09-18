@@ -10,6 +10,7 @@
 		AB74544B30326473008D5321 /* libdynamoe_core.a in Frameworks */ = {isa = PBXBuildFile; fileRef = AB74544A30325872008D5321 /* libdynamoe_core.a */; };
 		ABCD95923034F3D100186C2F /* ComputeShaders.metal in Sources */ = {isa = PBXBuildFile; fileRef = ABCD95913034F3D100186C2F /* ComputeShaders.metal */; };
 		ABD5C1EA3033AB4D009C869C /* dynamoe_core.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABD5C1E93033AB4D009C869C /* dynamoe_core.swift */; };
+		ABF1A2B0305E000100000001 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = ABF1A2B1305E000100000001 /* Sparkle */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -39,9 +40,22 @@
 		ABD5C1E93033AB4D009C869C /* dynamoe_core.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = dynamoe_core.swift; path = ../GeneratedFFI/dynamoe_core.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		ABF1A2B1305E000100000003 /* Exceptions for "DynaMoE" folder in "DynaMoE" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = AB4C57B930324B5A0082A516 /* DynaMoE */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		AB4C57BC30324B5A0082A516 /* DynaMoE */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				ABF1A2B1305E000100000003 /* Exceptions for "DynaMoE" folder in "DynaMoE" target */,
+			);
 			path = DynaMoE;
 			sourceTree = "<group>";
 		};
@@ -63,6 +77,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				AB74544B30326473008D5321 /* libdynamoe_core.a in Frameworks */,
+				ABF1A2B0305E000100000001 /* Sparkle in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -136,6 +151,7 @@
 			);
 			name = DynaMoE;
 			packageProductDependencies = (
+				ABF1A2B1305E000100000001 /* Sparkle */,
 			);
 			productName = DynaMoE;
 			productReference = AB4C57BA30324B5A0082A516 /* DynaMoE.app */;
@@ -219,6 +235,9 @@
 			);
 			mainGroup = AB4C57B130324B5A0082A516;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				ABF1A2B1305E000100000002 /* XCRemoteSwiftPackageReference "Sparkle" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = AB4C57BB30324B5A0082A516 /* Products */;
 			projectDirPath = "";
@@ -457,12 +476,12 @@
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = "$(SRCROOT)/../GeneratedFFI";
+				INFOPLIST_FILE = DynaMoE/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = DynaMoE;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
-				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphoneos*]" = UIStatusBarStyleDefault;
@@ -522,12 +541,12 @@
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
 				HEADER_SEARCH_PATHS = "$(SRCROOT)/../GeneratedFFI";
+				INFOPLIST_FILE = DynaMoE/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = DynaMoE;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
-				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UILaunchScreen_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIStatusBarStyle[sdk=iphoneos*]" = UIStatusBarStyleDefault;
@@ -717,6 +736,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		ABF1A2B1305E000100000002 /* XCRemoteSwiftPackageReference "Sparkle" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/sparkle-project/Sparkle";
+			requirement = {
+				kind = exactVersion;
+				version = 2.9.6;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		ABF1A2B1305E000100000001 /* Sparkle */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = ABF1A2B1305E000100000002 /* XCRemoteSwiftPackageReference "Sparkle" */;
+			productName = Sparkle;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = AB4C57B230324B5A0082A516 /* Project object */;
 }

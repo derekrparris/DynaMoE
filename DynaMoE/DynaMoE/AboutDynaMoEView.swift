@@ -24,7 +24,7 @@ struct AboutDynaMoEView: View {
     @State private var isCopiedInfo: Bool = false
 
     private let appVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
-    private let buildNumber = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "2026.1"
+    private let buildNumber = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "26.1"
 
     private let thirdPartyLicenses: [ThirdPartyLicenseItem] = [
         ThirdPartyLicenseItem(
