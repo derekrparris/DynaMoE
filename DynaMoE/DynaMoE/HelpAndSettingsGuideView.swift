@@ -198,9 +198,8 @@ struct HelpAndSettingsGuideView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     shortcutRow("⌘,", "Open Settings & Diagnostics")
                     shortcutRow("⌘?", "Open this Help & Settings Guide")
-                    shortcutRow("⌘N", "New Chat Session")
                     shortcutRow("⌘0", "Actual Size (Reset Zoom)")
-                    shortcutRow("⌘+", "Zoom In")
+                    shortcutRow("⌘=", "Zoom In")
                     shortcutRow("⌘-", "Zoom Out")
                 }
             }
@@ -227,13 +226,13 @@ struct HelpAndSettingsGuideView: View {
             Text("DynaMoE automatically scans `~/.cache/huggingface/hub` on startup to detect downloaded models, snapshots, weight formats, and quantizations.")
                 .font(.body)
 
-            infoBox(title: "Contiguous Binary Repackaging (Flash-MoE)", icon: "shippingbox.fill") {
+            infoBox(title: "Contiguous Binary Repackaging (FlashMoE)", icon: "shippingbox.fill") {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Sparse MoE models (such as Qwen 3.8 Flash Next with 512 experts) distribute weights across dozens of multi-gigabyte SafeTensors shards. During SSD streaming, loading non-contiguous expert slices causes random file seeks, severely limiting NVMe throughput.")
                         .font(.system(size: 12))
                         .lineSpacing(2)
 
-                    Text("Clicking 'Repack Model for Fast Streaming' restructures expert weights into contiguous per-layer binaries (`layer_XX.bin` + `layout.json`). An 8-thread POSIX `pread` pool can then stream active expert slices in a single contiguous I/O read (>3.5 GB/s on Apple internal SSDs).")
+                    Text("Clicking 'FlashMoE Repack' on a discovered MoE model losslessly restructures expert weights into contiguous per-layer binaries (`layer_XX.bin` + `layout.json`). An 8-thread POSIX `pread` pool can then stream active expert slices in a single contiguous I/O read (>3.5 GB/s on Apple internal SSDs), delivering ~100x faster generation.")
                         .font(.system(size: 12))
                         .lineSpacing(2)
 
@@ -248,7 +247,7 @@ struct HelpAndSettingsGuideView: View {
 
             VStack(alignment: .leading, spacing: 8) {
                 bulletPoint("Auto-Discovery", "Automatically parses config.json and SafeTensors headers to detect architecture, hidden dimensions, heads, and quantization.")
-                bulletPoint("Default Model", "Click 'Make Default' on any discovered model to load it automatically on future launches.")
+                bulletPoint("Default Model", "Click 'Set Default' (star icon) on any discovered model to load it automatically on future launches.")
                 bulletPoint("Last Used Retention", "DynaMoE remembers the last used model and automatically restores it across sessions.")
             }
         }
@@ -397,7 +396,7 @@ struct HelpAndSettingsGuideView: View {
 
             infoBox(title: "Cache Maintenance", icon: "arrow.triangle.2.circlepath") {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("• Flush Cache: Evicts unpinned SSD pages from system RAM via posix_madvise(POSIX_MADV_DONTNEED) to immediately reduce memory pressure.")
+                    Text("• Flush Expert Cache: Evicts unpinned SSD pages from system RAM via posix_madvise(POSIX_MADV_DONTNEED) to immediately reduce memory pressure.")
                     Text("• Pre-Fault All: Sequentially reads all weights into system memory cache ahead of time for benchmark preparation.")
                 }
                 .font(.system(size: 12))
@@ -443,13 +442,13 @@ struct HelpAndSettingsGuideView: View {
                 .font(.body)
 
             VStack(alignment: .leading, spacing: 8) {
-                bulletPoint("Tree Depth (D)", "How many speculative sequential steps ahead to project (typically 2-4).")
-                bulletPoint("Branching Factor (B)", "How many alternative candidate paths to expand per node (typically 2).")
-                bulletPoint("Max Active Expert Cap (E_max)", "For MoE models, prunes branches that would require streaming more than E_max unique experts in a single step, protecting NVMe read bandwidth.")
+                bulletPoint("Max Tree Depth (D)", "How many speculative sequential steps ahead to project (1-5, default 3).")
+                bulletPoint("Branching Factor (B)", "How many alternative candidate paths to expand per node (1-4, default 2).")
+                bulletPoint("Max Expert Cap per Step", "For MoE models, prunes branches that would require streaming more than this many unique experts in a single step, protecting NVMe read bandwidth (2-16, default 8).")
             }
 
             infoBox(title: "When to Enable JetSpec", icon: "bolt.fill") {
-                Text("JetSpec provides substantial speedups on dense autoregressive models and sparse MoE models with draft heads. For models with linear recurrent attention (like Ornith 1.5's Gated DeltaNet), JetSpec is disabled by default because state updates are already O(1) and branching states adds memory overhead.")
+                Text("JetSpec provides substantial speedups on resident standard-attention models — both dense autoregressive and sparse MoE models. Gated DeltaNet recurrent models (like Ornith 1.5) and disk-streamed models automatically use optimized direct execution for maximum speed and state accuracy, bypassing tree drafting.")
                     .font(.system(size: 12))
             }
         }
@@ -469,12 +468,12 @@ struct HelpAndSettingsGuideView: View {
             VStack(alignment: .leading, spacing: 8) {
                 bulletPoint("Working Directory Sandbox", "All file read/write and shell execution operations are constrained to your designated working directory to protect system security.")
                 bulletPoint("Safety Limits", "Configure 'Max Tool Output Length' (to avoid blowing context limits) and 'Max Agent Steps' (to prevent runaway execution loops).")
-                bulletPoint("Headless Chrome Web Search", "Zero-config, real-time web search powered by a local headless Chrome/Chromium instance executing on your Mac with DOM extraction and JavaScript SPA rendering.")
-                bulletPoint("Brave Search API", "Optional enterprise search integration for high-volume structured search queries.")
+                bulletPoint("Headless Browser Web Search", "Zero-config, real-time web search powered by a local headless browser (Chrome, Chromium, Brave, or Edge) executing on your Mac with DOM extraction and JavaScript SPA rendering.")
+                bulletPoint("Brave Search API", "Optional remote search integration for structured JSON queries over local headless browser execution.")
             }
 
             infoBox(title: "Supported Local Tools", icon: "wrench.fill") {
-                Text("• shell_run: Runs terminal commands in the sandbox\n• file_read: Reads files line-by-line\n• file_write: Creates or modifies code files\n• file_edit: Precise anchor-based search-and-replace\n• find_files / grep_search: File discovery & regex pattern matching\n• codebase_search: GPU vector & BM25 hybrid semantic search\n• spawn_subagent / list_subagents: Background multi-agent swarm orchestration\n• git_status / git_diff / git_commit: Full Git version control workflow\n• lint_diagnostics: Native compiler self-healing checks\n• web_search: Live web search via Headless Chrome / Brave\n• web_fetch: Fetches and cleans web pages with DOM rendering")
+                Text("• shell_run: Runs terminal commands in the sandbox\n• file_read: Reads files with optional line ranges\n• file_write: Creates or modifies code files\n• file_edit: Precise anchor-based search-and-replace\n• find_files / grep_search: File discovery & regex pattern matching\n• codebase_search: GPU vector & BM25 hybrid semantic search\n• spawn_subagent / get_subagent_status / send_subagent_message / list_subagents: Background multi-agent swarm orchestration\n• git_status / git_diff / git_commit: Full Git version control workflow\n• find_symbol_definition / find_references: Symbol definition & usage navigation\n• lint_diagnostics: Native compiler self-healing checks\n• web_search: Live web search via Headless Chrome / Brave\n• web_fetch: Fetches and cleans web pages with HTML stripping & markdown extraction\n• complete: Signals task completion with a structured summary")
                     .font(.system(size: 12, design: .monospaced))
                     .lineSpacing(3)
             }
@@ -493,10 +492,10 @@ struct HelpAndSettingsGuideView: View {
                 .font(.body)
 
             VStack(alignment: .leading, spacing: 8) {
-                bulletPoint("Tensor Catalog", "Search through hundreds of tensors. Filter by Embedding, Attention, Routing, Experts, Normalization, or LM Head to inspect shapes, data types, and byte offsets.")
-                bulletPoint("Execute Router Top-K", "Runs the Top-K gating shader to verify softmax routing probability distribution and expert index selection.")
-                bulletPoint("Execute Full Layer", "Computes a complete forward pass through one transformer layer to measure execution time.")
-                bulletPoint("Multi-Layer Test", "Chains N consecutive layers through double-buffered command encoders to profile raw GPU latency in milliseconds.")
+                bulletPoint("Tensor Inspector", "Search through hundreds of tensors by name and filter by category (Self-Attention, MoE Router, Routed Expert, Shared Expert, Embedding, LM Head) to inspect shard index, data types, and categories.")
+                bulletPoint("Test Layer 0 Router", "Runs the Top-K gating shader to verify softmax routing probability distribution and expert index selection.")
+                bulletPoint("Test Block L0", "Computes a complete forward pass through one transformer layer to measure execution time.")
+                bulletPoint("Test Backbone (Multi-Layer)", "Chains N consecutive layers through double-buffered command encoders to profile raw GPU latency in milliseconds.")
             }
         }
     }
@@ -510,9 +509,9 @@ struct HelpAndSettingsGuideView: View {
                 .font(.title2).bold()
 
             VStack(alignment: .leading, spacing: 14) {
-                hardwareCard("16 GB Unified RAM (M1/M2/M3/M4)", "Recommended Model: Ornith 1.5 9B OptiQ-4bit (Dense Hybrid)\n• Mode: Auto or Full RAM (~5.4 GB resident)\n• KV Cache: FP16 (or FP8 for >8k context)\n• JetSpec: Disabled\n• Coder Profile: T=0.60, TopP=0.95, TopK=20, RepPen=1.00, PresPen=0.00")
-                hardwareCard("24 GB - 36 GB Unified RAM", "Recommended Models: Ornith 1.5 9B (Full RAM) or Ornith 1.5 35B / Qwen 3.8 Flash Next (SSD Streaming)\n• Mode: Auto (Smart)\n• Budget: Balanced (16GB) or High Capacity (24GB)\n• KV Cache: FP16\n• Lookahead Prefetching: Enabled (Depth: 2)")
-                hardwareCard("64 GB - 128 GB+ Unified RAM (M-Max / M-Ultra)", "Recommended Models: Full MoE models in RAM without disk reads\n• Mode: Full RAM\n• KV Cache: FP16\n• JetSpec: Enabled (Depth: 3, Branching: 2, Expert Cap: 16)")
+                hardwareCard("16 GB Unified RAM (M1/M2/M3/M4)", "Recommended Model: Ornith 1.5 9B OptiQ-4bit (Dense Hybrid)\n• Mode: Auto or Full RAM (~5.4 GB resident)\n• KV Cache: FP16 (or FP8 for >4k context)\n• JetSpec: Disabled\n• Coder Profile: T=0.60, TopP=0.95, TopK=20, RepPen=1.00, PresPen=0.00")
+                hardwareCard("24 GB - 36 GB Unified RAM", "Recommended Models: Ornith 1.5 9B (Full RAM) or Ornith 1.5 35B / Qwen 3.8 Flash Next (SSD Streaming)\n• Mode: Auto (Smart)\n• Budget: 16 GB or Unrestricted\n• KV Cache: FP16\n• Lookahead Prefetching: Enabled (Depth: 2)")
+                hardwareCard("64 GB - 128 GB+ Unified RAM (M-Max / M-Ultra)", "Recommended Models: Full MoE models in RAM without disk reads\n• Mode: Full RAM\n• KV Cache: FP16\n• JetSpec: Enabled (Depth: 3, Branching: 2, Expert Cap: 8)")
             }
         }
     }
@@ -532,7 +531,7 @@ struct HelpAndSettingsGuideView: View {
 
             faqCard(
                 "Why is repetition penalty 1.00 for Coder?",
-                "Programming languages require repeating variable names, structural brackets, and keywords. Setting repetition penalty > 1.0 forces the model to invent erroneous synonyms and omit closing brackets. Use Presence Penalty (0.0-0.1) instead if you want mild topic variety."
+                "Programming languages require repeating variable names, structural brackets, and keywords. Setting repetition penalty > 1.0 forces the model to invent erroneous synonyms and omit closing brackets. Use Presence Penalty instead (e.g. 1.50 as in the Assistant profile) if you want vocabulary variety without distorting code syntax."
             )
 
             faqCard(
