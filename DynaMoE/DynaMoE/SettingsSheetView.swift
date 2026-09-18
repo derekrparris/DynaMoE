@@ -7,6 +7,7 @@ import SwiftUI
 import Metal
 
 enum SettingsTab: String, CaseIterable, Identifiable {
+    case general = "General"
     case models = "Models"
     case generation = "Generation"
     case memory = "Memory & SSD"
@@ -17,6 +18,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
 
     var icon: String {
         switch self {
+        case .general: return "gearshape"
         case .models: return "square.stack.3d.up.fill"
         case .generation: return "slider.horizontal.3"
         case .memory: return "memorychip"
@@ -179,6 +181,8 @@ struct SettingsSheetView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     switch selectedTab {
+                    case .general:
+                        generalSettingsSection
                     case .models:
                         modelsSettingsSection
                     case .generation:
@@ -196,6 +200,90 @@ struct SettingsSheetView: View {
         }
         .frame(minWidth: 680, minHeight: 560)
         .background(Color(NSColor.windowBackgroundColor))
+    }
+
+    // MARK: - Tab 0: General
+    private var generalSettingsSection: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text("General Application Settings")
+                .font(.headline)
+
+            VStack(alignment: .leading, spacing: 14) {
+                // Auto-Updates Toggle
+                Toggle(isOn: Binding(
+                    get: { UpdaterViewModel.shared.automaticallyChecksForUpdates },
+                    set: { UpdaterViewModel.shared.automaticallyChecksForUpdates = $0 }
+                )) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text("Enable Auto-Updates")
+                                .font(.system(size: 13, weight: .medium))
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                                .foregroundColor(.accentColor)
+                                .font(.system(size: 11))
+                        }
+                        Text("Automatically check for new DynaMoE releases in the background. Updates are verified and installed safely; you can always check manually with ⌘U.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+
+                Divider()
+
+                // Manual Check Now
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Check for Updates Now")
+                            .font(.system(size: 13, weight: .medium))
+                        Text("Manually query the update feed regardless of the automatic setting.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    Spacer()
+
+                    Button(action: {
+                        UpdaterViewModel.shared.checkForUpdates()
+                    }) {
+                        Label("Check Now", systemImage: "arrow.down.circle")
+                            .font(.system(size: 12, weight: .medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!UpdaterViewModel.shared.canCheckForUpdates)
+                    .help("Check for updates now (⌘U)")
+                }
+
+                Divider()
+
+                // Current Version
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Current Version")
+                            .font(.system(size: 13, weight: .medium))
+                        Text("The DynaMoE release currently installed.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    Spacer()
+
+                    Text(versionDisplayString)
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(Color.secondary.opacity(0.06))
+                        .cornerRadius(6)
+                }
+            }
+        }
+    }
+
+    private var versionDisplayString: String {
+        let shortVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
+        let buildVersion = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
+        return "v\(shortVersion) (\(buildVersion))"
     }
 
     // MARK: - Tab 1: Models & Weights Management

@@ -218,7 +218,7 @@ struct HelpAndSettingsGuideView: View {
     // MARK: - 2. Models & Repackaging
     private var modelsSection: some View {
         VStack(alignment: .leading, spacing: 16) {
-            headerBadge("Tab 1: Models", color: .purple)
+            headerBadge("Tab 2: Models", color: .purple)
 
             Text("Local Model Registry & Fast Repackaging")
                 .font(.title2).bold()
@@ -352,7 +352,7 @@ struct HelpAndSettingsGuideView: View {
     // MARK: - 4. Generation & Sampling Hyperparameters
     private var generationSection: some View {
         VStack(alignment: .leading, spacing: 16) {
-            headerBadge("Tab 2: Generation", color: .orange)
+            headerBadge("Tab 3: Generation", color: .orange)
 
             Text("Sampling Mathematics & Parameters")
                 .font(.title2).bold()
@@ -379,7 +379,7 @@ struct HelpAndSettingsGuideView: View {
     // MARK: - 5. Memory & SSD Management
     private var memorySection: some View {
         VStack(alignment: .leading, spacing: 16) {
-            headerBadge("Tab 3: Memory & SSD", color: .cyan)
+            headerBadge("Tab 4: Memory & SSD", color: .cyan)
 
             Text("Unified Memory Architecture (UMA) & SSD Paging")
                 .font(.title2).bold()
@@ -457,7 +457,7 @@ struct HelpAndSettingsGuideView: View {
     // MARK: - 8. Agent & Tool Execution
     private var agentSection: some View {
         VStack(alignment: .leading, spacing: 16) {
-            headerBadge("Tab 4: Agent & Tools", color: .teal)
+            headerBadge("Tab 5: Agent & Tools", color: .teal)
 
             Text("Autonomous Agent Engine & Function Calling")
                 .font(.title2).bold()
@@ -483,7 +483,7 @@ struct HelpAndSettingsGuideView: View {
     // MARK: - 9. Advanced Diagnostics
     private var diagnosticsSection: some View {
         VStack(alignment: .leading, spacing: 16) {
-            headerBadge("Tab 5: Advanced Diagnostics", color: .red)
+            headerBadge("Tab 6: Advanced Diagnostics", color: .red)
 
             Text("Metal Shaders & Tensor Inspector")
                 .font(.title2).bold()

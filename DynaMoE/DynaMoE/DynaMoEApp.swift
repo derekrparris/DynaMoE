@@ -11,14 +11,22 @@ import Combine
 import Sparkle
 
 final class UpdaterViewModel: ObservableObject {
+    static let shared = UpdaterViewModel()
+
     private let updaterController: SPUStandardUpdaterController
 
-    init(startUpdater: Bool = true) {
-        updaterController = SPUStandardUpdaterController(startingUpdater: startUpdater, updaterDelegate: nil, userDriverDelegate: nil)
+    private init() {
+        let isTesting = ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil || NSClassFromString("XCTestCase") != nil
+        updaterController = SPUStandardUpdaterController(startingUpdater: !isTesting, updaterDelegate: nil, userDriverDelegate: nil)
     }
 
     var canCheckForUpdates: Bool {
         updaterController.updater.canCheckForUpdates
+    }
+
+    var automaticallyChecksForUpdates: Bool {
+        get { updaterController.updater.automaticallyChecksForUpdates }
+        set { updaterController.updater.automaticallyChecksForUpdates = newValue }
     }
 
     func checkForUpdates() {
@@ -97,7 +105,7 @@ private extension CGFloat {
 struct DynaMoEApp: App {
     @ObservedObject private var zoomManager = AppZoomManager.shared
     @Environment(\.openWindow) private var openWindow
-    @StateObject private var updaterViewModel = UpdaterViewModel(startUpdater: ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil && NSClassFromString("XCTestCase") == nil)
+    @StateObject private var updaterViewModel = UpdaterViewModel.shared
 
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
