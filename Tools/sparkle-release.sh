@@ -54,6 +54,38 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# Canonicalize relative input paths NOW, before the script cd's elsewhere
+# (packing/DMG steps run from other directories later on).
+abspath() {
+    case "$1" in
+        /*) printf '%s\n' "$1" ;;
+        *) printf '%s\n' "$PWD/$1" ;;
+    esac
+}
+
+# Validate all inputs up front so a bad path fails before any build/pack work
+if [ -n "$APP_PATH" ]; then
+    APP_PATH="$(abspath "$APP_PATH")"
+    if [ ! -d "$APP_PATH" ]; then
+        echo "error: app not found at $APP_PATH" >&2
+        exit 1
+    fi
+fi
+if [ -n "$ARCHIVE_PATH" ]; then
+    ARCHIVE_PATH="$(abspath "$ARCHIVE_PATH")"
+    if [ ! -f "$ARCHIVE_PATH" ]; then
+        echo "error: archive not found at $ARCHIVE_PATH" >&2
+        exit 1
+    fi
+fi
+if [ -n "$DMG_PATH" ]; then
+    DMG_PATH="$(abspath "$DMG_PATH")"
+    if [ ! -f "$DMG_PATH" ]; then
+        echo "error: DMG not found at $DMG_PATH" >&2
+        exit 1
+    fi
+fi
+
 mkdir -p "$OUT_DIR" "$ITEMS_DIR"
 
 # Fetch the Sparkle CLI tools once (sign_update, generate_appcast, generate_keys)
@@ -157,7 +189,7 @@ fi
 
 DMG_NAME=""
 DMG_CMD=""
-if [ -n "$DMG_PATH" ] && [ -f "$DMG_PATH" ]; then
+if [ -n "$DMG_PATH" ]; then
     DMG_NAME="DynaMoE-$VERSION.dmg"
     cp "$DMG_PATH" "$OUT_DIR/$DMG_NAME"
     DMG_CMD=" '$OUT_DIR/$DMG_NAME'"
