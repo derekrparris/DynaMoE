@@ -37,6 +37,7 @@ DynaMoE supports sparse Mixture-of-Experts, hybrid recurrent SSM/attention archi
 * **Ornith 1.5 35B A3B**
 * **Ling 3.0 Tiny**
 * **Qwen 3.8 Flash Next FP8 MoE**
+* **Spark-X2.5-4B**
 
 **Note:** I don't currently have enough disk space to fully repack Qwen3.8 Flash Next to test streaming optimizations. If anyone has the room to test speeds with full repacking, please do let me know. I will be able to conduct further tests once I get a new computer :)
 
