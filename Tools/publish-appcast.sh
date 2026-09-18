@@ -13,7 +13,7 @@
 
 set -eu
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 APPCAST_FILE="$SCRIPT_DIR/appcast/appcast.xml"
 WORK="$(mktemp -d)"
 
