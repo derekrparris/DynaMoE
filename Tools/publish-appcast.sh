@@ -27,7 +27,9 @@ git worktree add "$WORK" origin/gh-pages
 cp "$APPCAST_FILE" "$WORK/appcast.xml"
 
 cd "$WORK"
-if git diff --quiet appcast.xml; then
+# An untracked appcast.xml (first publish) is "changed": git diff ignores
+# untracked files, so also require the file to be tracked before skipping.
+if git diff --quiet -- appcast.xml && git ls-files --error-unmatch -- appcast.xml >/dev/null 2>&1; then
     echo "appcast.xml unchanged; nothing to publish."
 else
     git add appcast.xml
