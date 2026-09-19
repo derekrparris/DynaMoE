@@ -692,3 +692,76 @@ which is a bigger kernel rewrite.
 **Action: REVERTED the prefill wiring to the old kernel path** (kernels remain
 compiled; decode's chunked path untouched and verified). Wiring kept behind a
 dead branch to be replaced by the tiled kernel in a follow-up.
+
+---
+
+## FIX #7: DECODE PREFETCH BUDGET + TOKEN-BOUNDARY LOOKAHEAD (SHIPPED)
+
+**Diagnosis.** Decode hit rate was capped by two structural limits:
+1. `expertStagingSize = 16 slots` → prediction budget = capacity - maxTopK
+   = **8 slots/layer** — exactly the previous token's set. The Markov and
+   prev-prev-history sources were starved by construction (budget filled by
+   the first history source alone). Hit rate 42-56% == P(prev set ∩ active).
+2. Every token starts cold: layer 0-1's kicks are issued mid-token
+   (B(l) kicks l+1), so Layer 0 showed a persistent "prefetch 0/8" and its
+   8 misses read synchronously at token start (5-10ms in DIAG), while the
+   logits GEMV + sampling ("Other" ~27ms) left the SSD completely idle.
+
+**Shipped changes (packed decode path only):**
+- Staging capacity 16 → 32 slots per buffer (~100.8 MB/buffer, ~202 MB both;
+  was ~50 MB/buffer).
+- Prediction budget capped at 16 candidates (larger lists waste IO on false
+  positives that compete with true-positive reads for SSD bandwidth — the
+  absolute floor is ~1.0 GB/token of needed reads at 4-6 GB/s, so the window
+  fits ~4-8 completions; ordering quality beats list length).
+- Intersection-promoted ordering: experts present in BOTH history tokens
+  (stable core) first, weight-ordered; then prev-only; then prev-prev-only;
+  then Markov.
+- Token-boundary lookahead kick: after the last layer's MoE completes, before
+  the final norm + logits GEMV, kick predicted sets for layers 0 and 1 (from
+  the current token's sets) into the two staging buffers — overlapping the
+  ~25-30ms Other window. The per-layer kick for layer 1 then skips (new
+  resident-layer guard in `kickPackedPrefetch`) when the boundary prediction
+  is still resident, avoiding duplicate reads of an identical prediction.
+- `packedPrefetchPending` converted from a single (layer, sem) to a per-layer
+  dict to support the two in-flight boundary kicks (one per staging buffer).
+- Consume logic unchanged: wait for the layer's pending sem, adopt resident
+  slots, sync-read misses into slots after the kick's.
+
+**Expected effect.** Layers 0-1 stop being cold every token (~10-25ms/token
+saved); hit rate should rise from 42-56% toward 55-70% on content-following
+turns, cutting IO toward ~80-110ms/token → ~4.5-5.0 tok/s. Watch: Layer 0/1
+"prefetch" counts in [DIAG] (no longer 0/8), the per-token Prefetch X/320
+percentage, and the IO block.
+
+**Note on theoretical ceiling.** Every needed expert is read from SSD/page
+cache exactly once per token (kick or sync), so total SSD traffic is ~1.0
+GB/token regardless of hit rate; the sync-wait portion is what hit rate
+removes. Page cache makes repeat experts cheap. With ~5.6 GB/s effective
+random-read throughput the absolute decode floor is ~180-200ms/token (~5
+tok/s) at this expert granularity; beating that needs smaller read
+granularity (component-level streaming), a different project.
+
+### QA #11 — Fix #7 REGRESSION, REVERTED
+
+Tokens 251-305ms -> 574-686ms (1.6 tok/s). IO 119-160 -> 343-439ms; RouterGPU
+67-85 -> 132-151ms; per-layer IO 1-6 -> 9-28ms. Hit rate ROSE (48-77%) but net
+throughput collapsed.
+
+**Root cause (confirmed by pattern):** budget 8 -> 16 doubled every kick to
+~50MB, but the per-layer overlap window (MoE GPU ~1-1.7ms + next PhaseA
+~1.3-3ms) only fits ~2-8 expert reads. Kicks no longer complete before
+consume; the all-or-nothing per-kick semaphore makes EVERY layer wait the
+FULL 16-expert kick (~15-20ms) even when it needs only 8. The wait eats the
+window. The old 8-expert kicks (~5ms) fit the window; 16-expert kicks never
+do.
+
+Also unresolved: the token-boundary kick produced 0/8 at Layer 0 in every
+DIAG (data not adopted or prediction source ineffective); combined with the
+concurrent-kick clobber race on shared buffers (per-layer kick resets
+resident[] while a still-reading boundary kick owns the buffer). Fixing
+properly needs per-slot or per-kick-tail tracking, not bigger budgets.
+
+**Action: REVERTED all Fix #7 changes** (staging 32->16, budget cap 16->8,
+ordering simplification, boundary kick, pending dict, resident guard).
+Decode returns to the QA #10 state (~250-300ms tokens, 42-56% hits).
