@@ -869,6 +869,7 @@ struct ContentView: View {
     @AppStorage("dynamoe_kv_cache_precision") private var kvCachePrecisionRaw: String = KVCachePrecision.fp16.rawValue
     @AppStorage("dynamoe_speculative_prefetch_enabled") private var speculativePrefetchEnabled: Bool = true
     @AppStorage("dynamoe_prefetch_lookahead_depth") private var prefetchLookaheadDepth: Int = 1
+    @AppStorage("dynamoe_pin_backbone_weights") private var pinBackboneWeights: Bool = true
     @AppStorage("dynamoe_jetspec_enabled") private var jetSpecEnabled: Bool = false
     @AppStorage("dynamoe_jetspec_depth") private var jetSpecMaxDepth: Int = 3
     @AppStorage("dynamoe_jetspec_branching") private var jetSpecBranchingFactor: Int = 2
@@ -10899,6 +10900,7 @@ struct ContentView: View {
         let memoryExecutionMode = self.memoryExecutionMode
         let memoryBudgetMode = self.memoryBudgetMode
         let currentSystemPrompt = self.systemPrompt
+        let shouldPinBackbone = pinBackboneWeights
 
         Task.detached(priority: .userInitiated) {
             // Drop file descriptors cached from a previously loaded model; they are
@@ -10967,6 +10969,39 @@ struct ContentView: View {
                 let isFlashMoE = ExpertRepacker.isPackedFormat(dir: dirUrl)
                 if isFlashMoE {
                     ExpertIOThreadPool.shared.initialize(numThreads: 8)
+
+                    // FlashMoE backbone pinning: the invariant weights (model_weights.bin —
+                    // every layer's q/k/v/o/GDN projections, norms, lm_head, embeddings) are
+                    // read by the GPU on EVERY token. Serving them from the file-backed mmap
+                    // re-faults them at ~0.065-2.5 GB/s whenever GPU work on other buffers
+                    // unwires the mappings (measured collapse to ~0.3 tok/s on 16 GB). Pread
+                    // the file once into an anonymous .storageModeShared buffer so all
+                    // backbone reads become resident DRAM traffic (~68 GB/s).
+                    if shouldPinBackbone,
+                       let shard0 = loadedSummary.shards.first(where: { $0.filename == "model_weights.bin" }) {
+                        let length = Int(shard0.length)
+                        if length > 0, length <= Int(device.maxBufferLength),
+                           let pinned = device.makeBuffer(length: length, options: .storageModeShared) {
+                            let pinPath = dirUrl.appendingPathComponent("model_weights.bin")
+                            let fd = open(pinPath.path, O_RDONLY | O_CLOEXEC)
+                            if fd >= 0 {
+                                await MainActor.run {
+                                    self.metalStatus = "⚡ Pinning backbone weights (\(String(format: "%.1f", Double(length) / 1073741824.0)) GB) into RAM..."
+                                }
+                                if let elapsed = ExpertIOThreadPool.preadFileIntoBuffer(fd: fd, dst: pinned.contents(), length: length, threads: 8) {
+                                    buffers[shard0.index] = pinned
+                                    print("⚡ [FlashMoE] Pinned backbone (\(String(format: "%.2f", Double(length) / 1073741824.0)) GB) into anonymous GPU memory in \(String(format: "%.2f", elapsed))s — per-token mmap re-faults eliminated")
+                                } else {
+                                    print("⚠️ [FlashMoE] Backbone pinning pread incomplete — falling back to mmap path")
+                                }
+                                close(fd)
+                            } else {
+                                print("⚠️ [FlashMoE] Cannot open \(pinPath.path) for pinning (errno=\(errno)) — falling back to mmap path")
+                            }
+                        } else {
+                            print("⚠️ [FlashMoE] Backbone pinning skipped: length \(length) invalid or exceeds maxBufferLength (\(Double(device.maxBufferLength) / 1073741824.0) GB)")
+                        }
+                    }
                 } else {
                     WorkingSetManager.shared.initialize(summary: loadedSummary, shardBuffers: buffers, mode: memoryBudgetMode, modelDir: dirUrl)
                     let effMode = memoryExecutionMode.resolveEffectiveMode(modelFootprintGB: mappedGB)

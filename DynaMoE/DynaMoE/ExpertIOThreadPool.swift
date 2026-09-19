@@ -67,6 +67,40 @@ public final class ExpertIOThreadPool {
         tasks = dispatchSync(tasks: tasks)
     }
 
+    /// Streams an entire file into a pre-allocated anonymous buffer (typically a
+    /// device.makeBuffer(length:options:.storageModeShared)) using an N-way parallel
+    /// POSIX pread across disjoint byte ranges. Used to pin invariant weights
+    /// (e.g. FlashMoE model_weights.bin backbone) into resident anonymous memory so the
+    /// GPU never re-faults them from the file-backed mmap during decode.
+    ///
+    /// Returns elapsed wall time in seconds on success (full `length` bytes read),
+    /// or nil if the open/read failed or the transfer was incomplete (partial data
+    /// would silently corrupt weights, so callers must fall back to the mmap path).
+    @discardableResult
+    public static func preadFileIntoBuffer(fd: Int32, dst: UnsafeMutableRawPointer, length: Int, threads: Int = 8) -> Double? {
+        guard fd >= 0, length > 0 else { return nil }
+        let workerCount = max(1, min(threads, length / 262144))
+        let rangeLen = length / workerCount
+        var totalRead: Int64 = 0
+        let t0 = CFAbsoluteTimeGetCurrent()
+        DispatchQueue.concurrentPerform(iterations: workerCount) { i in
+            var done = 0
+            let end = (i == workerCount - 1) ? length - (workerCount - 1) * rangeLen : rangeLen
+            let base = dst.advanced(by: i * rangeLen)
+            var fileOff = off_t(i) * off_t(rangeLen)
+            while done < end {
+                let toRead = min(262144, end - done)
+                let n = pread(fd, base.advanced(by: done), toRead, fileOff)
+                if n <= 0 { break }
+                done += n
+                fileOff += off_t(n)
+            }
+            OSAtomicAdd64(Int64(done), &totalRead)
+        }
+        guard totalRead == Int64(length) else { return nil }
+        return CFAbsoluteTimeGetCurrent() - t0
+    }
+
     // MARK: - File Descriptor Management
 
     /// Opens and caches the file descriptor for a packed layer file (e.g. packed_experts/layer_00.bin)
