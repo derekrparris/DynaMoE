@@ -792,3 +792,83 @@ held; it validated the KERNELS, not the app's argument binding.
 Lesson recorded: kernel-level bench equivalence does not cover wiring-level
 buffer mismatches; future chunk ports need an app-binding review or a bench
 that mirrors the app's exact buffer roles.
+
+---
+
+## FIX #8: PER-SLOT COMPLETION TRACKING FOR DECODE PREFETCH (SHIPPED)
+
+**Design (incorporating QA #11's lessons):**
+1. `ExpertIOThreadPool.dispatchAsync(tasks:onTaskDone:done:)` — per-task
+   completion signals. Each finished pread marks its slot OK and signals the
+   slot's semaphore; `done` signals after the whole batch.
+2. `PackedExpertKick` (class): targetLayer, bufIdx, staging buffer, slotBase,
+   candidate list, per-slot semaphores + OK flags, all-done semaphore.
+   Published SYNCHRONOUSLY at kick time so the consumer can always see it;
+   reads then run on the background queue.
+3. Consume (per layer): if the kick targeting this layer is resident, wait
+   ONLY the needed slots (15ms timeout each, then synchronous duplicate read
+   into a miss slot — correct because the kick writes a different slot);
+   false-positive reads never block. Stale kicks (skipped dense layer, token
+   boundary) are retired with a full wait before their slot space is reused.
+4. **Kick moved after `moeCmd.commit()`** — the retire-wait for the previous
+   kick into the same parity buffer (2 layers apart) now overlaps the GPU
+   execution of the current MoE command instead of serializing the CPU (the
+   QA #11 regression shape).
+5. Capacity 32 slots (~100.8 MB/buffer); prediction budget 16 (QA #7 showed
+   66-77% hits at this size; per-slot tracking removes the waits that made
+   16 candidates a regression).
+
+**Safety invariants.** GPU reads only slots that are sem-waited+OK (kick) or
+synchronously read (misses). Kick writes and consume miss-writes never share
+slots. Buffer reuse is guarded by the retire-wait. A short/failed pread
+signals its sem with OK=false and the consumer falls back to a duplicate sync
+read, so garbage slots are never advertised.
+
+**Expected effect.** Hit rate toward 55-70% (more candidates + ordered
+histories) without the QA #11 wait penalty; IO block down from ~120-160ms
+toward ~80-110ms/token. Risk watch: the retire-wait tail (kick ~50MB ≈ 10ms
+vs ~4-9ms elapsed per 2 layers) — overlapped with MoE GPU (~1-1.7ms) but may
+net-stall if SSD bandwidth drops; tune budget down to 12 if per-layer IO
+inflates.
+
+### QA #12 — Fix #8 (per-slot tracking) results: IO fixed, GPU inflates
+
+| | QA #10 (baseline) | QA #12 (now) |
+|---|---|---|
+| tokens | 251-305ms | 300-436ms |
+| IO | 119-160ms | **93-132ms** ✓ |
+| hit rate | 42-56% | 44-59% ✓ |
+| RouterGPU | 67-85ms | **89-149ms** ✗ |
+| MoEGPU | 39-41ms | **46-65ms** ✗ |
+| gqa PhaseA | 2.7-2.9ms | **5.1-8.9ms** ✗ |
+
+Per-slot consumption works exactly as designed (no full-kick waits; IO down
+~30%; hit rate up ~5-10pts). But 16-candidate kicks (50MB/layer, ~2.0GB/token
+of total SSD reads) saturate the disk (only ~5.6GB/s) and correlate 1:1 with
+GPU-phase inflation: concurrent 8-thread pread bursts during attention phases
+coincide with RouterGPU wall-time doubling (driver submission starvation /
+memory-controller contention). MoEGPU inflation includes the retire-wait
+tails (~+0.5ms/layer, bounded ✓).
+
+**Action: keep the per-slot machinery, shrink the kick budget to the SSD
+window: 16 -> 10 candidates** (31.5MB ≈ 5.6ms ≈ the 2-layer overlap window).
+SSD load per token drops from ~2.4GB to ~1.7GB; expected hit rate ~50-58%,
+tokens back toward ~260-290ms. The 77% hollow-hit-rate lesson: candidate
+counts beyond the window's read capacity buy late hits, not speed.
+
+### QA #13 — Fix #8 + budget 10: baseline restored, decode lane at diminishing returns
+
+Token 850 (best): **256ms** | RouterGPU=80.4ms ✓ (baseline) | IO=103.2ms ✓ |
+MoEGPU=40.4ms ✓ | 40% hits — the per-slot machinery is clean, GPU inflation
+gone. Token 849: 349ms @ 29% (topic drift); token 851: 377ms @ **2%** — the
+whole token's prediction collapsed (all layers 0/8-1/8): a mid-generation
+topic switch (code block) invalidates every temporal-history predictor at
+once. That failure mode is fundamental to history-based routing prediction,
+not a fixable bug.
+
+**State of the decode hit-rate lane:** hits bounded by temporal routing
+stability (~40-60% fluent text, collapses on topic switches); the remaining
+structural levers are (a) component-level expert streaming (breaks the
+~5 tok/s SSD floor, big project), (b) fused sampler/logits for the ~30ms
+"Other" block (~10-15ms recoverable), or (c) return to TTFT (GDN kernel
+threading, ~2-2.5s of TTFT — the clearest remaining win).

@@ -71,9 +71,11 @@ public final class ExpertIOThreadPool {
 
     /// Asynchronously dispatches pread tasks on a background queue and signals
     /// `done` exactly once after ALL tasks have completed (or immediately if empty).
-    /// Callers poll the semaphore to consume a speculative prefetch kick without
-    /// ever blocking the GPU submission path.
-    public func dispatchAsync(tasks: [ExpertPreadTask], done: DispatchSemaphore? = nil) {
+    /// When `onTaskDone` is provided it is invoked with the task index as soon as
+    /// that individual pread finishes, enabling per-slot consumption of
+    /// speculative prefetch kicks: consumers wait on individual slots instead of
+    /// the whole batch, so slow false-positive reads never block the critical path.
+    public func dispatchAsync(tasks: [ExpertPreadTask], onTaskDone: ((Int) -> Void)? = nil, done: DispatchSemaphore? = nil) {
         guard !tasks.isEmpty else {
             done?.signal()
             return
@@ -83,7 +85,15 @@ public final class ExpertIOThreadPool {
                 done?.signal()
                 return
             }
-            _ = self.dispatchSync(tasks: tasks)
+            var resultTasks = tasks
+            resultTasks.withUnsafeMutableBufferPointer { buffer in
+                DispatchQueue.concurrentPerform(iterations: buffer.count) { i in
+                    let task = buffer[i]
+                    let bytesRead = pread(task.fd, task.dst, task.size, task.offset)
+                    buffer[i].result = bytesRead
+                    onTaskDone?(i)
+                }
+            }
             done?.signal()
         }
     }

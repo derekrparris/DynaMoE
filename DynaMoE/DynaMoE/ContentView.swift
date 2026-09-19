@@ -4191,7 +4191,9 @@ struct ContentView: View {
             packedExpertsDir = nil
         }
 
-        let expertStagingSize = max(16 * 4194304, 16 * Int(loadedLayout?.expert_size ?? 4718592))
+        // FIX #8: 32 slots per staging buffer (kick candidates ≤16 + topK misses ≤8
+        // with headroom; ~100.8 MB per buffer for the FP8 packed layout).
+        let expertStagingSize = max(32 * 4194304, 32 * Int(loadedLayout?.expert_size ?? 4718592))
 
         // Allocate Shared Scratch Buffers (Reused across all generation steps)
         guard let singleTokenBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared),
@@ -4838,65 +4840,77 @@ struct ContentView: View {
                 let packedExpertSize = Int(loadedLayout?.expert_size ?? 1769472)
                 let maxTopK = Int(modelConfig?.effectiveNumExpertsPerTok ?? (numExperts >= 512 ? 10 : 8))
                 let packedPrefetchLock = NSLock()
-                var packedPrefetchResident: [[Int: Int]] = [[:], [:]]   // [bufferIdx] expertId -> slot
-                var packedPrefetchResidentLayer: [Int] = [-1, -1]
-                var packedPrefetchNextSlot: [Int] = [0, 0]
-                var packedPrefetchPending: (layer: Int, sem: DispatchSemaphore)? = nil
-                let packedPrefetchQueue = DispatchQueue(label: "com.dynamoe.packed.expertprefetch", qos: .userInitiated, attributes: .concurrent)
 
-                // Blocks until the in-flight prefetch for `layer` has landed (no-op if none).
-                func waitForPackedPrefetch(_ layer: Int) {
-                    packedPrefetchLock.lock()
-                    if let pending = packedPrefetchPending, pending.layer == layer {
-                        let sem = pending.sem
-                        packedPrefetchPending = nil
-                        packedPrefetchLock.unlock()
-                        _ = sem.wait(timeout: .now() + 5.0)
-                    } else {
-                        packedPrefetchLock.unlock()
+                // FIX #8: per-slot completion tracking. A kick publishes its candidate
+                // list and per-slot semaphores synchronously; the consuming layer waits
+                // ONLY for the slots it needs (signaled by the pool as each pread
+                // completes), while false-positive reads run to completion in the
+                // background. A kick's slot space is reclaimed at the next kick into
+                // the same staging buffer (2 layers later), which first waits for ALL
+                // of the old kick's reads — that retire-wait overlaps the current
+                // layer's MoE GPU command.
+                final class PackedExpertKick {
+                    let targetLayer: Int
+                    let bufIdx: Int
+                    let buffer: MTLBuffer
+                    let slotBase: Int               // first slot available for consume-side misses
+                    let candidates: [Int]           // slot i holds candidates[i]
+                    let slotSems: [DispatchSemaphore]
+                    let allDoneSem = DispatchSemaphore(value: 0)
+                    var slotOK: [Bool]              // guarded by packedPrefetchLock
+
+                    init(targetLayer: Int, bufIdx: Int, buffer: MTLBuffer, slotBase: Int, candidates: [Int]) {
+                        self.targetLayer = targetLayer
+                        self.bufIdx = bufIdx
+                        self.buffer = buffer
+                        self.slotBase = slotBase
+                        self.candidates = candidates
+                        self.slotSems = (0..<candidates.count).map { _ in DispatchSemaphore(value: 0) }
+                        self.slotOK = Array(repeating: false, count: candidates.count)
                     }
                 }
 
-                // Kicks the background pread of predicted experts for `targetLayer` into the
-                // opposite staging buffer. Safe to call while the GPU reads the current
-                // buffer: the prefetch writes only buffer (targetLayer & 1), and the previous
-                // MoE pass on that buffer completed before this layer's router resolved.
+                var packedKickInFlight: [PackedExpertKick?] = [nil, nil]
+                let packedPrefetchQueue = DispatchQueue(label: "com.dynamoe.packed.expertprefetch", qos: .userInitiated, attributes: .concurrent)
+
+                // Kicks the background pread of predicted experts for `targetLayer` into
+                // the opposite staging buffer. Safe while the GPU reads the current
+                // buffer: the prefetch writes only buffer (targetLayer & 1), whose
+                // previous MoE pass completed before this layer's router resolved.
+                // Must be called AFTER the current layer's MoE command is committed so
+                // the previous-same-parity-kick retire wait overlaps GPU execution.
                 func kickPackedPrefetch(_ predicted: [Int], targetLayer: Int, fd: Int32) {
                     guard !predicted.isEmpty else { return }
                     let targetBuf = targetLayer & 1
                     let stagingBuf = (targetBuf == 0) ? expertStagingBuffer : expertStagingBufferB
                     let capacity = expertStagingSize / packedExpertSize
-                    let slots = min(predicted.count, max(0, capacity - maxTopK))
-                    let sem = DispatchSemaphore(value: 0)
+                    let slots = min(predicted.count, 10, max(0, capacity - maxTopK))
+                    guard slots > 0 else { return }
+                    let kicked = Array(predicted.prefix(slots))
+                    let kick = PackedExpertKick(targetLayer: targetLayer, bufIdx: targetBuf, buffer: stagingBuf, slotBase: slots, candidates: kicked)
+
                     packedPrefetchLock.lock()
-                    packedPrefetchResident[targetBuf] = [:]
-                    packedPrefetchResidentLayer[targetBuf] = -1
-                    packedPrefetchNextSlot[targetBuf] = slots
-                    packedPrefetchPending = (targetLayer, sem)
+                    let old = packedKickInFlight[targetBuf]
+                    packedKickInFlight[targetBuf] = kick
                     packedPrefetchLock.unlock()
+                    // Retire the previous kick that owned this buffer's slot space
+                    // before its bytes can be overwritten (wait overlaps GPU work).
+                    if let old = old { _ = old.allDoneSem.wait(timeout: .now() + 30.0) }
 
                     packedPrefetchQueue.async {
                         var tasks: [ExpertPreadTask] = []
-                        for (slotIdx, expId) in predicted.prefix(slots).enumerated() {
+                        for (slotIdx, expId) in kicked.enumerated() {
                             tasks.append(ExpertPreadTask(fd: fd,
                                                          dst: stagingBuf.contents().advanced(by: slotIdx * packedExpertSize),
                                                          offset: off_t(expId * packedExpertSize),
                                                          size: packedExpertSize))
                         }
-                        var map: [Int: Int] = [:]
-                        if !tasks.isEmpty {
-                            ExpertIOThreadPool.shared.dispatchSync(tasks: &tasks)
-                            // Publish ONLY completed preads — a short read leaves garbage in
-                            // the slot, and advertising it would feed the GPU wrong weights.
-                            for (slotIdx, t) in tasks.enumerated() where t.result == t.size {
-                                map[predicted[slotIdx]] = slotIdx
-                            }
-                        }
-                        packedPrefetchLock.lock()
-                        packedPrefetchResident[targetBuf] = map
-                        packedPrefetchResidentLayer[targetBuf] = targetLayer
-                        packedPrefetchLock.unlock()
-                        sem.signal()
+                        ExpertIOThreadPool.shared.dispatchAsync(tasks: tasks, onTaskDone: { idx in
+                            packedPrefetchLock.lock()
+                            kick.slotOK[idx] = true
+                            packedPrefetchLock.unlock()
+                            kick.slotSems[idx].signal()
+                        }, done: kick.allDoneSem)
                     }
                 }
 
@@ -6233,6 +6247,9 @@ if layer.attnGateProjTensor != nil,
                             }
 
                             let activeIds = activeExperts.map { $0.id }
+                            // FIX #8: predicted experts for layer l+1, kicked after this
+                            // layer's MoE commit so the retire wait overlaps GPU execution.
+                            var deferredPredictedExperts: [Int]? = nil
                             if speculativePrefetchEnabled {
                                 // 1. Transition correlation tracking + 2-token history rotation
                                 if l > 0, let prevIds = previousLayerActiveExperts[l - 1] {
@@ -6250,8 +6267,16 @@ if layer.attnGateProjTensor != nil,
                                 //    cross-layer Markov signal measured ~0% and only fills
                                 //    remaining budget). Router top-k order is weight-ranked, so
                                 //    earlier entries are the higher-confidence candidates.
+                                // FIX #8: the kick itself moved AFTER this layer's MoE commit
+                                // (see below) so the previous-same-parity-kick retire wait
+                                // overlaps GPU execution instead of serializing the CPU.
                                 if l + 1 < actualLayers, packedPrefetchAdaptiveEnabled {
-                                    let budget = max(0, (expertStagingSize / packedExpertSize) - maxTopK)
+                                    // FIX #8: budget capped at 10 candidates. QA #12: 16-candidate
+                                    // kicks (50MB/layer, ~2.0GB/token) saturate the SSD and inflate
+                                    // GPU-phase wall-times (driver starvation) — candidates beyond
+                                    // the window's read capacity buy late hits, not speed.
+                                    // 10 candidates ≈ 31.5MB ≈ 5.6ms ≈ the 2-layer overlap window.
+                                    let budget = min(10, max(0, (expertStagingSize / packedExpertSize) - maxTopK))
                                     var seen = Set<Int>()
                                     var predicted: [Int] = []
                                     for hist in [previousLayerActiveExperts[l + 1] ?? [], layerExpertHistory[l + 1]?.first ?? []] {
@@ -6265,29 +6290,16 @@ if layer.attnGateProjTensor != nil,
                                         seen.insert(id)
                                         predicted.append(id)
                                     }
-                                    if !predicted.isEmpty {
-                                        if let packedDir = packedExpertsDir,
-                                           let nextFd = ExpertIOThreadPool.shared.getOrOpenLayerFD(layerIndex: l + 1, packedExpertsDir: packedDir) {
-                                            // Packed: stream predicted experts into the opposite staging
-                                            // buffer, overlapping this layer's MoE GPU work.
-                                            kickPackedPrefetch(predicted, targetLayer: l + 1, fd: nextFd)
-                                        } else if packedExpertsDir == nil {
-                                            // Unpacked: WSM mmap-path prefetch
-                                            WorkingSetManager.shared.prefetchLayerExperts(layer: l + 1, expertIds: predicted, shardBuffers: buffers)
-                                        }
-                                    }
+                                    // FIX #8: defer the kick until after moeCmd.commit() — store
+                                    // the predicted list for this layer.
+                                    deferredPredictedExperts = predicted
                                 }
 
                                 // 3. Lookahead prefetch layer l + 2 dense backbone — mmap models only.
                                 //    FlashMoE backbone is pinned in RAM at load; the WSM fallback here
                                 //    would just CPU-fault safetensors pages and compete with the
                                 //    critical-path expert preads for NVMe.
-                                if packedExpertsDir == nil && l + 2 < actualLayers {
-                                    let nextNextL = l + 2
-                                    if nextNextL < cachedLayers.count {
-                                        WorkingSetManager.shared.prefetchLayerBackbone(layer: cachedLayers[nextNextL], shardBuffers: buffers)
-                                    }
-                                }
+                                // FIX #8: moved after moeCmd.commit() alongside the kick.
                             }
                             WorkingSetManager.shared.touchAndEvict(layer: l, activeExpertIds: activeIds, mode: budgetMode, shardBuffers: buffers, isPrefill: !computeLogits)
 
@@ -6311,44 +6323,75 @@ if layer.attnGateProjTensor != nil,
 
                                 let isQuantizedAffine = (compGateB != nil || compGateW?.name.contains("Q4") == true || compGateW?.name.contains("Q8") == true || compGateW?.dtype.contains("Q4") == true || compGateW?.dtype.contains("Q8") == true || (compGateS != nil && !isFP8Layout))
 
-                                // 1. Pipelined expert consumption: reuse prefetched slots for this
-                                //    layer, synchronously pread only predictor misses, into the
-                                //    double-buffered staging slot for this layer parity.
+                                // 1. Per-slot expert consumption (FIX #8): wait only for the
+                                //    needed slots of the in-flight kick; false-positive reads
+                                //    continue in the background. Synchronously pread misses
+                                //    into slots after the kick's.
                                 let bufIdx = l & 1
                                 let stagingBuf = (bufIdx == 0) ? expertStagingBuffer : expertStagingBufferB
                                 let stagingCapacity = expertStagingSize / expertSize
 
                                 let tIoStart = CFAbsoluteTimeGetCurrent()
-                                waitForPackedPrefetch(l)
+
+                                var kick: PackedExpertKick? = nil
+                                var staleKick: PackedExpertKick? = nil
+                                packedPrefetchLock.lock()
+                                if let k = packedKickInFlight[bufIdx] {
+                                    if k.targetLayer == l {
+                                        kick = k
+                                    } else {
+                                        // Stale kick for this parity (e.g. a skipped dense layer
+                                        // or the token boundary): retire it fully before the
+                                        // slot space is reused.
+                                        staleKick = k
+                                        packedKickInFlight[bufIdx] = nil
+                                    }
+                                }
+                                packedPrefetchLock.unlock()
+                                if let old = staleKick {
+                                    _ = old.allDoneSem.wait(timeout: .now() + 30.0)
+                                }
 
                                 var slotOf: [Int: Int] = [:]
                                 var prefetchHits = 0
-                                packedPrefetchLock.lock()
-                                if packedPrefetchResidentLayer[bufIdx] == l {
-                                    slotOf = packedPrefetchResident[bufIdx]
+                                var nextSlot: Int
+                                var missList: [(id: Int, weight: Float)] = []
+                                if let k = kick {
+                                    nextSlot = k.slotBase
+                                    for exp in activeExperts {
+                                        if let idx = k.candidates.firstIndex(of: exp.id), idx < k.slotSems.count {
+                                            // Wait for THIS slot's pread only (bounded; a stalled
+                                            // read falls back to a synchronous duplicate below).
+                                            _ = k.slotSems[idx].wait(timeout: .now() + 15.0)
+                                            packedPrefetchLock.lock()
+                                            let ok = k.slotOK[idx]
+                                            packedPrefetchLock.unlock()
+                                            if ok {
+                                                slotOf[exp.id] = idx
+                                                prefetchHits += 1
+                                            } else {
+                                                missList.append(exp)
+                                            }
+                                        } else {
+                                            missList.append(exp)
+                                        }
+                                    }
                                 } else {
-                                    // No valid prefetched map for this layer on this buffer:
-                                    // the slot space is ours from 0. (Without this reset, miss
-                                    // allocations would accumulate across layers sharing the parity
-                                    // buffer and eventually overflow past the staging capacity.)
-                                    packedPrefetchNextSlot[bufIdx] = 0
+                                    nextSlot = 0
+                                    missList = activeExperts
                                 }
-                                packedPrefetchLock.unlock()
-                                for exp in activeExperts where slotOf[exp.id] != nil { prefetchHits += 1 }
 
                                 var missTasks: [ExpertPreadTask] = []
-                                for exp in activeExperts where slotOf[exp.id] == nil {
-                                    packedPrefetchLock.lock()
-                                    let slot = packedPrefetchNextSlot[bufIdx]
-                                    packedPrefetchNextSlot[bufIdx] = slot + 1
-                                    packedPrefetchLock.unlock()
+                                for exp in missList {
                                     // Unreachable by construction (misses ≤ maxTopK and the slot
-                                    // space starts at 0 or capacity-maxTopK); abort rather than
-                                    // ever feed the GPU a wrong expert's slot.
-                                    guard slot < stagingCapacity else {
+                                    // space starts at 0 or after the kick's candidates); abort
+                                    // rather than ever feed the GPU a wrong expert's slot.
+                                    guard nextSlot < stagingCapacity else {
                                         print("❌ [Prefetch] slot overflow at layer \(l) — aborting generation")
                                         return false
                                     }
+                                    let slot = nextSlot
+                                    nextSlot += 1
                                     slotOf[exp.id] = slot
                                     missTasks.append(ExpertPreadTask(fd: fd,
                                                                      dst: stagingBuf.contents().advanced(by: slot * expertSize),
@@ -6674,6 +6717,33 @@ if layer.attnGateProjTensor != nil,
                                 layerEnc2.endEncoding()
                                 let tMoeGpuStart = CFAbsoluteTimeGetCurrent()
                                 moeCmd.commit()
+
+                                // FIX #8: kick layer l+1's predicted expert reads now that the
+                                // GPU is busy with this layer's MoE. The retire-wait for the
+                                // previous same-parity kick (inside kickPackedPrefetch)
+                                // overlaps this GPU execution instead of serializing the CPU.
+                                if let predicted = deferredPredictedExperts, !predicted.isEmpty {
+                                    if let packedDir = packedExpertsDir,
+                                       let nextFd = ExpertIOThreadPool.shared.getOrOpenLayerFD(layerIndex: l + 1, packedExpertsDir: packedDir) {
+                                        // Packed: stream predicted experts into the opposite staging
+                                        // buffer, overlapping this layer's MoE GPU work.
+                                        kickPackedPrefetch(predicted, targetLayer: l + 1, fd: nextFd)
+                                    } else if packedExpertsDir == nil {
+                                        // Unpacked: WSM mmap-path prefetch
+                                        WorkingSetManager.shared.prefetchLayerExperts(layer: l + 1, expertIds: predicted, shardBuffers: buffers)
+                                    }
+                                }
+                                // 3. Lookahead prefetch layer l + 2 dense backbone — mmap models only.
+                                //    FlashMoE backbone is pinned in RAM at load; the WSM fallback here
+                                //    would just CPU-fault safetensors pages and compete with the
+                                //    critical-path expert preads for NVMe.
+                                if packedExpertsDir == nil && l + 2 < actualLayers {
+                                    let nextNextL = l + 2
+                                    if nextNextL < cachedLayers.count {
+                                        WorkingSetManager.shared.prefetchLayerBackbone(layer: cachedLayers[nextNextL], shardBuffers: buffers)
+                                    }
+                                }
+
                                 moeCmd.waitUntilCompleted()
                                 if let moeErr = moeCmd.error {
                                     print("❌ [METAL ERROR] prefill MoE cmd aborted: \(moeErr)")
