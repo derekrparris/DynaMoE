@@ -658,3 +658,37 @@ TTFT 14.2 -> 12.81s on this turn. Remaining whales, biggest first:
 3. Decode-side memory-pressure spikes (QA #9 token 1146: IO 504ms, prefetch
    12%, per-layer IO 12-16ms vs 2-6ms baseline) — swap/compressor stealing
    SSD bandwidth; separate lane.
+
+---
+
+## FIX #6a: MULTI-ROW CHUNKED PREFILL ATTENTION (SHIPPED, then REVERTED — see below)
+
+**Problem identified.** Prefill gqa layers fall to `gqaDecodeF16Pipeline` (the
+old per-thread full-KV-loop kernel — one thread per (head,row), 12k+ serial
+iterations) because `isStandardGqa=false` (fused Q+Gate) and there is no
+g_proj tensor. Measured prefill PhaseA = 5.66s of 12.11s TTFT; gqa layers
+~140ms each (~1.2s of it), GDN seq-scan ~135ms x 30 layers (~4.05s, the
+bigger half).
+
+**First attempt (rows-chunked kernels) FAILED bench verification.** Wrote
+`gqa_attention_decode_fused_f16_chunked_rows(+_combine)` (3D grid head x
+chunk x row, per-row causal limit). T17c results:
+
+- Numerically fine (error growth with row count is max-over-more-samples
+  statistics; per-element error ~2e-3, same noise floor as T17b; CPU ground
+  truth confirms ref kernel within 2e-3).
+- But 0.2-0.3x SLOWER than the old kernel at rows=64/128 (681-2948ms vs
+  121-262ms ref) and only 1.5x faster at rows=8.
+
+Root cause (measured, not fully explained): one thread per (head, chunk, row)
+with a serial chunk loop is latency-bound garbage on M1 — both the old kernel
+(~23us per serial KV iteration at 16-1024 threads) and the new one scale
+terribly with thread count above ~1-2k. T17b's decode win (chunkSize~64,
+1008 threads) does not extrapolate: 32k threads of this shape run 25x slower
+than thread-count-proportional. The correct prefill design needs SIMD-lane
+tiling (32 lanes split the headDim dot + online-softmax state per threadgroup),
+which is a bigger kernel rewrite.
+
+**Action: REVERTED the prefill wiring to the old kernel path** (kernels remain
+compiled; decode's chunked path untouched and verified). Wiring kept behind a
+dead branch to be replaced by the tiled kernel in a follow-up.

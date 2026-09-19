@@ -203,6 +203,8 @@ final class GPU {
                      "gqa_attention_decode_fused_f16",
                      "gqa_attention_decode_fused_f16_chunked",
                      "gqa_attention_decode_fused_f16_chunked_combine",
+                     "gqa_attention_decode_fused_f16_chunked_rows",
+                     "gqa_attention_decode_fused_f16_chunked_rows_combine",
                      "bench_fp8_moe_gate_up_fused", "bench_fp8_moe_down_fused"] {
             if let f = lib.makeFunction(name: name) {
                 do {
@@ -1734,6 +1736,162 @@ func main() {
             let tRef = (CFAbsoluteTimeGetCurrent() - t0) * 1000
             print("   fusedQ ctx=\(String(format: "%5d", ctx)): ref \(String(format: "%.2f", tRef))ms | chunked \(String(format: "%.2f", tChunk))ms (\(String(format: "%.1f", tRef / max(tChunk, 1e-9)))x) | max rel diff \(String(format: "%.2e", maxRel))")
         }
+    }
+
+    // ============================ T17c: multi-row chunked attention (PREFILL path) ============================
+    // Prefill dispatches the OLD fused kernel with height=rows (per-token causal via
+    // tokenIdx). Verify the new rows-chunked pair matches it byte-for-byte-ish and
+    // time both, in first-prefill mode (seqLen==0) and prefix mode (0x80000000|startPos).
+    log("--- T17c: start")
+    print("    --- T17c: multi-row chunked FUSED Q+Gate attention (prefill) vs old per-token kernel ---")
+    do {
+        guard let refPipe = gpu.pipe("gqa_attention_decode_fused_f16"),
+              let rowsPipe = gpu.pipe("gqa_attention_decode_fused_f16_chunked_rows"),
+              let rowsCombinePipe = gpu.pipe("gqa_attention_decode_fused_f16_chunked_rows_combine") else {
+            print("   (rows kernels unavailable - skipped)")
+            return
+        }
+        let nQ = 16, nKv = 2, hD = 256
+        let kvStride = nKv * hD
+        let maxRows = 128
+        let maxCtx = 8192
+        let maxChunks = 64
+        guard let qBuf = gpu.device.makeBuffer(length: maxRows * nQ * hD * 2 * 4, options: .storageModeShared),
+              let kCache = gpu.device.makeBuffer(length: maxCtx * kvStride * 2, options: .storageModeShared),
+              let vCache = gpu.device.makeBuffer(length: maxCtx * kvStride * 2, options: .storageModeShared),
+              let ctxRef = gpu.device.makeBuffer(length: maxRows * nQ * hD * 4, options: .storageModeShared),
+              let ctxRows = gpu.device.makeBuffer(length: maxRows * nQ * hD * 4, options: .storageModeShared),
+              let pM = gpu.device.makeBuffer(length: maxRows * nQ * maxChunks * 4, options: .storageModeShared),
+              let pL = gpu.device.makeBuffer(length: maxRows * nQ * maxChunks * 4, options: .storageModeShared),
+              let pAcc = gpu.device.makeBuffer(length: maxRows * nQ * maxChunks * hD * 4, options: .storageModeShared) else { return }
+
+        var seed: UInt32 = 0xB17E
+        func rnd3() -> Float { seed = seed &* 1664525 &+ 1013904223; return Float(Int((seed >> 16) % 2000) - 1000) / 1000.0 }
+        func f16BP3(_ f: Float) -> UInt16 { return Float16(f).bitPattern }
+        let kp3 = kCache.contents().bindMemory(to: UInt16.self, capacity: maxCtx * kvStride)
+        let vp3 = vCache.contents().bindMemory(to: UInt16.self, capacity: maxCtx * kvStride)
+        for i in 0..<(maxCtx * kvStride) {
+            seed = seed &* 1664525 &+ 1013904223
+            kp3[i] = f16BP3(rnd3())
+            seed = seed &* 1664525 &+ 1013904223
+            vp3[i] = f16BP3(rnd3())
+        }
+        let qp3 = qBuf.contents().bindMemory(to: Float.self, capacity: maxRows * nQ * hD * 2)
+        for i in 0..<(maxRows * nQ * hD * 2) { qp3[i] = rnd3() }
+
+        let queue3 = gpu.queue
+        func runRefRows(_ seqLen: UInt32, rows: Int) {
+            let cmd = queue3.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var s = seqLen, nq = UInt32(nQ), nkv = UInt32(nKv), hd = UInt32(hD)
+            enc.setComputePipelineState(refPipe)
+            enc.setBuffer(qBuf, offset: 0, index: 0)
+            enc.setBuffer(kCache, offset: 0, index: 1)
+            enc.setBuffer(vCache, offset: 0, index: 2)
+            enc.setBuffer(ctxRef, offset: 0, index: 3)
+            enc.setBytes(&s, length: 4, index: 4)
+            enc.setBytes(&nq, length: 4, index: 5)
+            enc.setBytes(&nkv, length: 4, index: 6)
+            enc.setBytes(&hd, length: 4, index: 7)
+            enc.dispatchThreads(MTLSize(width: nQ, height: rows, depth: 1), threadsPerThreadgroup: MTLSize(width: min(nQ, refPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            enc.endEncoding()
+            cmd.commit(); cmd.waitUntilCompleted()
+        }
+        func runRowsChunked(_ seqLen: UInt32, rows: Int, chunkTarget: UInt32 = 512) -> Double {
+            let maxLimit = (seqLen & 0x80000000) != 0 ? (seqLen & 0x7FFFFFFF) + UInt32(rows) : UInt32(rows)
+            let numChunks = max(1, min(UInt32(maxChunks), (maxLimit + chunkTarget - 1) / chunkTarget))
+            let chunkSize = (maxLimit + numChunks - 1) / numChunks
+            let cmd = queue3.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var s = seqLen, nq = UInt32(nQ), nkv = UInt32(nKv), hd = UInt32(hD)
+            var cs = chunkSize
+            enc.setComputePipelineState(rowsPipe)
+            enc.setBuffer(qBuf, offset: 0, index: 0)
+            enc.setBuffer(kCache, offset: 0, index: 1)
+            enc.setBuffer(vCache, offset: 0, index: 2)
+            enc.setBuffer(pM, offset: 0, index: 3)
+            enc.setBuffer(pL, offset: 0, index: 4)
+            enc.setBuffer(pAcc, offset: 0, index: 5)
+            enc.setBytes(&s, length: 4, index: 6)
+            enc.setBytes(&nq, length: 4, index: 7)
+            enc.setBytes(&nkv, length: 4, index: 8)
+            enc.setBytes(&hd, length: 4, index: 9)
+            enc.setBytes(&cs, length: 4, index: 10)
+            enc.dispatchThreadgroups(MTLSize(width: nQ, height: Int(numChunks), depth: rows), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+            var nc = numChunks
+            enc.setComputePipelineState(rowsCombinePipe)
+            enc.setBuffer(pM, offset: 0, index: 0)
+            enc.setBuffer(pL, offset: 0, index: 1)
+            enc.setBuffer(pAcc, offset: 0, index: 2)
+            enc.setBuffer(ctxRows, offset: 0, index: 3)
+            enc.setBuffer(qBuf, offset: 0, index: 4)
+            enc.setBytes(&nc, length: 4, index: 5)
+            enc.setBytes(&nq, length: 4, index: 6)
+            enc.setBytes(&hd, length: 4, index: 7)
+            enc.dispatchThreadgroups(MTLSize(width: nQ, height: rows, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            enc.endEncoding()
+            let t0 = CFAbsoluteTimeGetCurrent()
+            cmd.commit(); cmd.waitUntilCompleted()
+            return (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        }
+        func compareRows(rows: Int, ctxs: [(String, UInt32)], chunkTargets: [UInt32] = [512]) {
+            for (label, seqLen) in ctxs {
+                runRefRows(seqLen, rows: rows)
+                let t0 = CFAbsoluteTimeGetCurrent()
+                runRefRows(seqLen, rows: rows)
+                let tRef = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+                let a = ctxRef.contents().bindMemory(to: Float.self, capacity: rows * nQ * hD)
+                // CPU ground truth for the first row (online softmax, sequential)
+                let kpC = kCache.contents().bindMemory(to: UInt16.self, capacity: maxCtx * kvStride)
+                let vpC = vCache.contents().bindMemory(to: UInt16.self, capacity: maxCtx * kvStride)
+                let qpC = qBuf.contents().bindMemory(to: Float.self, capacity: maxRows * nQ * hD * 2)
+                let limit0: Int = (seqLen & 0x80000000) != 0 ? Int(seqLen & 0x7FFFFFFF) + 1 : 1
+                var cpuOut = [Float](repeating: 0, count: hD)
+                if limit0 > 0 {
+                    var m = -Float.infinity, l: Float = 0
+                    var acc = [Float](repeating: 0, count: hD)
+                    func f2(_ b: UInt16) -> Float { Float(Float16(bitPattern: b)) }
+                    for tau in 0..<min(limit0, maxCtx) {
+                        var dot: Float = 0
+                        for d in 0..<hD { dot += qpC[d] * f2(kpC[tau * kvStride + 0 * hD + d]) }
+                        dot /= sqrt(Float(hD))
+                        let mPrev = m
+                        if dot > m { m = dot }
+                        let alpha = exp(mPrev - m), beta = exp(dot - m)
+                        l = l * alpha + beta
+                        for d in 0..<hD { acc[d] = acc[d] * alpha + beta * f2(vpC[tau * kvStride + 0 * hD + d]) }
+                    }
+                    for d in 0..<hD {
+                        let g = qpC[0 * nQ * hD * 2 + 0 * hD * 2 + hD + d]
+                        cpuOut[d] = (l > 0 ? acc[d] / l : 0) * (1 / (1 + exp(-g)))
+                    }
+                }
+                let c0 = ctxRef.contents().bindMemory(to: Float.self, capacity: rows * nQ * hD)
+                var refVsCpu = 0.0
+                for d in 0..<hD {
+                    let x = Double(cpuOut[d]); let y = Double(c0[d])
+                    let rel = abs(x - y) / max(abs(x), abs(y), 1e-6)
+                    if rel > refVsCpu { refVsCpu = rel }
+                }
+                for ct in chunkTargets {
+                    let tRows = runRowsChunked(seqLen, rows: rows, chunkTarget: ct)
+                    let b = ctxRows.contents().bindMemory(to: Float.self, capacity: rows * nQ * hD)
+                    var maxRel = 0.0
+                    for i in 0..<(rows * nQ * hD) {
+                        let x = Double(a[i]); let y = Double(b[i])
+                        let rel = abs(x - y) / max(abs(x), abs(y), 1e-6)
+                        if rel > maxRel { maxRel = rel }
+                    }
+                    print("   rows=\(String(format: "%3d", rows)) \(label) chunkT=\(String(format: "%4d", ct)): ref \(String(format: "%7.2f", tRef))ms | rows-chunked \(String(format: "%7.2f", tRows))ms (\(String(format: "%.1f", tRef / max(tRows, 1e-9)))x) | ref-vs-chunk \(String(format: "%.2e", maxRel)) | ref-vs-cpu(row0) \(String(format: "%.2e", refVsCpu))")
+                }
+            }
+        }
+        _ = runRefRows(0, rows: 8); _ = runRowsChunked(0, rows: 8)
+        compareRows(rows: 8, ctxs: [("first-prefill", 0)], chunkTargets: [1024, 128, 64])
+        compareRows(rows: 8, ctxs: [("prefix@4000", 0x80000000 | 4000)], chunkTargets: [1024, 128, 64])
+        compareRows(rows: 64, ctxs: [("prefix@4000", 0x80000000 | 4000)], chunkTargets: [1024, 128, 64])
+        compareRows(rows: 128, ctxs: [("prefix@8000", 0x80000000 | 8000)], chunkTargets: [1024, 128, 64])
     }
 
     // ============================ T8: mmap cold page-fault path ============================

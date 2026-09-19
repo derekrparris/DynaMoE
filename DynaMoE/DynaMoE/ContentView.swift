@@ -3628,6 +3628,8 @@ struct ContentView: View {
         let gqaHeadGateF16ChunkedCombinePipeline: MTLComputePipelineState?
         let gqaFusedF16ChunkedPipeline: MTLComputePipelineState?
         let gqaFusedF16ChunkedCombinePipeline: MTLComputePipelineState?
+        let gqaFusedF16ChunkedRowsPipeline: MTLComputePipelineState?
+        let gqaFusedF16ChunkedRowsCombinePipeline: MTLComputePipelineState?
         let gqaHeadGateFP8Pipeline: MTLComputePipelineState?
         let bf16GeluGateUpPipeline: MTLComputePipelineState?
         let bf16GeluGateUpSimdPipeline: MTLComputePipelineState?
@@ -3718,6 +3720,14 @@ struct ContentView: View {
             if let gqaFusedF16ChunkedCombineFunc = defaultLibrary.makeFunction(name: "gqa_attention_decode_fused_f16_chunked_combine") {
                 gqaFusedF16ChunkedCombinePipeline = try device.makeComputePipelineState(function: gqaFusedF16ChunkedCombineFunc)
             } else { gqaFusedF16ChunkedCombinePipeline = nil }
+
+            if let gqaFusedF16ChunkedRowsFunc = defaultLibrary.makeFunction(name: "gqa_attention_decode_fused_f16_chunked_rows") {
+                gqaFusedF16ChunkedRowsPipeline = try device.makeComputePipelineState(function: gqaFusedF16ChunkedRowsFunc)
+            } else { gqaFusedF16ChunkedRowsPipeline = nil }
+
+            if let gqaFusedF16ChunkedRowsCombineFunc = defaultLibrary.makeFunction(name: "gqa_attention_decode_fused_f16_chunked_rows_combine") {
+                gqaFusedF16ChunkedRowsCombinePipeline = try device.makeComputePipelineState(function: gqaFusedF16ChunkedRowsCombineFunc)
+            } else { gqaFusedF16ChunkedRowsCombinePipeline = nil }
 
             if let gqaHeadGateFP8Func = defaultLibrary.makeFunction(name: "gqa_attention_decode_headgate_fp8") {
                 gqaHeadGateFP8Pipeline = try device.makeComputePipelineState(function: gqaHeadGateFP8Func)
@@ -6987,6 +6997,15 @@ if layer.attnGateProjTensor != nil,
                       let prefillStagingBufferB = device.makeBuffer(length: max(min(max(P * topKCount, 64), numExperts > 0 ? Int(numExperts) : 512) * Int(loadedLayout?.expert_size ?? 3151872), 64), options: .storageModeShared) else {
                     return false
                 }
+                // FIX #6a: flash-decoding partials for multi-row prefill attention.
+                let prefillAttnChunkRows = 64
+                let prefillAttnSeqMax = max(Int(KVCacheManager.shared.allocatedSeqLen) + 64, 1)
+                let prefillAttnChunksMax = max(1, min(64, (prefillAttnSeqMax + 1023) / 1024))
+                guard let attnPartialMBuffer = device.makeBuffer(length: max(prefillAttnChunkRows * Int(numHeads) * prefillAttnChunksMax, 64) * MemoryLayout<Float>.stride, options: .storageModeShared),
+                      let attnPartialLBuffer = device.makeBuffer(length: max(prefillAttnChunkRows * Int(numHeads) * prefillAttnChunksMax, 64) * MemoryLayout<Float>.stride, options: .storageModeShared),
+                      let attnPartialAccBuffer = device.makeBuffer(length: max(prefillAttnChunkRows * Int(numHeads) * prefillAttnChunksMax * Int(headDim), 64) * MemoryLayout<Float>.stride, options: .storageModeShared) else {
+                    return false
+                }
                 // FIX #5: double-buffered expert staging — layer l's MoE GPU reads one
                 // buffer while layer l+1's speculative preads fill the other.
                 var prefillStagingBuffer = prefillStagingBufferA
@@ -7010,10 +7029,6 @@ if layer.attnGateProjTensor != nil,
                 for i in 0..<P { denseWgtPtr[i] = 1.0 }
 
                 var hDim = hiddenDim
-                // Max query rows per attention dispatch during prefill. Bounds each kernel's
-                // duration so the GPU scheduler can interleave WindowServer frames
-                // (prevents Impacting-Interactivity aborts and UI stickiness on long prompts).
-                let prefillAttnChunkRows = 64
                 let prefillStartTime = CFAbsoluteTimeGetCurrent()
                 var lastUIUpdateTime = CFAbsoluteTimeGetCurrent()
 
@@ -7388,6 +7403,10 @@ if layer.attnGateProjTensor != nil,
                                             layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 7)
                                             layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: sliceRows, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), gqaStdPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                                         } else if let gqaPipe = gqaDecodeF16Pipeline ?? gqaDecodePipeline {
+                                            // FIX #6a NOTE: multi-row chunked kernels verified SLOWER
+                                            // than this path at prefill shapes (T17c) — see
+                                            // Benchmarks/PERF_FINDINGS.md. Reverted to the old kernel
+                                            // until a SIMD-tiled variant exists.
                                             layerEnc1.setComputePipelineState(gqaPipe)
                                             layerEnc1.setBuffer(qGateBuffer_all, offset: qOff, index: 0)
                                             layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
