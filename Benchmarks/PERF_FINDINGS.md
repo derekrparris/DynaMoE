@@ -244,3 +244,184 @@ the mmap path held in steady state, so net committed memory grows by roughly
 1.5–2 GB; on 16 GB machines this is the difference between a stable resident
 working set and a thrashing page cache. The toggle exists as an escape hatch
 for tighter-memory configurations.
+
+---
+
+## IMPLEMENTATION — Fix #2: software-pipelined expert streaming (SHIPPED)
+
+**Changes (all in `ContentView.swift` unless noted):**
+
+1. **Double-buffered expert staging.** Second 64 MB staging buffer
+   (`expertStagingBufferB`) allocated next to the original. Layer l consumes
+   buffer `l & 1`; the prefetcher writes buffer `(l+1) & 1`.
+
+2. **Pipelined decode consumption** (`runTokenForward`, packed branch): per layer,
+   1. wait for the in-flight prefetch of layer l (no-op when absent),
+   2. consume prefetched experts by slot map (`expertId -> slot`), synchronously
+      pread **only predictor misses** into free slots,
+   3. kick the background pread of layer l+1's Markov-predicted experts
+      (top-10 by aggregated transition counts, `ExpertTransitionTracker`) into the
+      opposite buffer — it overlaps this layer's MoE GPU phase,
+   4. GPU phase reads from the parity buffer with per-expert slot offsets.
+
+   Synchronization: one fresh `DispatchSemaphore` per kick (no stale-signal reuse);
+   wait has a 5 s timeout and the slot map is tagged with the resident layer so
+   stale maps can never be consumed. Capacity is guaranteed by construction
+   (prefetch slots ≤ capacity − maxTopK; misses ≤ maxTopK).
+
+3. **Adaptive gate.** Kicks are disabled for the rest of the generation if the
+   predictor's observed hit rate falls below 20% over the first 64 consumed
+   experts (prediction-useless routing would otherwise waste NVMe competing
+   with critical-path miss IO). Retried next generation as the tracker learns.
+
+4. **Backbone prefetch disabled for packed models.** All
+   `prefetchLayerBackbone` call sites are gated on `packedExpertsDir == nil` —
+   with fix #1 the backbone is resident; the old WSM fallback only CPU-faulted
+   safetensors pages and competed with the expert preads.
+
+5. **Telemetry.** `[DIAG] Layer ... (prefetch H/T)` per layer and
+   `| Prefetch H/T (N%)` in the token summary.
+
+**Benchmark verification (T14 — identical sticky routing replayed in both
+variants, 2 tokens, Markov predictor in the pipelined variant):**
+
+| Variant | Per-token (warm tokens) | Sync IO | Predicted-hit rate |
+|---|---|---|---|
+| T14 serialized (cold cache) | 303 ms (3.3 tok/s) | 234 ms/token | 0% (no prefetcher) |
+| T14 pipelined | **66 ms (15.1 tok/s)** | **0.8 ms/token** | **98%** |
+
+That is a **~4.5× improvement over the serialized cold path** and **~2.3× over
+the serialized warm path** (T6: 147 ms/token with fully warm expert cache).
+Combined with fix #1 (backbone pinning), the projected steady-state decode on
+this machine is ~10–15 tok/s while experts stream at NVMe line rate. The real
+hit rate depends on the model's routing locality — the `[DIAG]` prefetch
+telemetry now reports it live, and the adaptive gate bounds the worst case to
+the previous (all-miss) behavior.
+
+*Benchmark note:* the T10 fault-storm diagnostic section (now ordered last)
+can destabilize the bench process after hundreds of GPU fault dispatches on
+16 GB machines (SIGSEGV in the pread workers, seen in all orderings); the
+pipeline tests T13/T14 complete cleanly and are unaffected. Run with
+`--tokens 2` for the full suite.
+
+---
+
+## CORRECTNESS FIX (post-ship, SHIPPED)
+
+Initial QA on the live app produced garbage output (mixed-language tokens) —
+reproduced and root-caused with a new bench harness (T15: replicates the exact
+consume/kick shape and verifies every consumed expert's staged bytes against a
+direct read of the layer file). Two compounding bugs in the original consume
+path:
+
+1. **Slot-space leak → out-of-bounds staging writes.** `nextSlot` was only
+   reset by the kick's synchronous part — which never fires when the Markov
+   prediction is empty (cold tracker on the first tokens, or after the adaptive
+   gate turns the prefetcher off). Miss allocations then accumulated across
+   layers sharing the parity buffer, eventually allocating slots beyond the
+   staging capacity (21 slots × 3.0 MB = 64 MB) and preading weights past the
+   end of the buffer.
+
+2. **Silent wrong-expert fallback.** Skipped experts (capacity guard `continue`)
+   and any missing slot-map entry fell back to `slotOf[expert.id] ?? slot` in
+   the GPU loop, feeding the GPU **a different expert's weights** — the direct
+   cause of the gibberish output.
+
+**Fixes (app + bench):**
+
+- The consumer now **owns the slot space**: when the resident map is stale or
+  absent for this layer, `nextSlot[bufIdx]` is reset to 0, so misses always fill
+  from slot 0 and the slot count is bounded by construction
+  (kick slots ≤ capacity − maxTopK, misses ≤ maxTopK).
+- The capacity guard is now a **hard abort** instead of a silent `continue`
+  (unreachable by construction; aborting beats corrupting).
+- The kick publishes **only completed preads** (`result == size`); a short read
+  is no longer advertised as resident (the consumer re-reads it as a miss).
+- Removed the `?? slot` fallback hazard by the above (every consumed expert is
+  guaranteed a real slot).
+
+**Verification:** new bench harness T15 (app-shaped consume/kick + byte-exact
+verification of every consumed expert against a direct file read): **960
+consumed experts, 0 mismatches** after the fix (the pre-fix shape reproduced
+out-of-bounds slots 21/22 with wrong weights at byte level — exactly the
+in-app corruption).
+
+---
+
+## PREDICTOR FIX (post-QA #2, SHIPPED)
+
+Live-app QA #2: output correct, but the Markov (layer l → l+1 transition)
+predictor measured **0/320 hits** on real Ornith decode — the cross-layer
+routing signal is genuinely not predictive for this model's traffic, so the
+adaptive gate fell back to all-miss sync IO (~400 ms/token).
+
+**Fix: temporal-first prediction.** Consecutive tokens in fluent text route to
+largely the same experts **at the same layer** (content locality — the
+"Pre-gated MoE" insight; MoE-Infinity's temporal expert-reuse profile). The
+signal already exists in the runtime: `previousLayerActiveExperts[l + 1]`
+holds the previous token's expert set at layer l+1 (the dict persists across
+tokens; the current token only writes entries for layers it has reached).
+
+New prediction for layer l+1 (kicked at layer l, after router l resolves):
+
+1. **Temporal (primary):** previous token's full 8-expert set at layer l+1.
+2. **Markov fill:** cross-layer transition top-10 appended (dedup) into any
+   remaining prefetch budget (capacity − maxTopK slots).
+
+T14 benchmark (temporal-first predictor, sticky routing, same as before):
+**pipelined 13.4–17.1 tok/s vs serialized 3.1–3.3 tok/s (~4–5×), 98% hit
+rate**, sync IO ~1 ms/token. T15 byte-verification: 0 mismatches with the
+temporal predictor in the loop.
+
+Fix: gate judgement (and observation accumulation) now requires
+`hadTemporalHistory` (captured at token start: `!previousLayerActiveExperts.isEmpty`).
+Token 0's legitimate cold-start 0% can no longer latch the gate; from token 2
+onward the accumulated rate reflects real prediction quality, and the gate
+only latches off on genuine evidence of a unpredictable-routing workload.
+
+---
+
+## PREDICTOR RESULTS + 2-TOKEN HISTORY (post-QA #4, SHIPPED)
+
+Live QA #4 (Ornith, real prompt, tokens 240-245): temporal predictor running —
+**38-54% hit rate** (trending up as the session progresses; best token 54%),
+per-token **IO 120-160 ms** (down from ~230 ms), token time 299-400 ms.
+The adaptive gate no longer false-trips.
+
+Next lever shipped: **2-token temporal union**. Single-token history caps
+coverage near 50%; the union of the last two tokens' sets at the target layer
+(router top-k order is weight-ranked, so earlier entries are
+higher-confidence) pushed the measured coverage to ~70-75% in the bench.
+Prefetch budget unchanged (capacity − maxTopK = 13 slots: t-1's 8 + t-2's
+top-5). Expected effect on the user's numbers: misses drop from ~4/layer to
+~2/layer → sync IO from ~120-160 ms toward ~60-90 ms → token time toward
+~250-280 ms (~3.6-4 tok/s).
+
+Remaining cost structure at this point (from QA #4 logs):
+- RouterGPU (Phase A attention/SSM + router): ~106 ms/token — now the largest
+  single block; real attention/GDN compute + 3 blocking syncs per layer.
+- MoE GPU: ~44 ms/token.
+- Other (logits GEMV + sampling): ~31 ms/token.
+- IO: hit-rate dependent (120 ms at ~50% hits; floor ~30-45 ms at 75-100%).
+
+Fixes #3 (fused MoE kernels, 1.2-2x on the MoE block) and #4 (sync-point
+reduction) are the next structural wins once IO is fully hidden.
+
+---
+
+## GATE WARMUP FIX (post-QA #3, SHIPPED)
+
+Live-app QA #3: output correct, but `[DIAG]` showed the prefetcher disabled
+from the first token onward (0/320 forever, IO back to ~6 ms/layer sync).
+
+Root cause: the adaptive gate evaluated on the **first 64 observations of
+token 0** — which by design has *no* temporal history (`previousLayerActiveExperts`
+empty → 0% prediction) — and latched the prefetcher off for the entire
+generation. Every later token inherited the disabled state, so the temporal
+predictor never ran past token 0.
+
+Fix: gate judgement (and observation accumulation) now requires
+`hadTemporalHistory` (captured at token start: `!previousLayerActiveExperts.isEmpty`).
+Token 0's legitimate cold-start 0% can no longer latch the gate; from token 2
+onward the accumulated rate reflects real prediction quality, and the gate
+only latches off on genuine evidence of a unpredictable-routing workload.

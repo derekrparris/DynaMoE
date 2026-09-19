@@ -4174,6 +4174,7 @@ struct ContentView: View {
               let sharedScoreBuffer = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared),
               let interBuffer = device.makeBuffer(length: max(Int(maxInterDim), 512) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let expertStagingBuffer = device.makeBuffer(length: expertStagingSize, options: .storageModeShared),
+              let expertStagingBufferB = device.makeBuffer(length: expertStagingSize, options: .storageModeShared),
               let hcStreamsBuffer = device.makeBuffer(length: max(4 * Int(hiddenDim), 10240) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let hcNormedBuffer = device.makeBuffer(length: max(4 * Int(hiddenDim), 10240) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let hcBottleneckBuffer = device.makeBuffer(length: 512 * MemoryLayout<Float>.stride, options: .storageModeShared),
@@ -4741,12 +4742,27 @@ struct ContentView: View {
 
             // Helper for Single Token Forward Pass
             var previousLayerActiveExperts: [Int: [Int]] = [:]
+            // 2-deep per-layer expert history for the temporal predictor:
+            // layerExpertHistory[l][0] = previous token's set, [1] = the one before.
+            var layerExpertHistory: [Int: [[Int]]] = [:]
+            // Pipelined-expert adaptive gate: persistent across tokens; disables the
+            // prefetcher for the rest of the generation if the predictor proves useless
+            // (<20% hit rate over 64 consumed experts), since wasted prefetch then
+            // competes with critical-path miss IO for NVMe. Judgement is deferred until
+            // temporal history exists (token >= 2): the cold-start token legitimately
+            // produces 0% and must never latch the gate off.
+            var packedPrefetchAdaptiveEnabled = speculativePrefetchEnabled && packedExpertsDir != nil
+            var packedPrefetchObservedHits = 0
+            var packedPrefetchObservedTotal = 0
             func runTokenForward(tokenId: UInt32, step: UInt32, computeLogits: Bool, wait: Bool = true) -> Bool {
                 let tTokenStart = CFAbsoluteTimeGetCurrent()
+                let hadTemporalHistory = !previousLayerActiveExperts.isEmpty
                 var diagRouterGpuMs: Double = 0
                 var diagIoMs: Double = 0
                 var diagMoeGpuMs: Double = 0
                 var diagOtherMs: Double = 0
+                var diagPrefetchHits: Int = 0
+                var diagPrefetchTotal: Int = 0
                 let singleTokenPtr = singleTokenBuffer.contents().bindMemory(to: UInt32.self, capacity: 1)
                 singleTokenPtr[0] = tokenId
                 var hDim = hiddenDim
@@ -4768,13 +4784,84 @@ struct ContentView: View {
 
                 guard var activeCmd = commandQueue.makeCommandBuffer() else { return false }
 
+                // Pipelined packed-expert streaming state (per token, packed decode only).
+                // After layer l's router resolves, the l+1 predicted experts are pread into the
+                // OTHER staging buffer while layer l's MoE MLP runs on the GPU; layer l's own
+                // experts are consumed from prefetched slots, paying synchronous IO only for
+                // predictor misses.
+                let packedExpertSize = Int(loadedLayout?.expert_size ?? 1769472)
+                let maxTopK = Int(modelConfig?.effectiveNumExpertsPerTok ?? (numExperts >= 512 ? 10 : 8))
+                let packedPrefetchLock = NSLock()
+                var packedPrefetchResident: [[Int: Int]] = [[:], [:]]   // [bufferIdx] expertId -> slot
+                var packedPrefetchResidentLayer: [Int] = [-1, -1]
+                var packedPrefetchNextSlot: [Int] = [0, 0]
+                var packedPrefetchPending: (layer: Int, sem: DispatchSemaphore)? = nil
+                let packedPrefetchQueue = DispatchQueue(label: "com.dynamoe.packed.expertprefetch", qos: .userInitiated, attributes: .concurrent)
+
+                // Blocks until the in-flight prefetch for `layer` has landed (no-op if none).
+                func waitForPackedPrefetch(_ layer: Int) {
+                    packedPrefetchLock.lock()
+                    if let pending = packedPrefetchPending, pending.layer == layer {
+                        let sem = pending.sem
+                        packedPrefetchPending = nil
+                        packedPrefetchLock.unlock()
+                        _ = sem.wait(timeout: .now() + 5.0)
+                    } else {
+                        packedPrefetchLock.unlock()
+                    }
+                }
+
+                // Kicks the background pread of predicted experts for `targetLayer` into the
+                // opposite staging buffer. Safe to call while the GPU reads the current
+                // buffer: the prefetch writes only buffer (targetLayer & 1), and the previous
+                // MoE pass on that buffer completed before this layer's router resolved.
+                func kickPackedPrefetch(_ predicted: [Int], targetLayer: Int, fd: Int32) {
+                    guard !predicted.isEmpty else { return }
+                    let targetBuf = targetLayer & 1
+                    let stagingBuf = (targetBuf == 0) ? expertStagingBuffer : expertStagingBufferB
+                    let capacity = expertStagingSize / packedExpertSize
+                    let slots = min(predicted.count, max(0, capacity - maxTopK))
+                    let sem = DispatchSemaphore(value: 0)
+                    packedPrefetchLock.lock()
+                    packedPrefetchResident[targetBuf] = [:]
+                    packedPrefetchResidentLayer[targetBuf] = -1
+                    packedPrefetchNextSlot[targetBuf] = slots
+                    packedPrefetchPending = (targetLayer, sem)
+                    packedPrefetchLock.unlock()
+
+                    packedPrefetchQueue.async {
+                        var tasks: [ExpertPreadTask] = []
+                        for (slotIdx, expId) in predicted.prefix(slots).enumerated() {
+                            tasks.append(ExpertPreadTask(fd: fd,
+                                                         dst: stagingBuf.contents().advanced(by: slotIdx * packedExpertSize),
+                                                         offset: off_t(expId * packedExpertSize),
+                                                         size: packedExpertSize))
+                        }
+                        var map: [Int: Int] = [:]
+                        if !tasks.isEmpty {
+                            ExpertIOThreadPool.shared.dispatchSync(tasks: &tasks)
+                            // Publish ONLY completed preads — a short read leaves garbage in
+                            // the slot, and advertising it would feed the GPU wrong weights.
+                            for (slotIdx, t) in tasks.enumerated() where t.result == t.size {
+                                map[predicted[slotIdx]] = slotIdx
+                            }
+                        }
+                        packedPrefetchLock.lock()
+                        packedPrefetchResident[targetBuf] = map
+                        packedPrefetchResidentLayer[targetBuf] = targetLayer
+                        packedPrefetchLock.unlock()
+                        sem.signal()
+                    }
+                }
+
                 for loopIdx in 0..<totalLoops {
                     for l in 0..<actualLayers {
                         if Task.isCancelled { return false }
                         let layer = cachedLayers[l]
 
                         // Asynchronous Layer Lookahead Backbone Prefetching
-                        if speculativePrefetchEnabled {
+                        // (mmap models only — FlashMoE backbone is pinned in RAM at load)
+                        if speculativePrefetchEnabled && packedExpertsDir == nil {
                             let nextL = (l + 1) < actualLayers ? (l + 1) : 0
                             WorkingSetManager.shared.prefetchLayerBackbone(layer: cachedLayers[nextL], shardBuffers: buffers)
                             if prefetchLookaheadDepth >= 2 {
@@ -6009,23 +6096,55 @@ struct ContentView: View {
 
                             let activeIds = activeExperts.map { $0.id }
                             if speculativePrefetchEnabled {
-                                // 1. Transition correlation tracking
+                                // 1. Transition correlation tracking + 2-token history rotation
                                 if l > 0, let prevIds = previousLayerActiveExperts[l - 1] {
                                     WorkingSetManager.shared.transitionTracker.recordTransition(fromLayer: l - 1, fromExperts: prevIds, toLayer: l, toExperts: activeIds)
                                 }
+                                // Age the per-layer history: [l] currently holds the previous
+                                // token's set; shift it to depth 2 before overwriting.
+                                layerExpertHistory[l] = [previousLayerActiveExperts[l] ?? [], layerExpertHistory[l]?.first ?? []].filter { !$0.isEmpty }
                                 previousLayerActiveExperts[l] = activeIds
 
-                                // 2. Speculatively prefetch layer l + 1 experts based on Markov transition prediction
-                                if l + 1 < actualLayers {
-                                    let prefetchCount = min(10, max(8, activeIds.count))
-                                    let predicted = WorkingSetManager.shared.predictNextLayerExperts(currentLayer: l, currentActiveExperts: activeIds, topN: prefetchCount)
+                                // 2. Speculatively prefetch layer l + 1 experts. Temporal signal
+                                //    first: the last TWO tokens' expert sets at layer l+1
+                                //    (consecutive tokens in fluent text route to largely the same
+                                //    experts at the same layer — the measured signal; the
+                                //    cross-layer Markov signal measured ~0% and only fills
+                                //    remaining budget). Router top-k order is weight-ranked, so
+                                //    earlier entries are the higher-confidence candidates.
+                                if l + 1 < actualLayers, packedPrefetchAdaptiveEnabled {
+                                    let budget = max(0, (expertStagingSize / packedExpertSize) - maxTopK)
+                                    var seen = Set<Int>()
+                                    var predicted: [Int] = []
+                                    for hist in [previousLayerActiveExperts[l + 1] ?? [], layerExpertHistory[l + 1]?.first ?? []] {
+                                        for id in hist where !seen.contains(id) && predicted.count < budget {
+                                            seen.insert(id)
+                                            predicted.append(id)
+                                        }
+                                    }
+                                    let markov = WorkingSetManager.shared.predictNextLayerExperts(currentLayer: l, currentActiveExperts: activeIds, topN: 10)
+                                    for id in markov where !seen.contains(id) && predicted.count < budget {
+                                        seen.insert(id)
+                                        predicted.append(id)
+                                    }
                                     if !predicted.isEmpty {
-                                        WorkingSetManager.shared.prefetchLayerExperts(layer: l + 1, expertIds: predicted, shardBuffers: buffers)
+                                        if let packedDir = packedExpertsDir,
+                                           let nextFd = ExpertIOThreadPool.shared.getOrOpenLayerFD(layerIndex: l + 1, packedExpertsDir: packedDir) {
+                                            // Packed: stream predicted experts into the opposite staging
+                                            // buffer, overlapping this layer's MoE GPU work.
+                                            kickPackedPrefetch(predicted, targetLayer: l + 1, fd: nextFd)
+                                        } else if packedExpertsDir == nil {
+                                            // Unpacked: WSM mmap-path prefetch
+                                            WorkingSetManager.shared.prefetchLayerExperts(layer: l + 1, expertIds: predicted, shardBuffers: buffers)
+                                        }
                                     }
                                 }
 
-                                // 3. Lookahead prefetch layer l + 2 dense backbone
-                                if l + 2 < actualLayers {
+                                // 3. Lookahead prefetch layer l + 2 dense backbone — mmap models only.
+                                //    FlashMoE backbone is pinned in RAM at load; the WSM fallback here
+                                //    would just CPU-fault safetensors pages and compete with the
+                                //    critical-path expert preads for NVMe.
+                                if packedExpertsDir == nil && l + 2 < actualLayers {
                                     let nextNextL = l + 2
                                     if nextNextL < cachedLayers.count {
                                         WorkingSetManager.shared.prefetchLayerBackbone(layer: cachedLayers[nextNextL], shardBuffers: buffers)
@@ -6054,19 +6173,67 @@ struct ContentView: View {
 
                                 let isQuantizedAffine = (compGateB != nil || compGateW?.name.contains("Q4") == true || compGateW?.name.contains("Q8") == true || compGateW?.dtype.contains("Q4") == true || compGateW?.dtype.contains("Q8") == true || (compGateS != nil && !isFP8Layout))
 
-                                // 1. Fast parallel pread the active experts directly into unified staging MTLBuffer
+                                // 1. Pipelined expert consumption: reuse prefetched slots for this
+                                //    layer, synchronously pread only predictor misses, into the
+                                //    double-buffered staging slot for this layer parity.
+                                let bufIdx = l & 1
+                                let stagingBuf = (bufIdx == 0) ? expertStagingBuffer : expertStagingBufferB
+                                let stagingCapacity = expertStagingSize / expertSize
+
                                 let tIoStart = CFAbsoluteTimeGetCurrent()
-                                var tasks: [ExpertPreadTask] = []
-                                let rawStagingPtr = expertStagingBuffer.contents()
-                                for (slot, exp) in activeExperts.enumerated() {
-                                    let offset = off_t(exp.id * expertSize)
-                                    let dst = rawStagingPtr.advanced(by: slot * expertSize)
-                                    tasks.append(ExpertPreadTask(fd: fd, dst: dst, offset: offset, size: expertSize))
+                                waitForPackedPrefetch(l)
+
+                                var slotOf: [Int: Int] = [:]
+                                var prefetchHits = 0
+                                packedPrefetchLock.lock()
+                                if packedPrefetchResidentLayer[bufIdx] == l {
+                                    slotOf = packedPrefetchResident[bufIdx]
+                                } else {
+                                    // No valid prefetched map for this layer on this buffer:
+                                    // the slot space is ours from 0. (Without this reset, miss
+                                    // allocations would accumulate across layers sharing the parity
+                                    // buffer and eventually overflow past the staging capacity.)
+                                    packedPrefetchNextSlot[bufIdx] = 0
                                 }
-                                ExpertIOThreadPool.shared.dispatchSync(tasks: &tasks)
+                                packedPrefetchLock.unlock()
+                                for exp in activeExperts where slotOf[exp.id] != nil { prefetchHits += 1 }
+
+                                var missTasks: [ExpertPreadTask] = []
+                                for exp in activeExperts where slotOf[exp.id] == nil {
+                                    packedPrefetchLock.lock()
+                                    let slot = packedPrefetchNextSlot[bufIdx]
+                                    packedPrefetchNextSlot[bufIdx] = slot + 1
+                                    packedPrefetchLock.unlock()
+                                    // Unreachable by construction (misses ≤ maxTopK and the slot
+                                    // space starts at 0 or capacity-maxTopK); abort rather than
+                                    // ever feed the GPU a wrong expert's slot.
+                                    guard slot < stagingCapacity else {
+                                        print("❌ [Prefetch] slot overflow at layer \(l) — aborting generation")
+                                        return false
+                                    }
+                                    slotOf[exp.id] = slot
+                                    missTasks.append(ExpertPreadTask(fd: fd,
+                                                                     dst: stagingBuf.contents().advanced(by: slot * expertSize),
+                                                                     offset: off_t(exp.id * expertSize),
+                                                                     size: expertSize))
+                                }
+                                if !missTasks.isEmpty {
+                                    ExpertIOThreadPool.shared.dispatchSync(tasks: &missTasks)
+                                }
                                 let tIoElapsed = (CFAbsoluteTimeGetCurrent() - tIoStart) * 1000.0
                                 diagIoMs += tIoElapsed
-                                print("[DIAG] Layer \(l): IO=\(String(format: "%.1f", tIoElapsed))ms")
+                                diagPrefetchHits += prefetchHits
+                                diagPrefetchTotal += activeExperts.count
+                                if hadTemporalHistory {
+                                    packedPrefetchObservedHits += prefetchHits
+                                    packedPrefetchObservedTotal += activeExperts.count
+                                }
+                                if hadTemporalHistory && packedPrefetchObservedTotal >= 64,
+                                   Double(packedPrefetchObservedHits) / Double(packedPrefetchObservedTotal) < 0.2 {
+                                    packedPrefetchAdaptiveEnabled = false
+                                    print("⚠️ [Prefetch] hit rate \(String(format: "%.0f", Double(packedPrefetchObservedHits) / Double(packedPrefetchObservedTotal) * 100))% below 20% after temporal warmup — disabling expert prefetch for this generation")
+                                }
+                                print("[DIAG] Layer \(l): IO=\(String(format: "%.1f", tIoElapsed))ms (prefetch \(prefetchHits)/\(activeExperts.count))")
 
                                 guard let moeCmd = commandQueue.makeCommandBuffer(),
                                       let layerEnc2 = moeCmd.makeComputeCommandEncoder() else { return false }
@@ -6079,7 +6246,7 @@ struct ContentView: View {
                                 for (slot, expert) in activeExperts.enumerated() {
                                     let pk = expert.weight
                                     if pk <= 0.00001 { continue }
-                                    let slotOffset = UInt64(slot * expertSize)
+                                    let slotOffset = UInt64((slotOf[expert.id] ?? slot) * expertSize)
                                     let gWOff = slotOffset + (compGateW?.offset ?? 0)
                                     let gSOff = slotOffset + (compGateS?.offset ?? 524288)
                                     let gBOff = slotOffset + (compGateB?.offset ?? 557056)
@@ -6108,12 +6275,12 @@ struct ContentView: View {
                                             var pkVal = pk
 
                                             layerEnc2.setComputePipelineState(gateSimd)
-                                            layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 0)
-                                            layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 1)
+                                            layerEnc2.setBuffer(stagingBuf, offset: 0, index: 0)
+                                            layerEnc2.setBuffer(stagingBuf, offset: 0, index: 1)
                                             layerEnc2.setBuffer(xNorm2Buffer, offset: 0, index: 2)
                                             layerEnc2.setBuffer(interBuffer, offset: 0, index: 3)
-                                            layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 4)
-                                            layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 5)
+                                            layerEnc2.setBuffer(stagingBuf, offset: 0, index: 4)
+                                            layerEnc2.setBuffer(stagingBuf, offset: 0, index: 5)
                                             layerEnc2.setBytes(&gWOffU, length: 8, index: 6)
                                             layerEnc2.setBytes(&gSOffU, length: 8, index: 7)
                                             layerEnc2.setBytes(&uWOffU, length: 8, index: 8)
@@ -6124,10 +6291,10 @@ struct ContentView: View {
                                             layerEnc2.memoryBarrier(scope: .buffers)
 
                                             layerEnc2.setComputePipelineState(downSimd)
-                                            layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 0)
+                                            layerEnc2.setBuffer(stagingBuf, offset: 0, index: 0)
                                             layerEnc2.setBuffer(interBuffer, offset: 0, index: 1)
                                             layerEnc2.setBuffer(hMlpBuffer, offset: 0, index: 2)
-                                            layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 3)
+                                            layerEnc2.setBuffer(stagingBuf, offset: 0, index: 3)
                                             layerEnc2.setBytes(&dWOffU, length: 8, index: 4)
                                             layerEnc2.setBytes(&dSOffU, length: 8, index: 5)
                                             layerEnc2.setBytes(&interDimVal, length: 4, index: 6)
@@ -6154,12 +6321,12 @@ struct ContentView: View {
                                         var pkVal = pk
 
                                         layerEnc2.setComputePipelineState(q4GatePipe)
-                                        layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 0)
-                                        layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 1)
-                                        layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 2)
-                                        layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 3)
-                                        layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 4)
-                                        layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 5)
+                                        layerEnc2.setBuffer(stagingBuf, offset: 0, index: 0)
+                                        layerEnc2.setBuffer(stagingBuf, offset: 0, index: 1)
+                                        layerEnc2.setBuffer(stagingBuf, offset: 0, index: 2)
+                                        layerEnc2.setBuffer(stagingBuf, offset: 0, index: 3)
+                                        layerEnc2.setBuffer(stagingBuf, offset: 0, index: 4)
+                                        layerEnc2.setBuffer(stagingBuf, offset: 0, index: 5)
                                         layerEnc2.setBuffer(xNorm2Buffer, offset: 0, index: 6)
                                         layerEnc2.setBuffer(interBuffer, offset: 0, index: 7)
                                         layerEnc2.setBytes(&gWOffU, length: 8, index: 8)
@@ -6175,10 +6342,10 @@ struct ContentView: View {
                                         layerEnc2.memoryBarrier(scope: .buffers)
 
                                         layerEnc2.setComputePipelineState(q4DownPipe)
-                                        layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 0)
-                                        layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 1)
-                                        layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 2)
-                                        layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 3)
+                                        layerEnc2.setBuffer(stagingBuf, offset: 0, index: 0)
+                                        layerEnc2.setBuffer(stagingBuf, offset: 0, index: 1)
+                                        layerEnc2.setBuffer(stagingBuf, offset: 0, index: 2)
+                                        layerEnc2.setBuffer(stagingBuf, offset: 0, index: 3)
                                         layerEnc2.setBuffer(interBuffer, offset: 0, index: 4)
                                         layerEnc2.setBuffer(hMlpBuffer, offset: 0, index: 5)
                                         layerEnc2.setBytes(&dWOffU, length: 8, index: 6)
@@ -6200,8 +6367,8 @@ struct ContentView: View {
                                         var pkVal = pk
 
                                         layerEnc2.setComputePipelineState(gateSimd)
-                                        layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 0)
-                                        layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 1)
+                                        layerEnc2.setBuffer(stagingBuf, offset: 0, index: 0)
+                                        layerEnc2.setBuffer(stagingBuf, offset: 0, index: 1)
                                         layerEnc2.setBuffer(xNorm2Buffer, offset: 0, index: 2)
                                         layerEnc2.setBuffer(interBuffer, offset: 0, index: 3)
                                         layerEnc2.setBytes(&gWOffU, length: 8, index: 4)
@@ -6212,7 +6379,7 @@ struct ContentView: View {
                                         layerEnc2.memoryBarrier(scope: .buffers)
 
                                         layerEnc2.setComputePipelineState(downSimd)
-                                        layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 0)
+                                        layerEnc2.setBuffer(stagingBuf, offset: 0, index: 0)
                                         layerEnc2.setBuffer(interBuffer, offset: 0, index: 1)
                                         layerEnc2.setBuffer(hMlpBuffer, offset: 0, index: 2)
                                         layerEnc2.setBytes(&dWOffU, length: 8, index: 3)
@@ -6231,8 +6398,8 @@ struct ContentView: View {
                                         var pkVal = pk
 
                                         layerEnc2.setComputePipelineState(gateUnq)
-                                        layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 0)
-                                        layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 1)
+                                        layerEnc2.setBuffer(stagingBuf, offset: 0, index: 0)
+                                        layerEnc2.setBuffer(stagingBuf, offset: 0, index: 1)
                                         layerEnc2.setBuffer(xNorm2Buffer, offset: 0, index: 2)
                                         layerEnc2.setBuffer(interBuffer, offset: 0, index: 3)
                                         layerEnc2.setBytes(&gWOffU, length: 8, index: 4)
@@ -6243,7 +6410,7 @@ struct ContentView: View {
                                         layerEnc2.memoryBarrier(scope: .buffers)
 
                                         layerEnc2.setComputePipelineState(downUnq)
-                                        layerEnc2.setBuffer(expertStagingBuffer, offset: 0, index: 0)
+                                        layerEnc2.setBuffer(stagingBuf, offset: 0, index: 0)
                                         layerEnc2.setBuffer(interBuffer, offset: 0, index: 1)
                                         layerEnc2.setBuffer(hMlpBuffer, offset: 0, index: 2)
                                         layerEnc2.setBytes(&dWOffU, length: 8, index: 3)
@@ -6570,7 +6737,8 @@ struct ContentView: View {
                 if computeLogits {
                     let tTokenElapsed = (CFAbsoluteTimeGetCurrent() - tTokenStart) * 1000.0
                     diagOtherMs = tTokenElapsed - diagRouterGpuMs - diagIoMs - diagMoeGpuMs
-                    print("[DIAG] Token \(step) total=\(String(format: "%.1f", tTokenElapsed))ms | RouterGPU=\(String(format: "%.1f", diagRouterGpuMs))ms | IO=\(String(format: "%.1f", diagIoMs))ms | MoEGPU=\(String(format: "%.1f", diagMoeGpuMs))ms | Other=\(String(format: "%.1f", diagOtherMs))ms")
+                    let hitStr = diagPrefetchTotal > 0 ? " | Prefetch \(diagPrefetchHits)/\(diagPrefetchTotal) (\(String(format: "%.0f", Double(diagPrefetchHits) / Double(max(diagPrefetchTotal, 1)) * 100.0))%)" : ""
+                    print("[DIAG] Token \(step) total=\(String(format: "%.1f", tTokenElapsed))ms | RouterGPU=\(String(format: "%.1f", diagRouterGpuMs))ms | IO=\(String(format: "%.1f", diagIoMs))ms | MoEGPU=\(String(format: "%.1f", diagMoeGpuMs))ms | Other=\(String(format: "%.1f", diagOtherMs))ms\(hitStr)")
                 }
 
                 return true
@@ -6758,7 +6926,7 @@ struct ContentView: View {
                         let layer = cachedLayers[l]
                         let intermediateDim = layer.intermediateDim
 
-                        if speculativePrefetchEnabled {
+                        if speculativePrefetchEnabled && packedExpertsDir == nil {
                             let nextL = (l + 1) < actualLayers ? (l + 1) : 0
                             WorkingSetManager.shared.prefetchLayerBackbone(layer: cachedLayers[nextL], shardBuffers: buffers)
                         }
@@ -8067,7 +8235,7 @@ struct ContentView: View {
                                 }
                             } else {
                                 let activeExpIds = Array(expertTokenMap.keys)
-                                if speculativePrefetchEnabled {
+                                if speculativePrefetchEnabled && packedExpertsDir == nil {
                                     let nextL = (l + 1) < actualLayers ? (l + 1) : 0
                                     WorkingSetManager.shared.prefetchLayerBackbone(layer: cachedLayers[nextL], shardBuffers: buffers)
                                 }

@@ -905,6 +905,309 @@ func main() {
         print("   per-token: \(String(format: "%.0f", meanTok))ms -> \(String(format: "%.2f", 1000.0 / meanTok)) tok/s -> effective SSD bandwidth \(String(format: "%.2f", bytesPerToken / GB / (meanTok / 1000))) GB/s")
     }
 
+    // ============================ T13: PINNED backbone (the fix) ============================
+    // Implements the app fix: pread model_weights.bin once into an ANONYMOUS
+    // .storageModeShared MTLBuffer, then run the same app-shaped per-layer loop as T10
+    // reading the backbone from the pinned buffer instead of the mmap. Expected: the
+    // ~945 ms/layer re-fault collapses to sub-ms DRAM reads.
+    print("--- T13: full token sim with PINNED backbone (pread model_weights.bin -> anon buffer) ---")
+    do {
+        let pinPath = dir.appendingPathComponent("model_weights.bin")
+        let pinSize = Int(((try? FileManager.default.attributesOfItem(atPath: pinPath.path))?[.size] as? NSNumber)?.uint64Value ?? 0)
+        if pinSize <= 0 || pinSize > Int(gpu.device.maxBufferLength) {
+            print("   model_weights.bin missing or too large for single buffer (\(pinSize) bytes, max \(gpu.device.maxBufferLength)) - skipped")
+        } else {
+            guard let pinned = gpu.device.makeBuffer(length: pinSize, options: .storageModeShared) else {
+                print("   pin alloc failed"); return
+            }
+            let fdPin = open(pinPath.path, O_RDONLY | O_CLOEXEC)
+            guard fdPin >= 0 else { print("   open failed errno=\(errno)"); return }
+            defer { close(fdPin) }
+            let tPin = CFAbsoluteTimeGetCurrent()
+            // 8-way parallel pread of disjoint ranges (same mechanism as the app fix)
+            let workers = 8
+            let rangeLen = pinSize / workers
+            DispatchQueue.concurrentPerform(iterations: workers) { i in
+                var done = 0
+                let end = (i == workers - 1) ? pinSize - (workers - 1) * rangeLen : rangeLen
+                let base = pinned.contents().advanced(by: i * rangeLen)
+                var fileOff = off_t(i) * off_t(rangeLen)
+                while done < end {
+                    let toRead = min(262144, end - done)
+                    let n = pread(fdPin, base.advanced(by: done), toRead, fileOff)
+                    if n <= 0 { break }
+                    done += n
+                    fileOff += off_t(n)
+                }
+            }
+            print("   pinned \(String(format: "%.2f", Double(pinSize) / GB)) GB in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - tPin))s")
+
+            // every-byte reader over the pinned (anonymous) buffer
+            let readAll = gpu.pipe("bench_read_all")
+            let pageSize = Int(vm_page_size)
+
+            func pinnedBackboneRead(_ offset: Int, _ length: Int) -> Double {
+                guard let ra = readAll else { return 0 }
+                let cmd = gpu.queue.makeCommandBuffer()!
+                let enc = cmd.makeComputeCommandEncoder()!
+                let chunks = length / 256
+                enc.setComputePipelineState(ra)
+                enc.setBuffer(pinned, offset: offset, index: 0)
+                enc.setBuffer(rIdx, offset: 0, index: 1)
+                var nVal: UInt32 = UInt32(chunks)
+                enc.setBytes(&nVal, length: 4, index: 2)
+                enc.dispatchThreads(MTLSize(width: Int(nVal), height: 1, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: min(Int(nVal), 512), height: 1, depth: 1))
+                enc.endEncoding()
+                let t0 = CFAbsoluteTimeGetCurrent()
+                cmd.commit(); cmd.waitUntilCompleted()
+                return (CFAbsoluteTimeGetCurrent() - t0) * 1000
+            }
+
+            let fds = (0..<gNumLayers).map { openLayerFD(packedDir, layer: $0, noCache: false) }
+            defer { fds.forEach { close($0) } }
+            let rng = Rand(seed: 0xDA7A4A)
+            var tokenMs: [Double] = []
+            var perTokenBackboneMs: [Double] = []
+            let sem = DispatchSemaphore(value: 0)
+            Task.detached(priority: .userInitiated) {
+                for tok in 0..<gTokens {
+                    let tTok = CFAbsoluteTimeGetCurrent()
+                    var tokBackbone: Double = 0
+                    for l in 0..<gNumLayers {
+                        let ids = rng.tokenExperts()
+                        // 1. Backbone read from PINNED anonymous memory (spans vary per layer)
+                        let maxOff = pinSize - 61612064 - 4096
+                        let off = (l * 61537001) % max(1, maxOff)
+                        tokBackbone += pinnedBackboneRead(off, 61612064)
+
+                        // 2. Router GPU + sync
+                        let cmdA = gpu.queue.makeCommandBuffer()!
+                        let encA = cmdA.makeComputeCommandEncoder()!
+                        encodeRouter(enc: encA, gpu: gpu, h: hBuf, xNorm: xNorm, gamma: gamma, routerW: routerW,
+                                     indices: rIdx, weights: rW, numExperts: gNumExperts, topK: TOPK)
+                        encA.endEncoding()
+                        cmdA.commit(); cmdA.waitUntilCompleted()
+
+                        // 3. Pread 8 experts
+                        let raw = stagingA.contents()
+                        var tasks: [ExpertTask] = []
+                        for (slot, e) in ids.enumerated() {
+                            tasks.append(ExpertTask(fd: fds[l], dst: raw.advanced(by: slot * gExpertSize),
+                                                    offset: off_t(e * gExpertSize), size: gExpertSize))
+                        }
+                        dispatchPreads(&tasks)
+
+                        // 4. MoE GPU + sync
+                        let cmdB = gpu.queue.makeCommandBuffer()!
+                        let encB = cmdB.makeComputeCommandEncoder()!
+                        encodeMoEPhase(enc: encB, gpu: gpu, staging: stagingA, inter: inter, hMlp: hMlp,
+                                       xNorm: xNorm, ids: ids, expertSize: gExpertSize, comp: comp,
+                                       idsBuf: idsBuf, weightsBuf: weightsBuf, fused: false)
+                        encB.endEncoding()
+                        cmdB.commit(); cmdB.waitUntilCompleted()
+                    }
+                    tokenMs.append((CFAbsoluteTimeGetCurrent() - tTok) * 1000)
+                    perTokenBackboneMs.append(tokBackbone)
+                }
+                sem.signal()
+            }
+            sem.wait()
+            for (tok, ms) in tokenMs.enumerated() {
+                print("   token \(tok): \(String(format: "%.0f", ms))ms (\(String(format: "%.2f", 1000.0 / ms)) tok/s) | pinned backbone reads \(String(format: "%.1f", perTokenBackboneMs[tok]))ms total")
+            }
+        }
+    }
+
+    // ============================ T14: pipelined expert decode (the fix #2) ============================
+    // App-shaped pipelined loop: wait(prefetch l) -> consume hits, sync pread misses ->
+    // kick prefetch(l+1, Markov-predicted) -> MoE GPU. Routing is generated ONCE with
+    // realistic cross-layer locality (sticky hot sets shared between adjacent layers) and
+    // replayed identically in both variants so the only difference is pipelining.
+    print("--- T14: pipelined expert decode w/ Markov predictor (sticky routing) ---")
+    do {
+        let fds = (0..<gNumLayers).map { openLayerFD(packedDir, layer: $0, noCache: false) }
+        defer { fds.forEach { close($0) } }
+
+        // Sticky expert routing with cross-layer correlation
+        var rg = Rand(seed: 0x5EED)
+        var hot: [[Int]] = []
+        for l in 0..<gNumLayers {
+            var s = Set<Int>()
+            if l > 0 { for e in hot[l - 1].prefix(20) { s.insert(e) } }
+            while s.count < 40 { s.insert(rg.next(gNumExperts)) }
+            hot.append(Array(s))
+        }
+        var routing: [[[Int]]] = []
+        for _ in 0..<gTokens {
+            var tokEx: [[Int]] = []
+            for l in 0..<gNumLayers {
+                var s = Set<Int>()
+                let pool = Set(hot[l]).union(l + 1 < gNumLayers ? Set(hot[l + 1]) : [])
+                let poolArr = Array(pool)
+                for _ in 0..<5 { s.insert(poolArr[rg.next(poolArr.count)]) }
+                while s.count < TOPK { s.insert(rg.next(gNumExperts)) }
+                tokEx.append(Array(s))
+            }
+            routing.append(tokEx)
+        }
+
+        // Markov transition predictor (mirrors ExpertTransitionTracker)
+        var transitions: [Int: [Int: [Int: Int]]] = [:]
+        func recordTrans(_ l: Int, _ src: [Int], _ dst: [Int]) {
+            var layerMap = transitions[l] ?? [:]
+            for s in src {
+                var dstMap = layerMap[s] ?? [:]
+                for d in dst { dstMap[d, default: 0] += 1 }
+                layerMap[s] = dstMap
+            }
+            transitions[l] = layerMap
+        }
+        func markovPredict(_ l: Int, _ ids: [Int], _ topN: Int) -> [Int] {
+            guard let layerMap = transitions[l], !ids.isEmpty else { return [] }
+            var score: [Int: Int] = [:]
+            for id in ids {
+                if let dstMap = layerMap[id] { for (d, c) in dstMap { score[d, default: 0] += c } }
+            }
+            return score.sorted(by: { $0.value > $1.value }).prefix(topN).map { $0.key }
+        }
+
+        for pipelined in [false, true] {
+            var resident: [[Int: Int]] = [[:], [:]]       // [bufferIdx] expertId -> slot
+            var residentLayer: [Int] = [-1, -1]
+            var nextSlot: [Int] = [0, 0]
+            var pending: (layer: Int, sem: DispatchSemaphore)? = nil
+            let lock = NSLock()
+            let pfQueue = DispatchQueue(label: "t14.pf", qos: .userInitiated, attributes: .concurrent)
+            let capacity = stagingSize / gExpertSize
+
+            var tokenMs: [Double] = []
+            var ioMsTotal: [Double] = []
+            var hitRates: [Double] = []
+            let sem = DispatchSemaphore(value: 0)
+            Task.detached(priority: .userInitiated) {
+                for tok in 0..<gTokens {
+                    let tTok = CFAbsoluteTimeGetCurrent()
+                    var tokIo: Double = 0
+                    var tokHits = 0
+                    var tokTotal = 0
+                    for l in 0..<gNumLayers {
+                        let actual = routing[tok][l]
+                        // 1. wait for prefetch(l)
+                        lock.lock()
+                        if let p = pending, p.layer == l {
+                            let s = p.sem
+                            pending = nil
+                            lock.unlock()
+                            _ = s.wait(timeout: .now() + 5.0)
+                        } else {
+                            lock.unlock()
+                        }
+                        // 2. consume: hits from prefetched map, misses sync-pread
+                let bufIdx = l & 1
+                let stagingBuf = (bufIdx == 0) ? stagingA : stagingB
+                var slotOf: [Int: Int] = [:]
+                lock.lock()
+                if residentLayer[bufIdx] == l {
+                    slotOf = resident[bufIdx]
+                } else {
+                    nextSlot[bufIdx] = 0
+                }
+                lock.unlock()
+                var hits = 0
+                for e in actual where slotOf[e] != nil { hits += 1 }
+                var missTasks: [ExpertTask] = []
+                for e in actual where slotOf[e] == nil {
+                    lock.lock()
+                    let slot = nextSlot[bufIdx]
+                    nextSlot[bufIdx] = slot + 1
+                    lock.unlock()
+                    slotOf[e] = slot
+                    missTasks.append(ExpertTask(fd: fds[l], dst: stagingBuf.contents().advanced(by: slot * gExpertSize),
+                                                offset: off_t(e * gExpertSize), size: gExpertSize))
+                }
+                let tIo = CFAbsoluteTimeGetCurrent()
+                if !pipelined {
+                    // serialized baseline: ALL experts synchronously (ignore prefetched slots)
+                    slotOf = [:]
+                    for (idx, e) in actual.enumerated() {
+                        slotOf[e] = idx
+                        missTasks.append(ExpertTask(fd: fds[l], dst: stagingBuf.contents().advanced(by: idx * gExpertSize),
+                                                    offset: off_t(e * gExpertSize), size: gExpertSize))
+                    }
+                }
+                if !missTasks.isEmpty {
+                    dispatchPreads(&missTasks)
+                }
+                        let ioMs = (CFAbsoluteTimeGetCurrent() - tIo) * 1000
+                        tokIo += ioMs
+                        tokHits += hits
+                        tokTotal += actual.count
+
+                        // 3. kick prefetch(l+1) — temporal signal first (previous token's set at
+                        // layer l+1), Markov fills remaining budget (mirrors the app)
+                        if pipelined && l + 1 < gNumLayers {
+                            let temporal = (tok > 0) ? routing[tok - 1][l + 1] : []
+                            var predicted = temporal
+                            let markov = markovPredict(l, actual, 10)
+                            for id in markov where !predicted.contains(id) && predicted.count < 13 {
+                                predicted.append(id)
+                            }
+                            if !predicted.isEmpty {
+                                let tBuf = (l + 1) & 1
+                                let tStaging = (tBuf == 0) ? stagingA : stagingB
+                                let s2 = DispatchSemaphore(value: 0)
+                                lock.lock()
+                                resident[tBuf] = [:]
+                                residentLayer[tBuf] = -1
+                                nextSlot[tBuf] = min(predicted.count, tStaging.length / gExpertSize - TOPK)
+                                pending = (l + 1, s2)
+                                lock.unlock()
+                                pfQueue.async {
+                                    var map: [Int: Int] = [:]
+                                    var tasks2: [ExpertTask] = []
+                                    for (i, e) in predicted.prefix(min(predicted.count, tStaging.length / gExpertSize - TOPK)).enumerated() {
+                                        map[e] = i
+                                        tasks2.append(ExpertTask(fd: fds[l + 1], dst: tStaging.contents().advanced(by: i * gExpertSize),
+                                                                 offset: off_t(e * gExpertSize), size: gExpertSize))
+                                    }
+                                    if !tasks2.isEmpty { dispatchPreads(&tasks2) }
+                                    lock.lock()
+                                    resident[tBuf] = map
+                                    residentLayer[tBuf] = l + 1
+                                    lock.unlock()
+                                    s2.signal()
+                                }
+                            }
+                        }
+                        if !pipelined && l > 0 { recordTrans(l - 1, routing[tok][l - 1], actual) }
+                        if pipelined && l > 0 { recordTrans(l - 1, routing[tok][l - 1], actual) }
+
+                        // 4. MoE GPU (app kernels, same as T6)
+                        let cmdB = gpu.queue.makeCommandBuffer()!
+                        let encB = cmdB.makeComputeCommandEncoder()!
+                        encodeMoEPhase(enc: encB, gpu: gpu, staging: stagingBuf, inter: inter, hMlp: hMlp,
+                                       xNorm: xNorm, ids: actual, expertSize: gExpertSize, comp: comp,
+                                       idsBuf: idsBuf, weightsBuf: weightsBuf, fused: false)
+                        encB.endEncoding()
+                        cmdB.commit(); cmdB.waitUntilCompleted()
+                    }
+                    tokenMs.append((CFAbsoluteTimeGetCurrent() - tTok) * 1000)
+                    ioMsTotal.append(tokIo)
+                    hitRates.append(Double(tokHits) / Double(max(tokTotal, 1)))
+                }
+                sem.signal()
+            }
+            sem.wait()
+            let meanTok = tokenMs.reduce(0, +) / Double(tokenMs.count)
+            let meanIo = ioMsTotal.reduce(0, +) / Double(ioMsTotal.count)
+            let meanHit = hitRates.reduce(0, +) / Double(hitRates.count)
+            // skip token 0 (predictor cold) in the mean
+            let warmTok = tokenMs.dropFirst().reduce(0, +) / Double(max(1, tokenMs.count - 1))
+            print("   [\(pipelined ? "pipelined" : "serialized")] all-tokens \(String(format: "%.0f", meanTok))ms avg (\(String(format: "%.2f", 1000.0 / meanTok)) tok/s) | warm tokens (2+) \(String(format: "%.0f", warmTok))ms (\(String(format: "%.2f", 1000.0 / warmTok)) tok/s) | sync IO \(String(format: "%.1f", meanIo))ms/token | hit rate \(String(format: "%.0f", meanHit * 100))%")
+        }
+    }
+
     // ============================ T8: mmap cold page-fault path ============================
     // The backbone (attention/GDN weights) and lm_head are read by the GPU straight
     // from memmap'd .safetensors MTLBuffers -> 16KB VM page faults on cold pages.
@@ -1303,118 +1606,163 @@ func main() {
         print("   alloc \(String(format: "%.0f", (t1 - t0) * 1000))ms + touch \(String(format: "%.0f", (t2 - t1) * 1000))ms -> total fixed prefill overhead \(String(format: "%.0f", (t2 - t0) * 1000))ms")
     }
 
-    // ============================ T13: PINNED backbone (the fix) ============================
-    // Implements the app fix: pread model_weights.bin once into an ANONYMOUS
-    // .storageModeShared MTLBuffer, then run the same app-shaped per-layer loop as T10
-    // reading the backbone from the pinned buffer instead of the mmap. Expected: the
-    // ~945 ms/layer re-fault collapses to sub-ms DRAM reads.
-    print("--- T13: full token sim with PINNED backbone (pread model_weights.bin -> anon buffer) ---")
+    // ============================ T15: PIPELINE DATA CORRECTNESS ============================
+    // Replicates the app's EXACT fixed pipelined consume/kick shape (slot maps, per-kick
+    // semaphore, parity buffers, stale-map guard + consumer slot-space ownership) and
+    // verifies that every expert the GPU consumes has the CORRECT bytes in its slot
+    // (compared against a direct pread of the layer file).
+    print("--- T15: pipelined consume/kick DATA CORRECTNESS (app-shaped, fixed) ---")
     do {
-        let pinPath = dir.appendingPathComponent("model_weights.bin")
-        let pinSize = Int(((try? FileManager.default.attributesOfItem(atPath: pinPath.path))?[.size] as? NSNumber)?.uint64Value ?? 0)
-        if pinSize <= 0 || pinSize > Int(gpu.device.maxBufferLength) {
-            print("   model_weights.bin missing or too large for single buffer (\(pinSize) bytes, max \(gpu.device.maxBufferLength)) - skipped")
-        } else {
-            guard let pinned = gpu.device.makeBuffer(length: pinSize, options: .storageModeShared) else {
-                print("   pin alloc failed"); return
+        let fds = (0..<gNumLayers).map { openLayerFD(packedDir, layer: $0, noCache: false) }
+        defer { fds.forEach { close($0) } }
+
+        var rg = Rand(seed: 0x5EED)
+        var hot: [[Int]] = []
+        for l in 0..<gNumLayers {
+            var s = Set<Int>()
+            if l > 0 { for e in hot[l - 1].prefix(20) { s.insert(e) } }
+            while s.count < 40 { s.insert(rg.next(gNumExperts)) }
+            hot.append(Array(s))
+        }
+        var routing: [[[Int]]] = []
+        for _ in 0..<gTokens {
+            var tokEx: [[Int]] = []
+            for l in 0..<gNumLayers {
+                var s = Set<Int>()
+                let pool = Set(hot[l]).union(l + 1 < gNumLayers ? Set(hot[l + 1]) : [])
+                let poolArr = Array(pool)
+                for _ in 0..<5 { s.insert(poolArr[rg.next(poolArr.count)]) }
+                while s.count < TOPK { s.insert(rg.next(gNumExperts)) }
+                tokEx.append(Array(s))
             }
-            let fdPin = open(pinPath.path, O_RDONLY | O_CLOEXEC)
-            guard fdPin >= 0 else { print("   open failed errno=\(errno)"); return }
-            defer { close(fdPin) }
-            let tPin = CFAbsoluteTimeGetCurrent()
-            // 8-way parallel pread of disjoint ranges (same mechanism as the app fix)
-            let workers = 8
-            let rangeLen = pinSize / workers
-            DispatchQueue.concurrentPerform(iterations: workers) { i in
-                var done = 0
-                let end = (i == workers - 1) ? pinSize - (workers - 1) * rangeLen : rangeLen
-                let base = pinned.contents().advanced(by: i * rangeLen)
-                var fileOff = off_t(i) * off_t(rangeLen)
-                while done < end {
-                    let toRead = min(262144, end - done)
-                    let n = pread(fdPin, base.advanced(by: done), toRead, fileOff)
-                    if n <= 0 { break }
-                    done += n
-                    fileOff += off_t(n)
+            routing.append(tokEx)
+        }
+
+        let verifyBuf = UnsafeMutableRawPointer.allocate(byteCount: gExpertSize, alignment: 4096)
+        defer { verifyBuf.deallocate() }
+        var mismatches = 0
+        var checks = 0
+
+        var resident: [[Int: Int]] = [[:], [:]]
+        var residentLayer: [Int] = [-1, -1]
+        var nextSlot: [Int] = [0, 0]
+        var slotWriter: [[String]] = [[], []]
+        var pending: (layer: Int, sem: DispatchSemaphore)? = nil
+        let lock = NSLock()
+        let pfQueue = DispatchQueue(label: "t15.pf", qos: .userInitiated, attributes: .concurrent)
+        let capacity = stagingSize / gExpertSize
+
+        for tok in 0..<gTokens {
+            for l in 0..<gNumLayers {
+                let actual = routing[tok][l]
+                lock.lock()
+                if let p = pending, p.layer == l {
+                    let s = p.sem
+                    pending = nil
+                    lock.unlock()
+                    _ = s.wait(timeout: .now() + 5.0)
+                } else {
+                    lock.unlock()
                 }
-            }
-            print("   pinned \(String(format: "%.2f", Double(pinSize) / GB)) GB in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - tPin))s")
-
-            // every-byte reader over the pinned (anonymous) buffer
-            let readAll = gpu.pipe("bench_read_all")
-            let pageSize = Int(vm_page_size)
-
-            func pinnedBackboneRead(_ offset: Int, _ length: Int) -> Double {
-                guard let ra = readAll else { return 0 }
-                let cmd = gpu.queue.makeCommandBuffer()!
-                let enc = cmd.makeComputeCommandEncoder()!
-                let chunks = length / 256
-                enc.setComputePipelineState(ra)
-                enc.setBuffer(pinned, offset: offset, index: 0)
-                enc.setBuffer(rIdx, offset: 0, index: 1)
-                var nVal: UInt32 = UInt32(chunks)
-                enc.setBytes(&nVal, length: 4, index: 2)
-                enc.dispatchThreads(MTLSize(width: Int(nVal), height: 1, depth: 1),
-                                    threadsPerThreadgroup: MTLSize(width: min(Int(nVal), 512), height: 1, depth: 1))
-                enc.endEncoding()
-                let t0 = CFAbsoluteTimeGetCurrent()
-                cmd.commit(); cmd.waitUntilCompleted()
-                return (CFAbsoluteTimeGetCurrent() - t0) * 1000
-            }
-
-            let fds = (0..<gNumLayers).map { openLayerFD(packedDir, layer: $0, noCache: false) }
-            defer { fds.forEach { close($0) } }
-            let rng = Rand(seed: 0xDA7A4A)
-            var tokenMs: [Double] = []
-            var perTokenBackboneMs: [Double] = []
-            let sem = DispatchSemaphore(value: 0)
-            Task.detached(priority: .userInitiated) {
-                for tok in 0..<gTokens {
-                    let tTok = CFAbsoluteTimeGetCurrent()
-                    var tokBackbone: Double = 0
-                    for l in 0..<gNumLayers {
-                        let ids = rng.tokenExperts()
-                        // 1. Backbone read from PINNED anonymous memory (spans vary per layer)
-                        let maxOff = pinSize - 61612064 - 4096
-                        let off = (l * 61537001) % max(1, maxOff)
-                        tokBackbone += pinnedBackboneRead(off, 61612064)
-
-                        // 2. Router GPU + sync
-                        let cmdA = gpu.queue.makeCommandBuffer()!
-                        let encA = cmdA.makeComputeCommandEncoder()!
-                        encodeRouter(enc: encA, gpu: gpu, h: hBuf, xNorm: xNorm, gamma: gamma, routerW: routerW,
-                                     indices: rIdx, weights: rW, numExperts: gNumExperts, topK: TOPK)
-                        encA.endEncoding()
-                        cmdA.commit(); cmdA.waitUntilCompleted()
-
-                        // 3. Pread 8 experts
-                        let raw = stagingA.contents()
-                        var tasks: [ExpertTask] = []
-                        for (slot, e) in ids.enumerated() {
-                            tasks.append(ExpertTask(fd: fds[l], dst: raw.advanced(by: slot * gExpertSize),
-                                                    offset: off_t(e * gExpertSize), size: gExpertSize))
-                        }
-                        dispatchPreads(&tasks)
-
-                        // 4. MoE GPU + sync
-                        let cmdB = gpu.queue.makeCommandBuffer()!
-                        let encB = cmdB.makeComputeCommandEncoder()!
-                        encodeMoEPhase(enc: encB, gpu: gpu, staging: stagingA, inter: inter, hMlp: hMlp,
-                                       xNorm: xNorm, ids: ids, expertSize: gExpertSize, comp: comp,
-                                       idsBuf: idsBuf, weightsBuf: weightsBuf, fused: false)
-                        encB.endEncoding()
-                        cmdB.commit(); cmdB.waitUntilCompleted()
+                let bufIdx = l & 1
+                let stagingBuf = (bufIdx == 0) ? stagingA : stagingB
+                var slotOf: [Int: Int] = [:]
+                lock.lock()
+                if residentLayer[bufIdx] == l {
+                    slotOf = resident[bufIdx]
+                } else {
+                    nextSlot[bufIdx] = 0
+                    slotWriter[bufIdx] = [String](repeating: "reset", count: capacity)
+                }
+                lock.unlock()
+                var hits = 0
+                for e in actual where slotOf[e] != nil { hits += 1 }
+                var missTasks: [ExpertTask] = []
+                for e in actual where slotOf[e] == nil {
+                    lock.lock()
+                    let slot = nextSlot[bufIdx]
+                    nextSlot[bufIdx] = slot + 1
+                    lock.unlock()
+                    guard slot < capacity else { mismatches += 1; continue }
+                    slotOf[e] = slot
+                    missTasks.append(ExpertTask(fd: fds[l], dst: stagingBuf.contents().advanced(by: slot * gExpertSize),
+                                                offset: off_t(e * gExpertSize), size: gExpertSize))
+                }
+                if !missTasks.isEmpty {
+                    dispatchPreads(&missTasks)
+                    lock.lock()
+                    for t in missTasks {
+                        let slot = Int((t.dst - stagingBuf.contents()) / gExpertSize)
+                        while slotWriter[bufIdx].count <= slot { slotWriter[bufIdx].append("?") }
+                        slotWriter[bufIdx][slot] = "miss L\(l) e\(Int(t.offset / off_t(gExpertSize))) tok\(tok)"
                     }
-                    tokenMs.append((CFAbsoluteTimeGetCurrent() - tTok) * 1000)
-                    perTokenBackboneMs.append(tokBackbone)
+                    lock.unlock()
                 }
-                sem.signal()
-            }
-            sem.wait()
-            for (tok, ms) in tokenMs.enumerated() {
-                print("   token \(tok): \(String(format: "%.0f", ms))ms (\(String(format: "%.2f", 1000.0 / ms)) tok/s) | pinned backbone reads \(String(format: "%.1f", perTokenBackboneMs[tok]))ms total")
+
+                // kick prefetch(l+1) with the CURRENT layer's set as the prediction
+                if l + 1 < gNumLayers {
+                    let target = l + 1
+                    let tokStamp = tok
+                    let tBuf = target & 1
+                    let tStaging = (tBuf == 0) ? stagingA : stagingB
+                    let predicted = actual
+                    let s2 = DispatchSemaphore(value: 0)
+                    let tSlots = min(predicted.count, tStaging.length / gExpertSize - TOPK)
+                    lock.lock()
+                    resident[tBuf] = [:]
+                    residentLayer[tBuf] = -1
+                    nextSlot[tBuf] = tSlots
+                    pending = (target, s2)
+                    lock.unlock()
+                    pfQueue.async {
+                        var t2: [ExpertTask] = []
+                        for (i, e) in predicted.prefix(tSlots).enumerated() {
+                            t2.append(ExpertTask(fd: fds[target], dst: tStaging.contents().advanced(by: i * gExpertSize),
+                                                 offset: off_t(e * gExpertSize), size: gExpertSize))
+                        }
+                        var map: [Int: Int] = [:]
+                        if !t2.isEmpty {
+                            dispatchPreads(&t2)
+                            lock.lock()
+                            for (i, t) in t2.enumerated() where t.result == t.size {
+                                map[predicted[i]] = i
+                                let slot = Int((t.dst - tStaging.contents()) / gExpertSize)
+                                while slotWriter[tBuf].count <= slot { slotWriter[tBuf].append("?") }
+                                slotWriter[tBuf][slot] = "kick L\(target) e\(Int(t.offset / off_t(gExpertSize))) tok\(tokStamp)"
+                            }
+                            lock.unlock()
+                        }
+                        lock.lock()
+                        resident[tBuf] = map
+                        residentLayer[tBuf] = target
+                        lock.unlock()
+                        s2.signal()
+                    }
+                }
+
+                // VERIFY: each consumed expert's slot bytes == direct pread of that expert
+                let checkBase = stagingBuf.contents()
+                for e in actual {
+                    guard let slot = slotOf[e] else { mismatches += 1; continue }
+                    checks += 1
+                    let fdv = openLayerFD(packedDir, layer: l, noCache: true)
+                    _ = preadFull(fdv, verifyBuf, off_t(e * gExpertSize), gExpertSize)
+                    close(fdv)
+                    let staged = checkBase.advanced(by: slot * gExpertSize)
+                    if memcmp(staged, verifyBuf, gExpertSize) != 0 {
+                        mismatches += 1
+                        if mismatches < 5 {
+                            var diffOff = -1
+                            for b in 0..<gExpertSize where staged.load(fromByteOffset: b, as: UInt8.self) != verifyBuf.load(fromByteOffset: b, as: UInt8.self) {
+                                diffOff = b; break
+                            }
+                            print("   ⚠️ MISMATCH tok\(tok) layer\(l) expert\(e) slot\(slot): first diff at byte \(diffOff) | slot last written by: '\(slot < slotWriter[bufIdx].count ? slotWriter[bufIdx][slot] : "?")'")
+                        }
+                    }
+                }
             }
         }
+        print("   checked \(checks) consumed experts, mismatches: \(mismatches)")
     }
 
     print("")
