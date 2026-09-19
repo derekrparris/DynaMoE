@@ -197,6 +197,12 @@ final class GPU {
                      "bf16_swiglu_gate_up_simd", "bf16_down_proj_accumulate_simd",
                      "bf16_gemv_simd", "bench_fault_read", "bench_read_all",
                      "fp8_moe_gate_up_fused", "fp8_moe_down_fused",
+                     "gqa_attention_decode_headgate_f16",
+                     "gqa_attention_decode_headgate_f16_chunked",
+                     "gqa_attention_decode_headgate_f16_chunked_combine",
+                     "gqa_attention_decode_fused_f16",
+                     "gqa_attention_decode_fused_f16_chunked",
+                     "gqa_attention_decode_fused_f16_chunked_combine",
                      "bench_fp8_moe_gate_up_fused", "bench_fp8_moe_down_fused"] {
             if let f = lib.makeFunction(name: name) {
                 do {
@@ -598,7 +604,8 @@ func main() {
     print("")
 
     // ============================ T1: sequential cold ============================
-    print("--- T1: single-stream sequential read, one layer file (\(String(format: "%.0f", Double(gExpertSize * gNumExperts) / 1048576.0)) MB), 256KB chunks, F_NOCACHE ---")
+    log("--- T1: start")
+    print("    --- T1: single-stream sequential read, one layer file (\(String(format: "%.0f", Double(gExpertSize * gNumExperts) / 1048576.0)) MB), 256KB chunks, F_NOCACHE ---")
     do {
         let fd = openLayerFD(packedDir, layer: 7, noCache: true)
         let len = Int64(gExpertSize) * Int64(gNumExperts)
@@ -618,7 +625,8 @@ func main() {
     }
 
     // ============================ T2: 8-way parallel sequential ============================
-    print("--- T2: 8-thread parallel sequential read of same file (F_NOCACHE) ---")
+    log("--- T2: start")
+    print("    --- T2: 8-thread parallel sequential read of same file (F_NOCACHE) ---")
     do {
         let fd = openLayerFD(packedDir, layer: 7, noCache: true)
         let len = Int64(gExpertSize) * Int64(gNumExperts)
@@ -644,7 +652,8 @@ func main() {
     }
 
     // ============================ T3: app decode pread pattern ============================
-    print("--- T3: app's exact decode pread pattern: \(gNumLayers) layers x \(TOPK) experts x \(String(format: "%.1f", Double(gExpertSize) / 1048576.0)) MB ---")
+    log("--- T3: start")
+    print("    --- T3: app's exact decode pread pattern: \(gNumLayers) layers x \(TOPK) experts x \(String(format: "%.1f", Double(gExpertSize) / 1048576.0)) MB ---")
     print("    (page-cache fds like the app, concurrentPerform from Task.detached .userInitiated)")
     do {
         let fds = (0..<gNumLayers).map { openLayerFD(packedDir, layer: $0, noCache: false) }
@@ -700,7 +709,8 @@ func main() {
     }
 
     // ============================ T4: GPU MoE phase (real kernels) ============================
-    print("--- T4: GPU cost of decode MoE phase (\(TOPK) experts, 16 dispatches + barriers, app kernels) ---")
+    log("--- T4: start")
+    print("    --- T4: GPU cost of decode MoE phase (\(TOPK) experts, 16 dispatches + barriers, app kernels) ---")
     do {
         let rng = Rand(seed: 0xBEEF)
         var samples: [Double] = []
@@ -721,7 +731,8 @@ func main() {
     }
 
     // ============================ T4b: fused variant ============================
-    print("--- T4b: fused variant (all \(TOPK) experts in 2 dispatches) ---")
+    log("--- T4b: start")
+    print("    --- T4b: fused variant (all \(TOPK) experts in 2 dispatches) ---")
     do {
         if gpu.pipe("bench_fp8_moe_gate_up_fused") != nil {
             let rng = Rand(seed: 0xBEEF)
@@ -746,7 +757,8 @@ func main() {
     }
 
     // ============================ T5: router phase ============================
-    print("--- T5: router phase GPU (rmsnorm_bf16 + moe_router_topk_bf16, \(gNumExperts) experts) ---")
+    log("--- T5: start")
+    print("    --- T5: router phase GPU (rmsnorm_bf16 + moe_router_topk_bf16, \(gNumExperts) experts) ---")
     do {
         var samples: [Double] = []
         for _ in 0..<100 {
@@ -764,7 +776,8 @@ func main() {
     }
 
     // ============================ T6: serialized full token (CURRENT app behavior) ============================
-    print("--- T6: FULL serialized token sim (current app pipeline: router -> IO -> MoE per layer) ---")
+    log("--- T6: start")
+    print("    --- T6: FULL serialized token sim (current app pipeline: router -> IO -> MoE per layer) ---")
     do {
         let fds = (0..<gNumLayers).map { openLayerFD(packedDir, layer: $0, noCache: false) }
         defer { fds.forEach { close($0) } }
@@ -829,7 +842,8 @@ func main() {
     }
 
     // ============================ T7: pipelined upper bound ============================
-    print("--- T7: pipelined upper bound (oracle prefetch of layer l+1 during layer l GPU work) ---")
+    log("--- T7: start")
+    print("    --- T7: pipelined upper bound (oracle prefetch of layer l+1 during layer l GPU work) ---")
     do {
         let fds = (0..<gNumLayers).map { openLayerFD(packedDir, layer: $0, noCache: false) }
         defer { fds.forEach { close($0) } }
@@ -911,7 +925,8 @@ func main() {
     // .storageModeShared MTLBuffer, then run the same app-shaped per-layer loop as T10
     // reading the backbone from the pinned buffer instead of the mmap. Expected: the
     // ~945 ms/layer re-fault collapses to sub-ms DRAM reads.
-    print("--- T13: full token sim with PINNED backbone (pread model_weights.bin -> anon buffer) ---")
+    log("--- T13: start")
+    print("    --- T13: full token sim with PINNED backbone (pread model_weights.bin -> anon buffer) ---")
     do {
         let pinPath = dir.appendingPathComponent("model_weights.bin")
         let pinSize = Int(((try? FileManager.default.attributesOfItem(atPath: pinPath.path))?[.size] as? NSNumber)?.uint64Value ?? 0)
@@ -1025,7 +1040,8 @@ func main() {
     // kick prefetch(l+1, Markov-predicted) -> MoE GPU. Routing is generated ONCE with
     // realistic cross-layer locality (sticky hot sets shared between adjacent layers) and
     // replayed identically in both variants so the only difference is pipelining.
-    print("--- T14: pipelined expert decode w/ Markov predictor (sticky routing) ---")
+    log("--- T14: start")
+    print("    --- T14: pipelined expert decode w/ Markov predictor (sticky routing) ---")
     do {
         let fds = (0..<gNumLayers).map { openLayerFD(packedDir, layer: $0, noCache: false) }
         defer { fds.forEach { close($0) } }
@@ -1206,6 +1222,517 @@ func main() {
             // skip token 0 (predictor cold) in the mean
             let warmTok = tokenMs.dropFirst().reduce(0, +) / Double(max(1, tokenMs.count - 1))
             print("   [\(pipelined ? "pipelined" : "serialized")] all-tokens \(String(format: "%.0f", meanTok))ms avg (\(String(format: "%.2f", 1000.0 / meanTok)) tok/s) | warm tokens (2+) \(String(format: "%.0f", warmTok))ms (\(String(format: "%.2f", 1000.0 / warmTok)) tok/s) | sync IO \(String(format: "%.1f", meanIo))ms/token | hit rate \(String(format: "%.0f", meanHit * 100))%")
+        }
+    }
+
+    // ============================ T15: PIPELINE DATA CORRECTNESS ============================
+    // Replicates the app's EXACT fixed pipelined consume/kick shape (slot maps, per-kick
+    // semaphore, parity buffers, stale-map guard + consumer slot-space ownership) and
+    // verifies that every expert the GPU consumes has the CORRECT bytes in its slot
+    // (compared against a direct pread of the layer file).
+    log("--- T15: start")
+    print("    --- T15: pipelined consume/kick DATA CORRECTNESS (app-shaped, fixed) ---")
+    do {
+        let fds = (0..<gNumLayers).map { openLayerFD(packedDir, layer: $0, noCache: false) }
+        defer { fds.forEach { close($0) } }
+
+        var rg = Rand(seed: 0x5EED)
+        var hot: [[Int]] = []
+        for l in 0..<gNumLayers {
+            var s = Set<Int>()
+            if l > 0 { for e in hot[l - 1].prefix(20) { s.insert(e) } }
+            while s.count < 40 { s.insert(rg.next(gNumExperts)) }
+            hot.append(Array(s))
+        }
+        var routing: [[[Int]]] = []
+        for _ in 0..<gTokens {
+            var tokEx: [[Int]] = []
+            for l in 0..<gNumLayers {
+                var s = Set<Int>()
+                let pool = Set(hot[l]).union(l + 1 < gNumLayers ? Set(hot[l + 1]) : [])
+                let poolArr = Array(pool)
+                for _ in 0..<5 { s.insert(poolArr[rg.next(poolArr.count)]) }
+                while s.count < TOPK { s.insert(rg.next(gNumExperts)) }
+                tokEx.append(Array(s))
+            }
+            routing.append(tokEx)
+        }
+
+        let verifyBuf = UnsafeMutableRawPointer.allocate(byteCount: gExpertSize, alignment: 4096)
+        defer { verifyBuf.deallocate() }
+        var mismatches = 0
+        var checks = 0
+
+        var resident: [[Int: Int]] = [[:], [:]]
+        var residentLayer: [Int] = [-1, -1]
+        var nextSlot: [Int] = [0, 0]
+        var slotWriter: [[String]] = [[], []]
+        var pending: (layer: Int, sem: DispatchSemaphore)? = nil
+        let lock = NSLock()
+        let pfQueue = DispatchQueue(label: "t15.pf", qos: .userInitiated, attributes: .concurrent)
+        let capacity = stagingSize / gExpertSize
+
+        for tok in 0..<gTokens {
+            for l in 0..<gNumLayers {
+                let actual = routing[tok][l]
+                lock.lock()
+                if let p = pending, p.layer == l {
+                    let s = p.sem
+                    pending = nil
+                    lock.unlock()
+                    _ = s.wait(timeout: .now() + 5.0)
+                } else {
+                    lock.unlock()
+                }
+                let bufIdx = l & 1
+                let stagingBuf = (bufIdx == 0) ? stagingA : stagingB
+                var slotOf: [Int: Int] = [:]
+                lock.lock()
+                if residentLayer[bufIdx] == l {
+                    slotOf = resident[bufIdx]
+                } else {
+                    nextSlot[bufIdx] = 0
+                    slotWriter[bufIdx] = [String](repeating: "reset", count: capacity)
+                }
+                lock.unlock()
+                var hits = 0
+                for e in actual where slotOf[e] != nil { hits += 1 }
+                var missTasks: [ExpertTask] = []
+                for e in actual where slotOf[e] == nil {
+                    lock.lock()
+                    let slot = nextSlot[bufIdx]
+                    nextSlot[bufIdx] = slot + 1
+                    lock.unlock()
+                    guard slot < capacity else { mismatches += 1; continue }
+                    slotOf[e] = slot
+                    missTasks.append(ExpertTask(fd: fds[l], dst: stagingBuf.contents().advanced(by: slot * gExpertSize),
+                                                offset: off_t(e * gExpertSize), size: gExpertSize))
+                }
+                if !missTasks.isEmpty {
+                    dispatchPreads(&missTasks)
+                    lock.lock()
+                    for t in missTasks {
+                        let slot = Int((t.dst - stagingBuf.contents()) / gExpertSize)
+                        while slotWriter[bufIdx].count <= slot { slotWriter[bufIdx].append("?") }
+                        slotWriter[bufIdx][slot] = "miss L\(l) e\(Int(t.offset / off_t(gExpertSize))) tok\(tok)"
+                    }
+                    lock.unlock()
+                }
+
+                // kick prefetch(l+1) with the CURRENT layer's set as the prediction
+                if l + 1 < gNumLayers {
+                    let target = l + 1
+                    let tokStamp = tok
+                    let tBuf = target & 1
+                    let tStaging = (tBuf == 0) ? stagingA : stagingB
+                    let predicted = actual
+                    let s2 = DispatchSemaphore(value: 0)
+                    let tSlots = min(predicted.count, tStaging.length / gExpertSize - TOPK)
+                    lock.lock()
+                    resident[tBuf] = [:]
+                    residentLayer[tBuf] = -1
+                    nextSlot[tBuf] = tSlots
+                    pending = (target, s2)
+                    lock.unlock()
+                    pfQueue.async {
+                        var t2: [ExpertTask] = []
+                        for (i, e) in predicted.prefix(tSlots).enumerated() {
+                            t2.append(ExpertTask(fd: fds[target], dst: tStaging.contents().advanced(by: i * gExpertSize),
+                                                 offset: off_t(e * gExpertSize), size: gExpertSize))
+                        }
+                        var map: [Int: Int] = [:]
+                        if !t2.isEmpty {
+                            dispatchPreads(&t2)
+                            lock.lock()
+                            for (i, t) in t2.enumerated() where t.result == t.size {
+                                map[predicted[i]] = i
+                                let slot = Int((t.dst - tStaging.contents()) / gExpertSize)
+                                while slotWriter[tBuf].count <= slot { slotWriter[tBuf].append("?") }
+                                slotWriter[tBuf][slot] = "kick L\(target) e\(Int(t.offset / off_t(gExpertSize))) tok\(tokStamp)"
+                            }
+                            lock.unlock()
+                        }
+                        lock.lock()
+                        resident[tBuf] = map
+                        residentLayer[tBuf] = target
+                        lock.unlock()
+                        s2.signal()
+                    }
+                }
+
+                // VERIFY: each consumed expert's slot bytes == direct pread of that expert
+                let checkBase = stagingBuf.contents()
+                for e in actual {
+                    guard let slot = slotOf[e] else { mismatches += 1; continue }
+                    checks += 1
+                    let fdv = openLayerFD(packedDir, layer: l, noCache: true)
+                    _ = preadFull(fdv, verifyBuf, off_t(e * gExpertSize), gExpertSize)
+                    close(fdv)
+                    let staged = checkBase.advanced(by: slot * gExpertSize)
+                    if memcmp(staged, verifyBuf, gExpertSize) != 0 {
+                        mismatches += 1
+                        if mismatches < 5 {
+                            var diffOff = -1
+                            for b in 0..<gExpertSize where staged.load(fromByteOffset: b, as: UInt8.self) != verifyBuf.load(fromByteOffset: b, as: UInt8.self) {
+                                diffOff = b; break
+                            }
+                            print("   ⚠️ MISMATCH tok\(tok) layer\(l) expert\(e) slot\(slot): first diff at byte \(diffOff) | slot last written by: '\(slot < slotWriter[bufIdx].count ? slotWriter[bufIdx][slot] : "?")'")
+                        }
+                    }
+                }
+            }
+        }
+        print("   checked \(checks) consumed experts, mismatches: \(mismatches)")
+    }
+
+    // ============================ T16: fused MoE GPU equivalence ============================
+    // Runs the app's per-expert FP8 path and the new fused 2-dispatch path on identical
+    // staged data + routing, and compares the hMlp accumulators (tolerance for FP
+    // reduction-order noise).
+    log("--- T16: start")
+    print("    --- T16: fused MoE kernels vs per-expert kernels (output equivalence) ---")
+    do {
+        guard let refGate = gpu.pipe("fp8_swiglu_gate_up_simd"),
+              let refDown = gpu.pipe("fp8_down_proj_accumulate_simd"),
+              let fusedGate = gpu.pipe("fp8_moe_gate_up_fused"),
+              let fusedDown = gpu.pipe("fp8_moe_down_fused") else {
+            print("   (kernels unavailable - skipped)")
+            return
+        }
+        guard let hA = gpu.device.makeBuffer(length: HIDDEN * 4, options: .storageModeShared),
+              let hB = gpu.device.makeBuffer(length: HIDDEN * 4, options: .storageModeShared),
+              let slotList = gpu.device.makeBuffer(length: 16 * 4, options: .storageModeShared),
+              let slotW = gpu.device.makeBuffer(length: 16 * 4, options: .storageModeShared) else { return }
+
+        func runPath(_ fused: Bool, _ hMlp: MTLBuffer) {
+            let cmd = gpu.queue.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            encodeClear(enc, gpu, hMlp, HIDDEN)
+            let ids = (0..<TOPK).map { _ in 0 }  // unused; staging slot = position
+            if fused {
+                let slPtr = slotList.contents().bindMemory(to: UInt32.self, capacity: TOPK)
+                let swPtr = slotW.contents().bindMemory(to: Float.self, capacity: TOPK)
+                for i in 0..<TOPK { slPtr[i] = UInt32(i); swPtr[i] = 0.125 }
+                var es: UInt64 = UInt64(gExpertSize)
+                var gs: UInt64 = UInt64(comp.gateS)
+                var uw: UInt64 = UInt64(comp.upW)
+                var us: UInt64 = UInt64(comp.upS)
+                var dw: UInt64 = UInt64(comp.downW)
+                var ds: UInt64 = UInt64(comp.downS)
+                var hDimVal: UInt32 = UInt32(HIDDEN)
+                var interDimVal: UInt32 = UInt32(INTER)
+                var topKVal: UInt32 = UInt32(TOPK)
+                enc.setComputePipelineState(fusedGate)
+                enc.setBuffer(stagingA, offset: 0, index: 0)
+                enc.setBuffer(xNorm, offset: 0, index: 1)
+                enc.setBuffer(inter, offset: 0, index: 2)
+                enc.setBuffer(slotList, offset: 0, index: 3)
+                enc.setBytes(&es, length: 8, index: 4)
+                enc.setBytes(&gs, length: 8, index: 5)
+                enc.setBytes(&uw, length: 8, index: 6)
+                enc.setBytes(&us, length: 8, index: 7)
+                enc.setBytes(&hDimVal, length: 4, index: 8)
+                enc.setBytes(&interDimVal, length: 4, index: 9)
+                enc.setBytes(&topKVal, length: 4, index: 10)
+                enc.dispatchThreadgroups(MTLSize(width: INTER, height: TOPK, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                enc.setComputePipelineState(fusedDown)
+                enc.setBuffer(stagingA, offset: 0, index: 0)
+                enc.setBuffer(inter, offset: 0, index: 1)
+                enc.setBuffer(hMlp, offset: 0, index: 2)
+                enc.setBuffer(slotW, offset: 0, index: 3)
+                enc.setBuffer(slotList, offset: 0, index: 4)
+                enc.setBytes(&es, length: 8, index: 5)
+                enc.setBytes(&dw, length: 8, index: 6)
+                enc.setBytes(&ds, length: 8, index: 7)
+                enc.setBytes(&interDimVal, length: 4, index: 8)
+                enc.setBytes(&hDimVal, length: 4, index: 9)
+                enc.setBytes(&topKVal, length: 4, index: 10)
+                enc.dispatchThreadgroups(MTLSize(width: HIDDEN, height: TOPK, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+            } else {
+                for slot in 0..<TOPK {
+                    encodeExpert(enc: enc, gpu: gpu, staging: stagingA, inter: inter, hMlp: hMlp, xNorm: xNorm,
+                                 slot: slot, expertSize: gExpertSize, comp: comp, weight: 0.125)
+                }
+            }
+            enc.endEncoding()
+            cmd.commit(); cmd.waitUntilCompleted()
+        }
+
+        // fill staging slots with pseudo-random FP8-ish data + xNorm
+        let sp = stagingA.contents().assumingMemoryBound(to: UInt8.self)
+        var xr: UInt32 = 0x9E3779B9
+        for i in 0..<TOPK * gExpertSize {
+            xr = xr &* 1664525 &+ 1013904223
+            sp[i] = UInt8(truncatingIfNeeded: xr >> 13)
+        }
+        let xp = xNorm.contents().bindMemory(to: Float.self, capacity: HIDDEN)
+        for i in 0..<HIDDEN {
+            xr = xr &* 1664525 &+ 1013904223
+            xNorm.contents().advanced(by: i * 4).storeBytes(of: Float((Int(xr >> 16) % 2000 - 1000)) / 1000.0, as: Float.self)
+        }
+
+        runPath(false, hA)
+        runPath(true, hB)
+
+        let pa = hA.contents().bindMemory(to: Float.self, capacity: HIDDEN)
+        let pb = hB.contents().bindMemory(to: Float.self, capacity: HIDDEN)
+        var maxRel = 0.0
+        var bad = 0
+        for i in 0..<HIDDEN {
+            let a = Double(pa[i]); let b = Double(pb[i])
+            let denom = max(abs(a), abs(b), 1.0)
+            let rel = abs(a - b) / denom
+            if rel > maxRel { maxRel = rel }
+            if rel > 1e-4 { bad += 1 }
+        }
+        print("   HIDDEN=\(HIDDEN) outputs compared, max rel diff \(String(format: "%.2e", maxRel)), >1e-4 count: \(bad)")
+    }
+
+    // ============================ T17: chunked attention equivalence + timing ============================
+    // Builds a synthetic FP16 KV cache, runs the original one-thread-per-head headgate
+    // kernel and the new flash-decoding chunked pair, compares outputs, and times both
+    // at a long context.
+    log("--- T17: start")
+    print("    --- T17: chunked GQA attention vs original (equivalence + timing) ---")
+    do {
+        guard let refPipe = gpu.pipe("gqa_attention_decode_headgate_f16"),
+              let chunkPipe = gpu.pipe("gqa_attention_decode_headgate_f16_chunked"),
+              let combinePipe = gpu.pipe("gqa_attention_decode_headgate_f16_chunked_combine") else {
+            print("   (attention kernels unavailable - skipped)")
+            return
+        }
+        let nQ = 16, nKv = 2, hD = 256
+        log("   T17: buffers")
+        let kvStride = nKv * hD
+        let maxCtx = 8192
+        guard let qBuf = gpu.device.makeBuffer(length: nQ * hD * 4, options: .storageModeShared),
+              let kCache = gpu.device.makeBuffer(length: maxCtx * kvStride * 2, options: .storageModeShared),
+              let vCache = gpu.device.makeBuffer(length: maxCtx * kvStride * 2, options: .storageModeShared),
+              let ctxRef = gpu.device.makeBuffer(length: nQ * hD * 4, options: .storageModeShared),
+              let ctxChunked = gpu.device.makeBuffer(length: nQ * hD * 4, options: .storageModeShared),
+              let gateBuf = gpu.device.makeBuffer(length: nQ * 4, options: .storageModeShared),
+              let pM = gpu.device.makeBuffer(length: nQ * 256 * 4, options: .storageModeShared),
+              let pL = gpu.device.makeBuffer(length: nQ * 256 * 4, options: .storageModeShared),
+              let pAcc = gpu.device.makeBuffer(length: nQ * 256 * hD * 4, options: .storageModeShared) else { return }
+
+        // random half KV + q + gates
+        var seed: UInt32 = 0xCAFE
+        func rnd() -> Float { seed = seed &* 1664525 &+ 1013904223; return Float(Int((seed >> 16) % 2000) - 1000) / 1000.0 }
+        let kp = kCache.contents().bindMemory(to: UInt16.self, capacity: maxCtx * kvStride)
+        let vp = vCache.contents().bindMemory(to: UInt16.self, capacity: maxCtx * kvStride)
+        for i in 0..<(maxCtx * kvStride) {
+            seed = seed &* 1664525 &+ 1013904223
+            kp[i] = f16BitPattern(rnd())
+            seed = seed &* 1664525 &+ 1013904223
+            vp[i] = f16BitPattern(rnd())
+        }
+        let qp = qBuf.contents().bindMemory(to: Float.self, capacity: nQ * hD)
+        for i in 0..<(nQ * hD) { qp[i] = rnd() }
+        log("   T17: filled")
+        let gp = gateBuf.contents().bindMemory(to: Float.self, capacity: nQ)
+        for i in 0..<nQ { gp[i] = rnd() }
+
+        func runRef(_ seqLen: UInt32) {
+            let cmd = gpu.queue.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var s = seqLen, nq = UInt32(nQ), nkv = UInt32(nKv), hd = UInt32(hD), win = UInt32(0)
+            enc.setComputePipelineState(refPipe)
+            enc.setBuffer(qBuf, offset: 0, index: 0)
+            enc.setBuffer(kCache, offset: 0, index: 1)
+            enc.setBuffer(vCache, offset: 0, index: 2)
+            enc.setBuffer(ctxRef, offset: 0, index: 3)
+            enc.setBuffer(gateBuf, offset: 0, index: 4)
+            enc.setBytes(&s, length: 4, index: 5)
+            enc.setBytes(&nq, length: 4, index: 6)
+            enc.setBytes(&nkv, length: 4, index: 7)
+            enc.setBytes(&hd, length: 4, index: 8)
+            enc.setBytes(&win, length: 4, index: 9)
+            enc.dispatchThreads(MTLSize(width: nQ, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: nQ, height: 1, depth: 1))
+            enc.endEncoding()
+            cmd.commit(); cmd.waitUntilCompleted()
+        }
+
+        func runChunked(_ seqLen: UInt32) -> Double {
+            let numChunks = max(1, min(256, (seqLen + 63) / 64))
+            let chunkSize = (seqLen + numChunks - 1) / numChunks
+            let cmd = gpu.queue.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var s = seqLen, nq = UInt32(nQ), nkv = UInt32(nKv), hd = UInt32(hD), win = UInt32(0)
+            var cs = chunkSize
+            enc.setComputePipelineState(chunkPipe)
+            enc.setBuffer(qBuf, offset: 0, index: 0)
+            enc.setBuffer(kCache, offset: 0, index: 1)
+            enc.setBuffer(vCache, offset: 0, index: 2)
+            enc.setBuffer(pM, offset: 0, index: 3)
+            enc.setBuffer(pL, offset: 0, index: 4)
+            enc.setBuffer(pAcc, offset: 0, index: 5)
+            enc.setBytes(&s, length: 4, index: 6)
+            enc.setBytes(&nq, length: 4, index: 7)
+            enc.setBytes(&nkv, length: 4, index: 8)
+            enc.setBytes(&hd, length: 4, index: 9)
+            enc.setBytes(&win, length: 4, index: 10)
+            enc.setBytes(&cs, length: 4, index: 11)
+            enc.dispatchThreadgroups(MTLSize(width: nQ, height: Int(numChunks), depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+
+            var nc = numChunks
+            enc.setComputePipelineState(combinePipe)
+            enc.setBuffer(pM, offset: 0, index: 0)
+            enc.setBuffer(pL, offset: 0, index: 1)
+            enc.setBuffer(pAcc, offset: 0, index: 2)
+            enc.setBuffer(ctxChunked, offset: 0, index: 3)
+            enc.setBuffer(gateBuf, offset: 0, index: 4)
+            enc.setBytes(&nc, length: 4, index: 5)
+            enc.setBytes(&nq, length: 4, index: 6)
+            enc.setBytes(&hd, length: 4, index: 7)
+            enc.dispatchThreadgroups(MTLSize(width: nQ, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            enc.endEncoding()
+            let t0 = CFAbsoluteTimeGetCurrent()
+            cmd.commit(); cmd.waitUntilCompleted()
+            return (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        }
+
+        // helper: convert a Float to its UInt16 half bit pattern
+        func f16BitPattern(_ f: Float) -> UInt16 {
+            return Float16(f).bitPattern
+        }
+
+        _ = runRef(0); _ = runChunked(0)
+
+        for ctx in [1000, 2000, 4000, 8000] {
+            runRef(UInt32(ctx))
+            let tChunk = runChunked(UInt32(ctx))
+            // compare
+            let a = ctxRef.contents().bindMemory(to: Float.self, capacity: nQ * hD)
+            let b = ctxChunked.contents().bindMemory(to: Float.self, capacity: nQ * hD)
+            var maxRel = 0.0
+            for i in 0..<(nQ * hD) {
+                let x = Double(a[i]); let y = Double(b[i])
+                let rel = abs(x - y) / max(abs(x), abs(y), 1e-6)
+                if rel > maxRel { maxRel = rel }
+            }
+            let t0 = CFAbsoluteTimeGetCurrent()
+            runRef(UInt32(ctx))
+            let tRef = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+            print("   ctx=\(String(format: "%5d", ctx)): ref \(String(format: "%.2f", tRef))ms | chunked \(String(format: "%.2f", tChunk))ms (\(String(format: "%.1f", tRef / max(tChunk, 1e-9)))x) | max rel diff \(String(format: "%.2e", maxRel))")
+        }
+    }
+
+    // ============================ T17b: chunked FUSED-Q+gate attention (Ornith's path) ============================
+    // Ornith-class models have no g_proj tensor, so decode takes gqaDecodeF16Pipeline
+    // (fused Q[256]+Gate[256] per head, one thread per head). Verify the chunked pair
+    // against it and time both.
+    log("--- T17b: start")
+    print("    --- T17b: chunked FUSED Q+Gate attention vs original ---")
+    do {
+        guard let refPipe = gpu.pipe("gqa_attention_decode_fused_f16"),
+              let chunkPipe = gpu.pipe("gqa_attention_decode_fused_f16_chunked"),
+              let combinePipe = gpu.pipe("gqa_attention_decode_fused_f16_chunked_combine") else {
+            print("   (fused attention kernels unavailable - skipped)")
+            return
+        }
+        let nQ = 16, nKv = 2, hD = 256
+        let kvStride = nKv * hD
+        let maxCtx = 8192
+        guard let qBuf = gpu.device.makeBuffer(length: nQ * hD * 2 * 4, options: .storageModeShared),
+              let kCache = gpu.device.makeBuffer(length: maxCtx * kvStride * 2, options: .storageModeShared),
+              let vCache = gpu.device.makeBuffer(length: maxCtx * kvStride * 2, options: .storageModeShared),
+              let ctxRef = gpu.device.makeBuffer(length: nQ * hD * 4, options: .storageModeShared),
+              let ctxChunked = gpu.device.makeBuffer(length: nQ * hD * 4, options: .storageModeShared),
+              let pM = gpu.device.makeBuffer(length: nQ * 256 * 4, options: .storageModeShared),
+              let pL = gpu.device.makeBuffer(length: nQ * 256 * 4, options: .storageModeShared),
+              let pAcc = gpu.device.makeBuffer(length: nQ * 256 * hD * 4, options: .storageModeShared) else { return }
+
+        var seed: UInt32 = 0xB17D
+        func rnd2() -> Float { seed = seed &* 1664525 &+ 1013904223; return Float(Int((seed >> 16) % 2000) - 1000) / 1000.0 }
+        func f16BP(_ f: Float) -> UInt16 { return Float16(f).bitPattern }
+        let kp = kCache.contents().bindMemory(to: UInt16.self, capacity: maxCtx * kvStride)
+        let vp = vCache.contents().bindMemory(to: UInt16.self, capacity: maxCtx * kvStride)
+        for i in 0..<(maxCtx * kvStride) {
+            seed = seed &* 1664525 &+ 1013904223
+            kp[i] = f16BP(rnd2())
+            seed = seed &* 1664525 &+ 1013904223
+            vp[i] = f16BP(rnd2())
+        }
+        let qp = qBuf.contents().bindMemory(to: Float.self, capacity: nQ * hD * 2)
+        for i in 0..<(nQ * hD * 2) { qp[i] = rnd2() }
+
+        let queue = gpu.queue
+        func runRef(_ seqLen: UInt32) {
+            let cmd = queue.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var s = seqLen, nq = UInt32(nQ), nkv = UInt32(nKv), hd = UInt32(hD)
+            enc.setComputePipelineState(refPipe)
+            enc.setBuffer(qBuf, offset: 0, index: 0)
+            enc.setBuffer(kCache, offset: 0, index: 1)
+            enc.setBuffer(vCache, offset: 0, index: 2)
+            enc.setBuffer(ctxRef, offset: 0, index: 3)
+            enc.setBytes(&s, length: 4, index: 4)
+            enc.setBytes(&nq, length: 4, index: 5)
+            enc.setBytes(&nkv, length: 4, index: 6)
+            enc.setBytes(&hd, length: 4, index: 7)
+            enc.dispatchThreads(MTLSize(width: nQ, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: nQ, height: 1, depth: 1))
+            enc.endEncoding()
+            cmd.commit(); cmd.waitUntilCompleted()
+        }
+
+        func runChunked(_ seqLen: UInt32) -> Double {
+            let numChunks = max(1, min(256, (seqLen + 63) / 64))
+            let chunkSize = (seqLen + numChunks - 1) / numChunks
+            let cmd = queue.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var s = seqLen, nq = UInt32(nQ), nkv = UInt32(nKv), hd = UInt32(hD)
+            var cs = chunkSize
+            enc.setComputePipelineState(chunkPipe)
+            enc.setBuffer(qBuf, offset: 0, index: 0)
+            enc.setBuffer(kCache, offset: 0, index: 1)
+            enc.setBuffer(vCache, offset: 0, index: 2)
+            enc.setBuffer(pM, offset: 0, index: 3)
+            enc.setBuffer(pL, offset: 0, index: 4)
+            enc.setBuffer(pAcc, offset: 0, index: 5)
+            enc.setBytes(&s, length: 4, index: 6)
+            enc.setBytes(&nq, length: 4, index: 7)
+            enc.setBytes(&nkv, length: 4, index: 8)
+            enc.setBytes(&hd, length: 4, index: 9)
+            enc.setBytes(&cs, length: 4, index: 10)
+            enc.dispatchThreadgroups(MTLSize(width: nQ, height: Int(numChunks), depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+            var nc = numChunks
+            enc.setComputePipelineState(combinePipe)
+            enc.setBuffer(pM, offset: 0, index: 0)
+            enc.setBuffer(pL, offset: 0, index: 1)
+            enc.setBuffer(pAcc, offset: 0, index: 2)
+            enc.setBuffer(ctxChunked, offset: 0, index: 3)
+            enc.setBuffer(qBuf, offset: 0, index: 4)
+            enc.setBytes(&nc, length: 4, index: 5)
+            enc.setBytes(&nq, length: 4, index: 6)
+            enc.setBytes(&hd, length: 4, index: 7)
+            enc.dispatchThreadgroups(MTLSize(width: nQ, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            enc.endEncoding()
+            let t0 = CFAbsoluteTimeGetCurrent()
+            cmd.commit(); cmd.waitUntilCompleted()
+            return (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        }
+
+        _ = runRef(64); _ = runChunked(64)
+        for ctx in [1000, 2000, 4000, 8000] {
+            runRef(UInt32(ctx))
+            let tChunk = runChunked(UInt32(ctx))
+            let a = ctxRef.contents().bindMemory(to: Float.self, capacity: nQ * hD)
+            let b = ctxChunked.contents().bindMemory(to: Float.self, capacity: nQ * hD)
+            var maxRel = 0.0
+            for i in 0..<(nQ * hD) {
+                let x = Double(a[i]); let y = Double(b[i])
+                let rel = abs(x - y) / max(abs(x), abs(y), 1e-6)
+                if rel > maxRel { maxRel = rel }
+            }
+            let t0 = CFAbsoluteTimeGetCurrent()
+            runRef(UInt32(ctx))
+            let tRef = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+            print("   fusedQ ctx=\(String(format: "%5d", ctx)): ref \(String(format: "%.2f", tRef))ms | chunked \(String(format: "%.2f", tChunk))ms (\(String(format: "%.1f", tRef / max(tChunk, 1e-9)))x) | max rel diff \(String(format: "%.2e", maxRel))")
         }
     }
 
@@ -1605,270 +2132,6 @@ func main() {
         OSAtomicAdd64(Int64(x), &sinkGlobal)
         let t2 = CFAbsoluteTimeGetCurrent()
         print("   alloc \(String(format: "%.0f", (t1 - t0) * 1000))ms + touch \(String(format: "%.0f", (t2 - t1) * 1000))ms -> total fixed prefill overhead \(String(format: "%.0f", (t2 - t0) * 1000))ms")
-    }
-
-    // ============================ T15: PIPELINE DATA CORRECTNESS ============================
-    // Replicates the app's EXACT fixed pipelined consume/kick shape (slot maps, per-kick
-    // semaphore, parity buffers, stale-map guard + consumer slot-space ownership) and
-    // verifies that every expert the GPU consumes has the CORRECT bytes in its slot
-    // (compared against a direct pread of the layer file).
-    print("--- T15: pipelined consume/kick DATA CORRECTNESS (app-shaped, fixed) ---")
-    do {
-        let fds = (0..<gNumLayers).map { openLayerFD(packedDir, layer: $0, noCache: false) }
-        defer { fds.forEach { close($0) } }
-
-        var rg = Rand(seed: 0x5EED)
-        var hot: [[Int]] = []
-        for l in 0..<gNumLayers {
-            var s = Set<Int>()
-            if l > 0 { for e in hot[l - 1].prefix(20) { s.insert(e) } }
-            while s.count < 40 { s.insert(rg.next(gNumExperts)) }
-            hot.append(Array(s))
-        }
-        var routing: [[[Int]]] = []
-        for _ in 0..<gTokens {
-            var tokEx: [[Int]] = []
-            for l in 0..<gNumLayers {
-                var s = Set<Int>()
-                let pool = Set(hot[l]).union(l + 1 < gNumLayers ? Set(hot[l + 1]) : [])
-                let poolArr = Array(pool)
-                for _ in 0..<5 { s.insert(poolArr[rg.next(poolArr.count)]) }
-                while s.count < TOPK { s.insert(rg.next(gNumExperts)) }
-                tokEx.append(Array(s))
-            }
-            routing.append(tokEx)
-        }
-
-        let verifyBuf = UnsafeMutableRawPointer.allocate(byteCount: gExpertSize, alignment: 4096)
-        defer { verifyBuf.deallocate() }
-        var mismatches = 0
-        var checks = 0
-
-        var resident: [[Int: Int]] = [[:], [:]]
-        var residentLayer: [Int] = [-1, -1]
-        var nextSlot: [Int] = [0, 0]
-        var slotWriter: [[String]] = [[], []]
-        var pending: (layer: Int, sem: DispatchSemaphore)? = nil
-        let lock = NSLock()
-        let pfQueue = DispatchQueue(label: "t15.pf", qos: .userInitiated, attributes: .concurrent)
-        let capacity = stagingSize / gExpertSize
-
-        for tok in 0..<gTokens {
-            for l in 0..<gNumLayers {
-                let actual = routing[tok][l]
-                lock.lock()
-                if let p = pending, p.layer == l {
-                    let s = p.sem
-                    pending = nil
-                    lock.unlock()
-                    _ = s.wait(timeout: .now() + 5.0)
-                } else {
-                    lock.unlock()
-                }
-                let bufIdx = l & 1
-                let stagingBuf = (bufIdx == 0) ? stagingA : stagingB
-                var slotOf: [Int: Int] = [:]
-                lock.lock()
-                if residentLayer[bufIdx] == l {
-                    slotOf = resident[bufIdx]
-                } else {
-                    nextSlot[bufIdx] = 0
-                    slotWriter[bufIdx] = [String](repeating: "reset", count: capacity)
-                }
-                lock.unlock()
-                var hits = 0
-                for e in actual where slotOf[e] != nil { hits += 1 }
-                var missTasks: [ExpertTask] = []
-                for e in actual where slotOf[e] == nil {
-                    lock.lock()
-                    let slot = nextSlot[bufIdx]
-                    nextSlot[bufIdx] = slot + 1
-                    lock.unlock()
-                    guard slot < capacity else { mismatches += 1; continue }
-                    slotOf[e] = slot
-                    missTasks.append(ExpertTask(fd: fds[l], dst: stagingBuf.contents().advanced(by: slot * gExpertSize),
-                                                offset: off_t(e * gExpertSize), size: gExpertSize))
-                }
-                if !missTasks.isEmpty {
-                    dispatchPreads(&missTasks)
-                    lock.lock()
-                    for t in missTasks {
-                        let slot = Int((t.dst - stagingBuf.contents()) / gExpertSize)
-                        while slotWriter[bufIdx].count <= slot { slotWriter[bufIdx].append("?") }
-                        slotWriter[bufIdx][slot] = "miss L\(l) e\(Int(t.offset / off_t(gExpertSize))) tok\(tok)"
-                    }
-                    lock.unlock()
-                }
-
-                // kick prefetch(l+1) with the CURRENT layer's set as the prediction
-                if l + 1 < gNumLayers {
-                    let target = l + 1
-                    let tokStamp = tok
-                    let tBuf = target & 1
-                    let tStaging = (tBuf == 0) ? stagingA : stagingB
-                    let predicted = actual
-                    let s2 = DispatchSemaphore(value: 0)
-                    let tSlots = min(predicted.count, tStaging.length / gExpertSize - TOPK)
-                    lock.lock()
-                    resident[tBuf] = [:]
-                    residentLayer[tBuf] = -1
-                    nextSlot[tBuf] = tSlots
-                    pending = (target, s2)
-                    lock.unlock()
-                    pfQueue.async {
-                        var t2: [ExpertTask] = []
-                        for (i, e) in predicted.prefix(tSlots).enumerated() {
-                            t2.append(ExpertTask(fd: fds[target], dst: tStaging.contents().advanced(by: i * gExpertSize),
-                                                 offset: off_t(e * gExpertSize), size: gExpertSize))
-                        }
-                        var map: [Int: Int] = [:]
-                        if !t2.isEmpty {
-                            dispatchPreads(&t2)
-                            lock.lock()
-                            for (i, t) in t2.enumerated() where t.result == t.size {
-                                map[predicted[i]] = i
-                                let slot = Int((t.dst - tStaging.contents()) / gExpertSize)
-                                while slotWriter[tBuf].count <= slot { slotWriter[tBuf].append("?") }
-                                slotWriter[tBuf][slot] = "kick L\(target) e\(Int(t.offset / off_t(gExpertSize))) tok\(tokStamp)"
-                            }
-                            lock.unlock()
-                        }
-                        lock.lock()
-                        resident[tBuf] = map
-                        residentLayer[tBuf] = target
-                        lock.unlock()
-                        s2.signal()
-                    }
-                }
-
-                // VERIFY: each consumed expert's slot bytes == direct pread of that expert
-                let checkBase = stagingBuf.contents()
-                for e in actual {
-                    guard let slot = slotOf[e] else { mismatches += 1; continue }
-                    checks += 1
-                    let fdv = openLayerFD(packedDir, layer: l, noCache: true)
-                    _ = preadFull(fdv, verifyBuf, off_t(e * gExpertSize), gExpertSize)
-                    close(fdv)
-                    let staged = checkBase.advanced(by: slot * gExpertSize)
-                    if memcmp(staged, verifyBuf, gExpertSize) != 0 {
-                        mismatches += 1
-                        if mismatches < 5 {
-                            var diffOff = -1
-                            for b in 0..<gExpertSize where staged.load(fromByteOffset: b, as: UInt8.self) != verifyBuf.load(fromByteOffset: b, as: UInt8.self) {
-                                diffOff = b; break
-                            }
-                            print("   ⚠️ MISMATCH tok\(tok) layer\(l) expert\(e) slot\(slot): first diff at byte \(diffOff) | slot last written by: '\(slot < slotWriter[bufIdx].count ? slotWriter[bufIdx][slot] : "?")'")
-                        }
-                    }
-                }
-            }
-        }
-        print("   checked \(checks) consumed experts, mismatches: \(mismatches)")
-    }
-
-    // ============================ T16: fused MoE GPU equivalence ============================
-    // Runs the app's per-expert FP8 path and the new fused 2-dispatch path on identical
-    // staged data + routing, and compares the hMlp accumulators (tolerance for FP
-    // reduction-order noise).
-    print("--- T16: fused MoE kernels vs per-expert kernels (output equivalence) ---")
-    do {
-        guard let refGate = gpu.pipe("fp8_swiglu_gate_up_simd"),
-              let refDown = gpu.pipe("fp8_down_proj_accumulate_simd"),
-              let fusedGate = gpu.pipe("fp8_moe_gate_up_fused"),
-              let fusedDown = gpu.pipe("fp8_moe_down_fused") else {
-            print("   (kernels unavailable - skipped)")
-            return
-        }
-        guard let hA = gpu.device.makeBuffer(length: HIDDEN * 4, options: .storageModeShared),
-              let hB = gpu.device.makeBuffer(length: HIDDEN * 4, options: .storageModeShared),
-              let slotList = gpu.device.makeBuffer(length: 16 * 4, options: .storageModeShared),
-              let slotW = gpu.device.makeBuffer(length: 16 * 4, options: .storageModeShared) else { return }
-
-        func runPath(_ fused: Bool, _ hMlp: MTLBuffer) {
-            let cmd = gpu.queue.makeCommandBuffer()!
-            let enc = cmd.makeComputeCommandEncoder()!
-            encodeClear(enc, gpu, hMlp, HIDDEN)
-            let ids = (0..<TOPK).map { _ in 0 }  // unused; staging slot = position
-            if fused {
-                let slPtr = slotList.contents().bindMemory(to: UInt32.self, capacity: TOPK)
-                let swPtr = slotW.contents().bindMemory(to: Float.self, capacity: TOPK)
-                for i in 0..<TOPK { slPtr[i] = UInt32(i); swPtr[i] = 0.125 }
-                var es: UInt64 = UInt64(gExpertSize)
-                var gs: UInt64 = UInt64(comp.gateS)
-                var uw: UInt64 = UInt64(comp.upW)
-                var us: UInt64 = UInt64(comp.upS)
-                var dw: UInt64 = UInt64(comp.downW)
-                var ds: UInt64 = UInt64(comp.downS)
-                var hDimVal: UInt32 = UInt32(HIDDEN)
-                var interDimVal: UInt32 = UInt32(INTER)
-                var topKVal: UInt32 = UInt32(TOPK)
-                enc.setComputePipelineState(fusedGate)
-                enc.setBuffer(stagingA, offset: 0, index: 0)
-                enc.setBuffer(xNorm, offset: 0, index: 1)
-                enc.setBuffer(inter, offset: 0, index: 2)
-                enc.setBuffer(slotList, offset: 0, index: 3)
-                enc.setBytes(&es, length: 8, index: 4)
-                enc.setBytes(&gs, length: 8, index: 5)
-                enc.setBytes(&uw, length: 8, index: 6)
-                enc.setBytes(&us, length: 8, index: 7)
-                enc.setBytes(&hDimVal, length: 4, index: 8)
-                enc.setBytes(&interDimVal, length: 4, index: 9)
-                enc.setBytes(&topKVal, length: 4, index: 10)
-                enc.dispatchThreadgroups(MTLSize(width: INTER, height: TOPK, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-                enc.memoryBarrier(scope: .buffers)
-
-                enc.setComputePipelineState(fusedDown)
-                enc.setBuffer(stagingA, offset: 0, index: 0)
-                enc.setBuffer(inter, offset: 0, index: 1)
-                enc.setBuffer(hMlp, offset: 0, index: 2)
-                enc.setBuffer(slotW, offset: 0, index: 3)
-                enc.setBuffer(slotList, offset: 0, index: 4)
-                enc.setBytes(&es, length: 8, index: 5)
-                enc.setBytes(&dw, length: 8, index: 6)
-                enc.setBytes(&ds, length: 8, index: 7)
-                enc.setBytes(&interDimVal, length: 4, index: 8)
-                enc.setBytes(&hDimVal, length: 4, index: 9)
-                enc.setBytes(&topKVal, length: 4, index: 10)
-                enc.dispatchThreadgroups(MTLSize(width: HIDDEN, height: TOPK, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-                enc.memoryBarrier(scope: .buffers)
-            } else {
-                for slot in 0..<TOPK {
-                    encodeExpert(enc: enc, gpu: gpu, staging: stagingA, inter: inter, hMlp: hMlp, xNorm: xNorm,
-                                 slot: slot, expertSize: gExpertSize, comp: comp, weight: 0.125)
-                }
-            }
-            enc.endEncoding()
-            cmd.commit(); cmd.waitUntilCompleted()
-        }
-
-        // fill staging slots with pseudo-random FP8-ish data + xNorm
-        let sp = stagingA.contents().assumingMemoryBound(to: UInt8.self)
-        var xr: UInt32 = 0x9E3779B9
-        for i in 0..<TOPK * gExpertSize {
-            xr = xr &* 1664525 &+ 1013904223
-            sp[i] = UInt8(truncatingIfNeeded: xr >> 13)
-        }
-        let xp = xNorm.contents().bindMemory(to: Float.self, capacity: HIDDEN)
-        for i in 0..<HIDDEN {
-            xr = xr &* 1664525 &+ 1013904223
-            xNorm.contents().advanced(by: i * 4).storeBytes(of: Float((Int(xr >> 16) % 2000 - 1000)) / 1000.0, as: Float.self)
-        }
-
-        runPath(false, hA)
-        runPath(true, hB)
-
-        let pa = hA.contents().bindMemory(to: Float.self, capacity: HIDDEN)
-        let pb = hB.contents().bindMemory(to: Float.self, capacity: HIDDEN)
-        var maxRel = 0.0
-        var bad = 0
-        for i in 0..<HIDDEN {
-            let a = Double(pa[i]); let b = Double(pb[i])
-            let denom = max(abs(a), abs(b), 1.0)
-            let rel = abs(a - b) / denom
-            if rel > maxRel { maxRel = rel }
-            if rel > 1e-4 { bad += 1 }
-        }
-        print("   HIDDEN=\(HIDDEN) outputs compared, max rel diff \(String(format: "%.2e", maxRel)), >1e-4 count: \(bad)")
     }
 
     print("")

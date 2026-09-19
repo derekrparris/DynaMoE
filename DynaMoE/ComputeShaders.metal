@@ -6887,3 +6887,279 @@ kernel void fp8_moe_down_fused(
         outputAccumulator[d] += slotRoutingWeights[rank] * (down_dot * downScale);
     }
 }
+
+/// MSL Kernel: Chunked GQA Autoregressive Decoding with Headwise Sigmoid Output Gate
+/// (FP16 KV-Cache). Flash-decoding split-K: grid (numQHeads, numChunks); each thread
+/// runs an online-softmax partial over its KV chunk and writes (m, l, acc) partials.
+/// A follow-up combine kernel merges the partials and applies the gate.
+kernel void gqa_attention_decode_headgate_f16_chunked(
+    device const float* qVector [[buffer(0)]],
+    device const half* kCacheBuffer [[buffer(1)]],
+    device const half* vCacheBuffer [[buffer(2)]],
+    device float* partialM [[buffer(3)]],     // [numQHeads * numChunks]
+    device float* partialL [[buffer(4)]],     // [numQHeads * numChunks]
+    device float* partialAcc [[buffer(5)]],   // [numQHeads * numChunks * headDim]
+    constant uint32_t& seqLen [[buffer(6)]],
+    constant uint32_t& numQHeads [[buffer(7)]],
+    constant uint32_t& numKvHeads [[buffer(8)]],
+    constant uint32_t& headDim [[buffer(9)]],
+    constant uint32_t& slidingWindow [[buffer(10)]],
+    constant uint32_t& chunkSize [[buffer(11)]],
+    uint2 pos [[thread_position_in_grid]],
+    uint2 gridDim [[threadgroups_per_grid]]
+) {
+    uint qHeadIdx = pos.x;
+    uint chunkIdx = pos.y;
+    if (qHeadIdx >= numQHeads) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+
+    uint32_t qHeadBase = (qHeadIdx * headDim);
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    float4 acc[64];
+    uint32_t headDimVec = headDim / 4;
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        acc[d] = float4(0.0f);
+    }
+
+    float m = -1e20f;
+    float l = 0.0f;
+
+    device const float4* qHeadVec = (device const float4*)(qVector + qHeadBase);
+    uint32_t currentSeqLen = (seqLen == 0) ? 1 : ((seqLen & 0x80000000) ? ((seqLen & 0x7FFFFFFF) + 1) : seqLen);
+    uint32_t windowStart = (slidingWindow > 0 && currentSeqLen > slidingWindow) ? (currentSeqLen - slidingWindow) : 0;
+
+    uint32_t chunkStart = windowStart + chunkIdx * chunkSize;
+    uint32_t chunkEnd = min(chunkStart + chunkSize, currentSeqLen);
+
+    for (uint32_t tau = chunkStart; tau < chunkEnd; tau++) {
+        uint32_t kBase = (tau * kvStride) + kvHeadBase;
+        device const half4* kVec = (device const half4*)(kCacheBuffer + kBase);
+
+        float dot_val = 0.0f;
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            dot_val += dot(qHeadVec[d], float4(kVec[d]));
+        }
+        float score = dot_val * invSqrtHeadDim;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+
+        l = (l * alpha) + beta;
+
+        uint32_t vBase = (tau * kvStride) + kvHeadBase;
+        device const half4* vVec = (device const half4*)(vCacheBuffer + vBase);
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            acc[d] = (acc[d] * alpha) + (beta * float4(vVec[d]));
+        }
+    }
+
+    uint32_t partIdx = (qHeadIdx * gridDim.y) + chunkIdx;
+    partialM[partIdx] = m;
+    partialL[partIdx] = l;
+    device float4* accOut = (device float4*)(partialAcc + (((uint64_t)partIdx * headDim)));
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        accOut[d] = acc[d];
+    }
+}
+
+/// MSL Kernel: Combine pass for the chunked GQA decode — merges per-chunk online-softmax
+/// partials (log-sum-exp merge), applies the per-head sigmoid gate, writes attnOut.
+/// Grid: (numQHeads) x 1 thread each; each thread merges its head's full chunk list.
+kernel void gqa_attention_decode_headgate_f16_chunked_combine(
+    device const float* partialM [[buffer(0)]],
+    device const float* partialL [[buffer(1)]],
+    device const float* partialAcc [[buffer(2)]],
+    device float* attnOutBuffer [[buffer(3)]],
+    device const float* gateVector [[buffer(4)]],
+    constant uint32_t& numChunks [[buffer(5)]],
+    constant uint32_t& numQHeads [[buffer(6)]],
+    constant uint32_t& headDim [[buffer(7)]],
+    uint pos [[thread_position_in_grid]]
+) {
+    uint qHeadIdx = pos;
+    if (qHeadIdx >= numQHeads) return;
+
+    float M = -1e20f;
+    for (uint32_t c = 0; c < numChunks; c++) {
+        float m = partialM[(qHeadIdx * numChunks) + c];
+        if (m > M) M = m;
+    }
+
+    float4 acc[64];
+    uint32_t headDimVec = headDim / 4;
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        acc[d] = float4(0.0f);
+    }
+    float L = 0.0f;
+    for (uint32_t c = 0; c < numChunks; c++) {
+        uint32_t partIdx = (qHeadIdx * numChunks) + c;
+        float w = (partialL[partIdx] > 0.0f) ? exp(partialM[partIdx] - M) : 0.0f;
+        L += partialL[partIdx] * w;
+        device const float4* accIn = (device const float4*)(partialAcc + (((uint64_t)partIdx * headDim)));
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            acc[d] += accIn[d] * w;
+        }
+    }
+
+    float invL = (L > 0.0f) ? (1.0f / L) : 0.0f;
+    float gateLogit = gateVector[qHeadIdx];
+    float sigGate = 1.0f / (1.0f + exp(-gateLogit));
+    device float4* outVec = (device float4*)(attnOutBuffer + (qHeadIdx * headDim));
+
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        outVec[d] = acc[d] * invL * sigGate;
+    }
+}
+
+/// MSL Kernel: Chunked GQA decode with FUSED Q+Gate vector (FP16 KV). Flash-decoding
+/// split-K variant of gqa_attention_decode_fused_f16: grid (numQHeads, numChunks),
+/// each thread computes an online-softmax partial over its KV chunk and writes
+/// (m, l, acc) partials. The combine kernel merges partials and applies the
+/// elementwise sigmoid gate from the fused Q+Gate layout.
+kernel void gqa_attention_decode_fused_f16_chunked(
+    device const float* qGateVector [[buffer(0)]], // [numQHeads * (headDim*2)] = Q|Gate per head
+    device const half* kCacheBuffer [[buffer(1)]],
+    device const half* vCacheBuffer [[buffer(2)]],
+    device float* partialM [[buffer(3)]],
+    device float* partialL [[buffer(4)]],
+    device float* partialAcc [[buffer(5)]],
+    constant uint32_t& seqLen [[buffer(6)]],
+    constant uint32_t& numQHeads [[buffer(7)]],
+    constant uint32_t& numKvHeads [[buffer(8)]],
+    constant uint32_t& headDim [[buffer(9)]],
+    constant uint32_t& chunkSize [[buffer(10)]],
+    uint2 pos [[thread_position_in_grid]],
+    uint2 gridDim [[threadgroups_per_grid]]
+) {
+    uint qHeadIdx = pos.x;
+    uint chunkIdx = pos.y;
+    if (qHeadIdx >= numQHeads) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+
+    uint32_t qStride = headDim * 2;
+    uint32_t qHeadBase = (qHeadIdx * qStride);
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    float4 acc[64];
+    uint32_t headDimVec = headDim / 4;
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        acc[d] = float4(0.0f);
+    }
+
+    float m = -1e20f;
+    float l = 0.0f;
+
+    device const float4* qHeadVec = (device const float4*)(qGateVector + qHeadBase);
+    uint32_t currentSeqLen = (seqLen == 0) ? 1 : ((seqLen & 0x80000000) ? ((seqLen & 0x7FFFFFFF) + 1) : seqLen);
+
+    uint32_t chunkStart = chunkIdx * chunkSize;
+    uint32_t chunkEnd = min(chunkStart + chunkSize, currentSeqLen);
+
+    for (uint32_t tau = chunkStart; tau < chunkEnd; tau++) {
+        uint32_t kBase = (tau * kvStride) + kvHeadBase;
+        device const half4* kVec = (device const half4*)(kCacheBuffer + kBase);
+
+        float dot_val = 0.0f;
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            dot_val += dot(qHeadVec[d], float4(kVec[d]));
+        }
+        float score = dot_val * invSqrtHeadDim;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+
+        l = (l * alpha) + beta;
+
+        uint32_t vBase = (tau * kvStride) + kvHeadBase;
+        device const half4* vVec = (device const half4*)(vCacheBuffer + vBase);
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            acc[d] = (acc[d] * alpha) + (beta * float4(vVec[d]));
+        }
+    }
+
+    uint32_t partIdx = (qHeadIdx * gridDim.y) + chunkIdx;
+    partialM[partIdx] = m;
+    partialL[partIdx] = l;
+    device float4* accOut = (device float4*)(partialAcc + (((uint64_t)partIdx * headDim)));
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        accOut[d] = acc[d];
+    }
+}
+
+/// MSL Kernel: Combine pass for the chunked fused-Q+Gate GQA decode. Grid:
+/// (numQHeads) x 1 thread. Merges per-chunk partials (log-sum-exp merge), applies the
+/// elementwise sigmoid gate from the fused layout, writes attnOut.
+kernel void gqa_attention_decode_fused_f16_chunked_combine(
+    device const float* partialM [[buffer(0)]],
+    device const float* partialL [[buffer(1)]],
+    device const float* partialAcc [[buffer(2)]],
+    device float* attnOutBuffer [[buffer(3)]],
+    device const float* qGateVector [[buffer(4)]],
+    constant uint32_t& numChunks [[buffer(5)]],
+    constant uint32_t& numQHeads [[buffer(6)]],
+    constant uint32_t& headDim [[buffer(7)]],
+    uint pos [[thread_position_in_grid]]
+) {
+    uint qHeadIdx = pos;
+    if (qHeadIdx >= numQHeads) return;
+
+    uint32_t qStride = headDim * 2;
+    uint32_t gateBase = (qHeadIdx * qStride) + headDim;
+
+    float M = -1e20f;
+    for (uint32_t c = 0; c < numChunks; c++) {
+        float m = partialM[(qHeadIdx * numChunks) + c];
+        if (m > M) M = m;
+    }
+
+    float4 acc[64];
+    uint32_t headDimVec = headDim / 4;
+    for (uint32_t d = 0; d < headDimVec; d++) {
+        acc[d] = float4(0.0f);
+    }
+    float L = 0.0f;
+    for (uint32_t c = 0; c < numChunks; c++) {
+        uint32_t partIdx = (qHeadIdx * numChunks) + c;
+        float w = (partialL[partIdx] > 0.0f) ? exp(partialM[partIdx] - M) : 0.0f;
+        L += partialL[partIdx] * w;
+        device const float4* accIn = (device const float4*)(partialAcc + (((uint64_t)partIdx * headDim)));
+        for (uint32_t d = 0; d < headDimVec; d++) {
+            acc[d] += accIn[d] * w;
+        }
+    }
+
+    float invL = (L > 0.0f) ? (1.0f / L) : 0.0f;
+    device float4* outVec = (device float4*)(attnOutBuffer + (qHeadIdx * headDim));
+
+    for (uint32_t d = 0; d < headDim; d++) {
+        uint32_t vecIdx = d / 4;
+        uint32_t compIdx = d % 4;
+        float ctx = acc[vecIdx][compIdx] * invL;
+        float g = qGateVector[gateBase + d];
+        float sig_g = 1.0f / (1.0f + exp(-g));
+        if (d % 4 == compIdx) {
+            outVec[vecIdx][compIdx] = ctx * sig_g;
+        }
+    }
+}

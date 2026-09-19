@@ -469,6 +469,101 @@ Added instrumentation for the next round:
 
 ---
 
+## FIX #4a SHIPPED: chunked (flash-decoding style) GQA attention
+
+QA #6 diagnostics nailed the long-context whale: the 10 full-attention layers
+cost **23 ms each at ~1,000 tokens of context → 41-52 ms each at ~1,700
+tokens** (GDN layers stay ~1.25 ms) — the one-thread-per-head kernel is
+latency-bound with ~zero GPU occupancy. Separately, end-of-session logs showed
+system-wide inflation (IO 124→1,012 ms, MoE 39→102-149 ms, Other 27→150-187 ms)
+— memory-pressure/swap fighting the pinned backbone + KV + UI; separate
+mitigation, see next section.
+
+**Shipped: `gqa_attention_decode_headgate_f16_chunked` + combine kernel.**
+Flash-decoding split-K: grid `(numQHeads, numChunks)` with ~64 keys per chunk;
+each thread computes an online-softmax partial (m, l, acc) for its chunk; a
+combine kernel log-sum-exp-merges the partials and applies the per-head sigmoid
+gate. Scratch: heads × ≤256 chunks × (2 + headDim) floats (~4.2 MB max). Wired
+into the `.fp16` KV gated path with a fallback to the original kernel.
+
+**Verification (T17 in the bench, synthetic FP16 KV, 16 Q-heads / 2 KV-heads /
+256 dim):** outputs match the original kernel to max rel diff ~4e-3 (FP
+reduction-order noise), and the timing at decode-relevant contexts:
+
+| Context | Original (1 thread/head) | Chunked | Speedup |
+|---|---|---|---|
+| 1,000 | 23.0 ms | 2.9 ms | 7.9× |
+| 2,000 | 45.7 ms | 4.8 ms | 9.6× |
+| 4,000 | 91.2 ms | 13.5 ms | 6.8× |
+| 8,000 | 182.1 ms | 27.2 ms | 6.7× |
+
+Expected live impact at ~2,000-token context: RouterGPU drops from ~484 ms
+toward **~270-280 ms** (attention 45→5 ms × 10 layers), and long responses stop
+degrading linearly. Combined with the fused MoE path (shipped) the fixed GPU
+cost per token is now ~40-60 ms of attention + ~29 ms MoE.
+
+Remaining known items: the end-of-session memory-pressure inflation (IO/Other
+spikes at 1,600+ tokens — likely the 4.5 GB pinned backbone + KV + UI working
+set saturating 16 GB RAM), and the O(context) repetition-penalty scan in
+sampling (the Other bucket growth).
+
+---
+
+## QA #7 + DISPATCH-SITE FIX (shipped)
+
+QA #7 (~1,100-token response): gqa layers still at ~26 ms — the chunked
+attention was wired into the WRONG dispatch site. The edit had landed in
+`runLayerWisePrefill`'s batched-attention branch (single-token kernel operating
+on multi-token batched buffers — both ineffective and a correctness hazard),
+while the decode site (`runTokenForward`, fp16 KV) kept the original kernel.
+
+Fixed: the chunked block is removed from the prefill branch (original batched
+dispatch restored) and inserted at the decode site as the first branch of the
+fp16 gated path with a fall-through to the original headgate kernel. The
+prefill path must NOT use the chunked kernel: it is single-token decode-only
+(q/k/v/out offsets assume tokenIdx=0).
+
+Also identified from QA #7 logs: token 1087's hit rate dropped to 13% with
+IO back to ~245 ms — the temporal predictor degrades when the model's output
+is fully novel (the joke's creative punchline region); the 2-token history
+plus markov fill covers ~30-65% of traffic. The prefetch wait remains bounded.
+
+---
+
+## QA #8 + THE ACTUAL PATH FIX (shipped)
+
+QA #8 (fresh prompt, user confirms FP16 KV): gqa layers STILL ~23 ms —
+the chunked dispatch was wired to the HEADGATE branch, but **Ornith-class
+models have no `self_attn.g_proj` tensor** (verified in model_weights.json),
+so `attnGateProjTensor == nil` and decode actually falls through to the
+**fused Q+Gate fallback** (`gqaDecodeF16Pipeline` /
+`gqa_attention_decode_fused_f16`): per head, a fused vector of Q[256] +
+Gate[256] with an elementwise sigmoid gate — also one-thread-per-head.
+
+**Shipped: `gqa_attention_decode_fused_f16_chunked` + combine.** Mirrors the
+fused path exactly: partial kernel reads the fused Q vector and writes
+(m, l, acc) partials; combine log-sum-exp-merges and applies the elementwise
+sigmoid gate from the fused layout. Wired as the first branch of the
+`gqaDecodeF16 ?? gqaDecode` fallback with fall-through.
+
+**Verification (T17b, fused Q+Gate synthetic, FP16 KV):**
+
+| Context | Original | Chunked | Speedup | max rel diff |
+|---|---|---|---|---|
+| 1,000 | 23.5 ms | 2.8 ms | 8.4× | 3.1e-3 |
+| 2,000 | 46.9 ms | 4.9 ms | 9.6× | 2.6e-3 |
+| 4,000 | 92.8 ms | 14.1 ms | 6.6× | 1.3e-3 |
+| 8,000 | 184.9 ms | 27.1 ms | 6.8× | 5.2e-4 |
+
+Also observed in QA #8: a fresh long session ran with IO at ~500 ms/token
+(expert reads 13-15 ms/layer, prefetch 8-25%) — the memory-pressure signature
+appearing EARLY now; the SSD itself delivering ~1-1.4 GB/s on expert reads vs
+~4 GB/s in earlier sessions. Likely causes: swap/compressor traffic from the
+4.19 GB pinned backbone + KV cache + UI working set, or page-cache eviction by
+the app's own allocations. Investigation queued separately.
+
+---
+
 ## GATE WARMUP FIX (post-QA #3, SHIPPED)
 
 Live-app QA #3: output correct, but `[DIAG]` showed the prefetcher disabled

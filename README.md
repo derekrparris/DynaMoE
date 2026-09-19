@@ -292,6 +292,7 @@ DynaMoE/
 
 ### Phase 7: Odds & Ends ⏳ *(In Progress)*
 - [x] Add auto-update capability (Sparkle)
+- [x] MoE streaming bottleneck resolution (speed increase of over 500% compared to previous streaming speed)
 - [ ] Support for Ornith 1.5 vision capabilities
 - [ ] Support Apple Foundation Models
 - [ ] Use Apple Foundation Model (AFM) to compact conversations

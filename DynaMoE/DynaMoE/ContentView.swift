@@ -3624,6 +3624,10 @@ struct ContentView: View {
         let gqaStandardFP8Pipeline: MTLComputePipelineState?
         let gqaHeadGatePipeline: MTLComputePipelineState?
         let gqaHeadGateF16Pipeline: MTLComputePipelineState?
+        let gqaHeadGateF16ChunkedPipeline: MTLComputePipelineState?
+        let gqaHeadGateF16ChunkedCombinePipeline: MTLComputePipelineState?
+        let gqaFusedF16ChunkedPipeline: MTLComputePipelineState?
+        let gqaFusedF16ChunkedCombinePipeline: MTLComputePipelineState?
         let gqaHeadGateFP8Pipeline: MTLComputePipelineState?
         let bf16GeluGateUpPipeline: MTLComputePipelineState?
         let bf16GeluGateUpSimdPipeline: MTLComputePipelineState?
@@ -3698,6 +3702,22 @@ struct ContentView: View {
             if let gqaHeadGateF16Func = defaultLibrary.makeFunction(name: "gqa_attention_decode_headgate_f16") {
                 gqaHeadGateF16Pipeline = try device.makeComputePipelineState(function: gqaHeadGateF16Func)
             } else { gqaHeadGateF16Pipeline = nil }
+
+            if let gqaHeadGateF16ChunkedFunc = defaultLibrary.makeFunction(name: "gqa_attention_decode_headgate_f16_chunked") {
+                gqaHeadGateF16ChunkedPipeline = try device.makeComputePipelineState(function: gqaHeadGateF16ChunkedFunc)
+            } else { gqaHeadGateF16ChunkedPipeline = nil }
+
+            if let gqaHeadGateF16ChunkedCombineFunc = defaultLibrary.makeFunction(name: "gqa_attention_decode_headgate_f16_chunked_combine") {
+                gqaHeadGateF16ChunkedCombinePipeline = try device.makeComputePipelineState(function: gqaHeadGateF16ChunkedCombineFunc)
+            } else { gqaHeadGateF16ChunkedCombinePipeline = nil }
+
+            if let gqaFusedF16ChunkedFunc = defaultLibrary.makeFunction(name: "gqa_attention_decode_fused_f16_chunked") {
+                gqaFusedF16ChunkedPipeline = try device.makeComputePipelineState(function: gqaFusedF16ChunkedFunc)
+            } else { gqaFusedF16ChunkedPipeline = nil }
+
+            if let gqaFusedF16ChunkedCombineFunc = defaultLibrary.makeFunction(name: "gqa_attention_decode_fused_f16_chunked_combine") {
+                gqaFusedF16ChunkedCombinePipeline = try device.makeComputePipelineState(function: gqaFusedF16ChunkedCombineFunc)
+            } else { gqaFusedF16ChunkedCombinePipeline = nil }
 
             if let gqaHeadGateFP8Func = defaultLibrary.makeFunction(name: "gqa_attention_decode_headgate_fp8") {
                 gqaHeadGateFP8Pipeline = try device.makeComputePipelineState(function: gqaHeadGateFP8Func)
@@ -4185,6 +4205,9 @@ struct ContentView: View {
               let interBuffer = device.makeBuffer(length: max(Int(maxInterDim), 512) * max(1, Int(modelConfig?.effectiveNumExpertsPerTok ?? (numExperts >= 512 ? 10 : 8))) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let fusedSlotListBuffer = device.makeBuffer(length: 16 * MemoryLayout<UInt32>.stride, options: .storageModeShared),
               let fusedSlotWeightsBuffer = device.makeBuffer(length: 16 * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let attnPartialMBuffer = device.makeBuffer(length: 16 * 256 * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let attnPartialLBuffer = device.makeBuffer(length: 16 * 256 * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let attnPartialAccBuffer = device.makeBuffer(length: 16 * 256 * Int(headDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let expertStagingBuffer = device.makeBuffer(length: expertStagingSize, options: .storageModeShared),
               let expertStagingBufferB = device.makeBuffer(length: expertStagingSize, options: .storageModeShared),
               let hcStreamsBuffer = device.makeBuffer(length: max(4 * Int(hiddenDim), 10240) * MemoryLayout<Float>.stride, options: .storageModeShared),
@@ -5347,7 +5370,52 @@ struct ContentView: View {
                                         layerEnc1.dispatchThreads(MTLSize(width: Int(kvStride), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(kvStride), storePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                                     }
 
-                                    if layer.attnGateProjTensor != nil, let headGatePipe = gqaHeadGateF16Pipeline ?? gqaHeadGatePipeline {
+if layer.attnGateProjTensor != nil,
+                                       let chunkedPipe = gqaHeadGateF16ChunkedPipeline,
+                                       let chunkedCombinePipe = gqaHeadGateF16ChunkedCombinePipeline {
+                                        // Flash-decoding style: split the KV range across chunks so
+                                        // the attention runs on hundreds of threads instead of one
+                                        // thread per head (latency-bound at long contexts).
+                                        var windowSize: UInt32 = layer.isSlidingAttention ? UInt32(modelConfig?.effectiveSlidingWindow ?? 0) : 0
+                                        let curLen: UInt32 = (seqLen == 0) ? 1 : ((seqLen & 0x80000000) != 0 ? ((seqLen & 0x7FFFFFFF) + 1) : seqLen)
+                                        let winStart: UInt32 = (windowSize > 0 && curLen > windowSize) ? (curLen - windowSize) : 0
+                                        let spanLen = curLen - winStart
+                                        let numChunks: UInt32 = max(1, min(256, (spanLen + 63) / 64))
+                                        let chunkSize: UInt32 = (spanLen + numChunks - 1) / numChunks
+                                        var seqLenVal = seqLen
+                                        var nQv = nQ
+                                        var nKvv = nKv
+                                        var hDv = hD
+                                        var winVal = windowSize
+                                        var chunkVal = chunkSize
+                                        layerEnc1.setComputePipelineState(chunkedPipe)
+                                        layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                                        layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                        layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                        layerEnc1.setBuffer(attnPartialMBuffer, offset: 0, index: 3)
+                                        layerEnc1.setBuffer(attnPartialLBuffer, offset: 0, index: 4)
+                                        layerEnc1.setBuffer(attnPartialAccBuffer, offset: 0, index: 5)
+                                        layerEnc1.setBytes(&seqLenVal, length: MemoryLayout<UInt32>.stride, index: 6)
+                                        layerEnc1.setBytes(&nQv, length: MemoryLayout<UInt32>.stride, index: 7)
+                                        layerEnc1.setBytes(&nKvv, length: MemoryLayout<UInt32>.stride, index: 8)
+                                        layerEnc1.setBytes(&hDv, length: MemoryLayout<UInt32>.stride, index: 9)
+                                        layerEnc1.setBytes(&winVal, length: MemoryLayout<UInt32>.stride, index: 10)
+                                        layerEnc1.setBytes(&chunkVal, length: MemoryLayout<UInt32>.stride, index: 11)
+                                        layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: Int(numChunks), depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+                                        layerEnc1.memoryBarrier(scope: .buffers)
+
+                                        var numChunkVal = numChunks
+                                        layerEnc1.setComputePipelineState(chunkedCombinePipe)
+                                        layerEnc1.setBuffer(attnPartialMBuffer, offset: 0, index: 0)
+                                        layerEnc1.setBuffer(attnPartialLBuffer, offset: 0, index: 1)
+                                        layerEnc1.setBuffer(attnPartialAccBuffer, offset: 0, index: 2)
+                                        layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 3)
+                                        layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 4)
+                                        layerEnc1.setBytes(&numChunkVal, length: MemoryLayout<UInt32>.stride, index: 5)
+                                        layerEnc1.setBytes(&nQv, length: MemoryLayout<UInt32>.stride, index: 6)
+                                        layerEnc1.setBytes(&hDv, length: MemoryLayout<UInt32>.stride, index: 7)
+                                        layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+                                    } else if layer.attnGateProjTensor != nil, let headGatePipe = gqaHeadGateF16Pipeline ?? gqaHeadGatePipeline {
                                         // Spark 2.5: per-head sigmoid output gate + optional sliding window
                                         var windowSize: UInt32 = layer.isSlidingAttention ? UInt32(modelConfig?.effectiveSlidingWindow ?? 0) : 0
                                         layerEnc1.setComputePipelineState(headGatePipe)
@@ -5374,16 +5442,57 @@ struct ContentView: View {
                                         layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 7)
                                         layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), gqaStdPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                                     } else if let gqaPipe = gqaDecodeF16Pipeline ?? gqaDecodePipeline {
-                                        layerEnc1.setComputePipelineState(gqaPipe)
-                                        layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
-                                        layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
-                                        layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
-                                        layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 3)
-                                        layerEnc1.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 4)
-                                        layerEnc1.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 5)
-                                        layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 6)
-                                        layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 7)
-                                        layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), gqaPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                        if let chunkedPipe = gqaFusedF16ChunkedPipeline,
+                                           let chunkedCombinePipe = gqaFusedF16ChunkedCombinePipeline {
+                                            // Flash-decoding split-K for the fused Q+Gate path — the
+                                            // branch Ornith-class models actually take (no g_proj tensor).
+                                            var chunkedWin: UInt32 = 0
+                                            let curLen: UInt32 = (seqLen == 0) ? 1 : ((seqLen & 0x80000000) != 0 ? ((seqLen & 0x7FFFFFFF) + 1) : seqLen)
+                                            let numChunks: UInt32 = max(1, min(256, (curLen + 63) / 64))
+                                            let chunkSize: UInt32 = (curLen + numChunks - 1) / numChunks
+                                            var seqLenVal = seqLen
+                                            var nQv = nQ
+                                            var nKvv = nKv
+                                            var hDv = hD
+                                            var chunkVal = chunkSize
+                                            layerEnc1.setComputePipelineState(chunkedPipe)
+                                            layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                                            layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                            layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                            layerEnc1.setBuffer(attnPartialMBuffer, offset: 0, index: 3)
+                                            layerEnc1.setBuffer(attnPartialLBuffer, offset: 0, index: 4)
+                                            layerEnc1.setBuffer(attnPartialAccBuffer, offset: 0, index: 5)
+                                            layerEnc1.setBytes(&seqLenVal, length: MemoryLayout<UInt32>.stride, index: 6)
+                                            layerEnc1.setBytes(&nQv, length: MemoryLayout<UInt32>.stride, index: 7)
+                                            layerEnc1.setBytes(&nKvv, length: MemoryLayout<UInt32>.stride, index: 8)
+                                            layerEnc1.setBytes(&hDv, length: MemoryLayout<UInt32>.stride, index: 9)
+                                            layerEnc1.setBytes(&chunkVal, length: MemoryLayout<UInt32>.stride, index: 10)
+                                            layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: Int(numChunks), depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+                                            layerEnc1.memoryBarrier(scope: .buffers)
+
+                                            var numChunkVal = numChunks
+                                            layerEnc1.setComputePipelineState(chunkedCombinePipe)
+                                            layerEnc1.setBuffer(attnPartialMBuffer, offset: 0, index: 0)
+                                            layerEnc1.setBuffer(attnPartialLBuffer, offset: 0, index: 1)
+                                            layerEnc1.setBuffer(attnPartialAccBuffer, offset: 0, index: 2)
+                                            layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 3)
+                                            layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 4)
+                                            layerEnc1.setBytes(&numChunkVal, length: MemoryLayout<UInt32>.stride, index: 5)
+                                            layerEnc1.setBytes(&nQv, length: MemoryLayout<UInt32>.stride, index: 6)
+                                            layerEnc1.setBytes(&hDv, length: MemoryLayout<UInt32>.stride, index: 7)
+                                            layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+                                        } else {
+                                            layerEnc1.setComputePipelineState(gqaPipe)
+                                            layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                                            layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                            layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                            layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 3)
+                                            layerEnc1.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 4)
+                                            layerEnc1.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 5)
+                                            layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 6)
+                                            layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 7)
+                                            layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), gqaPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                        }
                                     }
 
                                 case .fp8:
