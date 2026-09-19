@@ -580,3 +580,81 @@ Fix: gate judgement (and observation accumulation) now requires
 Token 0's legitimate cold-start 0% can no longer latch the gate; from token 2
 onward the accumulated rate reflects real prediction quality, and the gate
 only latches off on genuine evidence of a unpredictable-routing workload.
+
+---
+
+## FIX #5: PREFILL EXPERT-READ PIPELINING (TTFT, SHIPPED)
+
+**Problem.** TTFT on a fresh chat was ~14-15s. Prefill (`runLayerWisePrefill`)
+Phase B was fully serialized per layer: `ExpertIOThreadPool.dispatchSync`
+reads ALL active experts (up to 256 x 3.15 MB = ~806 MB/layer) -> encode MoE
+cmd -> commit -> `waitUntilCompleted`. IO and GPU never overlapped: total
+prefill time ~= sum(IO) + sum(GPU). With ~32 GB streamed (256 experts x 40
+layers) at ~4-5.6 GB/s parallel pread (~6.4s) plus ~4-6s of GPU MoE/attention
+and 80 sync points, the two never overlapped.
+
+**Why prediction works here.** Router output for layer l+1 is not known until
+layer l's MoE completes (it needs `nextHBuf`), so exact next-layer sets are
+impossible — but temporal prediction is: layer l's active set predicts layer
+l+1's. For P >= ~64 prompt tokens nearly every expert is active on every layer
+(8 draws/token; coupon collector saturates 256 experts at ~200 tokens), so
+overlap between adjacent layers is near-perfect and the predicted set IS the
+read set. For small P (delta prefill of a short follow-up), overlap is partial
+and misses are read synchronously — still no worse than today.
+
+**Shipped design (packed-expert path only):**
+- Double staging buffers `prefillStagingBufferA/B` (each the same size as the
+  old single buffer: min(P*topK, numExperts) * expert_size). `prefillStagingBuffer`
+  is now a var rebound per layer; all existing kernel binding sites unchanged.
+- Per MoE layer (packed branch):
+  1. Drain stale kicks targeting earlier layers (dense-layer skips) by waiting
+     their semaphores — guarantees buffers are quiescent before reuse.
+  2. If a speculative kick exists for this layer (`prefetchedFor[l]`): wait its
+     semaphore, adopt its slot map as hits, read only the misses synchronously
+     into slots after the predicted ones. Otherwise read all (as before) into
+     the buffer NOT used by the last MoE GPU command.
+  3. Encode + `commit()` the MoE command, then — while the GPU runs — kick an
+     async pread of layer l+1's predicted set (this layer's active set, sorted,
+     into slots 0..K-1) into the OTHER staging buffer via the new
+     `ExpertIOThreadPool.dispatchAsync(tasks:done:)` (serial kick queue, one
+     in-flight kick per parity; completion signals a DispatchSemaphore).
+  4. `waitUntilCompleted()`.
+- `defer` drains any unconsumed kicks before function exit (cancellation and
+  error paths) so no in-flight pread writes into freed buffers.
+- Toggle: `dynamoe_prefill_pipeline` UserDefaults (default ON). When OFF no
+  kicks are issued and behavior matches the old sync path.
+- Telemetry: per-layer `[PREFILL-DIAG] Layer l: act= hits= miss= ioWait=` and
+  an end-of-prefill `[PREFILL-DIAG] Summary: ioWait= gpuWait= hitRate=
+  prefillTotal=` line.
+
+**Expected effect.** Per-layer cost becomes max(IO_window, GPU_window) instead
+of IO + GPU. Estimated TTFT ~14-15s -> ~8-10s (IO-bound floor ~6.4s + Phase A +
+non-overlappable head/tail). Decode path unaffected.
+
+### QA #10 — Fix #5 live results (continued session, delta prefill)
+
+Per-layer: L0 cold (act=245, ioWait=191.9ms); L1-39 act=157-238, hits 55-90%,
+ioWait 10-45ms (~4-6 GB/s on miss reads). Pipeline works.
+
+| Block | Time |
+|---|---|
+| ioWait (expert streaming) | 1.48s (was ~6s serialized) |
+| gpuWait (prefill MoE cmds) | 3.62s (~90ms/layer) |
+| Unaccounted (Phase A: batched attention over ~12k ctx, 30 GDN layers' sequential recurrence, per-token dispatch loops, embed, tail) | ~7.0s |
+| **prefillTotal** | **12.11s** |
+
+TTFT 14.2 -> 12.81s on this turn. Remaining whales, biggest first:
+1. **Phase A ~7s** — unmeasured until now. Suspects: GDN per-token sequential
+   recurrence (P tokens x 30 layers of per-token kernels), per-token
+   shared-gate/routing dispatch loops (Q8 path dispatches P kernels per layer),
+   batched attention over long context. Added `PhaseA=` timing to the per-layer
+   line + `other=` to the summary to split it on the next run.
+2. **MoE gpuWait 3.62s** — prefill uses the per-expert batched kernels
+   (~2 dispatches + barrier per expert per layer = ~19k dispatches). A fused
+   slot-list kernel (like decode's fused path) could cut dispatch overhead,
+   but measured ~90 GFLOP/s suggests poor per-expert threadgroup shapes
+   (count=1-3 tokens/expert) dominate — needs a batched-over-tokens rewrite,
+   not just dispatch fusion.
+3. Decode-side memory-pressure spikes (QA #9 token 1146: IO 504ms, prefetch
+   12%, per-layer IO 12-16ms vs 2-6ms baseline) — swap/compressor stealing
+   SSD bandwidth; separate lane.

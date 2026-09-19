@@ -67,6 +67,27 @@ public final class ExpertIOThreadPool {
         tasks = dispatchSync(tasks: tasks)
     }
 
+    private let asyncQueue = DispatchQueue(label: "dynamoe.expertio.async", qos: .userInitiated)
+
+    /// Asynchronously dispatches pread tasks on a background queue and signals
+    /// `done` exactly once after ALL tasks have completed (or immediately if empty).
+    /// Callers poll the semaphore to consume a speculative prefetch kick without
+    /// ever blocking the GPU submission path.
+    public func dispatchAsync(tasks: [ExpertPreadTask], done: DispatchSemaphore? = nil) {
+        guard !tasks.isEmpty else {
+            done?.signal()
+            return
+        }
+        asyncQueue.async { [weak self] in
+            guard let self else {
+                done?.signal()
+                return
+            }
+            _ = self.dispatchSync(tasks: tasks)
+            done?.signal()
+        }
+    }
+
     /// Streams an entire file into a pre-allocated anonymous buffer (typically a
     /// device.makeBuffer(length:options:.storageModeShared)) using an N-way parallel
     /// POSIX pread across disjoint byte ranges. Used to pin invariant weights

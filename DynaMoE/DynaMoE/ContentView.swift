@@ -6983,9 +6983,26 @@ if layer.attnGateProjTensor != nil,
                       let denseActiveWeightsBuffer = device.makeBuffer(length: max(P, 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
                       let expertActiveTokensBuffer = device.makeBuffer(length: max(P * topKCount, 64) * MemoryLayout<UInt32>.stride, options: .storageModeShared),
                       let expertActiveWeightsBuffer = device.makeBuffer(length: max(P * topKCount, 64) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let prefillStagingBuffer = device.makeBuffer(length: max(min(max(P * topKCount, 64), numExperts > 0 ? Int(numExperts) : 512) * Int(loadedLayout?.expert_size ?? 3151872), 64), options: .storageModeShared) else {
+                      let prefillStagingBufferA = device.makeBuffer(length: max(min(max(P * topKCount, 64), numExperts > 0 ? Int(numExperts) : 512) * Int(loadedLayout?.expert_size ?? 3151872), 64), options: .storageModeShared),
+                      let prefillStagingBufferB = device.makeBuffer(length: max(min(max(P * topKCount, 64), numExperts > 0 ? Int(numExperts) : 512) * Int(loadedLayout?.expert_size ?? 3151872), 64), options: .storageModeShared) else {
                     return false
                 }
+                // FIX #5: double-buffered expert staging — layer l's MoE GPU reads one
+                // buffer while layer l+1's speculative preads fill the other.
+                var prefillStagingBuffer = prefillStagingBufferA
+                var lastMoeStageIsA = false
+                let prefillPipelineEnabled = UserDefaults.standard.object(forKey: "dynamoe_prefill_pipeline") as? Bool ?? true
+                // In-flight speculative kick state, keyed by the target layer index.
+                var prefetchedFor: [Int: (buf: MTLBuffer, slotMap: [Int: Int], slotBase: Int, sem: DispatchSemaphore)] = [:]
+                defer {
+                    for (_, pf) in prefetchedFor { pf.sem.wait() }
+                }
+                var prefillDiagIoMs = 0.0
+                var prefillDiagGpuMs = 0.0
+                var prefillDiagPhaseAMs = 0.0
+                var prefillDiagLayers = 0
+                var prefillDiagHits = 0
+                var prefillDiagTotal = 0
 
                 let denseTokPtr = denseActiveTokensBuffer.contents().bindMemory(to: UInt32.self, capacity: P)
                 for i in 0..<P { denseTokPtr[i] = UInt32(i) }
@@ -8109,7 +8126,11 @@ if layer.attnGateProjTensor != nil,
 
                         layerEnc1.endEncoding()
                         activeCmd.commit()
+                        let tPhaseAStart = CFAbsoluteTimeGetCurrent()
                         activeCmd.waitUntilCompleted()
+                        let phaseAMs = (CFAbsoluteTimeGetCurrent() - tPhaseAStart) * 1000.0
+                        prefillDiagPhaseAMs += phaseAMs
+                        prefillDiagLayers += 1
                         if let actErr = activeCmd.error {
                             print("❌ [METAL ERROR] prefill layer activeCmd aborted: \(actErr)")
                             return false
@@ -8170,16 +8191,55 @@ if layer.attnGateProjTensor != nil,
                                 let numActive = uniqueActiveExpIds.count
 
                                 if numActive > 0 {
+                                    // FIX #5: consume the speculative kick that filled this
+                                    // layer's predicted experts during the previous layer's
+                                    // GPU window, then synchronously read only the misses.
+                                    let tIoStart = CFAbsoluteTimeGetCurrent()
+                                    var expSlotMap: [Int: Int] = [:]
+                                    var nextSlot = 0
+                                    var predHits = 0
+                                    // FIX #5: drain any stale kicks aimed at earlier layers
+                                    // (e.g. skipped dense layers) so their staging buffers
+                                    // are quiescent before reuse.
+                                    for (idx, stale) in prefetchedFor where idx < l {
+                                        stale.sem.wait()
+                                        prefetchedFor[idx] = nil
+                                    }
+                                    if prefillPipelineEnabled, let pf = prefetchedFor[l] {
+                                        pf.sem.wait()
+                                        prefetchedFor[l] = nil
+                                        for expId in uniqueActiveExpIds {
+                                            if let slot = pf.slotMap[expId] {
+                                                expSlotMap[expId] = slot
+                                                predHits += 1
+                                            }
+                                        }
+                                        nextSlot = pf.slotBase
+                                        prefillStagingBuffer = pf.buf
+                                        lastMoeStageIsA = (pf.buf === prefillStagingBufferA)
+                                    } else {
+                                        // No speculative data landed for this layer: read into
+                                        // the buffer NOT used by the last MoE GPU command.
+                                        prefillStagingBuffer = lastMoeStageIsA ? prefillStagingBufferB : prefillStagingBufferA
+                                        lastMoeStageIsA = !lastMoeStageIsA
+                                    }
                                     var tasks: [ExpertPreadTask] = []
                                     let rawStagingPtr = prefillStagingBuffer.contents()
-                                    var expSlotMap: [Int: Int] = [:]
-                                    for (slot, expId) in uniqueActiveExpIds.enumerated() {
-                                        expSlotMap[expId] = slot
+                                    for expId in uniqueActiveExpIds where expSlotMap[expId] == nil {
+                                        expSlotMap[expId] = nextSlot
                                         let offset = off_t(expId * expertSize)
-                                        let dst = rawStagingPtr.advanced(by: slot * expertSize)
+                                        let dst = rawStagingPtr.advanced(by: nextSlot * expertSize)
                                         tasks.append(ExpertPreadTask(fd: fd, dst: dst, offset: offset, size: expertSize))
+                                        nextSlot += 1
                                     }
-                                    ExpertIOThreadPool.shared.dispatchSync(tasks: &tasks)
+                                    if !tasks.isEmpty {
+                                        ExpertIOThreadPool.shared.dispatchSync(tasks: &tasks)
+                                    }
+                                    let ioWaitMs = (CFAbsoluteTimeGetCurrent() - tIoStart) * 1000.0
+                                    prefillDiagIoMs += ioWaitMs
+                                    prefillDiagHits += predHits
+                                    prefillDiagTotal += numActive
+                                    print("[PREFILL-DIAG] Layer \(l): act=\(numActive) hits=\(predHits) miss=\(numActive - predHits) PhaseA=\(String(format: "%.1f", phaseAMs))ms ioWait=\(String(format: "%.1f", ioWaitMs))ms")
 
                                     guard let moeCmd = commandQueue.makeCommandBuffer(),
                                           let layerEnc2 = moeCmd.makeComputeCommandEncoder() else {
@@ -8411,7 +8471,28 @@ if layer.attnGateProjTensor != nil,
 
                                     layerEnc2.endEncoding()
                                     moeCmd.commit()
+
+                                    // FIX #5: while this layer's MoE runs on the GPU, kick
+                                    // layer l+1's predicted expert reads (temporal prediction:
+                                    // this layer's active set) into the other staging buffer.
+                                    if prefillPipelineEnabled, l + 1 < actualLayers,
+                                       let nextFD = ExpertIOThreadPool.shared.getOrOpenLayerFD(layerIndex: l + 1, packedExpertsDir: packedDir) {
+                                        let targetBuf = lastMoeStageIsA ? prefillStagingBufferB : prefillStagingBufferA
+                                        let kickSem = DispatchSemaphore(value: 0)
+                                        var kickMap: [Int: Int] = [:]
+                                        var kickTasks: [ExpertPreadTask] = []
+                                        let targetPtr = targetBuf.contents()
+                                        for (slot, expId) in uniqueActiveExpIds.enumerated() {
+                                            kickMap[expId] = slot
+                                            kickTasks.append(ExpertPreadTask(fd: nextFD, dst: targetPtr.advanced(by: slot * expertSize), offset: off_t(expId * expertSize), size: expertSize))
+                                        }
+                                        prefetchedFor[l + 1] = (buf: targetBuf, slotMap: kickMap, slotBase: uniqueActiveExpIds.count, sem: kickSem)
+                                        ExpertIOThreadPool.shared.dispatchAsync(tasks: kickTasks, done: kickSem)
+                                    }
+
+                                    let tGpuStart = CFAbsoluteTimeGetCurrent()
                                     moeCmd.waitUntilCompleted()
+                                    prefillDiagGpuMs += (CFAbsoluteTimeGetCurrent() - tGpuStart) * 1000.0
                                     if let moeErr = moeCmd.error {
                                         print("❌ [METAL ERROR] prefill MoE cmd (speculative) aborted: \(moeErr)")
                                         return false
@@ -8808,6 +8889,11 @@ if layer.attnGateProjTensor != nil,
                         print("❌ [METAL ERROR] prefill copyCmd aborted: \(cpErr)")
                         return false
                     }
+                }
+
+                if prefillDiagTotal > 0 {
+                    let elapsed = max(0.001, CFAbsoluteTimeGetCurrent() - prefillStartTime)
+                    print("[PREFILL-DIAG] Summary: experts=\(prefillDiagTotal) layers=\(prefillDiagLayers) PhaseA=\(String(format: "%.2f", prefillDiagPhaseAMs))s ioWait=\(String(format: "%.2f", prefillDiagIoMs))s gpuWait=\(String(format: "%.2f", prefillDiagGpuMs))s other=\(String(format: "%.2f", max(0, elapsed - prefillDiagPhaseAMs / 1000.0 - prefillDiagIoMs / 1000.0 - prefillDiagGpuMs / 1000.0)))s hitRate=\(String(format: "%.0f", Double(prefillDiagHits) * 100.0 / Double(max(1, prefillDiagTotal))))% prefillTotal=\(String(format: "%.2f", elapsed))s")
                 }
 
                 return true
