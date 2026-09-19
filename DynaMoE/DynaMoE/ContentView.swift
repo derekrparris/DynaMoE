@@ -5420,7 +5420,11 @@ if layer.attnGateProjTensor != nil,
                                         layerEnc1.setBuffer(attnPartialLBuffer, offset: 0, index: 1)
                                         layerEnc1.setBuffer(attnPartialAccBuffer, offset: 0, index: 2)
                                         layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 3)
-                                        layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 4)
+                                        // Spark 2.5: the per-head sigmoid gate lives in the g_proj
+                                        // output (bVectorBuffer), NOT the fused QKV vector — the old
+                                        // headgate kernel binds bVectorBuffer here too. Binding
+                                        // qGateBuffer read Q values as gate logits (token soup).
+                                        layerEnc1.setBuffer(bVectorBuffer, offset: 0, index: 4)
                                         layerEnc1.setBytes(&numChunkVal, length: MemoryLayout<UInt32>.stride, index: 5)
                                         layerEnc1.setBytes(&nQv, length: MemoryLayout<UInt32>.stride, index: 6)
                                         layerEnc1.setBytes(&hDv, length: MemoryLayout<UInt32>.stride, index: 7)

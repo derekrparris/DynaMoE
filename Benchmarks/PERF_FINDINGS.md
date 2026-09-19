@@ -765,3 +765,30 @@ properly needs per-slot or per-kick-tail tracking, not bigger budgets.
 **Action: REVERTED all Fix #7 changes** (staging 32->16, budget cap 16->8,
 ordering simplification, boundary kick, pending dict, resident guard).
 Decode returns to the QA #10 state (~250-300ms tokens, 42-56% hits).
+
+---
+
+## HOTFIX: SPARK 2.5 TOKEN-SOUP REGRESSION (chunked headgate gate binding)
+
+**Symptom.** Spark X2.5-4B (dense DeepSeek-style: 36 layers = 27 sliding@512 +
+9 full, head_dim 256, 16 Q / 4 KV heads, headwise sigmoid output gate via a
+separate g_proj) produced multilingual token soup from the first thinking
+token after the chunked-attention commit (5ce99f2).
+
+**Root cause.** Decode's chunked headgate branch bound the combine kernel's
+gate input (buffer 4) to `qGateBuffer` (the fused QKV projection output) while
+the kernel reads `gateVector[qHeadIdx]` — a per-head scalar. Spark's real
+per-head gate logits live in `bVectorBuffer` (g_proj output, the same buffer
+the OLD headgate kernel binds). The combine therefore scaled every head by
+sigmoid(Q-vector bytes) — garbage gates, soup output. The fused Q+Gate chunked
+path (Ornith) was unaffected: its gate IS inside the fused vector.
+
+**Why T17 missed it.** The bench bound a dedicated synthetic gate buffer as
+buffer(4) for BOTH ref and chunked kernels — self-consistent, so equivalence
+held; it validated the KERNELS, not the app's argument binding.
+
+**Fix.** One line in the decode fp16 headgate chunked combine: bind
+`bVectorBuffer` (matching the non-chunked headgate branch). Rebuilt green.
+Lesson recorded: kernel-level bench equivalence does not cover wiring-level
+buffer mismatches; future chunk ports need an app-binding review or a bench
+that mirrors the app's exact buffer roles.
