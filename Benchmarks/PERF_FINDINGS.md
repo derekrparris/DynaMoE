@@ -409,6 +409,66 @@ reduction) are the next structural wins once IO is fully hidden.
 
 ---
 
+## FIX #3 SHIPPED: fused MoE expert kernels
+
+Long-context QA (#5, the 1,685-token "explain MoE" turn at 2.0 tok/s) showed a
+NEW dominant cost: **RouterGPU (Phase A attention/SSM + router) grew from
+~106 ms/token at short context to ~484 ms/token at ~1,900 tokens** — 72% of
+the token. Two causes identified:
+
+1. **GQA attention decode kernels dispatch one thread per query head**
+   (16 threads total, each serially looping the whole KV cache) — latency-bound
+   at long context, near-zero GPU occupancy. Affects the 10 full-attention
+   layers.
+2. UI/compositor contention from re-rendering the accumulating markdown view
+   every ~80 ms.
+
+Shipped in this round: **fused MoE expert kernels** (fix #3) — new
+`fp8_moe_gate_up_fused` + `fp8_moe_down_fused` MSL kernels in
+`ComputeShaders.metal`, dispatching all routed experts in **2 dispatches
+instead of 16 + barriers**. Design notes:
+
+- Grid `(intermediateDim, topK)` / `(hiddenDim, topK)`; the kernels walk an
+  explicit `slotList[rank] -> staging slot` mapping because the consume path
+  assigns slots in prediction-hit order, not router-rank order; weights are
+  rank-ordered (`fusedSlotWeightsBuffer`, filled at consume time).
+- `interBuffer` enlarged to topK × intermediateDim floats (dense per-rank
+  intermediate); safe for other paths (they use offset 0 only).
+- Applies to per-row-scaled FP8 layouts; block-scaled and Q4/BF16 keep the
+  existing per-expert path; automatic fallback when pipelines are missing.
+
+**Verification:** T16 in the bench runs both paths on identical staged data
+and routing — **max relative diff 0.00e+00 across all 2048 outputs** (byte
+equivalent). Bench timing: fused MoE GPU phase **0.72 ms/layer → ~29 ms/token**
+vs 1.14 ms/layer → ~46 ms/token per-expert (T4) — **~37% less GPU time on the
+MoE block**, and fewer dispatch/barrier round-trips to be preempted by the
+compositor.
+
+Next round: fix #4 (merge the per-layer command buffers to cut ~120 blocking
+GPU syncs/token — the direct lever on the RouterGPU scheduling-gap exposure),
+and a parallelized long-context GQA attention kernel (flash-decoding style
+split-K over the KV cache) for the 10 full-attention layers.
+
+---
+
+## QA #6 + DIAGNOSTICS (shipped)
+
+QA #6 (the joke turn, 112 tokens): **3.2 tok/s** end-to-end, tokens 316-367 ms.
+Fused-path MoE GPU measured ~39-40 ms (bench floor 29 ms + shared expert +
+dispatch overhead). Hit rate 30-47% on the short/novel response (weaker
+temporal locality than the long technical response's 65%) — the IO cost tracks
+the hit rate exactly as designed. MoEGPU ~39 ms.
+
+Added instrumentation for the next round:
+- `[DIAG] Layer N(gqa): PhaseA=X.XXms IO=...` — per-layer Phase-A time with a
+  marker on the 10 full-attention layers, to pinpoint whether the long-context
+  RouterGPU growth is attention-kernel time (gqa layers spike) or uniform
+  stretch (compositor/clock contention).
+- One-time `⚡ [MoE] fused expert path: ACTIVE|off (reason)` line per
+  generation, so the fused path's activation status is visible in logs.
+
+---
+
 ## GATE WARMUP FIX (post-QA #3, SHIPPED)
 
 Live-app QA #3: output correct, but `[DIAG]` showed the prefetcher disabled

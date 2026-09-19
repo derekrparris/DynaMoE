@@ -196,6 +196,7 @@ final class GPU {
                      "fp8_swiglu_gate_up_simd", "fp8_down_proj_accumulate_simd",
                      "bf16_swiglu_gate_up_simd", "bf16_down_proj_accumulate_simd",
                      "bf16_gemv_simd", "bench_fault_read", "bench_read_all",
+                     "fp8_moe_gate_up_fused", "fp8_moe_down_fused",
                      "bench_fp8_moe_gate_up_fused", "bench_fp8_moe_down_fused"] {
             if let f = lib.makeFunction(name: name) {
                 do {
@@ -1763,6 +1764,111 @@ func main() {
             }
         }
         print("   checked \(checks) consumed experts, mismatches: \(mismatches)")
+    }
+
+    // ============================ T16: fused MoE GPU equivalence ============================
+    // Runs the app's per-expert FP8 path and the new fused 2-dispatch path on identical
+    // staged data + routing, and compares the hMlp accumulators (tolerance for FP
+    // reduction-order noise).
+    print("--- T16: fused MoE kernels vs per-expert kernels (output equivalence) ---")
+    do {
+        guard let refGate = gpu.pipe("fp8_swiglu_gate_up_simd"),
+              let refDown = gpu.pipe("fp8_down_proj_accumulate_simd"),
+              let fusedGate = gpu.pipe("fp8_moe_gate_up_fused"),
+              let fusedDown = gpu.pipe("fp8_moe_down_fused") else {
+            print("   (kernels unavailable - skipped)")
+            return
+        }
+        guard let hA = gpu.device.makeBuffer(length: HIDDEN * 4, options: .storageModeShared),
+              let hB = gpu.device.makeBuffer(length: HIDDEN * 4, options: .storageModeShared),
+              let slotList = gpu.device.makeBuffer(length: 16 * 4, options: .storageModeShared),
+              let slotW = gpu.device.makeBuffer(length: 16 * 4, options: .storageModeShared) else { return }
+
+        func runPath(_ fused: Bool, _ hMlp: MTLBuffer) {
+            let cmd = gpu.queue.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            encodeClear(enc, gpu, hMlp, HIDDEN)
+            let ids = (0..<TOPK).map { _ in 0 }  // unused; staging slot = position
+            if fused {
+                let slPtr = slotList.contents().bindMemory(to: UInt32.self, capacity: TOPK)
+                let swPtr = slotW.contents().bindMemory(to: Float.self, capacity: TOPK)
+                for i in 0..<TOPK { slPtr[i] = UInt32(i); swPtr[i] = 0.125 }
+                var es: UInt64 = UInt64(gExpertSize)
+                var gs: UInt64 = UInt64(comp.gateS)
+                var uw: UInt64 = UInt64(comp.upW)
+                var us: UInt64 = UInt64(comp.upS)
+                var dw: UInt64 = UInt64(comp.downW)
+                var ds: UInt64 = UInt64(comp.downS)
+                var hDimVal: UInt32 = UInt32(HIDDEN)
+                var interDimVal: UInt32 = UInt32(INTER)
+                var topKVal: UInt32 = UInt32(TOPK)
+                enc.setComputePipelineState(fusedGate)
+                enc.setBuffer(stagingA, offset: 0, index: 0)
+                enc.setBuffer(xNorm, offset: 0, index: 1)
+                enc.setBuffer(inter, offset: 0, index: 2)
+                enc.setBuffer(slotList, offset: 0, index: 3)
+                enc.setBytes(&es, length: 8, index: 4)
+                enc.setBytes(&gs, length: 8, index: 5)
+                enc.setBytes(&uw, length: 8, index: 6)
+                enc.setBytes(&us, length: 8, index: 7)
+                enc.setBytes(&hDimVal, length: 4, index: 8)
+                enc.setBytes(&interDimVal, length: 4, index: 9)
+                enc.setBytes(&topKVal, length: 4, index: 10)
+                enc.dispatchThreadgroups(MTLSize(width: INTER, height: TOPK, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                enc.setComputePipelineState(fusedDown)
+                enc.setBuffer(stagingA, offset: 0, index: 0)
+                enc.setBuffer(inter, offset: 0, index: 1)
+                enc.setBuffer(hMlp, offset: 0, index: 2)
+                enc.setBuffer(slotW, offset: 0, index: 3)
+                enc.setBuffer(slotList, offset: 0, index: 4)
+                enc.setBytes(&es, length: 8, index: 5)
+                enc.setBytes(&dw, length: 8, index: 6)
+                enc.setBytes(&ds, length: 8, index: 7)
+                enc.setBytes(&interDimVal, length: 4, index: 8)
+                enc.setBytes(&hDimVal, length: 4, index: 9)
+                enc.setBytes(&topKVal, length: 4, index: 10)
+                enc.dispatchThreadgroups(MTLSize(width: HIDDEN, height: TOPK, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+            } else {
+                for slot in 0..<TOPK {
+                    encodeExpert(enc: enc, gpu: gpu, staging: stagingA, inter: inter, hMlp: hMlp, xNorm: xNorm,
+                                 slot: slot, expertSize: gExpertSize, comp: comp, weight: 0.125)
+                }
+            }
+            enc.endEncoding()
+            cmd.commit(); cmd.waitUntilCompleted()
+        }
+
+        // fill staging slots with pseudo-random FP8-ish data + xNorm
+        let sp = stagingA.contents().assumingMemoryBound(to: UInt8.self)
+        var xr: UInt32 = 0x9E3779B9
+        for i in 0..<TOPK * gExpertSize {
+            xr = xr &* 1664525 &+ 1013904223
+            sp[i] = UInt8(truncatingIfNeeded: xr >> 13)
+        }
+        let xp = xNorm.contents().bindMemory(to: Float.self, capacity: HIDDEN)
+        for i in 0..<HIDDEN {
+            xr = xr &* 1664525 &+ 1013904223
+            xNorm.contents().advanced(by: i * 4).storeBytes(of: Float((Int(xr >> 16) % 2000 - 1000)) / 1000.0, as: Float.self)
+        }
+
+        runPath(false, hA)
+        runPath(true, hB)
+
+        let pa = hA.contents().bindMemory(to: Float.self, capacity: HIDDEN)
+        let pb = hB.contents().bindMemory(to: Float.self, capacity: HIDDEN)
+        var maxRel = 0.0
+        var bad = 0
+        for i in 0..<HIDDEN {
+            let a = Double(pa[i]); let b = Double(pb[i])
+            let denom = max(abs(a), abs(b), 1.0)
+            let rel = abs(a - b) / denom
+            if rel > maxRel { maxRel = rel }
+            if rel > 1e-4 { bad += 1 }
+        }
+        print("   HIDDEN=\(HIDDEN) outputs compared, max rel diff \(String(format: "%.2e", maxRel)), >1e-4 count: \(bad)")
     }
 
     print("")

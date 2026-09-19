@@ -6774,3 +6774,116 @@ kernel void mla_attention_decode_f16(
     }
 }
 
+
+/// MSL Kernel: Fused FP8 MoE gate+up projections for ALL active routed experts in ONE
+/// dispatch. Grid: (intermediateDim, topK) threadgroups x 32 threads. `slotList[rank]`
+/// gives the staging slot (slot * expertSize layout) of the rank-th routed expert, so
+/// prediction-hit slot ordering is handled explicitly. Dense intermediate output at
+/// rank * intermediateDim.
+kernel void fp8_moe_gate_up_fused(
+    device const uchar* staging [[buffer(0)]],
+    device const float* inputVector [[buffer(1)]],
+    device float* intermediateOutput [[buffer(2)]],
+    device const uint32_t* slotList [[buffer(3)]],
+    constant uint64_t& expertSize [[buffer(4)]],
+    constant uint64_t& gateScaleOffset [[buffer(5)]],
+    constant uint64_t& upWeightOffset [[buffer(6)]],
+    constant uint64_t& upScaleOffset [[buffer(7)]],
+    constant uint32_t& hiddenDim [[buffer(8)]],
+    constant uint32_t& intermediateDim [[buffer(9)]],
+    constant uint32_t& topK [[buffer(10)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint r = tgPos.x;
+    uint rank = tgPos.y;
+    if (r >= intermediateDim || rank >= topK) return;
+
+    uint64_t base = (uint64_t)slotList[rank] * expertSize;
+    float gateScale = bf16_to_fp32(((device const ushort*)(staging + base + gateScaleOffset))[r]);
+    float upScale   = bf16_to_fp32(((device const ushort*)(staging + base + upScaleOffset))[r]);
+
+    device const uchar* gRow = staging + base + ((uint64_t)r * hiddenDim);
+    device const uchar* uRow = staging + base + upWeightOffset + ((uint64_t)r * hiddenDim);
+    device const float* inPtr = inputVector;
+
+    float gate_dot = 0.0f;
+    float up_dot   = 0.0f;
+
+    for (uint32_t baseD = laneId * 8; baseD < hiddenDim; baseD += 32 * 8) {
+        uchar4 g4_0 = *(device const uchar4*)(gRow + baseD);
+        uchar4 g4_1 = *(device const uchar4*)(gRow + baseD + 4);
+        uchar4 u4_0 = *(device const uchar4*)(uRow + baseD);
+        uchar4 u4_1 = *(device const uchar4*)(uRow + baseD + 4);
+        float4 in4_0 = *(device const float4*)(inPtr + baseD);
+        float4 in4_1 = *(device const float4*)(inPtr + baseD + 4);
+
+        gate_dot += (unpack_e4m3(g4_0.x) * in4_0.x) + (unpack_e4m3(g4_0.y) * in4_0.y) +
+                    (unpack_e4m3(g4_1.x) * in4_1.x) + (unpack_e4m3(g4_1.y) * in4_1.y) +
+                    (unpack_e4m3(g4_0.z) * in4_0.z) + (unpack_e4m3(g4_0.w) * in4_0.w) +
+                    (unpack_e4m3(g4_1.z) * in4_1.z) + (unpack_e4m3(g4_1.w) * in4_1.w);
+
+        up_dot   += (unpack_e4m3(u4_0.x) * in4_0.x) + (unpack_e4m3(u4_0.y) * in4_0.y) +
+                    (unpack_e4m3(u4_1.x) * in4_1.x) + (unpack_e4m3(u4_1.y) * in4_1.y) +
+                    (unpack_e4m3(u4_0.z) * in4_0.z) + (unpack_e4m3(u4_0.w) * in4_0.w) +
+                    (unpack_e4m3(u4_1.z) * in4_1.z) + (unpack_e4m3(u4_1.w) * in4_1.w);
+    }
+
+    gate_dot = simd_sum(gate_dot);
+    up_dot   = simd_sum(up_dot);
+
+    if (laneId == 0) {
+        float finalGate = gate_dot * gateScale;
+        float finalUp   = up_dot * upScale;
+        float silu_gate = finalGate / (1.0f + exp(-finalGate));
+        intermediateOutput[((uint64_t)rank * intermediateDim) + r] = silu_gate * finalUp;
+    }
+}
+
+/// MSL Kernel: Fused FP8 down-projection for ALL active routed experts in ONE dispatch.
+/// Grid: (hiddenDim, topK) threadgroups x 32 threads. Reads dense per-rank intermediate
+/// activations (written by fp8_moe_gate_up_fused), applies slotWeights[rank], and reads
+/// the staged weights via slotList[rank].
+kernel void fp8_moe_down_fused(
+    device const uchar* staging [[buffer(0)]],
+    device const float* intermediateVector [[buffer(1)]],
+    device float* outputAccumulator [[buffer(2)]],
+    device const float* slotRoutingWeights [[buffer(3)]],
+    device const uint32_t* slotList [[buffer(4)]],
+    constant uint64_t& expertSize [[buffer(5)]],
+    constant uint64_t& downWeightOffset [[buffer(6)]],
+    constant uint64_t& downScaleOffset [[buffer(7)]],
+    constant uint32_t& intermediateDim [[buffer(8)]],
+    constant uint32_t& hiddenDim [[buffer(9)]],
+    constant uint32_t& topK [[buffer(10)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint d = tgPos.x;
+    uint rank = tgPos.y;
+    if (d >= hiddenDim || rank >= topK) return;
+
+    uint64_t base = (uint64_t)slotList[rank] * expertSize;
+    float downScale = bf16_to_fp32(((device const ushort*)(staging + base + downScaleOffset))[d]);
+    device const uchar* dRow = staging + base + downWeightOffset + ((uint64_t)d * intermediateDim);
+    device const float* interPtr = intermediateVector + ((uint64_t)rank * intermediateDim);
+
+    float down_dot = 0.0f;
+    for (uint32_t baseI = laneId * 8; baseI < intermediateDim; baseI += 32 * 8) {
+        uchar4 d4_0 = *(device const uchar4*)(dRow + baseI);
+        uchar4 d4_1 = *(device const uchar4*)(dRow + baseI + 4);
+        float4 in4_0 = *(device const float4*)(interPtr + baseI);
+        float4 in4_1 = *(device const float4*)(interPtr + baseI + 4);
+
+        down_dot += (unpack_e4m3(d4_0.x) * in4_0.x) + (unpack_e4m3(d4_0.y) * in4_0.y) +
+                    (unpack_e4m3(d4_1.x) * in4_1.x) + (unpack_e4m3(d4_1.y) * in4_1.y) +
+                    (unpack_e4m3(d4_0.z) * in4_0.z) + (unpack_e4m3(d4_0.w) * in4_0.w) +
+                    (unpack_e4m3(d4_1.z) * in4_1.z) + (unpack_e4m3(d4_1.w) * in4_1.w);
+    }
+
+    down_dot = simd_sum(down_dot);
+
+    if (laneId == 0) {
+        outputAccumulator[d] += slotRoutingWeights[rank] * (down_dot * downScale);
+    }
+}

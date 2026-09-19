@@ -3592,6 +3592,8 @@ struct ContentView: View {
         let fp8DownPipeline: MTLComputePipelineState?
         let fp8GateUpSimdPipeline: MTLComputePipelineState?
         let fp8DownSimdPipeline: MTLComputePipelineState?
+        let fp8GateUpFusedPipeline: MTLComputePipelineState?
+        let fp8DownFusedPipeline: MTLComputePipelineState?
         let mxfp8GateUpPipeline: MTLComputePipelineState?
         let mxfp8DownPipeline: MTLComputePipelineState?
         let mxfp8GateUpSimdPipeline: MTLComputePipelineState?
@@ -3775,6 +3777,14 @@ struct ContentView: View {
             if let fp8DownSimd = defaultLibrary.makeFunction(name: "fp8_down_proj_accumulate_simd") {
                 fp8DownSimdPipeline = try device.makeComputePipelineState(function: fp8DownSimd)
             } else { fp8DownSimdPipeline = nil }
+
+            if let fp8GateUpFused = defaultLibrary.makeFunction(name: "fp8_moe_gate_up_fused") {
+                fp8GateUpFusedPipeline = try device.makeComputePipelineState(function: fp8GateUpFused)
+            } else { fp8GateUpFusedPipeline = nil }
+
+            if let fp8DownFused = defaultLibrary.makeFunction(name: "fp8_moe_down_fused") {
+                fp8DownFusedPipeline = try device.makeComputePipelineState(function: fp8DownFused)
+            } else { fp8DownFusedPipeline = nil }
 
             if let fp8BlockGateFunc = defaultLibrary.makeFunction(name: "fp8_block_swiglu_gate_up") {
                 fp8BlockGateUpPipeline = try device.makeComputePipelineState(function: fp8BlockGateFunc)
@@ -4172,7 +4182,9 @@ struct ContentView: View {
               let routerIndicesBuffer = device.makeBuffer(length: 16 * MemoryLayout<UInt32>.stride, options: .storageModeShared),
               let routerWeightsBuffer = device.makeBuffer(length: 16 * MemoryLayout<Float>.stride, options: .storageModeShared),
               let sharedScoreBuffer = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared),
-              let interBuffer = device.makeBuffer(length: max(Int(maxInterDim), 512) * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let interBuffer = device.makeBuffer(length: max(Int(maxInterDim), 512) * max(1, Int(modelConfig?.effectiveNumExpertsPerTok ?? (numExperts >= 512 ? 10 : 8))) * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let fusedSlotListBuffer = device.makeBuffer(length: 16 * MemoryLayout<UInt32>.stride, options: .storageModeShared),
+              let fusedSlotWeightsBuffer = device.makeBuffer(length: 16 * MemoryLayout<Float>.stride, options: .storageModeShared),
               let expertStagingBuffer = device.makeBuffer(length: expertStagingSize, options: .storageModeShared),
               let expertStagingBufferB = device.makeBuffer(length: expertStagingSize, options: .storageModeShared),
               let hcStreamsBuffer = device.makeBuffer(length: max(4 * Int(hiddenDim), 10240) * MemoryLayout<Float>.stride, options: .storageModeShared),
@@ -4757,6 +4769,7 @@ struct ContentView: View {
             func runTokenForward(tokenId: UInt32, step: UInt32, computeLogits: Bool, wait: Bool = true) -> Bool {
                 let tTokenStart = CFAbsoluteTimeGetCurrent()
                 let hadTemporalHistory = !previousLayerActiveExperts.isEmpty
+                var diagLayerRouterMs: Double = 0
                 var diagRouterGpuMs: Double = 0
                 var diagIoMs: Double = 0
                 var diagMoeGpuMs: Double = 0
@@ -6068,7 +6081,9 @@ struct ContentView: View {
                             let tRouterGpuStart = CFAbsoluteTimeGetCurrent()
                             activeCmd.commit()
                             activeCmd.waitUntilCompleted()
-                            diagRouterGpuMs += (CFAbsoluteTimeGetCurrent() - tRouterGpuStart) * 1000.0
+                            let layerRouterMs = (CFAbsoluteTimeGetCurrent() - tRouterGpuStart) * 1000.0
+                            diagRouterGpuMs += layerRouterMs
+                            diagLayerRouterMs = layerRouterMs
                             if let err = activeCmd.error {
                                 print("❌ [METAL ERROR] activeCmd failed at layer \(l): \(err)")
                                 return false
@@ -6233,7 +6248,7 @@ struct ContentView: View {
                                     packedPrefetchAdaptiveEnabled = false
                                     print("⚠️ [Prefetch] hit rate \(String(format: "%.0f", Double(packedPrefetchObservedHits) / Double(packedPrefetchObservedTotal) * 100))% below 20% after temporal warmup — disabling expert prefetch for this generation")
                                 }
-                                print("[DIAG] Layer \(l): IO=\(String(format: "%.1f", tIoElapsed))ms (prefetch \(prefetchHits)/\(activeExperts.count))")
+                                print("[DIAG] Layer \(l)\(layer.attentionType == .fullAttention ? "(gqa)" : ""): PhaseA=\(String(format: "%.2f", diagLayerRouterMs))ms IO=\(String(format: "%.1f", tIoElapsed))ms (prefetch \(prefetchHits)/\(activeExperts.count))")
 
                                 guard let moeCmd = commandQueue.makeCommandBuffer(),
                                       let layerEnc2 = moeCmd.makeComputeCommandEncoder() else { return false }
@@ -6243,6 +6258,65 @@ struct ContentView: View {
                                 layerEnc2.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                                 layerEnc2.memoryBarrier(scope: .buffers)
 
+                                // Fused fast path: all routed experts in 2 dispatches instead of
+                                // 2 per expert (16 dispatches + barriers). Applies to per-row-scaled
+                                // FP8 layouts (block-scaled and quantized-affine keep the per-expert
+                                // path). slotOf maps expert -> staging slot; the kernels walk the
+                                // router-rank list explicitly.
+                                let isBlockScaleFP8 = (compGateS?.size ?? 1024) < (intermediateDim * 2) || (compGateS?.name.contains("scale_inv") ?? false)
+                                let canFuseMoE = isFP8Layout && !isBlockScaleFP8 && activeExperts.count > 0 && fp8GateUpFusedPipeline != nil && fp8DownFusedPipeline != nil
+                                if l == 0 {
+                                    print("⚡ [MoE] fused expert path: \(canFuseMoE ? "ACTIVE (2 dispatches/expert-layer)" : "off (isFP8=\(isFP8Layout) blockScale=\(isBlockScaleFP8) pipelines=\(fp8GateUpFusedPipeline != nil)/\(fp8DownFusedPipeline != nil))")")
+                                }
+                                if canFuseMoE, let fusedGatePipe = fp8GateUpFusedPipeline, let fusedDownPipe = fp8DownFusedPipeline {
+                                    let slPtr = fusedSlotListBuffer.contents().bindMemory(to: UInt32.self, capacity: 16)
+                                    let swPtr = fusedSlotWeightsBuffer.contents().bindMemory(to: Float.self, capacity: 16)
+                                    for (rank, expert) in activeExperts.enumerated() {
+                                        slPtr[rank] = UInt32(slotOf[expert.id] ?? 0)
+                                        swPtr[rank] = expert.weight
+                                    }
+                                    var topKVal: UInt32 = UInt32(activeExperts.count)
+                                    var esVal: UInt64 = UInt64(expertSize)
+                                    var gsVal: UInt64 = compGateS?.offset ?? 1048576
+                                    var uwVal: UInt64 = compUpW?.offset ?? 1049600
+                                    var usVal: UInt64 = compUpS?.offset ?? 2098176
+                                    var dwVal: UInt64 = compDownW?.offset ?? 2099200
+                                    var dsVal: UInt64 = compDownS?.offset ?? 3147776
+                                    var hDimVal: UInt32 = UInt32(hiddenDim)
+                                    var interDimVal: UInt32 = UInt32(intermediateDim)
+
+                                    layerEnc2.setComputePipelineState(fusedGatePipe)
+                                    layerEnc2.setBuffer(stagingBuf, offset: 0, index: 0)
+                                    layerEnc2.setBuffer(xNorm2Buffer, offset: 0, index: 1)
+                                    layerEnc2.setBuffer(interBuffer, offset: 0, index: 2)
+                                    layerEnc2.setBuffer(fusedSlotListBuffer, offset: 0, index: 3)
+                                    layerEnc2.setBytes(&esVal, length: 8, index: 4)
+                                    layerEnc2.setBytes(&gsVal, length: 8, index: 5)
+                                    layerEnc2.setBytes(&uwVal, length: 8, index: 6)
+                                    layerEnc2.setBytes(&usVal, length: 8, index: 7)
+                                    layerEnc2.setBytes(&hDimVal, length: 4, index: 8)
+                                    layerEnc2.setBytes(&interDimVal, length: 4, index: 9)
+                                    layerEnc2.setBytes(&topKVal, length: 4, index: 10)
+                                    layerEnc2.dispatchThreadgroups(MTLSize(width: Int(intermediateDim), height: activeExperts.count, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                    layerEnc2.memoryBarrier(scope: .buffers)
+
+                                    layerEnc2.setComputePipelineState(fusedDownPipe)
+                                    layerEnc2.setBuffer(stagingBuf, offset: 0, index: 0)
+                                    layerEnc2.setBuffer(interBuffer, offset: 0, index: 1)
+                                    layerEnc2.setBuffer(hMlpBuffer, offset: 0, index: 2)
+                                    layerEnc2.setBuffer(fusedSlotWeightsBuffer, offset: 0, index: 3)
+                                    layerEnc2.setBuffer(fusedSlotListBuffer, offset: 0, index: 4)
+                                    layerEnc2.setBytes(&esVal, length: 8, index: 5)
+                                    layerEnc2.setBytes(&dwVal, length: 8, index: 6)
+                                    layerEnc2.setBytes(&dsVal, length: 8, index: 7)
+                                    layerEnc2.setBytes(&interDimVal, length: 4, index: 8)
+                                    layerEnc2.setBytes(&hDimVal, length: 4, index: 9)
+                                    layerEnc2.setBytes(&topKVal, length: 4, index: 10)
+                                    layerEnc2.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: activeExperts.count, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                    layerEnc2.memoryBarrier(scope: .buffers)
+                                }
+
+                                if !canFuseMoE {
                                 for (slot, expert) in activeExperts.enumerated() {
                                     let pk = expert.weight
                                     if pk <= 0.00001 { continue }
@@ -6420,6 +6494,7 @@ struct ContentView: View {
                                         layerEnc2.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), downUnq.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                                         layerEnc2.memoryBarrier(scope: .buffers)
                                     }
+                                }
                                 }
 
                                 if let gateW = layer.sharedGateWeight,
