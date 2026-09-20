@@ -872,3 +872,90 @@ structural levers are (a) component-level expert streaming (breaks the
 ~5 tok/s SSD floor, big project), (b) fused sampler/logits for the ~30ms
 "Other" block (~10-15ms recoverable), or (c) return to TTFT (GDN kernel
 threading, ~2-2.5s of TTFT — the clearest remaining win).
+
+---
+
+## FIX #9: WEIGHT-STATIONARY BATCHED GEMV FOR PREFILL (SHIPPED)
+
+**Measurement (T18).** The GDN recurrence kernels are NOT the prefill whale:
+seq kernel = 68us/token (48 TGs x 32 lanes); a 128-lane re-thread gained
+nothing (0.9-1.5x). The real prefill cost is the **per-token weight re-reads
+in the GEMV kernels**: bf16_gemv_simd traffic = P x weights (measured 3.2ms @
+P=1 -> 305ms @ P=1024, linear in P; ~170 GB/s effective). Every prefill layer
+runs ~4-10 GEMVs (in_projQKV 41.9MB, in_proj_z 25MB, out_proj 25MB, q/k/v/o
+...), so prefill re-reads ~9GB of weights per token for P~100.
+
+**Shipped kernel: `bf16_gemv_batched`** — one threadgroup per (output row,
+16-token block); ushort4 chunked weight loads (coalesced, 8 bf16/lane), 16
+token activations per chunk iteration, 16 simd_sum reductions. Weight traffic
+= ceil(P/16) x weights. Verified in T18b: identical to bf16_gemv_simd
+(rel <= 4e-4, float32 reordering), 1.6-2.3x faster at P=64..1024, slower at
+P=1 -> wired only for batchSize > 1; decode keeps bf16_gemv_simd.
+
+Wired in dispatchLinear's BF16 branch (before the simd branch). Covers
+Ornith's linear_attn in_projQKV/Z/A/B + out_proj and lm_head batched paths;
+Spark 2.5 (all-BF16 backbone) prefill benefits too.
+
+**Expected.** Ornith prefill GDN layers ~60ms of GEMV -> ~35ms; PhaseA 5.5s ->
+~3.5-4s; TTFT ~11.5s -> ~9-9.5s. The attention layers' projections are
+F8_E4M3 (fp8_gemv_simd, likely the same per-token re-read) — an
+`fp8_gemv_batched` clone is the follow-up if the PREFILL-DIAG confirms.
+Summary now prints P= and startPos= to confirm the actual prefill size.
+
+---
+
+## FIX #10: KV-PREFIX REUSE FOR HYBRID (GDN) MODELS (SHIPPED)
+
+**QA #14 (tools-on turn) exposed the TTFT multiplier:** P=1928,
+**startPos=0** — the app re-prefilled the ENTIRE conversation, and TTFT=390s
+vs prefillTotal=89s showed the web-search tool loop re-prefilled the full
+context after every tool result (each ~60-90s at P~1900-2900).
+
+Root cause (2 stacked bugs):
+1. `let prefixTokensReused = hasRecurrence ? 0 : findCommonPrefix(...)` —
+   prefix reuse was FORCE-DISABLED for any model with linear-attention layers
+   (Ornith: 30 GDN layers).
+2. `KVCacheManager.reset` zeroed linearStateBuffer + convStateBuffer on every
+   reset for recurrence models — so even a reused prefix would have run the
+   delta prefill with EMPTY recurrent states (the reason the disable existed).
+
+**Shipped mechanism:**
+- `KVCacheManager.captureLinearStates()` — memcpy the live GDN + conv states
+  into prefix snapshot buffers. Called at the exact moment `recordTurn` pins
+  the token list (turn end), so the snapshot corresponds to
+  `prompt + generated` by construction.
+- `reset(...)` restores the snapshots when `preservePrefixCount > 0 &&
+  linearStatesPinned` (instead of zeroing); zeroing remains for fresh or
+  partially-matched prefixes; `linearStatesPinned` clears on fresh resets.
+- ContentView reuse gate for recurrence models: reuse only when
+  `findCommonPrefix == currentPinnedCount` (FULL match — a partial match would
+  need states from mid-recurrence, which we cannot reconstruct).
+
+**Expected effect.** With the full conversation matching: turn-2+ prefill
+prefills only the delta (~50-1000 tokens for tool results) instead of
+~1900-2900. The web-search loop's TTFT drops from ~6.5min to ~1-2min
+(4x re-prefills of ~2900 tokens -> deltas); normal turns from ~89s to
+~3-5s. The MoE gpuWait (32.9s at P=1928) still re-runs per re-prefill and
+remains the next prefill lever (batched-over-tokens MoE).
+
+Also added a load-time warning if bf16_gemv_batched is unavailable from the
+metallib (Fix #9 did not engage in QA #14's build — GDN layers measured at
+the old per-token GEMV rate; verify the .metal file recompiled).
+
+### QA #15 — Fix #10 live results: THE PREFIX REUSE WIN
+
+- Tools-off follow-up turn: prefill **2-3s** (was ~89s). Fix #10 confirmed.
+- Tools-on web-search turn: re-prefill after the first search was
+  `P=868 startPos=2154`, hitRate=87%, ioWait=1.06s — the tool loop now
+  prefills tool-result deltas. TTFT 51-95s (was 390s).
+- GDN prefill layers still measure the OLD per-token GEMV rate
+  (475ms @ P=868 = 169 GB/s; batched would be ~35ms) — **Fix #9 still not
+  engaging in the user's build**. Added affirmative load print
+  ("⚡ [GEMV] bf16_gemv_batched pipeline ready") to diagnose; if absent, the
+  metallib didn't recompile (clean build needed).
+- gqa prefill layers ~1.7s each at P=868: FP8 attention GEMVs likely dominate
+  -> `fp8_gemv_batched` clone queued next.
+- Fixed the adaptive-gate warning spam (printed every layer once tripped;
+  now prints once at the flip). Gate behavior correct: after a tool-result
+  prefill the routing is genuinely novel (0-4% hits), kicks are disabled and
+  misses read sync — the right trade for unpredictable content.

@@ -7307,3 +7307,74 @@ kernel void gqa_attention_decode_fused_f16_chunked_rows_combine(
         outVec[vecIdx][compIdx] = ctx * sig_g;
     }
 }
+
+/// MSL Kernel: Weight-stationary batched BF16 GEMV (FIX #9). One threadgroup per
+/// (output row, 16-token block): the weight row is read ONCE per threadgroup, so
+/// total weight traffic scales with ceil(P/16) instead of P. Numerically identical
+/// to bf16_gemv_simd (verified T18b, rel <= 4e-4 under float32 reordering); use
+/// for prefill batches (P > 1). bf16_gemv_simd remains the P == 1 decode path.
+kernel void bf16_gemv_batched(
+    device const ushort* rawWeightBuffer [[buffer(0)]],
+    device const float* inputBatched [[buffer(1)]],
+    device float* outputBatched [[buffer(2)]],
+    constant uint64_t& weightOffset [[buffer(3)]],
+    constant uint32_t& inDim [[buffer(4)]],
+    constant uint32_t& outDim [[buffer(5)]],
+    constant uint32_t& batch [[buffer(6)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint o = tgPos.x;
+    uint t0 = tgPos.y * 16;
+    if (o >= outDim) return;
+    device const ushort4* w4 = (device const ushort4*)(rawWeightBuffer + (weightOffset / 2) + ((uint64_t)o * inDim));
+    float acc[16];
+    for (uint t = 0; t < 16; t++) acc[t] = 0.0f;
+    uint32_t numChunks = inDim / 8;
+    for (uint32_t c = laneId; c < numChunks; c += 32) {
+        ushort4 wLoRaw = w4[c * 2 + 0];
+        ushort4 wHiRaw = w4[c * 2 + 1];
+        float4 wLo = float4(bf16_to_fp32(wLoRaw.x), bf16_to_fp32(wLoRaw.y), bf16_to_fp32(wLoRaw.z), bf16_to_fp32(wLoRaw.w));
+        float4 wHi = float4(bf16_to_fp32(wHiRaw.x), bf16_to_fp32(wHiRaw.y), bf16_to_fp32(wHiRaw.z), bf16_to_fp32(wHiRaw.w));
+        for (uint t = 0; t < 16; t++) {
+            device const float4* in4 = (device const float4*)(inputBatched + ((uint64_t)(t0 + t) * inDim));
+            float4 in_lo = in4[c * 2 + 0];
+            float4 in_hi = in4[c * 2 + 1];
+            acc[t] += dot(wLo, in_lo) + dot(wHi, in_hi);
+        }
+    }
+    float s0 = simd_sum(acc[0]);
+    float s1 = simd_sum(acc[1]);
+    float s2 = simd_sum(acc[2]);
+    float s3 = simd_sum(acc[3]);
+    float s4 = simd_sum(acc[4]);
+    float s5 = simd_sum(acc[5]);
+    float s6 = simd_sum(acc[6]);
+    float s7 = simd_sum(acc[7]);
+    float s8 = simd_sum(acc[8]);
+    float s9 = simd_sum(acc[9]);
+    float s10 = simd_sum(acc[10]);
+    float s11 = simd_sum(acc[11]);
+    float s12 = simd_sum(acc[12]);
+    float s13 = simd_sum(acc[13]);
+    float s14 = simd_sum(acc[14]);
+    float s15 = simd_sum(acc[15]);
+    if (laneId == 0) {
+        if (t0 + 0 < batch) outputBatched[(uint64_t)(t0 + 0) * outDim + o] = s0;
+        if (t0 + 1 < batch) outputBatched[(uint64_t)(t0 + 1) * outDim + o] = s1;
+        if (t0 + 2 < batch) outputBatched[(uint64_t)(t0 + 2) * outDim + o] = s2;
+        if (t0 + 3 < batch) outputBatched[(uint64_t)(t0 + 3) * outDim + o] = s3;
+        if (t0 + 4 < batch) outputBatched[(uint64_t)(t0 + 4) * outDim + o] = s4;
+        if (t0 + 5 < batch) outputBatched[(uint64_t)(t0 + 5) * outDim + o] = s5;
+        if (t0 + 6 < batch) outputBatched[(uint64_t)(t0 + 6) * outDim + o] = s6;
+        if (t0 + 7 < batch) outputBatched[(uint64_t)(t0 + 7) * outDim + o] = s7;
+        if (t0 + 8 < batch) outputBatched[(uint64_t)(t0 + 8) * outDim + o] = s8;
+        if (t0 + 9 < batch) outputBatched[(uint64_t)(t0 + 9) * outDim + o] = s9;
+        if (t0 + 10 < batch) outputBatched[(uint64_t)(t0 + 10) * outDim + o] = s10;
+        if (t0 + 11 < batch) outputBatched[(uint64_t)(t0 + 11) * outDim + o] = s11;
+        if (t0 + 12 < batch) outputBatched[(uint64_t)(t0 + 12) * outDim + o] = s12;
+        if (t0 + 13 < batch) outputBatched[(uint64_t)(t0 + 13) * outDim + o] = s13;
+        if (t0 + 14 < batch) outputBatched[(uint64_t)(t0 + 14) * outDim + o] = s14;
+        if (t0 + 15 < batch) outputBatched[(uint64_t)(t0 + 15) * outDim + o] = s15;
+    }
+}

@@ -205,7 +205,12 @@ final class GPU {
                      "gqa_attention_decode_fused_f16_chunked_combine",
                      "gqa_attention_decode_fused_f16_chunked_rows",
                      "gqa_attention_decode_fused_f16_chunked_rows_combine",
-                     "bench_fp8_moe_gate_up_fused", "bench_fp8_moe_down_fused"] {
+                     "bench_fp8_moe_gate_up_fused", "bench_fp8_moe_down_fused",
+                     "linear_attention_recurrent_sequence_sigmoid",
+                     "linear_attention_recurrent_step_sigmoid",
+                     "gdn_seq_v2",
+                     "bf16_gemv_simd",
+                     "bf16_gemv_batched"] {
             if let f = lib.makeFunction(name: name) {
                 do {
                     pipelines[name] = try dev.makeComputePipelineState(function: f)
@@ -557,6 +562,183 @@ func main() {
             dot = simd_sum(dot);
             if (laneId == 0) {
                 outputAccumulator[d] += routingWeights[slot] * (dot * ds);
+            }
+        }
+
+        // T18 experiment: re-threaded GDN seq — 128 lanes per threadgroup (4 SIMD
+        // groups), one state row per lane, threadgroup-memory RMS reduction.
+        kernel void gdn_seq_v2(
+            device const float* qkvVectorSeq [[buffer(0)]],
+            device const float* zVectorSeq [[buffer(1)]],
+            device const float* aVectorSeq [[buffer(2)]],
+            device const float* bVectorSeq [[buffer(3)]],
+            device const uchar* aLogBuf [[buffer(4)]],
+            device const uchar* dtBiasBuf [[buffer(5)]],
+            device const uchar* normBuf [[buffer(6)]],
+            device float* stateMatrix [[buffer(7)]],
+            device float* outputVectorSeq [[buffer(8)]],
+            constant uint64_t& aLogOffset [[buffer(9)]],
+            constant uint64_t& dtBiasOffset [[buffer(10)]],
+            constant uint64_t& normOffset [[buffer(11)]],
+            constant uint32_t& numValHeads [[buffer(12)]],
+            constant uint32_t& numKeyHeads [[buffer(13)]],
+            constant uint32_t& headDim [[buffer(14)]],
+            constant float& eps [[buffer(15)]],
+            constant uint32_t& seqLen [[buffer(16)]],
+            uint headIdx [[threadgroup_position_in_grid]],
+            uint tgLane [[thread_index_in_threadgroup]],
+            uint simdId [[simdgroup_index_in_threadgroup]],
+            uint laneInSimd [[thread_index_in_simdgroup]]
+        ) {
+            if (headIdx >= numValHeads) return;
+            uint32_t keyHeadIdx = headIdx / (numValHeads / numKeyHeads);
+            uint32_t headDimVec4 = headDim / 4;
+            float invSqrtHeadDim = rsqrt((float)headDim);
+
+            uint32_t qBaseInToken = keyHeadIdx * headDim;
+            uint32_t kBaseInToken = (numKeyHeads * headDim) + (keyHeadIdx * headDim);
+            uint32_t vBaseInToken = (2 * numKeyHeads * headDim) + (headIdx * headDim);
+            uint32_t zBaseInToken = headIdx * headDim;
+            uint32_t outBaseInToken = headIdx * headDim;
+            uint32_t stateBase = headIdx * headDim * headDim;
+
+            uint32_t qkvStride = (2 * numKeyHeads + numValHeads) * headDim;
+            uint32_t zStride = numValHeads * headDim;
+            uint32_t aStride = numValHeads;
+            uint32_t bStride = numValHeads;
+            uint32_t outStride = numValHeads * headDim;
+
+            float aLogVal = read_bf16_unaligned(aLogBuf + aLogOffset + ((uint64_t)headIdx * 2));
+            float dtBiasVal = read_bf16_unaligned(dtBiasBuf + dtBiasOffset + ((uint64_t)headIdx * 2));
+            float expALog = exp(aLogVal);
+
+            uint32_t i = tgLane;           // one state row per lane (headDim = 128 = TG size)
+            if (i >= headDim) return;
+            uint32_t sRowBase = stateBase + ((uint32_t)i * headDim);
+            device float4* sRowVec4 = (device float4*)(stateMatrix + sRowBase);
+
+            threadgroup float tgPart[4];
+
+            for (uint32_t p = 0; p < seqLen; p++) {
+                uint64_t qkvTokenBase = (uint64_t)p * qkvStride;
+                uint64_t zTokenBase   = (uint64_t)p * zStride;
+                uint64_t aTokenBase   = (uint64_t)p * aStride;
+                uint64_t bTokenBase   = (uint64_t)p * bStride;
+                uint64_t outTokenBase = (uint64_t)p * outStride;
+
+                float aVal = aVectorSeq[aTokenBase + headIdx];
+                float bVal = bVectorSeq[bTokenBase + headIdx];
+                float x = aVal + dtBiasVal;
+                float dt = (x > 20.0f) ? x : ((x < -20.0f) ? exp(x) : log(1.0f + exp(x)));
+                float alpha = exp(-expALog * dt);
+                float beta = 1.0f / (1.0f + exp(-bVal));
+
+                device const float* qkvToken = qkvVectorSeq + qkvTokenBase;
+                device const float4* kVec4 = (device const float4*)(qkvToken + kBaseInToken);
+                device const float4* qVec4 = (device const float4*)(qkvToken + qBaseInToken);
+
+                float Sk_i = 0.0f;
+                for (uint32_t j = 0; j < headDimVec4; j++) {
+                    Sk_i += dot(sRowVec4[j], kVec4[j]);
+                }
+                Sk_i *= alpha;
+
+                float v_val = qkvToken[vBaseInToken + i];
+                float delta_v_i = beta * (v_val - Sk_i);
+
+                float y_i = 0.0f;
+                for (uint32_t j = 0; j < headDimVec4; j++) {
+                    float4 sNew = (sRowVec4[j] * alpha) + (delta_v_i * kVec4[j]);
+                    sRowVec4[j] = sNew;
+                    y_i += dot(sNew, qVec4[j]);
+                }
+                y_i *= invSqrtHeadDim;
+
+                float psq = simd_sum(y_i * y_i);
+                if (laneInSimd == 0) tgPart[simdId] = psq;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tgLane == 0) {
+                    tgPart[0] = tgPart[0] + tgPart[1] + tgPart[2] + tgPart[3];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                float headSumSq = tgPart[0];
+                float rms = rsqrt((headSumSq / (float)headDim) + eps);
+
+                device const float* zToken = zVectorSeq + zTokenBase;
+                device float* outToken = outputVectorSeq + outTokenBase;
+                float gamma = read_bf16_unaligned(normBuf + normOffset + ((uint64_t)i * 2));
+                float z = zToken[zBaseInToken + i];
+                float sig_z = 1.0f / (1.0f + exp(-z));
+                outToken[outBaseInToken + i] = y_i * rms * gamma * sig_z;
+            }
+        }
+
+        // T18b experiment: weight-stationary batched GEMV — one threadgroup per
+        // (output, 16-token block); the weight row is read once per TG, so total
+        // weight traffic scales with ceil(P/16) instead of P.
+        kernel void bf16_gemv_batched(
+            device const ushort* rawWeight [[buffer(0)]],
+            device const float* inputBatched [[buffer(1)]],
+            device float* outputBatched [[buffer(2)]],
+            constant uint64_t& weightOffset [[buffer(3)]],
+            constant uint32_t& inDim [[buffer(4)]],
+            constant uint32_t& outDim [[buffer(5)]],
+            constant uint32_t& batch [[buffer(6)]],
+            uint2 tg [[threadgroup_position_in_grid]],
+            uint lane [[thread_index_in_simdgroup]]
+        ) {
+            uint o = tg.x;
+            uint t0 = tg.y * 16;
+            if (o >= outDim) return;
+            device const ushort4* w4 = (device const ushort4*)(rawWeight + (uint)(weightOffset >> 1) + ((uint64_t)o * inDim));
+            float acc[16];
+            for (uint t = 0; t < 16; t++) acc[t] = 0.0f;
+            uint32_t numChunks = inDim / 8;
+            for (uint32_t c = lane; c < numChunks; c += 32) {
+                ushort4 wLoRaw = w4[c * 2 + 0];
+                ushort4 wHiRaw = w4[c * 2 + 1];
+                float4 wLo = float4(bf16_to_fp32(wLoRaw.x), bf16_to_fp32(wLoRaw.y), bf16_to_fp32(wLoRaw.z), bf16_to_fp32(wLoRaw.w));
+                float4 wHi = float4(bf16_to_fp32(wHiRaw.x), bf16_to_fp32(wHiRaw.y), bf16_to_fp32(wHiRaw.z), bf16_to_fp32(wHiRaw.w));
+                for (uint t = 0; t < 16; t++) {
+                    device const float4* in4 = (device const float4*)(inputBatched + ((uint64_t)(t0 + t) * inDim));
+                    float4 in_lo = in4[c * 2 + 0];
+                    float4 in_hi = in4[c * 2 + 1];
+                    acc[t] += dot(wLo, in_lo) + dot(wHi, in_hi);
+                }
+            }
+            float s0 = simd_sum(acc[0]);
+            float s1 = simd_sum(acc[1]);
+            float s2 = simd_sum(acc[2]);
+            float s3 = simd_sum(acc[3]);
+            float s4 = simd_sum(acc[4]);
+            float s5 = simd_sum(acc[5]);
+            float s6 = simd_sum(acc[6]);
+            float s7 = simd_sum(acc[7]);
+            float s8 = simd_sum(acc[8]);
+            float s9 = simd_sum(acc[9]);
+            float s10 = simd_sum(acc[10]);
+            float s11 = simd_sum(acc[11]);
+            float s12 = simd_sum(acc[12]);
+            float s13 = simd_sum(acc[13]);
+            float s14 = simd_sum(acc[14]);
+            float s15 = simd_sum(acc[15]);
+            if (lane == 0) {
+                if (t0 + 0 < batch) outputBatched[(uint64_t)(t0 + 0) * outDim + o] = s0;
+                if (t0 + 1 < batch) outputBatched[(uint64_t)(t0 + 1) * outDim + o] = s1;
+                if (t0 + 2 < batch) outputBatched[(uint64_t)(t0 + 2) * outDim + o] = s2;
+                if (t0 + 3 < batch) outputBatched[(uint64_t)(t0 + 3) * outDim + o] = s3;
+                if (t0 + 4 < batch) outputBatched[(uint64_t)(t0 + 4) * outDim + o] = s4;
+                if (t0 + 5 < batch) outputBatched[(uint64_t)(t0 + 5) * outDim + o] = s5;
+                if (t0 + 6 < batch) outputBatched[(uint64_t)(t0 + 6) * outDim + o] = s6;
+                if (t0 + 7 < batch) outputBatched[(uint64_t)(t0 + 7) * outDim + o] = s7;
+                if (t0 + 8 < batch) outputBatched[(uint64_t)(t0 + 8) * outDim + o] = s8;
+                if (t0 + 9 < batch) outputBatched[(uint64_t)(t0 + 9) * outDim + o] = s9;
+                if (t0 + 10 < batch) outputBatched[(uint64_t)(t0 + 10) * outDim + o] = s10;
+                if (t0 + 11 < batch) outputBatched[(uint64_t)(t0 + 11) * outDim + o] = s11;
+                if (t0 + 12 < batch) outputBatched[(uint64_t)(t0 + 12) * outDim + o] = s12;
+                if (t0 + 13 < batch) outputBatched[(uint64_t)(t0 + 13) * outDim + o] = s13;
+                if (t0 + 14 < batch) outputBatched[(uint64_t)(t0 + 14) * outDim + o] = s14;
+                if (t0 + 15 < batch) outputBatched[(uint64_t)(t0 + 15) * outDim + o] = s15;
             }
         }
         """
@@ -1892,6 +2074,257 @@ func main() {
         compareRows(rows: 8, ctxs: [("prefix@4000", 0x80000000 | 4000)], chunkTargets: [1024, 128, 64])
         compareRows(rows: 64, ctxs: [("prefix@4000", 0x80000000 | 4000)], chunkTargets: [1024, 128, 64])
         compareRows(rows: 128, ctxs: [("prefix@8000", 0x80000000 | 8000)], chunkTargets: [1024, 128, 64])
+    }
+
+    // ============================ T18: GDN prefill recurrence scan ============================
+    // The GDN linear-attention scan is the biggest prefill whale (~135ms/layer x 30
+    // layers) and the same per-token cost dominates decode RouterGPU. Time the
+    // existing seq kernel (48 TGs x 32 lanes, 4 rows/lane) vs a re-threaded variant
+    // (128 lanes/TG, 1 row/lane) and the per-token step-kernel loop.
+    log("--- T18: start")
+    print("    --- T18: GDN linear-attention recurrence (seq vs step vs re-threaded) ---")
+    do {
+        guard let seqPipe = gpu.pipe("linear_attention_recurrent_sequence_sigmoid"),
+              let stepPipe = gpu.pipe("linear_attention_recurrent_step_sigmoid"),
+              let seqV2Pipe = gpu.pipe("gdn_seq_v2") else {
+            print("   (GDN kernels unavailable - skipped)")
+            return
+        }
+        let nV = 48, nK = 16, hd = 128
+        let qkvStride = (2 * nK + nV) * hd   // 10240
+        let zStride = nV * hd                // 6144
+        let maxP = 1024
+        guard let qkvBuf = gpu.device.makeBuffer(length: maxP * qkvStride * 4, options: .storageModeShared),
+              let zBuf = gpu.device.makeBuffer(length: maxP * zStride * 4, options: .storageModeShared),
+              let aBuf = gpu.device.makeBuffer(length: maxP * nV * 4, options: .storageModeShared),
+              let bBuf = gpu.device.makeBuffer(length: maxP * nV * 4, options: .storageModeShared),
+              let aLogBuf = gpu.device.makeBuffer(length: nV * 2, options: .storageModeShared),
+              let dtBuf = gpu.device.makeBuffer(length: nV * 2, options: .storageModeShared),
+              let normBuf = gpu.device.makeBuffer(length: hd * 2, options: .storageModeShared),
+              let stateSeq = gpu.device.makeBuffer(length: nV * hd * hd * 4, options: .storageModeShared),
+              let stateStep = gpu.device.makeBuffer(length: nV * hd * hd * 4, options: .storageModeShared),
+              let outSeq = gpu.device.makeBuffer(length: maxP * zStride * 4, options: .storageModeShared),
+              let outStep = gpu.device.makeBuffer(length: maxP * zStride * 4, options: .storageModeShared) else { return }
+
+        var seed: UInt32 = 0x6D0E
+        func rnd4() -> Float { seed = seed &* 1664525 &+ 1013904223; return Float(Int((seed >> 16) % 2000) - 1000) / 2000.0 }
+        func bf16Bits(_ f: Float) -> UInt16 { UInt16((f.bitPattern >> 16) & 0xFFFF) }
+        func fill16(_ buf: MTLBuffer, _ count: Int, _ gen: () -> Float) {
+            let p = buf.contents().bindMemory(to: UInt16.self, capacity: count)
+            for i in 0..<count { p[i] = bf16Bits(gen()) }
+        }
+        let qp = qkvBuf.contents().bindMemory(to: Float.self, capacity: maxP * qkvStride)
+        for i in 0..<(maxP * qkvStride) { qp[i] = rnd4() }
+        let zp = zBuf.contents().bindMemory(to: Float.self, capacity: maxP * zStride)
+        for i in 0..<(maxP * zStride) { zp[i] = rnd4() }
+        let ap = aBuf.contents().bindMemory(to: Float.self, capacity: maxP * nV)
+        for i in 0..<(maxP * nV) { ap[i] = rnd4() }
+        let bp = bBuf.contents().bindMemory(to: Float.self, capacity: maxP * nV)
+        for i in 0..<(maxP * nV) { bp[i] = rnd4() }
+        fill16(aLogBuf, nV, { 0.5 + rnd4() })
+        fill16(dtBuf, nV, { rnd4() })
+        fill16(normBuf, hd, { 0.5 + rnd4() })
+
+        let queue4 = gpu.queue
+        func runSeq(_ P: Int) -> Double {
+            let cmd = queue4.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var aOff: UInt64 = 0, dtOff: UInt64 = 0, nOff: UInt64 = 0
+            var nVv = UInt32(nV), nKv = UInt32(nK), hdv = UInt32(hd), epsv = Float(1e-6), sv = UInt32(P)
+            enc.setComputePipelineState(seqPipe)
+            enc.setBuffer(qkvBuf, offset: 0, index: 0)
+            enc.setBuffer(zBuf, offset: 0, index: 1)
+            enc.setBuffer(aBuf, offset: 0, index: 2)
+            enc.setBuffer(bBuf, offset: 0, index: 3)
+            enc.setBuffer(aLogBuf, offset: 0, index: 4)
+            enc.setBuffer(dtBuf, offset: 0, index: 5)
+            enc.setBuffer(normBuf, offset: 0, index: 6)
+            enc.setBuffer(stateSeq, offset: 0, index: 7)
+            enc.setBuffer(outSeq, offset: 0, index: 8)
+            enc.setBytes(&aOff, length: 8, index: 9)
+            enc.setBytes(&dtOff, length: 8, index: 10)
+            enc.setBytes(&nOff, length: 8, index: 11)
+            enc.setBytes(&nVv, length: 4, index: 12)
+            enc.setBytes(&nKv, length: 4, index: 13)
+            enc.setBytes(&hdv, length: 4, index: 14)
+            enc.setBytes(&epsv, length: 4, index: 15)
+            enc.setBytes(&sv, length: 4, index: 16)
+            enc.dispatchThreadgroups(MTLSize(width: nV, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.endEncoding()
+            let t0 = CFAbsoluteTimeGetCurrent()
+            cmd.commit(); cmd.waitUntilCompleted()
+            return (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        }
+        func runStepLoop(_ P: Int) -> Double {
+            let cmd = queue4.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var aOff: UInt64 = 0, dtOff: UInt64 = 0, nOff: UInt64 = 0
+            var nVv = UInt32(nV), nKv = UInt32(nK), hdv = UInt32(hd), epsv = Float(1e-6)
+            // NOTE: step kernel has fixed qkvVector layout [8192] for 32 val heads;
+            // only meaningful for nV==32 shapes. Time with the seq-shaped buffers only
+            // when nV==32; otherwise skip.
+            if nV != 32 { return -1 }
+            for p in 0..<P {
+                enc.setComputePipelineState(stepPipe)
+                enc.setBuffer(qkvBuf, offset: p * qkvStride * 4, index: 0)
+                enc.setBuffer(zBuf, offset: p * zStride * 4, index: 1)
+                enc.setBuffer(aBuf, offset: p * nV * 4, index: 2)
+                enc.setBuffer(bBuf, offset: p * nV * 4, index: 3)
+                enc.setBuffer(aLogBuf, offset: 0, index: 4)
+                enc.setBuffer(dtBuf, offset: 0, index: 5)
+                enc.setBuffer(normBuf, offset: 0, index: 6)
+                enc.setBuffer(stateStep, offset: 0, index: 7)
+                enc.setBuffer(outStep, offset: p * zStride * 4, index: 8)
+                enc.setBytes(&aOff, length: 8, index: 9)
+                enc.setBytes(&dtOff, length: 8, index: 10)
+                enc.setBytes(&nOff, length: 8, index: 11)
+                enc.setBytes(&nVv, length: 4, index: 12)
+                enc.setBytes(&nKv, length: 4, index: 13)
+                enc.setBytes(&hdv, length: 4, index: 14)
+                enc.setBytes(&epsv, length: 4, index: 15)
+                enc.dispatchThreadgroups(MTLSize(width: nV, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            }
+            enc.endEncoding()
+            let t0 = CFAbsoluteTimeGetCurrent()
+            cmd.commit(); cmd.waitUntilCompleted()
+            return (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        }
+        func runSeqV2(_ P: Int) -> Double {
+            let cmd = queue4.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var aOff: UInt64 = 0, dtOff: UInt64 = 0, nOff: UInt64 = 0
+            var nVv = UInt32(nV), nKv = UInt32(nK), hdv = UInt32(hd), epsv = Float(1e-6), sv = UInt32(P)
+            enc.setComputePipelineState(seqV2Pipe)
+            enc.setBuffer(qkvBuf, offset: 0, index: 0)
+            enc.setBuffer(zBuf, offset: 0, index: 1)
+            enc.setBuffer(aBuf, offset: 0, index: 2)
+            enc.setBuffer(bBuf, offset: 0, index: 3)
+            enc.setBuffer(aLogBuf, offset: 0, index: 4)
+            enc.setBuffer(dtBuf, offset: 0, index: 5)
+            enc.setBuffer(normBuf, offset: 0, index: 6)
+            enc.setBuffer(stateStep, offset: 0, index: 7)
+            enc.setBuffer(outStep, offset: 0, index: 8)
+            enc.setBytes(&aOff, length: 8, index: 9)
+            enc.setBytes(&dtOff, length: 8, index: 10)
+            enc.setBytes(&nOff, length: 8, index: 11)
+            enc.setBytes(&nVv, length: 4, index: 12)
+            enc.setBytes(&nKv, length: 4, index: 13)
+            enc.setBytes(&hdv, length: 4, index: 14)
+            enc.setBytes(&epsv, length: 4, index: 15)
+            enc.setBytes(&sv, length: 4, index: 16)
+            enc.dispatchThreadgroups(MTLSize(width: nV, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            enc.endEncoding()
+            let t0 = CFAbsoluteTimeGetCurrent()
+            cmd.commit(); cmd.waitUntilCompleted()
+            return (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        }
+        func compareOut(_ P: Int, _ a: MTLBuffer, _ b: MTLBuffer) -> Double {
+            let n = P * zStride
+            let ap2 = a.contents().bindMemory(to: Float.self, capacity: n)
+            let bp2 = b.contents().bindMemory(to: Float.self, capacity: n)
+            var maxRel = 0.0
+            for i in 0..<n {
+                let x = Double(ap2[i]); let y = Double(bp2[i])
+                let rel = abs(x - y) / max(abs(x), abs(y), 1e-6)
+                if rel > maxRel { maxRel = rel }
+            }
+            return maxRel
+        }
+        func resetState(_ buf: MTLBuffer) {
+            let p = buf.contents().bindMemory(to: Float.self, capacity: nV * hd * hd)
+            for i in 0..<(nV * hd * hd) { p[i] = rnd4() }
+        }
+        _ = runSeq(8)
+        for P in [64, 128, 1024] {
+            // v2 must run from the SAME INITIAL state: snapshot it before seq mutates it.
+            resetState(stateSeq)
+            stateStep.contents().copyMemory(from: stateSeq.contents(), byteCount: nV * hd * hd * 4)
+            let tSeq = runSeq(P)
+            let tStep = runStepLoop(P)
+            let tV2 = runSeqV2(P)
+            let relOut = compareOut(P, outSeq, outStep)
+            print("   GDN P=\(String(format: "%4d", P)): seq \(String(format: "%.2f", tSeq))ms | step-loop \(String(format: "%.2f", tStep))ms | v2 \(String(format: "%.2f", tV2))ms (\(String(format: "%.2f", tSeq / max(tV2, 1e-9)))x) | seq-vs-v2 rel \(String(format: "%.1e", relOut))")
+        }
+        // Batched BF16 GEMV at the app's prefill shapes (in_projQKV: 2560->10240,
+        // out_proj: 6144->2560). The bf16_gemv_simd kernel reads each weight row once
+        // regardless of batch, so cost should be ~weights/bandwidth, NOT per-token.
+        if let gemvPipe = gpu.pipe("bf16_gemv_simd"),
+           let gemvBPipe = gpu.pipe("bf16_gemv_batched"),
+           let wBuf = gpu.device.makeBuffer(length: 2560 * 10240 * 2, options: .storageModeShared),
+           let inB = gpu.device.makeBuffer(length: maxP * 2560 * 4, options: .storageModeShared),
+           let outB = gpu.device.makeBuffer(length: maxP * 10240 * 4, options: .storageModeShared),
+           let outB2 = gpu.device.makeBuffer(length: maxP * 10240 * 4, options: .storageModeShared) {
+            let wp = wBuf.contents().bindMemory(to: UInt16.self, capacity: 2560 * 10240)
+            for i in 0..<(2560 * 10240) { wp[i] = bf16Bits(rnd4()) }
+            let inp = inB.contents().bindMemory(to: Float.self, capacity: maxP * 2560)
+            for i in 0..<(maxP * 2560) { inp[i] = rnd4() }
+            for P in [1, 64, 1024] {
+                let cmd = queue4.makeCommandBuffer()!
+                let enc = cmd.makeComputeCommandEncoder()!
+                var wOff: UInt64 = 0, inD = UInt32(2560), outD = UInt32(10240)
+                enc.setComputePipelineState(gemvPipe)
+                enc.setBuffer(wBuf, offset: 0, index: 0)
+                enc.setBuffer(inB, offset: 0, index: 1)
+                enc.setBuffer(outB, offset: 0, index: 2)
+                enc.setBytes(&wOff, length: 8, index: 3)
+                enc.setBytes(&inD, length: 4, index: 4)
+                enc.setBytes(&outD, length: 4, index: 5)
+                enc.dispatchThreadgroups(MTLSize(width: 10240, height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.endEncoding()
+                let t0 = CFAbsoluteTimeGetCurrent()
+                cmd.commit(); cmd.waitUntilCompleted()
+                let t = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+
+                // batched variant
+                let cmd2 = queue4.makeCommandBuffer()!
+                let enc2 = cmd2.makeComputeCommandEncoder()!
+                var batchVal = UInt32(P)
+                enc2.setComputePipelineState(gemvBPipe)
+                enc2.setBuffer(wBuf, offset: 0, index: 0)
+                enc2.setBuffer(inB, offset: 0, index: 1)
+                enc2.setBuffer(outB2, offset: 0, index: 2)
+                enc2.setBytes(&wOff, length: 8, index: 3)
+                enc2.setBytes(&inD, length: 4, index: 4)
+                enc2.setBytes(&outD, length: 4, index: 5)
+                enc2.setBytes(&batchVal, length: 4, index: 6)
+                let tokBlocks = (P + 15) / 16
+                enc2.dispatchThreadgroups(MTLSize(width: 10240, height: tokBlocks, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc2.endEncoding()
+                let t02 = CFAbsoluteTimeGetCurrent()
+                cmd2.commit(); cmd2.waitUntilCompleted()
+                let t2 = (CFAbsoluteTimeGetCurrent() - t02) * 1000
+
+                let refP = outB.contents().bindMemory(to: Float.self, capacity: P * 10240)
+                let batP = outB2.contents().bindMemory(to: Float.self, capacity: P * 10240)
+                var maxRel = 0.0
+                var firstBad = -1
+                for i in 0..<(P * 10240) {
+                    let x = Double(refP[i]); let y = Double(batP[i])
+                    // Near-zero outputs amplify relative error under reordering;
+                    // judge by absolute error scaled by the typical magnitude.
+                    let rel = abs(x - y) / max(1e-2, max(abs(x), abs(y)))
+                    if rel > maxRel { maxRel = rel }
+                    if rel > 0.05 && firstBad < 0 { firstBad = i }
+                }
+                if firstBad >= 0 {
+                    let tok = firstBad / 10240, o = firstBad % 10240
+                    print("   first mismatch: idx=\(firstBad) (tok=\(tok), o=\(o)) simd=\(refP[firstBad]) bat=\(batP[firstBad])")
+                }
+                // CPU ground truth for the first 4 outputs of token 0
+                var cpuVals: [Float] = []
+                for o in 0..<4 {
+                    var dot: Float = 0
+                    for j in 0..<2560 {
+                        let wBits = wp[o * 2560 + j]
+                        let wVal = Float(UInt32(wBits) << 16).bitPattern
+                        dot += Float(bitPattern: wVal) * inp[j]
+                    }
+                    cpuVals.append(dot)
+                }
+                print("   cpu[0..3]: \(cpuVals.map { String(format: "%.4f", $0) }.joined(separator: ",")) | simd[0..3]: \((0..<4).map { String(format: "%.4f", refP[$0]) }.joined(separator: ",")) | bat[0..3]: \((0..<4).map { String(format: "%.4f", batP[$0]) }.joined(separator: ","))")
+                print("   GEMV 2560->10240 P=\(String(format: "%4d", P)): simd \(String(format: "%7.2f", t))ms | batched \(String(format: "%7.2f", t2))ms (\(String(format: "%.1f", t / max(t2, 1e-9)))x) | rel \(String(format: "%.1e", maxRel))")
+            }
+        }
     }
 
     // ============================ T8: mmap cold page-fault path ============================

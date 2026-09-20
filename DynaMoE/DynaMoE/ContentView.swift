@@ -99,6 +99,42 @@ final class KVCacheManager {
     var allocatedSeqLen: Int = 0
     var allocatedKvBytes: Int = 0
     var activePrecision: KVCachePrecision = .fp16
+    private var device: MTLDevice?
+
+    // FIX #10: snapshots of the GDN recurrent + conv states taken at the moment
+    // the pinned prefix token list is recorded (turn end). When the next turn's
+    // prompt matches the ENTIRE pinned prefix, these restore the O(1) recurrence
+    // state so only the delta tokens need prefilling.
+    private var prefixLinearStateBuffer: MTLBuffer?
+    private var prefixConvStateBuffer: MTLBuffer?
+    private var prefixLinearStateBytes: Int = 0
+    private var prefixConvStateBytes: Int = 0
+    public private(set) var linearStatesPinned: Bool = false
+
+    /// Captures the live GDN recurrent + conv states into prefix snapshots.
+    /// Call at the exact moment the pinned token list is recorded so the state
+    /// corresponds to the pinned token count.
+    func captureLinearStates() {
+        if let live = linearStateBuffer {
+            if prefixLinearStateBuffer == nil || prefixLinearStateBytes < live.length {
+                prefixLinearStateBuffer = device?.makeBuffer(length: live.length, options: .storageModeShared)
+                prefixLinearStateBytes = live.length
+            }
+            if let snap = prefixLinearStateBuffer, snap.length >= live.length {
+                memcpy(snap.contents(), live.contents(), live.length)
+                linearStatesPinned = true
+            }
+        }
+        if let live = convStateBuffer {
+            if prefixConvStateBuffer == nil || prefixConvStateBytes < live.length {
+                prefixConvStateBuffer = device?.makeBuffer(length: live.length, options: .storageModeShared)
+                prefixConvStateBytes = live.length
+            }
+            if let snap = prefixConvStateBuffer, snap.length >= live.length {
+                memcpy(snap.contents(), live.contents(), live.length)
+            }
+        }
+    }
 
     func reset(
         device: MTLDevice,
@@ -115,6 +151,7 @@ final class KVCacheManager {
         let wasAllocated = (kCacheBuffer != nil)
         self.allocatedSeqLen = maxSeqLen
         self.activePrecision = precision
+        self.device = device
 
         let isLing = (config?.isLingModel == true)
         let loops = max(totalLoops, config?.effectiveNumLoops ?? 1)
@@ -212,8 +249,22 @@ final class KVCacheManager {
         if linearStateBuffer == nil || linearStateBuffer!.length < linStateBytes {
             self.linearStateBuffer = device.makeBuffer(length: linStateBytes, options: .storageModeShared)
         }
-        if isLing || config?.hasLinearRecurrence == true || preservePrefixCount == 0 {
+        // FIX #10: with a fully-matched prefix we restore the snapshot instead of
+        // zeroing, so the delta prefill continues from the correct recurrence state.
+        var canRestoreLinear = false
+        if preservePrefixCount > 0 && linearStatesPinned,
+           let snapS = prefixLinearStateBuffer,
+           let liveS = linearStateBuffer,
+           snapS.length >= min(linStateBytes, snapS.length),
+           liveS.length >= min(linStateBytes, snapS.length) {
+            let copyBytes = min(linStateBytes, liveS.length, snapS.length)
+            memcpy(liveS.contents(), snapS.contents(), copyBytes)
+            canRestoreLinear = true
+        } else if isLing || config?.hasLinearRecurrence == true || preservePrefixCount == 0 {
             if let sBuf = linearStateBuffer { memset(sBuf.contents(), 0, min(linStateBytes, sBuf.length)) }
+        }
+        if preservePrefixCount == 0 {
+            linearStatesPinned = false
         }
 
         let convChannels = isLing ? 6144 : max(10240, (config?.effectiveLinearNumValueHeads ?? 32) > 32 ? 10240 : 8192)
@@ -221,7 +272,10 @@ final class KVCacheManager {
         if convStateBuffer == nil || convStateBuffer!.length < convBytes {
             self.convStateBuffer = device.makeBuffer(length: convBytes, options: .storageModeShared)
         }
-        if isLing || config?.hasLinearRecurrence == true || preservePrefixCount == 0 {
+        if canRestoreLinear, let snapC = prefixConvStateBuffer, let liveC = convStateBuffer, snapC.length >= min(convBytes, snapC.length), liveC.length >= min(convBytes, snapC.length) {
+            let copyBytes = min(convBytes, liveC.length, snapC.length)
+            memcpy(liveC.contents(), snapC.contents(), copyBytes)
+        } else if isLing || config?.hasLinearRecurrence == true || preservePrefixCount == 0 {
             if let cBuf = convStateBuffer { memset(cBuf.contents(), 0, min(convBytes, cBuf.length)) }
         }
     }
@@ -3581,6 +3635,7 @@ struct ContentView: View {
         let rmsnormOffsetF16Pipeline: MTLComputePipelineState?
         let gemvBF16Pipeline: MTLComputePipelineState
         let bf16GemvSimdPipeline: MTLComputePipelineState?
+        let bf16GemvBatchedPipeline: MTLComputePipelineState?
         let fp8GemvPipeline: MTLComputePipelineState?
         let mxfp8GemvPipeline: MTLComputePipelineState?
         let mxfp8GemvSimdPipeline: MTLComputePipelineState?
@@ -3771,6 +3826,14 @@ struct ContentView: View {
             if let bGemvSimd = defaultLibrary.makeFunction(name: "bf16_gemv_simd") {
                 bf16GemvSimdPipeline = try device.makeComputePipelineState(function: bGemvSimd)
             } else { bf16GemvSimdPipeline = nil }
+
+            if let bGemvBatched = defaultLibrary.makeFunction(name: "bf16_gemv_batched") {
+                bf16GemvBatchedPipeline = try device.makeComputePipelineState(function: bGemvBatched)
+                print("⚡ [GEMV] bf16_gemv_batched pipeline ready — prefill uses weight-stationary reads")
+            } else {
+                bf16GemvBatchedPipeline = nil
+                print("⚠️ [GEMV] bf16_gemv_batched unavailable — prefill GEMVs fall back to per-token weight reads")
+            }
 
             if let fp8GemvFunc = defaultLibrary.makeFunction(name: "fp8_gemv") {
                 fp8GemvPipeline = try device.makeComputePipelineState(function: fp8GemvFunc)
@@ -4259,7 +4322,17 @@ struct ContentView: View {
             kvPrec = .fp16
         }
         let hasRecurrence = (modelConfig?.isLingModel == true || modelConfig?.hasLinearRecurrence == true || cachedLayers.contains { $0.attentionType == .linearAttention })
-        let prefixTokensReused = hasRecurrence ? 0 : PrefixCacheManager.shared.findCommonPrefix(promptTokenIds: promptTokenIds, sessionId: sessionId)
+        // FIX #10: hybrid (GDN) models now reuse the KV prefix too — but only when
+        // the ENTIRE pinned prefix matches, because the O(1) recurrent states are
+        // only valid at exactly the pinned token count (snapshot is taken at turn
+        // end next to recordTurn).
+        let reuseCandidate = PrefixCacheManager.shared.findCommonPrefix(promptTokenIds: promptTokenIds, sessionId: sessionId)
+        let prefixTokensReused: Int
+        if hasRecurrence {
+            prefixTokensReused = (reuseCandidate > 0 && reuseCandidate == PrefixCacheManager.shared.currentPinnedCount) ? reuseCandidate : 0
+        } else {
+            prefixTokensReused = reuseCandidate
+        }
         KVCacheManager.shared.reset(
             device: device,
             config: modelConfig,
@@ -4455,6 +4528,19 @@ struct ContentView: View {
                         enc.setBytes(&outD, length: MemoryLayout<UInt32>.stride, index: 7)
                         enc.dispatchThreads(MTLSize(width: Int(outDim), height: batchSize, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(outDim), fp8Pipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                     }
+                } else if batchSize > 1, let bBatchedPipe = bf16GemvBatchedPipeline {
+                    // FIX #9: weight-stationary batched GEMV for prefill (P > 1) —
+                    // weight traffic ceil(P/16) instead of P; verified T18b 1.6-2x.
+                    var batchVal = UInt32(batchSize)
+                    enc.setComputePipelineState(bBatchedPipe)
+                    enc.setBuffer(wRaw, offset: 0, index: 0)
+                    enc.setBuffer(inBuf, offset: inOffset, index: 1)
+                    enc.setBuffer(outBuf, offset: outOffset, index: 2)
+                    enc.setBytes(&wOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                    enc.setBytes(&inD, length: MemoryLayout<UInt32>.stride, index: 4)
+                    enc.setBytes(&outD, length: MemoryLayout<UInt32>.stride, index: 5)
+                    enc.setBytes(&batchVal, length: MemoryLayout<UInt32>.stride, index: 6)
+                    enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: (batchSize + 15) / 16, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                 } else if let bSimdPipe = bf16GemvSimdPipeline {
                     enc.setComputePipelineState(bSimdPipe)
                     enc.setBuffer(wRaw, offset: 0, index: 0)
@@ -6409,7 +6495,7 @@ if layer.attnGateProjTensor != nil,
                                     packedPrefetchObservedHits += prefetchHits
                                     packedPrefetchObservedTotal += activeExperts.count
                                 }
-                                if hadTemporalHistory && packedPrefetchObservedTotal >= 64,
+                                if hadTemporalHistory, packedPrefetchAdaptiveEnabled, packedPrefetchObservedTotal >= 64,
                                    Double(packedPrefetchObservedHits) / Double(packedPrefetchObservedTotal) < 0.2 {
                                     packedPrefetchAdaptiveEnabled = false
                                     print("⚠️ [Prefetch] hit rate \(String(format: "%.0f", Double(packedPrefetchObservedHits) / Double(packedPrefetchObservedTotal) * 100))% below 20% after temporal warmup — disabling expert prefetch for this generation")
@@ -8986,7 +9072,7 @@ if layer.attnGateProjTensor != nil,
 
                 if prefillDiagTotal > 0 {
                     let elapsed = max(0.001, CFAbsoluteTimeGetCurrent() - prefillStartTime)
-                    print("[PREFILL-DIAG] Summary: experts=\(prefillDiagTotal) layers=\(prefillDiagLayers) PhaseA=\(String(format: "%.2f", prefillDiagPhaseAMs))s ioWait=\(String(format: "%.2f", prefillDiagIoMs))s gpuWait=\(String(format: "%.2f", prefillDiagGpuMs))s other=\(String(format: "%.2f", max(0, elapsed - prefillDiagPhaseAMs / 1000.0 - prefillDiagIoMs / 1000.0 - prefillDiagGpuMs / 1000.0)))s hitRate=\(String(format: "%.0f", Double(prefillDiagHits) * 100.0 / Double(max(1, prefillDiagTotal))))% prefillTotal=\(String(format: "%.2f", elapsed))s")
+                    print("[PREFILL-DIAG] Summary: P=\(P) startPos=\(startPos) experts=\(prefillDiagTotal) layers=\(prefillDiagLayers) PhaseA=\(String(format: "%.2f", prefillDiagPhaseAMs / 1000.0))s ioWait=\(String(format: "%.2f", prefillDiagIoMs / 1000.0))s gpuWait=\(String(format: "%.2f", prefillDiagGpuMs / 1000.0))s other=\(String(format: "%.2f", max(0, elapsed - prefillDiagPhaseAMs / 1000.0 - prefillDiagIoMs / 1000.0 - prefillDiagGpuMs / 1000.0)))s hitRate=\(String(format: "%.0f", Double(prefillDiagHits) * 100.0 / Double(max(1, prefillDiagTotal))))% prefillTotal=\(String(format: "%.2f", elapsed))s")
                 }
 
                 return true
@@ -10780,6 +10866,10 @@ if layer.attnGateProjTensor != nil,
                         self.sessions[sIdx].messages[mIdx].jetSpecDraftAccepted = (effectiveJetSpec && self.jetSpecTotalDraftAccepted > 0) ? self.jetSpecTotalDraftAccepted : nil
                     }
                 }
+                // FIX #10: snapshot the GDN recurrent + conv states at the exact
+                // moment the pinned token list is recorded, so a fully-matched
+                // prefix next turn can restore them and skip re-prefilling.
+                KVCacheManager.shared.captureLinearStates()
                 PrefixCacheManager.shared.recordTurn(
                     promptTokenIds: promptTokenIds,
                     generatedTokenIds: generatedTokenIds,
