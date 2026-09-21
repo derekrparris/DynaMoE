@@ -81,8 +81,16 @@ public final class GrammarConstrainedSampler {
     // Registered Tool & Parameter sets
     private var registeredToolNames: Set<String> = []
     private var toolParameterKeys: [String: Set<String>] = [:]
+    private var toolRequiredKeys: [String: Set<String>] = [:]
     private var toolTrie = TokenTrieNode()
     private let registrationLock = NSLock()
+
+    // Live call context, refreshed on every updateState so the tag-choice masks
+    // can withhold `</function>` until a tool's required parameters are present.
+    private var currentToolName: String?
+    private var seenParameterKeys: Set<String> = []
+
+    private static let typedParamKeyRegex = try? NSRegularExpression(pattern: "<parameter=\\s*([^\\s>\"]+)", options: [])
 
     // Structural Tag constants
     private let toolCallOpen = "<tool_call>"
@@ -100,6 +108,7 @@ public final class GrammarConstrainedSampler {
         registrationLock.lock()
         registeredToolNames.removeAll()
         toolParameterKeys.removeAll()
+        toolRequiredKeys.removeAll()
         toolTrie = TokenTrieNode()
 
         for tool in tools {
@@ -114,12 +123,22 @@ public final class GrammarConstrainedSampler {
                 }
             }
             toolParameterKeys[name] = paramKeys
+
+            var requiredKeys = Set<String>()
+            if let required = tool.function.parameters["required"]?.value as? [String] {
+                requiredKeys.formUnion(required)
+            } else if let requiredAny = tool.function.parameters["required"]?.value as? [Any] {
+                requiredKeys.formUnion(requiredAny.compactMap { $0 as? String })
+            }
+            toolRequiredKeys[name] = requiredKeys
         }
         registrationLock.unlock()
     }
 
     public func reset() {
         currentState = .outsideToolCall
+        currentToolName = nil
+        seenParameterKeys.removeAll()
     }
 
     // MARK: - Dynamic State Transition
@@ -129,11 +148,15 @@ public final class GrammarConstrainedSampler {
 
         if emittedText.contains(toolCallClose) {
             currentState = .outsideToolCall
+            currentToolName = nil
+            seenParameterKeys.removeAll()
             return
         }
 
         if !emittedText.contains(toolCallOpen) {
             currentState = .outsideToolCall
+            currentToolName = nil
+            seenParameterKeys.removeAll()
             return
         }
 
@@ -146,6 +169,8 @@ public final class GrammarConstrainedSampler {
             if let gtRange = afterFn.range(of: ">") {
                 let fnName = String(afterFn[..<gtRange.lowerBound]).trimmingCharacters(in: .whitespaces)
                 let insideFnBody = String(afterFn[gtRange.upperBound...])
+                currentToolName = fnName
+                seenParameterKeys = Self.parameterKeysTyped(in: insideFnBody)
 
                 // Check parameter state
                 if let pRange = insideFnBody.range(of: paramOpenPrefix, options: .backwards) {
@@ -171,10 +196,27 @@ public final class GrammarConstrainedSampler {
                 }
             } else {
                 currentState = .insideFunctionName(currentName: afterFn)
+                currentToolName = nil
+                seenParameterKeys.removeAll()
             }
         } else {
             currentState = .enteringToolCall(matchedPrefix: toolCallSlice)
+            currentToolName = nil
+            seenParameterKeys.removeAll()
         }
+    }
+
+    /// Parameter keys already opened in a function body, used to decide whether
+    /// the call has satisfied its tool's required arguments yet.
+    private static func parameterKeysTyped(in body: String) -> Set<String> {
+        guard let re = typedParamKeyRegex else { return [] }
+        let ns = body as NSString
+        var keys = Set<String>()
+        re.enumerateMatches(in: body, options: [], range: NSRange(location: 0, length: ns.length)) { match, _, _ in
+            guard let match, match.numberOfRanges > 1 else { return }
+            keys.insert(ns.substring(with: match.range(at: 1)))
+        }
+        return keys
     }
 
     // MARK: - Metal / Accelerate Logit Masking Kernel
@@ -227,7 +269,7 @@ public final class GrammarConstrainedSampler {
                     vocabSize: vocabSize,
                     currentPrefix: canonicalPrefix(matchedPrefix, after: paramClose),
                     tokenDecoder: tokenDecoder,
-                    options: [paramOpenPrefix, functionClose]
+                    options: optionsRequiringRequiredParams([paramOpenPrefix, functionClose])
                 )
             }
 
@@ -280,7 +322,7 @@ public final class GrammarConstrainedSampler {
                 // resurrecting the close-tag loop.
                 currentPrefix: canonicalPrefix(matchedPrefix, after: paramClose),
                 tokenDecoder: tokenDecoder,
-                options: [paramOpenPrefix, functionClose]
+                options: optionsRequiringRequiredParams([paramOpenPrefix, functionClose])
             )
 
         case .closingToolCall(let matchedPrefix):
@@ -296,6 +338,17 @@ public final class GrammarConstrainedSampler {
         default:
             return
         }
+    }
+
+    /// Withholds `</function>` while the current tool still has required
+    /// parameters that were never opened, forcing the model to emit them.
+    /// Prevents structurally-legal but semantically-empty calls (e.g. a
+    /// shell_run with no `command`) that the harness must otherwise reject.
+    private func optionsRequiringRequiredParams(_ base: [String]) -> [String] {
+        guard let tool = currentToolName,
+              let required = toolRequiredKeys[tool], !required.isEmpty,
+              !required.isSubset(of: seenParameterKeys) else { return base }
+        return base.filter { $0 != functionClose }
     }
 
     /// Drops everything through the last occurrence of `marker` so tag-choice

@@ -1152,3 +1152,24 @@ Real-world-shape test: 17.7KB page (mostly inline JS/CSS) -> 72 chars (246x).
 The 1.txt incident shape (7290-token suffix from one curl) would compress to
 a ~50-token suffix, i.e. that ~7-minute attention-bound prefill becomes
 sub-second. Remaining lever: batched multi-row prefill attention kernel.
+
+### QA #23 — schema-aware required-parameter enforcement in the tool grammar
+
+2.txt showed the between-tags masks working (4/4 breaks clean, zero cycles,
+zero re-prefills, suffix-only prefills of 414/393/53ms) but exposed a
+semantic hole: the mask legitimately allows `</function>` right after the
+name (some tools take no params), so `<function=shell_run></function>` is
+structurally legal yet carries no `command`. The harness guard
+(hasEmptyRequiredArguments) caught it, skipped execution and the model
+recovered — but the call was wasted.
+
+Fix: registerTools now records each tool's `required` keys (ToolDefinition
+already carried them), updateState tracks the live call context
+(currentToolName + parameter keys already opened, scanned from the function
+body), and the tag-choice masks withhold `</function>` while any required key
+is missing — forcing the model to emit `<parameter=command>` before closing.
+Optional params still omit freely; tools with no required keys and unknown
+tools stay ungated (fail-open; the harness guard remains the backstop).
+Verified: 19 new standalone assertions (gate matrix, body scanning,
+end-to-end empty-call shape from 2.txt) plus the existing 27; full-project
+typecheck clean.
