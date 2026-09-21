@@ -10597,6 +10597,7 @@ if layer.attnGateProjTensor != nil,
                     // 4. Sample Next Token
                     let logitsPtr = logitsBuffer.contents().bindMemory(to: Float.self, capacity: Int(vocabSize))
                     let isGrammarActive = runAgentTools && (UserDefaults.standard.object(forKey: "dynamoe_agent_grammar_masking") == nil ? true : UserDefaults.standard.bool(forKey: "dynamoe_agent_grammar_masking"))
+                    GrammarConstrainedSampler.shared.enforceStructuralTagContinuation = !(modelConfig?.isLingModel == true)
                     let nextToken = sampleNextToken(
                         logits: logitsPtr,
                         vocabSize: Int(vocabSize),

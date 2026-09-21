@@ -73,6 +73,10 @@ public final class GrammarConstrainedSampler {
 
     public private(set) var currentState: GrammarParserState = .outsideToolCall
     public var isEnabled: Bool = true
+    /// Ling/Bailing-native calls put the name right after the open tag with no
+    /// `<function=` wrapper; the tag-choice masks below would fight that format,
+    /// so they only engage for models that use the structural-tag shape.
+    public var enforceStructuralTagContinuation: Bool = true
 
     // Registered Tool & Parameter sets
     private var registeredToolNames: Set<String> = []
@@ -188,6 +192,45 @@ public final class GrammarConstrainedSampler {
         case .outsideToolCall:
             return
 
+        case .enteringToolCall(let matchedPrefix):
+            // Once the tool-call open tag has been emitted, the only legal
+            // continuation is typing `<function=` (then a registered name via
+            // insideFunctionName). Left unconstrained, the model can loop bare
+            // open tags forever (observed: 21 consecutive empty tool calls).
+            if enforceStructuralTagContinuation {
+                applyTagChoiceMask(
+                    logits: logits,
+                    vocabSize: vocabSize,
+                    currentPrefix: matchedPrefix,
+                    tokenDecoder: tokenDecoder,
+                    options: [functionOpenPrefix]
+                )
+            }
+
+        case .enteringParameterTag(let matchedPrefix):
+            // Reached with a function body that has no complete `<parameter=`:
+            // a fresh body, a malformed attempt like `<parameter(names>`, or a
+            // body that already closed with `</function>`. Constrain each case
+            // to its legal continuations instead of leaving the vocab open.
+            guard enforceStructuralTagContinuation else { return }
+            if matchedPrefix.contains(functionClose) {
+                applyTagChoiceMask(
+                    logits: logits,
+                    vocabSize: vocabSize,
+                    currentPrefix: canonicalPrefix(matchedPrefix, after: functionClose),
+                    tokenDecoder: tokenDecoder,
+                    options: [toolCallClose]
+                )
+            } else {
+                applyTagChoiceMask(
+                    logits: logits,
+                    vocabSize: vocabSize,
+                    currentPrefix: canonicalPrefix(matchedPrefix, after: paramClose),
+                    tokenDecoder: tokenDecoder,
+                    options: [paramOpenPrefix, functionClose]
+                )
+            }
+
         case .insideFunctionName(let currentPrefix):
             let allowedTools = registeredToolNames.filter { $0.hasPrefix(currentPrefix) }
             if allowedTools.isEmpty { return }
@@ -228,17 +271,39 @@ public final class GrammarConstrainedSampler {
             }
 
         case .closingFunction(let matchedPrefix):
+            guard enforceStructuralTagContinuation else { return }
             applyTagChoiceMask(
                 logits: logits,
                 vocabSize: vocabSize,
-                currentPrefix: matchedPrefix,
+                // Re-anchor past any spurious extra `</parameter>`: without this
+                // the second close dead-ends the prefix and unmasks the vocab,
+                // resurrecting the close-tag loop.
+                currentPrefix: canonicalPrefix(matchedPrefix, after: paramClose),
                 tokenDecoder: tokenDecoder,
                 options: [paramOpenPrefix, functionClose]
+            )
+
+        case .closingToolCall(let matchedPrefix):
+            guard enforceStructuralTagContinuation else { return }
+            applyTagChoiceMask(
+                logits: logits,
+                vocabSize: vocabSize,
+                currentPrefix: canonicalPrefix(matchedPrefix, after: functionClose),
+                tokenDecoder: tokenDecoder,
+                options: [toolCallClose]
             )
 
         default:
             return
         }
+    }
+
+    /// Drops everything through the last occurrence of `marker` so tag-choice
+    /// masking re-anchors at the latest structural boundary instead of
+    /// dead-ending on already-emitted tags.
+    private func canonicalPrefix(_ prefix: String, after marker: String) -> String {
+        guard let range = prefix.range(of: marker, options: .backwards) else { return prefix }
+        return String(prefix[range.upperBound...])
     }
 
     /// After a parameter value has closed, the only legal continuations are

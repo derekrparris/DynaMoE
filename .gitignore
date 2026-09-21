@@ -79,6 +79,7 @@ build/
 *.cer
 /config.local.json
 DynaMoE Architectural Overview.md
+AGENTS.md
 
 # ==========================================
 # Sparkle auto-update tooling
