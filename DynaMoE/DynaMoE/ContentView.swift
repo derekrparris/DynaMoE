@@ -1453,10 +1453,19 @@ struct ContentView: View {
         guard !trimmed.isEmpty else { return }
         if isGeneratingText {
             print("⏹ [INT] interrupt requested — cancelling current generation and sending a fresh turn")
+            let previous = generationTask
             stopAutoregressiveGeneration()
             Task { @MainActor in
-                // Brief yield to allow the cancelled generation task to release resources cleanly
-                try? await Task.sleep(nanoseconds: 60_000_000)
+                // Wait for the cancelled generation to actually stop instead of
+                // guessing with a fixed delay. Its replacement resets the shared KV
+                // cache here in startAutoregressiveGeneration, and with no prefix to
+                // preserve that reset drops the buffers and allocates fresh ones, so
+                // starting the replacement while the old task is still inside a
+                // kernel dispatch would let that task write into the replacement's
+                // buffers. Both the decode and prefill layer loops check
+                // cancellation at every layer boundary, so this bounds the wait to
+                // one layer (one token during decode).
+                await previous?.value
                 self.handleSendMessage(trimmed)
             }
         } else {

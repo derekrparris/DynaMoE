@@ -1445,16 +1445,10 @@ Fix, one early return plus one generation identity:
   generation. Those sites all shared the same defect; guarding only the flagged
   line would have left three live instances.
 
-Deliberately NOT done: awaiting the previous task before starting the
-replacement. That would be the airtight fix for the KV race, but a cancelled
-task sitting inside `runLayerWisePrefill` does not observe cancellation until it
-returns to the token loop — one measured prefill in this journal ran 419.6s. A
-bounded 60ms race is better than stalling the user's replacement prompt for
-minutes. Residual, documented: while a cancelled task finishes the prefill or
-token it was mid-way through, it still shares KV/working-set state and can write
-`generatedStreamText` for up to one iteration. Closing that properly needs
-cancellation checks inside the prefill loop, or an interrupt path that waits
-with a timeout - both larger changes than this review item.
+Deliberately NOT done here: awaiting the previous task before starting the
+replacement. Written at the time on the belief that a cancelled task sitting
+inside `runLayerWisePrefill` does not observe cancellation until it returns to
+the token loop. **That belief was wrong** — corrected and acted on in QA #30.
 
 Verified: app typecheck clean under the project's real flags. Behaviour is
 observable in the run log; the user should see `⏹ [INT]` followed by
@@ -1507,3 +1501,64 @@ protocol. Revisit only if another caller of the mask hook appears.
 Verified: app typecheck clean under the project's real flags;
 `testGrammarGenerationTokenIsolatesStaleWriters` now also asserts
 `isCurrent` is true for the live token and false for the superseded one.
+
+### QA #30 — replacement generation reset shared KV buffers under a live task
+
+Review (Copilot, High): the generation token isolates grammar/UI bookkeeping but
+not the shared inference buffers. `KVCacheManager.shared.reset` immediately
+before `beginGeneration` can nil, reallocate or copy the singleton KV/state
+buffers while the cancelled detached task is still inside
+`runLayerWisePrefill`/`runTokenForward`, and the replacement then races the old
+task on the same Metal buffers. The 60ms interrupt delay is not a
+synchronization barrier.
+
+Confirmed, and pre-existing rather than introduced by the token change — the
+reset call has always sat there, and the interrupt path has always started the
+replacement on a fixed 60ms guess. Reading `KVCacheManager.reset` shows it is
+worse than a plain race: with `preservePrefixCount == 0` it sets
+`kCacheBuffer`/`vCacheBuffer` to nil and allocates fresh backing, so a task that
+is still mid-layer does not merely touch freed memory, it dispatches against
+whatever the singleton now points at — the replacement's brand new KV cache. The
+`memcpy` prefix-preservation branch additionally copies from the old buffers
+while the old task writes to them.
+
+This is the residual that QA #28 deferred, and the deferral rested on a wrong
+fact. This journal claimed a cancelled task inside `runLayerWisePrefill` does not
+observe cancellation until it returns to the token loop, and cited a 419.6s
+prefill as the cost of waiting. Both layer loops actually check cancellation at
+every layer boundary (`ContentView.swift:5104` decode, `:7400` prefill, plus
+`:9328` on the JetSpec path), so a cancelled task stops dispatching after the
+current layer. The 419.6s figure was the whole 40-layer prefill, not the
+remaining work. Corrected here.
+
+Fix: the interrupt path now waits for the previous generation to actually finish
+instead of sleeping for 60ms — `let previous = generationTask` captured before
+`stopAutoregressiveGeneration()` nils it, then `await previous?.value` before
+`handleSendMessage`. Because the layer loops bail at the next boundary this is
+bounded by one layer, which is one token during decode (the common interrupt)
+and the worst case is a single layer of a very large prefill. The await
+suspends rather than blocking the main actor, so the old task's own
+`await MainActor.run` hops still complete.
+
+Audited the other paths that reach the same reset, and they are already
+correctly ordered, so no identity machinery was needed there:
+`dequeueAndRunNextPromptIfNeeded` and the agent-continuation sites are all called
+from inside the outgoing task's finalization, which is past its buffer work, and
+the replacement starts on a later main-actor hop. Sends from the UI cannot start
+a concurrent generation either: `ChatDetailView` routes Enter to the queue and
+Cmd+Enter to `interruptAndSendMessage` while generating, and the send button is
+only built in the `else` branch of its `isGenerating` check
+(`ChatDetailView.swift:738`), so `handleSendMessage` is unreachable mid-run. No
+defensive guard was added to it — a synchronous guard could not fix the race
+anyway, since only an await can postpone the reset.
+
+Not addressed: a Metal dispatch cannot be preempted, so the wait floor is one
+layer. During a huge-prefill interrupt that is seconds rather than milliseconds.
+That is the right trade against silently corrupting the KV cache, but it is a
+real responsiveness cost and the reason to keep an eye on interrupt latency in
+large-prefill runs.
+
+Verified: app typecheck clean under the project's real flags. Watch for
+`⏹ [INT] interrupt requested` followed by the replacement's own
+`⚡ [GEMV]` pipeline-ready pair only after the previous generation's
+`⏹ [GEN] ended ... reason=cancelled` line.
