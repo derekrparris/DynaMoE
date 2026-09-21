@@ -6500,9 +6500,11 @@ final class DynaMoETests: XCTestCase {
         XCTAssertTrue(historyTurn.hasSuffix("<|role_end|>"))
         XCTAssertFalse(historyTurn.contains("<role>ASSISTANT</role>"))
 
-        // Ling action continuation nudges with the native call shape.
+        // Ling action continuation nudges with the native call shape. Framed as
+        // SYSTEM so the recovered-action nudge is not attributed to the user.
         let continuation = harness.formatLingActionContinuationTurn(thinkingEnabled: true)
-        XCTAssertTrue(continuation.contains("<role>HUMAN</role>"))
+        XCTAssertTrue(continuation.contains("<role>SYSTEM</role>"))
+        XCTAssertFalse(continuation.contains("<role>HUMAN</role>"))
         XCTAssertTrue(continuation.contains("<arg_key>path</arg_key>"))
         XCTAssertTrue(continuation.hasSuffix("<role>ASSISTANT</role>\n<think>"))
     }
@@ -6528,6 +6530,92 @@ final class DynaMoETests: XCTestCase {
         } else {
             XCTFail("Expected insideParameterValue state but got \(sampler.currentState)")
         }
+    }
+
+    /// The live grammar context is shared by every generation, so a cancelled
+    /// generation unwinding in parallel must not be able to write into its
+    /// successor's state (and must not clobber the required-parameter gate).
+    func testGrammarGenerationTokenIsolatesStaleWriters() {
+        let sampler = GrammarConstrainedSampler.shared
+        sampler.registerTools(AgentHarness.shared.availableToolDefinitions)
+
+        // Generation one opens a tool call; generation two then starts and resets
+        // the shared context.
+        let firstToken = sampler.beginGeneration()
+        sampler.updateState(emittedText: "<tool_call><function=file_read><parameter=path>a.txt")
+
+        let secondToken = sampler.beginGeneration()
+        XCTAssertNotEqual(firstToken, secondToken, "beginGeneration must issue a new token")
+        XCTAssertEqual(sampler.currentState, .outsideToolCall, "starting a generation clears state")
+
+        // Masking is exercised with an empty vocab: only the state transition and
+        // the token guard matter here.
+        var logits = [Float](repeating: 0, count: 1)
+        func apply(_ text: String, token: UInt64) {
+            logits.withUnsafeMutableBufferPointer { buf in
+                sampler.updateStateAndApplyLogitMask(
+                    emittedText: text,
+                    logits: buf.baseAddress!,
+                    vocabSize: 0,
+                    tokenDecoder: { _ in nil },
+                    enforceStructuralTagContinuation: true,
+                    token: token
+                )
+            }
+        }
+
+        apply("<tool_call><function=shell_run><parameter=command>ls", token: secondToken)
+        if case .insideParameterValue(let tool, let param) = sampler.currentState {
+            XCTAssertEqual(tool, "shell_run")
+            XCTAssertEqual(param, "command")
+        } else {
+            XCTFail("Expected insideParameterValue but got \(sampler.currentState)")
+        }
+
+        // A late write from the cancelled first generation is dropped.
+        apply("<tool_call><function=file_read><parameter=path>a.txt", token: firstToken)
+        if case .insideParameterValue(let tool, _) = sampler.currentState {
+            XCTAssertEqual(tool, "shell_run", "stale generation must not overwrite the live state")
+        } else {
+            XCTFail("Stale write changed the state: \(sampler.currentState)")
+        }
+
+        sampler.reset()
+        XCTAssertEqual(sampler.currentState, .outsideToolCall)
+    }
+
+    /// Pure-logic coverage for the uncalled-action nudge. A false positive here
+    /// injects a synthetic turn and the model answers its own closing message,
+    /// while a false negative drops a narrated action the model never executed.
+    func testUncalledActionIntentDetection() {
+        let harness = AgentHarness.shared
+        func detect(_ content: String, thinking: String? = nil) -> Bool {
+            harness.detectUncalledActionIntent(content: content, thinking: thinking)
+        }
+
+        // Genuine narrated actions.
+        XCTAssertTrue(detect("I'll start by reading the design doc and then summarize."))
+        XCTAssertTrue(detect("Let me check the logs first."))
+        XCTAssertTrue(detect("First, I'll inspect the config file."))
+        XCTAssertTrue(detect("I should read the file before answering. Let me start by reading it."))
+        XCTAssertTrue(detect("Let me look into the charging curve."))
+        XCTAssertTrue(detect("Sure, one moment.", thinking: "Let me first look at the router code."))
+
+        // A pleasantry elsewhere in the turn must not mask a real action.
+        XCTAssertTrue(detect("Happy to help — I'll read the config now."))
+        XCTAssertTrue(detect("Glad to help. Let me check the logs."))
+
+        // Closing pleasantries and ordinary prose must not fire.
+        XCTAssertFalse(detect("You're welcome! Let me know if there's anything else you want to look into — happy to help."))
+        XCTAssertFalse(detect("Happy to help — let me know if you'd like me to look into the charging curve."))
+        XCTAssertFalse(detect("Let me know if you want me to look into it."))
+        XCTAssertFalse(detect("The EPA ranges look at combined cycle numbers."))
+        XCTAssertFalse(detect("You can check the docs for details."))
+        XCTAssertFalse(detect("No problem at all!"))
+
+        // Long turns are out of scope for the nudge.
+        let long = String(repeating: "A sentence about the car. ", count: 20) + "I'll start by reading it."
+        XCTAssertFalse(detect(long))
     }
 
     func testControlledProcessRunner() async throws {
@@ -6606,6 +6694,15 @@ final class DynaMoETests: XCTestCase {
         XCTAssertTrue(responseTurn.contains("<tool_response>"))
         XCTAssertTrue(responseTurn.contains("# DynaMoE"))
         XCTAssertTrue(responseTurn.contains("</tool_response>"))
+
+        // 4. Action-continuation nudge is a system directive, not a user turn, so
+        //    a recovered action is not answered as if the user had spoken.
+        let continuationTurn = AgentHarness.shared.formatActionContinuationTurn(
+            includeThinkSuffix: true
+        )
+        XCTAssertTrue(continuationTurn.contains("<|im_start|>system"))
+        XCTAssertFalse(continuationTurn.contains("<|im_start|>user"))
+        XCTAssertTrue(continuationTurn.hasSuffix("<|im_start|>assistant\n thinking"))
         XCTAssertTrue(responseTurn.contains("<|im_start|>assistant\n<think>"))
     }
 

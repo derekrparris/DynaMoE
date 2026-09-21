@@ -1273,3 +1273,103 @@ for Ling — matching the framing the app already uses for its system prompt
 (`ContentView.swift:1706`, `:3546`, `:3513`). This is a behavior change, so
 treat any change in recovery rates as the thing to watch; the detector fix
 means the path now only runs on genuine narrated intents.
+
+Review follow-up (Copilot, High): `testLingNativePromptAndToolResponseFormatting`
+still asserted `continuation.contains("<role>HUMAN</role>")` at
+`DynaMoETests.swift:6505`, so the role change would have failed the suite.
+Valid catch. Updated to assert `<role>SYSTEM</role>` and added an explicit
+`XCTAssertFalse(... "<role>HUMAN</role>")` so the intent is locked. The ChatML
+formatter had no coverage at all, so `testAgentMultiTurnToolCallParsingAndContinuation`
+now also asserts `formatActionContinuationTurn` emits `<|im_start|>system` with
+no `<|im_start|>user`. `formatToolResponseTurn` was deliberately not changed —
+tool results stay user-role — and its assertion is untouched. Both tests are
+pure formatter/parser checks with no model dependency, so they run on any host.
+
+Review follow-up (Copilot, Medium): the pleasantry veto ran after the
+commitment-phrase check but *before* the cue+action check, so any turn that
+paired a pleasantry with a real narrated action was suppressed — "Happy to help
+— I'll read the config now." returned false. That is a regression I introduced,
+and it is the expensive direction: a false negative drops a narrated action the
+model never executed, which is the exact failure the detector exists to catch.
+Before the rewrite the old unconditional pattern list would have matched "read
+the" and fired.
+
+Fix: the cue+action check now runs before any wrap-up consideration, and the
+pleasantry veto is deleted rather than reordered. Reordering alone would have
+left the veto unreachable — once the cue+action test fails the answer is false
+either way — so keeping it would have been dead code. The veto also turned out
+to be unnecessary: the original regression is already fenced off because its
+action words ("look into") have no first-person cue in front of them, since
+"let me know" is excluded as a cue. Confirmed by test: the exact regression
+string, "Let me know if you want me to look into it", and "The EPA ranges look
+at combined cycle numbers" all still return false without any veto.
+
+Documented cost: a conditional offer ("I'll look into it if you want") now
+counts as an intent, because the cue+action pair is genuinely present. That is
+one cheap extra turn, and with the system framing from earlier in this entry it
+reads as a resumed action rather than a phantom user question — a better trade
+than the false negatives the blanket veto caused. Recorded in the code comment
+on the check so the next reviewer sees it was deliberate.
+
+Verified: standalone suite now 25 cases including four pleasantry-plus-action
+positives and the conditional-offer cost; added
+`testUncalledActionIntentDetection` to the XCTest suite so the detector has
+real coverage (pure logic, no model dependency, runs on any host). App
+typecheck clean under the project's real flags.
+
+### QA #27 — grammar masking state is shared across generations (review follow-up)
+
+Review (Copilot, High): the live-context fields added for the required-parameter
+gate (`currentToolName`, `seenParameterKeys`) are shared through
+`GrammarConstrainedSampler.shared`, mutated from the detached generation task
+and reset on the main actor with no synchronization.
+
+Verified, and worse than the comment implies in one respect. The app target sets
+`SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, so the sampler was implicitly
+`@MainActor` while the generation loop calls it from
+`Task.detached` (`ContentView.swift:4442`) without `await`. That is an unchecked
+isolation violation that Swift 5 mode only warns about, so nothing enforced
+mutual exclusion at runtime — the state machine really was unsynchronized.
+
+A second, purely logical hazard sits on top: cancellation gives a previous
+generation up to one more token iteration to unwind, and a token takes ~350ms on
+the reference machine while the requeue path waits only ~80ms. During that
+window the old task keeps calling `updateState` with its own accumulated text,
+so the new generation's state could be overwritten by its predecessor.
+
+Fix:
+
+- `nonisolated` on `GrammarConstrainedSampler` and `TokenTrieNode` — states the
+  real threading contract instead of claiming main-actor isolation that was
+  never honoured. This is what the compiler was trying to tell us.
+- `stateLock` (`NSRecursiveLock`) guards every mutable grammar field;
+  `currentState`, `isEnabled` and `enforceStructuralTagContinuation` are now
+  lock-backed accessors, so off-actor reads and writes are synchronized.
+- `beginGeneration()` clears the context and issues a monotonically increasing
+  token. `updateStateAndApplyLogitMask(..., token:)` advances the state machine
+  and applies the mask under a single lock hold, and drops any write bearing a
+  stale token. A cancelled generation can no longer clobber its successor, and
+  state + mask can no longer be interleaved by another task.
+- `applyLogitMaskLocked` also holds `registrationLock` for its duration:
+  `registerTools` rebuilds the schema in place (removeAll + refill), and a torn
+  read mid-rebuild silently dropped the tool-name mask for a token. Lock order
+  is always stateLock then registrationLock; `registerTools` never takes
+  stateLock, so the ordering cannot invert.
+
+Blast radius is unchanged from QA #23/#25: this is prevention, and the harness's
+`hasEmptyRequiredArguments` guard remains the backstop, so the worst case was
+always a wasted call plus a recovered error turn, not a wrong result.
+
+Verified: new test `testGrammarGenerationTokenIsolatesStaleWriters` drives two
+generations through the shared sampler and asserts the second generation's state
+survives a late write carrying the first generation's token, that
+`beginGeneration` issues distinct tokens, and that it clears the context. App
+typecheck clean under the project's real flags; new `nonisolated` shape probed
+in isolation to confirm it produces no actor-isolation diagnostics.
+
+Tooling caveat found while verifying this: `xcrun swiftc -typecheck` on the app
+globs only reports the `no such module 'Sparkle'` error and then stops, so it
+suppresses every warning in every other file — including exactly the isolation
+warnings this review is about. Pass the project's flags
+(`-swift-version 5 -default-isolation MainActor`) and treat a clean CLI
+typecheck as "no errors", not "no warnings".

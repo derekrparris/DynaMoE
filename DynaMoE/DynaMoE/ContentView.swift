@@ -4413,7 +4413,7 @@ struct ContentView: View {
             precision: kvPrec,
             preservePrefixCount: prefixTokensReused
         )
-        GrammarConstrainedSampler.shared.reset()
+        let grammarGenerationToken = GrammarConstrainedSampler.shared.beginGeneration()
 
         isGeneratingText = true
         generatingSessionId = sessionId ?? selectedSessionId ?? sessions.first?.id
@@ -10637,7 +10637,6 @@ if layer.attnGateProjTensor != nil,
                     // 4. Sample Next Token
                     let logitsPtr = logitsBuffer.contents().bindMemory(to: Float.self, capacity: Int(vocabSize))
                     let isGrammarActive = runAgentTools && (UserDefaults.standard.object(forKey: "dynamoe_agent_grammar_masking") == nil ? true : UserDefaults.standard.bool(forKey: "dynamoe_agent_grammar_masking"))
-                    GrammarConstrainedSampler.shared.enforceStructuralTagContinuation = !(modelConfig?.isLingModel == true)
                     let nextToken = sampleNextToken(
                         logits: logitsPtr,
                         vocabSize: Int(vocabSize),
@@ -10650,8 +10649,14 @@ if layer.attnGateProjTensor != nil,
                         presencePenalty: presPen,
                         eosTokenIds: modelConfig?.effectiveEosTokenIds.map { UInt32($0) } ?? [eosTokenId],
                         grammarMask: isGrammarActive && !UserDefaults.standard.bool(forKey: "dynamoe_disable_grammar") ? { maskLogits, maskVocab in
-                            GrammarConstrainedSampler.shared.updateState(emittedText: accumulatedDecodedText)
-                            GrammarConstrainedSampler.shared.applyLogitMask(logits: maskLogits, vocabSize: maskVocab, tokenDecoder: { try? tokenizer.decode(ids: [$0]) })
+                            GrammarConstrainedSampler.shared.updateStateAndApplyLogitMask(
+                                emittedText: accumulatedDecodedText,
+                                logits: maskLogits,
+                                vocabSize: maskVocab,
+                                tokenDecoder: { try? tokenizer.decode(ids: [$0]) },
+                                enforceStructuralTagContinuation: !(modelConfig?.isLingModel == true),
+                                token: grammarGenerationToken
+                            )
                         } : nil
                     )
                     if tokensGenerated < 10 && DebugFlags.tokenStepLogging {

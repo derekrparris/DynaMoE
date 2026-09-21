@@ -3142,19 +3142,14 @@ public final class AgentHarness {
         "i'm going to start", "i am going to start"
     ]
 
-    /// Wrap-up language. A closing pleasantry is never a promise to act, even
-    /// when it borrows action words ("let me know if you want to look into it").
-    private static let closingPleasantryRegex = try? NSRegularExpression(
-        pattern: "\\b(?:let me know|happy to help|happy to look|glad to help|feel free to|if you'd like|if you want|anything else|you're welcome|no problem|don't hesitate|just ask)\\b",
-        options: [.caseInsensitive]
-    )
-
     /// Action vocabulary counts only when a first-person commitment cue sits
     /// just before it in the same clause. Bare action nouns appear constantly in
-    /// ordinary prose ("you can check the docs", "want to look into that"?),
+    /// ordinary prose ("you can check the docs", "want to look into that"),
     /// which previously fired a wasted continuation turn with no action intended.
     /// "let me know" is excluded as a cue, and the window is tight so a cue in
-    /// one clause cannot reach an action word in a later one.
+    /// one clause cannot reach an action word in a later one. This is also what
+    /// fences off the closing-pleasantery false positive, so no separate veto is
+    /// applied - see `detectUncalledActionIntent`.
     private static let commitmentActionRegex = try? NSRegularExpression(
         pattern: "\\b(?:i'll|i will|i'm going to|i am going to|let me(?! know)|we'll|we will|i should|i need to)\\b[^.!?\\n]{0,30}?\\b(?:take a look at|look at (?:the|this)|look into|look up|read (?:the|this)|start by reading|inspect(?:ing)? the|check(?:ing)? the|examine the|add (?:a |the )?column|edit(?:ing)? the|modif(?:y|ying) the|update the|change the|search (?:for|the web)|grep for|run the|execute the|create the|write (?:to|the)|open the|fetch the|download the|save the|summarize the)\\b",
         options: [.caseInsensitive]
@@ -3179,13 +3174,11 @@ public final class AgentHarness {
             }
         }
 
-        // 2. A reply that wraps up is conversational, not a promise to act.
-        if let re = Self.closingPleasantryRegex,
-           re.firstMatch(in: contentLower, options: [], range: NSRange(contentLower.startIndex..., in: contentLower)) != nil {
-            return false
-        }
-
-        // 3. Otherwise the action vocabulary needs a commitment cue in front.
+        // 2. Otherwise the action vocabulary needs a first-person commitment cue
+        // just in front of it, in the same clause. Checked BEFORE any wrap-up
+        // wording: "Happy to help — I'll read the config now" is a genuine
+        // narrated action, and a pleasantry elsewhere in the turn must not mask
+        // it.
         if let re = Self.commitmentActionRegex {
             for text in [contentLower, thinkingLower] where !text.isEmpty {
                 if re.firstMatch(in: text, options: [], range: NSRange(text.startIndex..., in: text)) != nil {
@@ -3194,6 +3187,14 @@ public final class AgentHarness {
             }
         }
 
+        // 3. Nothing to act on. A wrapping-up turn never gets here with a live
+        // cue, because its action words have no first-person commitment in front
+        // ("let me know" is excluded as a cue, which is what stopped the closing
+        // pleasantry from reading as a promise), so a separate pleasantry veto is
+        // dead weight. Dropping it costs only the conditional offer ("I'll look
+        // into it if you want"), which is nudged into one cheap extra turn that
+        // reads as a resumed action rather than a phantom user question - a
+        // better trade than reviving the false negatives a blanket veto caused.
         return false
     }
 

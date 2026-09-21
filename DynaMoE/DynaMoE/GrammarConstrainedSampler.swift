@@ -27,7 +27,9 @@ public enum GrammarParserState: Equatable {
 
 // MARK: - Token Prefix Trie for High-Speed Logit Masking
 
-public final class TokenTrieNode {
+/// `nonisolated` for the same reason as the sampler: it is a pure data
+/// structure owned and walked by the nonisolated grammar masking path.
+nonisolated public final class TokenTrieNode {
     public var isTerminal: Bool = false
     public var children: [Character: TokenTrieNode] = [:]
     public var terminalTokenIds: Set<UInt32> = []
@@ -68,15 +70,49 @@ public final class TokenTrieNode {
 
 // MARK: - Grammar-Constrained Sampler
 
-public final class GrammarConstrainedSampler {
+/// Thread-safe by explicit locking, not by actor isolation: the live state
+/// machine is driven from the detached generation task
+/// (`ContentView.startAutoregressiveGeneration`), so `nonisolated` states the
+/// real contract and `stateLock` provides the mutual exclusion.
+nonisolated public final class GrammarConstrainedSampler {
     public static let shared = GrammarConstrainedSampler()
 
-    public private(set) var currentState: GrammarParserState = .outsideToolCall
-    public var isEnabled: Bool = true
+    private var _currentState: GrammarParserState = .outsideToolCall
+    public var currentState: GrammarParserState {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _currentState
+    }
+
+    private var _isEnabled: Bool = true
+    public var isEnabled: Bool {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return _isEnabled
+        }
+        set {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            _isEnabled = newValue
+        }
+    }
     /// Ling/Bailing-native calls put the name right after the open tag with no
     /// `<function=` wrapper; the tag-choice masks below would fight that format,
     /// so they only engage for models that use the structural-tag shape.
-    public var enforceStructuralTagContinuation: Bool = true
+    private var _enforceStructuralTagContinuation: Bool = true
+    public var enforceStructuralTagContinuation: Bool {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return _enforceStructuralTagContinuation
+        }
+        set {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            _enforceStructuralTagContinuation = newValue
+        }
+    }
 
     // Registered Tool & Parameter sets
     private var registeredToolNames: Set<String> = []
@@ -84,6 +120,14 @@ public final class GrammarConstrainedSampler {
     private var toolRequiredKeys: [String: Set<String>] = [:]
     private var toolTrie = TokenTrieNode()
     private let registrationLock = NSLock()
+
+    /// Guards every piece of mutable grammar state. Recursive because the locked
+    /// internals read the public accessors above.
+    private let stateLock = NSRecursiveLock()
+    /// Bumped by `beginGeneration`. A generation task carries the token it was
+    /// issued; writes bearing a stale token are dropped, so a cancelled
+    /// generation unwinding in parallel cannot clobber its successor's state.
+    private var generationToken: UInt64 = 0
 
     // Live call context, refreshed on every updateState so the tag-choice masks
     // can withhold `</function>` until a tool's required parameters are present.
@@ -133,26 +177,66 @@ public final class GrammarConstrainedSampler {
         registrationLock.unlock()
     }
 
-    public func reset() {
-        currentState = .outsideToolCall
+    /// Starts a generation: clears the live context and returns the token that
+    /// `updateStateAndApplyLogitMask` requires. A cancelled generation unwinding
+    /// in parallel still holds its old token, so its late `updateState` calls are
+    /// dropped instead of corrupting the new generation's required-param gate.
+    @discardableResult
+    public func beginGeneration() -> UInt64 {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        generationToken &+= 1
+        _currentState = .outsideToolCall
         currentToolName = nil
         seenParameterKeys.removeAll()
+        return generationToken
+    }
+
+    public func reset() {
+        _ = beginGeneration()
     }
 
     // MARK: - Dynamic State Transition
 
     public func updateState(emittedText: String) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        updateStateLocked(emittedText: emittedText)
+    }
+
+    /// Updates the shared state machine, refreshes the structural-tag setting and
+    /// applies the mask for the resulting state under a single lock hold, so the
+    /// three cannot be interleaved by another generation. Writes carrying a stale
+    /// `token` are discarded.
+    public func updateStateAndApplyLogitMask(
+        emittedText: String,
+        logits: UnsafeMutablePointer<Float>,
+        vocabSize: Int,
+        tokenDecoder: (UInt32) -> String?,
+        enforceStructuralTagContinuation: Bool,
+        token: UInt64
+    ) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard token == generationToken else { return }
+        _enforceStructuralTagContinuation = enforceStructuralTagContinuation
+        updateStateLocked(emittedText: emittedText)
+        applyLogitMaskLocked(logits: logits, vocabSize: vocabSize, tokenDecoder: tokenDecoder)
+    }
+
+    /// Caller must hold `stateLock`.
+    private func updateStateLocked(emittedText: String) {
         guard isEnabled else { return }
 
         if emittedText.contains(toolCallClose) {
-            currentState = .outsideToolCall
+            _currentState = .outsideToolCall
             currentToolName = nil
             seenParameterKeys.removeAll()
             return
         }
 
         if !emittedText.contains(toolCallOpen) {
-            currentState = .outsideToolCall
+            _currentState = .outsideToolCall
             currentToolName = nil
             seenParameterKeys.removeAll()
             return
@@ -179,26 +263,26 @@ public final class GrammarConstrainedSampler {
                         if let cRange = afterValue.range(of: paramClose) {
                             let afterClose = String(afterValue[cRange.upperBound...])
                             if let fRange = afterClose.range(of: functionClose, options: .backwards) {
-                                currentState = .closingToolCall(matchedPrefix: String(afterClose[fRange.upperBound...]))
+                                _currentState = .closingToolCall(matchedPrefix: String(afterClose[fRange.upperBound...]))
                             } else {
-                                currentState = .closingFunction(matchedPrefix: afterClose)
+                                _currentState = .closingFunction(matchedPrefix: afterClose)
                             }
                         } else {
-                            currentState = .insideParameterValue(toolName: fnName, paramKey: pKey)
+                            _currentState = .insideParameterValue(toolName: fnName, paramKey: pKey)
                         }
                     } else {
-                        currentState = .insideParameterName(toolName: fnName, currentKey: afterP)
+                        _currentState = .insideParameterName(toolName: fnName, currentKey: afterP)
                     }
                 } else {
-                    currentState = .enteringParameterTag(matchedPrefix: insideFnBody)
+                    _currentState = .enteringParameterTag(matchedPrefix: insideFnBody)
                 }
             } else {
-                currentState = .insideFunctionName(currentName: afterFn)
+                _currentState = .insideFunctionName(currentName: afterFn)
                 currentToolName = nil
                 seenParameterKeys.removeAll()
             }
         } else {
-            currentState = .enteringToolCall(matchedPrefix: toolCallSlice)
+            _currentState = .enteringToolCall(matchedPrefix: toolCallSlice)
             currentToolName = nil
             seenParameterKeys.removeAll()
         }
@@ -233,9 +317,24 @@ public final class GrammarConstrainedSampler {
         vocabSize: Int,
         tokenDecoder: (UInt32) -> String?
     ) {
-        guard isEnabled else { return }
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        applyLogitMaskLocked(logits: logits, vocabSize: vocabSize, tokenDecoder: tokenDecoder)
+    }
 
-        switch currentState {
+    /// Caller must hold `stateLock`. Also takes `registrationLock` for the
+    /// duration: `registerTools` rebuilds the schema in place, and a torn read
+    /// mid-rebuild would let the tool-name mask silently drop out for a token.
+    private func applyLogitMaskLocked(
+        logits: UnsafeMutablePointer<Float>,
+        vocabSize: Int,
+        tokenDecoder: (UInt32) -> String?
+    ) {
+        guard isEnabled else { return }
+        registrationLock.lock()
+        defer { registrationLock.unlock() }
+
+        switch _currentState {
         case .outsideToolCall:
             return
 
