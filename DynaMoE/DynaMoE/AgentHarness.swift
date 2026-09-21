@@ -3705,11 +3705,11 @@ public final class AgentHarness {
     /// tag density and HTML-vocabulary tags, so JSON, XML data, and shell text
     /// never reach the conversion path.
     public static func looksLikeHTML(_ text: String) -> Bool {
+        if text.range(of: "<\\?xml", options: [.regularExpression, .caseInsensitive]) != nil { return false }
         if text.range(of: "<!doctype html", options: [.regularExpression, .caseInsensitive]) != nil { return true }
         if text.range(of: "<html[\\s>]", options: [.regularExpression, .caseInsensitive]) != nil { return true }
         if text.range(of: "<body[\\s>]", options: [.regularExpression, .caseInsensitive]) != nil { return true }
         guard text.utf8.count > 512 else { return false }
-        if text.range(of: "<\\?xml", options: [.regularExpression, .caseInsensitive]) != nil { return false }
         guard let re = htmlTagRegex, let vocab = htmlVocabRegex else { return false }
         let tagCount = re.numberOfMatches(in: text, options: [], range: NSRange(text.startIndex..., in: text))
         guard tagCount >= 12 else { return false }
