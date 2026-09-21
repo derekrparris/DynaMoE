@@ -3671,9 +3671,17 @@ public final class AgentHarness {
         pattern: "(?m)^[ \\t]*(?:(?:skip to(?: main)? content)|share|menu|search(?: button)?|sign (?:in|up)|log (?:in|out)|advertisement)[ \\t]*$",
         options: [.caseInsensitive]
     )
-    private static let htmlNoisePhraseRegex = try? NSRegularExpression(
-        pattern: "(?i)(?:skip to(?: main)? content|advertisement|sign (?:in|up)|log (?:in|out))",
-        options: []
+    private static let htmlAnchorRegex = try? NSRegularExpression(
+        pattern: "<a\\b[^>]*>(.*?)</a>",
+        options: [.dotMatchesLineSeparators, .caseInsensitive]
+    )
+    /// Boilerplate phrases are removed only when they constitute an ENTIRE link
+    /// span (navigation), never as words inside prose, commands, or code. The
+    /// anchor-delimiting step tags link text with bracket sentinels the generic
+    /// tag stripper cannot produce.
+    private static let htmlNoiseLinkRegex = try? NSRegularExpression(
+        pattern: "⟦\\s*(?:(?:skip to(?: main)? content)|share|menu|search(?: button)?|sign (?:in|up)|log (?:in|out)|advertisement)\\s*⟧",
+        options: [.caseInsensitive]
     )
 
     private static let htmlVocabRegex = try? NSRegularExpression(
@@ -3709,19 +3717,26 @@ public final class AgentHarness {
             s = re.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: " ")
         }
 
-        // 2. Newlines at block boundaries so text does not glue together.
+        // 2. Mark navigation link spans before tags are stripped, so boilerplate
+        //    removal can be restricted to link text instead of matching words
+        //    anywhere in the document (prose and code stay untouched).
+        if let re = htmlAnchorRegex {
+            s = re.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: " ⟦$1⟧ ")
+        }
+
+        // 3. Newlines at block boundaries so text does not glue together.
         let blockClosers = ["</p>", "</div>", "</li>", "</tr>", "</ul>", "</ol>", "</table>", "</section>", "</article>", "</header>", "</footer>", "</nav>", "</blockquote>", "</pre>", "</h1>", "</h2>", "</h3>", "</h4>", "</h5>", "</h6>", "</dd>", "</dt>", "<br>", "<br/>", "<br />", "<hr>", "<hr/>", "<hr />"]
         for closer in blockClosers {
             s = s.replacingOccurrences(of: closer, with: "\n", options: .caseInsensitive)
         }
 
-        // 3. Strip every remaining tag (replaced with a space so inline
+        // 4. Strip every remaining tag (replaced with a space so inline
         //    siblings like nav links stay separate words).
         if let re = htmlTagRegex {
             s = re.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: " ")
         }
 
-        // 4. Decode entities: numeric first (covers the long tail), then the
+        // 5. Decode entities: numeric first (covers the long tail), then the
         //    common named set.
         if let re = htmlNumericEntityRegex {
             let ns = NSMutableString(string: s)
@@ -3745,11 +3760,12 @@ public final class AgentHarness {
             s = s.replacingOccurrences(of: entity, with: replacement)
         }
 
-        // 5. Drop boilerplate: unambiguous phrases anywhere, then common
-        //    single-word noise lines, then collapse whitespace runs.
-        if let re = htmlNoisePhraseRegex {
+        // 6. Drop boilerplate: exact-match link spans, then common single-word
+        //    noise lines, then collapse whitespace runs.
+        if let re = htmlNoiseLinkRegex {
             s = re.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: " ")
         }
+        s = s.replacingOccurrences(of: "⟦", with: " ").replacingOccurrences(of: "⟧", with: " ")
         if let re = htmlNoiseLineRegex {
             s = re.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: "")
         }

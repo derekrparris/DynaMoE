@@ -1173,3 +1173,23 @@ tools stay ungated (fail-open; the harness guard remains the backstop).
 Verified: 19 new standalone assertions (gate matrix, body scanning,
 end-to-end empty-call shape from 2.txt) plus the existing 27; full-project
 typecheck clean.
+
+### QA #24 — boilerplate removal restricted to navigation links (review follow-up)
+
+An external review flagged that the unanchored boilerplate pass removed
+"sign in" / "log in" / "advertisement" anywhere in a converted page, silently
+mutating legitimate prose, commands, and code examples.
+
+Compromise shipped: boilerplate is now defined structurally, not lexically.
+`<a>...</a>` spans are bracketed with sentinels during conversion, and a noise
+phrase is dropped only when it constitutes an ENTIRE link span (or an entire
+line, as before). Prose sentences keep their words; a descriptive link like
+"Sign in with your company SSO" is kept; real nav items ("Sign in", "Share",
+"Skip to main content", "advertisement" as link text) still disappear, so the
+original problem (nav items concatenated into one long line after tag
+stripping) stays fixed. Sentinels never reach the output.
+
+Verified: suite now 40+ assertions, incl. prose/code survival, nav removal,
+partial-link retention, and sentinel-leak checks. Typecheck clean.
+Alternative if strict review parity is preferred: delete the link-span pass
+entirely and keep line-scoped removal only.
