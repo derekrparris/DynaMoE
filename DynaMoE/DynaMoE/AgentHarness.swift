@@ -130,7 +130,7 @@ public extension AgentTool {
 public final class ShellRunTool: AgentTool {
     public let definition = ToolDefinition(
         name: "shell_run",
-        description: "Executes shell commands on the local macOS terminal via zsh. Use this to run scripts, compilers, git, or check system state. Output is captured and returned.",
+        description: "Executes shell commands on the local macOS terminal via zsh. Use this to run scripts, compilers, git, or check system state. Output is captured and returned. When fetching web pages, prefer raw text endpoints (e.g. raw.githubusercontent.com/OWNER/REPO/HEAD/path) over rendered HTML pages; large HTML responses are auto-converted to plain text and truncated.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
@@ -168,7 +168,13 @@ public final class ShellRunTool: AgentTool {
             timeoutSeconds: 120.0
         )
 
-        let cleanStdout = AgentHarness.truncateText(AgentHarness.sanitizeText(stdout.trimmingCharacters(in: .whitespacesAndNewlines)), limit: maxOutputLength)
+        var rawStdout = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if AgentHarness.looksLikeHTML(rawStdout), rawStdout.utf8.count > 2048 {
+            let converted = AgentHarness.htmlToPlainText(rawStdout)
+            print("🛠 [shell_run] HTML output converted: \(rawStdout.utf8.count) -> \(converted.utf8.count) chars")
+            rawStdout = "[HTML converted to plain text: \(rawStdout.utf8.count) -> \(converted.utf8.count) chars]\n\(converted)"
+        }
+        let cleanStdout = AgentHarness.truncateText(AgentHarness.sanitizeText(rawStdout), limit: maxOutputLength)
         let cleanStderr = AgentHarness.truncateText(AgentHarness.sanitizeText(stderr.trimmingCharacters(in: .whitespacesAndNewlines)), limit: maxOutputLength)
 
         if exitCode == 0 {
@@ -3127,66 +3133,77 @@ public final class AgentHarness {
         return nil
     }
 
+    /// Unambiguous first-person commitments: the model narrating an action it is
+    /// about to take. Precise enough to match anywhere in a turn.
+    private static let commitmentPhrases = [
+        "i'll start by", "let me start by", "i will start by",
+        "let me first", "first, i will", "first, let me", "first i'll",
+        "to begin, i will", "to begin, let me",
+        "i'm going to start", "i am going to start"
+    ]
+
+    /// Action vocabulary counts only when a first-person commitment cue sits
+    /// just before it in the same clause. Bare action nouns appear constantly in
+    /// ordinary prose ("you can check the docs", "want to look into that"),
+    /// which previously fired a wasted continuation turn with no action intended.
+    /// "let me know" is excluded as a cue, and the window is tight so a cue in
+    /// one clause cannot reach an action word in a later one. This is also what
+    /// fences off the closing-pleasantery false positive, so no separate veto is
+    /// applied - see `detectUncalledActionIntent`.
+    private static let commitmentActionRegex = try? NSRegularExpression(
+        pattern: "\\b(?:i'll|i will|i'm going to|i am going to|let me(?! know)|we'll|we will|i should|i need to)\\b[^.!?\\n]{0,30}?\\b(?:take a look at|look at (?:the|this)|look into|look up|read (?:the|this)|start by reading|inspect(?:ing)? the|check(?:ing)? the|examine the|add (?:a |the )?column|edit(?:ing)? the|modif(?:y|ying) the|update the|change the|search (?:for|the web)|grep for|run the|execute the|create the|write (?:to|the)|open the|fetch the|download the|save the|summarize the)\\b",
+        options: [.caseInsensitive]
+    )
+
+    /// True when the assistant narrated an action ("Let me read the config
+    /// first") but ended its turn without emitting a tool call. Kept deliberately
+    /// narrow: a false positive here injects a synthetic turn and makes the model
+    /// answer its own closing message.
     public func detectUncalledActionIntent(content: String, thinking: String?) -> Bool {
-        let contentLower = content.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        let thinkingLower = (thinking ?? "").lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        let contentLower = content.lowercased().replacingOccurrences(of: "\u{2019}", with: "'").trimmingCharacters(in: .whitespacesAndNewlines)
+        let thinkingLower = (thinking ?? "").lowercased().replacingOccurrences(of: "\u{2019}", with: "'").trimmingCharacters(in: .whitespacesAndNewlines)
 
         if contentLower.count > 400 {
             return false
         }
 
-        let actionPatterns = [
-            "take a look at",
-            "look at the",
-            "look at this",
-            "look into",
-            "read the",
-            "reading the",
-            "start by reading",
-            "read this",
-            "inspect the",
-            "inspecting the",
-            "check the",
-            "checking the",
-            "examine the",
-            "add a column",
-            "add the column",
-            "add column",
-            "edit the",
-            "modifying the",
-            "modify the",
-            "update the",
-            "change the",
-            "search for",
-            "search the web",
-            "look up",
-            "run the",
-            "execute the",
-            "create the",
-            "write to",
-            "write the",
-            "i'll start by",
-            "let me start by",
-            "i will start by",
-            "let me first",
-            "first, i will",
-            "first, let me",
-            "first i'll",
-            "to begin, i will",
-            "to begin, let me"
-        ]
-
-        for p in actionPatterns {
-            if contentLower.contains(p) || thinkingLower.contains(p) {
+        // 1. Explicit commitments ("I'll start by reading X") always count.
+        for phrase in Self.commitmentPhrases {
+            if contentLower.contains(phrase) || thinkingLower.contains(phrase) {
                 return true
             }
         }
 
+        // 2. Otherwise the action vocabulary needs a first-person commitment cue
+        // just in front of it, in the same clause. Checked BEFORE any wrap-up
+        // wording: "Happy to help — I'll read the config now" is a genuine
+        // narrated action, and a pleasantry elsewhere in the turn must not mask
+        // it.
+        if let re = Self.commitmentActionRegex {
+            for text in [contentLower, thinkingLower] where !text.isEmpty {
+                if re.firstMatch(in: text, options: [], range: NSRange(text.startIndex..., in: text)) != nil {
+                    return true
+                }
+            }
+        }
+
+        // 3. Nothing to act on. A wrapping-up turn never gets here with a live
+        // cue, because its action words have no first-person commitment in front
+        // ("let me know" is excluded as a cue, which is what stopped the closing
+        // pleasantry from reading as a promise), so a separate pleasantry veto is
+        // dead weight. Dropping it costs only the conditional offer ("I'll look
+        // into it if you want"), which is nudged into one cheap extra turn that
+        // reads as a resumed action rather than a phantom user question - a
+        // better trade than reviving the false negatives a blanket veto caused.
         return false
     }
 
+    /// A recovered-action nudge. Framed as a `<|im_start|>system` directive, not
+    /// a user turn: injecting `<|im_start|>user` made the model answer the harness
+    /// as if the user had spoken, producing a second assistant bubble about
+    /// whether it had intended an action.
     public func formatActionContinuationTurn(includeThinkSuffix: Bool = false) -> String {
-        var turn = "<|im_start|>user\n"
+        var turn = "<|im_start|>system\n"
         turn += "If you intended to take an action, execute it now by emitting a complete tool call like <tool_call><function=file_read><parameter=path>/Users/example.txt</parameter></function></tool_call>. Do not echo the schema template itself. Otherwise, just reply to the user and end your turn.\n"
         turn += "<|im_end|>\n<|im_start|>assistant\n"
         if includeThinkSuffix {
@@ -3195,11 +3212,12 @@ public final class AgentHarness {
         return turn
     }
 
-    /// Ling/Bailing-3.0-native action-continuation nudge using `<role>HUMAN</role>` /
-    /// `<role>ASSISTANT</role>` boundaries and the native `<tool_call>name<arg_key>/<arg_value>`
-    /// call shape. Used when the model described an action in prose but never emitted a call.
+    /// Ling/Bailing-3.0-native mirror of formatActionContinuationTurn, using the
+    /// native `<tool_call>name<arg_key>/<arg_value>` shape. Framed as
+    /// `<role>SYSTEM</role>` so the recovered-action nudge is not attributed to
+    /// the user.
     public func formatLingActionContinuationTurn(thinkingEnabled: Bool = true) -> String {
-        var turn = "<role>HUMAN</role>"
+        var turn = "<role>SYSTEM</role>"
         turn += "If you intended to take an action, execute it now by emitting a complete tool call like <tool_call>file_read\n<arg_key>path</arg_key>\n<arg_value>/Users/example.txt</arg_value>\n</tool_call>. Do not echo the schema template itself. Otherwise, just reply to the user and end your turn."
         turn += "<|role_end|>\n<role>ASSISTANT</role>"
         turn += thinkingEnabled ? "\n<think>" : "\n<think></think>"
@@ -3653,6 +3671,129 @@ public final class AgentHarness {
     /// Used to convert the token-based tool-output budget into a character budget.
     public static func charBudget(forTokenBudget tokens: Int) -> Int {
         max(600, tokens * 5 / 2)
+    }
+
+    private static let htmlScriptStyleRegex = try? NSRegularExpression(
+        pattern: "<(?i:script|style|noscript|svg|template|head)(?=[\\s/>])[^>]*>.*?</(?i:script|style|noscript|svg|template|head)\\s*>|<!--.*?-->|<(?i:script|style|noscript|svg|template|head)(?=[\\s/>])[^>]*/>",
+        options: [.dotMatchesLineSeparators]
+    )
+    private static let htmlTagRegex = try? NSRegularExpression(pattern: "<[^<>]{0,400}>", options: [.dotMatchesLineSeparators])
+    private static let htmlNumericEntityRegex = try? NSRegularExpression(pattern: "&#(x?)([0-9a-fA-F]+);", options: [])
+    private static let htmlNoiseLineRegex = try? NSRegularExpression(
+        pattern: "(?m)^[ \\t]*(?:(?:skip to(?: main)? content)|share|menu|search(?: button)?|sign (?:in|up)|log (?:in|out)|advertisement)[ \\t]*$",
+        options: [.caseInsensitive]
+    )
+    private static let htmlAnchorRegex = try? NSRegularExpression(
+        pattern: "<a\\b[^>]*>(.*?)</a>",
+        options: [.dotMatchesLineSeparators, .caseInsensitive]
+    )
+    /// Boilerplate phrases are removed only when they constitute an ENTIRE link
+    /// span (navigation), never as words inside prose, commands, or code. The
+    /// anchor-delimiting step tags link text with bracket sentinels the generic
+    /// tag stripper cannot produce.
+    private static let htmlNoiseLinkRegex = try? NSRegularExpression(
+        pattern: "⟦\\s*(?:(?:skip to(?: main)? content)|share|menu|search(?: button)?|sign (?:in|up)|log (?:in|out)|advertisement)\\s*⟧",
+        options: [.caseInsensitive]
+    )
+
+    private static let htmlVocabRegex = try? NSRegularExpression(
+        pattern: "<(?i:div|span|p[\\s>]|a[\\s>]|li[\\s>]|ul|ol|meta|link|script|style|table|img|br|h[1-6][\\s>]|header|footer|nav|section|form|input|button)",
+        options: []
+    )
+
+    /// Heuristic HTML detection for tool output. A doctype/html/body marker is
+    /// definitive; an XML declaration opts out; otherwise output must show both
+    /// tag density and HTML-vocabulary tags, so JSON, XML data, and shell text
+    /// never reach the conversion path.
+    public static func looksLikeHTML(_ text: String) -> Bool {
+        if text.range(of: "<\\?xml", options: [.regularExpression, .caseInsensitive]) != nil { return false }
+        if text.range(of: "<!doctype html", options: [.regularExpression, .caseInsensitive]) != nil { return true }
+        if text.range(of: "<html[\\s>]", options: [.regularExpression, .caseInsensitive]) != nil { return true }
+        if text.range(of: "<body[\\s>]", options: [.regularExpression, .caseInsensitive]) != nil { return true }
+        guard text.utf8.count > 512 else { return false }
+        guard let re = htmlTagRegex, let vocab = htmlVocabRegex else { return false }
+        let tagCount = re.numberOfMatches(in: text, options: [], range: NSRange(text.startIndex..., in: text))
+        guard tagCount >= 12 else { return false }
+        return vocab.firstMatch(in: text, options: [], range: NSRange(text.startIndex..., in: text)) != nil
+    }
+
+    /// Converts HTML to compact plain text for the model context: drops
+    /// script/style/head blocks, turns block-level boundaries into newlines,
+    /// strips remaining tags, decodes entities, and collapses whitespace.
+    /// Cuts a fetched web page from ~29KB of markup to its readable content.
+    public static func htmlToPlainText(_ html: String) -> String {
+        var s = html
+
+        // 1. Drop invisible/bulk blocks (scripts, styles, metadata, comments).
+        if let re = htmlScriptStyleRegex {
+            s = re.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: " ")
+        }
+
+        // 2. Mark navigation link spans before tags are stripped, so boilerplate
+        //    removal can be restricted to link text instead of matching words
+        //    anywhere in the document (prose and code stay untouched).
+        if let re = htmlAnchorRegex {
+            s = re.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: " ⟦$1⟧ ")
+        }
+
+        // 3. Newlines at block boundaries so text does not glue together.
+        let blockClosers = ["</p>", "</div>", "</li>", "</tr>", "</ul>", "</ol>", "</table>", "</section>", "</article>", "</header>", "</footer>", "</nav>", "</blockquote>", "</pre>", "</h1>", "</h2>", "</h3>", "</h4>", "</h5>", "</h6>", "</dd>", "</dt>", "<br>", "<br/>", "<br />", "<hr>", "<hr/>", "<hr />"]
+        for closer in blockClosers {
+            s = s.replacingOccurrences(of: closer, with: "\n", options: .caseInsensitive)
+        }
+
+        // 4. Strip every remaining tag (replaced with a space so inline
+        //    siblings like nav links stay separate words).
+        if let re = htmlTagRegex {
+            s = re.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: " ")
+        }
+
+        // 5. Decode entities: numeric first (covers the long tail), then the
+        //    common named set.
+        if let re = htmlNumericEntityRegex {
+            let ns = NSMutableString(string: s)
+            for m in re.matches(in: s, options: [], range: NSRange(s.startIndex..., in: s)).reversed() {
+                let isHex = m.range(at: 1).length > 0
+                let digitsRange = m.range(at: 2)
+                guard let digits = Range(digitsRange, in: s), let value = UInt32(String(s[digits]), radix: isHex ? 16 : 10),
+                      let scalar = Unicode.Scalar(value) else { continue }
+                ns.replaceCharacters(in: m.range, with: String(Character(scalar)))
+            }
+            s = ns as String
+        }
+        let named: [String: String] = [
+            "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": "\"", "&apos;": "'",
+            "&nbsp;": " ", "&copy;": "©", "&reg;": "®", "&trade;": "™",
+            "&mdash;": "—", "&ndash;": "–", "&hellip;": "…", "&middot;": "·",
+            "&rsquo;": "'", "&lsquo;": "'", "&rdquo;": "\"", "&ldquo;": "\"",
+            "&laquo;": "«", "&raquo;": "»", "&deg;": "°", "&times;": "×"
+        ]
+        for (entity, replacement) in named {
+            s = s.replacingOccurrences(of: entity, with: replacement)
+        }
+
+        // 6. Drop boilerplate: exact-match link spans, then common single-word
+        //    noise lines, then collapse whitespace runs.
+        if let re = htmlNoiseLinkRegex {
+            s = re.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: " ")
+        }
+        s = s.replacingOccurrences(of: "⟦", with: " ").replacingOccurrences(of: "⟧", with: " ")
+        if let re = htmlNoiseLineRegex {
+            s = re.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: "")
+        }
+        var collapsed = ""
+        var blankRun = 0
+        for line in s.components(separatedBy: "\n") {
+            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+            if trimmedLine.isEmpty {
+                blankRun += 1
+                if blankRun <= 1 { collapsed += "\n" }
+            } else {
+                blankRun = 0
+                collapsed += trimmedLine + "\n"
+            }
+        }
+        return collapsed.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Truncates oversized text for the model context. The head keeps as much as the

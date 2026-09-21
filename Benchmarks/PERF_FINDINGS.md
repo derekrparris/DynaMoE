@@ -1062,3 +1062,503 @@ complete registered tool name (function) or a complete parameter key
 key; values remain unconstrained. This should eliminate the degenerate
 tool-call truncations, the failed curl fragments, and the resulting
 startPos=0 re-prefills.
+
+### QA #20 — G.txt verifies the unnamed-call fix; tools.txt exposes a second loop; raw-token splice shipped
+
+G.txt (7 generations, 6 tool calls): the unnamed `<function>` loop is gone.
+All calls parsed and executed (shell_run exit=0, no curl failures), final
+1171-token answer ended on clean EOS, zero GDN divergence warnings, pins
+exact every turn. But turns 4/5/7 still looped `</parameter>` after a
+successfully closed value (turn 5 exited via an EOS-family token mid-loop,
+masking as a clean EOS). Cost: two degenerate-cycle exits left the turn text
+ending mid-tag -> next prompt re-tokenized one token off the pin -> hybrid
+gate failed -> 3.5s/4.7s full re-prefills (vs 30-400ms suffix prefills on
+healthy turns).
+
+tools.txt exposed the same disease one level up: the four "between-tags"
+grammar states (enteringToolCall, enteringParameterTag) were unconstrained
+(default: return). Observed: turn 1 emitted a malformed `<parameter(names>`
+tag; turn 2 looped 21 consecutive empty tool-call open tags.
+
+Fixes shipped:
+1. Grammar between-tags masking: all four between-tag states now constrain
+   continuation toward the legal tag(s), with prefix canonicalization at the
+   last structural boundary so repeated close tags re-anchor instead of
+   dead-ending into the unmask valve. Ling/Bailing native format is gated off
+   via enforceStructuralTagContinuation (set from modelConfig at the call site).
+   Verified: 27/27 logic assertions + full-project typecheck.
+2. Raw-token splice for agent continuations: continuation turns now assemble
+   the next prompt from the previous turn's ACTUAL prompt+generated token ids
+   (buildSplicedContinuationTokens) plus a freshly tokenized suffix (end tag +
+   tool-response/continuation text), instead of re-encoding the accumulated
+   string. Re-tokenization could diverge by one token whenever generation was
+   cut mid-tag; the splice makes the pin match byte-exact, so the hybrid
+   full-pin gate passes and the suffix-only prefill runs (TTFT for
+   continuation turns drops to the suffix length). Wired at all six
+   continuation sites (tool response, uncalled-action, loop-guard synthesis,
+   subagent relay, force-synthesis, empty-reply recovery); falls back to the
+   string path if suffix tokenization fails. Verified: 13/13 property
+   assertions (prefix continuity, pin full-match, endTag append semantics,
+   fallback paths, character-sequence equivalence vs the string path).
+   Residual: the empty-reply recovery site replays the bare prompt, which is
+   shorter than the pin -> hybrid full re-prefill remains correct there.
+
+### QA #21 — 1.txt: splice works end-to-end; prefill attention identified as the last big hot spot
+
+First full run with the raw-token splice: all agent continuation turns
+prefilled only their suffix — 42-44ms (143-147 tokens) vs 3.5-4.7s full
+re-prefills before. Zero 🔁 full re-prefills across 6 tool calls; clean EOS
+finish; run never quit mid-turn.
+
+The one huge prefill (post first shell_run): PhaseA total 419.6s (~7 min),
+with the 10 gqa/attention layers at ~30s each vs ~4s for MoE layers. The
+splice math proves the suffix was 11348-4058 = 7290 tokens — the curl'd
+GitHub HTML page (~29KB markup) injected as the tool result. MoE layers stay
+linear (~0.55ms/token, same rate as turn 1); attention goes superlinear
+(quadratic in context length) on a kernel path that is far off GPU peak
+(~0.1 TFLOP of attention work per gqa layer taking ~30s => ~1-3% of peak).
+Two levers:
+1. Tool-result hygiene: strip/trim HTML in shell_run renders (or steer the
+   model to raw.githubusercontent URLs) — would have cut this turn ~10x.
+2. Batched multi-row attention prefill kernel (the reverted FIX #6a idea) is
+   the remaining big TTFT win for large tool-result turns.
+
+Also: a silent mid-run generation restart was identified (8 pipeline-ready
+prints vs 7 [GEN] lines): user interrupt (stop + new message) => fresh
+re-render whose system prompt embedded the post-tools_load tool list =>
+diverged from the pin at token 24 => one full 3004-token re-prefill (~85s).
+Inherent to interrupts (genuinely new prompt), but silent cancel-exits now
+log 🛑 reason=cancelled with the tail text, and interruptAndSendMessage logs
+⏹ [INT] so future logs tell the full story.
+
+### QA #22 — shell_run HTML conversion shipped (tool-result hygiene, lever 1)
+
+shell_run now detects HTML in stdout (doctype/html/body markers definitive;
+otherwise >512B + >=12 tags + at least one HTML-vocabulary tag; XML
+declaration opts out so config files stay intact) and converts pages to
+plain text before truncation: script/style/head/noscript/svg/template blocks
+and comments dropped wholesale, block-level closers become newlines, tags
+strip to spaces, numeric+named entities decoded, boilerplate phrases/lines
+removed, whitespace collapsed. Non-HTML output (JSON, XML, logs) passes
+through untouched; conversion only engages above 2KB. shell_run's tool
+description now steers the model toward raw text endpoints.
+
+Verified with 30+ standalone assertions incl. two regressions caught during
+development: (1) the tag-stripping alternation matched the `head` prefix
+inside `<header>`, swallowing the whole page body until the next `</script>`
+(fixed with a `(?=[\s/>])` name-boundary lookahead); (2) tag-density alone
+flagged large XML configs as HTML (fixed with the vocabulary requirement).
+Real-world-shape test: 17.7KB page (mostly inline JS/CSS) -> 72 chars (246x).
+The 1.txt incident shape (7290-token suffix from one curl) would compress to
+a ~50-token suffix, i.e. that ~7-minute attention-bound prefill becomes
+sub-second. Remaining lever: batched multi-row prefill attention kernel.
+
+### QA #23 — schema-aware required-parameter enforcement in the tool grammar
+
+2.txt showed the between-tags masks working (4/4 breaks clean, zero cycles,
+zero re-prefills, suffix-only prefills of 414/393/53ms) but exposed a
+semantic hole: the mask legitimately allows `</function>` right after the
+name (some tools take no params), so `<function=shell_run></function>` is
+structurally legal yet carries no `command`. The harness guard
+(hasEmptyRequiredArguments) caught it, skipped execution and the model
+recovered — but the call was wasted.
+
+Fix: registerTools now records each tool's `required` keys (ToolDefinition
+already carried them), updateState tracks the live call context
+(currentToolName + parameter keys already opened, scanned from the function
+body), and the tag-choice masks withhold `</function>` while any required key
+is missing — forcing the model to emit `<parameter=command>` before closing.
+Optional params still omit freely; tools with no required keys and unknown
+tools stay ungated (fail-open; the harness guard remains the backstop).
+Verified: 19 new standalone assertions (gate matrix, body scanning,
+end-to-end empty-call shape from 2.txt) plus the existing 27; full-project
+typecheck clean.
+
+### QA #24 — boilerplate removal restricted to navigation links (review follow-up)
+
+An external review flagged that the unanchored boilerplate pass removed
+"sign in" / "log in" / "advertisement" anywhere in a converted page, silently
+mutating legitimate prose, commands, and code examples.
+
+Compromise shipped: boilerplate is now defined structurally, not lexically.
+`<a>...</a>` spans are bracketed with sentinels during conversion, and a noise
+phrase is dropped only when it constitutes an ENTIRE link span (or an entire
+line, as before). Prose sentences keep their words; a descriptive link like
+"Sign in with your company SSO" is kept; real nav items ("Sign in", "Share",
+"Skip to main content", "advertisement" as link text) still disappear, so the
+original problem (nav items concatenated into one long line after tag
+stripping) stays fixed. Sentinels never reach the output.
+
+Verified: suite now 40+ assertions, incl. prose/code survival, nav removal,
+partial-link retention, and sentinel-leak checks. Typecheck clean.
+Alternative if strict review parity is preferred: delete the link-span pass
+entirely and keep line-scoped removal only.
+
+### QA #25 — required-param scan must skip parameter values (review follow-up)
+
+Review flagged that parameterKeysTyped regex-scanned the whole function body,
+so a literal `<parameter=command>` inside a VALUE (shell command echoing tool
+markup, file_write content, a cwd string) counted as an opened required key
+and opened the `</function>` gate early. Valid, though low severity: the
+harness's hasEmptyRequiredArguments guard is the real backstop, so the worst
+case is a wasted call + recovered error turn, not a wrong result.
+
+Fix: parameterKeysTyped is now a small stateful walk — find `<parameter=`,
+read the key to `>`, jump past the next `</parameter>`, repeat. Tag-like text
+inside values is never scanned; unterminated values stop the walk, which
+keeps the gate engaged (safe direction). This also matches parser semantics
+(first `</parameter>` closes the value) and is stricter than the parser can
+be, never looser.
+
+Verified: new cases include a literal `<parameter=command>` in a cwd value
+(not counted, gate holds), a real command after such a value (counted, gate
+opens), an entire embedded tool-call block inside a content value (not
+counted), unterminated values, and early-close semantics. Full suite passes;
+typecheck clean.
+
+### QA #26 — uncalled-action nudge false positive: "look into" in a closing pleasantry
+
+Symptom: after the user sent "very cool, thanks!", the app produced TWO
+assistant bubbles. The first was a normal close — "You're welcome! Let me know
+if there's anything else you want to look into — happy to help." — then, after
+a 22.7s "thinking" pause, a second bubble: "There isn't any outstanding action
+or task to complete here…".
+
+Cause: `detectUncalledActionIntent` matched actionPatterns unconditionally over
+the finished text. The close contains the substring "look into", so the
+detector returned true, `hasUncalledIntent` set `willContinueAgent`, and
+`formatActionContinuationTurn()` was appended — a synthetic `<|im_start|>user`
+turn asking the model to execute an action if it meant one. The model then
+*answered the harness directive* instead of the user, which is why the second
+bubble reads like a meta-reply.
+
+Cost from the log: the close pinned 3369 tokens (prompt=3318 gen=51); the
+synthetic turn spliced to 3440 raw tokens (P=70, startPos=3369,
+`prefillTotal=8.30s`, PhaseA=3.55s at a 50% expert hit rate) plus 22.7s of
+thinking and 119 new tokens, before pinning again at 3559. Well over a minute
+of work to answer "thanks!". The splice itself worked correctly end-to-end on
+this path (a live verification of splice site 6).
+
+Fix, in `AgentHarness.detectUncalledActionIntent`: three narrow signals replace
+the broad pattern list.
+
+1. `commitmentPhrases` — explicit first-person starts ("i'll start by",
+   "let me start by", "first, let me", "i'm going to start", …) matched
+   anywhere in content or thinking: always an intent.
+2. `closingPleasantryRegex` — wrap-up language ("let me know", "happy to
+   help", "anything else", "you're welcome", …) **vetoes** detection. A
+   pleasantry is never a promise to act even when it borrows action words.
+3. `commitmentActionRegex` — a first-person cue ("i'll", "let me" but not
+   "let me know", "i should", "i need to", …) followed within 30 characters,
+   in the same clause, by action vocabulary. Ordinary prose ("you can check
+   the docs", "the ranges look at combined cycle numbers") no longer fires.
+
+Curly apostrophes (U+2019) are normalized so "I’ll start by" matches. The
+existing >400-character bail is preserved and runs first.
+
+Verified: 20-case standalone suite (`/tmp/detect_test.swift`) — 9 positives
+including thinking-only cues and the curly-apostrophe form; 8 negatives
+including the exact regression string, "happy to help — let me know if you'd
+like me to look into the charging curve", bare action nouns, and second-person
+advice; the >400-char bail; and the documented ordering rule that an explicit
+commitment phrase still wins over a pleasantry in the same message
+("I'll start by reading the spec, and I'll let you know what I find"). All
+pass. Full-project typecheck clean.
+
+Follow-up in the same pass: the nudge itself was framed as a synthetic
+`<|im_start|>user` turn, which is *why* a fired continuation reads as a second
+assistant bubble answering a meta-question. Both formatters now emit a system
+directive — `<|im_start|>system` for ChatML models and `<role>SYSTEM</role>`
+for Ling — matching the framing the app already uses for its system prompt
+(`ContentView.swift:1706`, `:3546`, `:3513`). This is a behavior change, so
+treat any change in recovery rates as the thing to watch; the detector fix
+means the path now only runs on genuine narrated intents.
+
+Review follow-up (Copilot, High): `testLingNativePromptAndToolResponseFormatting`
+still asserted `continuation.contains("<role>HUMAN</role>")` at
+`DynaMoETests.swift:6505`, so the role change would have failed the suite.
+Valid catch. Updated to assert `<role>SYSTEM</role>` and added an explicit
+`XCTAssertFalse(... "<role>HUMAN</role>")` so the intent is locked. The ChatML
+formatter had no coverage at all, so `testAgentMultiTurnToolCallParsingAndContinuation`
+now also asserts `formatActionContinuationTurn` emits `<|im_start|>system` with
+no `<|im_start|>user`. `formatToolResponseTurn` was deliberately not changed —
+tool results stay user-role — and its assertion is untouched. Both tests are
+pure formatter/parser checks with no model dependency, so they run on any host.
+
+Review follow-up (Copilot, High): the new assertion
+`continuationTurn.hasSuffix("<|im_start|>assistant\n thinking")` could never
+pass. Correct, and the cause is worth recording because it is a tooling trap,
+not a logic slip. `formatActionContinuationTurn` appends the literal
+`" thinking\n"` (real angle brackets), so the turn ends with the tag plus a
+trailing newline. The assertion as written expected `\n`, a space, and the bare
+word `thinking`. Verified at byte level: the needle's codepoints were
+`0x5c 0x6e 0x20 0x74 0x68 0x69 0x6e 0x6b 0x69 0x6e 0x67` (backslash, n, space,
+`thinking`) where every neighbouring assertion uses
+`0x3c 0x74 0x68 0x69 0x6e 0x6b 0x3e` (` thinking`) — including the assertion two
+lines below it that I did not write.
+
+Root cause: the literal was copied from a rendered file view, and the rendering
+pipeline strips `<`/`>` from unrecognized tags, so ` thinking` displays as
+` thinking`. The same sanitizing affects comments and prose, which is harmless,
+but makes any tag-bearing *code or test literal* untrustworthy when read
+through a rendering. Every tag literal written in this branch was re-audited at
+byte level: all production tags (`<|im_start|>system`, `<|im_start|>user`,
+`<|role_end|>`, `<role>SYSTEM</role>`, `<role>OBSERVATION</role>`) and the
+tool-call template embedded in the continuation directive (`<tool_call>`,
+`<function=`, `</function>`, `<parameter=`, `</parameter>` — one each) are
+intact. The test was the only casualty.
+
+Also checked the neighbouring assertions that share this shape: the Ling
+`hasSuffix("<role>ASSISTANT</role>\n thinking")` is correct because the Ling
+formatter ends with `"\n thinking"` and no trailing newline, so it was left
+alone. Added a note that the trailing newline is part of the ChatML
+`" thinking\n"` handoff. Confirmed by simulating both forms against the real
+tail: the corrected assertion returns true, the original returns false.
+
+Review follow-up (Copilot, Medium): the pleasantry veto ran after the
+commitment-phrase check but *before* the cue+action check, so any turn that
+paired a pleasantry with a real narrated action was suppressed — "Happy to help
+— I'll read the config now." returned false. That is a regression I introduced,
+and it is the expensive direction: a false negative drops a narrated action the
+model never executed, which is the exact failure the detector exists to catch.
+Before the rewrite the old unconditional pattern list would have matched "read
+the" and fired.
+
+Fix: the cue+action check now runs before any wrap-up consideration, and the
+pleasantry veto is deleted rather than reordered. Reordering alone would have
+left the veto unreachable — once the cue+action test fails the answer is false
+either way — so keeping it would have been dead code. The veto also turned out
+to be unnecessary: the original regression is already fenced off because its
+action words ("look into") have no first-person cue in front of them, since
+"let me know" is excluded as a cue. Confirmed by test: the exact regression
+string, "Let me know if you want me to look into it", and "The EPA ranges look
+at combined cycle numbers" all still return false without any veto.
+
+Documented cost: a conditional offer ("I'll look into it if you want") now
+counts as an intent, because the cue+action pair is genuinely present. That is
+one cheap extra turn, and with the system framing from earlier in this entry it
+reads as a resumed action rather than a phantom user question — a better trade
+than the false negatives the blanket veto caused. Recorded in the code comment
+on the check so the next reviewer sees it was deliberate.
+
+Verified: standalone suite now 25 cases including four pleasantry-plus-action
+positives and the conditional-offer cost; added
+`testUncalledActionIntentDetection` to the XCTest suite so the detector has
+real coverage (pure logic, no model dependency, runs on any host). App
+typecheck clean under the project's real flags.
+
+### QA #27 — grammar masking state is shared across generations (review follow-up)
+
+Review (Copilot, High): the live-context fields added for the required-parameter
+gate (`currentToolName`, `seenParameterKeys`) are shared through
+`GrammarConstrainedSampler.shared`, mutated from the detached generation task
+and reset on the main actor with no synchronization.
+
+Verified, and worse than the comment implies in one respect. The app target sets
+`SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, so the sampler was implicitly
+`@MainActor` while the generation loop calls it from
+`Task.detached` (`ContentView.swift:4442`) without `await`. That is an unchecked
+isolation violation that Swift 5 mode only warns about, so nothing enforced
+mutual exclusion at runtime — the state machine really was unsynchronized.
+
+A second, purely logical hazard sits on top: cancellation gives a previous
+generation up to one more token iteration to unwind, and a token takes ~350ms on
+the reference machine while the requeue path waits only ~80ms. During that
+window the old task keeps calling `updateState` with its own accumulated text,
+so the new generation's state could be overwritten by its predecessor.
+
+Fix:
+
+- `nonisolated` on `GrammarConstrainedSampler` and `TokenTrieNode` — states the
+  real threading contract instead of claiming main-actor isolation that was
+  never honoured. This is what the compiler was trying to tell us.
+- `stateLock` (`NSRecursiveLock`) guards every mutable grammar field;
+  `currentState`, `isEnabled` and `enforceStructuralTagContinuation` are now
+  lock-backed accessors, so off-actor reads and writes are synchronized.
+- `beginGeneration()` clears the context and issues a monotonically increasing
+  token. `updateStateAndApplyLogitMask(..., token:)` advances the state machine
+  and applies the mask under a single lock hold, and drops any write bearing a
+  stale token. A cancelled generation can no longer clobber its successor, and
+  state + mask can no longer be interleaved by another task.
+- `applyLogitMaskLocked` also holds `registrationLock` for its duration:
+  `registerTools` rebuilds the schema in place (removeAll + refill), and a torn
+  read mid-rebuild silently dropped the tool-name mask for a token. Lock order
+  is always stateLock then registrationLock; `registerTools` never takes
+  stateLock, so the ordering cannot invert.
+
+Blast radius is unchanged from QA #23/#25: this is prevention, and the harness's
+`hasEmptyRequiredArguments` guard remains the backstop, so the worst case was
+always a wasted call plus a recovered error turn, not a wrong result.
+
+Verified: new test `testGrammarGenerationTokenIsolatesStaleWriters` drives two
+generations through the shared sampler and asserts the second generation's state
+survives a late write carrying the first generation's token, that
+`beginGeneration` issues distinct tokens, and that it clears the context. App
+typecheck clean under the project's real flags; new `nonisolated` shape probed
+in isolation to confirm it produces no actor-isolation diagnostics.
+
+Tooling caveat found while verifying this: `xcrun swiftc -typecheck` on the app
+globs only reports the `no such module 'Sparkle'` error and then stops, so it
+suppresses every warning in every other file — including exactly the isolation
+warnings this review is about. Pass the project's flags
+(`-swift-version 5 -default-isolation MainActor`) and treat a clean CLI
+typecheck as "no errors", not "no warnings".
+
+### QA #28 — a cancelled generation ran the whole finalization path (review follow-up)
+
+Review (Copilot, High): cancellation only breaks the token loop. The detached
+task then continues through finalization, which updates shared UI state,
+captures/records the prefix and can schedule another agent turn. Since
+`interruptAndSendMessage` starts the replacement after only 60ms, the cancelled
+task can overwrite the replacement's `generationTask`/prefix cache and race its
+shared KV buffers.
+
+Confirmed, and it is reachable. `stopAutoregressiveGeneration()` (the
+Stop/interrupt path, and the only caller that owns the UI cleanup) sets
+`isGeneratingText = false`, cancels and nils `generationTask`. The replacement
+then starts 60-80ms later and assigns a fresh `generationTask`. The cancelled
+task reaches its finalization block afterwards — up to one token later, ~350ms
+on the reference machine — and that block sets `isGeneratingText = false` and
+`generationTask = nil` again, silently **disarming the replacement**: the Stop
+button and any later interrupt would no longer be able to cancel the running
+generation. The same block also runs
+
+- `KVCacheManager.shared.captureLinearStates()` and
+  `PrefixCacheManager.shared.recordTurn(...)`, pinning a truncated turn into the
+  prefix cache while the replacement is prefilling against the same KV cache, and
+- `dequeueAndRunNextPromptIfNeeded(sessionId:)`, which can start yet another
+  generation on top of the replacement.
+
+Fix, one early return plus one generation identity:
+
+- The detached task now returns immediately when `Task.isCancelled`, before the
+  finalization block. Nothing is lost: the partial reply is already committed to
+  the message by the per-token streaming updates, and the caller has already set
+  the status line. Logs `⏹ [GEN] cancelled at N tokens — skipping finalization`.
+- Cancellation alone is not a sufficient licence to mutate shared generation
+  state, because `interruptAndSendMessage` supersedes the task. Added
+  `@State generationId`, bumped once per `startAutoregressiveGeneration` and
+  captured by that task, plus `ownsGeneration(_:)`. Every other place that
+  cleared `generationTask`/`isGeneratingText` on cancellation
+  (`ContentView.swift` prefill-failure guard, tool-execution guard, and the two
+  agent-continuation guards) now returns early unless it still owns the
+  generation. Those sites all shared the same defect; guarding only the flagged
+  line would have left three live instances.
+
+Deliberately NOT done here: awaiting the previous task before starting the
+replacement. Written at the time on the belief that a cancelled task sitting
+inside `runLayerWisePrefill` does not observe cancellation until it returns to
+the token loop. **That belief was wrong** — corrected and acted on in QA #30.
+
+Verified: app typecheck clean under the project's real flags. Behaviour is
+observable in the run log; the user should see `⏹ [INT]` followed by
+`⏹ [GEN] cancelled at N tokens — skipping finalization` and then only the
+replacement's own generation.
+
+### QA #29 — a superseded generation sampled from unmasked logits (review follow-up)
+
+Review (Copilot, High): returning early from `updateStateAndApplyLogitMask` on a
+stale token silently treats the stale generation as if masking had succeeded —
+the logits are left unmasked and `sampleNextToken` gets no signal to abort, so
+the cancelled task can sample one unmasked token and still reach the later
+finalization/prefix-recording path.
+
+The unmasked-draw half is correct and worth fixing: the staleness guard exists to
+protect the *shared* state machine, but it also silently drops the mask, and the
+sampling loop had no way to tell the difference between "masked" and "mask not
+applied". The loop only re-checked cancellation at the top of each iteration, so
+a cancel arriving during a token forward (a ~350ms window, and the mask is
+dropped for the whole remainder of that iteration) let the task draw a token
+from raw logits and commit it into its message and the stream buffer.
+
+The "still reach the finalization/prefix-recording path" half was already closed
+by QA #28, which returns a cancelled task before finalization. That also means
+this is narrower than the review suggests: the stray token lands only in the
+task's own superseded message, and the task returns before tool parsing, so it
+can neither be executed as a tool call nor recorded as a prefix.
+
+Fix, making staleness visible rather than silent:
+
+- `GrammarConstrainedSampler.isCurrent(_:)` — the generation token is now
+  queryable, so a caller can tell that its mask was dropped.
+- The decode loop stops before sampling when the task is cancelled *or* the
+  token is no longer current, logging
+  `⏹ [GEN] superseded at N tokens — stopping before sampling`. Checking before
+  the draw rather than after the commit means no unmasked token is drawn at all.
+- The finalization block is additionally gated on `ownsGeneration`, so a
+  superseded-without-cancelled task cannot touch the UI flags, the task handle,
+  the prefix cache, or schedule another turn. `Task.isCancelled` was the only
+  check there before; ownership is the stronger and more precise condition.
+
+Deliberately not done: propagating the stale result through the mask closure as
+a Bool. The closure is a `(UnsafeMutablePointer<Float>, Int) -> Void` hook shared
+with `InferenceEngine.sampleNextToken`, which returns a bare `UInt32` with no
+error channel, so that route needs either a sentinel value or an optional return
+threaded through two signatures and the single call site. Querying staleness
+where the loop can see it achieves the same outcome without inventing a sentinel
+protocol. Revisit only if another caller of the mask hook appears.
+
+Verified: app typecheck clean under the project's real flags;
+`testGrammarGenerationTokenIsolatesStaleWriters` now also asserts
+`isCurrent` is true for the live token and false for the superseded one.
+
+### QA #30 — replacement generation reset shared KV buffers under a live task
+
+Review (Copilot, High): the generation token isolates grammar/UI bookkeeping but
+not the shared inference buffers. `KVCacheManager.shared.reset` immediately
+before `beginGeneration` can nil, reallocate or copy the singleton KV/state
+buffers while the cancelled detached task is still inside
+`runLayerWisePrefill`/`runTokenForward`, and the replacement then races the old
+task on the same Metal buffers. The 60ms interrupt delay is not a
+synchronization barrier.
+
+Confirmed, and pre-existing rather than introduced by the token change — the
+reset call has always sat there, and the interrupt path has always started the
+replacement on a fixed 60ms guess. Reading `KVCacheManager.reset` shows it is
+worse than a plain race: with `preservePrefixCount == 0` it sets
+`kCacheBuffer`/`vCacheBuffer` to nil and allocates fresh backing, so a task that
+is still mid-layer does not merely touch freed memory, it dispatches against
+whatever the singleton now points at — the replacement's brand new KV cache. The
+`memcpy` prefix-preservation branch additionally copies from the old buffers
+while the old task writes to them.
+
+This is the residual that QA #28 deferred, and the deferral rested on a wrong
+fact. This journal claimed a cancelled task inside `runLayerWisePrefill` does not
+observe cancellation until it returns to the token loop, and cited a 419.6s
+prefill as the cost of waiting. Both layer loops actually check cancellation at
+every layer boundary (`ContentView.swift:5104` decode, `:7400` prefill, plus
+`:9328` on the JetSpec path), so a cancelled task stops dispatching after the
+current layer. The 419.6s figure was the whole 40-layer prefill, not the
+remaining work. Corrected here.
+
+Fix: the interrupt path now waits for the previous generation to actually finish
+instead of sleeping for 60ms — `let previous = generationTask` captured before
+`stopAutoregressiveGeneration()` nils it, then `await previous?.value` before
+`handleSendMessage`. Because the layer loops bail at the next boundary this is
+bounded by one layer, which is one token during decode (the common interrupt)
+and the worst case is a single layer of a very large prefill. The await
+suspends rather than blocking the main actor, so the old task's own
+`await MainActor.run` hops still complete.
+
+Audited the other paths that reach the same reset, and they are already
+correctly ordered, so no identity machinery was needed there:
+`dequeueAndRunNextPromptIfNeeded` and the agent-continuation sites are all called
+from inside the outgoing task's finalization, which is past its buffer work, and
+the replacement starts on a later main-actor hop. Sends from the UI cannot start
+a concurrent generation either: `ChatDetailView` routes Enter to the queue and
+Cmd+Enter to `interruptAndSendMessage` while generating, and the send button is
+only built in the `else` branch of its `isGenerating` check
+(`ChatDetailView.swift:738`), so `handleSendMessage` is unreachable mid-run. No
+defensive guard was added to it — a synchronous guard could not fix the race
+anyway, since only an await can postpone the reset.
+
+Not addressed: a Metal dispatch cannot be preempted, so the wait floor is one
+layer. During a huge-prefill interrupt that is seconds rather than milliseconds.
+That is the right trade against silently corrupting the KV cache, but it is a
+real responsiveness cost and the reason to keep an eye on interrupt latency in
+large-prefill runs.
+
+Verified: app typecheck clean under the project's real flags. Watch for
+`⏹ [INT] interrupt requested` followed by the replacement's own
+`⚡ [GEMV]` pipeline-ready pair only after the previous generation's
+`⏹ [GEN] ended ... reason=cancelled` line.
