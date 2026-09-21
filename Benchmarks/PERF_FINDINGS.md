@@ -959,3 +959,106 @@ the old per-token GEMV rate; verify the .metal file recompiled).
   now prints once at the flip). Gate behavior correct: after a tool-result
   prefill the routing is genuinely novel (0-4% hits), kicks are disabled and
   misses read sync — the right trade for unpredictable content.
+
+### FIX #9b: FP8 BATCHED GEMV (SHIPPED, VERIFIED)
+
+`fp8_gemv_batched` cloned from bf16_gemv_batched: uchar4 weight chunk loads +
+unpack_e4m3 dequant once per chunk + 16 token activations per iteration +
+per-row bf16 scale applied at the final sum. One threadgroup per (output,
+16-token block). T18c verification: identical to fp8_gemv_simd
+(rel <= 8.6e-06 — the e4m3 dequant is deterministic, only float32 reordering),
+1.7x faster at P=64 and P=1024; P=1 stays on fp8_gemv_simd.
+
+Wired in dispatchLinear's FP8 branch (before the simd branch, batchSize > 1).
+Covers Ornith's self_attn q/k/v/o projections (F8_E4M3) during prefill — the
+gqa prefill layers measured ~1.7s each at P=868 in QA #15, dominated by the
+per-token FP8 GEMV re-reads. Expected: those drop toward ~0.3-0.5s, cutting
+delta-prefill totals by roughly a third. Load prints confirm which pipelines
+are live. Note: the bench's experiment copies of the batched kernels were
+removed once they became production kernels in ComputeShaders.metal (double
+definition otherwise).
+
+### QA #16 — batched GEMVs live; NEW REGRESSION: tool-loop truncation
+
+Both ⚡ [GEMV] pipeline prints confirmed. Delta prefill improved (P=616:
+35.16s total, PhaseA=20.9s, gpuWait=10.8s — was 50.8s at P=868). BUT:
+- GDN prefill layers still ~0.54ms/token — the batched kernels measure only
+  ~17GB/s effective in T18b (activation L2 re-reads dominate), so the
+  in-app win is modest, not the traffic-model's 10x. A tiled GEMM is the
+  real fix if we continue this lane.
+- Decode speed down (2.8 tok/s at ~2.8k ctx) — partly the adaptive gate
+  correctly disabling prefetch on novel post-search content (IO 130-190ms).
+- **NEW BUG: agent tool loop truncates** — model does one tool call, intends
+  another, stops (85-token turn). Reproduced 2x. Prime suspect: the Fix #10
+  GDN-state restore desyncing the recurrence state vs the pinned token list
+  (turn 1 without restore is fine; truncated turns all follow a restore).
+
+Shipped diagnostics: restore self-check (memcmp live-vs-snapshot at reset;
+a nonzero diff means the state ran ahead of the pin between turns),
+pin-length log at capture (📌 [PREFIX] pinned N tokens), and an A/B toggle:
+`defaults write com.drp.DynaMoE dynamoe_disable_prefix_reuse -bool YES`.
+
+### QA #17 — logs A/B analysis
+
+- Self-check: ZERO GDN-state divergence in both runs — the snapshot/restore
+  is byte-consistent; no smoking gun for the truncation in the state path.
+- Pins grow exactly right: A 2044->2795->3609; B 2067->2402->3161->6515.
+- Turns reuse correctly (startPos=2044/2067/2402 with 79-89% hit rates,
+  ioWait ~1s). Prefills now: P=698-721 in ~40s (batched GEMV + pipelining).
+- **B turn 4: startPos=0, P=5540, 286s** — the full-pin gate fell back. The
+  final synthesis turn's prompt likely diverges from the raw generated
+  tokens (thinking stripped / re-rendered) or passes a different sessionId;
+  added a reuse-gate print (partial-match/no-common-prefix reasons) to
+  identify which on the next run.
+- A's truncation (92-token gen, then loop end): no diagnostic smoking gun;
+  tokens healthy (285ms, 46% prefetch), attention ctx-consistent. Decisive
+  test remains the dynamoe_disable_prefix_reuse toggle A/B (not yet run).
+
+### QA #18 — E.txt analysis: the truncation chain fully explained
+
+Break reasons logged: turn 1 tool-parser-freeze (normal, search call fired);
+turns 2+3 **degenerate-cycle** (the model repeating `parameter>`-style
+fragments while writing the curl shell_run call); turn 4 clean eos-token at
+612 tokens (final answer completed).
+
+Chain: model degenerates mid-tool-call -> cycle guard breaks the generation
+-> parsed tool call is a fragment (unterminated quote) -> zsh exits != 0 ->
+"Failed" curl runs -> the mangled assistant turn diverges from the pinned
+tokens -> strict full-pin gate falls back to startPos=0 -> 134-142s full
+re-prefills (the "slower last prefill").
+
+Key exonerations: turn 3 degenerated with NO state restore (fresh full
+prefill) -> Fix #10 restore NOT the cause (consistent with C/D A/B).
+Grammar masks only tool/parameter NAMES (the curl value is unconstrained),
+so not grammar-forced either. Remaining suspects: sampling loops on
+structured output / the search-result echo content.
+
+Shipped diagnostics: shell_run exit/stderr print (curl failures become
+visible: DNS vs 4xx vs syntax); the cycle-break tail log extended to ~48
+tokens/320 chars to see exactly what the model was repeating; A/B toggle
+`defaults write DRP.DynaMoE dynamoe_disable_grammar -bool YES` (grammar only
+constrains names, so this is a weaker suspect, but cheap to test).
+Note: same URL succeeds from the shell on this machine (HTTP 200) -> the
+app's curl failures stem from the mangled/parsed call, not the network.
+
+### QA #19 — F.txt: ROOT CAUSE of the tool-loop truncation found and fixed
+
+The extended 🛑 tail logs exposed the mechanism:
+- Turn 1 froze normally on `<function=tools_load><parameter=names>["web_search"]</parameter>ieldquo` (tools_load fired, web_search loaded).
+- Turn 2 (and E's turns 2-3) emitted `<function>` — an UNNAMED tool call —
+  then looped on empty `<parameter>` tags until the degenerate-cycle guard
+  broke the generation. Everything downstream (failed curls, prompt
+  divergence, startPos=0 re-prefills) follows from that truncation.
+
+Root cause: GrammarConstrainedSampler.applyLogitMask's `>` escape hatch
+allowed any token starting with '>' to bypass the name-constraint EVEN when
+the tool/parameter name was incomplete — so the model could legally emit
+`<function>` with an empty name, then (in the unconstrained parameter-body
+states) loop empty `<parameter>` tags forever.
+
+Fix: the `>` escape is now allowed only when the current prefix IS a
+complete registered tool name (function) or a complete parameter key
+(parameter name). The model is forced to name the tool and each parameter
+key; values remain unconstrained. This should eliminate the degenerate
+tool-call truncations, the failed curl fragments, and the resulting
+startPos=0 re-prefills.

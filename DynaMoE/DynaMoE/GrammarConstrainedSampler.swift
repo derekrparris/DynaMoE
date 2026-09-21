@@ -148,7 +148,17 @@ public final class GrammarConstrainedSampler {
                     let afterP = String(insideFnBody[pRange.upperBound...])
                     if let pGt = afterP.range(of: ">") {
                         let pKey = String(afterP[..<pGt.lowerBound]).trimmingCharacters(in: .whitespaces)
-                        currentState = .insideParameterValue(toolName: fnName, paramKey: pKey)
+                        let afterValue = String(afterP[pGt.upperBound...])
+                        if let cRange = afterValue.range(of: paramClose) {
+                            let afterClose = String(afterValue[cRange.upperBound...])
+                            if let fRange = afterClose.range(of: functionClose, options: .backwards) {
+                                currentState = .closingToolCall(matchedPrefix: String(afterClose[fRange.upperBound...]))
+                            } else {
+                                currentState = .closingFunction(matchedPrefix: afterClose)
+                            }
+                        } else {
+                            currentState = .insideParameterValue(toolName: fnName, paramKey: pKey)
+                        }
                     } else {
                         currentState = .insideParameterName(toolName: fnName, currentKey: afterP)
                     }
@@ -181,15 +191,20 @@ public final class GrammarConstrainedSampler {
         case .insideFunctionName(let currentPrefix):
             let allowedTools = registeredToolNames.filter { $0.hasPrefix(currentPrefix) }
             if allowedTools.isEmpty { return }
+            // The '>' escape must only open once a COMPLETE tool name has been
+            // typed; otherwise the model can legally emit '<function>' with an
+            // empty name and then loop on empty '<parameter>' tags (observed as
+            // degenerate-cycle breaks that truncate tool calls).
+            let nameComplete = registeredToolNames.contains(currentPrefix)
 
             for v in 0..<vocabSize {
                 guard let str = tokenDecoder(UInt32(v)) else { continue }
-                if str.contains(">") && registeredToolNames.contains(currentPrefix) {
+                if str.contains(">") && nameComplete {
                     continue
                 }
                 let cand = currentPrefix + str
                 let matchesAny = allowedTools.contains { $0.hasPrefix(cand) || cand.hasPrefix($0) }
-                if !matchesAny && !str.hasPrefix(">") {
+                if !matchesAny && !(str.hasPrefix(">") && nameComplete) {
                     logits[v] = -Float.infinity
                 }
             }
@@ -198,21 +213,72 @@ public final class GrammarConstrainedSampler {
             guard let validKeys = toolParameterKeys[toolName] else { return }
             let allowedKeys = validKeys.filter { $0.hasPrefix(currentKey) }
             if allowedKeys.isEmpty { return }
+            let keyComplete = validKeys.contains(currentKey)
 
             for v in 0..<vocabSize {
                 guard let str = tokenDecoder(UInt32(v)) else { continue }
-                if str.contains(">") && validKeys.contains(currentKey) {
+                if str.contains(">") && keyComplete {
                     continue
                 }
                 let cand = currentKey + str
                 let matchesAny = allowedKeys.contains { $0.hasPrefix(cand) || cand.hasPrefix($0) }
-                if !matchesAny && !str.hasPrefix(">") {
+                if !matchesAny && !(str.hasPrefix(">") && keyComplete) {
                     logits[v] = -Float.infinity
                 }
             }
 
+        case .closingFunction(let matchedPrefix):
+            applyTagChoiceMask(
+                logits: logits,
+                vocabSize: vocabSize,
+                currentPrefix: matchedPrefix,
+                tokenDecoder: tokenDecoder,
+                options: [paramOpenPrefix, functionClose]
+            )
+
         default:
             return
+        }
+    }
+
+    /// After a parameter value has closed, the only legal continuations are
+    /// another `<parameter=` tag or `</function>`, with whitespace between them.
+    /// Without this mask the model can repeat `</parameter>` until the cycle
+    /// guard truncates the call, which then poisons the pinned prefix.
+    private func applyTagChoiceMask(
+        logits: UnsafeMutablePointer<Float>,
+        vocabSize: Int,
+        currentPrefix: String,
+        tokenDecoder: (UInt32) -> String?,
+        options: [String]
+    ) {
+        func isWSChar(_ c: Character) -> Bool { c == " " || c == "\n" || c == "\t" || c == "\r" }
+        func isWS(_ s: some StringProtocol) -> Bool { s.allSatisfy(isWSChar) }
+        let trimmed = currentPrefix.drop(while: isWSChar)
+        let atWhitespaceBoundary = trimmed.isEmpty
+        // Dead-end valve: a prefix that can no longer reach any legal tag (e.g. a
+        // half-typed second `</parameter>`) would mask the entire vocab; unmask
+        // instead and let the next state transition recover.
+        if !options.contains(where: { $0.hasPrefix(trimmed) || trimmed.hasPrefix($0) }) { return }
+
+        func allowed(_ candidate: String) -> Bool {
+            let t = candidate.drop(while: isWSChar)
+            for option in options {
+                if option.hasPrefix(t) { return true }
+                if t.hasPrefix(option) {
+                    let rest = t.dropFirst(option.count)
+                    if isWS(rest) { return true }
+                    if options.contains(where: { $0.hasPrefix(rest.drop(while: isWSChar)) }) { return true }
+                }
+            }
+            return false
+        }
+
+        for v in 0..<vocabSize {
+            guard let str = tokenDecoder(UInt32(v)) else { continue }
+            if atWhitespaceBoundary && isWS(str) { continue }
+            if allowed(currentPrefix + str) { continue }
+            logits[v] = -Float.infinity
         }
     }
 }

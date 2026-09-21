@@ -258,6 +258,17 @@ final class KVCacheManager {
            snapS.length >= min(linStateBytes, snapS.length),
            liveS.length >= min(linStateBytes, snapS.length) {
             let copyBytes = min(linStateBytes, liveS.length, snapS.length)
+            // Self-check: at reset time nothing should have advanced the live state
+            // since capture, so the restore should be a byte-identical no-op. A
+            // mismatch means the state ran ahead of the pinned token list between
+            // turns (e.g. an unpinned prefill-only pass) — surfacing it loudly.
+            if memcmp(liveS.contents(), snapS.contents(), copyBytes) != 0 {
+                var diffs = 0
+                let a = liveS.contents().bindMemory(to: Float.self, capacity: copyBytes / 4)
+                let b = snapS.contents().bindMemory(to: Float.self, capacity: copyBytes / 4)
+                for i in 0..<(copyBytes / 4) where a[i] != b[i] { diffs += 1 }
+                print("⚠️ [PREFIX] GDN state diverged from snapshot at restore: \(diffs)/\(copyBytes / 4) floats differ (pin=\(preservePrefixCount))")
+            }
             memcpy(liveS.contents(), snapS.contents(), copyBytes)
             canRestoreLinear = true
         } else if isLing || config?.hasLinearRecurrence == true || preservePrefixCount == 0 {
@@ -3636,6 +3647,7 @@ struct ContentView: View {
         let gemvBF16Pipeline: MTLComputePipelineState
         let bf16GemvSimdPipeline: MTLComputePipelineState?
         let bf16GemvBatchedPipeline: MTLComputePipelineState?
+        let fp8GemvBatchedPipeline: MTLComputePipelineState?
         let fp8GemvPipeline: MTLComputePipelineState?
         let mxfp8GemvPipeline: MTLComputePipelineState?
         let mxfp8GemvSimdPipeline: MTLComputePipelineState?
@@ -3833,6 +3845,14 @@ struct ContentView: View {
             } else {
                 bf16GemvBatchedPipeline = nil
                 print("⚠️ [GEMV] bf16_gemv_batched unavailable — prefill GEMVs fall back to per-token weight reads")
+            }
+
+            if let fGemvBatched = defaultLibrary.makeFunction(name: "fp8_gemv_batched") {
+                fp8GemvBatchedPipeline = try device.makeComputePipelineState(function: fGemvBatched)
+                print("⚡ [GEMV] fp8_gemv_batched pipeline ready — attention prefill uses weight-stationary reads")
+            } else {
+                fp8GemvBatchedPipeline = nil
+                print("⚠️ [GEMV] fp8_gemv_batched unavailable — attention prefill GEMVs fall back to per-token weight reads")
             }
 
             if let fp8GemvFunc = defaultLibrary.makeFunction(name: "fp8_gemv") {
@@ -4328,8 +4348,21 @@ struct ContentView: View {
         // end next to recordTurn).
         let reuseCandidate = PrefixCacheManager.shared.findCommonPrefix(promptTokenIds: promptTokenIds, sessionId: sessionId)
         let prefixTokensReused: Int
-        if hasRecurrence {
-            prefixTokensReused = (reuseCandidate > 0 && reuseCandidate == PrefixCacheManager.shared.currentPinnedCount) ? reuseCandidate : 0
+        // A/B toggle for bisecting the tool-call truncation: defaults write
+        // com.drp.DynaMoE dynamoe_disable_prefix_reuse -bool YES
+        if UserDefaults.standard.bool(forKey: "dynamoe_disable_prefix_reuse") {
+            prefixTokensReused = 0
+        } else         if hasRecurrence {
+            if reuseCandidate > 0 && reuseCandidate == PrefixCacheManager.shared.currentPinnedCount {
+                prefixTokensReused = reuseCandidate
+            } else {
+                if reuseCandidate != 0 {
+                    print("🔁 [PREFIX] partial match \(reuseCandidate)/\(PrefixCacheManager.shared.currentPinnedCount) pinned — hybrid state cannot rewind; full re-prefill")
+                } else if PrefixCacheManager.shared.currentPinnedCount > 0 {
+                    print("🔁 [PREFIX] no common prefix with pin of \(PrefixCacheManager.shared.currentPinnedCount) (session mismatch or prompt diverged at token 0) — full re-prefill")
+                }
+                prefixTokensReused = 0
+            }
         } else {
             prefixTokensReused = reuseCandidate
         }
@@ -4505,7 +4538,21 @@ struct ContentView: View {
                         enc.setBytes(&inD, length: MemoryLayout<UInt32>.stride, index: 6)
                         enc.setBytes(&outD, length: MemoryLayout<UInt32>.stride, index: 7)
                         enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: batchSize, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
-                    } else if let simdPipe = fp8GemvSimdPipeline {
+                    } else if batchSize > 1, let fBatchedPipe = fp8GemvBatchedPipeline {
+                    // FIX #9b: weight-stationary batched FP8 GEMV for prefill (P > 1).
+                    var batchVal = UInt32(batchSize)
+                    enc.setComputePipelineState(fBatchedPipe)
+                    enc.setBuffer(wRaw, offset: 0, index: 0)
+                    enc.setBuffer(inBuf, offset: inOffset, index: 1)
+                    enc.setBuffer(outBuf, offset: outOffset, index: 2)
+                    enc.setBuffer(sRaw, offset: 0, index: 3)
+                    enc.setBytes(&wOff, length: MemoryLayout<UInt64>.stride, index: 4)
+                    enc.setBytes(&sOff, length: MemoryLayout<UInt64>.stride, index: 5)
+                    enc.setBytes(&inD, length: MemoryLayout<UInt32>.stride, index: 6)
+                    enc.setBytes(&outD, length: MemoryLayout<UInt32>.stride, index: 7)
+                    enc.setBytes(&batchVal, length: MemoryLayout<UInt32>.stride, index: 8)
+                    enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: (batchSize + 15) / 16, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                } else if let simdPipe = fp8GemvSimdPipeline {
                         enc.setComputePipelineState(simdPipe)
                         enc.setBuffer(wRaw, offset: 0, index: 0)
                         enc.setBuffer(inBuf, offset: inOffset, index: 1)
@@ -10561,7 +10608,7 @@ if layer.attnGateProjTensor != nil,
                         repetitionPenalty: repPen,
                         presencePenalty: presPen,
                         eosTokenIds: modelConfig?.effectiveEosTokenIds.map { UInt32($0) } ?? [eosTokenId],
-                        grammarMask: isGrammarActive ? { maskLogits, maskVocab in
+                        grammarMask: isGrammarActive && !UserDefaults.standard.bool(forKey: "dynamoe_disable_grammar") ? { maskLogits, maskVocab in
                             GrammarConstrainedSampler.shared.updateState(emittedText: accumulatedDecodedText)
                             GrammarConstrainedSampler.shared.applyLogitMask(logits: maskLogits, vocabSize: maskVocab, tokenDecoder: { try? tokenizer.decode(ids: [$0]) })
                         } : nil
@@ -10574,12 +10621,15 @@ if layer.attnGateProjTensor != nil,
                 }
 
                 var shouldBreak = false
+                var breakReason = ""
+                var lastCandidateToken: UInt32 = 0
                 for nextToken in acceptedBatch {
                     // 5. Check EOS
                     let isLingEos = (modelConfig?.isLingModel == true) && (nextToken == 156895 || nextToken == 156892)
                     let isSparkEos = (modelConfig?.isSparkModel == true) && (nextToken == 1 || nextToken == 2)
                     if nextToken == eosTokenId || nextToken == 248044 || nextToken == 248046 || nextToken == 166101 || nextToken == 166102 || isLingEos || isSparkEos {
                         shouldBreak = true
+                        breakReason = "eos-token(\(nextToken))"
                         break
                     }
 
@@ -10605,6 +10655,7 @@ if layer.attnGateProjTensor != nil,
                             }
                             if isCycle {
                                 shouldBreak = true
+                                breakReason = "degenerate-cycle"
                                 break
                             }
                         }
@@ -10640,17 +10691,23 @@ if layer.attnGateProjTensor != nil,
                     accumulatedDecodedText = emittable
                     if deltaText.contains("<|im_end|>") || deltaText.contains("<|endoftext|>") || deltaText.contains("<|role_end|>") {
                         shouldBreak = true
+                        breakReason = "end-tag-in-text"
                         break
                     }
 
                     // Pre-Execution Catching: Freeze decoding immediately when </tool_call> closes
                     if runAgentTools && StreamingToolParser.shared.shouldFreezeGeneration(accumulatedText: accumulatedDecodedText, deltaText: deltaText) {
                         shouldBreak = true
+                        breakReason = "tool-parser-freeze"
                         break
                     }
                 }
 
-                if shouldBreak { break }
+                if shouldBreak {
+                    let tailText = (try? tokenizer.decode(ids: Array(generatedTokenIds.suffix(48)))) ?? ""
+                    print("🛑 [GEN] ended at \(tokensGenerated) tokens: reason=\(breakReason) tail='\(tailText.prefix(320))'")
+                    break
+                }
 
                 // Token boundary working set pruning: keep resident set strictly within budget
                 WorkingSetManager.shared.trimToBudget(mode: budgetMode, shardBuffers: buffers)
@@ -10875,6 +10932,7 @@ if layer.attnGateProjTensor != nil,
                     generatedTokenIds: generatedTokenIds,
                     sessionId: sessionId
                 )
+                print("📌 [PREFIX] pinned \(promptTokenIds.count + generatedTokenIds.count) tokens (prompt=\(promptTokenIds.count) gen=\(generatedTokenIds.count))")
                 if shouldForceSynthesis {
                     let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
                     var assistantTurnText = finalDecoded

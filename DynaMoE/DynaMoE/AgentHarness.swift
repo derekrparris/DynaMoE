@@ -172,12 +172,14 @@ public final class ShellRunTool: AgentTool {
         let cleanStderr = AgentHarness.truncateText(AgentHarness.sanitizeText(stderr.trimmingCharacters(in: .whitespacesAndNewlines)), limit: maxOutputLength)
 
         if exitCode == 0 {
+            print("🛠 [shell_run] exit=0 cmd='\(String(command.prefix(100)))'")
             let res = AgentHarness.toolSuccessJSON(tool: "shell_run", data: [
                 "stdout": cleanStdout.isEmpty ? "Command succeeded with no output." : cleanStdout,
                 "exit_code": 0
             ])
             return (res, cleanStdout, nil, false)
         } else {
+            print("🛠 [shell_run] exit=\(exitCode) cmd='\(String(command.prefix(100)))' stderr='\(String(cleanStderr.prefix(160)))' stdout='\(String(cleanStdout.prefix(80)))'")
             let res = AgentHarness.toolErrorJSON(tool: "shell_run", error: cleanStderr.isEmpty ? cleanStdout : cleanStderr, extra: [
                 "exit_code": exitCode,
                 "stdout": cleanStdout

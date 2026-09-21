@@ -210,7 +210,9 @@ final class GPU {
                      "linear_attention_recurrent_step_sigmoid",
                      "gdn_seq_v2",
                      "bf16_gemv_simd",
-                     "bf16_gemv_batched"] {
+                     "bf16_gemv_batched",
+                     "fp8_gemv_simd",
+                     "fp8_gemv_batched"] {
             if let f = lib.makeFunction(name: name) {
                 do {
                     pipelines[name] = try dev.makeComputePipelineState(function: f)
@@ -673,74 +675,8 @@ func main() {
             }
         }
 
-        // T18b experiment: weight-stationary batched GEMV — one threadgroup per
-        // (output, 16-token block); the weight row is read once per TG, so total
-        // weight traffic scales with ceil(P/16) instead of P.
-        kernel void bf16_gemv_batched(
-            device const ushort* rawWeight [[buffer(0)]],
-            device const float* inputBatched [[buffer(1)]],
-            device float* outputBatched [[buffer(2)]],
-            constant uint64_t& weightOffset [[buffer(3)]],
-            constant uint32_t& inDim [[buffer(4)]],
-            constant uint32_t& outDim [[buffer(5)]],
-            constant uint32_t& batch [[buffer(6)]],
-            uint2 tg [[threadgroup_position_in_grid]],
-            uint lane [[thread_index_in_simdgroup]]
-        ) {
-            uint o = tg.x;
-            uint t0 = tg.y * 16;
-            if (o >= outDim) return;
-            device const ushort4* w4 = (device const ushort4*)(rawWeight + (uint)(weightOffset >> 1) + ((uint64_t)o * inDim));
-            float acc[16];
-            for (uint t = 0; t < 16; t++) acc[t] = 0.0f;
-            uint32_t numChunks = inDim / 8;
-            for (uint32_t c = lane; c < numChunks; c += 32) {
-                ushort4 wLoRaw = w4[c * 2 + 0];
-                ushort4 wHiRaw = w4[c * 2 + 1];
-                float4 wLo = float4(bf16_to_fp32(wLoRaw.x), bf16_to_fp32(wLoRaw.y), bf16_to_fp32(wLoRaw.z), bf16_to_fp32(wLoRaw.w));
-                float4 wHi = float4(bf16_to_fp32(wHiRaw.x), bf16_to_fp32(wHiRaw.y), bf16_to_fp32(wHiRaw.z), bf16_to_fp32(wHiRaw.w));
-                for (uint t = 0; t < 16; t++) {
-                    device const float4* in4 = (device const float4*)(inputBatched + ((uint64_t)(t0 + t) * inDim));
-                    float4 in_lo = in4[c * 2 + 0];
-                    float4 in_hi = in4[c * 2 + 1];
-                    acc[t] += dot(wLo, in_lo) + dot(wHi, in_hi);
-                }
-            }
-            float s0 = simd_sum(acc[0]);
-            float s1 = simd_sum(acc[1]);
-            float s2 = simd_sum(acc[2]);
-            float s3 = simd_sum(acc[3]);
-            float s4 = simd_sum(acc[4]);
-            float s5 = simd_sum(acc[5]);
-            float s6 = simd_sum(acc[6]);
-            float s7 = simd_sum(acc[7]);
-            float s8 = simd_sum(acc[8]);
-            float s9 = simd_sum(acc[9]);
-            float s10 = simd_sum(acc[10]);
-            float s11 = simd_sum(acc[11]);
-            float s12 = simd_sum(acc[12]);
-            float s13 = simd_sum(acc[13]);
-            float s14 = simd_sum(acc[14]);
-            float s15 = simd_sum(acc[15]);
-            if (lane == 0) {
-                if (t0 + 0 < batch) outputBatched[(uint64_t)(t0 + 0) * outDim + o] = s0;
-                if (t0 + 1 < batch) outputBatched[(uint64_t)(t0 + 1) * outDim + o] = s1;
-                if (t0 + 2 < batch) outputBatched[(uint64_t)(t0 + 2) * outDim + o] = s2;
-                if (t0 + 3 < batch) outputBatched[(uint64_t)(t0 + 3) * outDim + o] = s3;
-                if (t0 + 4 < batch) outputBatched[(uint64_t)(t0 + 4) * outDim + o] = s4;
-                if (t0 + 5 < batch) outputBatched[(uint64_t)(t0 + 5) * outDim + o] = s5;
-                if (t0 + 6 < batch) outputBatched[(uint64_t)(t0 + 6) * outDim + o] = s6;
-                if (t0 + 7 < batch) outputBatched[(uint64_t)(t0 + 7) * outDim + o] = s7;
-                if (t0 + 8 < batch) outputBatched[(uint64_t)(t0 + 8) * outDim + o] = s8;
-                if (t0 + 9 < batch) outputBatched[(uint64_t)(t0 + 9) * outDim + o] = s9;
-                if (t0 + 10 < batch) outputBatched[(uint64_t)(t0 + 10) * outDim + o] = s10;
-                if (t0 + 11 < batch) outputBatched[(uint64_t)(t0 + 11) * outDim + o] = s11;
-                if (t0 + 12 < batch) outputBatched[(uint64_t)(t0 + 12) * outDim + o] = s12;
-                if (t0 + 13 < batch) outputBatched[(uint64_t)(t0 + 13) * outDim + o] = s13;
-                if (t0 + 14 < batch) outputBatched[(uint64_t)(t0 + 14) * outDim + o] = s14;
-                if (t0 + 15 < batch) outputBatched[(uint64_t)(t0 + 15) * outDim + o] = s15;
-            }
-        }
+        // (bf16_gemv_batched and fp8_gemv_batched are production kernels in
+        // ComputeShaders.metal now — the bench makes them from the source directly.)
         """
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("bench_fused.metal")
         try? (src + fused).write(to: tmp, atomically: true, encoding: .utf8)
@@ -2323,6 +2259,71 @@ func main() {
                 }
                 print("   cpu[0..3]: \(cpuVals.map { String(format: "%.4f", $0) }.joined(separator: ",")) | simd[0..3]: \((0..<4).map { String(format: "%.4f", refP[$0]) }.joined(separator: ",")) | bat[0..3]: \((0..<4).map { String(format: "%.4f", batP[$0]) }.joined(separator: ","))")
                 print("   GEMV 2560->10240 P=\(String(format: "%4d", P)): simd \(String(format: "%7.2f", t))ms | batched \(String(format: "%7.2f", t2))ms (\(String(format: "%.1f", t / max(t2, 1e-9)))x) | rel \(String(format: "%.1e", maxRel))")
+            }
+        }
+
+        // FP8 batched GEMV clone check (FIX #9b): identical structure to bf16 with
+        // unpack_e4m3 dequant + per-row bf16 scale.
+        if let fp8SimdPipe = gpu.pipe("fp8_gemv_simd"),
+           let fp8BPipe = gpu.pipe("fp8_gemv_batched"),
+           let w8 = gpu.device.makeBuffer(length: 2560 * 10240, options: .storageModeShared),
+           let s8 = gpu.device.makeBuffer(length: 10240 * 2, options: .storageModeShared),
+           let inF8 = gpu.device.makeBuffer(length: maxP * 2560 * 4, options: .storageModeShared),
+           let outF8a = gpu.device.makeBuffer(length: maxP * 10240 * 4, options: .storageModeShared),
+           let outF8b = gpu.device.makeBuffer(length: maxP * 10240 * 4, options: .storageModeShared) {
+            let w8p = w8.contents().bindMemory(to: UInt8.self, capacity: 2560 * 10240)
+            for i in 0..<(2560 * 10240) { w8p[i] = UInt8(truncatingIfNeeded: seed &+ 31) }
+            let s8p = s8.contents().bindMemory(to: UInt16.self, capacity: 10240)
+            for i in 0..<10240 { s8p[i] = bf16Bits(0.5 + rnd4() * 0.5) }
+            let inF8p = inF8.contents().bindMemory(to: Float.self, capacity: maxP * 2560)
+            for i in 0..<(maxP * 2560) { inF8p[i] = rnd4() }
+            for P in [1, 64, 1024] {
+                let cmd = queue4.makeCommandBuffer()!
+                let enc = cmd.makeComputeCommandEncoder()!
+                var wOff8: UInt64 = 0, sOff8: UInt64 = 0, inD8 = UInt32(2560), outD8 = UInt32(10240)
+                enc.setComputePipelineState(fp8SimdPipe)
+                enc.setBuffer(w8, offset: 0, index: 0)
+                enc.setBuffer(inF8, offset: 0, index: 1)
+                enc.setBuffer(outF8a, offset: 0, index: 2)
+                enc.setBuffer(s8, offset: 0, index: 3)
+                enc.setBytes(&wOff8, length: 8, index: 4)
+                enc.setBytes(&sOff8, length: 8, index: 5)
+                enc.setBytes(&inD8, length: 4, index: 6)
+                enc.setBytes(&outD8, length: 4, index: 7)
+                enc.dispatchThreadgroups(MTLSize(width: 10240, height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.endEncoding()
+                let t0 = CFAbsoluteTimeGetCurrent()
+                cmd.commit(); cmd.waitUntilCompleted()
+                let tA = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+
+                let cmd2 = queue4.makeCommandBuffer()!
+                let enc2 = cmd2.makeComputeCommandEncoder()!
+                var batchF8 = UInt32(P)
+                enc2.setComputePipelineState(fp8BPipe)
+                enc2.setBuffer(w8, offset: 0, index: 0)
+                enc2.setBuffer(inF8, offset: 0, index: 1)
+                enc2.setBuffer(outF8b, offset: 0, index: 2)
+                enc2.setBuffer(s8, offset: 0, index: 3)
+                enc2.setBytes(&wOff8, length: 8, index: 4)
+                enc2.setBytes(&sOff8, length: 8, index: 5)
+                enc2.setBytes(&inD8, length: 4, index: 6)
+                enc2.setBytes(&outD8, length: 4, index: 7)
+                enc2.setBytes(&batchF8, length: 4, index: 8)
+                enc2.dispatchThreadgroups(MTLSize(width: 10240, height: (P + 15) / 16, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc2.endEncoding()
+                let t02 = CFAbsoluteTimeGetCurrent()
+                cmd2.commit(); cmd2.waitUntilCompleted()
+                let tB = (CFAbsoluteTimeGetCurrent() - t02) * 1000
+
+                let aP = outF8a.contents().bindMemory(to: Float.self, capacity: P * 10240)
+                let bP = outF8b.contents().bindMemory(to: Float.self, capacity: P * 10240)
+                var maxRel = 0.0
+                for i in 0..<(P * 10240) {
+                    let x = Double(aP[i]); let y = Double(bP[i])
+                    let rel = abs(x - y) / max(1e-2, max(abs(x), abs(y)))
+                    if rel > maxRel { maxRel = rel }
+                }
+                print("   FP8 GEMV 2560->10240 P=\(String(format: "%4d", P)): simd \(String(format: "%7.2f", tA))ms | batched \(String(format: "%7.2f", tB))ms (\(String(format: "%.1f", tA / max(tB, 1e-9)))x) | rel \(String(format: "%.1e", maxRel))")
             }
         }
     }
