@@ -927,6 +927,11 @@ struct ContentView: View {
     @State private var generationElapsedMs: Double = 0.0
     @State private var generationStatusText: String? = nil
     @State private var generationTask: Task<Void, Never>? = nil
+    /// Monotonic id for the live generation. A cancelled task that has already
+    /// been superseded (interrupt + replacement, or a scheduled continuation)
+    /// must not clear this generation's task handle/UI flags, record a prefix,
+    /// or schedule another turn — see `ownsGeneration`.
+    @State private var generationId: UInt64 = 0
 
     // Working Set & Dynamic SSD Expert Paging State
     @State private var memoryExecutionMode: MemoryExecutionMode = .autoDetect
@@ -3404,6 +3409,15 @@ struct ContentView: View {
         generationStatusText = "⏹ Generation stopped by user."
     }
 
+    /// True when the given generation still owns the shared generation state.
+    /// Cancellation alone is not enough to mutate that state: `interruptAndSendMessage`
+    /// starts a replacement shortly after cancelling, so a cancelled task that
+    /// clears `generationTask`/`isGeneratingText` would silently disarm the
+    /// replacement (Stop would no longer cancel it). Call from the main actor.
+    private func ownsGeneration(_ id: UInt64) -> Bool {
+        id == generationId
+    }
+
     /// Builds the raw-token prompt for an agent continuation turn: the previous
     /// turn's actual prompt+generated token ids plus the freshly tokenized turn
     /// suffix (end tag + tool-response/continuation text). Re-tokenizing the
@@ -4414,6 +4428,8 @@ struct ContentView: View {
             preservePrefixCount: prefixTokensReused
         )
         let grammarGenerationToken = GrammarConstrainedSampler.shared.beginGeneration()
+        generationId &+= 1
+        let myGenerationId = generationId
 
         isGeneratingText = true
         generatingSessionId = sessionId ?? selectedSessionId ?? sessions.first?.id
@@ -10569,6 +10585,7 @@ if layer.attnGateProjTensor != nil,
                     }
                     if !ok {
                         await MainActor.run {
+                            guard self.ownsGeneration(myGenerationId) else { return }
                             self.isGeneratingText = false
                             self.generationTask = nil
                             self.generationStatusText = Task.isCancelled ? "⏹ Generation stopped by user." : "❌ Ingestion failed during prefill."
@@ -10637,6 +10654,13 @@ if layer.attnGateProjTensor != nil,
                     // 4. Sample Next Token
                     let logitsPtr = logitsBuffer.contents().bindMemory(to: Float.self, capacity: Int(vocabSize))
                     let isGrammarActive = runAgentTools && (UserDefaults.standard.object(forKey: "dynamoe_agent_grammar_masking") == nil ? true : UserDefaults.standard.bool(forKey: "dynamoe_agent_grammar_masking"))
+                    // Cancel can land after the loop-head check, and a superseded
+                    // generation has its grammar mask dropped silently. Without this
+                    // the task would draw a token from unmasked logits and commit it.
+                    if Task.isCancelled || !GrammarConstrainedSampler.shared.isCurrent(grammarGenerationToken) {
+                        print("⏹ [GEN] superseded at \(tokensGenerated) tokens — stopping before sampling")
+                        break
+                    }
                     let nextToken = sampleNextToken(
                         logits: logitsPtr,
                         vocabSize: Int(vocabSize),
@@ -10894,6 +10918,19 @@ if layer.attnGateProjTensor != nil,
             let finalTtft = firstTokenTimestamp.map { $0 - startTime }
             let finalThinkDuration = thinkingEndTimestamp.map { $0 - generationStartTime }
 
+            // A cancelled turn must not finalize. The Stop/interrupt path already
+            // cleared isGeneratingText/generationTask and set the status line, and a
+            // replacement generation may be starting: finalizing here would nil out
+            // the replacement's task handle, flip its UI flags, record this
+            // truncated turn into the prefix cache while the replacement is using
+            // the same KV cache, and can schedule another agent turn on top of the
+            // replacement. The partial reply is already committed to the message
+            // from the streaming updates above, so nothing is lost by returning.
+            if Task.isCancelled {
+                print("⏹ [GEN] cancelled at \(tokensGenerated) tokens — skipping finalization")
+                return
+            }
+
             // Agent Harness Multi-Step Tool Check
             let parsedResult = runAgentTools ? StreamingToolParser.shared.parseStreamingToolCalls(from: finalDecoded) : (calls: [], brokenFragments: [])
             let hasUncalledIntent = runAgentTools && parsedResult.calls.isEmpty && agentStep == 0 && (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink)
@@ -10908,6 +10945,10 @@ if layer.attnGateProjTensor != nil,
                 && (priorContent ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
             await MainActor.run {
+                // Superseded by a newer generation: it owns the UI flags, the task
+                // handle and the prefix cache now, so this task must not touch any
+                // of them (nor schedule another turn).
+                guard self.ownsGeneration(myGenerationId) else { return }
                 if !willContinueAgent {
                     self.isGeneratingText = false
                     self.generationTask = nil
@@ -11098,6 +11139,7 @@ if layer.attnGateProjTensor != nil,
                     for (idx, call) in parsedResult.calls.enumerated() {
                         if Task.isCancelled {
                             await MainActor.run {
+                                guard self.ownsGeneration(myGenerationId) else { return }
                                 self.isGeneratingText = false
                                 self.generationTask = nil
                                 self.generationStatusText = "⏹ Tool execution stopped by user."
@@ -11234,6 +11276,7 @@ if layer.attnGateProjTensor != nil,
 
                     if Task.isCancelled {
                         await MainActor.run {
+                            guard self.ownsGeneration(myGenerationId) else { return }
                             self.isGeneratingText = false
                             self.generationTask = nil
                             self.generationStatusText = "⏹ Generation stopped by user."
@@ -11440,6 +11483,7 @@ if layer.attnGateProjTensor != nil,
                 } else if agentStep == 0 && (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink) {
                     if Task.isCancelled {
                         await MainActor.run {
+                            guard self.ownsGeneration(myGenerationId) else { return }
                             self.isGeneratingText = false
                             self.generationTask = nil
                             self.generationStatusText = "⏹ Generation stopped by user."

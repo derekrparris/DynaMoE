@@ -1285,6 +1285,36 @@ no `<|im_start|>user`. `formatToolResponseTurn` was deliberately not changed —
 tool results stay user-role — and its assertion is untouched. Both tests are
 pure formatter/parser checks with no model dependency, so they run on any host.
 
+Review follow-up (Copilot, High): the new assertion
+`continuationTurn.hasSuffix("<|im_start|>assistant\n thinking")` could never
+pass. Correct, and the cause is worth recording because it is a tooling trap,
+not a logic slip. `formatActionContinuationTurn` appends the literal
+`" thinking\n"` (real angle brackets), so the turn ends with the tag plus a
+trailing newline. The assertion as written expected `\n`, a space, and the bare
+word `thinking`. Verified at byte level: the needle's codepoints were
+`0x5c 0x6e 0x20 0x74 0x68 0x69 0x6e 0x6b 0x69 0x6e 0x67` (backslash, n, space,
+`thinking`) where every neighbouring assertion uses
+`0x3c 0x74 0x68 0x69 0x6e 0x6b 0x3e` (` thinking`) — including the assertion two
+lines below it that I did not write.
+
+Root cause: the literal was copied from a rendered file view, and the rendering
+pipeline strips `<`/`>` from unrecognized tags, so ` thinking` displays as
+` thinking`. The same sanitizing affects comments and prose, which is harmless,
+but makes any tag-bearing *code or test literal* untrustworthy when read
+through a rendering. Every tag literal written in this branch was re-audited at
+byte level: all production tags (`<|im_start|>system`, `<|im_start|>user`,
+`<|role_end|>`, `<role>SYSTEM</role>`, `<role>OBSERVATION</role>`) and the
+tool-call template embedded in the continuation directive (`<tool_call>`,
+`<function=`, `</function>`, `<parameter=`, `</parameter>` — one each) are
+intact. The test was the only casualty.
+
+Also checked the neighbouring assertions that share this shape: the Ling
+`hasSuffix("<role>ASSISTANT</role>\n thinking")` is correct because the Ling
+formatter ends with `"\n thinking"` and no trailing newline, so it was left
+alone. Added a note that the trailing newline is part of the ChatML
+`" thinking\n"` handoff. Confirmed by simulating both forms against the real
+tail: the corrected assertion returns true, the original returns false.
+
 Review follow-up (Copilot, Medium): the pleasantry veto ran after the
 commitment-phrase check but *before* the cue+action check, so any turn that
 paired a pleasantry with a real narrated action was suppressed — "Happy to help
@@ -1373,3 +1403,107 @@ suppresses every warning in every other file — including exactly the isolation
 warnings this review is about. Pass the project's flags
 (`-swift-version 5 -default-isolation MainActor`) and treat a clean CLI
 typecheck as "no errors", not "no warnings".
+
+### QA #28 — a cancelled generation ran the whole finalization path (review follow-up)
+
+Review (Copilot, High): cancellation only breaks the token loop. The detached
+task then continues through finalization, which updates shared UI state,
+captures/records the prefix and can schedule another agent turn. Since
+`interruptAndSendMessage` starts the replacement after only 60ms, the cancelled
+task can overwrite the replacement's `generationTask`/prefix cache and race its
+shared KV buffers.
+
+Confirmed, and it is reachable. `stopAutoregressiveGeneration()` (the
+Stop/interrupt path, and the only caller that owns the UI cleanup) sets
+`isGeneratingText = false`, cancels and nils `generationTask`. The replacement
+then starts 60-80ms later and assigns a fresh `generationTask`. The cancelled
+task reaches its finalization block afterwards — up to one token later, ~350ms
+on the reference machine — and that block sets `isGeneratingText = false` and
+`generationTask = nil` again, silently **disarming the replacement**: the Stop
+button and any later interrupt would no longer be able to cancel the running
+generation. The same block also runs
+
+- `KVCacheManager.shared.captureLinearStates()` and
+  `PrefixCacheManager.shared.recordTurn(...)`, pinning a truncated turn into the
+  prefix cache while the replacement is prefilling against the same KV cache, and
+- `dequeueAndRunNextPromptIfNeeded(sessionId:)`, which can start yet another
+  generation on top of the replacement.
+
+Fix, one early return plus one generation identity:
+
+- The detached task now returns immediately when `Task.isCancelled`, before the
+  finalization block. Nothing is lost: the partial reply is already committed to
+  the message by the per-token streaming updates, and the caller has already set
+  the status line. Logs `⏹ [GEN] cancelled at N tokens — skipping finalization`.
+- Cancellation alone is not a sufficient licence to mutate shared generation
+  state, because `interruptAndSendMessage` supersedes the task. Added
+  `@State generationId`, bumped once per `startAutoregressiveGeneration` and
+  captured by that task, plus `ownsGeneration(_:)`. Every other place that
+  cleared `generationTask`/`isGeneratingText` on cancellation
+  (`ContentView.swift` prefill-failure guard, tool-execution guard, and the two
+  agent-continuation guards) now returns early unless it still owns the
+  generation. Those sites all shared the same defect; guarding only the flagged
+  line would have left three live instances.
+
+Deliberately NOT done: awaiting the previous task before starting the
+replacement. That would be the airtight fix for the KV race, but a cancelled
+task sitting inside `runLayerWisePrefill` does not observe cancellation until it
+returns to the token loop — one measured prefill in this journal ran 419.6s. A
+bounded 60ms race is better than stalling the user's replacement prompt for
+minutes. Residual, documented: while a cancelled task finishes the prefill or
+token it was mid-way through, it still shares KV/working-set state and can write
+`generatedStreamText` for up to one iteration. Closing that properly needs
+cancellation checks inside the prefill loop, or an interrupt path that waits
+with a timeout - both larger changes than this review item.
+
+Verified: app typecheck clean under the project's real flags. Behaviour is
+observable in the run log; the user should see `⏹ [INT]` followed by
+`⏹ [GEN] cancelled at N tokens — skipping finalization` and then only the
+replacement's own generation.
+
+### QA #29 — a superseded generation sampled from unmasked logits (review follow-up)
+
+Review (Copilot, High): returning early from `updateStateAndApplyLogitMask` on a
+stale token silently treats the stale generation as if masking had succeeded —
+the logits are left unmasked and `sampleNextToken` gets no signal to abort, so
+the cancelled task can sample one unmasked token and still reach the later
+finalization/prefix-recording path.
+
+The unmasked-draw half is correct and worth fixing: the staleness guard exists to
+protect the *shared* state machine, but it also silently drops the mask, and the
+sampling loop had no way to tell the difference between "masked" and "mask not
+applied". The loop only re-checked cancellation at the top of each iteration, so
+a cancel arriving during a token forward (a ~350ms window, and the mask is
+dropped for the whole remainder of that iteration) let the task draw a token
+from raw logits and commit it into its message and the stream buffer.
+
+The "still reach the finalization/prefix-recording path" half was already closed
+by QA #28, which returns a cancelled task before finalization. That also means
+this is narrower than the review suggests: the stray token lands only in the
+task's own superseded message, and the task returns before tool parsing, so it
+can neither be executed as a tool call nor recorded as a prefix.
+
+Fix, making staleness visible rather than silent:
+
+- `GrammarConstrainedSampler.isCurrent(_:)` — the generation token is now
+  queryable, so a caller can tell that its mask was dropped.
+- The decode loop stops before sampling when the task is cancelled *or* the
+  token is no longer current, logging
+  `⏹ [GEN] superseded at N tokens — stopping before sampling`. Checking before
+  the draw rather than after the commit means no unmasked token is drawn at all.
+- The finalization block is additionally gated on `ownsGeneration`, so a
+  superseded-without-cancelled task cannot touch the UI flags, the task handle,
+  the prefix cache, or schedule another turn. `Task.isCancelled` was the only
+  check there before; ownership is the stronger and more precise condition.
+
+Deliberately not done: propagating the stale result through the mask closure as
+a Bool. The closure is a `(UnsafeMutablePointer<Float>, Int) -> Void` hook shared
+with `InferenceEngine.sampleNextToken`, which returns a bare `UInt32` with no
+error channel, so that route needs either a sentinel value or an optional return
+threaded through two signatures and the single call site. Querying staleness
+where the loop can see it achieves the same outcome without inventing a sentinel
+protocol. Revisit only if another caller of the mask hook appears.
+
+Verified: app typecheck clean under the project's real flags;
+`testGrammarGenerationTokenIsolatesStaleWriters` now also asserts
+`isCurrent` is true for the live token and false for the superseded one.

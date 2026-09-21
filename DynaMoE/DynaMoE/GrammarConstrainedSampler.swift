@@ -196,6 +196,17 @@ nonisolated public final class GrammarConstrainedSampler {
         _ = beginGeneration()
     }
 
+    /// True when `token` still identifies the live generation.
+    ///
+    /// The mask is silently skipped for a superseded generation, so the sampling
+    /// loop uses this to notice that its mask was dropped and stop, rather than
+    /// drawing a token from unmasked logits and committing it.
+    public func isCurrent(_ token: UInt64) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return token == generationToken
+    }
+
     // MARK: - Dynamic State Transition
 
     public func updateState(emittedText: String) {

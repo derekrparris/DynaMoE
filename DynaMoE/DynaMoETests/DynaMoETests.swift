@@ -6548,6 +6548,12 @@ final class DynaMoETests: XCTestCase {
         XCTAssertNotEqual(firstToken, secondToken, "beginGeneration must issue a new token")
         XCTAssertEqual(sampler.currentState, .outsideToolCall, "starting a generation clears state")
 
+        // `isCurrent` is how the sampling loop notices that its mask was dropped:
+        // the mask is skipped for a superseded generation, so the loop must be
+        // able to detect that and stop instead of drawing from unmasked logits.
+        XCTAssertTrue(sampler.isCurrent(secondToken))
+        XCTAssertFalse(sampler.isCurrent(firstToken))
+
         // Masking is exercised with an empty vocab: only the state transition and
         // the token guard matter here.
         var logits = [Float](repeating: 0, count: 1)
@@ -6702,7 +6708,9 @@ final class DynaMoETests: XCTestCase {
         )
         XCTAssertTrue(continuationTurn.contains("<|im_start|>system"))
         XCTAssertFalse(continuationTurn.contains("<|im_start|>user"))
-        XCTAssertTrue(continuationTurn.hasSuffix("<|im_start|>assistant\n thinking"))
+        // The turn ends inside the assistant opener with the reasoning tag already
+        // open (the trailing newline is part of `" thinking\n"`).
+        XCTAssertTrue(continuationTurn.hasSuffix("<|im_start|>assistant\n thinking\n"))
         XCTAssertTrue(responseTurn.contains("<|im_start|>assistant\n<think>"))
     }
 
