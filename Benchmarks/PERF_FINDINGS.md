@@ -1193,3 +1193,25 @@ Verified: suite now 40+ assertions, incl. prose/code survival, nav removal,
 partial-link retention, and sentinel-leak checks. Typecheck clean.
 Alternative if strict review parity is preferred: delete the link-span pass
 entirely and keep line-scoped removal only.
+
+### QA #25 — required-param scan must skip parameter values (review follow-up)
+
+Review flagged that parameterKeysTyped regex-scanned the whole function body,
+so a literal `<parameter=command>` inside a VALUE (shell command echoing tool
+markup, file_write content, a cwd string) counted as an opened required key
+and opened the `</function>` gate early. Valid, though low severity: the
+harness's hasEmptyRequiredArguments guard is the real backstop, so the worst
+case is a wasted call + recovered error turn, not a wrong result.
+
+Fix: parameterKeysTyped is now a small stateful walk — find `<parameter=`,
+read the key to `>`, jump past the next `</parameter>`, repeat. Tag-like text
+inside values is never scanned; unterminated values stop the walk, which
+keeps the gate engaged (safe direction). This also matches parser semantics
+(first `</parameter>` closes the value) and is stricter than the parser can
+be, never looser.
+
+Verified: new cases include a literal `<parameter=command>` in a cwd value
+(not counted, gate holds), a real command after such a value (counted, gate
+opens), an entire embedded tool-call block inside a content value (not
+counted), unterminated values, and early-close semantics. Full suite passes;
+typecheck clean.

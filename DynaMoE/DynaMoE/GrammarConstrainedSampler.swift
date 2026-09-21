@@ -90,8 +90,6 @@ public final class GrammarConstrainedSampler {
     private var currentToolName: String?
     private var seenParameterKeys: Set<String> = []
 
-    private static let typedParamKeyRegex = try? NSRegularExpression(pattern: "<parameter=\\s*([^\\s>\"]+)", options: [])
-
     // Structural Tag constants
     private let toolCallOpen = "<tool_call>"
     private let toolCallClose = "</tool_call>"
@@ -170,7 +168,7 @@ public final class GrammarConstrainedSampler {
                 let fnName = String(afterFn[..<gtRange.lowerBound]).trimmingCharacters(in: .whitespaces)
                 let insideFnBody = String(afterFn[gtRange.upperBound...])
                 currentToolName = fnName
-                seenParameterKeys = Self.parameterKeysTyped(in: insideFnBody)
+                seenParameterKeys = parameterKeysTyped(in: insideFnBody)
 
                 // Check parameter state
                 if let pRange = insideFnBody.range(of: paramOpenPrefix, options: .backwards) {
@@ -206,15 +204,22 @@ public final class GrammarConstrainedSampler {
         }
     }
 
-    /// Parameter keys already opened in a function body, used to decide whether
-    /// the call has satisfied its tool's required arguments yet.
-    private static func parameterKeysTyped(in body: String) -> Set<String> {
-        guard let re = typedParamKeyRegex else { return [] }
-        let ns = body as NSString
+    /// Parameter keys actually OPENED in a function body, used to decide whether
+    /// the call has satisfied its tool's required arguments yet. Walks the body
+    /// and skips each value span, so a literal `<parameter=...>` printed inside
+    /// a value (shell commands echoing tool markup, docs, cwd strings) is not
+    /// mistaken for an opened required key. Unterminated values stop the walk,
+    /// which keeps the required-parameter gate engaged (the safe direction).
+    private func parameterKeysTyped(in body: String) -> Set<String> {
         var keys = Set<String>()
-        re.enumerateMatches(in: body, options: [], range: NSRange(location: 0, length: ns.length)) { match, _, _ in
-            guard let match, match.numberOfRanges > 1 else { return }
-            keys.insert(ns.substring(with: match.range(at: 1)))
+        var searchStart = body.startIndex
+        while searchStart < body.endIndex,
+              let open = body.range(of: paramOpenPrefix, range: searchStart..<body.endIndex),
+              let gt = body.range(of: ">", range: open.upperBound..<body.endIndex) {
+            let key = body[open.upperBound..<gt.lowerBound].trimmingCharacters(in: .whitespaces)
+            if !key.isEmpty { keys.insert(key) }
+            guard let close = body.range(of: paramClose, range: gt.upperBound..<body.endIndex) else { break }
+            searchStart = close.upperBound
         }
         return keys
     }
