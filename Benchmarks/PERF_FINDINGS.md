@@ -1062,3 +1062,71 @@ complete registered tool name (function) or a complete parameter key
 key; values remain unconstrained. This should eliminate the degenerate
 tool-call truncations, the failed curl fragments, and the resulting
 startPos=0 re-prefills.
+
+### QA #20 — G.txt verifies the unnamed-call fix; tools.txt exposes a second loop; raw-token splice shipped
+
+G.txt (7 generations, 6 tool calls): the unnamed `<function>` loop is gone.
+All calls parsed and executed (shell_run exit=0, no curl failures), final
+1171-token answer ended on clean EOS, zero GDN divergence warnings, pins
+exact every turn. But turns 4/5/7 still looped `</parameter>` after a
+successfully closed value (turn 5 exited via an EOS-family token mid-loop,
+masking as a clean EOS). Cost: two degenerate-cycle exits left the turn text
+ending mid-tag -> next prompt re-tokenized one token off the pin -> hybrid
+gate failed -> 3.5s/4.7s full re-prefills (vs 30-400ms suffix prefills on
+healthy turns).
+
+tools.txt exposed the same disease one level up: the four "between-tags"
+grammar states (enteringToolCall, enteringParameterTag) were unconstrained
+(default: return). Observed: turn 1 emitted a malformed `<parameter(names>`
+tag; turn 2 looped 21 consecutive empty tool-call open tags.
+
+Fixes shipped:
+1. Grammar between-tags masking: all four between-tag states now constrain
+   continuation toward the legal tag(s), with prefix canonicalization at the
+   last structural boundary so repeated close tags re-anchor instead of
+   dead-ending into the unmask valve. Ling/Bailing native format is gated off
+   via enforceStructuralTagContinuation (set from modelConfig at the call site).
+   Verified: 27/27 logic assertions + full-project typecheck.
+2. Raw-token splice for agent continuations: continuation turns now assemble
+   the next prompt from the previous turn's ACTUAL prompt+generated token ids
+   (buildSplicedContinuationTokens) plus a freshly tokenized suffix (end tag +
+   tool-response/continuation text), instead of re-encoding the accumulated
+   string. Re-tokenization could diverge by one token whenever generation was
+   cut mid-tag; the splice makes the pin match byte-exact, so the hybrid
+   full-pin gate passes and the suffix-only prefill runs (TTFT for
+   continuation turns drops to the suffix length). Wired at all six
+   continuation sites (tool response, uncalled-action, loop-guard synthesis,
+   subagent relay, force-synthesis, empty-reply recovery); falls back to the
+   string path if suffix tokenization fails. Verified: 13/13 property
+   assertions (prefix continuity, pin full-match, endTag append semantics,
+   fallback paths, character-sequence equivalence vs the string path).
+   Residual: the empty-reply recovery site replays the bare prompt, which is
+   shorter than the pin -> hybrid full re-prefill remains correct there.
+
+### QA #21 — 1.txt: splice works end-to-end; prefill attention identified as the last big hot spot
+
+First full run with the raw-token splice: all agent continuation turns
+prefilled only their suffix — 42-44ms (143-147 tokens) vs 3.5-4.7s full
+re-prefills before. Zero 🔁 full re-prefills across 6 tool calls; clean EOS
+finish; run never quit mid-turn.
+
+The one huge prefill (post first shell_run): PhaseA total 419.6s (~7 min),
+with the 10 gqa/attention layers at ~30s each vs ~4s for MoE layers. The
+splice math proves the suffix was 11348-4058 = 7290 tokens — the curl'd
+GitHub HTML page (~29KB markup) injected as the tool result. MoE layers stay
+linear (~0.55ms/token, same rate as turn 1); attention goes superlinear
+(quadratic in context length) on a kernel path that is far off GPU peak
+(~0.1 TFLOP of attention work per gqa layer taking ~30s => ~1-3% of peak).
+Two levers:
+1. Tool-result hygiene: strip/trim HTML in shell_run renders (or steer the
+   model to raw.githubusercontent URLs) — would have cut this turn ~10x.
+2. Batched multi-row attention prefill kernel (the reverted FIX #6a idea) is
+   the remaining big TTFT win for large tool-result turns.
+
+Also: a silent mid-run generation restart was identified (8 pipeline-ready
+prints vs 7 [GEN] lines): user interrupt (stop + new message) => fresh
+re-render whose system prompt embedded the post-tools_load tool list =>
+diverged from the pin at token 24 => one full 3004-token re-prefill (~85s).
+Inherent to interrupts (genuinely new prompt), but silent cancel-exits now
+log 🛑 reason=cancelled with the tail text, and interruptAndSendMessage logs
+⏹ [INT] so future logs tell the full story.

@@ -1447,6 +1447,7 @@ struct ContentView: View {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         if isGeneratingText {
+            print("⏹ [INT] interrupt requested — cancelling current generation and sending a fresh turn")
             stopAutoregressiveGeneration()
             Task { @MainActor in
                 // Brief yield to allow the cancelled generation task to release resources cleanly
@@ -3403,7 +3404,34 @@ struct ContentView: View {
         generationStatusText = "⏹ Generation stopped by user."
     }
 
-    private func startAutoregressiveGeneration(customPrompt: String? = nil, sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false, forceSynthesis: Bool = false) {
+    /// Builds the raw-token prompt for an agent continuation turn: the previous
+    /// turn's actual prompt+generated token ids plus the freshly tokenized turn
+    /// suffix (end tag + tool-response/continuation text). Re-tokenizing the
+    /// accumulated text can diverge by one token when generation was cut
+    /// mid-tag, which breaks exact prefix reuse on hybrid models and forces a
+    /// full re-prefill; splicing the real ids makes the pin match byte-exact.
+    /// Returns nil when the suffix cannot be tokenized (caller falls back to
+    /// the string path).
+    private func buildSplicedContinuationTokens(
+        basePromptTokens: [UInt32],
+        generatedTokenIds: [UInt32],
+        turnText: String,
+        endTag: String,
+        suffix: String,
+        encode: (String) throws -> [UInt32]
+    ) -> [UInt32]? {
+        var tokens = basePromptTokens
+        tokens.append(contentsOf: generatedTokenIds)
+        if !turnText.contains(endTag) {
+            guard let endIds = try? encode(endTag), !endIds.isEmpty else { return nil }
+            tokens.append(contentsOf: endIds)
+        }
+        guard let suffixIds = try? encode(suffix), !suffixIds.isEmpty else { return nil }
+        tokens.append(contentsOf: suffixIds)
+        return tokens
+    }
+
+    private func startAutoregressiveGeneration(customPrompt: String? = nil, promptTokens: [UInt32]? = nil, sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false, forceSynthesis: Bool = false) {
         guard let summary = summary,
               let tokenizer = tokenizer,
               let device = MTLCreateSystemDefaultDevice(),
@@ -3522,7 +3550,15 @@ struct ContentView: View {
 
         let promptTokenIds: [UInt32]
         do {
-            promptTokenIds = try tokenizer.encode(text: formattedPrompt)
+            if let spliced = promptTokens, !spliced.isEmpty {
+                // Agent continuations arrive as raw tokens spliced from the
+                // previous turn's actual prompt+generated ids, so the pinned
+                // prefix matches exactly even when generation was cut mid-tag.
+                promptTokenIds = spliced
+                print("🧩 [SPLICE] prompt assembled from \(spliced.count) raw tokens — skipping re-encode")
+            } else {
+                promptTokenIds = try tokenizer.encode(text: formattedPrompt)
+            }
         } catch {
             let err = "❌ Tokenizer failed to encode prompt: \(error.localizedDescription)"
             isGeneratingText = false
@@ -10563,7 +10599,11 @@ if layer.attnGateProjTensor != nil,
             var generationStartTime = CFAbsoluteTimeGetCurrent()
 
             for _ in 0..<maxTokens {
-                if Task.isCancelled { break }
+                if Task.isCancelled {
+                    let tailText = (try? tokenizer.decode(ids: Array(generatedTokenIds.suffix(48)))) ?? ""
+                    print("🛑 [GEN] ended at \(tokensGenerated) tokens: reason=cancelled tail='\(tailText.prefix(320))'")
+                    break
+                }
                 let currentTokenId = contextTokens.last!
 
                 var acceptedBatch: [UInt32] = []
@@ -10948,6 +10988,14 @@ if layer.attnGateProjTensor != nil,
                     </system>
                     """
                     let synthesisPrompt = formattedPrompt + assistantTurnText + synthesisDirective
+                    let splicedTokens = self.buildSplicedContinuationTokens(
+                        basePromptTokens: promptTokenIds,
+                        generatedTokenIds: generatedTokenIds,
+                        turnText: finalDecoded,
+                        endTag: endTag,
+                        suffix: synthesisDirective,
+                        encode: { try tokenizer.encode(text: $0) }
+                    )
                     let synthesisMsgId = UUID()
                     if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
                         if let mId = messageId, let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
@@ -10966,6 +11014,7 @@ if layer.attnGateProjTensor != nil,
                     self.generationStatusText = "🛡️ Tool loop guard hit — forcing final answer..."
                     self.startAutoregressiveGeneration(
                         customPrompt: synthesisPrompt,
+                        promptTokens: splicedTokens,
                         sessionId: sessionId,
                         messageId: synthesisMsgId,
                         agentStep: agentStep + 1,
@@ -10997,6 +11046,7 @@ if layer.attnGateProjTensor != nil,
                     }
                     self.startAutoregressiveGeneration(
                         customPrompt: formattedPrompt,
+                        promptTokens: promptTokenIds,
                         sessionId: sessionId,
                         messageId: messageId,
                         agentStep: agentStep,
@@ -11220,6 +11270,14 @@ if layer.attnGateProjTensor != nil,
                             assistantTurnText += endTag
                         }
                         let nextPrompt = formattedPrompt + assistantTurnText + "\n" + toolResponseTurn
+                        let splicedTokens = self.buildSplicedContinuationTokens(
+                            basePromptTokens: promptTokenIds,
+                            generatedTokenIds: generatedTokenIds,
+                            turnText: finalDecoded,
+                            endTag: endTag,
+                            suffix: "\n" + toolResponseTurn,
+                            encode: { try tokenizer.encode(text: $0) }
+                        )
                         await MainActor.run {
                             let nextAssistantMsgId = UUID()
                             if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
@@ -11238,6 +11296,7 @@ if layer.attnGateProjTensor != nil,
                             }
                             self.startAutoregressiveGeneration(
                                 customPrompt: nextPrompt,
+                                promptTokens: splicedTokens,
                                 sessionId: sessionId,
                                 messageId: nextAssistantMsgId,
                                 agentStep: agentStep + 1
@@ -11265,6 +11324,14 @@ if layer.attnGateProjTensor != nil,
                             </system>
                             """
                             let synthesisPrompt = formattedPrompt + assistantTurnText + "\n" + toolResponseContext + synthesisDirective
+                            let splicedTokens = self.buildSplicedContinuationTokens(
+                                basePromptTokens: promptTokenIds,
+                                generatedTokenIds: generatedTokenIds,
+                                turnText: finalDecoded,
+                                endTag: endTag,
+                                suffix: "\n" + toolResponseContext + synthesisDirective,
+                                encode: { try tokenizer.encode(text: $0) }
+                            )
                             await MainActor.run {
                                 let synthesisMsgId = UUID()
                                 if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
@@ -11284,6 +11351,7 @@ if layer.attnGateProjTensor != nil,
                                 self.generationStatusText = "🛡️ Tool loop guard hit — forcing final answer..."
                                 self.startAutoregressiveGeneration(
                                     customPrompt: synthesisPrompt,
+                                    promptTokens: splicedTokens,
                                     sessionId: sessionId,
                                     messageId: synthesisMsgId,
                                     agentStep: agentStep + 1,
@@ -11322,6 +11390,14 @@ if layer.attnGateProjTensor != nil,
                                 </system>
                                 """
                                 let relayPrompt = formattedPrompt + assistantTurnText + relayDirective
+                                let splicedTokens = self.buildSplicedContinuationTokens(
+                                    basePromptTokens: promptTokenIds,
+                                    generatedTokenIds: generatedTokenIds,
+                                    turnText: finalDecoded,
+                                    endTag: endTag,
+                                    suffix: relayDirective,
+                                    encode: { try tokenizer.encode(text: $0) }
+                                )
                                 await MainActor.run {
                                     let relayMsgId = UUID()
                                     if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
@@ -11337,6 +11413,7 @@ if layer.attnGateProjTensor != nil,
                                     self.generationStatusText = "📨 Subagent report ready — relaying results to user..."
                                     self.startAutoregressiveGeneration(
                                         customPrompt: relayPrompt,
+                                        promptTokens: splicedTokens,
                                         sessionId: sessionId,
                                         messageId: relayMsgId,
                                         agentStep: agentStep + 1,
@@ -11381,6 +11458,14 @@ if layer.attnGateProjTensor != nil,
                         assistantTurnText += endTag
                     }
                     let nextPrompt = formattedPrompt + assistantTurnText + "\n" + continuationTurn
+                    let splicedTokens = self.buildSplicedContinuationTokens(
+                        basePromptTokens: promptTokenIds,
+                        generatedTokenIds: generatedTokenIds,
+                        turnText: finalDecoded,
+                        endTag: endTag,
+                        suffix: "\n" + continuationTurn,
+                        encode: { try tokenizer.encode(text: $0) }
+                    )
                     await MainActor.run {
                         let nextAssistantMsgId = UUID()
                         if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
@@ -11399,6 +11484,7 @@ if layer.attnGateProjTensor != nil,
                         }
                         self.startAutoregressiveGeneration(
                             customPrompt: nextPrompt,
+                            promptTokens: splicedTokens,
                             sessionId: sessionId,
                             messageId: nextAssistantMsgId,
                             agentStep: agentStep + 1
