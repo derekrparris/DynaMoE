@@ -1130,3 +1130,25 @@ diverged from the pin at token 24 => one full 3004-token re-prefill (~85s).
 Inherent to interrupts (genuinely new prompt), but silent cancel-exits now
 log 🛑 reason=cancelled with the tail text, and interruptAndSendMessage logs
 ⏹ [INT] so future logs tell the full story.
+
+### QA #22 — shell_run HTML conversion shipped (tool-result hygiene, lever 1)
+
+shell_run now detects HTML in stdout (doctype/html/body markers definitive;
+otherwise >512B + >=12 tags + at least one HTML-vocabulary tag; XML
+declaration opts out so config files stay intact) and converts pages to
+plain text before truncation: script/style/head/noscript/svg/template blocks
+and comments dropped wholesale, block-level closers become newlines, tags
+strip to spaces, numeric+named entities decoded, boilerplate phrases/lines
+removed, whitespace collapsed. Non-HTML output (JSON, XML, logs) passes
+through untouched; conversion only engages above 2KB. shell_run's tool
+description now steers the model toward raw text endpoints.
+
+Verified with 30+ standalone assertions incl. two regressions caught during
+development: (1) the tag-stripping alternation matched the `head` prefix
+inside `<header>`, swallowing the whole page body until the next `</script>`
+(fixed with a `(?=[\s/>])` name-boundary lookahead); (2) tag-density alone
+flagged large XML configs as HTML (fixed with the vocabulary requirement).
+Real-world-shape test: 17.7KB page (mostly inline JS/CSS) -> 72 chars (246x).
+The 1.txt incident shape (7290-token suffix from one curl) would compress to
+a ~50-token suffix, i.e. that ~7-minute attention-bound prefill becomes
+sub-second. Remaining lever: batched multi-row prefill attention kernel.

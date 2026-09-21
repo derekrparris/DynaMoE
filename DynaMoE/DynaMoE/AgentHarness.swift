@@ -130,7 +130,7 @@ public extension AgentTool {
 public final class ShellRunTool: AgentTool {
     public let definition = ToolDefinition(
         name: "shell_run",
-        description: "Executes shell commands on the local macOS terminal via zsh. Use this to run scripts, compilers, git, or check system state. Output is captured and returned.",
+        description: "Executes shell commands on the local macOS terminal via zsh. Use this to run scripts, compilers, git, or check system state. Output is captured and returned. When fetching web pages, prefer raw text endpoints (e.g. raw.githubusercontent.com/OWNER/REPO/HEAD/path) over rendered HTML pages; large HTML responses are auto-converted to plain text and truncated.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
@@ -168,7 +168,13 @@ public final class ShellRunTool: AgentTool {
             timeoutSeconds: 120.0
         )
 
-        let cleanStdout = AgentHarness.truncateText(AgentHarness.sanitizeText(stdout.trimmingCharacters(in: .whitespacesAndNewlines)), limit: maxOutputLength)
+        var rawStdout = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if AgentHarness.looksLikeHTML(rawStdout), rawStdout.utf8.count > 2048 {
+            let converted = AgentHarness.htmlToPlainText(rawStdout)
+            print("🛠 [shell_run] HTML output converted: \(rawStdout.utf8.count) -> \(converted.utf8.count) chars")
+            rawStdout = "[HTML converted to plain text: \(rawStdout.utf8.count) -> \(converted.utf8.count) chars]\n\(converted)"
+        }
+        let cleanStdout = AgentHarness.truncateText(AgentHarness.sanitizeText(rawStdout), limit: maxOutputLength)
         let cleanStderr = AgentHarness.truncateText(AgentHarness.sanitizeText(stderr.trimmingCharacters(in: .whitespacesAndNewlines)), limit: maxOutputLength)
 
         if exitCode == 0 {
@@ -3653,6 +3659,113 @@ public final class AgentHarness {
     /// Used to convert the token-based tool-output budget into a character budget.
     public static func charBudget(forTokenBudget tokens: Int) -> Int {
         max(600, tokens * 5 / 2)
+    }
+
+    private static let htmlScriptStyleRegex = try? NSRegularExpression(
+        pattern: "<(?i:script|style|noscript|svg|template|head)(?=[\\s/>])[^>]*>.*?</(?i:script|style|noscript|svg|template|head)\\s*>|<!--.*?-->|<(?i:script|style|noscript|svg|template|head)(?=[\\s/>])[^>]*/>",
+        options: [.dotMatchesLineSeparators]
+    )
+    private static let htmlTagRegex = try? NSRegularExpression(pattern: "<[^<>]{0,400}>", options: [.dotMatchesLineSeparators])
+    private static let htmlNumericEntityRegex = try? NSRegularExpression(pattern: "&#(x?)([0-9a-fA-F]+);", options: [])
+    private static let htmlNoiseLineRegex = try? NSRegularExpression(
+        pattern: "(?m)^[ \\t]*(?:(?:skip to(?: main)? content)|share|menu|search(?: button)?|sign (?:in|up)|log (?:in|out)|advertisement)[ \\t]*$",
+        options: [.caseInsensitive]
+    )
+    private static let htmlNoisePhraseRegex = try? NSRegularExpression(
+        pattern: "(?i)(?:skip to(?: main)? content|advertisement|sign (?:in|up)|log (?:in|out))",
+        options: []
+    )
+
+    private static let htmlVocabRegex = try? NSRegularExpression(
+        pattern: "<(?i:div|span|p[\\s>]|a[\\s>]|li[\\s>]|ul|ol|meta|link|script|style|table|img|br|h[1-6][\\s>]|header|footer|nav|section|form|input|button)",
+        options: []
+    )
+
+    /// Heuristic HTML detection for tool output. A doctype/html/body marker is
+    /// definitive; an XML declaration opts out; otherwise output must show both
+    /// tag density and HTML-vocabulary tags, so JSON, XML data, and shell text
+    /// never reach the conversion path.
+    public static func looksLikeHTML(_ text: String) -> Bool {
+        if text.range(of: "<!doctype html", options: [.regularExpression, .caseInsensitive]) != nil { return true }
+        if text.range(of: "<html[\\s>]", options: [.regularExpression, .caseInsensitive]) != nil { return true }
+        if text.range(of: "<body[\\s>]", options: [.regularExpression, .caseInsensitive]) != nil { return true }
+        guard text.utf8.count > 512 else { return false }
+        if text.range(of: "<\\?xml", options: [.regularExpression, .caseInsensitive]) != nil { return false }
+        guard let re = htmlTagRegex, let vocab = htmlVocabRegex else { return false }
+        let tagCount = re.numberOfMatches(in: text, options: [], range: NSRange(text.startIndex..., in: text))
+        guard tagCount >= 12 else { return false }
+        return vocab.firstMatch(in: text, options: [], range: NSRange(text.startIndex..., in: text)) != nil
+    }
+
+    /// Converts HTML to compact plain text for the model context: drops
+    /// script/style/head blocks, turns block-level boundaries into newlines,
+    /// strips remaining tags, decodes entities, and collapses whitespace.
+    /// Cuts a fetched web page from ~29KB of markup to its readable content.
+    public static func htmlToPlainText(_ html: String) -> String {
+        var s = html
+
+        // 1. Drop invisible/bulk blocks (scripts, styles, metadata, comments).
+        if let re = htmlScriptStyleRegex {
+            s = re.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: " ")
+        }
+
+        // 2. Newlines at block boundaries so text does not glue together.
+        let blockClosers = ["</p>", "</div>", "</li>", "</tr>", "</ul>", "</ol>", "</table>", "</section>", "</article>", "</header>", "</footer>", "</nav>", "</blockquote>", "</pre>", "</h1>", "</h2>", "</h3>", "</h4>", "</h5>", "</h6>", "</dd>", "</dt>", "<br>", "<br/>", "<br />", "<hr>", "<hr/>", "<hr />"]
+        for closer in blockClosers {
+            s = s.replacingOccurrences(of: closer, with: "\n", options: .caseInsensitive)
+        }
+
+        // 3. Strip every remaining tag (replaced with a space so inline
+        //    siblings like nav links stay separate words).
+        if let re = htmlTagRegex {
+            s = re.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: " ")
+        }
+
+        // 4. Decode entities: numeric first (covers the long tail), then the
+        //    common named set.
+        if let re = htmlNumericEntityRegex {
+            let ns = NSMutableString(string: s)
+            for m in re.matches(in: s, options: [], range: NSRange(s.startIndex..., in: s)).reversed() {
+                let isHex = m.range(at: 1).length > 0
+                let digitsRange = m.range(at: 2)
+                guard let digits = Range(digitsRange, in: s), let value = UInt32(String(s[digits]), radix: isHex ? 16 : 10),
+                      let scalar = Unicode.Scalar(value) else { continue }
+                ns.replaceCharacters(in: m.range, with: String(Character(scalar)))
+            }
+            s = ns as String
+        }
+        let named: [String: String] = [
+            "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": "\"", "&apos;": "'",
+            "&nbsp;": " ", "&copy;": "©", "&reg;": "®", "&trade;": "™",
+            "&mdash;": "—", "&ndash;": "–", "&hellip;": "…", "&middot;": "·",
+            "&rsquo;": "'", "&lsquo;": "'", "&rdquo;": "\"", "&ldquo;": "\"",
+            "&laquo;": "«", "&raquo;": "»", "&deg;": "°", "&times;": "×"
+        ]
+        for (entity, replacement) in named {
+            s = s.replacingOccurrences(of: entity, with: replacement)
+        }
+
+        // 5. Drop boilerplate: unambiguous phrases anywhere, then common
+        //    single-word noise lines, then collapse whitespace runs.
+        if let re = htmlNoisePhraseRegex {
+            s = re.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: " ")
+        }
+        if let re = htmlNoiseLineRegex {
+            s = re.stringByReplacingMatches(in: s, options: [], range: NSRange(s.startIndex..., in: s), withTemplate: "")
+        }
+        var collapsed = ""
+        var blankRun = 0
+        for line in s.components(separatedBy: "\n") {
+            let trimmedLine = line.trimmingCharacters(in: .whitespaces)
+            if trimmedLine.isEmpty {
+                blankRun += 1
+                if blankRun <= 1 { collapsed += "\n" }
+            } else {
+                blankRun = 0
+                collapsed += trimmedLine + "\n"
+            }
+        }
+        return collapsed.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// Truncates oversized text for the model context. The head keeps as much as the
