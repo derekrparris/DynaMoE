@@ -1215,3 +1215,61 @@ Verified: new cases include a literal `<parameter=command>` in a cwd value
 opens), an entire embedded tool-call block inside a content value (not
 counted), unterminated values, and early-close semantics. Full suite passes;
 typecheck clean.
+
+### QA #26 — uncalled-action nudge false positive: "look into" in a closing pleasantry
+
+Symptom: after the user sent "very cool, thanks!", the app produced TWO
+assistant bubbles. The first was a normal close — "You're welcome! Let me know
+if there's anything else you want to look into — happy to help." — then, after
+a 22.7s "thinking" pause, a second bubble: "There isn't any outstanding action
+or task to complete here…".
+
+Cause: `detectUncalledActionIntent` matched actionPatterns unconditionally over
+the finished text. The close contains the substring "look into", so the
+detector returned true, `hasUncalledIntent` set `willContinueAgent`, and
+`formatActionContinuationTurn()` was appended — a synthetic `<|im_start|>user`
+turn asking the model to execute an action if it meant one. The model then
+*answered the harness directive* instead of the user, which is why the second
+bubble reads like a meta-reply.
+
+Cost from the log: the close pinned 3369 tokens (prompt=3318 gen=51); the
+synthetic turn spliced to 3440 raw tokens (P=70, startPos=3369,
+`prefillTotal=8.30s`, PhaseA=3.55s at a 50% expert hit rate) plus 22.7s of
+thinking and 119 new tokens, before pinning again at 3559. Well over a minute
+of work to answer "thanks!". The splice itself worked correctly end-to-end on
+this path (a live verification of splice site 6).
+
+Fix, in `AgentHarness.detectUncalledActionIntent`: three narrow signals replace
+the broad pattern list.
+
+1. `commitmentPhrases` — explicit first-person starts ("i'll start by",
+   "let me start by", "first, let me", "i'm going to start", …) matched
+   anywhere in content or thinking: always an intent.
+2. `closingPleasantryRegex` — wrap-up language ("let me know", "happy to
+   help", "anything else", "you're welcome", …) **vetoes** detection. A
+   pleasantry is never a promise to act even when it borrows action words.
+3. `commitmentActionRegex` — a first-person cue ("i'll", "let me" but not
+   "let me know", "i should", "i need to", …) followed within 30 characters,
+   in the same clause, by action vocabulary. Ordinary prose ("you can check
+   the docs", "the ranges look at combined cycle numbers") no longer fires.
+
+Curly apostrophes (U+2019) are normalized so "I’ll start by" matches. The
+existing >400-character bail is preserved and runs first.
+
+Verified: 20-case standalone suite (`/tmp/detect_test.swift`) — 9 positives
+including thinking-only cues and the curly-apostrophe form; 8 negatives
+including the exact regression string, "happy to help — let me know if you'd
+like me to look into the charging curve", bare action nouns, and second-person
+advice; the >400-char bail; and the documented ordering rule that an explicit
+commitment phrase still wins over a pleasantry in the same message
+("I'll start by reading the spec, and I'll let you know what I find"). All
+pass. Full-project typecheck clean.
+
+Follow-up in the same pass: the nudge itself was framed as a synthetic
+`<|im_start|>user` turn, which is *why* a fired continuation reads as a second
+assistant bubble answering a meta-question. Both formatters now emit a system
+directive — `<|im_start|>system` for ChatML models and `<role>SYSTEM</role>`
+for Ling — matching the framing the app already uses for its system prompt
+(`ContentView.swift:1706`, `:3546`, `:3513`). This is a behavior change, so
+treat any change in recovery rates as the thing to watch; the detector fix
+means the path now only runs on genuine narrated intents.

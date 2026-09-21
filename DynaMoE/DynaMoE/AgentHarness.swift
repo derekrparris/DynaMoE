@@ -3133,66 +3133,76 @@ public final class AgentHarness {
         return nil
     }
 
+    /// Unambiguous first-person commitments: the model narrating an action it is
+    /// about to take. Precise enough to match anywhere in a turn.
+    private static let commitmentPhrases = [
+        "i'll start by", "let me start by", "i will start by",
+        "let me first", "first, i will", "first, let me", "first i'll",
+        "to begin, i will", "to begin, let me",
+        "i'm going to start", "i am going to start"
+    ]
+
+    /// Wrap-up language. A closing pleasantry is never a promise to act, even
+    /// when it borrows action words ("let me know if you want to look into it").
+    private static let closingPleasantryRegex = try? NSRegularExpression(
+        pattern: "\\b(?:let me know|happy to help|happy to look|glad to help|feel free to|if you'd like|if you want|anything else|you're welcome|no problem|don't hesitate|just ask)\\b",
+        options: [.caseInsensitive]
+    )
+
+    /// Action vocabulary counts only when a first-person commitment cue sits
+    /// just before it in the same clause. Bare action nouns appear constantly in
+    /// ordinary prose ("you can check the docs", "want to look into that"?),
+    /// which previously fired a wasted continuation turn with no action intended.
+    /// "let me know" is excluded as a cue, and the window is tight so a cue in
+    /// one clause cannot reach an action word in a later one.
+    private static let commitmentActionRegex = try? NSRegularExpression(
+        pattern: "\\b(?:i'll|i will|i'm going to|i am going to|let me(?! know)|we'll|we will|i should|i need to)\\b[^.!?\\n]{0,30}?\\b(?:take a look at|look at (?:the|this)|look into|look up|read (?:the|this)|start by reading|inspect(?:ing)? the|check(?:ing)? the|examine the|add (?:a |the )?column|edit(?:ing)? the|modif(?:y|ying) the|update the|change the|search (?:for|the web)|grep for|run the|execute the|create the|write (?:to|the)|open the|fetch the|download the|save the|summarize the)\\b",
+        options: [.caseInsensitive]
+    )
+
+    /// True when the assistant narrated an action ("Let me read the config
+    /// first") but ended its turn without emitting a tool call. Kept deliberately
+    /// narrow: a false positive here injects a synthetic turn and makes the model
+    /// answer its own closing message.
     public func detectUncalledActionIntent(content: String, thinking: String?) -> Bool {
-        let contentLower = content.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        let thinkingLower = (thinking ?? "").lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        let contentLower = content.lowercased().replacingOccurrences(of: "\u{2019}", with: "'").trimmingCharacters(in: .whitespacesAndNewlines)
+        let thinkingLower = (thinking ?? "").lowercased().replacingOccurrences(of: "\u{2019}", with: "'").trimmingCharacters(in: .whitespacesAndNewlines)
 
         if contentLower.count > 400 {
             return false
         }
 
-        let actionPatterns = [
-            "take a look at",
-            "look at the",
-            "look at this",
-            "look into",
-            "read the",
-            "reading the",
-            "start by reading",
-            "read this",
-            "inspect the",
-            "inspecting the",
-            "check the",
-            "checking the",
-            "examine the",
-            "add a column",
-            "add the column",
-            "add column",
-            "edit the",
-            "modifying the",
-            "modify the",
-            "update the",
-            "change the",
-            "search for",
-            "search the web",
-            "look up",
-            "run the",
-            "execute the",
-            "create the",
-            "write to",
-            "write the",
-            "i'll start by",
-            "let me start by",
-            "i will start by",
-            "let me first",
-            "first, i will",
-            "first, let me",
-            "first i'll",
-            "to begin, i will",
-            "to begin, let me"
-        ]
-
-        for p in actionPatterns {
-            if contentLower.contains(p) || thinkingLower.contains(p) {
+        // 1. Explicit commitments ("I'll start by reading X") always count.
+        for phrase in Self.commitmentPhrases {
+            if contentLower.contains(phrase) || thinkingLower.contains(phrase) {
                 return true
+            }
+        }
+
+        // 2. A reply that wraps up is conversational, not a promise to act.
+        if let re = Self.closingPleasantryRegex,
+           re.firstMatch(in: contentLower, options: [], range: NSRange(contentLower.startIndex..., in: contentLower)) != nil {
+            return false
+        }
+
+        // 3. Otherwise the action vocabulary needs a commitment cue in front.
+        if let re = Self.commitmentActionRegex {
+            for text in [contentLower, thinkingLower] where !text.isEmpty {
+                if re.firstMatch(in: text, options: [], range: NSRange(text.startIndex..., in: text)) != nil {
+                    return true
+                }
             }
         }
 
         return false
     }
 
+    /// A recovered-action nudge. Framed as a `<|im_start|>system` directive, not
+    /// a user turn: injecting `<|im_start|>user` made the model answer the harness
+    /// as if the user had spoken, producing a second assistant bubble about
+    /// whether it had intended an action.
     public func formatActionContinuationTurn(includeThinkSuffix: Bool = false) -> String {
-        var turn = "<|im_start|>user\n"
+        var turn = "<|im_start|>system\n"
         turn += "If you intended to take an action, execute it now by emitting a complete tool call like <tool_call><function=file_read><parameter=path>/Users/example.txt</parameter></function></tool_call>. Do not echo the schema template itself. Otherwise, just reply to the user and end your turn.\n"
         turn += "<|im_end|>\n<|im_start|>assistant\n"
         if includeThinkSuffix {
@@ -3201,11 +3211,12 @@ public final class AgentHarness {
         return turn
     }
 
-    /// Ling/Bailing-3.0-native action-continuation nudge using `<role>HUMAN</role>` /
-    /// `<role>ASSISTANT</role>` boundaries and the native `<tool_call>name<arg_key>/<arg_value>`
-    /// call shape. Used when the model described an action in prose but never emitted a call.
+    /// Ling/Bailing-3.0-native mirror of formatActionContinuationTurn, using the
+    /// native `<tool_call>name<arg_key>/<arg_value>` shape. Framed as
+    /// `<role>SYSTEM</role>` so the recovered-action nudge is not attributed to
+    /// the user.
     public func formatLingActionContinuationTurn(thinkingEnabled: Bool = true) -> String {
-        var turn = "<role>HUMAN</role>"
+        var turn = "<role>SYSTEM</role>"
         turn += "If you intended to take an action, execute it now by emitting a complete tool call like <tool_call>file_read\n<arg_key>path</arg_key>\n<arg_value>/Users/example.txt</arg_value>\n</tool_call>. Do not echo the schema template itself. Otherwise, just reply to the user and end your turn."
         turn += "<|role_end|>\n<role>ASSISTANT</role>"
         turn += thinkingEnabled ? "\n<think>" : "\n<think></think>"
