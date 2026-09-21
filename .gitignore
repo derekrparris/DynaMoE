@@ -54,6 +54,11 @@ build/
 *.so
 /DynaMoE/GeneratedFFI/
 
+# EXCEPTION: the hand-written Swift/ObjC bridging header. It is required via
+# SWIFT_OBJC_BRIDGING_HEADER and is NOT generated, so ignoring it breaks the
+# build on fresh clones and after any `git clean -xfd` / orphan-branch reset.
+!DynaMoE/DynaMoE-Bridging-Header.h
+
 # ==========================================
 # Local AI Models & Weights (CRITICAL)
 # ==========================================
