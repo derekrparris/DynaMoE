@@ -403,7 +403,7 @@ struct ChatDetailView: View {
                             promptText = ""
                         }
                     )
-                    .frame(minHeight: max(32, 38 * zoomManager.zoomScale), maxHeight: max(100, 140 * zoomManager.zoomScale))
+                    .frame(minHeight: max(21, 25 * zoomManager.zoomScale), maxHeight: max(100, 140 * zoomManager.zoomScale))
                     .padding(.horizontal, 4)
                     .padding(.top, 2)
                     
