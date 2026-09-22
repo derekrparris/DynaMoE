@@ -108,7 +108,7 @@ if [ -n "$APP_PATH" ]; then
         exit 1
     fi
     echo "==> Using provided app: $APP_PATH"
-    if ! codesign -dv "$APP_PATH" 2>&1 | grep -q "Developer ID"; then
+    if ! codesign -dv --verbose=2 "$APP_PATH" 2>&1 | grep -q "Authority=Developer ID Application"; then
         echo "warning: '$APP_PATH' does not appear to be signed with Developer ID." >&2
         echo "         Updates installed from it may be blocked by Gatekeeper." >&2
     fi
