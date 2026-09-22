@@ -130,7 +130,7 @@ public extension AgentTool {
 public final class ShellRunTool: AgentTool {
     public let definition = ToolDefinition(
         name: "shell_run",
-        description: "Executes shell commands on the local macOS terminal via zsh. Use this to run scripts, compilers, git, or check system state. Output is captured and returned. When fetching web pages, prefer raw text endpoints (e.g. raw.githubusercontent.com/OWNER/REPO/HEAD/path) over rendered HTML pages; large HTML responses are auto-converted to plain text and truncated.",
+        description: "Executes shell commands on the local macOS terminal via zsh. Use this to run scripts, compilers, git, or check system state. Output is captured and returned. When fetching web pages, prefer raw text endpoints (e.g. raw.githubusercontent.com/OWNER/REPO/HEAD/path) over rendered HTML pages; large HTML responses are auto-converted to plain text and truncated. PATH includes /opt/homebrew/bin, /usr/local/bin, ~/.cargo/bin and ~/.local/bin, so brew/cargo/pip-user tools resolve directly.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
@@ -676,11 +676,13 @@ public final class HeadlessChromeSearchEngine: @unchecked Sendable {
                 return path
             }
         }
-        // Fallback: check PATH using /usr/bin/which
+        // Fallback: check PATH using /usr/bin/which (curated env: GUI apps get
+        // launchd's minimal PATH, so brew-installed browsers need the injection)
         for bin in ["google-chrome", "chromium", "chrome"] {
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/usr/bin/which")
             proc.arguments = [bin]
+            proc.environment = ControlledProcessRunner.toolEnvironment()
             let pipe = Pipe()
             proc.standardOutput = pipe
             if let _ = try? proc.run() {
@@ -3212,6 +3214,49 @@ public final class AgentHarness {
         return turn
     }
 
+    /// Structural check for a tool call that generation abandoned mid-stream:
+    /// a tool-call opener with no closer, or a function tag that never reached a
+    /// closing angle bracket. The parser drops such fragments silently, so the
+    /// turn would otherwise end with the intended action never executed and no
+    /// recovery nudge (observed: a function tag cut off before its parameters).
+    public func hasTruncatedToolCall(in text: String) -> Bool {
+        if let openRange = text.range(of: StreamingToolParser.qwenToolCallOpen, options: .backwards) {
+            if text.range(of: StreamingToolParser.qwenToolCallClose, range: openRange.upperBound..<text.endIndex) == nil {
+                return true
+            }
+        }
+        if let fnRange = text.range(of: StreamingToolParser.qwenFunctionOpen, options: .backwards) {
+            let after = text[fnRange.upperBound...]
+            if after.contains(StreamingToolParser.qwenFunctionClose) || after.contains(">") {
+                return false
+            }
+            return true
+        }
+        return false
+    }
+
+    /// Recovery nudge for a truncated tool call. System-framed for the same
+    /// reason as formatActionContinuationTurn: the harness, not the user, is
+    /// asking for the call to be re-issued.
+    public func formatTruncatedToolCallTurn(includeThinkSuffix: Bool = false) -> String {
+        var turn = "<|im_start|>system\n"
+        turn += "Your previous tool call was cut off before it could be parsed. Re-emit the ENTIRE call now, complete and correctly formatted: the <tool_call> opener, <function=name> with every needed <parameter=key>value</parameter> block, then </function> and the </tool_call> closer. Do not echo the schema template itself.\n"
+        turn += "<|im_end|>\n<|im_start|>assistant\n"
+        if includeThinkSuffix {
+            turn += "<think>\n"
+        }
+        return turn
+    }
+
+    /// Ling mirror of formatTruncatedToolCallTurn.
+    public func formatLingTruncatedToolCallTurn(thinkingEnabled: Bool = true) -> String {
+        var turn = "<role>SYSTEM</role>"
+        turn += "Your previous tool call was cut off before it could be parsed. Re-emit the ENTIRE call now, complete and correctly formatted: the <tool_call> opener, the tool name, every needed parameter, then the </tool_call> closer. Do not echo the schema template itself."
+        turn += "<|role_end|>\n<role>ASSISTANT</role>"
+        turn += thinkingEnabled ? "\n<think>" : "\n<think</think>"
+        return turn
+    }
+
     /// Ling/Bailing-3.0-native mirror of formatActionContinuationTurn, using the
     /// native `<tool_call>name<arg_key>/<arg_value>` shape. Framed as
     /// `<role>SYSTEM</role>` so the recovered-action nudge is not attributed to
@@ -3309,9 +3354,26 @@ public final class AgentHarness {
 
         for m in matches {
             guard m.numberOfRanges >= 3 else { continue }
-            let fnName = nsText.substring(with: m.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+            var fnName = nsText.substring(with: m.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
             let body = nsText.substring(with: m.range(at: 2))
             let rawMatch = nsText.substring(with: m.range(at: 0))
+            guard !fnName.isEmpty else { continue }
+
+            // The name slot occasionally arrives as attribute-style junk the model
+            // emits when it loses the call format (observed:
+            // <function=tools_discover query name="shell" /> — parsed as a tool
+            // literally named 'tools_discover query name="shell" /' and rejected as
+            // Unknown tool). Registered tool names never contain whitespace, so the
+            // real name is the first whitespace-delimited token; a trailing "/" is a
+            // self-closing slash. Any key="value" pairs in the junk are harvested as
+            // string arguments below (after the body is parsed, so they merge
+            // instead of being overwritten).
+            var attrJunk = ""
+            if let splitIdx = fnName.firstIndex(where: { $0 == " " || $0 == "\t" || $0 == "\n" }) {
+                attrJunk = String(fnName[splitIdx...])
+                fnName = String(fnName[..<splitIdx])
+            }
+            while fnName.hasSuffix("/") { fnName.removeLast() }
             guard !fnName.isEmpty else { continue }
 
             var args: [String: Any] = [:]
@@ -3337,6 +3399,15 @@ public final class AgentHarness {
                         args[pName] = jsonVal
                     } else {
                         args[pName] = pValStr
+                    }
+                }
+            }
+
+            if !attrJunk.isEmpty, let attrRegex = try? NSRegularExpression(pattern: "([A-Za-z_][A-Za-z0-9_]*)=\"([^\"]*)\"", options: []) {
+                let nsJunk = attrJunk as NSString
+                for am in attrRegex.matches(in: attrJunk, options: [], range: NSRange(location: 0, length: nsJunk.length)) {
+                    if am.numberOfRanges >= 3, args[nsJunk.substring(with: am.range(at: 1))] == nil {
+                        args[nsJunk.substring(with: am.range(at: 1))] = nsJunk.substring(with: am.range(at: 2))
                     }
                 }
             }
@@ -4050,29 +4121,9 @@ public final class AgentHarness {
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
 
-        // 1. Expand environment PATH for macOS GUI applications and set non-interactive flags
-        var env = ProcessInfo.processInfo.environment
-        let userHome = FileManager.default.homeDirectoryForCurrentUser.path
-        let currentPath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
-        let extraPaths = [
-            "/opt/homebrew/bin",
-            "/opt/homebrew/sbin",
-            "/usr/local/bin",
-            "/usr/local/sbin",
-            "\(userHome)/.cargo/bin",
-            "\(userHome)/.local/bin"
-        ]
-        let fullPath = (extraPaths + [currentPath]).joined(separator: ":")
-        env["PATH"] = fullPath
-        env["HOMEBREW_NO_AUTO_UPDATE"] = "1"
-        env["HOMEBREW_NO_INSTALL_CLEANUP"] = "1"
-        env["HOMEBREW_NO_ENV_HINTS"] = "1"
-        env["CI"] = "1"
-        env["TERM"] = "dumb"
-        env["PAGER"] = "cat"
-        env["GIT_TERMINAL_PROMPT"] = "0"
-        env["NONINTERACTIVE"] = "1"
-        env["DEBIAN_FRONTEND"] = "noninteractive"
+        // 1. Curated environment shared with ControlledProcessRunner: GUI-app PATH
+        //    injection plus non-interactive flags (see toolEnvironment()).
+        let env = ControlledProcessRunner.toolEnvironment()
 
         process.environment = env
         process.executableURL = executableURL

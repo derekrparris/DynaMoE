@@ -1221,6 +1221,7 @@ struct ContentView: View {
                     supportsThinking: activeModelSupportsThinking,
                     isThinkingEnabled: isThinkingEnabledForActiveSession,
                     isAgentToolsEnabled: isAgentToolsEnabledForActiveSession,
+                    isModelLoaded: tokenizer != nil && summary != nil,
                     onSendMessage: { prompt in
                         handleSendMessage(prompt)
                     },
@@ -1235,11 +1236,6 @@ struct ContentView: View {
                     },
                     onRemoveQueuedPrompt: { id in
                         handleRemoveQueuedPrompt(id: id)
-                    },
-                    onSelectPromptStarter: { starter in
-                        chatPromptText = starter
-                        handleSendMessage(starter)
-                        chatPromptText = ""
                     },
                     onSelectDiscoveredModel: { dm in
                         switchModel(to: dm)
@@ -1533,6 +1529,16 @@ struct ContentView: View {
     }
 
     private func handleSendMessage(_ text: String) {
+        // Backstop for the send button's isModelLoaded gate: sending before the
+        // engine is ready must not touch chat or harness state — a pre-load
+        // prompt was observed to poison later sessions (garbled output even in
+        // fresh chats) until the app relaunched.
+        guard tokenizer != nil, summary != nil else {
+            let err = "⚠️ No model loaded — select a model in Settings (bottom left) before sending."
+            generationStatusText = err
+            gpuComputeOutput = err
+            return
+        }
         guard let currentSessionId = selectedSessionId ?? sessions.first?.id else { return }
         guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return }
         
@@ -11489,6 +11495,71 @@ if layer.attnGateProjTensor != nil,
                         }
                         return
                     }
+                } else if agentStep == 0 && (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.hasTruncatedToolCall(in: finalDecoded) {
+                    // The model abandoned a tool call mid-stream (opener without a
+                    // closer, or a function tag that never closed). The parser
+                    // silently drops such fragments, so without this branch the
+                    // turn simply ends and the intended action never runs.
+                    if Task.isCancelled {
+                        await MainActor.run {
+                            guard self.ownsGeneration(myGenerationId) else { return }
+                            self.isGeneratingText = false
+                            self.generationTask = nil
+                            self.generationStatusText = "⏹ Generation stopped by user."
+                        }
+                        return
+                    }
+
+                    let continuationTurn: String
+                    if modelConfig?.isLingModel == true {
+                        continuationTurn = AgentHarness.shared.formatLingTruncatedToolCallTurn(
+                            thinkingEnabled: thinkingEnabled
+                        )
+                    } else {
+                        continuationTurn = AgentHarness.shared.formatTruncatedToolCallTurn(
+                            includeThinkSuffix: thinkingEnabled
+                        )
+                    }
+                    var assistantTurnText = finalDecoded
+                    let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
+                    if !assistantTurnText.contains(endTag) {
+                        assistantTurnText += endTag
+                    }
+                    let nextPrompt = formattedPrompt + assistantTurnText + "\n" + continuationTurn
+                    let splicedTokens = self.buildSplicedContinuationTokens(
+                        basePromptTokens: promptTokenIds,
+                        generatedTokenIds: generatedTokenIds,
+                        turnText: finalDecoded,
+                        endTag: endTag,
+                        suffix: "\n" + continuationTurn,
+                        encode: { try tokenizer.encode(text: $0) }
+                    )
+                    await MainActor.run {
+                        let nextAssistantMsgId = UUID()
+                        if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
+                            if let mId = messageId, let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                                self.sessions[sIdx].messages[mIdx].isThinking = false
+                                self.sessions[sIdx].messages[mIdx].prefillStatus = nil
+                            }
+                            let nextMsg = ChatMessage(
+                                id: nextAssistantMsgId,
+                                role: .assistant,
+                                content: "",
+                                thinkingContent: nil,
+                                isThinking: thinkingEnabled
+                            )
+                            self.sessions[sIdx].messages.append(nextMsg)
+                        }
+                        self.generationStatusText = "⚠️ Tool call was cut off — asking the model to re-emit it..."
+                        self.startAutoregressiveGeneration(
+                            customPrompt: nextPrompt,
+                            promptTokens: splicedTokens,
+                            sessionId: sessionId,
+                            messageId: nextAssistantMsgId,
+                            agentStep: agentStep + 1
+                        )
+                    }
+                    return
                 } else if agentStep == 0 && (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink) {
                     if Task.isCancelled {
                         await MainActor.run {

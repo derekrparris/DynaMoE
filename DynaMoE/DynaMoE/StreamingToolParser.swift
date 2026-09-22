@@ -22,6 +22,7 @@ public final class StreamingToolParser {
     // Structural Delimiters
     public static let qwenToolCallOpen = "<tool_call>"
     public static let qwenToolCallClose = "</tool_call>"
+    public static let qwenFunctionOpen = "<function="
     public static let qwenFunctionClose = "</function>"
     public static let llamaTagOpen = "<|python_tag|>"
     public static let llamaTagClose = "</|python_tag|>"

@@ -144,6 +144,38 @@ public final class SemanticDocumentReader {
 public final class ControlledProcessRunner {
     public static let shared = ControlledProcessRunner()
 
+    /// Environment for tool-spawned processes. A GUI app inherits launchd's
+    /// minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), and `zsh -c` reads no
+    /// shell rc files, so Homebrew/cargo/user-local tools are invisible to
+    /// `shell_run` even though they resolve fine in the user's terminal —
+    /// `which brew` fails while `which ls` works. Prepend the standard user
+    /// tool locations to whatever PATH the app inherited, and force
+    /// non-interactive behaviour (no pagers, no prompts, no auto-update).
+    public static func toolEnvironment() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        let userHome = FileManager.default.homeDirectoryForCurrentUser.path
+        let currentPath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        let extraPaths = [
+            "/opt/homebrew/bin",
+            "/opt/homebrew/sbin",
+            "/usr/local/bin",
+            "/usr/local/sbin",
+            "\(userHome)/.cargo/bin",
+            "\(userHome)/.local/bin"
+        ]
+        env["PATH"] = (extraPaths + [currentPath]).joined(separator: ":")
+        env["HOMEBREW_NO_AUTO_UPDATE"] = "1"
+        env["HOMEBREW_NO_INSTALL_CLEANUP"] = "1"
+        env["HOMEBREW_NO_ENV_HINTS"] = "1"
+        env["CI"] = "1"
+        env["TERM"] = "dumb"
+        env["PAGER"] = "cat"
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        env["NONINTERACTIVE"] = "1"
+        env["DEBIAN_FRONTEND"] = "noninteractive"
+        return env
+    }
+
     public func runCommand(
         command: String,
         workingDirectory: URL?,
@@ -157,10 +189,7 @@ public final class ControlledProcessRunner {
             process.currentDirectoryURL = wd.resolvingSymlinksInPath()
         }
 
-        var env = ProcessInfo.processInfo.environment
-        env["PAGER"] = "cat"
-        env["TERM"] = "dumb"
-        env["CI"] = "1"
+        var env = Self.toolEnvironment()
         process.environment = env
 
         let outPipe = Pipe()

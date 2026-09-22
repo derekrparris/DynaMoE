@@ -26,12 +26,12 @@ struct ChatDetailView: View {
     var supportsThinking: Bool = false
     var isThinkingEnabled: Bool = true
     var isAgentToolsEnabled: Bool = true
+    var isModelLoaded: Bool = true
     var onSendMessage: (String) -> Void
     var onStopGeneration: () -> Void
     var onQueuePrompt: ((String) -> Void)? = nil
     var onSendImmediate: ((String) -> Void)? = nil
     var onRemoveQueuedPrompt: ((UUID) -> Void)? = nil
-    var onSelectPromptStarter: (String) -> Void
     var onSelectDiscoveredModel: ((DiscoveredModel) -> Void)? = nil
     var onOpenSettings: (() -> Void)? = nil
     var onToggleThinking: ((Bool) -> Void)? = nil
@@ -227,8 +227,7 @@ struct ChatDetailView: View {
                         } else {
                             EmptyWelcomeView(
                                 modelName: modelName,
-                                isStreamingOffDisk: isStreamingOffDisk,
-                                onSelectStarter: onSelectPromptStarter
+                                isStreamingOffDisk: isStreamingOffDisk
                             )
                             .padding(.top, 48)
                             .padding(.bottom, 32)
@@ -741,18 +740,18 @@ struct ChatDetailView: View {
                         } else {
                             Button(action: {
                                 let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
-                                if !trimmed.isEmpty {
+                                if !trimmed.isEmpty && isModelLoaded {
                                     onSendMessage(trimmed)
                                     promptText = ""
                                 }
                             }) {
                                 Image(systemName: "arrow.right.circle.fill")
                                     .font(.system(size: max(20, 26 * zoomManager.zoomScale)))
-                                    .foregroundColor(promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? .secondary.opacity(0.3) : .purple)
+                                    .foregroundColor(promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !isModelLoaded ? .secondary.opacity(0.3) : .purple)
                             }
                             .buttonStyle(.plain)
-                            .disabled(promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                            .help("Send Message")
+                            .disabled(promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !isModelLoaded)
+                            .help(isModelLoaded ? "Send Message" : "Load a model first")
                         }
                     }
                 }
@@ -1274,14 +1273,6 @@ struct EmptyWelcomeView: View {
     @ObservedObject private var zoomManager = AppZoomManager.shared
     var modelName: String?
     var isStreamingOffDisk: Bool = false
-    var onSelectStarter: (String) -> Void
-
-    let promptStarters = [
-        "Tell me a clever computer related joke",
-        "Explain how Mixture-of-Experts (MoE) routing works",
-        "Write a Swift function for parallel async tasks",
-        "What is the difference between BF16 and FP8?"
-    ]
 
     var body: some View {
         VStack(spacing: max(20, 28 * zoomManager.zoomScale)) {
@@ -1315,31 +1306,6 @@ struct EmptyWelcomeView: View {
                 }
             }
 
-            // Starter Prompt Chips
-            VStack(spacing: max(7, 10 * zoomManager.zoomScale)) {
-                ForEach(promptStarters, id: \.self) { starter in
-                    Button(action: {
-                        onSelectStarter(starter)
-                    }) {
-                        HStack {
-                            Text(starter)
-                                .font(.system(size: max(10.5, 13.5 * zoomManager.zoomScale)))
-                                .foregroundColor(.primary)
-                            Spacer()
-                            Image(systemName: "arrow.up.right")
-                                .font(.system(size: max(8.5, 11 * zoomManager.zoomScale)))
-                                .foregroundColor(.secondary)
-                        }
-                        .padding(.horizontal, max(12, 16 * zoomManager.zoomScale))
-                        .padding(.vertical, max(9, 12 * zoomManager.zoomScale))
-                        .background(Color.secondary.opacity(0.06))
-                        .cornerRadius(12)
-                    }
-                    .buttonStyle(.plain)
-                    .frame(maxWidth: max(400, 520 * zoomManager.zoomScale))
-                }
-            }
-            .padding(.top, 4)
         }
         .frame(maxWidth: .infinity)
     }

@@ -6593,6 +6593,38 @@ final class DynaMoETests: XCTestCase {
     /// Pure-logic coverage for the uncalled-action nudge. A false positive here
     /// injects a synthetic turn and the model answers its own closing message,
     /// while a false negative drops a narrated action the model never executed.
+    /// The model sometimes abandons a tool call mid-stream (opener without a
+    /// closer) or garbles the function tag into attribute junk; both shapes
+    /// used to dead-end the agent loop silently.
+    func testTruncatedAndMalformedToolCallRecovery() {
+        let harness = AgentHarness.shared
+        let FN_OPEN = "<function="
+        let FN_CLOSE = "</function>"
+        let TC_OPEN = "<tool_call>"
+        let TC_CLOSE = "</tool_call>"
+
+        XCTAssertTrue(harness.hasTruncatedToolCall(in: "prose "+FN_OPEN+"shell_run\n"+FN_CLOSE))
+        XCTAssertTrue(harness.hasTruncatedToolCall(in: "prose "+TC_OPEN+" then nothing"))
+        XCTAssertFalse(harness.hasTruncatedToolCall(in: "complete: "+TC_OPEN+"x"+FN_OPEN+"file_read\n"+FN_CLOSE+"done"+TC_CLOSE))
+        XCTAssertFalse(harness.hasTruncatedToolCall(in: "no tool markers at all"))
+
+        let parsed = AgentHarness.shared.parseAllXMLFunctionCalls(
+            FN_OPEN + "tools_discover query name=\"shell\" /" + ">optional body" + FN_CLOSE
+        )
+        XCTAssertEqual(parsed.count, 1)
+        XCTAssertEqual(parsed.first?.name, "tools_discover")
+        XCTAssertEqual(parsed.first?.arguments["name"] as? String, "shell")
+
+        let chatTurn = harness.formatTruncatedToolCallTurn(includeThinkSuffix: true)
+        XCTAssertTrue(chatTurn.contains("<|im_start|>system"))
+        XCTAssertFalse(chatTurn.contains("<|im_start|>user"))
+        XCTAssertTrue(chatTurn.hasSuffix("<|im_start|>assistant\n<think>\n"))
+        let lingTurn = harness.formatLingTruncatedToolCallTurn(thinkingEnabled: true)
+        XCTAssertTrue(lingTurn.contains("<role>SYSTEM</role>"))
+        XCTAssertTrue(lingTurn.contains("<role>ASSISTANT</role>"))
+        XCTAssertTrue(lingTurn.contains("<think>"))
+    }
+
     func testUncalledActionIntentDetection() {
         let harness = AgentHarness.shared
         func detect(_ content: String, thinking: String? = nil) -> Bool {
@@ -6710,7 +6742,7 @@ final class DynaMoETests: XCTestCase {
         XCTAssertFalse(continuationTurn.contains("<|im_start|>user"))
         // The turn ends inside the assistant opener with the reasoning tag already
         // open (the trailing newline is part of `" thinking\n"`).
-        XCTAssertTrue(continuationTurn.hasSuffix("<|im_start|>assistant\n thinking\n"))
+        XCTAssertTrue(continuationTurn.hasSuffix("<|im_start|>assistant\n<think>\n"))
         XCTAssertTrue(responseTurn.contains("<|im_start|>assistant\n<think>"))
     }
 
