@@ -42,8 +42,31 @@ struct ChatDetailView: View {
     @State private var isReasoningExpanded: [UUID: Bool] = [:]
     @State private var promptTokenCount: Int = 0
     @State private var tokenCountTask: Task<Void, Never>? = nil
+    @State private var isPinnedToBottom: Bool = true
+    /// Changing identity of the invisible bottom marker. SwiftUI's scrollTo is a
+    /// no-op when the target view is already on screen, so during streaming the
+    /// marker's id is bumped every tick to force a real scroll to the bottom.
+    @State private var scrollAnchorTick: Int = 0
+
+    /// Distance-from-bottom bookkeeping for the pin/detach logic.
+    private struct ScrollSnapshot: Equatable {
+        var offset: CGFloat
+        var contentHeight: CGFloat
+        var containerHeight: CGFloat
+
+        var distanceFromBottom: CGFloat {
+            contentHeight - (offset + containerHeight)
+        }
+    }
     @AppStorage("dynamoe_agent_turbo_mode") private var isTurboModeEnabled: Bool = false
     @ObservedObject private var subagentManager = SubagentManager.shared
+
+    /// Ticks while the newest message streams (content or thinking grows), so the
+    /// scroll handlers can follow live output without diffing full strings.
+    private var streamingTick: Int {
+        guard let last = session?.messages.last else { return 0 }
+        return last.content.count &* 31 &+ (last.thinkingContent?.count ?? 0)
+    }
 
     private func modelIconName(for name: String?) -> String {
         let lower = (name ?? "").lowercased()
@@ -232,33 +255,66 @@ struct ChatDetailView: View {
                             .padding(.top, 48)
                             .padding(.bottom, 32)
                         }
+                        Color.clear
+                            .frame(height: 0)
+                            .id(scrollAnchorTick)
                     }
                     .frame(maxWidth: max(600, 800 * zoomManager.zoomScale))
                     .padding(.horizontal, 24)
                     .frame(maxWidth: .infinity)
                 }
                 .onChange(of: session?.id) { _ in
-                    if let lastId = session?.messages.last?.id {
-                        DispatchQueue.main.async {
-                            proxy.scrollTo(lastId, anchor: .bottom)
-                        }
+                    isPinnedToBottom = true
+                    scrollAnchorTick += 1
+                    DispatchQueue.main.async {
+                        proxy.scrollTo(scrollAnchorTick, anchor: .bottom)
                     }
                 }
                 .onChange(of: session?.messages.count) { _ in
-                    if let lastId = session?.messages.last?.id {
-                        withAnimation(.easeOut(duration: 0.2)) {
-                            proxy.scrollTo(lastId, anchor: .bottom)
-                        }
+                    guard isPinnedToBottom else { return }
+                    scrollAnchorTick += 1
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        proxy.scrollTo(scrollAnchorTick, anchor: .bottom)
+                    }
+                }
+                .onChange(of: streamingTick) { _ in
+                    guard isPinnedToBottom, isGenerating else { return }
+                    scrollAnchorTick += 1
+                    DispatchQueue.main.async {
+                        proxy.scrollTo(scrollAnchorTick, anchor: .bottom)
                     }
                 }
                 .onChange(of: isGenerating) { generating in
-                    if !generating {
-                        if let lastId = session?.messages.last?.id {
-                            withAnimation(.easeOut(duration: 0.25)) {
-                                proxy.scrollTo(lastId, anchor: .bottom)
-                            }
+                    if generating {
+                        // A new turn is starting (user sent or a queued prompt fired):
+                        // re-pin and jump to the newest message.
+                        isPinnedToBottom = true
+                        scrollAnchorTick += 1
+                        withAnimation(.easeOut(duration: 0.2)) {
+                            proxy.scrollTo(scrollAnchorTick, anchor: .bottom)
+                        }
+                    } else if isPinnedToBottom {
+                        scrollAnchorTick += 1
+                        withAnimation(.easeOut(duration: 0.25)) {
+                            proxy.scrollTo(scrollAnchorTick, anchor: .bottom)
                         }
                     }
+                }
+                .onScrollGeometryChange(for: ScrollSnapshot.self) { geometry in
+                    ScrollSnapshot(
+                        offset: geometry.contentOffset.y,
+                        contentHeight: geometry.contentSize.height,
+                        containerHeight: geometry.containerSize.height
+                    )
+                } action: { old, new in
+                    if new.contentHeight != old.contentHeight && new.offset == old.offset {
+                        // Content grew under us (streaming output) — not a user
+                        // scroll. Keep the current pin state; the tick handler
+                        // will follow if pinned. Otherwise growing content would
+                        // read as "scrolled away from bottom" and unpin itself.
+                        return
+                    }
+                    isPinnedToBottom = new.distanceFromBottom <= 48
                 }
             }
 
