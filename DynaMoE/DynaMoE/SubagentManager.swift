@@ -788,7 +788,7 @@ final class SubagentToolExecutor {
     /// result plus its human-readable output for report building.
     func runTool(named name: String, arguments: [String: Any]) async -> (json: String, readable: String) {
         guard AgentHarness.shared.tools[name] != nil else {
-            let err = "Unknown tool '\(name)'."
+            let err = "Unknown tool '\(name)'. Available tools: \(allowedTools.sorted().joined(separator: ", "))."
             return (AgentHarness.toolErrorJSON(tool: name, error: err), err)
         }
         guard allowedTools.contains(name) else {

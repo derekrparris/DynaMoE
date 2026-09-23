@@ -391,40 +391,32 @@ nonisolated public final class GrammarConstrainedSampler {
         case .insideFunctionName(let currentPrefix):
             let allowedTools = registeredToolNames.filter { $0.hasPrefix(currentPrefix) }
             if allowedTools.isEmpty { return }
-            // The '>' escape must only open once a COMPLETE tool name has been
-            // typed; otherwise the model can legally emit '<function>' with an
-            // empty name and then loop on empty '<parameter>' tags (observed as
-            // degenerate-cycle breaks that truncate tool calls).
-            let nameComplete = registeredToolNames.contains(currentPrefix)
 
             for v in 0..<vocabSize {
                 guard let str = tokenDecoder(UInt32(v)) else { continue }
-                if str.contains(">") && nameComplete {
-                    continue
-                }
                 let cand = currentPrefix + str
-                let matchesAny = allowedTools.contains { $0.hasPrefix(cand) || cand.hasPrefix($0) }
-                if !matchesAny && !(str.hasPrefix(">") && nameComplete) {
-                    logits[v] = -Float.infinity
-                }
+                // Still typing a name, or a token that spans name completion
+                // and terminates it with '>' ("rch>"). Anything else that runs
+                // past a complete name mints an unregistered tool (observed:
+                // "web_search" + "_fetch" produced `web_search_fetch`, which
+                // both broke the call and emptied the allowed set, silently
+                // dropping the mask for the rest of the name).
+                if allowedTools.contains(where: { $0.hasPrefix(cand) }) { continue }
+                if overshootTerminatesWord(cand, words: registeredToolNames) { continue }
+                logits[v] = -Float.infinity
             }
 
         case .insideParameterName(let toolName, let currentKey):
             guard let validKeys = toolParameterKeys[toolName] else { return }
             let allowedKeys = validKeys.filter { $0.hasPrefix(currentKey) }
             if allowedKeys.isEmpty { return }
-            let keyComplete = validKeys.contains(currentKey)
 
             for v in 0..<vocabSize {
                 guard let str = tokenDecoder(UInt32(v)) else { continue }
-                if str.contains(">") && keyComplete {
-                    continue
-                }
                 let cand = currentKey + str
-                let matchesAny = allowedKeys.contains { $0.hasPrefix(cand) || cand.hasPrefix($0) }
-                if !matchesAny && !(str.hasPrefix(">") && keyComplete) {
-                    logits[v] = -Float.infinity
-                }
+                if allowedKeys.contains(where: { $0.hasPrefix(cand) }) { continue }
+                if overshootTerminatesWord(cand, words: validKeys) { continue }
+                logits[v] = -Float.infinity
             }
 
         case .closingFunction(let matchedPrefix):
@@ -453,6 +445,20 @@ nonisolated public final class GrammarConstrainedSampler {
         default:
             return
         }
+    }
+
+    /// A candidate that runs past a complete word (tool name or parameter key)
+    /// is only legal when the overshoot terminates the word: optional space/tab,
+    /// then '>'. Trailing whitespace alone is not accepted — the state machine
+    /// stays in the name state for it, where no registered word would match the
+    /// padded prefix and the mask would silently drop out.
+    private func overshootTerminatesWord(_ cand: String, words: Set<String>) -> Bool {
+        for word in words where cand.hasPrefix(word) {
+            var rest = cand.dropFirst(word.count)
+            while rest.first == " " || rest.first == "\t" { rest = rest.dropFirst() }
+            if rest.first == ">" { return true }
+        }
+        return false
     }
 
     /// Withholds `</function>` while the current tool still has required

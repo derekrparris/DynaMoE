@@ -996,7 +996,7 @@ Both ⚡ [GEMV] pipeline prints confirmed. Delta prefill improved (P=616:
 Shipped diagnostics: restore self-check (memcmp live-vs-snapshot at reset;
 a nonzero diff means the state ran ahead of the pin between turns),
 pin-length log at capture (📌 [PREFIX] pinned N tokens), and an A/B toggle:
-`defaults write com.drp.DynaMoE dynamoe_disable_prefix_reuse -bool YES`.
+`defaults write DRP.DynaMoE dynamoe_disable_prefix_reuse -bool YES`.
 
 ### QA #17 — logs A/B analysis
 
@@ -1562,3 +1562,49 @@ Verified: app typecheck clean under the project's real flags. Watch for
 `⏹ [INT] interrupt requested` followed by the replacement's own
 `⚡ [GEMV]` pipeline-ready pair only after the previous generation's
 `⏹ [GEN] ended ... reason=cancelled` line.
+
+### QA #31 — 404-era log + prompt dumps: prefix reuse exonerated, the "echo done" gesture found
+
+Shipped a prompt-dump diagnostic (`dynamoe_dump_prompts` or a marker file at
+`~/Downloads/DynaMoe-dump-prompts`, written to `~/Downloads/DynaMoePromptDumps/`)
+that records the exact decoded token stream each turn attends over, plus a
+splice-vs-reencode equivalence verdict. Two instructive things about enabling it:
+the app is sandboxed, so prefs live in
+`~/Library/Containers/DRP.DynaMoE/.../Preferences/DRP.DynaMoE.plist`, and
+`cfprefsd` can keep serving a stale cached value for a running app — the marker
+file bypasses both. (The bundle id is `DRP.DynaMoE`, not `com.drp.DynaMoE`;
+earlier docs entries had it wrong and the A/B toggles were therefore never
+reachable.)
+
+What the dumps show across a clean 5-turn run:
+
+- `prefixReused == pin` on every continuation, suffix-only prefills, no
+  `🔁` full re-prefills, and the splice-vs-reencode check diverges by exactly one
+  token at the first turn boundary (token 2081) and never structurally. That is
+  the known-benign boundary case the splice exists to avoid — prefix reuse is
+  healthy, pin math is exact, and nothing is duplicated or dropped in context.
+- The WEB RESULTS themselves were fine (MSN/Fortune/real articles, correct URLs),
+  the search loop guard fired correctly when the model re-searched the same query,
+  and the model's final answer was accurate and well-reasoned.
+
+The real defect was turn management: after delivering its final answer the model
+emitted a `<tool_call><function=shell_run><parameter=command>echo done`, the
+harness executed it, and the agent loop therefore continued — producing a second
+bubble that re-summarized the same answer. A no-op shell command cannot advance
+any task; the model emits one as a "task finished" gesture because the system
+prompt told it when it MUST call tools but never how to end a turn (`complete`
+exists but nothing points at it).
+
+Fixes:
+1. Prompt: a new "# Ending Your Turn" section — plain text ends a turn; use
+   `complete` (with summary) only when the whole task is done; never emit
+   placeholder/no-op tool calls; one final answer per task. Also fixed a literal
+   concatenation bug that glued the format-guidance paragraph onto the end of the
+   preceding one ("...because of them.If you choose to call a function ONLY...").
+2. Harness backstop: `AgentHarness.isNoOpGestureToolCall` drops gesture calls
+   (`shell_run` with a bare `echo`/`echo <short>`/`true`/`:`/`exit`, no
+   redirection/pipe/chaining/substitution) before the continue decision and before
+   execution, so the turn ends instead of looping.
+
+Verified: 17-case unit test (gesture shapes vs real commands incl. `echo done >
+file`, `echo done && ls`, `echo $HOME`), plus the existing grammar/agent suites.

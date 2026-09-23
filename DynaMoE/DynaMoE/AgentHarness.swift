@@ -2752,6 +2752,26 @@ public final class AgentHarness {
         return true
     }
 
+    /// True for calls that cannot advance any task: a `shell_run` whose command is
+    /// a bare no-op (`echo`, `true`, `:`, `exit`), which models emit as a "task
+    /// finished" gesture when they should have called `complete` or simply ended
+    /// the turn. Executing one restarts the agent loop and yields a duplicate
+    /// answer turn, so the caller drops these instead of continuing.
+    public static func isNoOpGestureToolCall(_ call: ParsedToolCall) -> Bool {
+        guard call.name == "shell_run",
+              let command = call.arguments["command"] as? String else { return false }
+        let normalized = command.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return true }
+        // Anything that could actually do something (redirect, pipe, chain,
+        // substitution, multiple statements) is not a gesture.
+        let effectMarkers = [">", "|", ";", "&&", "$", "`", "\n", "\r"]
+        if effectMarkers.contains(where: { normalized.contains($0) }) { return false }
+        if normalized == "true" || normalized == ":" || normalized == "exit" { return true }
+        if normalized == "echo" { return true }
+        if normalized.hasPrefix("echo ") && normalized.count <= 24 { return true }
+        return false
+    }
+
     /// Consecutive tool calls (across agent steps) with empty required arguments.
     public private(set) var consecutiveEmptyToolCalls: Int = 0
 
@@ -2974,6 +2994,16 @@ public final class AgentHarness {
 
         prompt += """
 
+        # Ending Your Turn
+
+        - Once you have the information you need, answer the user in plain text and end your turn. A plain-text reply is a complete turn; no tool call is required to finish.
+        - Call `complete` (with a summary) only when the user's whole task is finished and you are handing back the final result. Never call it mid-task.
+        - NEVER emit placeholder or no-op tool calls (`shell_run` with `echo`, `true`, `:`, or similar) to signal that you are done. They cannot advance the task, and the harness discards them and ends the turn.
+        - Do not re-answer or re-summarize a result you already delivered. Deliver one final answer per task.
+        """
+
+        prompt += """
+
         # Tool Result Format & Reading Guidance
 
         Tool results are delivered as PLAIN TEXT, not JSON: a `[tool_name] status` header line, `key: value` metadata lines, and one or more `--- field ---` sections containing the raw content verbatim. Read the `--- content ---` section as the actual file/page text.
@@ -2985,6 +3015,8 @@ public final class AgentHarness {
 
         if isLingModel {
             prompt += """
+
+
             If you choose to call a function ONLY reply in the following native format with NO suffix:
 
             <tool_call>example_function_name
@@ -3015,6 +3047,8 @@ public final class AgentHarness {
             """
         } else {
             prompt += """
+
+
             If you choose to call a function ONLY reply in the following format with NO suffix:
 
             <tool_call>
@@ -3492,7 +3526,12 @@ public final class AgentHarness {
         let effectiveMaxLen = AgentHarness.charBudget(forTokenBudget: tokenBudget)
 
         guard let tool = tools[call.name] else {
-            let err = "Unknown tool '\(call.name)'"
+            // Echo the valid names back: a bare "Unknown tool 'web_search_fetch'"
+            // teaches the model to repeat the bad string verbatim on the retry.
+            let available = availableToolDefinitions.map { $0.function.name }
+            let err = available.isEmpty
+                ? "Unknown tool '\(call.name)'"
+                : "Unknown tool '\(call.name)'. Available tools: \(available.joined(separator: ", "))."
             let json = AgentHarness.toolErrorJSON(tool: call.name, error: err)
             let rec = ToolCallRecord(
                 name: call.name,

@@ -6590,6 +6590,63 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(sampler.currentState, .outsideToolCall)
     }
 
+    /// Regression for the `web_search_fetch` failure loop: after the model had
+    /// typed a complete tool name ("web_search"), the function-name mask
+    /// allowed ANY continuation of it ("web_search" + "_fetch"), minting an
+    /// unregistered name, and one overshoot character then emptied the allowed
+    /// set and silently dropped the mask for the rest of the name. The bogus
+    /// call failed, the retry turns echoed "Unknown tool 'web_search_fetch'"
+    /// back into context, and the model latched onto that string and repeated
+    /// it forever. A complete name (or parameter key) may now only be followed
+    /// by '>'; spanning tokens must terminate the word.
+    func testGrammarMaskRejectsNameOvershoot() {
+        let harness = AgentHarness.shared
+        let sampler = GrammarConstrainedSampler.shared
+        try? harness.loadTool(named: "web_search")
+        try? harness.loadTool(named: "web_fetch")
+        defer {
+            harness.resetLoadedToolsToCore()
+            sampler.reset()
+        }
+
+        sampler.isEnabled = true
+        sampler.reset()
+
+        func masked(_ text: String, tokens: [String]) -> [Bool] {
+            sampler.updateState(emittedText: text)
+            var logits = [Float](repeating: 0, count: tokens.count)
+            logits.withUnsafeMutableBufferPointer { buf in
+                sampler.applyLogitMask(
+                    logits: buf.baseAddress!,
+                    vocabSize: tokens.count,
+                    tokenDecoder: { tokens[Int($0)] }
+                )
+            }
+            return logits.map { $0 == -.infinity }
+        }
+
+        // A complete name may only be followed by '>'.
+        XCTAssertEqual(
+            masked("<tool_call><function=web_search", tokens: ["_fetch", ">", "search_fetch"]),
+            [true, false, true],
+            "extending a complete tool name must be masked out"
+        )
+
+        // A token may span name completion, but only when it terminates the name.
+        XCTAssertEqual(
+            masked("<tool_call><function=web_sea", tokens: ["rch", "rch>", "rch_fetch", "rchx"]),
+            [false, false, true, true],
+            "spanning tokens must terminate the name with '>'"
+        )
+
+        // Same rule for parameter keys once the key is complete.
+        XCTAssertEqual(
+            masked("<tool_call><function=web_fetch><parameter=url", tokens: [">", "x", "_bad"]),
+            [false, true, true],
+            "extending a complete parameter key must be masked out"
+        )
+    }
+
     /// Pure-logic coverage for the uncalled-action nudge. A false positive here
     /// injects a synthetic turn and the model answers its own closing message,
     /// while a false negative drops a narrated action the model never executed.
@@ -6654,6 +6711,36 @@ final class DynaMoETests: XCTestCase {
         // Long turns are out of scope for the nudge.
         let long = String(repeating: "A sentence about the car. ", count: 20) + "I'll start by reading it."
         XCTAssertFalse(detect(long))
+    }
+
+    /// Models emit no-op shell commands (`echo done`, `true`, `:`) as a "task
+    /// finished" gesture when they should call `complete` or just end the turn.
+    /// Executing one restarted the agent loop and produced a duplicate answer
+    /// bubble, so they must be detected and dropped — while real commands that
+    /// merely contain those words must still run.
+    func testNoOpGestureToolCallDetection() {
+        func call(_ command: String, tool: String = "shell_run") -> ParsedToolCall {
+            ParsedToolCall(name: tool, arguments: ["command": command], rawArguments: command, rawText: command)
+        }
+        func isGesture(_ command: String) -> Bool {
+            AgentHarness.isNoOpGestureToolCall(call(command))
+        }
+
+        XCTAssertTrue(isGesture("echo done"))
+        XCTAssertTrue(isGesture("  echo done  "))
+        XCTAssertTrue(isGesture("ECHO DONE"))
+        XCTAssertTrue(isGesture("echo"))
+        XCTAssertTrue(isGesture("true"))
+        XCTAssertTrue(isGesture(":"))
+        XCTAssertTrue(isGesture("exit"))
+
+        XCTAssertFalse(isGesture("echo done > /tmp/out.txt"))
+        XCTAssertFalse(isGesture("echo done && ls"))
+        XCTAssertFalse(isGesture("ls -la"))
+        XCTAssertFalse(isGesture("git status"))
+        XCTAssertFalse(isGesture("echo $HOME"))
+        XCTAssertFalse(isGesture("curl -s https://example.com"))
+        XCTAssertFalse(AgentHarness.isNoOpGestureToolCall(call("echo done", tool: "file_read")))
     }
 
     func testControlledProcessRunner() async throws {
