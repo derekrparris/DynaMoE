@@ -3451,13 +3451,38 @@ struct ContentView: View {
     ) -> [UInt32]? {
         var tokens = basePromptTokens
         tokens.append(contentsOf: generatedTokenIds)
-        if !turnText.contains(endTag) {
-            guard let endIds = try? encode(endTag), !endIds.isEmpty else { return nil }
-            tokens.append(contentsOf: endIds)
-        }
+        // `turnText` MUST be the raw decoded turn, never a normalized copy: the
+        // closure decision has to be made against what the model actually emitted.
+        guard let closure = StreamingToolParser.turnClosureSuffix(
+            forRawDecodedTurn: turnText,
+            endTag: endTag,
+            encode: encode
+        ) else { return nil }
+        tokens.append(contentsOf: closure)
         guard let suffixIds = try? encode(suffix), !suffixIds.isEmpty else { return nil }
         tokens.append(contentsOf: suffixIds)
         return tokens
+    }
+
+    /// The pre-execution freeze fires the moment `</function>` closes, so a frozen
+    /// tool call is routinely committed to context WITHOUT its `</tool_call>`
+    /// closer. Spliced into the next prompt verbatim, the model's own history
+    /// becomes a stack of structurally invalid call examples and it starts
+    /// inventing shapes (observed: `<parameter=url>` re-opened inside a
+    /// `<parameter=url>` value, then repeating a malformed call verbatim). Close
+    /// the block and terminate the turn so the model always reads back valid
+    /// examples of its own format. Paired with `buildSplicedContinuationTokens`,
+    /// which performs the same normalization on the token stream.
+    private func closedAssistantTurnText(_ decoded: String, endTag: String) -> String {
+        var text = decoded
+        let unclosed = StreamingToolParser.unclosedToolCallCount(text)
+        if unclosed > 0 {
+            for _ in 0..<unclosed { text += StreamingToolParser.qwenToolCallClose }
+        }
+        if !text.contains(endTag) {
+            text += endTag
+        }
+        return text
     }
 
     private func startAutoregressiveGeneration(customPrompt: String? = nil, promptTokens: [UInt32]? = nil, sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false, forceSynthesis: Bool = false) {
@@ -11123,10 +11148,7 @@ if layer.attnGateProjTensor != nil,
                 print("📌 [PREFIX] pinned \(promptTokenIds.count + generatedTokenIds.count) tokens (prompt=\(promptTokenIds.count) gen=\(generatedTokenIds.count))")
                 if shouldForceSynthesis {
                     let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
-                    var assistantTurnText = finalDecoded
-                    if !assistantTurnText.contains(endTag) {
-                        assistantTurnText += endTag
-                    }
+                    let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
                     let synthesisDirective = """
                     \n\n<system>
                     IMPORTANT: All tool use is now DISABLED for this task. Your recent tool calls carried empty arguments and could not be executed, and the run was forcibly ended to protect the conversation from looping.
@@ -11413,11 +11435,8 @@ if layer.attnGateProjTensor != nil,
                                 includeThinkSuffix: thinkingEnabled
                             )
                         }
-                        var assistantTurnText = finalDecoded
                         let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
-                        if !assistantTurnText.contains(endTag) {
-                            assistantTurnText += endTag
-                        }
+                        let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
                         let nextPrompt = formattedPrompt + assistantTurnText + "\n" + toolResponseTurn
                         let splicedTokens = self.buildSplicedContinuationTokens(
                             basePromptTokens: promptTokenIds,
@@ -11460,10 +11479,7 @@ if layer.attnGateProjTensor != nil,
                         let escalateToSynthesis = AgentHarness.shared.consecutiveEmptyToolCalls >= 2
                         if (AgentHarness.shared.lastSearchGuardAction == .forceSynthesis || escalateToSynthesis) && !ranCompleteTool {
                             let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
-                            var assistantTurnText = finalDecoded
-                            if !assistantTurnText.contains(endTag) {
-                                assistantTurnText += endTag
-                            }
+                            let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
                             let toolResponseContext = toolResponses.map { AgentHarness.renderToolResultForModel($0) }.joined(separator: "\n")
                             let synthesisDirective = """
                             \n\n<system>
@@ -11525,10 +11541,7 @@ if layer.attnGateProjTensor != nil,
                             }
                             if !pendingRelay.isEmpty {
                                 let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
-                                var assistantTurnText = finalDecoded
-                                if !assistantTurnText.contains(endTag) {
-                                    assistantTurnText += endTag
-                                }
+                                let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
                                 let relayContext = pendingRelay.joined(separator: "\n\n")
                                 let relayDirective = """
                                 \n\n<system>
@@ -11606,11 +11619,8 @@ if layer.attnGateProjTensor != nil,
                             includeThinkSuffix: thinkingEnabled
                         )
                     }
-                    var assistantTurnText = finalDecoded
                     let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
-                    if !assistantTurnText.contains(endTag) {
-                        assistantTurnText += endTag
-                    }
+                    let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
                     let nextPrompt = formattedPrompt + assistantTurnText + "\n" + continuationTurn
                     let splicedTokens = self.buildSplicedContinuationTokens(
                         basePromptTokens: promptTokenIds,
@@ -11667,11 +11677,8 @@ if layer.attnGateProjTensor != nil,
                             includeThinkSuffix: thinkingEnabled
                         )
                     }
-                    var assistantTurnText = finalDecoded
                     let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
-                    if !assistantTurnText.contains(endTag) {
-                        assistantTurnText += endTag
-                    }
+                    let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
                     let nextPrompt = formattedPrompt + assistantTurnText + "\n" + continuationTurn
                     let splicedTokens = self.buildSplicedContinuationTokens(
                         basePromptTokens: promptTokenIds,

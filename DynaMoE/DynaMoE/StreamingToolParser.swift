@@ -29,6 +29,54 @@ public final class StreamingToolParser {
 
     public init() {}
 
+    /// True when `text` contains a `<tool_call>` opener whose block never closed —
+    /// the shape the pre-execution freeze leaves behind whenever it cuts
+    /// generation at `</function>` (which is the common case: 7 of 9 calls in one
+    /// observed run). Callers close the block before the text is spliced into the
+    /// next prompt; left unterminated, the model's own history becomes a stack of
+    /// structurally invalid call examples and it starts inventing shapes.
+    public static func hasUnclosedToolCallBlock(_ text: String) -> Bool {
+        unclosedToolCallCount(text) > 0
+    }
+
+    /// How many `<tool_call>` blocks a turn left unterminated. Count-based rather
+    /// than "last block" so a turn that froze two calls gets both closed, not one.
+    /// A literal marker inside a value can skew the count, which only ever means
+    /// one extra (harmless) closer.
+    public static func unclosedToolCallCount(_ text: String) -> Int {
+        let opens = text.components(separatedBy: qwenToolCallOpen).count - 1
+        let closes = text.components(separatedBy: qwenToolCallClose).count - 1
+        return max(0, opens - closes)
+    }
+
+    /// The tokens that must be appended after a turn's generated ids so the turn
+    /// the model reads back next time is well-formed: a `</tool_call>` closer when
+    /// the freeze cut the call at `</function>`, then the model's end tag when the
+    /// turn never emitted one.
+    ///
+    /// MUST be fed the RAW decoded turn text. Feeding an already-normalized string
+    /// makes `hasUnclosedToolCallBlock` read the closer the caller just added and
+    /// skip appending it to the token stream, so the model sees a turn that the
+    /// string path claims is closed but the token path left open (observed: every
+    /// continuation in one run lost both its closer AND its end tag).
+    public static func turnClosureSuffix(
+        forRawDecodedTurn decodedTurn: String,
+        endTag: String,
+        encode: (String) throws -> [UInt32]
+    ) -> [UInt32]? {
+        var ids: [UInt32] = []
+        let unclosed = unclosedToolCallCount(decodedTurn)
+        if unclosed > 0 {
+            guard let closeIds = try? encode(qwenToolCallClose), !closeIds.isEmpty else { return nil }
+            for _ in 0..<unclosed { ids.append(contentsOf: closeIds) }
+        }
+        if !decodedTurn.contains(endTag) {
+            guard let endIds = try? encode(endTag), !endIds.isEmpty else { return nil }
+            ids.append(contentsOf: endIds)
+        }
+        return ids
+    }
+
     /// Checks if the stream has completed a tool call and should immediately freeze token generation.
     /// This is Pre-Execution Catching: zero wasted tokens and zero post-tool hallucination.
     public func shouldFreezeGeneration(
@@ -173,12 +221,44 @@ public final class StreamingToolParser {
         return out
     }
 
+    /// The model sometimes opens a parameter tag and then opens it AGAIN inside
+    /// the value it is writing:
+    ///
+    ///     <parameter=command>
+    ///     <parameter=command>curl -s https://example.com
+    ///     </parameter>
+    ///
+    /// a shape it picked up imitating the unterminated calls the pre-execution
+    /// freeze leaves in its own context. The inner payload is the real value
+    /// (these are not knowingly nested structures), so descend into it rather
+    /// than handing the tool a value that starts with literal markup. Observed
+    /// cost of not doing this: `shell_run` executed the markup as a shell
+    /// redirect ("zsh: no such file or directory: parameter=command") and
+    /// `web_fetch` rejected it as an invalid URL, each time looping.
+    ///
+    /// Shared by both call parsers so they cannot disagree (the live agent loop
+    /// parses with `parseStreamingToolCalls`, not the AgentHarness one).
+    public static func unwrapNestedParameterTag(_ value: String) -> String {
+        var v = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        var guardCount = 0
+        while v.hasPrefix("<parameter="), guardCount < 4 {
+            guard let open = v.range(of: ">") else { break }
+            v = String(v[open.upperBound...])
+            if let close = v.range(of: "</parameter>", options: .backwards) {
+                v = String(v[..<close.lowerBound])
+            }
+            v = v.trimmingCharacters(in: .whitespacesAndNewlines)
+            guardCount += 1
+        }
+        return v
+    }
+
     /// Decodes a canonical `<parameter=...>` value the same way `AgentHarness.parseAllXMLFunctionCalls`
     /// does: JSON objects, arrays, and numbers become structured values, everything else stays a
     /// plain string. Required for Ling's template, which JSON-encodes non-string argument values
     /// (e.g. arrays for `tools_load`'s `names`, booleans for flags, numbers for counts).
     private static func decodeParameterValue(_ rawValue: String) -> Any {
-        var value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        var value = unwrapNestedParameterTag(rawValue)
         if value.count >= 2, value.hasPrefix("\""), value.hasSuffix("\"") {
             value = String(value.dropFirst().dropLast())
         }

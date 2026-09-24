@@ -6743,6 +6743,129 @@ final class DynaMoETests: XCTestCase {
         XCTAssertFalse(AgentHarness.isNoOpGestureToolCall(call("echo done", tool: "file_read")))
     }
 
+    /// The pre-execution freeze cuts generation at `</function>`, so the model's
+    /// own tool calls are committed to context without a `</tool_call>` closer
+    /// (7 of 9 calls in one observed run). That history teaches the model invalid
+    /// examples of its own format, and it started inventing shapes — a
+    /// `<parameter=url>` re-opened inside its own value, repeated verbatim.
+    func testToolCallHygieneAndNestedParameterTolerance() {
+        let FN_OPEN = "<function="
+        let FN_CLOSE = "</function>"
+        let TC_OPEN = "<tool_call>"
+        let TC_CLOSE = "</tool_call>"
+        let P_OPEN = "<parameter="
+        let P_CLOSE = "</parameter>"
+
+        let frozen = TC_OPEN + "\n" + FN_OPEN + "web_search>\n" + P_OPEN + "query>\nToyota Century\n" + P_CLOSE + "\n" + FN_CLOSE
+        XCTAssertTrue(StreamingToolParser.hasUnclosedToolCallBlock(frozen))
+        XCTAssertFalse(StreamingToolParser.hasUnclosedToolCallBlock(frozen + TC_CLOSE))
+        XCTAssertFalse(StreamingToolParser.hasUnclosedToolCallBlock("no tool call here"))
+        // A turn that froze several calls must report all of them, not just the last.
+        XCTAssertEqual(StreamingToolParser.unclosedToolCallCount(TC_OPEN + FN_OPEN + "a>" + FN_CLOSE + TC_OPEN + FN_OPEN + "b>" + FN_CLOSE), 2)
+        XCTAssertFalse(
+            StreamingToolParser.hasUnclosedToolCallBlock(TC_OPEN + FN_OPEN + "x>\n" + FN_CLOSE + TC_CLOSE + "\nprose after the block"),
+            "a closed block followed by prose must not be flagged"
+        )
+
+        // The malformed shape observed in the dump: the parameter tag re-opened
+        // inside its own value. The inner payload is the real value.
+        let malformed = TC_OPEN + "\n" + FN_OPEN + "web_fetch>\n"
+            + P_OPEN + "url>\n" + P_OPEN + "url>\nhttps://example.com/article\n" + P_CLOSE + "\n"
+            + FN_CLOSE + "\n" + TC_CLOSE
+        let parsed = AgentHarness.shared.parseAllXMLFunctionCalls(malformed)
+        XCTAssertEqual(parsed.count, 1)
+        XCTAssertEqual(parsed.first?.name, "web_fetch")
+        XCTAssertEqual(parsed.first?.arguments["url"] as? String, "https://example.com/article")
+
+        // A well-formed call is untouched by the tolerance.
+        let wellFormed = TC_OPEN + "\n" + FN_OPEN + "web_fetch>\n"
+            + P_OPEN + "url>\nhttps://example.com/other\n" + P_CLOSE + "\n" + FN_CLOSE + "\n" + TC_CLOSE
+        let parsedGood = AgentHarness.shared.parseAllXMLFunctionCalls(wellFormed)
+        XCTAssertEqual(parsedGood.first?.arguments["url"] as? String, "https://example.com/other")
+
+        // The LIVE agent loop parses with StreamingToolParser, not the AgentHarness
+        // parser — patching only the latter left this exact call executing its own
+        // markup as a shell redirect ("zsh: no such file or directory:
+        // parameter=command"). Run the observed bytes through the live path.
+        let liveMalformed = TC_OPEN + "\n" + FN_OPEN + "shell_run>\n"
+            + P_OPEN + "command>\n"
+            + P_OPEN + "command>curl -s https://fortune.com/2025/10/106932.html\n"
+            + P_CLOSE + "\n" + FN_CLOSE
+        let live = StreamingToolParser.shared.parseStreamingToolCalls(from: liveMalformed)
+        XCTAssertEqual(live.calls.count, 1)
+        XCTAssertEqual(live.calls.first?.name, "shell_run")
+        XCTAssertEqual(
+            live.calls.first?.arguments["command"] as? String,
+            "curl -s https://fortune.com/2025/10/106932.html",
+            "the live parser must descend into a re-opened parameter tag"
+        )
+    }
+
+    /// `tools_load` hard-failed on any dialect other than a clean string array, and
+    /// a rejected load silently leaves the model without the tool it asked for — an
+    /// observed run emitted `{"web_search", "web_fetch"}` (JSON-set braces), got
+    /// "Missing 'name' or 'names'", never had web_fetch, and scraped pages with
+    /// `curl | grep` for the rest of the session.
+    func testToolNameListDialects() {
+        func names(_ value: Any) -> [String] { AgentHarness.normalizeToolNameList(value) }
+
+        XCTAssertEqual(names(["web_search", "web_fetch"]), ["web_search", "web_fetch"])
+        XCTAssertEqual(names([Any]() as [Any]), [])
+        XCTAssertEqual(names(["web_search", 42, "web_fetch"]), ["web_search", "web_fetch"])
+        XCTAssertEqual(names("{\"web_search\", \"web_fetch\"}"), ["web_search", "web_fetch"])
+        XCTAssertEqual(names("[\"web_search\",\"web_fetch\"]"), ["web_search", "web_fetch"])
+        XCTAssertEqual(names("web_search, web_fetch"), ["web_search", "web_fetch"])
+        XCTAssertEqual(names("web_search web_fetch"), ["web_search", "web_fetch"])
+        XCTAssertEqual(names("web_fetch"), ["web_fetch"])
+        XCTAssertEqual(names("  'web_fetch'  "), ["web_fetch"])
+    }
+
+    /// End-to-end through the tool itself: the braced dialect must load the tools
+    /// and the tool block must actually contain them afterwards.
+    func testToolsLoadAcceptsBracedDialect() async throws {
+        let harness = AgentHarness.shared
+        let tool = ToolLoadTool()
+        defer { harness.resetLoadedToolsToCore() }
+
+        let result = try await tool.execute(
+            arguments: ["names": "{\"web_search\", \"web_fetch\"}"],
+            workingDirectory: nil,
+            maxOutputLength: 4000
+        )
+        XCTAssertFalse(result.resultJSON.contains("\"status\": \"error\""), "load must succeed: \(result.resultJSON.prefix(300))")
+        XCTAssertNotNil(harness.loadedTools["web_search"])
+        XCTAssertNotNil(harness.loadedTools["web_fetch"])
+        let loaded = Set(harness.availableToolDefinitions.map { $0.function.name })
+        XCTAssertTrue(loaded.contains("web_fetch"), "web_fetch must be exposed to the model after a braced load")
+    }
+
+    /// A missing article that answers HTTP 200 with a styled error page must not be
+    /// fed to the model as content — one observed fetch returned ~300 tokens of
+    /// "Oops! Page not found" plus unrelated trending headlines for a fabricated
+    /// Fortune URL, and the model then reasoned about that noise.
+    func testSoftNotFoundDetection() {
+        func signal(_ title: String, _ body: String) -> String? {
+            AgentHarness.softNotFoundSignal(title: title, cleanedContent: body)
+        }
+
+        // The observed shape: site-name title, marker a few hundred chars into a
+        // short page dominated by nav chrome and a trending-stories list.
+        let navJunk = (1...25).map { "Nav Item \($0)\n" }.joined()
+        XCTAssertNotNil(signal("Fortune", navJunk + "\n# Oops! Page not found\n\nOur apologies. It may have expired or there could be a typo.\n"))
+        XCTAssertNotNil(signal("404 Not Found", "whatever"))
+        XCTAssertNotNil(signal("Page Not Found | Example", "short"))
+        XCTAssertNotNil(signal("Example", "This page could not be found."))
+        XCTAssertNotNil(signal("Example", "The page you are looking for might have been removed."))
+        XCTAssertNotNil(signal("Example", "Article not found"))
+
+        // Real content must pass: a long article that mentions the phrase in passing,
+        // and a short clean page.
+        let longArticle = String(repeating: "A paragraph of genuine reporting about the Toyota Century. ", count: 300) + "\nSee our page not found policy for details."
+        XCTAssertNil(signal("Toyota Century review", longArticle), "long articles must not be flagged on an incidental phrase")
+        XCTAssertNil(signal("Error handling in Swift", "Real article body about try/catch and Result types."))
+        XCTAssertNil(signal("Toyota Century US launch", "Toyota has not announced plans to bring the Century to the United States."))
+    }
+
     func testControlledProcessRunner() async throws {
         let runner = ControlledProcessRunner.shared
         let res = try await runner.runCommand(command: "echo 'DynaMoE Harness Online'", workingDirectory: nil, timeoutSeconds: 5)

@@ -1608,3 +1608,147 @@ Fixes:
 
 Verified: 17-case unit test (gesture shapes vs real commands incl. `echo done >
 file`, `echo done && ls`, `echo $HOME`), plus the existing grammar/agent suites.
+
+### QA #32 — prompt dumps expose the freeze's dirty context: unterminated calls → format drift
+
+The prompt dumps from an 9-step Ornith agent run show the structural defect that
+QA #31's turn-management fix did not address. Counting tags in a mid-run dump:
+9 `<tool_call>` openers, 2 closers, 11 `<parameter=` openers, 9 closers.
+
+The freeze fires the moment `</function>` closes (the fallback branch in
+`shouldFreezeGeneration`), which is the common case — so 7 of 9 calls were
+committed to the pinned context with NO `</tool_call>` closer. The model then
+reads back its own history as a stack of structurally invalid examples of the
+format it is being asked to follow. Within a few turns it drifted:
+
+    <tool_call>
+    <function=web_fetch>
+    <parameter=url>
+    <parameter=url>
+    https://www.thdrive.com
+    </parameter>
+    </function>
+
+— the parameter tag re-opened inside its own value, with a bogus URL. The harness
+parsed the value as literal markup, `web_fetch` rejected it ("Invalid URL"), the
+model repeated the identical malformed call on the next turn, and the run
+spiraled. Prefix reuse was healthy throughout (`prefixReused == pin` every
+continuation; splice-vs-reencode diverges only by the known-benign boundary
+tokens, growing ~2/turn). This is context hygiene, not KV or prefill.
+
+Fixes:
+1. `StreamingToolParser.hasUnclosedToolCallBlock` + `closedAssistantTurnText`:
+   every continuation now closes an unterminated `<tool_call>` block before the
+   turn is spliced into the next prompt (token path and string path both, so the
+   fallback agrees). The model only ever reads back valid examples of its format.
+2. Parser tolerance: `AgentHarness.unwrapNestedParameterTag` descends into a
+   re-opened `<parameter=…>` inside a value, so the observed shape resolves to
+   the inner payload instead of poisoning the tool call.
+3. `web_fetch`'s invalid-URL error now echoes the offending value and points at
+   the `url` field from the search results, instead of a bare "Invalid URL" the
+   model can only respond to by repeating itself.
+4. Tests: freeze/no-closer detection (incl. closed-block-then-prose), the exact
+   malformed shape from the dump, and the well-formed control.
+
+Note for agent runs: the Ornith "Precise" profile ships repetitionPenalty 1.00 and
+presencePenalty 0.00, while the model's own Agentic-Loop profile uses presence
+1.50. Verbatim repeats (this run's duplicated malformed call) are what presence
+penalty targets; worth an A/B on long agent runs.
+
+### QA #33 — the closure fix regressed the token path; the unwrap fix landed in the wrong parser
+
+Two self-inflicted bugs, both caught by the prompt dumps from the next run.
+
+1. `buildSplicedContinuationTokens` was fed the ALREADY-normalized turn text. Its
+   "is the block unclosed?" test therefore read the closer the caller had just
+   added and skipped appending it to the token stream — and the end-tag test read
+   the appended `<|im_end|>` and skipped that too. Result: every continuation in
+   that run spliced turns with NO `</tool_call>` and NO `<|im_end|>`, i.e. the
+   model's own turn boundary was invisible in context. The dump shows it directly:
+   the splice window reads `</function><|im_start|>user` while the re-encoded
+   window reads `</function></tool_call><|im_end|><|im_start|>user`.
+   Fix: the token path always takes the RAW decoded turn; the closure decision
+   lives in one shared `StreamingToolParser.turnClosureSuffix`, and
+   `closedAssistantTurnText` mirrors it for the string path. Closure is now
+   count-based (`unclosedToolCallCount`) so a turn that froze two calls closes
+   both.
+
+2. `unwrapNestedParameterTag` was added to `AgentHarness.parseAllXMLFunctionCalls`,
+   but the live agent loop parses with `StreamingToolParser.parseStreamingToolCalls`
+   — so the fix never ran where it mattered. The dump shows the consequence in
+   exact bytes: a `shell_run` whose value re-opened
+   `<parameter=command>` executed that markup as a shell redirect
+   (`zsh:1: no such file or directory: parameter=command`, exit 1), and the
+   `web_fetch` twin returned "Invalid URL" — each repeated verbatim.
+   Fix: one public implementation in `StreamingToolParser`, called by
+   `decodeParameterValue` (the live dialect path) and by the AgentHarness parser.
+
+Both are now pinned by tests that run the observed bytes through the LIVE parser
+entry point, not just the AgentHarness one. Also observed in the same run and not
+yet addressed: a `web_fetch` of a fabricated URL returned a soft-404 page whose
+body was ~300 tokens of "Oops! Page not found" plus unrelated trending-story
+headlines, which the model then had to read and reason about. Soft-404 detection
+(compact error instead of the noise body) is the obvious next hygiene win.
+
+### QA #34 — soft-404 pages no longer ship as content
+
+Observed in the 15:xx dumps: a fabricated Fortune URL
+(`fortune.com/2025/10/106932.html`) answered HTTP 200 with "Oops! Page not
+found" plus a list of unrelated trending headlines. `web_fetch` returned that
+body as success, so the model spent ~300 tokens reading nav chrome and pop
+finance links, then kept constructing URLs.
+
+Fix: `AgentHarness.softNotFoundSignal(title:cleanedContent:)`, checked in
+`web_fetch` right after cleaning and before any content is assembled. Title
+signals are precise ("404", "page not found", "page unavailable", "not found")
+— bare "error" is deliberately excluded so "Error handling in Swift" stays real.
+Body signals ("oops! page not found", "the page you are looking for",
+"article not found", …) only count within the first 1500 chars of a page under
+8000 chars, because a not-found shell is always small while a long article may
+mention the phrase in passing. On match, `web_fetch` returns a compact error that
+names the URL, the matched signal, and points the model back at the `url` field
+from the search results instead of the page body.
+
+Verified: 9 assertions covering the exact observed shape (site-name title, marker
+buried behind nav chrome), several title/body variants, and three negatives
+(long article with an incidental phrase, a real "Error handling in Swift"
+article, and an ordinary news sentence).
+
+### QA #35 — the format fixes hold; the loop moved to tool SELECTION (tools_load dialect)
+
+The 16:22 run's dumps are structurally CLEAN — every dump has balanced
+`<tool_call>`/`</tool_call>` (2/2 … 16/16) and `<|im_start|>`/`<|im_end|>`
+off-by-one as expected for a live turn, and splice-vs-reencode diverges only by
+the benign boundary tokens. So the closure, end-tag, and unwrap fixes did their
+job; no format invention anywhere in 13 steps.
+
+The new failure mode is tool choice, and the trigger is one rejected call:
+
+    [tools_load] ERROR: Missing 'name' or 'names' parameter in tools_load.
+
+The model wrote `{"web_search", "web_fetch"}` — JSON-set braces, not an array.
+`tools_load` only accepted `[String]`/`String`, so the value decoded as a plain
+string and the load was rejected. Consequence for the whole run: **web_fetch was
+never loaded** (dumps show 0 `function=web_fetch` in all 13 steps), so the model
+read every page with `curl` through `shell_run`, then hand-wrote
+`grep -oE 'price[^ ]*"content[^ ]*' | ...` extractors, hit zsh quoting errors
+("unmatched \""), retried the same shape, and degenerated into
+`articles/articles/articles/...` inside a URL until the cycle guard cut it.
+
+Fixes:
+1. `AgentHarness.normalizeToolNameList` accepts the dialects models actually
+   emit: `["a","b"]`, `[Any]` of strings, `{a, b}`, `a, b`, `a b`, `a`, with
+   quotes/brackets attached. `tools_load` uses it for both `names` and `name`,
+   de-duplicates, and its error now echoes what it received plus the array shape.
+2. `shell_run`'s description no longer advertises fetching pages ("prefer raw
+   text endpoints…") — that wording invited curl-based scraping. It now says:
+   read pages with `web_fetch`; do not pipe curl into grep.
+3. A zsh quoting/syntax failure now comes back with a hint naming the likely
+   cause and the alternative (`web_fetch`), instead of a bare "unmatched \"".
+4. `tools_load`'s schema description shows the literal array form.
+
+Verified: 9 dialect cases plus an end-to-end `tools_load` test asserting the
+braced form actually loads web_search+web_fetch and exposes them to the model.
+Full test classes re-run against a stashed clean tree: identical failure sets
+(9 pre-existing dogfood failures, 2 pre-existing DynaMoETests failures — none
+introduced).
