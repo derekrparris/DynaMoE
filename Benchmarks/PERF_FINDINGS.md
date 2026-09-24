@@ -1611,7 +1611,7 @@ file`, `echo done && ls`, `echo $HOME`), plus the existing grammar/agent suites.
 
 ### QA #32 — prompt dumps expose the freeze's dirty context: unterminated calls → format drift
 
-The prompt dumps from an 9-step Ornith agent run show the structural defect that
+The prompt dumps from a 9-step Ornith agent run show the structural defect that
 QA #31's turn-management fix did not address. Counting tags in a mid-run dump:
 9 `<tool_call>` openers, 2 closers, 11 `<parameter=` openers, 9 closers.
 
