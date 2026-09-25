@@ -784,11 +784,22 @@ final class SubagentToolExecutor {
         allowedTools.contains(toolName) && AgentHarness.shared.tools[toolName] != nil
     }
 
+    /// What this subagent can actually call: the declared whitelist intersected with
+    /// the tools the harness has installed. The whitelist on its own is NOT the
+    /// available set — it may name tools that were never registered, and it omits
+    /// installed tools outside the whitelist — so it must not be reported as
+    /// "Available tools".
+    var callableToolNames: [String] {
+        allowedTools.filter { AgentHarness.shared.tools[$0] != nil }.sorted()
+    }
+
     /// Runs a real tool and records it as a transcript step. Returns the tool's JSON
     /// result plus its human-readable output for report building.
     func runTool(named name: String, arguments: [String: Any]) async -> (json: String, readable: String) {
         guard AgentHarness.shared.tools[name] != nil else {
-            let err = "Unknown tool '\(name)'."
+            let callable = callableToolNames
+            let listed = callable.isEmpty ? "none — this subagent's whitelist names no installed tool" : callable.joined(separator: ", ")
+            let err = "Unknown tool '\(name)'. Allowed tools: \(listed)."
             return (AgentHarness.toolErrorJSON(tool: name, error: err), err)
         }
         guard allowedTools.contains(name) else {

@@ -29,6 +29,10 @@ public struct ToolCallRecord: Identifiable, Codable, Equatable {
     public var error: String?
     public var executionDurationSeconds: Double?
     public var timestamp: Date
+    /// True for a no-op "gesture" call the harness skipped instead of running. The
+    /// record is kept so reconstructed history has a matching result for the call
+    /// the assistant emitted, but it is hidden from the tool timeline UI.
+    public var isGesture: Bool
 
     public init(
         id: UUID = UUID(),
@@ -39,7 +43,8 @@ public struct ToolCallRecord: Identifiable, Codable, Equatable {
         output: String? = nil,
         error: String? = nil,
         executionDurationSeconds: Double? = nil,
-        timestamp: Date = Date()
+        timestamp: Date = Date(),
+        isGesture: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -50,6 +55,7 @@ public struct ToolCallRecord: Identifiable, Codable, Equatable {
         self.error = error
         self.executionDurationSeconds = executionDurationSeconds
         self.timestamp = timestamp
+        self.isGesture = isGesture
     }
 }
 

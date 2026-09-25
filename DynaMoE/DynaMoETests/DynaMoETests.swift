@@ -6590,6 +6590,87 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(sampler.currentState, .outsideToolCall)
     }
 
+    /// Regression for the `web_search_fetch` failure loop: after the model had
+    /// typed a complete tool name ("web_search"), the function-name mask
+    /// allowed ANY continuation of it ("web_search" + "_fetch"), minting an
+    /// unregistered name, and one overshoot character then emptied the allowed
+    /// set and silently dropped the mask for the rest of the name. The bogus
+    /// call failed, the retry turns echoed "Unknown tool 'web_search_fetch'"
+    /// back into context, and the model latched onto that string and repeated
+    /// it forever. A complete name (or parameter key) may now only be followed
+    /// by '>'; spanning tokens must terminate the word.
+    func testGrammarMaskRejectsNameOvershoot() {
+        let harness = AgentHarness.shared
+        let sampler = GrammarConstrainedSampler.shared
+        try? harness.loadTool(named: "web_search")
+        try? harness.loadTool(named: "web_fetch")
+        defer {
+            harness.resetLoadedToolsToCore()
+            sampler.reset()
+        }
+
+        sampler.isEnabled = true
+        sampler.reset()
+
+        func masked(_ text: String, tokens: [String]) -> [Bool] {
+            sampler.updateState(emittedText: text)
+            var logits = [Float](repeating: 0, count: tokens.count)
+            logits.withUnsafeMutableBufferPointer { buf in
+                sampler.applyLogitMask(
+                    logits: buf.baseAddress!,
+                    vocabSize: tokens.count,
+                    tokenDecoder: { tokens[Int($0)] }
+                )
+            }
+            return logits.map { $0 == -.infinity }
+        }
+
+        // A complete name may only be followed by '>'.
+        XCTAssertEqual(
+            masked("<tool_call><function=web_search", tokens: ["_fetch", ">", "search_fetch"]),
+            [true, false, true],
+            "extending a complete tool name must be masked out"
+        )
+
+        // A token may span name completion, but only when it terminates the name.
+        XCTAssertEqual(
+            masked("<tool_call><function=web_sea", tokens: ["rch", "rch>", "rch_fetch", "rchx"]),
+            [false, false, true, true],
+            "spanning tokens must terminate the name with '>'"
+        )
+
+        // Same rule for parameter keys once the key is complete.
+        XCTAssertEqual(
+            masked("<tool_call><function=web_fetch><parameter=url", tokens: [">", "x", "_bad"]),
+            [false, true, true],
+            "extending a complete parameter key must be masked out"
+        )
+
+        // '>' must END the overshoot: a merged token carrying the tail past this
+        // state would slip behind the gate that withholds `</function>` until the
+        // required parameters are written ("name></function>" closes a call with no
+        // command at all), and "name>junk" starts the body early.
+        XCTAssertEqual(
+            masked("<tool_call><function=web_sea", tokens: ["rch>junk", "rch></function>", "rch>"]),
+            [true, true, false],
+            "only a '>'-terminated overshoot may pass the name state"
+        )
+        XCTAssertEqual(
+            masked("<tool_call><function=web_fetch><parameter=url", tokens: [">junk", ">"]),
+            [true, false],
+            "only a '>'-terminated overshoot may pass the parameter-key state"
+        )
+
+        // Dead-end valve: if no token satisfies the strict rule (a tokenizer with no
+        // bare '>' token), the loosely-allowed one is released instead of leaving
+        // the whole vocab masked — sampling on all -inf logits yields garbage.
+        XCTAssertEqual(
+            masked("<tool_call><function=web_search", tokens: ["_fetch", ">junk"]),
+            [true, false],
+            "the dead-end valve must keep exactly one continuation alive"
+        )
+    }
+
     /// Pure-logic coverage for the uncalled-action nudge. A false positive here
     /// injects a synthetic turn and the model answers its own closing message,
     /// while a false negative drops a narrated action the model never executed.
@@ -6654,6 +6735,360 @@ final class DynaMoETests: XCTestCase {
         // Long turns are out of scope for the nudge.
         let long = String(repeating: "A sentence about the car. ", count: 20) + "I'll start by reading it."
         XCTAssertFalse(detect(long))
+    }
+
+    /// Models emit no-op shell commands (`echo done`, `true`, `:`) as a "task
+    /// finished" gesture when they should call `complete` or just end the turn.
+    /// Executing one restarted the agent loop and produced a duplicate answer
+    /// bubble, so they must be detected and dropped — while real commands that
+    /// merely contain those words must still run.
+    func testNoOpGestureToolCallDetection() {
+        func call(_ command: String, tool: String = "shell_run") -> ParsedToolCall {
+            ParsedToolCall(name: tool, arguments: ["command": command], rawArguments: command, rawText: command)
+        }
+        func isGesture(_ command: String) -> Bool {
+            AgentHarness.isNoOpGestureToolCall(call(command))
+        }
+
+        XCTAssertTrue(isGesture("echo done"))
+        XCTAssertTrue(isGesture("  echo done  "))
+        XCTAssertTrue(isGesture("ECHO DONE"))
+        XCTAssertTrue(isGesture("echo"))
+        XCTAssertTrue(isGesture("true"))
+        XCTAssertTrue(isGesture(":"))
+        XCTAssertTrue(isGesture("exit"))
+
+        XCTAssertFalse(isGesture("echo done > /tmp/out.txt"))
+        XCTAssertFalse(isGesture("echo done && ls"))
+        XCTAssertFalse(isGesture("ls -la"))
+        XCTAssertFalse(isGesture("git status"))
+        XCTAssertFalse(isGesture("echo $HOME"))
+        XCTAssertFalse(isGesture("curl -s https://example.com"))
+        XCTAssertFalse(AgentHarness.isNoOpGestureToolCall(call("echo done", tool: "file_read")))
+
+        // A skipped gesture still yields a persisted record so reconstructed history
+        // has a matching result for the raw call in the assistant content: the output
+        // carries the model-facing notice and the flag keeps it out of the UI.
+        let gestureRecord = AgentHarness.gestureSkipRecord(for: call("echo done"))
+        XCTAssertTrue(gestureRecord.isGesture)
+        XCTAssertEqual(gestureRecord.name, "shell_run")
+        XCTAssertEqual(gestureRecord.status, .success)
+        XCTAssertTrue(gestureRecord.output?.contains("[shell_run]") == true)
+        XCTAssertTrue(gestureRecord.output?.contains("skipped") == true)
+
+        // splitGestureCalls reports the skipped index so the caller can persist it.
+        let split = AgentHarness.splitGestureCalls([call("ls -la"), call("echo done"), call("git status")])
+        XCTAssertEqual(split.actionableIndices, [0, 2])
+        XCTAssertEqual(split.skipNotices.keys.sorted(), [1])
+    }
+
+    /// The pre-execution freeze cuts generation at `</function>`, so the model's
+    /// own tool calls are committed to context without a `</tool_call>` closer
+    /// (7 of 9 calls in one observed run). That history teaches the model invalid
+    /// examples of its own format, and it started inventing shapes — a
+    /// `<parameter=url>` re-opened inside its own value, repeated verbatim.
+    func testToolCallHygieneAndNestedParameterTolerance() {
+        let FN_OPEN = "<function="
+        let FN_CLOSE = "</function>"
+        let TC_OPEN = "<tool_call>"
+        let TC_CLOSE = "</tool_call>"
+        let P_OPEN = "<parameter="
+        let P_CLOSE = "</parameter>"
+
+        let frozen = TC_OPEN + "\n" + FN_OPEN + "web_search>\n" + P_OPEN + "query>\nToyota Century\n" + P_CLOSE + "\n" + FN_CLOSE
+        XCTAssertTrue(StreamingToolParser.hasUnclosedToolCallBlock(frozen))
+        XCTAssertFalse(StreamingToolParser.hasUnclosedToolCallBlock(frozen + TC_CLOSE))
+        XCTAssertFalse(StreamingToolParser.hasUnclosedToolCallBlock("no tool call here"))
+        // A turn that froze several calls must report all of them, not just the last.
+        XCTAssertEqual(StreamingToolParser.unclosedToolCallCount(TC_OPEN + FN_OPEN + "a>" + FN_CLOSE + TC_OPEN + FN_OPEN + "b>" + FN_CLOSE), 2)
+        // A literal `<tool_call>` printed inside a parameter value is data, not a
+        // structural opener: counting it appended a stray closer to the next prompt.
+        let literalInValue = TC_OPEN + "\n" + FN_OPEN + "shell_run>\n" + P_OPEN + "command>\necho " + TC_OPEN + "\n" + P_CLOSE + "\n" + FN_CLOSE
+        XCTAssertEqual(StreamingToolParser.unclosedToolCallCount(literalInValue), 1)
+        XCTAssertEqual(StreamingToolParser.unclosedToolCallCount(literalInValue + TC_CLOSE), 0)
+        // Same for the Ling dialect's <arg_value> payload.
+        let argValueLiteral = TC_OPEN + FN_OPEN + "x>\n<arg_value>say " + TC_OPEN + " now</arg_value>\n" + FN_CLOSE
+        XCTAssertEqual(StreamingToolParser.unclosedToolCallCount(argValueLiteral), 1)
+        // A closed block whose value mentions the marker stays fully balanced.
+        let closedThenLiteral = TC_OPEN + FN_OPEN + "x>\n" + P_OPEN + "k>v " + TC_OPEN + P_CLOSE + "\n" + FN_CLOSE + TC_CLOSE
+        XCTAssertEqual(StreamingToolParser.unclosedToolCallCount(closedThenLiteral), 0)
+        XCTAssertFalse(
+            StreamingToolParser.hasUnclosedToolCallBlock(TC_OPEN + FN_OPEN + "x>\n" + FN_CLOSE + TC_CLOSE + "\nprose after the block"),
+            "a closed block followed by prose must not be flagged"
+        )
+
+        // The malformed shape observed in the dump: the parameter tag re-opened
+        // inside its own value. The inner payload is the real value.
+        let malformed = TC_OPEN + "\n" + FN_OPEN + "web_fetch>\n"
+            + P_OPEN + "url>\n" + P_OPEN + "url>\nhttps://example.com/article\n" + P_CLOSE + "\n"
+            + FN_CLOSE + "\n" + TC_CLOSE
+        let parsed = AgentHarness.shared.parseAllXMLFunctionCalls(malformed)
+        XCTAssertEqual(parsed.count, 1)
+        XCTAssertEqual(parsed.first?.name, "web_fetch")
+        XCTAssertEqual(parsed.first?.arguments["url"] as? String, "https://example.com/article")
+
+        // A well-formed call is untouched by the tolerance.
+        let wellFormed = TC_OPEN + "\n" + FN_OPEN + "web_fetch>\n"
+            + P_OPEN + "url>\nhttps://example.com/other\n" + P_CLOSE + "\n" + FN_CLOSE + "\n" + TC_CLOSE
+        let parsedGood = AgentHarness.shared.parseAllXMLFunctionCalls(wellFormed)
+        XCTAssertEqual(parsedGood.first?.arguments["url"] as? String, "https://example.com/other")
+
+        // The LIVE agent loop parses with StreamingToolParser, not the AgentHarness
+        // parser — patching only the latter left this exact call executing its own
+        // markup as a shell redirect ("zsh: no such file or directory:
+        // parameter=command"). Run the observed bytes through the live path.
+        let liveMalformed = TC_OPEN + "\n" + FN_OPEN + "shell_run>\n"
+            + P_OPEN + "command>\n"
+            + P_OPEN + "command>curl -s https://fortune.com/2025/10/106932.html\n"
+            + P_CLOSE + "\n" + FN_CLOSE
+        let live = StreamingToolParser.shared.parseStreamingToolCalls(from: liveMalformed)
+        XCTAssertEqual(live.calls.count, 1)
+        XCTAssertEqual(live.calls.first?.name, "shell_run")
+        XCTAssertEqual(
+            live.calls.first?.arguments["command"] as? String,
+            "curl -s https://fortune.com/2025/10/106932.html",
+            "the live parser must descend into a re-opened parameter tag"
+        )
+    }
+
+    /// When reads keep failing the model invents hosts instead of reusing the ones
+    /// its searches returned (observed live: wttr.org → wttr.info → wttri.info →
+    /// "wt.tr.info", all nonexistent, while real forecast URLs sat in context). The
+    /// guardrail must hand those URLs back after consecutive failures.
+    func testWebFetchFailureGuardrail() {
+        let harness = AgentHarness.shared
+        harness.beginAgentSearchGuard()
+        defer { harness.beginAgentSearchGuard() }
+
+        let failedResult = AgentHarness.toolErrorJSON(tool: "web_fetch", error: "Failed to retrieve content")
+
+        // Below the limit: untouched.
+        harness.recordWebFetchOutcome(succeeded: false)
+        XCTAssertEqual(harness.consecutiveWebFetchFailures, 1)
+        XCTAssertFalse(harness.applyWebFetchFailureGuard(to: failedResult).contains("guardrail"))
+
+        // At the limit: the notice lists the URLs the search returned.
+        harness.recordWebFetchOutcome(succeeded: false)
+        harness.noteSearchResultURLs(["https://www.accuweather.com/en/us/burlington-nc/27215/weather-forecast/329809"])
+        let guarded = harness.applyWebFetchFailureGuard(to: failedResult)
+        XCTAssertTrue(guarded.contains("guardrail"), guarded)
+        XCTAssertTrue(guarded.contains("accuweather.com"), "the notice must offer real sources: \(guarded)")
+        XCTAssertTrue(guarded.contains("consecutive web fetches have failed"))
+
+        // With no search results yet, it says so rather than listing nothing.
+        harness.beginAgentSearchGuard()
+        harness.recordWebFetchOutcome(succeeded: false)
+        harness.recordWebFetchOutcome(succeeded: false)
+        XCTAssertTrue(harness.applyWebFetchFailureGuard(to: failedResult).contains("call web_search first"))
+
+        // A success resets the counter, so one-off failures never trigger it.
+        harness.recordWebFetchOutcome(succeeded: true)
+        XCTAssertEqual(harness.consecutiveWebFetchFailures, 0)
+        XCTAssertFalse(harness.applyWebFetchFailureGuard(to: failedResult).contains("guardrail"))
+
+        // curl/wget shell commands count as web reads; other commands do not.
+        XCTAssertTrue(AgentHarness.looksLikeWebFetchCommand("curl -s https://example.com | head -50"))
+        XCTAssertTrue(AgentHarness.looksLikeWebFetchCommand("wget -qO- https://example.com"))
+        XCTAssertFalse(AgentHarness.looksLikeWebFetchCommand("ls -la"))
+        XCTAssertFalse(AgentHarness.looksLikeWebFetchCommand("git status"))
+        XCTAssertFalse(AgentHarness.looksLikeWebFetchCommand(nil))
+    }
+
+    /// A subagent's unknown-tool error must describe what that subagent can call —
+    /// the whitelist INTERSECTED with installed tools. The whitelist alone is not
+    /// "available tools" (it can name tools that were never registered, and it omits
+    /// installed tools outside the whitelist), so labeling it that way sent the
+    /// model hunting for tools it could never call.
+    func testSubagentUnknownToolErrorListsCallableTools() async {
+        let harness = AgentHarness.shared
+        XCTAssertNotNil(harness.tools["web_search"], "precondition: web_search is installed in the catalog")
+
+        func executor(allowed: [String]) -> SubagentToolExecutor {
+            let owner = SubagentInstance(
+                role: "Test Runner",
+                taskDescription: "unit test",
+                allowedTools: allowed
+            )
+            return SubagentToolExecutor(owner: owner, workingDirectory: nil)
+        }
+
+        // Whitelist naming one installed tool plus a fabricated one; a call for a
+        // tool that does not exist at all must advertise only the intersection.
+        let runner = executor(allowed: ["web_search", "ghost_tool"])
+        XCTAssertEqual(runner.callableToolNames, ["web_search"])
+        let unknown = await runner.runTool(named: "phantom_tool", arguments: [:])
+        XCTAssertTrue(unknown.json.contains("Unknown tool 'phantom_tool'"))
+        XCTAssertTrue(unknown.json.contains("Allowed tools: web_search"), "error must list the callable intersection: \(unknown.json)")
+        XCTAssertFalse(unknown.json.contains("Available tools"), "the whitelist must not be labeled available tools")
+        XCTAssertFalse(unknown.json.contains("ghost_tool"), "uninstalled whitelist entries must not be advertised")
+
+        // Installed but un-whitelisted tools take the distinct whitelist message
+        // (which may name whitelist entries that are not installed — that list IS
+        // the declared whitelist, so its label stays accurate).
+        let notAllowed = await runner.runTool(named: "web_fetch", arguments: [:])
+        XCTAssertTrue(notAllowed.json.contains("not in this subagent's allowed_tools"), notAllowed.json)
+
+        // A whitelist naming no installed tool says so instead of listing nothing.
+        let empty = executor(allowed: ["ghost_tool"])
+        let emptyErr = await empty.runTool(named: "phantom_tool", arguments: [:])
+        XCTAssertTrue(emptyErr.json.contains("whitelist names no installed tool"), emptyErr.json)
+
+        harness.resetLoadedToolsToCore()
+    }
+
+    /// A turn may contain both a real call and a no-op gesture. The gesture is not
+    /// executed, but the assistant turn spliced into the next prompt is built from
+    /// the raw generated tokens, so the call is present there — it must still get a
+    /// result, or the transcript shows a call with no response and the model
+    /// re-issues it.
+    func testGestureCallsKeepTranscriptSlots() {
+        func call(_ name: String, _ command: String?) -> ParsedToolCall {
+            ParsedToolCall(
+                name: name,
+                arguments: command.map { ["command": $0] } ?? [:],
+                rawArguments: command ?? "",
+                rawText: name
+            )
+        }
+
+        // [real, gesture, real] — order must survive compaction.
+        let calls = [
+            call("web_search", nil),
+            call("shell_run", "echo done"),
+            call("file_read", nil)
+        ]
+        let split = AgentHarness.splitGestureCalls(calls)
+
+        XCTAssertEqual(split.actionableIndices, [0, 2], "execution order must follow transcript order")
+        XCTAssertEqual(split.skipNotices.keys.sorted(), [1], "only the gesture call is skipped")
+
+        // One slot per emitted call; the gesture's slot carries a skip notice, so
+        // stamping results in and compacting yields a 1:1 call↔result transcript.
+        var slots = [String?](repeating: nil, count: calls.count)
+        for (idx, notice) in split.skipNotices { slots[idx] = notice }
+        XCTAssertEqual(slots[1]?.contains("skipped"), true)
+        slots[split.actionableIndices[0]] = "{\"tool\":\"web_search\"}"
+        slots[split.actionableIndices[1]] = "{\"tool\":\"file_read\"}"
+        XCTAssertEqual(slots.compactMap { $0 }.count, calls.count, "every call must have a result")
+
+        // All-gesture and no-gesture turns behave too.
+        let allGestures = AgentHarness.splitGestureCalls([call("shell_run", "true"), call("shell_run", ":")])
+        XCTAssertTrue(allGestures.actionableIndices.isEmpty)
+        XCTAssertEqual(allGestures.skipNotices.count, 2)
+        let noGestures = AgentHarness.splitGestureCalls([call("web_fetch", nil)])
+        XCTAssertEqual(noGestures.actionableIndices, [0])
+        XCTAssertTrue(noGestures.skipNotices.isEmpty)
+    }
+
+    /// `tools_load` hard-failed on any dialect other than a clean string array, and
+    /// a rejected load silently leaves the model without the tool it asked for — an
+    /// observed run emitted `{"web_search", "web_fetch"}` (JSON-set braces), got
+    /// "Missing 'name' or 'names'", never had web_fetch, and scraped pages with
+    /// `curl | grep` for the rest of the session.
+    func testToolNameListDialects() {
+        func names(_ value: Any) -> [String] { AgentHarness.normalizeToolNameList(value) }
+
+        XCTAssertEqual(names(["web_search", "web_fetch"]), ["web_search", "web_fetch"])
+        XCTAssertEqual(names([Any]() as [Any]), [])
+        XCTAssertEqual(names(["web_search", 42, "web_fetch"]), ["web_search", "web_fetch"])
+        XCTAssertEqual(names("{\"web_search\", \"web_fetch\"}"), ["web_search", "web_fetch"])
+        XCTAssertEqual(names("[\"web_search\",\"web_fetch\"]"), ["web_search", "web_fetch"])
+        XCTAssertEqual(names("web_search, web_fetch"), ["web_search", "web_fetch"])
+        XCTAssertEqual(names("web_search web_fetch"), ["web_search", "web_fetch"])
+        XCTAssertEqual(names("web_fetch"), ["web_fetch"])
+        XCTAssertEqual(names("  'web_fetch'  "), ["web_fetch"])
+    }
+
+    /// A load request for a tool that is ALREADY loaded must still return its
+    /// schema. Nothing else carries a loaded tool's interface: the pinned system
+    /// prompt's tool block stays at the core set across loads, so the load response
+    /// is the only channel. A model that asked for an already-loaded tool used to
+    /// get "already loaded" with no schema — knowing the tool existed but not how to
+    /// call it — and fell back to scraping with curl (observed in a live run whose
+    /// web_search schema was never sent).
+    func testToolsLoadRepeatsSchemaForAlreadyLoadedTools() async throws {
+        let harness = AgentHarness.shared
+        let tool = ToolLoadTool()
+        defer { harness.resetLoadedToolsToCore() }
+
+        // Load it once so the second call takes the already-loaded path.
+        _ = try await tool.execute(arguments: ["names": "[\"web_search\"]"], workingDirectory: nil, maxOutputLength: 4000)
+        XCTAssertNotNil(harness.loadedTools["web_search"])
+
+        let repeatResult = try await tool.execute(arguments: ["names": "[\"web_search\"]"], workingDirectory: nil, maxOutputLength: 4000)
+        let json = repeatResult.resultJSON
+        // JSONSerialization pretty-prints with a space before the colon
+        // ("status" : "success"), so match on the values, not a compacted form.
+        XCTAssertTrue(json.contains("success"), String(json.prefix(200)))
+        XCTAssertTrue(json.contains("already_loaded"), "the repeat must be reported as already loaded")
+        // web_search-specific parameter names prove the schema itself came back,
+        // not just the tool's name.
+        XCTAssertTrue(json.contains("max_results"), "web_search's schema must be present: \(String(json.prefix(600)))")
+        XCTAssertTrue(json.contains("query"), "web_search's schema must be present: \(String(json.prefix(600)))")
+        XCTAssertTrue(
+            (repeatResult.stdout ?? "").contains("already loaded"),
+            "the message must say it was already loaded: \(repeatResult.stdout ?? "")"
+        )
+    }
+
+    /// End-to-end through the tool itself: the braced dialect must load the tools
+    /// and the tool block must actually contain them afterwards.
+    func testToolsLoadAcceptsBracedDialect() async throws {
+        let harness = AgentHarness.shared
+        let tool = ToolLoadTool()
+        defer { harness.resetLoadedToolsToCore() }
+
+        let result = try await tool.execute(
+            arguments: ["names": "{\"web_search\", \"web_fetch\"}"],
+            workingDirectory: nil,
+            maxOutputLength: 4000
+        )
+        XCTAssertFalse(result.resultJSON.contains("\"status\": \"error\""), "load must succeed: \(result.resultJSON.prefix(300))")
+        XCTAssertNotNil(harness.loadedTools["web_search"])
+        XCTAssertNotNil(harness.loadedTools["web_fetch"])
+        let loaded = Set(harness.availableToolDefinitions.map { $0.function.name })
+        XCTAssertTrue(loaded.contains("web_fetch"), "web_fetch must be exposed to the model after a braced load")
+    }
+
+    /// A missing article that answers HTTP 200 with a styled error page must not be
+    /// fed to the model as content — one observed fetch returned ~300 tokens of
+    /// "Oops! Page not found" plus unrelated trending headlines for a fabricated
+    /// Fortune URL, and the model then reasoned about that noise.
+    func testSoftNotFoundDetection() {
+        func signal(_ title: String, _ body: String) -> String? {
+            AgentHarness.softNotFoundSignal(title: title, cleanedContent: body)
+        }
+
+        // The observed shape: site-name title, marker a few hundred chars into a
+        // short page dominated by nav chrome and a trending-stories list.
+        let navJunk = (1...25).map { "Nav Item \($0)\n" }.joined()
+        XCTAssertNotNil(signal("Fortune", navJunk + "\n# Oops! Page not found\n\nOur apologies. It may have expired or there could be a typo.\n"))
+        XCTAssertNotNil(signal("404 Not Found", "whatever"))
+        XCTAssertNotNil(signal("Page Not Found | Example", "short"))
+        XCTAssertNotNil(signal("Example", "This page could not be found."))
+        XCTAssertNotNil(signal("Example", "The page you are looking for might have been removed."))
+        XCTAssertNotNil(signal("Example", "Article not found"))
+
+        // Real content must pass: a long article that mentions the phrase in passing,
+        // and a short clean page.
+        let longArticle = String(repeating: "A paragraph of genuine reporting about the Toyota Century. ", count: 300) + "\nSee our page not found policy for details."
+        XCTAssertNil(signal("Toyota Century review", longArticle), "long articles must not be flagged on an incidental phrase")
+        XCTAssertNil(signal("Error handling in Swift", "Real article body about try/catch and Result types."))
+        XCTAssertNil(signal("Toyota Century US launch", "Toyota has not announced plans to bring the Century to the United States."))
+
+        // Titles that DISCUSS the phrase are real articles, not error pages. Without
+        // segment matching these were rejected before their content was ever read.
+        let helpArticle = "Step one: check the URL. Step two: clear your cache and reload the page."
+        XCTAssertNil(signal("How to Fix a Page Not Found Error", helpArticle))
+        XCTAssertNil(signal("Why Was the Page Not Found?", helpArticle))
+        XCTAssertNil(signal("404: A Story of Loss", "Chapter one. The server never answered, and nobody knew why."))
+        XCTAssertNil(signal("Troubleshooting 404 Responses in Express", helpArticle))
+
+        // Error pages whose marker stands alone as a title segment still match.
+        XCTAssertNotNil(signal("Page Not Found - Example", "short"))
+        XCTAssertNotNil(signal("404 Not Found", "short"))
+        XCTAssertNotNil(signal("Example | 404", "short"))
+        XCTAssertNotNil(signal("Oops", "short"))
     }
 
     func testControlledProcessRunner() async throws {

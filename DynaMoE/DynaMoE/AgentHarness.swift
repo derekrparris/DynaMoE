@@ -130,7 +130,7 @@ public extension AgentTool {
 public final class ShellRunTool: AgentTool {
     public let definition = ToolDefinition(
         name: "shell_run",
-        description: "Executes shell commands on the local macOS terminal via zsh. Use this to run scripts, compilers, git, or check system state. Output is captured and returned. When fetching web pages, prefer raw text endpoints (e.g. raw.githubusercontent.com/OWNER/REPO/HEAD/path) over rendered HTML pages; large HTML responses are auto-converted to plain text and truncated. PATH includes /opt/homebrew/bin, /usr/local/bin, ~/.cargo/bin and ~/.local/bin, so brew/cargo/pip-user tools resolve directly.",
+        description: "Executes shell commands on the local macOS terminal via zsh. Use this for local work: scripts, compilers, git, build and system state. Output is captured and returned. To READ A WEB PAGE, use web_fetch with a url from web_search results; do NOT scrape pages with curl/wget piped into grep/sed, and do not hand-write shell regexes for page content. PATH includes /opt/homebrew/bin, /usr/local/bin, ~/.cargo/bin and ~/.local/bin, so brew/cargo/pip-user tools resolve directly.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
@@ -186,7 +186,16 @@ public final class ShellRunTool: AgentTool {
             return (res, cleanStdout, nil, false)
         } else {
             print("🛠 [shell_run] exit=\(exitCode) cmd='\(String(command.prefix(100)))' stderr='\(String(cleanStderr.prefix(160)))' stdout='\(String(cleanStdout.prefix(80)))'")
-            let res = AgentHarness.toolErrorJSON(tool: "shell_run", error: cleanStderr.isEmpty ? cleanStdout : cleanStderr, extra: [
+            // A quoting/syntax failure is almost always a hand-written curl+
+            // grep scrape or nested quotes. Say what to do instead; the model
+            // otherwise retries the same broken shape until it degenerates.
+            let syntaxSignals = ["unmatched", "syntax error", "parse error", "bad pattern", "no matches found"]
+            let looksLikeSyntaxError = syntaxSignals.contains { cleanStderr.lowercased().contains($0) }
+            let hint = looksLikeSyntaxError
+                ? "\nHint: this is a shell quoting/syntax error. To read a web page, call web_fetch with a url from the web_search results instead of piping curl into grep. Otherwise simplify the command: avoid nested quotes and hand-written regexes with brackets or pipes in them."
+                : ""
+            let baseError = cleanStderr.isEmpty ? cleanStdout : cleanStderr
+            let res = AgentHarness.toolErrorJSON(tool: "shell_run", error: baseError + hint, extra: [
                 "exit_code": exitCode,
                 "stdout": cleanStdout
             ])
@@ -989,6 +998,10 @@ public final class WebSearchTool: AgentTool {
                 enrichedResults.append(entry)
             }
 
+            // Remember the returned URLs: if later fetches keep failing, the
+            // guardrail hands these back instead of letting the model invent hosts.
+            AgentHarness.shared.noteSearchResultURLs(enrichedResults.compactMap { $0["url"] as? String })
+
             let res = AgentHarness.toolSuccessJSON(tool: "web_search", data: [
                 "query": cleanQuery,
                 "count": results.count,
@@ -1109,7 +1122,11 @@ public final class WebFetchTool: AgentTool {
         guard let urlStr = arguments["url"] as? String,
               let url = URL(string: urlStr.trimmingCharacters(in: .whitespacesAndNewlines)),
               url.scheme == "http" || url.scheme == "https" else {
-            let err = "Invalid URL: please provide an absolute http:// or https:// URL."
+            // Echo the offending value back. A bare "Invalid URL" gave the model
+            // nothing to correct, and it repeated the same malformed call verbatim
+            // (observed twice in one run).
+            let got = (arguments["url"] as? String).map { AgentHarness.truncateText($0, limit: 200) } ?? "<missing>"
+            let err = "Invalid URL: received \"\(got)\". Pass the url field exactly as it appears in the web_search results (an absolute http:// or https:// URL)."
             return (AgentHarness.toolErrorJSON(tool: "web_fetch", error: err), nil, err, false)
         }
 
@@ -1155,6 +1172,14 @@ public final class WebFetchTool: AgentTool {
             }
 
             let fullCleaned = Self.cleanHTMLStructure(pageHtml)
+
+            // A soft 404 (HTTP 200 with a styled not-found page) otherwise ships
+            // nav chrome plus unrelated trending headlines as if it were content.
+            if let signal = AgentHarness.softNotFoundSignal(title: pageTitle, cleanedContent: fullCleaned) {
+                let err = "Page not found at \(url.absoluteString) — the site answered with its '\(signal)' error page, not article content. This URL has nothing to read; copy the exact url field from the web_search results instead of fetching a constructed one."
+                return (AgentHarness.toolErrorJSON(tool: "web_fetch", error: err), nil, err, false)
+            }
+
             var contentToReturn: String
 
             if fullCleaned.count <= limit {
@@ -1735,7 +1760,7 @@ public final class ToolDiscoverTool: AgentTool {
 public final class ToolLoadTool: AgentTool {
     public let definition = ToolDefinition(
         name: "tools_load",
-        description: "Loads installed tools' full schemas into context so they can be called directly. Use tools_discover to list available tools first. Accepts a single 'name' or a 'names' array. Idempotent: loading an already-loaded tool is a no-op success. Prefer loading all tools needed for a task in ONE call (a single 'names' array), since each load event rewrites the tool block and triggers a context re-prefill.",
+        description: "Loads installed tools' full schemas into context so they can be called directly. Use tools_discover to list available tools first. Accepts a single 'name' or a 'names' JSON array (e.g. \"names\": [\"web_search\", \"web_fetch\"]); braces or comma-separated strings also work. Idempotent: loading an already-loaded tool is a no-op success. Prefer loading all tools needed for a task in ONE call (a single 'names' array), since each load event rewrites the tool block and triggers a context re-prefill.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
@@ -1756,17 +1781,21 @@ public final class ToolLoadTool: AgentTool {
     public func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
         let harness = AgentHarness.shared
 
-        // Resolve batch ('names') or single ('name') form.
+        // Resolve batch ('names') or single ('name') form, tolerating the loose
+        // dialects models actually emit (JSON-set braces, comma/space separated).
         var names: [String] = []
-        if let batch = arguments["names"] as? [String] {
-            names = batch.compactMap { ($0 as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        if let batch = arguments["names"] {
+            names.append(contentsOf: AgentHarness.normalizeToolNameList(batch))
         }
-        if let single = arguments["name"] as? String {
-            let trimmed = single.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty { names.append(trimmed) }
+        if let single = arguments["name"] {
+            names.append(contentsOf: AgentHarness.normalizeToolNameList(single))
         }
+        // De-duplicate while preserving order.
+        var seenNames = Set<String>()
+        names = names.filter { seenNames.insert($0).inserted }
         if names.isEmpty {
-            let err = "Missing 'name' or 'names' parameter in tools_load. Run tools_discover to list available tools."
+            let received = arguments["names"].map { "\($0)" } ?? arguments["name"].map { "\($0)" } ?? "<none>"
+            let err = "tools_load could not read a tool name from: \(received). Pass names as a JSON array of strings, e.g. [\"web_search\", \"web_fetch\"]."
             return (AgentHarness.toolErrorJSON(tool: "tools_load", error: err), nil, err, false)
         }
 
@@ -1774,7 +1803,17 @@ public final class ToolLoadTool: AgentTool {
         var schemas: [String: String] = [:]
         var errors: [String] = []
         for name in names {
-            if harness.loadedTools[name] != nil {
+            if let existing = harness.loadedTools[name] {
+                // Repeat the schema even when the tool is already loaded. The pinned
+                // system prompt's tool block is only ever the CORE set (loads do not
+                // rewrite it), so this response is the only channel that can carry a
+                // loaded tool's interface — and skipping repeats left the model
+                // knowing a tool existed but not how to call it (observed: it never
+                // used a loaded web_search and scraped with curl instead).
+                if let schemaData = try? JSONEncoder().encode(existing.definition),
+                   let schemaStr = String(data: schemaData, encoding: .utf8) {
+                    schemas[name] = schemaStr
+                }
                 loadedResults.append([
                     "tool_name": name,
                     "registration": false,
@@ -1802,13 +1841,15 @@ public final class ToolLoadTool: AgentTool {
         }
 
         let newlyLoaded = loadedResults.filter { ($0["registration"] as? Bool) == true }.map { $0["tool_name"] as? String ?? "" }
+        let alreadyLoaded = loadedResults.filter { ($0["already_loaded"] as? Bool) == true }.map { $0["tool_name"] as? String ?? "" }
+        let repeatNote = alreadyLoaded.isEmpty ? "" : " Schema(s) repeated for the already-loaded tool(s) so you can call them correctly."
         let msg: String
         if newlyLoaded.count == 1, let only = newlyLoaded.first {
-            msg = "Tool '\(only)' loaded. You may now call it directly using the provided schema."
+            msg = "Tool '\(only)' loaded. You may now call it directly using the provided schema." + repeatNote
         } else if newlyLoaded.count > 1 {
-            msg = "Tools \(newlyLoaded.map { "'\($0)'" }.joined(separator: ", ")) loaded. You may now call them directly using the provided schemas."
+            msg = "Tools \(newlyLoaded.map { "'\($0)'" }.joined(separator: ", ")) loaded. You may now call them directly using the provided schemas." + repeatNote
         } else {
-            msg = "All requested tools were already loaded."
+            msg = "Requested tool(s) were already loaded:\(alreadyLoaded.map { " '\($0)'" }.joined())." + repeatNote
         }
 
         var data: [String: Any] = [
@@ -2696,6 +2737,17 @@ public final class AgentHarness {
     /// Issuing the same normalized query this many times triggers the repeat guard.
     public var searchRepeatLimit: Int = 2
 
+    /// URLs web_search actually returned in the current run, newest last. Used to
+    /// hand the model real sources when it starts inventing hosts.
+    public private(set) var recentSearchResultURLs: [String] = []
+    /// Consecutive web-fetch attempts that failed: a `web_fetch` error, or a
+    /// `shell_run` running curl/wget that exited non-zero. Models that cannot fetch
+    /// an invented host invent another one ("wttr.org" → "wttr.info" → "wttri.info"),
+    /// so consecutive failures are the signal to intervene.
+    public private(set) var consecutiveWebFetchFailures: Int = 0
+    /// Consecutive failures before the guardrail appends guidance to the result.
+    public var webFetchFailureLimit: Int = 2
+
     /// Resets guard state at the start of a new task and re-exposes `web_search` in case a
     /// previous run unloaded it.
     public func beginAgentSearchGuard() {
@@ -2704,6 +2756,8 @@ public final class AgentHarness {
         webSearchDisabled = false
         lastSearchGuardAction = .none
         consecutiveEmptyToolCalls = 0
+        recentSearchResultURLs.removeAll()
+        consecutiveWebFetchFailures = 0
         if tools["web_search"] != nil && loadedTools["web_search"] == nil {
             _ = try? loadTool(named: "web_search")
         }
@@ -2750,6 +2804,110 @@ public final class AgentHarness {
             }
         }
         return true
+    }
+
+    /// Normalizes the many shapes a model uses for a tool-name list into plain
+    /// names. Needed because `tools_load` was hard-failing on dialects other than
+    /// a clean string array, and a rejected load leaves the model without the tool
+    /// it asked for — observed: `{"web_search", "web_fetch"}` (JSON-set braces)
+    /// rejected as "Missing 'name' or 'names'", so web_fetch was never loaded and
+    /// the model scraped pages with `curl | grep` for the rest of the run.
+    ///
+    /// Accepts: ["a","b"], [Any] of strings, "{a, b}", "a, b", "a b", "a", and any
+    /// of those with quotes or brackets attached.
+    public static func normalizeToolNameList(_ value: Any) -> [String] {
+        var raw: [String] = []
+        if let arr = value as? [String] {
+            raw = arr
+        } else if let arr = value as? [Any] {
+            raw = arr.compactMap { $0 as? String }
+        } else if let s = value as? String {
+            raw = [s]
+        }
+        var names: [String] = []
+        for entry in raw {
+            let stripped = entry
+                .replacingOccurrences(of: "{", with: "")
+                .replacingOccurrences(of: "}", with: "")
+                .replacingOccurrences(of: "[", with: "")
+                .replacingOccurrences(of: "]", with: "")
+            // Split on commas when present, otherwise on whitespace.
+            let pieces = stripped.contains(",")
+                ? stripped.components(separatedBy: ",")
+                : stripped.components(separatedBy: .whitespacesAndNewlines)
+            for piece in pieces {
+                let name = piece.trimmingCharacters(in: CharacterSet(charactersIn: " \t\n\r\"'"))
+                if !name.isEmpty { names.append(name) }
+            }
+        }
+        return names
+    }
+
+    /// Splits a turn's parsed calls into the ones to execute and the no-op
+    /// "gesture" calls to skip, preserving transcript order.
+    ///
+    /// Gestures still need a matching result in the next prompt: the assistant turn
+    /// spliced into it is built from the RAW generated tokens, so the call is there
+    /// whether or not it ran, and a call with no result reads as a truncated
+    /// exchange that invites the model to re-issue it. `skipNotices` maps each
+    /// dropped call's index in `calls` to the notice the harness reports for it, so
+    /// the caller can lay out one result per call in order.
+    public static func splitGestureCalls(_ calls: [ParsedToolCall]) -> (actionableIndices: [Int], skipNotices: [Int: String]) {
+        var actionableIndices: [Int] = []
+        var skipNotices: [Int: String] = [:]
+        for (idx, call) in calls.enumerated() {
+            if isNoOpGestureToolCall(call) {
+                skipNotices[idx] = gestureSkipNotice(tool: call.name)
+            } else {
+                actionableIndices.append(idx)
+            }
+        }
+        return (actionableIndices, skipNotices)
+    }
+
+    /// The model-facing result reported for a dropped gesture call.
+    public static func gestureSkipNotice(tool: String) -> String {
+        toolSuccessJSON(tool: tool, data: [
+            "skipped": true,
+            "reason": "No-op gesture call (e.g. shell_run with echo/true/:). It cannot advance the task, so the harness treated it as the end of the turn and did not run it. Do not re-issue it."
+        ])
+    }
+
+    /// The persisted record for a dropped gesture call. It carries the same
+    /// model-facing notice the live continuation turn reports, so reconstructed
+    /// history gives the gesture a matching result instead of leaving the raw call
+    /// in `msg.content` unanswered. Marked `isGesture` so the UI hides it.
+    public static func gestureSkipRecord(for call: ParsedToolCall) -> ToolCallRecord {
+        var stringArgs: [String: String] = [:]
+        for (k, v) in call.arguments { stringArgs[k] = "\(v)" }
+        return ToolCallRecord(
+            name: call.name,
+            arguments: stringArgs,
+            rawArguments: call.rawArguments,
+            status: .success,
+            output: renderToolResultForModel(gestureSkipNotice(tool: call.name)),
+            isGesture: true
+        )
+    }
+
+    /// True for calls that cannot advance any task: a `shell_run` whose command is
+    /// a bare no-op (`echo`, `true`, `:`, `exit`), which models emit as a "task
+    /// finished" gesture when they should have called `complete` or simply ended
+    /// the turn. Executing one restarts the agent loop and yields a duplicate
+    /// answer turn, so the caller drops these instead of continuing.
+    public static func isNoOpGestureToolCall(_ call: ParsedToolCall) -> Bool {
+        guard call.name == "shell_run",
+              let command = call.arguments["command"] as? String else { return false }
+        let normalized = command.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !normalized.isEmpty else { return true }
+        // Anything that could actually do something (redirect, pipe, chain,
+        // substitution, multiple statements) is not a gesture.
+        let effectMarkers = [">", "|", ";", "&&", "$", "`", "\n", "\r"]
+        if effectMarkers.contains(where: { normalized.contains($0) }) { return false }
+        if normalized == "true" || normalized == ":" || normalized == "exit" { return true }
+        if normalized == "echo" { return true }
+        if normalized.hasPrefix("echo ") && normalized.count <= 24 { return true }
+        return false
     }
 
     /// Consecutive tool calls (across agent steps) with empty required arguments.
@@ -2974,6 +3132,16 @@ public final class AgentHarness {
 
         prompt += """
 
+        # Ending Your Turn
+
+        - Once you have the information you need, answer the user in plain text and end your turn. A plain-text reply is a complete turn; no tool call is required to finish.
+        - Call `complete` (with a summary) only when the user's whole task is finished and you are handing back the final result. Never call it mid-task.
+        - NEVER emit placeholder or no-op tool calls (`shell_run` with `echo`, `true`, `:`, or similar) to signal that you are done. They cannot advance the task, and the harness discards them and ends the turn.
+        - Do not re-answer or re-summarize a result you already delivered. Deliver one final answer per task.
+        """
+
+        prompt += """
+
         # Tool Result Format & Reading Guidance
 
         Tool results are delivered as PLAIN TEXT, not JSON: a `[tool_name] status` header line, `key: value` metadata lines, and one or more `--- field ---` sections containing the raw content verbatim. Read the `--- content ---` section as the actual file/page text.
@@ -2985,6 +3153,8 @@ public final class AgentHarness {
 
         if isLingModel {
             prompt += """
+
+
             If you choose to call a function ONLY reply in the following native format with NO suffix:
 
             <tool_call>example_function_name
@@ -3015,6 +3185,8 @@ public final class AgentHarness {
             """
         } else {
             prompt += """
+
+
             If you choose to call a function ONLY reply in the following format with NO suffix:
 
             <tool_call>
@@ -3391,7 +3563,9 @@ public final class AgentHarness {
                 for pm in pMatches {
                     guard pm.numberOfRanges >= 3 else { continue }
                     let pName = nsBody.substring(with: pm.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
-                    let pValStr = nsBody.substring(with: pm.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    let pValStr = StreamingToolParser.unwrapNestedParameterTag(
+                        nsBody.substring(with: pm.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                    )
 
                     if let data = pValStr.data(using: .utf8),
                        let jsonVal = try? JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed),
@@ -3492,7 +3666,12 @@ public final class AgentHarness {
         let effectiveMaxLen = AgentHarness.charBudget(forTokenBudget: tokenBudget)
 
         guard let tool = tools[call.name] else {
-            let err = "Unknown tool '\(call.name)'"
+            // Echo the valid names back: a bare "Unknown tool 'web_search_fetch'"
+            // teaches the model to repeat the bad string verbatim on the retry.
+            let available = availableToolDefinitions.map { $0.function.name }
+            let err = available.isEmpty
+                ? "Unknown tool '\(call.name)'"
+                : "Unknown tool '\(call.name)'. Available tools: \(available.joined(separator: ", "))."
             let json = AgentHarness.toolErrorJSON(tool: call.name, error: err)
             let rec = ToolCallRecord(
                 name: call.name,
@@ -3520,12 +3699,22 @@ public final class AgentHarness {
             } else {
                 baseResult = try await tool.execute(arguments: call.arguments, workingDirectory: wd, maxOutputLength: effectiveMaxLen)
             }
-            let json = baseResult.resultJSON
+            let rawJSON = baseResult.resultJSON
             let stdout = baseResult.stdout
             let stderr = baseResult.stderr
             let isCompleted = baseResult.isCompleted
             let duration = CFAbsoluteTimeGetCurrent() - startTime
             let status: ToolExecutionStatus = (stderr != nil && !stderr!.isEmpty) ? .error : .success
+
+            // Web-read attempts (web_fetch, or curl/wget through shell_run) share one
+            // failure counter; the guardrail below fires when the model is guessing
+            // hosts instead of using the URLs its searches returned.
+            let isWebReadAttempt = call.name == "web_fetch"
+                || (call.name == "shell_run" && AgentHarness.looksLikeWebFetchCommand(call.arguments["command"] as? String))
+            if isWebReadAttempt {
+                recordWebFetchOutcome(succeeded: status == .success)
+            }
+            let json = isWebReadAttempt ? applyWebFetchFailureGuard(to: rawJSON) : rawJSON
 
             // Store the exact model-facing rendering so history reconstruction embeds
             // byte-identical context (live turn and rebuilt turn always agree).
@@ -3555,6 +3744,55 @@ public final class AgentHarness {
             )
             return (json, rec, false)
         }
+    }
+
+    // MARK: - Web Fetch Failure Guard
+
+    /// Records the URLs a search returned, so a later guardrail can hand the model
+    /// real sources instead of letting it invent hosts.
+    public func noteSearchResultURLs(_ urls: [String]) {
+        for url in urls where !recentSearchResultURLs.contains(url) {
+            recentSearchResultURLs.append(url)
+        }
+        if recentSearchResultURLs.count > 24 {
+            recentSearchResultURLs.removeFirst(recentSearchResultURLs.count - 24)
+        }
+    }
+
+    /// Feeds the consecutive-failure counter behind `applyWebFetchFailureGuard`.
+    public func recordWebFetchOutcome(succeeded: Bool) {
+        consecutiveWebFetchFailures = succeeded ? 0 : consecutiveWebFetchFailures + 1
+    }
+
+    /// True when a shell command looks like an attempt to read a web page, so its
+    /// failures count toward the same guardrail.
+    public static func looksLikeWebFetchCommand(_ command: String?) -> Bool {
+        guard let lowered = command?.lowercased(), !lowered.isEmpty else { return false }
+        return lowered.contains("curl") || lowered.contains("wget")
+    }
+
+    /// Appends guidance once web fetches keep failing. Without it the model invents
+    /// another nonexistent host each turn (observed: wttr.org → wttr.info →
+    /// wttri.info → "wt.tr.info"), burning steps on hosts it cannot resolve when the
+    /// search results it already has list real forecast pages.
+    func applyWebFetchFailureGuard(to resultJSON: String) -> String {
+        guard consecutiveWebFetchFailures >= webFetchFailureLimit else { return resultJSON }
+        let urls = Array(recentSearchResultURLs.suffix(6))
+        let urlList = urls.isEmpty
+            ? "(this run has no web_search results yet — call web_search first)"
+            : urls.map { "  " + $0 }.joined(separator: "\n")
+        let notice = "[guardrail] \(consecutiveWebFetchFailures) consecutive web fetches have failed (missing host, empty body, or non-zero curl exit). Fetch URLs EXACTLY as web_search returned them; do not construct or guess a host. Urls from this run's searches:\n\(urlList)\nIf those do not answer the question, reply from the snippets already in the conversation instead of fetching again."
+        guard var obj = try? JSONSerialization.jsonObject(with: Data(resultJSON.utf8)) as? [String: Any] else {
+            return resultJSON
+        }
+        var result = (obj["result"] as? [String: Any]) ?? [:]
+        result["guardrail"] = notice
+        obj["result"] = result
+        if let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]),
+           let str = String(data: data, encoding: .utf8) {
+            return str
+        }
+        return resultJSON
     }
 
     // MARK: - Web Search Loop Guard Logic
@@ -3975,6 +4213,83 @@ public final class AgentHarness {
     }
 
     // MARK: - Tool Result Rendering (model-facing observations)
+
+    /// Detects a "soft 404": many sites answer a missing article with HTTP 200 and
+    /// a styled error page — nav chrome, a "Page not found" heading, then unrelated
+    /// trending headlines. Returning that body hands the model a few hundred tokens
+    /// of noise to reason over, and in practice invites it to keep fetching URLs it
+    /// invented. Returns the matched signal for the error message, or nil when the
+    /// page looks like real content.
+    public static func softNotFoundSignal(title: String, cleanedContent: String) -> String? {
+        func errorPage() -> String {
+            let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? "not found" : trimmed
+        }
+        // Titles are matched on whole separator-delimited segments, never on a bare
+        // substring: "How to Fix a Page Not Found Error" and "Why Was the Page Not
+        // Found?" discuss the phrase and are real articles, while "Page Not Found -
+        // Site" / "404 Not Found | Site" are error pages whose marker stands alone
+        // as a segment. Numbers/words like "404" or "Oops" only count when the
+        // title IS that marker, so "404: A Story of Loss" falls through to the body
+        // check below instead of being rejected on its prefix.
+        let separatorPattern = "\\s*[|:·–—]\\s*|\\s+-\\s+"
+        var segments: [String] = []
+        if let separatorRegex = try? NSRegularExpression(pattern: separatorPattern) {
+            let nsTitle = title.lowercased() as NSString
+            var cursor = 0
+            for match in separatorRegex.matches(in: nsTitle as String, range: NSRange(location: 0, length: nsTitle.length)) {
+                segments.append(nsTitle.substring(with: NSRange(location: cursor, length: match.range.location - cursor)))
+                cursor = match.range.location + match.range.length
+            }
+            segments.append(nsTitle.substring(from: cursor))
+        } else {
+            segments = [title.lowercased()]
+        }
+        segments = segments
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: " \t\n\r\"'()[]")) }
+            .filter { !$0.isEmpty }
+        let strongMarkers: Set<String> = [
+            "404 not found", "404 error", "error 404", "not found", "page not found",
+            "page not available", "page unavailable", "page cannot be found", "page could not be found"
+        ]
+        let bareMarkers: Set<String> = ["404", "error", "oops", "not found"]
+        if segments.contains(where: { strongMarkers.contains($0) }) { return errorPage() }
+        // Bare markers ("404", "Oops") only stand alone or beside a site name — a
+        // segment with spaces in it is prose ("404: A Story of Loss"), which must go
+        // through the body check instead.
+        if let bare = segments.first(where: { bareMarkers.contains($0) }),
+           segments.allSatisfy({ $0 == bare || !$0.contains(" ") }) {
+            return errorPage()
+        }
+
+        // Body signals only count near the top of a SHORT page: a long article may
+        // legitimately mention "page not found", while a not-found shell is always
+        // small (nav + boilerplate + a trending list). Bare "error" is deliberately
+        // not a title signal — it would flag real articles ("Error handling in …").
+        guard cleanedContent.count <= 8000 else { return nil }
+        let head = String(cleanedContent.prefix(1500)).lowercased()
+        let bodySignals = [
+            "oops! page not found",
+            "page not found",
+            "404 not found",
+            "404 error",
+            "this page could not be found",
+            "the page you are looking for",
+            "the page you requested",
+            "page doesn't exist",
+            "page does not exist",
+            "couldn't find that page",
+            "we can't find that page",
+            "no such page",
+            "content is not available",
+            "article not found",
+            "this article is no longer available"
+        ]
+        for signal in bodySignals where head.contains(signal) {
+            return signal
+        }
+        return nil
+    }
 
     /// Renders a tool result JSON into the plain, human-readable form the model should see.
     /// Observations are emitted as text rather than JSON so file content (HTML, code, CSV)

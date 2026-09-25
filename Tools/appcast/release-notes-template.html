@@ -1,0 +1,353 @@
+<!doctype html>
+<!--
+  DynaMoE Sparkle release-notes template
+  ─────────────────────────────────────────
+  Sparkle renders the CDATA description block of each
+  Tools/appcast/items/<version>.xml in a WebView with JavaScript disabled.
+  This template is fully self-contained (inline CSS + inline SVG, no JS, no
+  external requests) and honors the system theme via prefers-color-scheme,
+  so it adapts to Light / Dark / Auto with no extra work.
+
+  Workflow for a new release:
+    1. Copy this file's <style> + <body> content (NOT this comment — it
+       contains CDATA delimiters that would break the appcast XML).
+    2. Edit the tokens marked with "EDIT" below (version, build, notes).
+    3. Paste into the item's CDATA description, replacing the old HTML.
+    4. Run Tools/generate-appcast.sh, then Tools/publish-appcast.sh.
+
+  Preview standalone: open this file in Safari and toggle
+  System Settings > Appearance to see Light / Dark / Auto behavior.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DynaMoE Release Notes</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f2f2f4;
+    --card: #ffffff;
+    --card-2: #f7f7f9;
+    --hairline: rgba(0, 0, 0, 0.08);
+    --hairline-soft: rgba(0, 0, 0, 0.06);
+    --text: #1d1d1f;
+    --text-2: rgba(60, 60, 67, 0.62);
+    --text-3: rgba(60, 60, 67, 0.44);
+    --accent: #af52de;
+    --accent-strong: #8e3cc4;
+    --accent-soft: rgba(175, 82, 222, 0.12);
+    --chip-ink: #8e3cc4;
+    --hero-1: #bf5af2;
+    --hero-2: #5e5ce6;
+    --hero-3: #0a84ff;
+    --glow: rgba(175, 82, 222, 0.35);
+    --mono: "SF Mono", ui-monospace, Menlo, monospace;
+    --sans: -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif;
+    --rounded: "SF Pro Rounded", -apple-system, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1e1e20;
+      --card: rgba(255, 255, 255, 0.05);
+      --card-2: rgba(255, 255, 255, 0.035);
+      --hairline: rgba(255, 255, 255, 0.09);
+      --hairline-soft: rgba(255, 255, 255, 0.06);
+      --text: #f5f5f7;
+      --text-2: rgba(235, 235, 245, 0.62);
+      --text-3: rgba(235, 235, 245, 0.42);
+      --accent: #bf5af2;
+      --accent-strong: #d9a8f7;
+      --accent-soft: rgba(191, 90, 242, 0.16);
+      --chip-ink: #d9a8f7;
+      --hero-1: #c95bf8;
+      --hero-2: #6b6af0;
+      --hero-3: #2f95ff;
+      --glow: rgba(191, 90, 242, 0.4);
+    }
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  ::selection { background: var(--accent-soft); }
+  body {
+    font-family: var(--sans);
+    font-size: 13px;
+    line-height: 1.55;
+    color: var(--text);
+    background: var(--bg);
+    -webkit-font-smoothing: antialiased;
+    padding: 28px 30px 34px;
+    max-width: 640px;
+    margin: 0 auto;
+  }
+  a { color: var(--accent-strong); text-decoration: none; }
+  a:hover { text-decoration: underline; text-underline-offset: 2px; }
+
+  /* ── Hero header ─────────────────────────────────────────── */
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding-bottom: 18px;
+    margin-bottom: 22px;
+    border-bottom: 1px solid var(--hairline-soft);
+    position: relative;
+  }
+  header::after {
+    content: "";
+    position: absolute;
+    top: -10px;
+    right: -14px;
+    width: 120px;
+    height: 120px;
+    background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 56 56'%3E%3Cg fill='none' stroke='%23af52de' stroke-width='1.4' stroke-linejoin='round' opacity='0.10'%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4'/%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4' transform='translate(13.86,0)'/%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4' transform='translate(-13.86,0)'/%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4' transform='translate(6.93,12)'/%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4' transform='translate(-6.93,12)'/%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4' transform='translate(6.93,-12)'/%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4' transform='translate(-6.93,-12)'/%3E%3C/g%3E%3C/svg%3E") no-repeat center / contain;
+    pointer-events: none;
+  }
+  .app-badge {
+    width: 64px;
+    height: 64px;
+    flex: none;
+    border-radius: 15px;
+    background: linear-gradient(135deg, var(--hero-1), var(--hero-2) 52%, var(--hero-3));
+    box-shadow: 0 4px 14px var(--glow), inset 0 0 0 0.5px rgba(255, 255, 255, 0.25);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .app-badge svg { width: 40px; height: 40px; }
+  h1 {
+    font-family: var(--rounded);
+    font-size: 26px;
+    font-weight: 700;
+    letter-spacing: -0.4px;
+    line-height: 1.15;
+  }
+  .meta-line {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-top: 2px;
+    font-family: var(--mono);
+  }
+  .ver-chip {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--chip-ink);
+    background: var(--accent-soft);
+    border: 1px solid var(--hairline-soft);
+    border-radius: 5px;
+    padding: 1px 7px;
+  }
+  .build { font-size: 11px; color: var(--text-3); }
+  .tagline {
+    margin-top: 5px;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-2);
+  }
+
+  /* ── Sections ────────────────────────────────────────────── */
+  section { margin-bottom: 24px; }
+  h2 {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: -0.1px;
+    margin-bottom: 10px;
+  }
+  h2 .icon {
+    width: 26px;
+    height: 26px;
+    flex: none;
+    border-radius: 7px;
+    background: var(--accent-soft);
+    color: var(--chip-ink);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  h2 .icon svg { width: 14px; height: 14px; }
+
+  /* Feature cards */
+  .card {
+    background: var(--card);
+    border: 1px solid var(--hairline);
+    border-radius: 10px;
+    padding: 13px 15px;
+    margin-bottom: 8px;
+  }
+  .card h3 { font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+  .card p { color: var(--text-2); font-size: 12.5px; }
+  .card code, p code, li code {
+    font-family: var(--mono);
+    font-size: 11px;
+    background: var(--accent-soft);
+    color: var(--chip-ink);
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+
+  /* Fixed / changed lists */
+  ul.changes { list-style: none; }
+  ul.changes li {
+    position: relative;
+    padding-left: 22px;
+    margin-bottom: 6px;
+    color: var(--text-2);
+  }
+  ul.changes li::before {
+    content: "";
+    position: absolute;
+    left: 4px;
+    top: 6px;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--accent);
+    opacity: 0.75;
+  }
+  ul.changes li strong { color: var(--text); font-weight: 600; }
+
+  /* Spec rows (About-window style) */
+  .spec {
+    background: var(--card-2);
+    border: 1px solid var(--hairline-soft);
+    border-radius: 10px;
+    padding: 3px 15px;
+  }
+  .spec .row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 9px 0;
+  }
+  .spec .row + .row { border-top: 1px solid var(--hairline-soft); }
+  .spec .row .k { color: var(--text-2); font-size: 12px; }
+  .spec .row .v {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    font-weight: 600;
+    text-align: right;
+  }
+
+  /* Footer action buttons */
+  footer {
+    display: flex;
+    gap: 9px;
+    flex-wrap: wrap;
+    margin-top: 4px;
+  }
+  footer a.btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11.5px;
+    font-weight: 500;
+    color: var(--text);
+    background: var(--card);
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    padding: 6px 12px;
+  }
+  footer a.btn:hover { background: var(--accent-soft); text-decoration: none; }
+  footer a.btn svg { width: 12px; height: 12px; opacity: 0.55; }
+  .fineprint {
+    margin-top: 16px;
+    font-size: 10.5px;
+    color: var(--text-3);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="app-badge" aria-hidden="true">
+    <svg viewBox="0 0 56 56">
+      <defs>
+        <linearGradient id="dg" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stop-color="#bf5af2"/>
+          <stop offset="0.5" stop-color="#5e5ce6"/>
+          <stop offset="1" stop-color="#0a84ff"/>
+        </linearGradient>
+      </defs>
+      <circle cx="28" cy="28" r="25" fill="#fff"/>
+      <g fill="none" stroke="url(#dg)" stroke-width="1.7" stroke-linejoin="round">
+        <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(28,28)"/>
+        <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(41.86,28)"/>
+        <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(14.14,28)"/>
+        <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(34.93,40)"/>
+        <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(21.07,40)"/>
+        <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(34.93,16)"/>
+        <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(21.07,16)"/>
+      </g>
+    </svg>
+  </div>
+  <div>
+    <h1>DynaMoE</h1>
+    <div class="meta-line">
+      <span class="ver-chip">v26.0</span>            <!-- EDIT: version -->
+      <span class="build">(Build 26.0)</span>        <!-- EDIT: CFBundleVersion -->
+    </div>
+    <div class="tagline">High-Performance MoE Inference Engine for Apple Silicon</div>
+  </div>
+</header>
+
+<!-- EDIT: Highlights — one card per user-facing feature -->
+<section>
+  <h2>
+    <span class="icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.5 14 5v6l-6 3.5L2 11V5l6-3.5Zm0 1.73L3.5 5.87v4.26L8 12.77l4.5-2.64V5.87L8 3.23Zm0 1.6 3.2 1.88v2.58L8 11.17 4.8 9.29V6.71L8 4.83Z"/></svg></span>
+    What's New in 26.0
+  </h2>
+  <div class="card">
+    <h3>JetSpec speculative decoding</h3>
+    <p>Speculative tree decoding verified in a single Metal pass, with KV-cache compaction and MoE expert-budget pruning. Enable via <code>dynamoe_jetspec_enabled</code>.</p>
+  </div>
+  <div class="card">
+    <h3>FP8 KV cache</h3>
+    <p>New E4M3 / E5M2 cache precision unlocks long-context sessions on 16 GB machines. Configure under Settings → <code>dynamoe_kv_cache_precision</code>.</p>
+  </div>
+</section>
+
+<!-- EDIT: Fixes — plain bullet list -->
+<section>
+  <h2>
+    <span class="icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M13.78 3.97a.75.75 0 0 1 0 1.06l-6.5 6.5a.75.75 0 0 1-1.06 0l-3-3a.75.75 0 1 1 1.06-1.06l2.47 2.47 5.97-5.97a.75.75 0 0 1 1.06 0Z"/></svg></span>
+    Fixes
+  </h2>
+  <ul class="changes">
+    <li><strong>Tool calls:</strong> StreamingToolParser no longer freezes generation before the closing tag is emitted.</li>
+    <li><strong>Prefix cache:</strong> delta prefill now attends over preserved prefix slots reliably.</li>
+    <li><strong>Memory:</strong> telemetry separates dirty heap from clean zero-copy pages again.</li>
+  </ul>
+</section>
+
+<!-- EDIT: Under the hood — label/value spec rows -->
+<section>
+  <h2>
+    <span class="icon"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><rect x="4.25" y="4.25" width="7.5" height="7.5" rx="1.6"/><path d="M6.5 2.4v1.85M9.5 2.4v1.85M6.5 11.75v1.85M9.5 11.75v1.85M2.4 6.5h1.85M2.4 9.5h1.85M11.75 6.5h1.85M11.75 9.5h1.85"/></svg></span>
+    Under the Hood
+  </h2>
+  <div class="spec">
+    <div class="row"><span class="k">Engine</span><span class="v">dynamoe_core 26.0 · Rust + Metal</span></div>
+    <div class="row"><span class="k">Update size</span><span class="v">5.2 MB</span></div>              <!-- EDIT -->
+    <div class="row"><span class="k">Requires</span><span class="v">macOS 15.6+ · Apple Silicon</span></div>
+  </div>
+</section>
+
+<footer>
+  <a class="btn" href="https://github.com/derekrparris/DynaMoE/releases/tag/v26.0">   <!-- EDIT: release URL -->
+    <svg viewBox="0 0 16 16" fill="currentColor"><path d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l1.66-1.66a2 2 0 0 0 0-2.83l-.94-.94a2 2 0 0 0-2.83 0L3.51 6.01a2 2 0 0 0 0 2.83l.94.94a.75.75 0 0 0 1.06-1.06l-.94-.94a.5.5 0 0 1 0-.71l2.35-2.35a.5.5 0 0 1 .71 0l.94.94a.5.5 0 0 1 0 .71L6.22 8.72Zm3.56-1.44a.75.75 0 0 0-1.06-1.06L7.06 7.88a2 2 0 0 0 0 2.83l.94.94a2 2 0 0 0 2.83 0l2.35-2.35a2 2 0 0 0 0-2.83l-.94-.94a.75.75 0 0 0-1.06 1.06l.94.94a.5.5 0 0 1 0 .71L9.77 9.59a.5.5 0 0 1-.71 0l-.94-.94a.5.5 0 0 1 0-.71l1.66-1.66Z"/></svg>
+    GitHub Release
+  </a>
+  <a class="btn" href="https://github.com/derekrparris/DynaMoE">
+    <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.5a6.5 6.5 0 0 0-2.06 12.67c.33.06.45-.14.45-.32v-1.12c-1.8.39-2.18-.87-2.18-.87-.3-.75-.73-.95-.73-.95-.59-.4.05-.4.05-.4.65.05 1 .67 1 .67.58 1 1.53.71 1.9.54.06-.42.23-.71.41-.87-1.44-.16-2.95-.72-2.95-3.2 0-.71.25-1.29.67-1.74-.07-.17-.29-.83.06-1.73 0 0 .54-.17 1.77.66a6.15 6.15 0 0 1 3.22 0c1.23-.83 1.77-.66 1.77-.66.35.9.13 1.56.06 1.73.42.45.67 1.03.67 1.74 0 2.49-1.51 3.04-2.96 3.2.23.2.44.59.44 1.19v1.76c0 .18.12.39.45.32A6.5 6.5 0 0 0 8 1.5Z"/></svg>
+    Repository
+  </a>
+</footer>
+
+<p class="fineprint">DynaMoE is an independent open-source inference engine. macOS, Metal, and Apple Silicon are trademarks of Apple Inc. Apache 2.0 licensed.</p>
+
+</body>
+</html>

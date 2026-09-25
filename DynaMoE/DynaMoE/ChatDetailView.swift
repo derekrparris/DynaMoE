@@ -1155,8 +1155,12 @@ struct ChatMessageView: View {
                     }
 
                     // Tool Calls Execution Cards & Sequential Timeline (if any tool calls were issued)
-                    if let toolCalls = message.toolCalls, !toolCalls.isEmpty {
-                        ToolExecutionTimelineView(toolCalls: toolCalls)
+                    // Gesture calls keep a record for history reconstruction but are hidden here.
+                    if let toolCalls = message.toolCalls {
+                        let visibleToolCalls = toolCalls.filter { !$0.isGesture }
+                        if !visibleToolCalls.isEmpty {
+                            ToolExecutionTimelineView(toolCalls: visibleToolCalls)
+                        }
                     }
 
                     // Main Response Text rendered via Rich Markdown Engine

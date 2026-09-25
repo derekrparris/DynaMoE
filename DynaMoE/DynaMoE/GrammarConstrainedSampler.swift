@@ -391,41 +391,53 @@ nonisolated public final class GrammarConstrainedSampler {
         case .insideFunctionName(let currentPrefix):
             let allowedTools = registeredToolNames.filter { $0.hasPrefix(currentPrefix) }
             if allowedTools.isEmpty { return }
-            // The '>' escape must only open once a COMPLETE tool name has been
-            // typed; otherwise the model can legally emit '<function>' with an
-            // empty name and then loop on empty '<parameter>' tags (observed as
-            // degenerate-cycle breaks that truncate tool calls).
-            let nameComplete = registeredToolNames.contains(currentPrefix)
 
+            var allowedCount = 0
+            var valveIndex: Int? = nil
+            var valveLogit: Float = 0
             for v in 0..<vocabSize {
                 guard let str = tokenDecoder(UInt32(v)) else { continue }
-                if str.contains(">") && nameComplete {
-                    continue
-                }
                 let cand = currentPrefix + str
-                let matchesAny = allowedTools.contains { $0.hasPrefix(cand) || cand.hasPrefix($0) }
-                if !matchesAny && !(str.hasPrefix(">") && nameComplete) {
-                    logits[v] = -Float.infinity
+                // Still typing a name, or a token that spans name completion
+                // and terminates it with '>' ("rch>"). Anything else that runs
+                // past a complete name mints an unregistered tool (observed:
+                // "web_search" + "_fetch" produced `web_search_fetch`, which
+                // both broke the call and emptied the allowed set, silently
+                // dropping the mask for the rest of the name).
+                if allowedTools.contains(where: { $0.hasPrefix(cand) }) { allowedCount += 1; continue }
+                if overshootTerminatesWord(cand, words: registeredToolNames) { allowedCount += 1; continue }
+                // Dead-end valve: if a tokenizer has no bare '>' token, the strict
+                // rule can mask the entire vocab, and sampling on all -inf logits
+                // yields garbage rather than an error. Remember one token the loose
+                // rule would accept so it can be released below.
+                if valveIndex == nil, overshootStartsWordTerminator(cand, words: registeredToolNames) {
+                    valveIndex = v
+                    valveLogit = logits[v]
                 }
+                logits[v] = -Float.infinity
             }
+            if allowedCount == 0, let valve = valveIndex { logits[valve] = valveLogit }
 
         case .insideParameterName(let toolName, let currentKey):
             guard let validKeys = toolParameterKeys[toolName] else { return }
             let allowedKeys = validKeys.filter { $0.hasPrefix(currentKey) }
             if allowedKeys.isEmpty { return }
-            let keyComplete = validKeys.contains(currentKey)
 
+            var allowedCount = 0
+            var valveIndex: Int? = nil
+            var valveLogit: Float = 0
             for v in 0..<vocabSize {
                 guard let str = tokenDecoder(UInt32(v)) else { continue }
-                if str.contains(">") && keyComplete {
-                    continue
-                }
                 let cand = currentKey + str
-                let matchesAny = allowedKeys.contains { $0.hasPrefix(cand) || cand.hasPrefix($0) }
-                if !matchesAny && !(str.hasPrefix(">") && keyComplete) {
-                    logits[v] = -Float.infinity
+                if allowedKeys.contains(where: { $0.hasPrefix(cand) }) { allowedCount += 1; continue }
+                if overshootTerminatesWord(cand, words: validKeys) { allowedCount += 1; continue }
+                if valveIndex == nil, overshootStartsWordTerminator(cand, words: validKeys) {
+                    valveIndex = v
+                    valveLogit = logits[v]
                 }
+                logits[v] = -Float.infinity
             }
+            if allowedCount == 0, let valve = valveIndex { logits[valve] = valveLogit }
 
         case .closingFunction(let matchedPrefix):
             guard enforceStructuralTagContinuation else { return }
@@ -453,6 +465,38 @@ nonisolated public final class GrammarConstrainedSampler {
         default:
             return
         }
+    }
+
+    /// A candidate that runs past a complete word (tool name or parameter key)
+    /// is only legal when the overshoot terminates the word: optional space/tab,
+    /// then '>'. Trailing whitespace alone is not accepted — the state machine
+    /// stays in the name state for it, where no registered word would match the
+    /// padded prefix and the mask would silently drop out.
+    private func overshootTerminatesWord(_ cand: String, words: Set<String>) -> Bool {
+        for word in words where cand.hasPrefix(word) {
+            var rest = cand.dropFirst(word.count)
+            while rest.first == " " || rest.first == "\t" { rest = rest.dropFirst() }
+            // '>' must END the overshoot. Accepting arbitrary text after it let one
+            // merged token carry the whole tail past this state's mask, and the tail
+            // is where the gates live: "name></function>" closed a call whose
+            // required parameters had never been written (the required-param gate
+            // only ever withholds the `</function>` tag choice, so it cannot see a
+            // token that smuggles the tag in behind a '>'), and "name>junk" began
+            // the body early. The tail must arrive as its own token to be gated.
+            if rest == ">" { return true }
+        }
+        return false
+    }
+
+    /// Loose form of the overshoot test, used ONLY as a dead-end valve: it accepts
+    /// '>' followed by anything. Not a legality rule — see `overshootTerminatesWord`.
+    private func overshootStartsWordTerminator(_ cand: String, words: Set<String>) -> Bool {
+        for word in words where cand.hasPrefix(word) {
+            var rest = cand.dropFirst(word.count)
+            while rest.first == " " || rest.first == "\t" { rest = rest.dropFirst() }
+            if rest.first == ">" { return true }
+        }
+        return false
     }
 
     /// Withholds `</function>` while the current tool still has required

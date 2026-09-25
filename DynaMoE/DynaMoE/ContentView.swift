@@ -1752,7 +1752,10 @@ struct ContentView: View {
                     if !cleanMsg.isEmpty {
                         assistantBody += cleanMsg + "\n"
                     }
-                    if let calls = msg.toolCalls, !calls.isEmpty {
+                    // Rebuild the call only when the stored content no longer carries
+                    // it (mirrors the Spark/Ling branches); otherwise the raw call is
+                    // already in `cleanMsg` and rebuilding would print it twice.
+                    if let calls = msg.toolCalls, !calls.isEmpty, !cleanMsg.contains("tool_call>") {
                         for call in calls {
                             assistantBody += "<tool_call>\n<function=\(call.name)>\n"
                             for (k, v) in call.arguments {
@@ -3451,13 +3454,38 @@ struct ContentView: View {
     ) -> [UInt32]? {
         var tokens = basePromptTokens
         tokens.append(contentsOf: generatedTokenIds)
-        if !turnText.contains(endTag) {
-            guard let endIds = try? encode(endTag), !endIds.isEmpty else { return nil }
-            tokens.append(contentsOf: endIds)
-        }
+        // `turnText` MUST be the raw decoded turn, never a normalized copy: the
+        // closure decision has to be made against what the model actually emitted.
+        guard let closure = StreamingToolParser.turnClosureSuffix(
+            forRawDecodedTurn: turnText,
+            endTag: endTag,
+            encode: encode
+        ) else { return nil }
+        tokens.append(contentsOf: closure)
         guard let suffixIds = try? encode(suffix), !suffixIds.isEmpty else { return nil }
         tokens.append(contentsOf: suffixIds)
         return tokens
+    }
+
+    /// The pre-execution freeze fires the moment `</function>` closes, so a frozen
+    /// tool call is routinely committed to context WITHOUT its `</tool_call>`
+    /// closer. Spliced into the next prompt verbatim, the model's own history
+    /// becomes a stack of structurally invalid call examples and it starts
+    /// inventing shapes (observed: `<parameter=url>` re-opened inside a
+    /// `<parameter=url>` value, then repeating a malformed call verbatim). Close
+    /// the block and terminate the turn so the model always reads back valid
+    /// examples of its own format. Paired with `buildSplicedContinuationTokens`,
+    /// which performs the same normalization on the token stream.
+    private func closedAssistantTurnText(_ decoded: String, endTag: String) -> String {
+        var text = decoded
+        let unclosed = StreamingToolParser.unclosedToolCallCount(text)
+        if unclosed > 0 {
+            for _ in 0..<unclosed { text += StreamingToolParser.qwenToolCallClose }
+        }
+        if !text.contains(endTag) {
+            text += endTag
+        }
+        return text
     }
 
     private func startAutoregressiveGeneration(customPrompt: String? = nil, promptTokens: [UInt32]? = nil, sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false, forceSynthesis: Bool = false) {
@@ -4414,7 +4442,7 @@ struct ContentView: View {
         let reuseCandidate = PrefixCacheManager.shared.findCommonPrefix(promptTokenIds: promptTokenIds, sessionId: sessionId)
         let prefixTokensReused: Int
         // A/B toggle for bisecting the tool-call truncation: defaults write
-        // com.drp.DynaMoE dynamoe_disable_prefix_reuse -bool YES
+        // DRP.DynaMoE dynamoe_disable_prefix_reuse -bool YES
         if UserDefaults.standard.bool(forKey: "dynamoe_disable_prefix_reuse") {
             prefixTokensReused = 0
         } else         if hasRecurrence {
@@ -4431,6 +4459,60 @@ struct ContentView: View {
         } else {
             prefixTokensReused = reuseCandidate
         }
+
+        // Prompt-dump diagnostic for the tool-call spiral bisection
+        // (defaults write DRP.DynaMoE dynamoe_dump_prompts -bool YES).
+        // Writes the EXACT decoded token stream the model attends over this turn
+        // to ~/Downloads/DynaMoePromptDumps/, and for spliced continuations also
+        // verifies the splice against a fresh encode of the equivalent string
+        // prompt. Small divergences (1-2 tokens at a turn boundary) are the
+        // known-benign non-round-trip cases the splice exists to avoid; a
+        // structural divergence (missing/duplicated block) is the smoking gun.
+        // Marker-file gate too: a sandboxed app's prefs live in its container and
+        // cfprefsd can serve a stale cached value, so a plain `defaults write`
+        // sometimes never reaches a running app. Touch this file to enable:
+        //   touch ~/Downloads/DynaMoE-dump-prompts
+        let dumpMarker = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Downloads/DynaMoE-dump-prompts")
+        let dumpEnabled = UserDefaults.standard.bool(forKey: "dynamoe_dump_prompts")
+            || FileManager.default.fileExists(atPath: dumpMarker.path)
+        print("🧪 [DUMP] checkpoint: dump_flag=\(UserDefaults.standard.bool(forKey: "dynamoe_dump_prompts")) marker=\(FileManager.default.fileExists(atPath: dumpMarker.path)) prefix_flag=\(UserDefaults.standard.bool(forKey: "dynamoe_disable_prefix_reuse")) tokens=\(promptTokenIds.count)")
+        if dumpEnabled {
+            let header = """
+            turn meta: promptTokens=\(promptTokenIds.count) prefixReused=\(prefixTokensReused) pin=\(PrefixCacheManager.shared.currentPinnedCount) agentStep=\(agentStep) spliced=\(promptTokens != nil) sessionId=\(sessionId?.uuidString ?? "nil")
+            """
+            var report = header + "\n\n"
+            if let encodedStringPrompt = try? tokenizer.encode(text: formattedPrompt), promptTokens != nil {
+                if encodedStringPrompt == promptTokenIds {
+                    report += "splice-vs-reencode: IDENTICAL (\(promptTokenIds.count) tokens)\n\n"
+                } else {
+                    let common = zip(encodedStringPrompt, promptTokenIds).prefix(while: { $0 == $1 }).count
+                    let winLo = max(0, common - 16)
+                    let winHi = min(min(encodedStringPrompt.count, promptTokenIds.count), common + 16)
+                    let splicedWin = (try? tokenizer.decode(ids: Array(promptTokenIds[winLo..<min(winHi + 64, promptTokenIds.count)]))) ?? "?"
+                    let encodedWin = (try? tokenizer.decode(ids: Array(encodedStringPrompt[winLo..<min(winHi + 64, encodedStringPrompt.count)]))) ?? "?"
+                    report += "splice-vs-reencode: DIVERGES at token \(common) (splice=\(promptTokenIds.count) string=\(encodedStringPrompt.count))\n"
+                    report += "--- spliced window: \(splicedWin)\n--- re-encoded window: \(encodedWin)\n\n"
+                }
+            }
+            report += (try? tokenizer.decode(ids: promptTokenIds)) ?? "<decode failed>"
+            var dumpDir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads/DynaMoePromptDumps")
+            do {
+                try FileManager.default.createDirectory(at: dumpDir, withIntermediateDirectories: true)
+            } catch {
+                dumpDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("DynaMoePromptDumps")
+                try? FileManager.default.createDirectory(at: dumpDir, withIntermediateDirectories: true)
+            }
+            let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+            let dumpFile = dumpDir.appendingPathComponent("prompt-step\(agentStep)-\(stamp).txt")
+            do {
+                try report.write(to: dumpFile, atomically: true, encoding: .utf8)
+                print("🧪 [DUMP] wrote \(dumpFile.path) (\(promptTokenIds.count) tokens, reused \(prefixTokensReused))")
+            } catch {
+                print("🧪 [DUMP] FAILED to write \(dumpFile.path): \(error.localizedDescription)")
+            }
+        }
+
         KVCacheManager.shared.reset(
             device: device,
             config: modelConfig,
@@ -10946,10 +11028,88 @@ if layer.attnGateProjTensor != nil,
                 return
             }
 
+            // Prefix-pin backfill: each decode iteration forwards the PREVIOUS
+            // token before sampling the next, so the final appended token never
+            // gets a forward pass. recordTurn then pins prompt+generated as fully
+            // cached, but that last token's KV slot (and the GDN recurrent state,
+            // snapshotted below at pin time) holds stale data — and the next
+            // turn's delta prefill resumes past the gap, leaving one poisoned
+            // slot in the pinned prefix per agent turn (observed as progressive
+            // stutter/degeneration across multi-tool runs at ~3900+ tokens).
+            // Forward the appended-but-uncomputed tail so the pin is real model
+            // state. Under JetSpec the range may re-forward one already-written
+            // accepted token; re-writing the same token to the same slot is benign.
+            // Invariant: currentStep tracks the last (unforwarded) index, i.e.
+            // currentStep == totalContextTokens - 1, because the decode loop
+            // advances the step BEFORE appending its sampled token (and JetSpec
+            // advances by its batch size). So this loop forwards exactly one token.
+            if !generatedTokenIds.isEmpty {
+                let totalContextTokens = promptTokenIds.count + tokensGenerated
+                var backfillPos = Int(currentStep)
+                var backfillFailed = false
+                while backfillPos < totalContextTokens {
+                    if Task.isCancelled { break }
+                    let ok = autoreleasepool {
+                        runTokenForward(tokenId: contextTokens[backfillPos], step: UInt32(backfillPos), computeLogits: false, wait: true)
+                    }
+                    if !ok {
+                        backfillFailed = true
+                        break
+                    }
+                    backfillPos += 1
+                }
+                // A cancel that lands mid-backfill must abort the whole turn, not
+                // fall through: the code below pins the prefix and can schedule the
+                // next agent step, which is exactly what the interrupt is trying to
+                // stop.
+                if Task.isCancelled {
+                    print("⏹ [GEN] cancelled during prefix backfill — skipping finalization")
+                    return
+                }
+                // A failed forward means the tail is short of the tokens the pin
+                // would claim. Drop the pinned prefix instead of recording a pin
+                // whose KV slots were never written; the next turn then re-prefills
+                // from scratch rather than trusting stale state.
+                if backfillFailed {
+                    print("⚠️ [GEN] prefix backfill forward failed at \(backfillPos)/\(totalContextTokens) — dropping the pinned prefix")
+                    await MainActor.run {
+                        guard self.ownsGeneration(myGenerationId) else { return }
+                        PrefixCacheManager.shared.invalidate(sessionId: sessionId)
+                        // Unlike a cancellation, a failed forward has no other
+                        // reset path: without this the UI and the generation
+                        // scheduler stay stuck in an active-generation state.
+                        self.isGeneratingText = false
+                        self.generationTask = nil
+                        self.generationStatusText = "❌ Prefix backfill failed; generation stopped."
+                        if let sId = sessionId, let mId = messageId,
+                           let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                           let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                            self.sessions[sIdx].messages[mIdx].prefillStatus = nil
+                            self.sessions[sIdx].messages[mIdx].isThinking = false
+                        }
+                    }
+                    return
+                }
+            }
+
             // Agent Harness Multi-Step Tool Check
             let parsedResult = runAgentTools ? StreamingToolParser.shared.parseStreamingToolCalls(from: finalDecoded) : (calls: [], brokenFragments: [])
-            let hasUncalledIntent = runAgentTools && parsedResult.calls.isEmpty && agentStep == 0 && (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink)
-            let willContinueAgent = (!parsedResult.calls.isEmpty || hasUncalledIntent)
+            // No-op "gesture" calls (shell_run echo/true/:) are the model's way of
+            // signalling it is finished. Executing them restarts the loop and
+            // produces a duplicate answer bubble, so treat them as turn end.
+            // Gesture calls are skipped but still occupy their slot in the
+            // transcript, so every call the assistant emitted gets exactly one
+            // result (see `splitGestureCalls`).
+            let gestureSplit = AgentHarness.splitGestureCalls(parsedResult.calls)
+            let actionableCallIndices = gestureSplit.actionableIndices
+            let actionableCalls = actionableCallIndices.map { parsedResult.calls[$0] }
+            var responseSlots = [String?](repeating: nil, count: parsedResult.calls.count)
+            for (idx, notice) in gestureSplit.skipNotices { responseSlots[idx] = notice }
+            if !gestureSplit.skipNotices.isEmpty {
+                print("🧹 [AGENT] dropped \(gestureSplit.skipNotices.count) no-op gesture call(s) — treating turn as finished")
+            }
+            let hasUncalledIntent = runAgentTools && actionableCalls.isEmpty && agentStep == 0 && (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink)
+            let willContinueAgent = (!actionableCalls.isEmpty || hasUncalledIntent)
             // Collapse guard: the agent run ended with no tool calls and no usable answer,
             // but this run saw repeated degenerate (empty-argument) tool calls — force one
             // final synthesis turn (tools disabled) so the model answers instead of ending
@@ -10978,8 +11138,8 @@ if layer.attnGateProjTensor != nil,
                 let finalJetSpecBadge = effectiveJetSpec && self.jetSpecTotalDraftProposed > 0 ? " (JetSpec τ=\(String(format: "%.1f", self.jetSpecMeanTau)), \(self.jetSpecTotalDraftAccepted) draft tokens accepted)" : ""
                 if !willContinueAgent {
                     self.generationStatusText = "✨ Generated \(tokensGenerated) tokens in \(String(format: "%.2f", finalElapsedMs)) ms (\(String(format: "%.1f", finalTokPerSec)) tok/s)\(finalJetSpecBadge)"
-                } else if !parsedResult.calls.isEmpty {
-                    self.generationStatusText = "⚙️ Executing \(parsedResult.calls.count) tool call(s)..."
+                } else if !actionableCalls.isEmpty {
+                    self.generationStatusText = "⚙️ Executing \(actionableCalls.count) tool call(s)..."
                 } else {
                     self.generationStatusText = "🔄 Continuing agent multi-turn action..."
                 }
@@ -11037,10 +11197,7 @@ if layer.attnGateProjTensor != nil,
                 print("📌 [PREFIX] pinned \(promptTokenIds.count + generatedTokenIds.count) tokens (prompt=\(promptTokenIds.count) gen=\(generatedTokenIds.count))")
                 if shouldForceSynthesis {
                     let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
-                    var assistantTurnText = finalDecoded
-                    if !assistantTurnText.contains(endTag) {
-                        assistantTurnText += endTag
-                    }
+                    let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
                     let synthesisDirective = """
                     \n\n<system>
                     IMPORTANT: All tool use is now DISABLED for this task. Your recent tool calls carried empty arguments and could not be executed, and the run was forcibly ended to protect the conversation from looping.
@@ -11119,39 +11276,53 @@ if layer.attnGateProjTensor != nil,
 
             // Agent Harness Multi-Step Tool Execution
             if runAgentTools {
-                if !parsedResult.calls.isEmpty {
-                    var initialRecords: [ToolCallRecord] = []
-                    for call in parsedResult.calls {
-                        var stringArgs: [String: String] = [:]
-                        for (k, v) in call.arguments {
-                            stringArgs[k] = "\(v)"
-                        }
-                        initialRecords.append(ToolCallRecord(
-                            name: call.name,
-                            arguments: stringArgs,
-                            rawArguments: call.rawArguments,
-                            status: .running
-                        ))
+                // One record per emitted call, in transcript order. Gesture calls are
+                // skipped (not executed) but still get a record whose output is the
+                // skip notice, marked `isGesture` and hidden from the UI: the raw
+                // gesture call stays in `msg.content`, and reconstructed for a later
+                // user turn it would otherwise read as a call with no result and
+                // invite a repeat. Built before the execute loop so it can address
+                // records by id.
+                var recordsByCallIndex: [ToolCallRecord?] = Array(repeating: nil, count: parsedResult.calls.count)
+                for idx in actionableCallIndices {
+                    let call = parsedResult.calls[idx]
+                    var stringArgs: [String: String] = [:]
+                    for (k, v) in call.arguments {
+                        stringArgs[k] = "\(v)"
                     }
-
-                    // Attach initial records to ChatMessage
+                    recordsByCallIndex[idx] = ToolCallRecord(
+                        name: call.name,
+                        arguments: stringArgs,
+                        rawArguments: call.rawArguments,
+                        status: .running
+                    )
+                }
+                for (idx, _) in gestureSplit.skipNotices {
+                    recordsByCallIndex[idx] = AgentHarness.gestureSkipRecord(for: parsedResult.calls[idx])
+                }
+                let orderedRecords = recordsByCallIndex.compactMap { $0 }
+                if !orderedRecords.isEmpty {
                     await MainActor.run {
                         if let sId = sessionId, let mId = messageId,
                            let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
                            let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
                             var currentCalls = self.sessions[sIdx].messages[mIdx].toolCalls ?? []
-                            currentCalls.append(contentsOf: initialRecords)
+                            currentCalls.append(contentsOf: orderedRecords)
                             self.sessions[sIdx].messages[mIdx].toolCalls = currentCalls
-                            self.generationStatusText = "⚙️ Executing \(initialRecords.count) tool call(s)..."
+                            if !actionableCalls.isEmpty {
+                                self.generationStatusText = "⚙️ Executing \(actionableCalls.count) tool call(s)..."
+                            }
                         }
                     }
+                }
+                let initialRecords = actionableCallIndices.map { recordsByCallIndex[$0]! }
 
+                if !actionableCalls.isEmpty {
                     let baseWdURL = self.agentWorkingDirectory.isEmpty ? nil : URL(fileURLWithPath: self.agentWorkingDirectory)
-                    var toolResponses: [String] = []
                     var anyCompleted = false
                     var ranCompleteTool = false
 
-                    for (idx, call) in parsedResult.calls.enumerated() {
+                    for (idx, call) in actionableCalls.enumerated() {
                         if Task.isCancelled {
                             await MainActor.run {
                                 guard self.ownsGeneration(myGenerationId) else { return }
@@ -11176,7 +11347,7 @@ if layer.attnGateProjTensor != nil,
 
                         let recordId = initialRecords[idx].id
                         await MainActor.run {
-                            self.generationStatusText = "⚙️ Executing [\(idx + 1)/\(parsedResult.calls.count)]: \(call.name)..."
+                            self.generationStatusText = "⚙️ Executing [\(idx + 1)/\(actionableCalls.count)]: \(call.name)..."
                         }
 
                         // Degenerate-call guard: reject tool calls whose required arguments
@@ -11199,7 +11370,7 @@ if layer.attnGateProjTensor != nil,
                                 tool: call.name,
                                 error: "Empty arguments — this call carried no usable parameters and was not executed. Either provide real arguments, or stop calling tools and answer the user directly from what you already know."
                             )
-                            toolResponses.append(emptyArgJSON)
+                            responseSlots[actionableCallIndices[idx]] = emptyArgJSON
                             if !emptyArgJSON.isEmpty {
                                 // Keep record output identical to what the model sees in the
                                 // live observation turn so history reconstruction agrees.
@@ -11247,7 +11418,7 @@ if layer.attnGateProjTensor != nil,
                                     }
                                 }
                                 let rejectJSON = AgentHarness.toolErrorJSON(tool: call.name, error: "Action rejected by user.")
-                                toolResponses.append(rejectJSON)
+                                responseSlots[actionableCallIndices[idx]] = rejectJSON
                                 if let sId = sessionId, let mId = messageId,
                                    let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
                                    let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }),
@@ -11265,7 +11436,7 @@ if layer.attnGateProjTensor != nil,
                             workingDirectory: baseWdURL,
                             maxOutputLength: self.maxToolOutputLength
                         )
-                        toolResponses.append(execResult.resultJSON)
+                        responseSlots[actionableCallIndices[idx]] = execResult.resultJSON
                         if execResult.isCompleted {
                             anyCompleted = true
                         }
@@ -11299,6 +11470,10 @@ if layer.attnGateProjTensor != nil,
                         return
                     }
 
+                    // Transcript order: one result per call the assistant emitted,
+                    // gestures included.
+                    let toolResponses = responseSlots.compactMap { $0 }
+
                     // If not finished and steps remaining, invoke next step
                     if !anyCompleted && (agentStep + 1 < self.maxAgentSteps) {
                         // Auto-relay: completed background subagents whose final reports have
@@ -11327,11 +11502,8 @@ if layer.attnGateProjTensor != nil,
                                 includeThinkSuffix: thinkingEnabled
                             )
                         }
-                        var assistantTurnText = finalDecoded
                         let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
-                        if !assistantTurnText.contains(endTag) {
-                            assistantTurnText += endTag
-                        }
+                        let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
                         let nextPrompt = formattedPrompt + assistantTurnText + "\n" + toolResponseTurn
                         let splicedTokens = self.buildSplicedContinuationTokens(
                             basePromptTokens: promptTokenIds,
@@ -11374,10 +11546,7 @@ if layer.attnGateProjTensor != nil,
                         let escalateToSynthesis = AgentHarness.shared.consecutiveEmptyToolCalls >= 2
                         if (AgentHarness.shared.lastSearchGuardAction == .forceSynthesis || escalateToSynthesis) && !ranCompleteTool {
                             let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
-                            var assistantTurnText = finalDecoded
-                            if !assistantTurnText.contains(endTag) {
-                                assistantTurnText += endTag
-                            }
+                            let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
                             let toolResponseContext = toolResponses.map { AgentHarness.renderToolResultForModel($0) }.joined(separator: "\n")
                             let synthesisDirective = """
                             \n\n<system>
@@ -11439,10 +11608,7 @@ if layer.attnGateProjTensor != nil,
                             }
                             if !pendingRelay.isEmpty {
                                 let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
-                                var assistantTurnText = finalDecoded
-                                if !assistantTurnText.contains(endTag) {
-                                    assistantTurnText += endTag
-                                }
+                                let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
                                 let relayContext = pendingRelay.joined(separator: "\n\n")
                                 let relayDirective = """
                                 \n\n<system>
@@ -11520,11 +11686,8 @@ if layer.attnGateProjTensor != nil,
                             includeThinkSuffix: thinkingEnabled
                         )
                     }
-                    var assistantTurnText = finalDecoded
                     let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
-                    if !assistantTurnText.contains(endTag) {
-                        assistantTurnText += endTag
-                    }
+                    let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
                     let nextPrompt = formattedPrompt + assistantTurnText + "\n" + continuationTurn
                     let splicedTokens = self.buildSplicedContinuationTokens(
                         basePromptTokens: promptTokenIds,
@@ -11581,11 +11744,8 @@ if layer.attnGateProjTensor != nil,
                             includeThinkSuffix: thinkingEnabled
                         )
                     }
-                    var assistantTurnText = finalDecoded
                     let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
-                    if !assistantTurnText.contains(endTag) {
-                        assistantTurnText += endTag
-                    }
+                    let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
                     let nextPrompt = formattedPrompt + assistantTurnText + "\n" + continuationTurn
                     let splicedTokens = self.buildSplicedContinuationTokens(
                         basePromptTokens: promptTokenIds,
