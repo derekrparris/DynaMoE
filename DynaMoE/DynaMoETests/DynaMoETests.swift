@@ -6864,6 +6864,20 @@ final class DynaMoETests: XCTestCase {
         XCTAssertNil(signal("Toyota Century review", longArticle), "long articles must not be flagged on an incidental phrase")
         XCTAssertNil(signal("Error handling in Swift", "Real article body about try/catch and Result types."))
         XCTAssertNil(signal("Toyota Century US launch", "Toyota has not announced plans to bring the Century to the United States."))
+
+        // Titles that DISCUSS the phrase are real articles, not error pages. Without
+        // segment matching these were rejected before their content was ever read.
+        let helpArticle = "Step one: check the URL. Step two: clear your cache and reload the page."
+        XCTAssertNil(signal("How to Fix a Page Not Found Error", helpArticle))
+        XCTAssertNil(signal("Why Was the Page Not Found?", helpArticle))
+        XCTAssertNil(signal("404: A Story of Loss", "Chapter one. The server never answered, and nobody knew why."))
+        XCTAssertNil(signal("Troubleshooting 404 Responses in Express", helpArticle))
+
+        // Error pages whose marker stands alone as a title segment still match.
+        XCTAssertNotNil(signal("Page Not Found - Example", "short"))
+        XCTAssertNotNil(signal("404 Not Found", "short"))
+        XCTAssertNotNil(signal("Example | 404", "short"))
+        XCTAssertNotNil(signal("Oops", "short"))
     }
 
     func testControlledProcessRunner() async throws {

@@ -1752,3 +1752,45 @@ braced form actually loads web_search+web_fetch and exposes them to the model.
 Full test classes re-run against a stashed clean tree: identical failure sets
 (9 pre-existing dogfood failures, 2 pre-existing DynaMoETests failures — none
 introduced).
+
+Review follow-up (Copilot, Medium on QA #34): the title heuristic matched a
+substring, so a legitimate article titled "How to Fix a Page Not Found Error" or
+"Why Was the Page Not Found?" was rejected as a soft 404 before its content was
+ever read. Valid — the whole point of the check is to skip error shells, not to
+veto articles that discuss the phrase.
+
+Fix: titles are now split into separator-delimited segments (`|`, `:`, `·`, `–`,
+`—`, or a spaced hyphen) and matched per segment. Strong markers ("page not
+found", "404 not found", "page unavailable", …) must equal a whole segment;
+their bare forms ("404", "error", "oops") only count when the title IS that
+marker or every other segment looks like a site name (no spaces), so
+"404: A Story of Loss" and "Troubleshooting 404 Responses in Express" fall
+through to the body check and read normally, while "Example | 404" and
+"Page Not Found - Example" still match. The standalone check caught the
+"Example | 404" regression in the first cut of the fix.
+
+Verified: the case list grew to 19 (help-article title, question title, prose
+after a "404:" prefix, troubleshooting title as negatives; four title-segment
+error forms plus five body-signal forms as positives) and all pass. Note for the
+next session on this machine: an Xcode/macOS update here drops the Metal
+toolchain component (`xcodebuild -downloadComponent MetalToolchain`) and leaves
+the previously built test bundle unsigned (CodeSign: "code object is not signed
+at all" in DynaMoETests.xctest) — a `clean` plus fresh build fixes that.
+
+Review follow-up (Copilot, Medium on QA #32's backfill loop): breaking out of the
+backfill loop on cancellation did not stop finalization — execution fell through
+to `recordTurn` and could schedule the next agent step on top of the interrupt,
+and a failed backfill forward would pin a prefix whose tail slots were never
+written (exactly the hole the backfill exists to close).
+
+Fix in `ContentView` after the loop:
+- Cancellation (checked after the loop as well as inside it) returns immediately
+  with `⏹ [GEN] cancelled during prefix backfill — skipping finalization`,
+  matching the turn's earlier cancel guard, so no pin is recorded and no
+  continuation is scheduled.
+- A failed `runTokenForward` logs
+  `⚠️ [GEN] prefix backfill forward failed at N/total — dropping the pinned prefix`
+  and invalidates the session's pin (MainActor, behind the generation-ownership
+  guard) before returning. The next turn full re-prefills instead of trusting
+  slots that were never computed. The partial reply is already committed to the
+  message by the streaming updates, so nothing user-visible is lost.

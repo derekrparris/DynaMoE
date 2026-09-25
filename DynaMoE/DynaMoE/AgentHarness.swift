@@ -4086,11 +4086,47 @@ public final class AgentHarness {
     /// invented. Returns the matched signal for the error message, or nil when the
     /// page looks like real content.
     public static func softNotFoundSignal(title: String, cleanedContent: String) -> String? {
-        let titleLower = title.lowercased()
-        for signal in ["404", "page not found", "page unavailable", "not found"] where titleLower.contains(signal) {
+        func errorPage() -> String {
             let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? signal : trimmed
+            return trimmed.isEmpty ? "not found" : trimmed
         }
+        // Titles are matched on whole separator-delimited segments, never on a bare
+        // substring: "How to Fix a Page Not Found Error" and "Why Was the Page Not
+        // Found?" discuss the phrase and are real articles, while "Page Not Found -
+        // Site" / "404 Not Found | Site" are error pages whose marker stands alone
+        // as a segment. Numbers/words like "404" or "Oops" only count when the
+        // title IS that marker, so "404: A Story of Loss" falls through to the body
+        // check below instead of being rejected on its prefix.
+        let separatorPattern = "\\s*[|:·–—]\\s*|\\s+-\\s+"
+        var segments: [String] = []
+        if let separatorRegex = try? NSRegularExpression(pattern: separatorPattern) {
+            let nsTitle = title.lowercased() as NSString
+            var cursor = 0
+            for match in separatorRegex.matches(in: nsTitle as String, range: NSRange(location: 0, length: nsTitle.length)) {
+                segments.append(nsTitle.substring(with: NSRange(location: cursor, length: match.range.location - cursor)))
+                cursor = match.range.location + match.range.length
+            }
+            segments.append(nsTitle.substring(from: cursor))
+        } else {
+            segments = [title.lowercased()]
+        }
+        segments = segments
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: " \t\n\r\"'()[]")) }
+            .filter { !$0.isEmpty }
+        let strongMarkers: Set<String> = [
+            "404 not found", "404 error", "error 404", "not found", "page not found",
+            "page not available", "page unavailable", "page cannot be found", "page could not be found"
+        ]
+        let bareMarkers: Set<String> = ["404", "error", "oops", "not found"]
+        if segments.contains(where: { strongMarkers.contains($0) }) { return errorPage() }
+        // Bare markers ("404", "Oops") only stand alone or beside a site name — a
+        // segment with spaces in it is prose ("404: A Story of Loss"), which must go
+        // through the body check instead.
+        if let bare = segments.first(where: { bareMarkers.contains($0) }),
+           segments.allSatisfy({ $0 == bare || !$0.contains(" ") }) {
+            return errorPage()
+        }
+
         // Body signals only count near the top of a SHORT page: a long article may
         // legitimately mention "page not found", while a not-found shell is always
         // small (nav + boilerplate + a trending list). Bare "error" is deliberately

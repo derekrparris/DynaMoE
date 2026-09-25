@@ -11039,13 +11039,37 @@ if layer.attnGateProjTensor != nil,
             if !generatedTokenIds.isEmpty {
                 let totalContextTokens = promptTokenIds.count + tokensGenerated
                 var backfillPos = Int(currentStep)
+                var backfillFailed = false
                 while backfillPos < totalContextTokens {
                     if Task.isCancelled { break }
                     let ok = autoreleasepool {
                         runTokenForward(tokenId: contextTokens[backfillPos], step: UInt32(backfillPos), computeLogits: false, wait: true)
                     }
-                    if !ok { break }
+                    if !ok {
+                        backfillFailed = true
+                        break
+                    }
                     backfillPos += 1
+                }
+                // A cancel that lands mid-backfill must abort the whole turn, not
+                // fall through: the code below pins the prefix and can schedule the
+                // next agent step, which is exactly what the interrupt is trying to
+                // stop.
+                if Task.isCancelled {
+                    print("⏹ [GEN] cancelled during prefix backfill — skipping finalization")
+                    return
+                }
+                // A failed forward means the tail is short of the tokens the pin
+                // would claim. Drop the pinned prefix instead of recording a pin
+                // whose KV slots were never written; the next turn then re-prefills
+                // from scratch rather than trusting stale state.
+                if backfillFailed {
+                    print("⚠️ [GEN] prefix backfill forward failed at \(backfillPos)/\(totalContextTokens) — dropping the pinned prefix")
+                    await MainActor.run {
+                        guard self.ownsGeneration(myGenerationId) else { return }
+                        PrefixCacheManager.shared.invalidate(sessionId: sessionId)
+                    }
+                    return
                 }
             }
 
