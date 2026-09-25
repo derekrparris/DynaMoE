@@ -6825,6 +6825,49 @@ final class DynaMoETests: XCTestCase {
         )
     }
 
+    /// When reads keep failing the model invents hosts instead of reusing the ones
+    /// its searches returned (observed live: wttr.org → wttr.info → wttri.info →
+    /// "wt.tr.info", all nonexistent, while real forecast URLs sat in context). The
+    /// guardrail must hand those URLs back after consecutive failures.
+    func testWebFetchFailureGuardrail() {
+        let harness = AgentHarness.shared
+        harness.beginAgentSearchGuard()
+        defer { harness.beginAgentSearchGuard() }
+
+        let failedResult = AgentHarness.toolErrorJSON(tool: "web_fetch", error: "Failed to retrieve content")
+
+        // Below the limit: untouched.
+        harness.recordWebFetchOutcome(succeeded: false)
+        XCTAssertEqual(harness.consecutiveWebFetchFailures, 1)
+        XCTAssertFalse(harness.applyWebFetchFailureGuard(to: failedResult).contains("guardrail"))
+
+        // At the limit: the notice lists the URLs the search returned.
+        harness.recordWebFetchOutcome(succeeded: false)
+        harness.noteSearchResultURLs(["https://www.accuweather.com/en/us/burlington-nc/27215/weather-forecast/329809"])
+        let guarded = harness.applyWebFetchFailureGuard(to: failedResult)
+        XCTAssertTrue(guarded.contains("guardrail"), guarded)
+        XCTAssertTrue(guarded.contains("accuweather.com"), "the notice must offer real sources: \(guarded)")
+        XCTAssertTrue(guarded.contains("consecutive web fetches have failed"))
+
+        // With no search results yet, it says so rather than listing nothing.
+        harness.beginAgentSearchGuard()
+        harness.recordWebFetchOutcome(succeeded: false)
+        harness.recordWebFetchOutcome(succeeded: false)
+        XCTAssertTrue(harness.applyWebFetchFailureGuard(to: failedResult).contains("call web_search first"))
+
+        // A success resets the counter, so one-off failures never trigger it.
+        harness.recordWebFetchOutcome(succeeded: true)
+        XCTAssertEqual(harness.consecutiveWebFetchFailures, 0)
+        XCTAssertFalse(harness.applyWebFetchFailureGuard(to: failedResult).contains("guardrail"))
+
+        // curl/wget shell commands count as web reads; other commands do not.
+        XCTAssertTrue(AgentHarness.looksLikeWebFetchCommand("curl -s https://example.com | head -50"))
+        XCTAssertTrue(AgentHarness.looksLikeWebFetchCommand("wget -qO- https://example.com"))
+        XCTAssertFalse(AgentHarness.looksLikeWebFetchCommand("ls -la"))
+        XCTAssertFalse(AgentHarness.looksLikeWebFetchCommand("git status"))
+        XCTAssertFalse(AgentHarness.looksLikeWebFetchCommand(nil))
+    }
+
     /// A subagent's unknown-tool error must describe what that subagent can call —
     /// the whitelist INTERSECTED with installed tools. The whitelist alone is not
     /// "available tools" (it can name tools that were never registered, and it omits
@@ -6928,6 +6971,38 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(names("web_search web_fetch"), ["web_search", "web_fetch"])
         XCTAssertEqual(names("web_fetch"), ["web_fetch"])
         XCTAssertEqual(names("  'web_fetch'  "), ["web_fetch"])
+    }
+
+    /// A load request for a tool that is ALREADY loaded must still return its
+    /// schema. Nothing else carries a loaded tool's interface: the pinned system
+    /// prompt's tool block stays at the core set across loads, so the load response
+    /// is the only channel. A model that asked for an already-loaded tool used to
+    /// get "already loaded" with no schema — knowing the tool existed but not how to
+    /// call it — and fell back to scraping with curl (observed in a live run whose
+    /// web_search schema was never sent).
+    func testToolsLoadRepeatsSchemaForAlreadyLoadedTools() async throws {
+        let harness = AgentHarness.shared
+        let tool = ToolLoadTool()
+        defer { harness.resetLoadedToolsToCore() }
+
+        // Load it once so the second call takes the already-loaded path.
+        _ = try await tool.execute(arguments: ["names": "[\"web_search\"]"], workingDirectory: nil, maxOutputLength: 4000)
+        XCTAssertNotNil(harness.loadedTools["web_search"])
+
+        let repeatResult = try await tool.execute(arguments: ["names": "[\"web_search\"]"], workingDirectory: nil, maxOutputLength: 4000)
+        let json = repeatResult.resultJSON
+        // JSONSerialization pretty-prints with a space before the colon
+        // ("status" : "success"), so match on the values, not a compacted form.
+        XCTAssertTrue(json.contains("success"), String(json.prefix(200)))
+        XCTAssertTrue(json.contains("already_loaded"), "the repeat must be reported as already loaded")
+        // web_search-specific parameter names prove the schema itself came back,
+        // not just the tool's name.
+        XCTAssertTrue(json.contains("max_results"), "web_search's schema must be present: \(String(json.prefix(600)))")
+        XCTAssertTrue(json.contains("query"), "web_search's schema must be present: \(String(json.prefix(600)))")
+        XCTAssertTrue(
+            (repeatResult.stdout ?? "").contains("already loaded"),
+            "the message must say it was already loaded: \(repeatResult.stdout ?? "")"
+        )
     }
 
     /// End-to-end through the tool itself: the braced dialect must load the tools

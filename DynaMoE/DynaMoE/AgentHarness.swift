@@ -998,6 +998,10 @@ public final class WebSearchTool: AgentTool {
                 enrichedResults.append(entry)
             }
 
+            // Remember the returned URLs: if later fetches keep failing, the
+            // guardrail hands these back instead of letting the model invent hosts.
+            AgentHarness.shared.noteSearchResultURLs(enrichedResults.compactMap { $0["url"] as? String })
+
             let res = AgentHarness.toolSuccessJSON(tool: "web_search", data: [
                 "query": cleanQuery,
                 "count": results.count,
@@ -1799,7 +1803,17 @@ public final class ToolLoadTool: AgentTool {
         var schemas: [String: String] = [:]
         var errors: [String] = []
         for name in names {
-            if harness.loadedTools[name] != nil {
+            if let existing = harness.loadedTools[name] {
+                // Repeat the schema even when the tool is already loaded. The pinned
+                // system prompt's tool block is only ever the CORE set (loads do not
+                // rewrite it), so this response is the only channel that can carry a
+                // loaded tool's interface — and skipping repeats left the model
+                // knowing a tool existed but not how to call it (observed: it never
+                // used a loaded web_search and scraped with curl instead).
+                if let schemaData = try? JSONEncoder().encode(existing.definition),
+                   let schemaStr = String(data: schemaData, encoding: .utf8) {
+                    schemas[name] = schemaStr
+                }
                 loadedResults.append([
                     "tool_name": name,
                     "registration": false,
@@ -1827,13 +1841,15 @@ public final class ToolLoadTool: AgentTool {
         }
 
         let newlyLoaded = loadedResults.filter { ($0["registration"] as? Bool) == true }.map { $0["tool_name"] as? String ?? "" }
+        let alreadyLoaded = loadedResults.filter { ($0["already_loaded"] as? Bool) == true }.map { $0["tool_name"] as? String ?? "" }
+        let repeatNote = alreadyLoaded.isEmpty ? "" : " Schema(s) repeated for the already-loaded tool(s) so you can call them correctly."
         let msg: String
         if newlyLoaded.count == 1, let only = newlyLoaded.first {
-            msg = "Tool '\(only)' loaded. You may now call it directly using the provided schema."
+            msg = "Tool '\(only)' loaded. You may now call it directly using the provided schema." + repeatNote
         } else if newlyLoaded.count > 1 {
-            msg = "Tools \(newlyLoaded.map { "'\($0)'" }.joined(separator: ", ")) loaded. You may now call them directly using the provided schemas."
+            msg = "Tools \(newlyLoaded.map { "'\($0)'" }.joined(separator: ", ")) loaded. You may now call them directly using the provided schemas." + repeatNote
         } else {
-            msg = "All requested tools were already loaded."
+            msg = "Requested tool(s) were already loaded:\(alreadyLoaded.map { " '\($0)'" }.joined())." + repeatNote
         }
 
         var data: [String: Any] = [
@@ -2721,6 +2737,17 @@ public final class AgentHarness {
     /// Issuing the same normalized query this many times triggers the repeat guard.
     public var searchRepeatLimit: Int = 2
 
+    /// URLs web_search actually returned in the current run, newest last. Used to
+    /// hand the model real sources when it starts inventing hosts.
+    public private(set) var recentSearchResultURLs: [String] = []
+    /// Consecutive web-fetch attempts that failed: a `web_fetch` error, or a
+    /// `shell_run` running curl/wget that exited non-zero. Models that cannot fetch
+    /// an invented host invent another one ("wttr.org" → "wttr.info" → "wttri.info"),
+    /// so consecutive failures are the signal to intervene.
+    public private(set) var consecutiveWebFetchFailures: Int = 0
+    /// Consecutive failures before the guardrail appends guidance to the result.
+    public var webFetchFailureLimit: Int = 2
+
     /// Resets guard state at the start of a new task and re-exposes `web_search` in case a
     /// previous run unloaded it.
     public func beginAgentSearchGuard() {
@@ -2729,6 +2756,8 @@ public final class AgentHarness {
         webSearchDisabled = false
         lastSearchGuardAction = .none
         consecutiveEmptyToolCalls = 0
+        recentSearchResultURLs.removeAll()
+        consecutiveWebFetchFailures = 0
         if tools["web_search"] != nil && loadedTools["web_search"] == nil {
             _ = try? loadTool(named: "web_search")
         }
@@ -3653,12 +3682,22 @@ public final class AgentHarness {
             } else {
                 baseResult = try await tool.execute(arguments: call.arguments, workingDirectory: wd, maxOutputLength: effectiveMaxLen)
             }
-            let json = baseResult.resultJSON
+            let rawJSON = baseResult.resultJSON
             let stdout = baseResult.stdout
             let stderr = baseResult.stderr
             let isCompleted = baseResult.isCompleted
             let duration = CFAbsoluteTimeGetCurrent() - startTime
             let status: ToolExecutionStatus = (stderr != nil && !stderr!.isEmpty) ? .error : .success
+
+            // Web-read attempts (web_fetch, or curl/wget through shell_run) share one
+            // failure counter; the guardrail below fires when the model is guessing
+            // hosts instead of using the URLs its searches returned.
+            let isWebReadAttempt = call.name == "web_fetch"
+                || (call.name == "shell_run" && AgentHarness.looksLikeWebFetchCommand(call.arguments["command"] as? String))
+            if isWebReadAttempt {
+                recordWebFetchOutcome(succeeded: status == .success)
+            }
+            let json = isWebReadAttempt ? applyWebFetchFailureGuard(to: rawJSON) : rawJSON
 
             // Store the exact model-facing rendering so history reconstruction embeds
             // byte-identical context (live turn and rebuilt turn always agree).
@@ -3688,6 +3727,55 @@ public final class AgentHarness {
             )
             return (json, rec, false)
         }
+    }
+
+    // MARK: - Web Fetch Failure Guard
+
+    /// Records the URLs a search returned, so a later guardrail can hand the model
+    /// real sources instead of letting it invent hosts.
+    public func noteSearchResultURLs(_ urls: [String]) {
+        for url in urls where !recentSearchResultURLs.contains(url) {
+            recentSearchResultURLs.append(url)
+        }
+        if recentSearchResultURLs.count > 24 {
+            recentSearchResultURLs.removeFirst(recentSearchResultURLs.count - 24)
+        }
+    }
+
+    /// Feeds the consecutive-failure counter behind `applyWebFetchFailureGuard`.
+    public func recordWebFetchOutcome(succeeded: Bool) {
+        consecutiveWebFetchFailures = succeeded ? 0 : consecutiveWebFetchFailures + 1
+    }
+
+    /// True when a shell command looks like an attempt to read a web page, so its
+    /// failures count toward the same guardrail.
+    public static func looksLikeWebFetchCommand(_ command: String?) -> Bool {
+        guard let lowered = command?.lowercased(), !lowered.isEmpty else { return false }
+        return lowered.contains("curl") || lowered.contains("wget")
+    }
+
+    /// Appends guidance once web fetches keep failing. Without it the model invents
+    /// another nonexistent host each turn (observed: wttr.org → wttr.info →
+    /// wttri.info → "wt.tr.info"), burning steps on hosts it cannot resolve when the
+    /// search results it already has list real forecast pages.
+    func applyWebFetchFailureGuard(to resultJSON: String) -> String {
+        guard consecutiveWebFetchFailures >= webFetchFailureLimit else { return resultJSON }
+        let urls = Array(recentSearchResultURLs.suffix(6))
+        let urlList = urls.isEmpty
+            ? "(this run has no web_search results yet — call web_search first)"
+            : urls.map { "  " + $0 }.joined(separator: "\n")
+        let notice = "[guardrail] \(consecutiveWebFetchFailures) consecutive web fetches have failed (missing host, empty body, or non-zero curl exit). Fetch URLs EXACTLY as web_search returned them; do not construct or guess a host. Urls from this run's searches:\n\(urlList)\nIf those do not answer the question, reply from the snippets already in the conversation instead of fetching again."
+        guard var obj = try? JSONSerialization.jsonObject(with: Data(resultJSON.utf8)) as? [String: Any] else {
+            return resultJSON
+        }
+        var result = (obj["result"] as? [String: Any]) ?? [:]
+        result["guardrail"] = notice
+        obj["result"] = result
+        if let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]),
+           let str = String(data: data, encoding: .utf8) {
+            return str
+        }
+        return resultJSON
     }
 
     // MARK: - Web Search Loop Guard Logic

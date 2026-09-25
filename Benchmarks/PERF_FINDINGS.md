@@ -1865,3 +1865,76 @@ Verified: test constructs a real executor for a generated subagent instance and
 checks a fabricated whitelist entry never leaks into the list, the callable
 intersection is advertised, installed-but-un-whitelisted tools keep their distinct
 message, and an all-fabricated whitelist explains itself.
+
+### QA #36 — tools_load must repeat schemas for already-loaded tools
+
+Live 15:20 run (weather lookup) went off the rails: the model loaded web_search +
+web_fetch, then never used web_search — it curled wttr.org (wrong TLD, parked
+page), a dead noaa.gov path, a malformed URL, and re-called tools_discover twice.
+Context hygiene was perfect throughout (splice-vs-reencode IDENTICAL on every
+turn, balanced tags), so this was a tool-INTERFACE problem, not corruption.
+
+Root cause is the schema channel. The pinned system prompt's tool block is fixed
+at the CORE set (loads do not rewrite it — that is why the tool description's
+"load/unload rewrites the tool block and triggers a re-prefill" is aspirational),
+so the tools_load RESPONSE is the only place a loaded tool's schema can arrive.
+`loadedTools` persists in-process across sessions, so a second run that asks for
+web_search gets `already_loaded: true` and — before this fix — NO schema. The
+model then knows the tool exists (tools_discover lists it; its own thinking said
+"Actually there's a tool web_search loaded. Let me try it") but has never seen its
+parameters, so it hand-rolls curl instead. Same disease as QA #35, different
+symptom.
+
+Fix: `ToolLoadTool` now repeats the schema for already-loaded tools and says so in
+the message ("Schema(s) repeated for the already-loaded tool(s) so you can call
+them correctly").
+
+Verified: test loads web_search, calls tools_load again, and asserts the response
+carries web_search's schema (max_results/query), reports already_loaded, and says
+"already loaded" in the message. (First cut of that test asserted
+`"status": "success"`, which never matches JSONSerialization's pretty-printed
+`"status" : "success"` — match on values, not on compacted key separators.)
+
+Residual, smaller hygiene item seen in the same run: the model once wrote
+`</function>` without `</parameter>`; the closure adds `</tool_call>` but cannot
+insert a `</parameter>` BEFORE an already-emitted `</function>` without splitting
+the generated token range, which would break the pin as a prefix (one full
+re-prefill per occurrence). Left alone deliberately; the parser tolerates it and
+the required-param walk stops at unterminated values (safe direction).
+
+Unrelated: `testWorkingSetManagerTokenBoundaryEviction` failed once in a
+full-class run and passes in isolation — order-dependent flake in shared
+WorkingSetManager state, not touched by this change.
+
+### QA #37 — invented-host fetch loop: schema fix landed, new guardrail added
+
+The 16:57 run is the first where the model actually used web_search AND web_fetch
+(QA #36's schema repeat working — before it, a loaded web_search had no interface
+and the model curled instead). Context hygiene stayed clean: splice-vs-reencode
+diverges only by the benign boundary tokens (4→6, at token 2724), tags balanced.
+
+New failure mode: the model wanted a curl-friendly weather endpoint it knows from
+pretraining (wttr.in) and burned six consecutive steps on hosts that do not exist —
+wttr.info, wttri.info, "wt.tr.info" (one shell_run even ran a bare URL as the
+command, exit 127) — with a web_fetch of a nonexistent host returning
+content_length 0. Meanwhile the search results already in context listed real
+forecast pages (accuweather.com, …). So the model ignores the URLs it was given and
+constructs its own; the prompt rule ("NEVER invent URLs") does not hold under this
+temptation.
+
+Fix: a failure-driven guardrail, mirroring the web-search loop guard.
+- `AgentHarness.recentSearchResultURLs` records what web_search returned (reset per
+  run in `beginAgentSearchGuard`).
+- `recordWebFetchOutcome(succeeded:)` counts consecutive web-read failures;
+  `looksLikeWebFetchCommand` makes curl/wget through shell_run count too, so a
+  fetch-loop through either tool is caught.
+- After `webFetchFailureLimit` (2) consecutive failures, `applyWebFetchFailureGuard`
+  appends a notice listing up to six URLs from this run's searches, says the host
+  was not from search results, and tells the model to answer from the snippets
+  instead of fetching again. It is applied in `executeTool`, so it covers web_fetch
+  and shell_run identically, and a success resets the counter (one-off failures
+  never trigger it).
+
+Verified: guardrail unit test (below limit untouched; at limit lists the returned
+URL; empty-search case explains itself; success resets; curl/wget detection
+positives and negatives). Full fast class: the two pre-existing failures only.
