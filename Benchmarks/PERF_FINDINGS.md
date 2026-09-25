@@ -1961,3 +1961,24 @@ Tests: `testToolCallHygieneAndNestedParameterTolerance` adds the literal-in-valu
 case (count stays 1; appending one closer balances to 0), the `<arg_value>`
 variant, and a closed block whose value mentions the marker (stays 0). Existing
 frozen/multi-call/closed-plus-prose assertions unchanged. Verified: test passes.
+
+### QA #39 — a failed prefix backfill left the app stuck "generating" (review follow-up)
+
+Review follow-up (Copilot, Medium on the backfill failure branch in
+`ContentView.swift`): when the backfill forward returns false, the branch invalidated the
+pinned prefix and returned, but did not clear `isGeneratingText` /
+`generationTask`. Confirmed: cancellation has its own reset path (the canceller
+clears both flags), but a Metal forward failure is not a cancellation and has no
+other reset, so the spinner and the generation scheduler stayed in an
+active-generation state and new prompts could not start.
+
+Fix: the failure branch now resets the same state as the prefill-failure path
+(`ContentView.swift:10683`), in the same `ownsGeneration`-guarded MainActor block
+that invalidates the prefix: clears `isGeneratingText`, `generationTask`,
+status text, and the message's `prefillStatus` / `isThinking`.
+
+`Task.isCancelled` early-returns in the surrounding code were left as-is: the
+canceller already owns flag reset, and the `ownsGeneration` guard keeps a
+superseded task from touching its replacement.
+
+Verified: `swiftc -typecheck` clean, `xcodebuild build` succeeded.

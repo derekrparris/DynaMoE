@@ -11072,6 +11072,18 @@ if layer.attnGateProjTensor != nil,
                     await MainActor.run {
                         guard self.ownsGeneration(myGenerationId) else { return }
                         PrefixCacheManager.shared.invalidate(sessionId: sessionId)
+                        // Unlike a cancellation, a failed forward has no other
+                        // reset path: without this the UI and the generation
+                        // scheduler stay stuck in an active-generation state.
+                        self.isGeneratingText = false
+                        self.generationTask = nil
+                        self.generationStatusText = "❌ Prefix backfill failed; generation stopped."
+                        if let sId = sessionId, let mId = messageId,
+                           let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                           let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
+                            self.sessions[sIdx].messages[mIdx].prefillStatus = nil
+                            self.sessions[sIdx].messages[mIdx].isThinking = false
+                        }
                     }
                     return
                 }
