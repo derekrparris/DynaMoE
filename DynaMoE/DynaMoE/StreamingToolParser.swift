@@ -27,6 +27,13 @@ public final class StreamingToolParser {
     public static let llamaTagOpen = "<|python_tag|>"
     public static let llamaTagClose = "</|python_tag|>"
 
+    // Parameter/argument value spans: tag-like text inside them is data, not structure.
+    private static let parameterOpen = "<parameter="
+    private static let parameterOpenBare = "<parameter>"
+    private static let parameterClose = "</parameter>"
+    private static let argValueOpen = "<arg_value>"
+    private static let argValueClose = "</arg_value>"
+
     public init() {}
 
     /// True when `text` contains a `<tool_call>` opener whose block never closed —
@@ -41,12 +48,55 @@ public final class StreamingToolParser {
 
     /// How many `<tool_call>` blocks a turn left unterminated. Count-based rather
     /// than "last block" so a turn that froze two calls gets both closed, not one.
-    /// A literal marker inside a value can skew the count, which only ever means
-    /// one extra (harmless) closer.
+    ///
+    /// Only structural openers count. Parameter/argument values are unconstrained
+    /// by the grammar, so a shell command, URL, or search query echoing a literal
+    /// `<tool_call>` is data, not a block opener; counting it appended an extra
+    /// `</tool_call>` and persisted an unmatched closer into the next prompt,
+    /// the history corruption this suffix exists to prevent.
     public static func unclosedToolCallCount(_ text: String) -> Int {
-        let opens = text.components(separatedBy: qwenToolCallOpen).count - 1
-        let closes = text.components(separatedBy: qwenToolCallClose).count - 1
-        return max(0, opens - closes)
+        var depth = 0
+        var valueTerminator: String? = nil
+        var index = text.startIndex
+        while index < text.endIndex {
+            let remaining = text[index...]
+            if let terminator = valueTerminator {
+                if remaining.hasPrefix(terminator) {
+                    index = text.index(index, offsetBy: terminator.count)
+                    valueTerminator = nil
+                } else {
+                    index = text.index(after: index)
+                }
+                continue
+            }
+            if remaining.hasPrefix(parameterOpen) {
+                valueTerminator = parameterClose
+                index = text.index(index, offsetBy: parameterOpen.count)
+                continue
+            }
+            if remaining.hasPrefix(parameterOpenBare) {
+                valueTerminator = parameterClose
+                index = text.index(index, offsetBy: parameterOpenBare.count)
+                continue
+            }
+            if remaining.hasPrefix(argValueOpen) {
+                valueTerminator = argValueClose
+                index = text.index(index, offsetBy: argValueOpen.count)
+                continue
+            }
+            if remaining.hasPrefix(qwenToolCallOpen) {
+                depth += 1
+                index = text.index(index, offsetBy: qwenToolCallOpen.count)
+                continue
+            }
+            if remaining.hasPrefix(qwenToolCallClose) {
+                if depth > 0 { depth -= 1 }
+                index = text.index(index, offsetBy: qwenToolCallClose.count)
+                continue
+            }
+            index = text.index(after: index)
+        }
+        return depth
     }
 
     /// The tokens that must be appended after a turn's generated ids so the turn

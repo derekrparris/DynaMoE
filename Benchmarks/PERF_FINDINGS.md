@@ -1938,3 +1938,26 @@ Fix: a failure-driven guardrail, mirroring the web-search loop guard.
 Verified: guardrail unit test (below limit untouched; at limit lists the returned
 URL; empty-search case explains itself; success resets; curl/wget detection
 positives and negatives). Full fast class: the two pre-existing failures only.
+
+### QA #38 — structural `<tool_call>` counting: a marker inside a value is data (review follow-up)
+
+Review follow-up (Copilot, High on `StreamingToolParser.unclosedToolCallCount`):
+counting raw `<tool_call>` / `</tool_call>` substrings cannot tell a structural
+opener from the same literal printed inside a parameter value. Confirmed real:
+the grammar leaves `.insideParameterValue` unconstrained (`default: return` in
+`GrammarConstrainedSampler.applyLogitMaskLocked`), so a shell command, URL, or
+search query that echoes the marker inflates `opens`. One extra `</tool_call>`
+was then appended to the turn — an UNMATCHED closer spliced into the model's own
+history, the same corruption class QA #32/#33 spent the run eliminating (the
+code's "one extra (harmless) closer" note was wrong).
+
+Fix: `unclosedToolCallCount` now scans left-to-right with a depth counter and
+skips value spans — `<parameter=…>`…`</parameter>`, the bare `<parameter>`
+dialect, and Ling's `<arg_value>…</arg_value>` — so tag-like text inside a value
+is treated as data. Nesting is tracked (depth floors at 0) instead of the former
+`max(0, opens - closes)` subtraction.
+
+Tests: `testToolCallHygieneAndNestedParameterTolerance` adds the literal-in-value
+case (count stays 1; appending one closer balances to 0), the `<arg_value>`
+variant, and a closed block whose value mentions the marker (stays 0). Existing
+frozen/multi-call/closed-plus-prose assertions unchanged. Verified: test passes.

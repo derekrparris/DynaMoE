@@ -6786,6 +6786,17 @@ final class DynaMoETests: XCTestCase {
         XCTAssertFalse(StreamingToolParser.hasUnclosedToolCallBlock("no tool call here"))
         // A turn that froze several calls must report all of them, not just the last.
         XCTAssertEqual(StreamingToolParser.unclosedToolCallCount(TC_OPEN + FN_OPEN + "a>" + FN_CLOSE + TC_OPEN + FN_OPEN + "b>" + FN_CLOSE), 2)
+        // A literal `<tool_call>` printed inside a parameter value is data, not a
+        // structural opener: counting it appended a stray closer to the next prompt.
+        let literalInValue = TC_OPEN + "\n" + FN_OPEN + "shell_run>\n" + P_OPEN + "command>\necho " + TC_OPEN + "\n" + P_CLOSE + "\n" + FN_CLOSE
+        XCTAssertEqual(StreamingToolParser.unclosedToolCallCount(literalInValue), 1)
+        XCTAssertEqual(StreamingToolParser.unclosedToolCallCount(literalInValue + TC_CLOSE), 0)
+        // Same for the Ling dialect's <arg_value> payload.
+        let argValueLiteral = TC_OPEN + FN_OPEN + "x>\n<arg_value>say " + TC_OPEN + " now</arg_value>\n" + FN_CLOSE
+        XCTAssertEqual(StreamingToolParser.unclosedToolCallCount(argValueLiteral), 1)
+        // A closed block whose value mentions the marker stays fully balanced.
+        let closedThenLiteral = TC_OPEN + FN_OPEN + "x>\n" + P_OPEN + "k>v " + TC_OPEN + P_CLOSE + "\n" + FN_CLOSE + TC_CLOSE
+        XCTAssertEqual(StreamingToolParser.unclosedToolCallCount(closedThenLiteral), 0)
         XCTAssertFalse(
             StreamingToolParser.hasUnclosedToolCallBlock(TC_OPEN + FN_OPEN + "x>\n" + FN_CLOSE + TC_CLOSE + "\nprose after the block"),
             "a closed block followed by prose must not be flagged"
