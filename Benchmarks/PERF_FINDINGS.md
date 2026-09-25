@@ -1982,3 +1982,35 @@ canceller already owns flag reset, and the `ownsGeneration` guard keeps a
 superseded task from touching its replacement.
 
 Verified: `swiftc -typecheck` clean, `xcodebuild build` succeeded.
+
+### QA #40 — skipped gestures get no result in durable history (review follow-up)
+
+Review follow-up (Copilot, Medium on the gesture split): `responseSlots` fed only
+the immediate continuation turn; it was never persisted to
+`ChatMessage.toolCalls`, and `initialRecords` was built from `actionableCalls`
+alone, so a skipped gesture had no record. The assistant message content still
+carried the raw gesture call (the display path strips `<tool_call>` blocks from
+`content`, confirming they live there), so a LATER user turn re-encoded an
+assistant turn whose call had no matching `<tool_response>` — the truncated-
+exchange shape that invites the model to re-issue the call.
+
+Fix: every skipped gesture now gets a persisted record via
+`AgentHarness.gestureSkipRecord(for:)` — its output is the same model-facing skip
+notice the live turn reports, rendered once so live and rebuilt turns agree — and
+the record is flagged `isGesture` so `ChatDetailView` hides it from the tool
+timeline. Record building moved ahead of the `!actionableCalls.isEmpty` guard and
+is laid out by call index, so a gesture-only turn (which ends the run) persists
+too and every call keeps its transcript order.
+
+The same path exposed a second bug: the Qwen history-reconstruction branch was
+missing the `!cleanMsg.contains("tool_call>")` guard the Spark and Ling branches
+already had, so whenever `content` still carried the raw call it was appended
+again by the rebuild loop — every prior tool call (and now every gesture) would
+appear TWICE in the reconstructed prompt for a new user turn. Guard added; it
+falls back to rebuilding from the record when the content no longer carries the
+call.
+
+Tests: `testNoOpGestureToolCallDetection` now asserts the gesture record's shape
+(isGesture, name, status, rendered notice) and that `splitGestureCalls` reports
+the skipped index. Verified: test passes, full fast class shows only the two
+pre-existing failures.

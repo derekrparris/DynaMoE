@@ -6765,6 +6765,21 @@ final class DynaMoETests: XCTestCase {
         XCTAssertFalse(isGesture("echo $HOME"))
         XCTAssertFalse(isGesture("curl -s https://example.com"))
         XCTAssertFalse(AgentHarness.isNoOpGestureToolCall(call("echo done", tool: "file_read")))
+
+        // A skipped gesture still yields a persisted record so reconstructed history
+        // has a matching result for the raw call in the assistant content: the output
+        // carries the model-facing notice and the flag keeps it out of the UI.
+        let gestureRecord = AgentHarness.gestureSkipRecord(for: call("echo done"))
+        XCTAssertTrue(gestureRecord.isGesture)
+        XCTAssertEqual(gestureRecord.name, "shell_run")
+        XCTAssertEqual(gestureRecord.status, .success)
+        XCTAssertTrue(gestureRecord.output?.contains("[shell_run]") == true)
+        XCTAssertTrue(gestureRecord.output?.contains("skipped") == true)
+
+        // splitGestureCalls reports the skipped index so the caller can persist it.
+        let split = AgentHarness.splitGestureCalls([call("ls -la"), call("echo done"), call("git status")])
+        XCTAssertEqual(split.actionableIndices, [0, 2])
+        XCTAssertEqual(split.skipNotices.keys.sorted(), [1])
     }
 
     /// The pre-execution freeze cuts generation at `</function>`, so the model's

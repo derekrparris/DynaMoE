@@ -2873,6 +2873,23 @@ public final class AgentHarness {
         ])
     }
 
+    /// The persisted record for a dropped gesture call. It carries the same
+    /// model-facing notice the live continuation turn reports, so reconstructed
+    /// history gives the gesture a matching result instead of leaving the raw call
+    /// in `msg.content` unanswered. Marked `isGesture` so the UI hides it.
+    public static func gestureSkipRecord(for call: ParsedToolCall) -> ToolCallRecord {
+        var stringArgs: [String: String] = [:]
+        for (k, v) in call.arguments { stringArgs[k] = "\(v)" }
+        return ToolCallRecord(
+            name: call.name,
+            arguments: stringArgs,
+            rawArguments: call.rawArguments,
+            status: .success,
+            output: renderToolResultForModel(gestureSkipNotice(tool: call.name)),
+            isGesture: true
+        )
+    }
+
     /// True for calls that cannot advance any task: a `shell_run` whose command is
     /// a bare no-op (`echo`, `true`, `:`, `exit`), which models emit as a "task
     /// finished" gesture when they should have called `complete` or simply ended

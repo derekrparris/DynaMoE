@@ -1752,7 +1752,10 @@ struct ContentView: View {
                     if !cleanMsg.isEmpty {
                         assistantBody += cleanMsg + "\n"
                     }
-                    if let calls = msg.toolCalls, !calls.isEmpty {
+                    // Rebuild the call only when the stored content no longer carries
+                    // it (mirrors the Spark/Ling branches); otherwise the raw call is
+                    // already in `cleanMsg` and rebuilding would print it twice.
+                    if let calls = msg.toolCalls, !calls.isEmpty, !cleanMsg.contains("tool_call>") {
                         for call in calls {
                             assistantBody += "<tool_call>\n<function=\(call.name)>\n"
                             for (k, v) in call.arguments {
@@ -11273,33 +11276,48 @@ if layer.attnGateProjTensor != nil,
 
             // Agent Harness Multi-Step Tool Execution
             if runAgentTools {
-                if !actionableCalls.isEmpty {
-                    var initialRecords: [ToolCallRecord] = []
-                    for call in actionableCalls {
-                        var stringArgs: [String: String] = [:]
-                        for (k, v) in call.arguments {
-                            stringArgs[k] = "\(v)"
-                        }
-                        initialRecords.append(ToolCallRecord(
-                            name: call.name,
-                            arguments: stringArgs,
-                            rawArguments: call.rawArguments,
-                            status: .running
-                        ))
+                // One record per emitted call, in transcript order. Gesture calls are
+                // skipped (not executed) but still get a record whose output is the
+                // skip notice, marked `isGesture` and hidden from the UI: the raw
+                // gesture call stays in `msg.content`, and reconstructed for a later
+                // user turn it would otherwise read as a call with no result and
+                // invite a repeat. Built before the execute loop so it can address
+                // records by id.
+                var recordsByCallIndex: [ToolCallRecord?] = Array(repeating: nil, count: parsedResult.calls.count)
+                for idx in actionableCallIndices {
+                    let call = parsedResult.calls[idx]
+                    var stringArgs: [String: String] = [:]
+                    for (k, v) in call.arguments {
+                        stringArgs[k] = "\(v)"
                     }
-
-                    // Attach initial records to ChatMessage
+                    recordsByCallIndex[idx] = ToolCallRecord(
+                        name: call.name,
+                        arguments: stringArgs,
+                        rawArguments: call.rawArguments,
+                        status: .running
+                    )
+                }
+                for (idx, _) in gestureSplit.skipNotices {
+                    recordsByCallIndex[idx] = AgentHarness.gestureSkipRecord(for: parsedResult.calls[idx])
+                }
+                let orderedRecords = recordsByCallIndex.compactMap { $0 }
+                if !orderedRecords.isEmpty {
                     await MainActor.run {
                         if let sId = sessionId, let mId = messageId,
                            let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
                            let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
                             var currentCalls = self.sessions[sIdx].messages[mIdx].toolCalls ?? []
-                            currentCalls.append(contentsOf: initialRecords)
+                            currentCalls.append(contentsOf: orderedRecords)
                             self.sessions[sIdx].messages[mIdx].toolCalls = currentCalls
-                            self.generationStatusText = "⚙️ Executing \(initialRecords.count) tool call(s)..."
+                            if !actionableCalls.isEmpty {
+                                self.generationStatusText = "⚙️ Executing \(actionableCalls.count) tool call(s)..."
+                            }
                         }
                     }
+                }
+                let initialRecords = actionableCallIndices.map { recordsByCallIndex[$0]! }
 
+                if !actionableCalls.isEmpty {
                     let baseWdURL = self.agentWorkingDirectory.isEmpty ? nil : URL(fileURLWithPath: self.agentWorkingDirectory)
                     var anyCompleted = false
                     var ranCompleteTool = false
