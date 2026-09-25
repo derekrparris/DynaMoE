@@ -6825,6 +6825,48 @@ final class DynaMoETests: XCTestCase {
         )
     }
 
+    /// A subagent's unknown-tool error must describe what that subagent can call —
+    /// the whitelist INTERSECTED with installed tools. The whitelist alone is not
+    /// "available tools" (it can name tools that were never registered, and it omits
+    /// installed tools outside the whitelist), so labeling it that way sent the
+    /// model hunting for tools it could never call.
+    func testSubagentUnknownToolErrorListsCallableTools() async {
+        let harness = AgentHarness.shared
+        XCTAssertNotNil(harness.tools["web_search"], "precondition: web_search is installed in the catalog")
+
+        func executor(allowed: [String]) -> SubagentToolExecutor {
+            let owner = SubagentInstance(
+                role: "Test Runner",
+                taskDescription: "unit test",
+                allowedTools: allowed
+            )
+            return SubagentToolExecutor(owner: owner, workingDirectory: nil)
+        }
+
+        // Whitelist naming one installed tool plus a fabricated one; a call for a
+        // tool that does not exist at all must advertise only the intersection.
+        let runner = executor(allowed: ["web_search", "ghost_tool"])
+        XCTAssertEqual(runner.callableToolNames, ["web_search"])
+        let unknown = await runner.runTool(named: "phantom_tool", arguments: [:])
+        XCTAssertTrue(unknown.json.contains("Unknown tool 'phantom_tool'"))
+        XCTAssertTrue(unknown.json.contains("Allowed tools: web_search"), "error must list the callable intersection: \(unknown.json)")
+        XCTAssertFalse(unknown.json.contains("Available tools"), "the whitelist must not be labeled available tools")
+        XCTAssertFalse(unknown.json.contains("ghost_tool"), "uninstalled whitelist entries must not be advertised")
+
+        // Installed but un-whitelisted tools take the distinct whitelist message
+        // (which may name whitelist entries that are not installed — that list IS
+        // the declared whitelist, so its label stays accurate).
+        let notAllowed = await runner.runTool(named: "web_fetch", arguments: [:])
+        XCTAssertTrue(notAllowed.json.contains("not in this subagent's allowed_tools"), notAllowed.json)
+
+        // A whitelist naming no installed tool says so instead of listing nothing.
+        let empty = executor(allowed: ["ghost_tool"])
+        let emptyErr = await empty.runTool(named: "phantom_tool", arguments: [:])
+        XCTAssertTrue(emptyErr.json.contains("whitelist names no installed tool"), emptyErr.json)
+
+        harness.resetLoadedToolsToCore()
+    }
+
     /// A turn may contain both a real call and a no-op gesture. The gesture is not
     /// executed, but the assistant turn spliced into the next prompt is built from
     /// the raw generated tokens, so the call is present there — it must still get a

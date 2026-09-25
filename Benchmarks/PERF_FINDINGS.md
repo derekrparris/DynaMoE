@@ -1849,3 +1849,19 @@ keeps exactly one continuation alive). Note: the first cut of these assertions
 paired a complete prefix with a spanning token (candidate "web_searchrch>"),
 which cannot match — corrected. Full fast class: only the two pre-existing
 failures.
+
+Review follow-up (Copilot, Low): a subagent's unknown-tool error printed the
+subagent WHITELIST as "Available tools". The whitelist is not the available set —
+it can name tools that were never registered and omits installed tools outside it —
+so the recovery hint sent the model after tools it could never call.
+
+Fix: `SubagentToolExecutor.callableToolNames` is the whitelist INTERSECTED with the
+harness's installed catalog, and the unknown-tool error now reads
+"Unknown tool 'X'. Allowed tools: <callable>." (or says the whitelist names no
+installed tool, instead of listing nothing). The separate un-whitelisted error
+still reports the declared whitelist, which is accurate under its own label.
+
+Verified: test constructs a real executor for a generated subagent instance and
+checks a fabricated whitelist entry never leaks into the list, the callable
+intersection is advertised, installed-but-un-whitelisted tools keep their distinct
+message, and an all-fabricated whitelist explains itself.
