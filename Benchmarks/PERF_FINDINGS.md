@@ -1794,3 +1794,27 @@ Fix in `ContentView` after the loop:
   guard) before returning. The next turn full re-prefills instead of trusting
   slots that were never computed. The partial reply is already committed to the
   message by the streaming updates, so nothing user-visible is lost.
+
+Review follow-up (Copilot, Medium on the gesture filter): filtering
+`parsedResult.calls` only changed execution — `finalDecoded` (and, more
+importantly, the token splice) still contained the dropped no-op call. In a turn
+with both a gesture and a real call, the assistant turn carried two calls while
+`toolResponseTurn` carried one result, leaving an unmatched call in the
+transcript to invite a retry.
+
+Note on the fix: removing the call from the assistant TEXT cannot work. The next
+prompt is assembled from the raw generated token ids, so a dropped call is in the
+transcript regardless of what the string says — the transcript has to gain a
+matching result instead.
+
+Fix: `AgentHarness.splitGestureCalls` returns the actionable call indices plus a
+skip notice per dropped call (keyed by its index), and the agent loop keeps one
+response slot per emitted call, stamping results into their transcript positions
+and compacting at the end. Gesture calls get no UI chip and are never executed;
+their slot carries
+`[tool] success / skipped: true / reason: no-op gesture … do not re-issue it`.
+Ordering is preserved for mixed turns, so call N always has result N.
+
+Verified: 3 assertions on a [real, gesture, real] turn (indices [0, 2], one skip
+notice at 1, a full 1:1 slot mapping after compaction) plus all-gesture and
+no-gesture turns. Gesture detection suite still passes.

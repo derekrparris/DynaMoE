@@ -11078,10 +11078,16 @@ if layer.attnGateProjTensor != nil,
             // No-op "gesture" calls (shell_run echo/true/:) are the model's way of
             // signalling it is finished. Executing them restarts the loop and
             // produces a duplicate answer bubble, so treat them as turn end.
-            let actionableCalls = parsedResult.calls.filter { !AgentHarness.isNoOpGestureToolCall($0) }
-            if actionableCalls.count != parsedResult.calls.count {
-                let dropped = parsedResult.calls.filter { AgentHarness.isNoOpGestureToolCall($0) }
-                print("🧹 [AGENT] dropped \(dropped.count) no-op gesture call(s) — treating turn as finished")
+            // Gesture calls are skipped but still occupy their slot in the
+            // transcript, so every call the assistant emitted gets exactly one
+            // result (see `splitGestureCalls`).
+            let gestureSplit = AgentHarness.splitGestureCalls(parsedResult.calls)
+            let actionableCallIndices = gestureSplit.actionableIndices
+            let actionableCalls = actionableCallIndices.map { parsedResult.calls[$0] }
+            var responseSlots = [String?](repeating: nil, count: parsedResult.calls.count)
+            for (idx, notice) in gestureSplit.skipNotices { responseSlots[idx] = notice }
+            if !gestureSplit.skipNotices.isEmpty {
+                print("🧹 [AGENT] dropped \(gestureSplit.skipNotices.count) no-op gesture call(s) — treating turn as finished")
             }
             let hasUncalledIntent = runAgentTools && actionableCalls.isEmpty && agentStep == 0 && (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink)
             let willContinueAgent = (!actionableCalls.isEmpty || hasUncalledIntent)
@@ -11279,7 +11285,6 @@ if layer.attnGateProjTensor != nil,
                     }
 
                     let baseWdURL = self.agentWorkingDirectory.isEmpty ? nil : URL(fileURLWithPath: self.agentWorkingDirectory)
-                    var toolResponses: [String] = []
                     var anyCompleted = false
                     var ranCompleteTool = false
 
@@ -11331,7 +11336,7 @@ if layer.attnGateProjTensor != nil,
                                 tool: call.name,
                                 error: "Empty arguments — this call carried no usable parameters and was not executed. Either provide real arguments, or stop calling tools and answer the user directly from what you already know."
                             )
-                            toolResponses.append(emptyArgJSON)
+                            responseSlots[actionableCallIndices[idx]] = emptyArgJSON
                             if !emptyArgJSON.isEmpty {
                                 // Keep record output identical to what the model sees in the
                                 // live observation turn so history reconstruction agrees.
@@ -11379,7 +11384,7 @@ if layer.attnGateProjTensor != nil,
                                     }
                                 }
                                 let rejectJSON = AgentHarness.toolErrorJSON(tool: call.name, error: "Action rejected by user.")
-                                toolResponses.append(rejectJSON)
+                                responseSlots[actionableCallIndices[idx]] = rejectJSON
                                 if let sId = sessionId, let mId = messageId,
                                    let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
                                    let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }),
@@ -11397,7 +11402,7 @@ if layer.attnGateProjTensor != nil,
                             workingDirectory: baseWdURL,
                             maxOutputLength: self.maxToolOutputLength
                         )
-                        toolResponses.append(execResult.resultJSON)
+                        responseSlots[actionableCallIndices[idx]] = execResult.resultJSON
                         if execResult.isCompleted {
                             anyCompleted = true
                         }
@@ -11430,6 +11435,10 @@ if layer.attnGateProjTensor != nil,
                         }
                         return
                     }
+
+                    // Transcript order: one result per call the assistant emitted,
+                    // gestures included.
+                    let toolResponses = responseSlots.compactMap { $0 }
 
                     // If not finished and steps remaining, invoke next step
                     if !anyCompleted && (agentStep + 1 < self.maxAgentSteps) {

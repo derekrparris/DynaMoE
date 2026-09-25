@@ -2814,6 +2814,36 @@ public final class AgentHarness {
         return names
     }
 
+    /// Splits a turn's parsed calls into the ones to execute and the no-op
+    /// "gesture" calls to skip, preserving transcript order.
+    ///
+    /// Gestures still need a matching result in the next prompt: the assistant turn
+    /// spliced into it is built from the RAW generated tokens, so the call is there
+    /// whether or not it ran, and a call with no result reads as a truncated
+    /// exchange that invites the model to re-issue it. `skipNotices` maps each
+    /// dropped call's index in `calls` to the notice the harness reports for it, so
+    /// the caller can lay out one result per call in order.
+    public static func splitGestureCalls(_ calls: [ParsedToolCall]) -> (actionableIndices: [Int], skipNotices: [Int: String]) {
+        var actionableIndices: [Int] = []
+        var skipNotices: [Int: String] = [:]
+        for (idx, call) in calls.enumerated() {
+            if isNoOpGestureToolCall(call) {
+                skipNotices[idx] = gestureSkipNotice(tool: call.name)
+            } else {
+                actionableIndices.append(idx)
+            }
+        }
+        return (actionableIndices, skipNotices)
+    }
+
+    /// The model-facing result reported for a dropped gesture call.
+    public static func gestureSkipNotice(tool: String) -> String {
+        toolSuccessJSON(tool: tool, data: [
+            "skipped": true,
+            "reason": "No-op gesture call (e.g. shell_run with echo/true/:). It cannot advance the task, so the harness treated it as the end of the turn and did not run it. Do not re-issue it."
+        ])
+    }
+
     /// True for calls that cannot advance any task: a `shell_run` whose command is
     /// a bare no-op (`echo`, `true`, `:`, `exit`), which models emit as a "task
     /// finished" gesture when they should have called `complete` or simply ended

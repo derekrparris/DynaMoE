@@ -6801,6 +6801,50 @@ final class DynaMoETests: XCTestCase {
         )
     }
 
+    /// A turn may contain both a real call and a no-op gesture. The gesture is not
+    /// executed, but the assistant turn spliced into the next prompt is built from
+    /// the raw generated tokens, so the call is present there — it must still get a
+    /// result, or the transcript shows a call with no response and the model
+    /// re-issues it.
+    func testGestureCallsKeepTranscriptSlots() {
+        func call(_ name: String, _ command: String?) -> ParsedToolCall {
+            ParsedToolCall(
+                name: name,
+                arguments: command.map { ["command": $0] } ?? [:],
+                rawArguments: command ?? "",
+                rawText: name
+            )
+        }
+
+        // [real, gesture, real] — order must survive compaction.
+        let calls = [
+            call("web_search", nil),
+            call("shell_run", "echo done"),
+            call("file_read", nil)
+        ]
+        let split = AgentHarness.splitGestureCalls(calls)
+
+        XCTAssertEqual(split.actionableIndices, [0, 2], "execution order must follow transcript order")
+        XCTAssertEqual(split.skipNotices.keys.sorted(), [1], "only the gesture call is skipped")
+
+        // One slot per emitted call; the gesture's slot carries a skip notice, so
+        // stamping results in and compacting yields a 1:1 call↔result transcript.
+        var slots = [String?](repeating: nil, count: calls.count)
+        for (idx, notice) in split.skipNotices { slots[idx] = notice }
+        XCTAssertEqual(slots[1]?.contains("skipped"), true)
+        slots[split.actionableIndices[0]] = "{\"tool\":\"web_search\"}"
+        slots[split.actionableIndices[1]] = "{\"tool\":\"file_read\"}"
+        XCTAssertEqual(slots.compactMap { $0 }.count, calls.count, "every call must have a result")
+
+        // All-gesture and no-gesture turns behave too.
+        let allGestures = AgentHarness.splitGestureCalls([call("shell_run", "true"), call("shell_run", ":")])
+        XCTAssertTrue(allGestures.actionableIndices.isEmpty)
+        XCTAssertEqual(allGestures.skipNotices.count, 2)
+        let noGestures = AgentHarness.splitGestureCalls([call("web_fetch", nil)])
+        XCTAssertEqual(noGestures.actionableIndices, [0])
+        XCTAssertTrue(noGestures.skipNotices.isEmpty)
+    }
+
     /// `tools_load` hard-failed on any dialect other than a clean string array, and
     /// a rejected load silently leaves the model without the tool it asked for — an
     /// observed run emitted `{"web_search", "web_fetch"}` (JSON-set braces), got
