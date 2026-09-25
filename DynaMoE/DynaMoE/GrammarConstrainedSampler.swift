@@ -392,6 +392,9 @@ nonisolated public final class GrammarConstrainedSampler {
             let allowedTools = registeredToolNames.filter { $0.hasPrefix(currentPrefix) }
             if allowedTools.isEmpty { return }
 
+            var allowedCount = 0
+            var valveIndex: Int? = nil
+            var valveLogit: Float = 0
             for v in 0..<vocabSize {
                 guard let str = tokenDecoder(UInt32(v)) else { continue }
                 let cand = currentPrefix + str
@@ -401,23 +404,40 @@ nonisolated public final class GrammarConstrainedSampler {
                 // "web_search" + "_fetch" produced `web_search_fetch`, which
                 // both broke the call and emptied the allowed set, silently
                 // dropping the mask for the rest of the name).
-                if allowedTools.contains(where: { $0.hasPrefix(cand) }) { continue }
-                if overshootTerminatesWord(cand, words: registeredToolNames) { continue }
+                if allowedTools.contains(where: { $0.hasPrefix(cand) }) { allowedCount += 1; continue }
+                if overshootTerminatesWord(cand, words: registeredToolNames) { allowedCount += 1; continue }
+                // Dead-end valve: if a tokenizer has no bare '>' token, the strict
+                // rule can mask the entire vocab, and sampling on all -inf logits
+                // yields garbage rather than an error. Remember one token the loose
+                // rule would accept so it can be released below.
+                if valveIndex == nil, overshootStartsWordTerminator(cand, words: registeredToolNames) {
+                    valveIndex = v
+                    valveLogit = logits[v]
+                }
                 logits[v] = -Float.infinity
             }
+            if allowedCount == 0, let valve = valveIndex { logits[valve] = valveLogit }
 
         case .insideParameterName(let toolName, let currentKey):
             guard let validKeys = toolParameterKeys[toolName] else { return }
             let allowedKeys = validKeys.filter { $0.hasPrefix(currentKey) }
             if allowedKeys.isEmpty { return }
 
+            var allowedCount = 0
+            var valveIndex: Int? = nil
+            var valveLogit: Float = 0
             for v in 0..<vocabSize {
                 guard let str = tokenDecoder(UInt32(v)) else { continue }
                 let cand = currentKey + str
-                if allowedKeys.contains(where: { $0.hasPrefix(cand) }) { continue }
-                if overshootTerminatesWord(cand, words: validKeys) { continue }
+                if allowedKeys.contains(where: { $0.hasPrefix(cand) }) { allowedCount += 1; continue }
+                if overshootTerminatesWord(cand, words: validKeys) { allowedCount += 1; continue }
+                if valveIndex == nil, overshootStartsWordTerminator(cand, words: validKeys) {
+                    valveIndex = v
+                    valveLogit = logits[v]
+                }
                 logits[v] = -Float.infinity
             }
+            if allowedCount == 0, let valve = valveIndex { logits[valve] = valveLogit }
 
         case .closingFunction(let matchedPrefix):
             guard enforceStructuralTagContinuation else { return }
@@ -453,6 +473,24 @@ nonisolated public final class GrammarConstrainedSampler {
     /// stays in the name state for it, where no registered word would match the
     /// padded prefix and the mask would silently drop out.
     private func overshootTerminatesWord(_ cand: String, words: Set<String>) -> Bool {
+        for word in words where cand.hasPrefix(word) {
+            var rest = cand.dropFirst(word.count)
+            while rest.first == " " || rest.first == "\t" { rest = rest.dropFirst() }
+            // '>' must END the overshoot. Accepting arbitrary text after it let one
+            // merged token carry the whole tail past this state's mask, and the tail
+            // is where the gates live: "name></function>" closed a call whose
+            // required parameters had never been written (the required-param gate
+            // only ever withholds the `</function>` tag choice, so it cannot see a
+            // token that smuggles the tag in behind a '>'), and "name>junk" began
+            // the body early. The tail must arrive as its own token to be gated.
+            if rest == ">" { return true }
+        }
+        return false
+    }
+
+    /// Loose form of the overshoot test, used ONLY as a dead-end valve: it accepts
+    /// '>' followed by anything. Not a legality rule — see `overshootTerminatesWord`.
+    private func overshootStartsWordTerminator(_ cand: String, words: Set<String>) -> Bool {
         for word in words where cand.hasPrefix(word) {
             var rest = cand.dropFirst(word.count)
             while rest.first == " " || rest.first == "\t" { rest = rest.dropFirst() }

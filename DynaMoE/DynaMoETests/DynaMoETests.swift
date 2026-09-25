@@ -6645,6 +6645,30 @@ final class DynaMoETests: XCTestCase {
             [false, true, true],
             "extending a complete parameter key must be masked out"
         )
+
+        // '>' must END the overshoot: a merged token carrying the tail past this
+        // state would slip behind the gate that withholds `</function>` until the
+        // required parameters are written ("name></function>" closes a call with no
+        // command at all), and "name>junk" starts the body early.
+        XCTAssertEqual(
+            masked("<tool_call><function=web_sea", tokens: ["rch>junk", "rch></function>", "rch>"]),
+            [true, true, false],
+            "only a '>'-terminated overshoot may pass the name state"
+        )
+        XCTAssertEqual(
+            masked("<tool_call><function=web_fetch><parameter=url", tokens: [">junk", ">"]),
+            [true, false],
+            "only a '>'-terminated overshoot may pass the parameter-key state"
+        )
+
+        // Dead-end valve: if no token satisfies the strict rule (a tokenizer with no
+        // bare '>' token), the loosely-allowed one is released instead of leaving
+        // the whole vocab masked — sampling on all -inf logits yields garbage.
+        XCTAssertEqual(
+            masked("<tool_call><function=web_search", tokens: ["_fetch", ">junk"]),
+            [true, false],
+            "the dead-end valve must keep exactly one continuation alive"
+        )
     }
 
     /// Pure-logic coverage for the uncalled-action nudge. A false positive here

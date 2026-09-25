@@ -1818,3 +1818,34 @@ Ordering is preserved for mixed turns, so call N always has result N.
 Verified: 3 assertions on a [real, gesture, real] turn (indices [0, 2], one skip
 notice at 1, a full 1:1 slot mapping after compaction) plus all-gesture and
 no-gesture turns. Gesture detection suite still passes.
+
+Review follow-up (Copilot, Medium on the overshoot rule): `overshootTerminatesWord`
+accepted any remainder that merely STARTED with '>', so a single tokenizer token
+("rch>junk", "rch></function>") was admitted and carried text past the state this
+mask exists to constrain.
+
+Why this is more than cosmetic: the required-parameter gate works by withholding
+the `</function>` TAG CHOICE (`optionsRequiringRequiredParams`), so it cannot see
+a tag smuggled in behind a '>' inside one token. Observed shape it would allow:
+a token like `name></function>` closes a call whose required parameters were never
+written — exactly the structurally-legal-but-empty call the gate was added to
+prevent (QA #23). Since values are unconstrained, "name>junk" also began the body
+early, bypassing the parameter-name state entirely.
+
+Fix: the overshoot must END the word — optional space/tab, then '>' and nothing
+else. The tail now has to arrive as its own token, where the tag-choice masks can
+gate it.
+
+Also added a dead-end valve, since the strict rule is the first one that can
+conceivably mask an entire vocab (a tokenizer with no bare '>' token would have
+no legal continuation while typing a name): the mask pass counts allowed tokens
+and remembers the logit of the first loosely-allowed candidate; if nothing at all
+was allowed, that one token is released. Sampling on all -inf logits silently
+produces garbage rather than an error, so failing open is the safe direction.
+
+Verified: grammar suite extended with '>'-terminated vs '>'+tail cases for both
+the name and parameter-key states, plus a valve case (vocab of ["_fetch", ">junk"]
+keeps exactly one continuation alive). Note: the first cut of these assertions
+paired a complete prefix with a spanning token (candidate "web_searchrch>"),
+which cannot match — corrected. Full fast class: only the two pre-existing
+failures.
