@@ -11036,6 +11036,10 @@ if layer.attnGateProjTensor != nil,
             // Forward the appended-but-uncomputed tail so the pin is real model
             // state. Under JetSpec the range may re-forward one already-written
             // accepted token; re-writing the same token to the same slot is benign.
+            // Invariant: currentStep tracks the last (unforwarded) index, i.e.
+            // currentStep == totalContextTokens - 1, because the decode loop
+            // advances the step BEFORE appending its sampled token (and JetSpec
+            // advances by its batch size). So this loop forwards exactly one token.
             if !generatedTokenIds.isEmpty {
                 let totalContextTokens = promptTokenIds.count + tokensGenerated
                 var backfillPos = Int(currentStep)
