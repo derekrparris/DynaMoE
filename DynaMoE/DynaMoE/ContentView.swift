@@ -11114,9 +11114,22 @@ if layer.attnGateProjTensor != nil,
             // but this run saw repeated degenerate (empty-argument) tool calls — force one
             // final synthesis turn (tools disabled) so the model answers instead of ending
             // in tag noise.
+            //
+            // Gesture guard: a no-op gesture call (bare `echo`/`true`/`:`) is the model's
+            // "task finished" signal, so it ends the turn (QA #31). But when the model
+            // gestures WITHOUT having written any answer — e.g. mid-task, right after a
+            // confusing tool result — ending the run leaves the user with nothing. Force
+            // the same synthesis turn in that case. If the model already wrote an answer
+            // this turn (or earlier), the gesture stands as a normal end.
+            let gestureOnlyTurn = runAgentTools && actionableCalls.isEmpty && !gestureSplit.skipNotices.isEmpty
+            let responseHasAnswer = !AgentHarness.shared.responseTextWithoutToolCalls(finalResp)
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             let shouldForceSynthesis = runAgentTools && !willContinueAgent && !Task.isCancelled
-                && AgentHarness.shared.consecutiveEmptyToolCalls >= 2
-                && finalResp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                && (
+                    (gestureOnlyTurn && !responseHasAnswer)
+                    || (AgentHarness.shared.consecutiveEmptyToolCalls >= 2
+                        && finalResp.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                )
                 && (priorContent ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
             await MainActor.run {
@@ -11200,7 +11213,7 @@ if layer.attnGateProjTensor != nil,
                     let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
                     let synthesisDirective = """
                     \n\n<system>
-                    IMPORTANT: All tool use is now DISABLED for this task. Your recent tool calls carried empty arguments and could not be executed, and the run was forcibly ended to protect the conversation from looping.
+                    IMPORTANT: All tool use is now DISABLED for this task. Your turn ended without a usable tool call — your recent calls carried empty arguments and could not be executed, or you emitted a no-op call that cannot advance the task — so the run was ended to protect the conversation from looping.
                     Using ONLY the tool outputs already shown above in this conversation — plus your own knowledge — now write your complete, self-contained final answer to the user's original question.
                     Do not emit any tool calls. Do not search again. Just answer.
                     </system>
@@ -11355,6 +11368,7 @@ if layer.attnGateProjTensor != nil,
                         // broken scaffold never burns an execution step or an approval.
                         if AgentHarness.hasEmptyRequiredArguments(toolName: call.name, arguments: call.arguments) {
                             AgentHarness.shared.recordToolCallValidity(false)
+                            AgentHarness.shared.recordToolCallOutcome(toolName: call.name, succeeded: false)
                             await MainActor.run {
                                 if let sId = sessionId, let mId = messageId,
                                    let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
@@ -11419,6 +11433,7 @@ if layer.attnGateProjTensor != nil,
                                 }
                                 let rejectJSON = AgentHarness.toolErrorJSON(tool: call.name, error: "Action rejected by user.")
                                 responseSlots[actionableCallIndices[idx]] = rejectJSON
+                                AgentHarness.shared.recordToolCallOutcome(toolName: call.name, succeeded: false)
                                 if let sId = sessionId, let mId = messageId,
                                    let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
                                    let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }),
@@ -11437,6 +11452,10 @@ if layer.attnGateProjTensor != nil,
                             maxOutputLength: self.maxToolOutputLength
                         )
                         responseSlots[actionableCallIndices[idx]] = execResult.resultJSON
+                        AgentHarness.shared.recordToolCallOutcome(
+                            toolName: call.name,
+                            succeeded: execResult.record.status == .success
+                        )
                         if execResult.isCompleted {
                             anyCompleted = true
                         }
@@ -11474,8 +11493,15 @@ if layer.attnGateProjTensor != nil,
                     // gestures included.
                     let toolResponses = responseSlots.compactMap { $0 }
 
+                    // A same-tool failure streak, or too many failed calls overall,
+                    // means the model is re-issuing calls that cannot succeed; stop
+                    // spending steps and force a synthesis turn instead.
+                    let agent = AgentHarness.shared
+                    let toolFailureLoop = agent.consecutiveFailedToolCalls >= agent.failedToolCallLimit
+                        || agent.totalFailedToolCalls >= agent.failedToolCallTotalLimit
+
                     // If not finished and steps remaining, invoke next step
-                    if !anyCompleted && (agentStep + 1 < self.maxAgentSteps) {
+                    if !anyCompleted && !toolFailureLoop && (agentStep + 1 < self.maxAgentSteps) {
                         // Auto-relay: completed background subagents whose final reports have
                         // not yet reached the conversation get injected as SUBAGENT_RESULT
                         // blocks here, so the coordinator can present them to the user.
@@ -11544,6 +11570,8 @@ if layer.attnGateProjTensor != nil,
                         // empty arguments — give the model one final synthesis turn with
                         // tool calling disabled so it actually answers instead of spinning.
                         let escalateToSynthesis = AgentHarness.shared.consecutiveEmptyToolCalls >= 2
+                            || AgentHarness.shared.consecutiveFailedToolCalls >= AgentHarness.shared.failedToolCallLimit
+                            || AgentHarness.shared.totalFailedToolCalls >= AgentHarness.shared.failedToolCallTotalLimit
                         if (AgentHarness.shared.lastSearchGuardAction == .forceSynthesis || escalateToSynthesis) && !ranCompleteTool {
                             let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
                             let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
@@ -11661,11 +11689,18 @@ if layer.attnGateProjTensor != nil,
                         }
                         return
                     }
-                } else if agentStep == 0 && (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.hasTruncatedToolCall(in: finalDecoded) {
-                    // The model abandoned a tool call mid-stream (opener without a
-                    // closer, or a function tag that never closed). The parser
-                    // silently drops such fragments, so without this branch the
-                    // turn simply ends and the intended action never runs.
+                } else if (agentStep + 1 < self.maxAgentSteps)
+                    && gestureSplit.skipNotices.isEmpty
+                    && AgentHarness.shared.hasToolCallMarkup(in: finalDecoded) {
+                    // The model attempted a tool call that the parser could not turn into
+                    // a usable call: a call abandoned mid-stream (opener without a closer),
+                    // a wrong dialect, or a body with no usable parameter. The parser drops
+                    // such fragments silently, so without this branch the turn simply ends
+                    // and the intended action never runs. This must apply at EVERY agent
+                    // step, not just the first: observed a run that stopped dead at step 3
+                    // after the model emitted another malformed call, because the recovery
+                    // was gated to `agentStep == 0`. Gesture calls (intentional end signals)
+                    // are parsed, so they never reach this branch.
                     if Task.isCancelled {
                         await MainActor.run {
                             guard self.ownsGeneration(myGenerationId) else { return }
@@ -11954,7 +11989,6 @@ if layer.attnGateProjTensor != nil,
         
         let memoryExecutionMode = self.memoryExecutionMode
         let memoryBudgetMode = self.memoryBudgetMode
-        let currentSystemPrompt = self.systemPrompt
         let shouldPinBackbone = pinBackboneWeights
 
         Task.detached(priority: .userInitiated) {
@@ -11981,13 +12015,6 @@ if layer.attnGateProjTensor != nil,
                 let dirUrl = isDir.boolValue ? fileUrl : fileUrl.deletingLastPathComponent()
                 let cfg = ModelConfig.load(from: dirUrl)
                 let arch = cfg?.resolveArchitectureType(summary: loadedSummary) ?? (loadedSummary.maxExpertId > 0 ? .hybridSsmMoe : .denseTransformer)
-
-                let sysPrompt: String
-                if currentSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    sysPrompt = ModelConfig.getUserDefaultSystemPrompt()
-                } else {
-                    sysPrompt = currentSystemPrompt
-                }
 
                 // Auto-load tokenizer.json from model directory if present
                 let tokUrl = dirUrl.appendingPathComponent("tokenizer.json")
@@ -12071,7 +12098,14 @@ if layer.attnGateProjTensor != nil,
                     self.shardBuffers = buffers
                     self.modelConfig = cfg
                     self.detectedArchitecture = arch
-                    self.systemPrompt = sysPrompt
+                    // Do NOT restore a system prompt captured before the load here.
+                    // This completion runs asynchronously AFTER switchModel has already
+                    // called applyProfile, so writing back the pre-load value clobbered
+                    // the active profile's prompt (UI showed Assistant while the run used
+                    // the stale coder prompt). Only fill the user default if empty.
+                    if self.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        self.systemPrompt = ModelConfig.getUserDefaultSystemPrompt()
+                    }
                     if let tok = tok {
                         self.tokenizer = tok
                     }

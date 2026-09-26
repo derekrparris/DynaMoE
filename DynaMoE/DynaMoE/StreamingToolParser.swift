@@ -286,21 +286,81 @@ public final class StreamingToolParser {
     /// redirect ("zsh: no such file or directory: parameter=command") and
     /// `web_fetch` rejected it as an invalid URL, each time looping.
     ///
+    /// A related loop: the model re-emits the bare key terminator as the value's
+    /// first line (`<parameter=command>` then `command>`), so the command becomes
+    /// `command>\npython3 …` and zsh fails with "parse error near '\n'". Both the
+    /// bare `<parameter>` opener and that `key>` line are stripped here.
+    ///
     /// Shared by both call parsers so they cannot disagree (the live agent loop
     /// parses with `parseStreamingToolCalls`, not the AgentHarness one).
     public static func unwrapNestedParameterTag(_ value: String) -> String {
         var v = value.trimmingCharacters(in: .whitespacesAndNewlines)
         var guardCount = 0
-        while v.hasPrefix("<parameter="), guardCount < 4 {
-            guard let open = v.range(of: ">") else { break }
-            v = String(v[open.upperBound...])
-            if let close = v.range(of: "</parameter>", options: .backwards) {
-                v = String(v[..<close.lowerBound])
+        while guardCount < 8 {
+            if v.hasPrefix("<parameter=") {
+                guard let open = v.range(of: ">") else { break }
+                v = String(v[open.upperBound...])
+                if let close = v.range(of: "</parameter>", options: .backwards) {
+                    v = String(v[..<close.lowerBound])
+                }
+                v = v.trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if v.hasPrefix("<parameter>") {
+                v = String(v.dropFirst("<parameter>".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if let newline = v.firstIndex(of: "\n") {
+                // The model can re-emit tag-like markup as the value's first lines:
+                // a lone key terminator ("command>") or a made-up tag ("<command>",
+                // "</command>") instead of the content. Drop each such leading line
+                // and descend, so the intended content survives if it is there and,
+                // if the value is ONLY such markup, the caller sees an empty value
+                // (which the empty-argument guard already handles) instead of a
+                // command that fails with a shell parse error every step.
+                let firstLine = v[..<newline].trimmingCharacters(in: .whitespaces)
+                let rest = String(v[v.index(after: newline)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard Self.isSpuriousMarkupLine(firstLine) else { break }
+                v = rest
+                if v.isEmpty { return "" }
+            } else {
+                break
             }
-            v = v.trimmingCharacters(in: .whitespacesAndNewlines)
             guardCount += 1
         }
+        if Self.isSpuriousMarkupLine(v) { return "" }
         return v
+    }
+
+    /// True for a lone markup token that is not real content: a bare `key>`
+    /// terminator, or an angle-bracketed name (`<command>`, `</command>`). A real
+    /// redirect (`> out.txt`, `< input.txt`) or `<<'EOF'` does not match (whole
+    /// line, single token, no spaces).
+    private static func isSpuriousMarkupLine(_ line: String) -> Bool {
+        guard !line.isEmpty, !line.contains(" ") , !line.contains("\t") else { return false }
+        var name = line
+        if name.hasPrefix("</") {
+            name = String(name.dropFirst(2))
+        } else if name.hasPrefix("<") {
+            name = String(name.dropFirst())
+        }
+        guard name.hasSuffix(">") else { return false }
+        name = String(name.dropLast())
+        guard let first = name.first, first.isLetter || first == "_" else { return false }
+        return name.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "." || $0 == "-" }
+    }
+
+    /// Stores a parsed parameter, preferring the FIRST non-empty value when the model
+    /// emits the same parameter name twice. Observed failure: a `shell_run` call with
+    /// two `<parameter=command>` blocks — the real command first, then a human-readable
+    /// echo ("echo check python pandas availability"). Last-wins silently dropped the
+    /// real command and executed the echo, wasting the step. A later value may still
+    /// replace an earlier one that collapsed to empty (noise-only), so both orderings
+    /// recover the real value.
+    static func assignParameter(_ args: inout [String: Any], key: String, value: Any) {
+        guard !key.isEmpty else { return }
+        if let existing = args[key] {
+            let existingEmpty = (existing as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? false
+            let newEmpty = (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? false
+            if !(existingEmpty && !newEmpty) { return }
+        }
+        args[key] = value
     }
 
     /// Decodes a canonical `<parameter=...>` value the same way `AgentHarness.parseAllXMLFunctionCalls`
@@ -376,7 +436,7 @@ public final class StreamingToolParser {
                     let trimmedChunk = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
                     if let key = pendingKey {
                         if !key.isEmpty && !trimmedChunk.isEmpty {
-                            args[key] = Self.decodeParameterValue(trimmedChunk)
+                            Self.assignParameter(&args, key: key, value: Self.decodeParameterValue(trimmedChunk))
                         }
                         pendingKey = nil
                     }
@@ -388,7 +448,7 @@ public final class StreamingToolParser {
                             let key = String(afterEq[..<gt.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
                             let inlineValue = String(afterEq[gt.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
                             if !key.isEmpty, !inlineValue.isEmpty {
-                                args[key] = Self.decodeParameterValue(inlineValue)
+                                Self.assignParameter(&args, key: key, value: Self.decodeParameterValue(inlineValue))
                             } else if !key.isEmpty {
                                 pendingKey = key
                             }

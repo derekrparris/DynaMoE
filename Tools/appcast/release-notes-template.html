@@ -287,8 +287,8 @@
   <div>
     <h1>DynaMoE</h1>
     <div class="meta-line">
-      <span class="ver-chip">v26.0</span>            <!-- EDIT: version -->
-      <span class="build">(Build 26.0)</span>        <!-- EDIT: CFBundleVersion -->
+      <span class="ver-chip">v26.2</span>            <!-- EDIT: version -->
+      <span class="build">(Build 26.2)</span>        <!-- EDIT: CFBundleVersion -->
     </div>
     <div class="tagline">High-Performance MoE Inference Engine for Apple Silicon</div>
   </div>
@@ -298,15 +298,11 @@
 <section>
   <h2>
     <span class="icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.5 14 5v6l-6 3.5L2 11V5l6-3.5Zm0 1.73L3.5 5.87v4.26L8 12.77l4.5-2.64V5.87L8 3.23Zm0 1.6 3.2 1.88v2.58L8 11.17 4.8 9.29V6.71L8 4.83Z"/></svg></span>
-    What's New in 26.0
+    What's New in 26.2
   </h2>
   <div class="card">
-    <h3>JetSpec speculative decoding</h3>
-    <p>Speculative tree decoding verified in a single Metal pass, with KV-cache compaction and MoE expert-budget pruning. Enable via <code>dynamoe_jetspec_enabled</code>.</p>
-  </div>
-  <div class="card">
-    <h3>FP8 KV cache</h3>
-    <p>New E4M3 / E5M2 cache precision unlocks long-context sessions on 16 GB machines. Configure under Settings → <code>dynamoe_kv_cache_precision</code>.</p>
+    <h3>Thinking Accordion Settings</h3>
+    <p>Added a new default setting for the thinking accordion (open or collapsed).</p>
   </div>
 </section>
 
@@ -317,9 +313,7 @@
     Fixes
   </h2>
   <ul class="changes">
-    <li><strong>Tool calls:</strong> StreamingToolParser no longer freezes generation before the closing tag is emitted.</li>
-    <li><strong>Prefix cache:</strong> delta prefill now attends over preserved prefix slots reliably.</li>
-    <li><strong>Memory:</strong> telemetry separates dirty heap from clean zero-copy pages again.</li>
+    <li><strong>Tool calls:</strong> Numerous bug fixes around shell commands and tool calls</li>
   </ul>
 </section>
 
@@ -330,8 +324,8 @@
     Under the Hood
   </h2>
   <div class="spec">
-    <div class="row"><span class="k">Engine</span><span class="v">dynamoe_core 26.0 · Rust + Metal</span></div>
-    <div class="row"><span class="k">Update size</span><span class="v">5.2 MB</span></div>              <!-- EDIT -->
+    <div class="row"><span class="k">Engine</span><span class="v">dynamoe_core · Rust + Metal</span></div>
+    <div class="row"><span class="k">Update size</span><span class="v">19.2 MB</span></div>              <!-- EDIT -->
     <div class="row"><span class="k">Requires</span><span class="v">macOS 15.6+ · Apple Silicon</span></div>
   </div>
 </section>

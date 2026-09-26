@@ -155,7 +155,13 @@ public struct GenerationProfileSettings: Codable, Equatable, Hashable {
         if isOrnith {
             switch type {
             case .coder:
-                // Official Ornith-1.5-9B Precise Coding & Tool Calling Profile
+                // Official Ornith-1.5-9B Precise Coding & Tool Calling Profile.
+                // Note: an earlier revision raised repetitionPenalty here (1.10 /
+                // 1.20) to fight template loops, but that is counterproductive —
+                // the penalty also perturbs VERBATIM copying (the model mangled
+                // `/Users/derekparris` to `derekeparris`/`derek Harris`), and it did
+                // not stop the loops anyway. Kept at the official 1.00; loop damage
+                // is handled by the parser repair + failure caps instead.
                 return GenerationProfileSettings(
                     temperature: 0.60,
                     topP: 0.95,

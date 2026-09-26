@@ -2014,3 +2014,333 @@ Tests: `testNoOpGestureToolCallDetection` now asserts the gesture record's shape
 (isGesture, name, status, rendered notice) and that `splitGestureCalls` reports
 the skipped index. Verified: test passes, full fast class shows only the two
 pre-existing failures.
+
+### QA #41 — "off the rails" after a large tool dump: nested-tag value loop (release + debug)
+
+Both regressions reported after the release are the SAME task — "analyze this CSV
+in ~/Downloads" — and both start right after a nearly-complete large tool result
+that got truncated.
+
+- Session `2260612F` (19:16–19:26): step0 emitted a clean `head -5`; step1 then
+  degenerated into `<parameter=command>` followed by a run of bare `<parameter>`
+  openers with no value and no closers. The harness closed the block with one
+  `</tool_call>`; the parser handed `shell_run` a value of literal `<parameter>`
+  markup; zsh failed (`parse error near '\n'`); the malformed turn entered history
+  and the model re-emitted the same shape for seven steps.
+- Session `A884D96F` (19:34–19:51): step0 clean `cat`; the model then minted a
+  wrong filename (`/Users/derek Harris/…`, dropping the `_`/`,`) and re-issued the
+  failing `wc -l` until an `ls` finally showed the real name.
+
+Mechanical checks were clean: system prompt unchanged pre/post merge; prompts
+well-formed; tag balance correct (the "extra closers" were only the dump's
+divergence-window header); `splice-vs-reencode` IDENTICAL for every session-B
+turn and a benign 1-token divergence for session A. Crucially, `unclosedToolCallCount`
+returns the same value for these turns under the new scanner and the old
+substring counter, so the recent closure/splice work does NOT change these
+continuations — the prompts are byte-identical to the previous build's.
+
+Root cause: the parameter-VALUE state was unconstrained, so once the model began
+echoing `<parameter` inside the value it could loop there forever. The active
+Ornith profile (`ModelProfileManager`, ornith `.coder`) uses `temperature 0.60,
+repetitionPenalty 1.00` — no repetition penalty — so nothing discouraged the
+repeat, and the `<<<TRUNCATED>>>` marker (with no `next_start_line` for
+`shell_run`) is exactly what prompted the model to try again.
+
+Fixes:
+1. `GrammarConstrainedSampler` now masks the value state so it can never re-open
+   `<parameter`/`<arg_value`. Single-token openers are withheld from a set built
+   once per tokenizer (`ensureOpenerTokenIds`); a split opener (tail sitting on
+   `<`, `<pa`, …) triggers an O(vocab) completion scan (`endsWithOpenerPartial`).
+   Nested tags are never valid — the parser already rewrites them as a repair.
+2. `shell_run` truncation now adds a `note` telling the model NOT to re-run the
+   same command, but to narrow (head/tail/grep/sed) or write a summary to a file
+   and page it with `file_read`. The bare marker was the retry trigger.
+3. `AgentHarness.consecutiveFailedToolCalls` tracks same-tool failure streaks
+   (`recordToolCallOutcome`); at `failedToolCallLimit` (4) the run ends with the
+   forced-synthesis turn instead of burning the remaining steps. Mirrors the
+   existing empty-arg / search / web-fetch guards.
+
+Tests: `testGrammarMaskBlocksNestedTagInParameterValue` (whole opener, split
+opener, and a legitimate `</parameter>` that must stay allowed) and
+`testConsecutiveFailedToolCallStreak`. Verified: `swiftc -typecheck` clean,
+`xcodebuild build` succeeded, full fast class shows only the two pre-existing
+failures.
+
+### QA #42 — second CSV retest: path-copy fidelity + thrash-with-successes (release)
+
+Re-run of the same "analyze this CSV" task, twice (two step0 dumps → sessions
+`2260612F` and `8E56D734`). The grammar fix held — the `<parameter>` loop is gone
+— but a new shape of the same disease appeared in `8E56D734`:
+
+- step1 is a clean `head -5`; the ~10k-token CSV dump comes back truncated.
+- step2 the model writes a Python heredoc, but the path is mangled to
+  `/Users/derekparris/Downloads/LDW End of Engagement Survey.csv` — the
+  `_September 25, 2026_14.06` suffix dropped. FileNotFound.
+- It then thrashes for six more steps: `/Users/derekarris/...` (missing `p`),
+  literal `...` placeholders, then the invented `/Users/derek Harris/...` that
+  earlier session B also produced, and heredocs with DUPLICATED terminators
+  (`PYEOF\nPYEOF\nEOF`, `EOF\nEOF`) so even successful-looking writes error with
+  `zsh: command not found: PYEOF`.
+
+Not a prompt bug: `splice-vs-reencode` is IDENTICAL for every step, and the exact
+filename is in the prompt verbatim twice (user message + step0 call). It is the
+model losing copy fidelity after the big tool result — and the consecutive
+failure streak never tripped because partial successes (writing a script,
+listing a dir) reset it every few steps.
+
+Fixes:
+1. `AgentHarness.missingPathRepairHint` — on a "no such file" failure it finds
+   the non-existent `/Users/…` or `/home/…` path in the command, lists the real
+   names in that directory (up to six, ranked by shared prefix), and tells the
+   model to copy the exact name. Wired into `shell_run`'s error hint. This is the
+   direct break for the path-mangling loop.
+2. `AgentHarness.totalFailedToolCalls` (limit 6) — counts ALL failed calls in the
+   run regardless of interspersed successes, and escalates to the forced-synthesis
+   turn like the consecutive streak. The streak alone cannot bound a thrash that
+   succeeds every few steps.
+
+Tests: `testMissingPathRepairHintSuggestsRealSibling` and an extended
+`testConsecutiveFailedToolCallStreak` (total survives successes; switching tools
+restarts only the consecutive). Verified: `swiftc -typecheck` clean,
+`xcodebuild build` succeeded, full fast class shows only the two pre-existing
+failures.
+
+### QA #43 — grammar mask redirected the loop; repair the value, and give the model a repetition penalty
+
+Re-run of the same task (`2A60624E`), now with a short path (`Survey_Data.csv`)
+so the path-mangling is out of the picture. The model still degenerated, but in a
+new shape — and it points at the grammar fix from QA #41:
+
+    <tool_call>
+    <function=shell_run>
+    <parameter=command>
+    command>
+    python3 << 'EOF'
+    ...
+    EOF
+    </parameter>
+
+The value's first line is `command>` — the model re-emitted the key terminator.
+The parsed command became `command>\npython3 …`, so zsh failed with
+`parse error near '\n'`, and it repeated for every following step. `command>`
+appears ONLY in this session's dumps (not before QA #41), so masking `<parameter`
+inside the value did not remove the degeneration — it redirected it to the next
+token. Whack-a-mole.
+
+Two fixes:
+
+1. `StreamingToolParser.unwrapNestedParameterTag` now strips a value's leading
+   spurious markup: a bare `<parameter>` opener AND a lone `key>` line (the
+   duplicated key terminator). A legitimate multi-line value or a real redirect
+   (`> out.txt`) does not match, so real content is untouched. With this the
+   `command>` case parses to the intended `python3 << 'EOF' …` and RUNS, so the
+   loop breaks by success rather than by another guard.
+
+2. `ModelProfileManager` Ornith `.coder` repetitionPenalty 1.00 → 1.10 (the only
+   deviation from the official 1.00 profile; documented in the code and the
+   profile test). At 1.00 there is no penalty and the model freely repeats the
+   just-emitted tag/key/terminator. This is the lever that should stop the
+   degeneration at the source; it is a one-line revert if 35B quality suffers.
+
+Tests: `testSpuriousKeyTerminatorInParameterValue` (both parsers recover the
+command; normal value and real redirect untouched) and the Ornith profile
+assertion updated to 1.10. Verified: `swiftc -typecheck` clean, `xcodebuild
+build` succeeded, full fast class shows only the two pre-existing failures.
+
+### QA #44 — the loop token morphs (`<parameter>` → `command>` → `<command>`); recover the value, don't chase the token
+
+The 12:38–13:58 dumps are ONE session (`CDCDBA27`): step0 at 12:38 ran well
+(steps 1–5 wrote and ran scripts successfully), fumbled around step 7–9 (a
+`/tmp/bin/python` attempt), and after a follow-up message the model degenerated
+into a `<command>` loop:
+
+    <parameter=command>
+    <command>
+    <command>
+    … ten lines …
+    <</tool_call>
+
+The value had NO real command — the model's thinking was coherent ("let me check
+the python@3.14 install directory") but it failed to emit the command, and the
+free-form value state repeated tag-like tokens. Note the loop token keeps
+changing between sessions: `<parameter>` (QA #31/A), `command>` (QA #43),
+`<command>` (here). Chasing each one with grammar rules is whack-a-mole; the
+repetition penalty (1.10) was too weak to overcome a sharply peaked repeat.
+
+Fixes:
+
+1. `StreamingToolParser.unwrapNestedParameterTag` now strips leading tag-shaped
+   markup lines generically — `<command>`, `</command>`, `command>` — not just
+   `<parameter…>`. A value that is ONLY such noise collapses to EMPTY, which the
+   existing empty-argument guard catches: the call is not executed, it counts
+   toward `consecutiveEmptyToolCalls` (>= 2) and the failure caps, so the run ends
+   with a synthesis turn after two loops instead of seven parse errors. When real
+   content follows the noise it is recovered as before. Real redirects (`> out.txt`,
+   `< input.txt`) and `<<'EOF'` do not match (whole line, single token, no spaces).
+
+2. `ModelProfileManager` Ornith `.coder` repetitionPenalty 1.10 → 1.20 (still the
+   only deviation from the official 1.00 profile).
+
+Not fixed, and worth stating plainly: the model is failing to PRODUCE the
+command. Harness repairs only stop the damage; they cannot invent the command.
+If this persists, the next lever is sampling (temperature) or disabling grammar
+masking as a diagnostic — and ultimately the model may be the limit on this task.
+
+Tests: `testSpuriousKeyTerminatorInParameterValue` extended (`<command>`/`</command>`/
+`command>` collapse to empty; the live parser surfaces an empty command so the
+guard catches it) and the profile assertion updated to 1.20. Verified:
+`swiftc -typecheck` clean, `xcodebuild build` succeeded, full fast class shows
+only the two pre-existing failures.
+
+### QA #45 — agents must check Homebrew before calling a package missing
+
+Field report: the agent repeatedly concludes a tool/library is "not installed"
+when it is actually brew-managed, because it only checks `which <tool>`, the
+system interpreter, or `/usr/local`. On this machine that is the common case
+(e.g. `python@3.14` under `/opt/homebrew/opt`, brew formula tools), so the model
+wastes steps trying to install or work around something that already exists.
+
+Fix (prompt/tool guidance only, no behavior change):
+
+- New system-prompt section `# Local Environment & Homebrew` (all models,
+  including Ling): check `brew --version`, `brew list --formula` / `--cask`,
+  `brew --prefix <formula>`, and `which -a <tool>` BEFORE concluding anything is
+  missing; enumerate language runtimes (e.g. the several `python3`s) and query a
+  specific interpreter directly; never install/upgrade unless asked; when
+  reporting a missing dependency, state that Homebrew was checked.
+- `shell_run`'s tool description now carries the same rule, so it is visible even
+  if a model skims the system prompt.
+
+Tests: `testAgentHarnessToolCalling` asserts the section and its key commands are
+present in the built prompt. Verified: `swiftc -typecheck` clean, `xcodebuild
+build` succeeded, full fast class shows only the two pre-existing failures.
+
+### QA #46 — reverted the Ornith repetition-penalty bump (it broke verbatim copying)
+
+Follow-up to QA #43/#44. Field report: the agent copied the attached path
+correctly under the `.assistant` profile, but mangled it immediately under
+`.coder` (`/Users/derekparris/…` → `derekeparris`, `derekarris`) after a rebuild.
+
+The comparison is confounded — the well-behaved run was `.assistant` on a build
+WITHOUT the QA #45 Homebrew section, the failing run was `.coder` on the build
+WITH it. But the Homebrew section is static brew guidance and cannot change how
+the model copies a username. The real difference is the profile, and every coder
+run in the dumps mangles the path.
+
+The repetition penalty I added is the wrong lever: it penalizes tokens already in
+the recent window, and the username sits right there, so it nudges the model to
+ALTER a verbatim copy. It also never stopped the template loops (they occur at
+1.00 as well). Reverted `ModelProfileManager` Ornith `.coder` repetitionPenalty
+1.20 → 1.00 (official). Loop damage stays handled by the parser repair + failure
+caps from QA #42–#44.
+
+Remaining profile delta from the assistant config that worked: temperature 0.60
+vs 1.00 and presencePenalty 0.00 vs 1.50. If coder still mangles the path at
+1.00, the next step is to align those rather than touch penalties.
+
+Tests: profile assertion back to 1.00. Verified: `swiftc -typecheck` clean,
+`xcodebuild build` succeeded, full fast class shows only the two pre-existing
+failures. (`testModelSpecificProfilesCoderAndAssistant` flaked once in a full
+run, then passed on re-run; it reads shared UserDefaults.)
+
+### QA #47 — model load clobbered the active profile's system prompt (UI/profile desync)
+
+Field report: on app launch the Assistant profile was shown as active (it is set
+from the persisted `dynamoe_model_global_active_profile_v1` / per-model map and
+the UI reflects it), yet the run's own prompt dump showed the CODER system prompt
+(`"You are an expert software engineer and programming assistant…"`) and coder
+sampling. The Assistant profile's prompt (`"You are a helpful, respectful, and
+honest AI assistant."`) never appeared in the prompt.
+
+Root cause (ordering bug in `ContentView.loadAndBridgeToMetal`, NOT in
+`ModelProfileManager`): the loader captured `self.systemPrompt` before starting
+its detached task, then wrote that captured value BACK on completion:
+
+    let currentSystemPrompt = self.systemPrompt   // captured at call time
+    ...
+    await MainActor.run { ... self.systemPrompt = sysPrompt }
+
+Launch order is `onAppear -> switchModel -> loadAndBridgeToMetal` (starts the
+async load) followed immediately by `applyProfile(.assistant, …)` (sets the
+correct prompt). Because the load completes LATER, its stale write won: the
+profile-applied prompt was overwritten by whatever `self.systemPrompt` held
+before `applyProfile` ran — the persisted user-default prompt, which had been
+set to the coder text via "Save as Default". Result: `activeProfile == .assistant`
+while the model ran the coder prompt.
+
+Fix: the load completion no longer restores a pre-load prompt. It only fills the
+user default when `systemPrompt` is empty. The profile (via `applyProfile`, which
+every `switchModel`/session-change/open-panel path already calls) is authoritative.
+
+Verified against the live machine state: `~/Library/Preferences/DRP.DynaMoE.plist`
+(non-sandboxed store — the sandbox container plist is stale and lacks profile
+keys) holds `dynamoe_user_default_system_prompt` = the coder text and
+`dynamoe_model_active_profiles_v1["ornith-ai/ornith-1.5-35b-a3b-fp8"] = "Assistant"`,
+exactly matching the reported desync. Dump `prompt-step0-…19-18-48Z.txt` contains
+`expert software engineer` and not `helpful, respectful`.
+
+Tests: new `testOrnith35BFamilyProfileResolution` (35B key normalizes to
+`ornith-ai/ornith-1.5-35b-a3b-fp8`, snapshot path normalizes to the same key, and
+`.assistant` resolution returns temp 1.00 / presence 1.50 / the assistant prompt).
+Also repaired a dangling edit in `testModelSpecificProfilesCoderAndAssistant`
+(missing `let manager = ModelProfileManager.shared`). Verified: `swiftc -parse`
+clean, both profile tests pass via `xcodebuild test`.
+
+### QA #48 — duplicate parameter executed the wrong command; malformed call at step>0 ended the run silently
+
+Two defects surfaced in one run (session 753AF4D4, `prompt-step0-…20-06-54Z.txt`);
+the profile fix from QA #47 held (every dump carries the Assistant system prompt).
+
+**(a) Duplicate `<parameter=command>` — last value won.** At step 3 the model emitted
+two command parameters in one `shell_run`:
+
+    <parameter=command>
+    python3 -c "import pandas; print(pandas.__version__)" && ls -la …/Survey_Data.csv
+    </parameter>
+    <parameter=command>
+    echo check python pandas availability
+    </parameter>
+
+Both parsers (`StreamingToolParser.parseStreamingToolCalls` dialect path and
+`AgentHarness.parseAllXMLFunctionCalls`) assigned with `args[key] = value`, so the
+trailing human-language echo OVERWROTE the real command. The harness ran the echo,
+the intended pandas/ls check never happened, and the model got a useless result.
+Fix: `StreamingToolParser.assignParameter` keeps the FIRST non-empty value; a later
+value may still replace an earlier one that collapsed to empty (noise-only), so both
+orderings recover the real value.
+
+**(b) A malformed tool call at step > 0 ended the run with no recovery.** The turn
+that followed produced no further dump: the parser returned zero usable calls, and the
+only recovery branches for "model tried to call a tool but it did not parse" were gated
+to `agentStep == 0` (`hasTruncatedToolCall` / `detectUncalledActionIntent`). At step 3
+the run simply fell out of the harness with `willContinueAgent == false`, the model's
+raw output left in the bubble, no re-prompt and no answer. Fix: new
+`AgentHarness.hasToolCallMarkup(in:)` (true when the text contains `<tool_call>` or
+`<function=`) and the recovery branch now fires at ANY agent step when a turn carried
+tool-call markup but produced no actionable call — provided no gesture call ended the
+turn. Bounded by `maxAgentSteps`.
+
+Tests: `testDuplicateParameterPrefersRealValue` (real value wins over the trailing
+echo, via both the live parser and the canonical parser; noise-first ordering still
+recovers a later real value; `hasToolCallMarkup` true for attempted calls, false for a
+plain answer). Verified: `swiftc -parse` clean, parser tests pass.
+
+**(c) The actual stop was a no-op gesture — the console confirmed it.** The app log
+from the run ends with `🧹 [AGENT] dropped 1 no-op gesture call(s) — treating turn as
+finished`, followed by `📌 [PREFIX] pinned 6678 tokens (prompt=6437 gen=241)` — a
+6437-token prompt matching exactly `prompt-step3`'s `promptTokens=6437`. So the turn
+after the bad tool result emitted a bare no-op `shell_run` (a "task finished" gesture per
+QA #31) and the harness ended the run by design, with no final answer.
+
+QA #31's gesture handling is right when the model gestures AFTER writing its answer
+(otherwise a second re-summary bubble). It is wrong when the model gestures WITHOUT any
+answer — the run just stops and the user gets nothing. Fix: after the gesture drop, if
+the model wrote no answer this turn (and there is no prior content in the bubble), force
+the existing tools-disabled synthesis turn so the user gets an answer. `responseTextWithoutToolCalls`
+strips `<tool_call>…</tool_call>` blocks so a gesture commingled with a real answer still
+ends normally. The synthesis directive now names both causes (empty-argument calls or a
+no-op end-of-turn call).
+
+Tests: gesture assertions added to `testDuplicateParameterPrefersRealValue` (answer+gesture
+still counts as an answer; gesture-only strips to empty). Verified: `swiftc -parse` clean,
+`testDuplicateParameterPrefersRealValue` and `testNoOpGestureToolCallDetection` pass.

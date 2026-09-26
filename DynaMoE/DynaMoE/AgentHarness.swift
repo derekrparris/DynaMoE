@@ -130,7 +130,7 @@ public extension AgentTool {
 public final class ShellRunTool: AgentTool {
     public let definition = ToolDefinition(
         name: "shell_run",
-        description: "Executes shell commands on the local macOS terminal via zsh. Use this for local work: scripts, compilers, git, build and system state. Output is captured and returned. To READ A WEB PAGE, use web_fetch with a url from web_search results; do NOT scrape pages with curl/wget piped into grep/sed, and do not hand-write shell regexes for page content. PATH includes /opt/homebrew/bin, /usr/local/bin, ~/.cargo/bin and ~/.local/bin, so brew/cargo/pip-user tools resolve directly.",
+        description: "Executes shell commands on the local macOS terminal via zsh. Use this for local work: scripts, compilers, git, build and system state. Output is captured and returned. To READ A WEB PAGE, use web_fetch with a url from web_search results; do NOT scrape pages with curl/wget piped into grep/sed, and do not hand-write shell regexes for page content. PATH includes /opt/homebrew/bin, /usr/local/bin, ~/.cargo/bin and ~/.local/bin, so brew/cargo/pip-user tools resolve directly. Homebrew is the usual installer on macOS: before calling a tool or package missing, check `brew --version`, `brew list --formula`, and `brew --prefix <formula>` — a bare `which` or the system interpreter will miss brew installs.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
@@ -179,10 +179,17 @@ public final class ShellRunTool: AgentTool {
 
         if exitCode == 0 {
             print("🛠 [shell_run] exit=0 cmd='\(String(command.prefix(100)))'")
-            let res = AgentHarness.toolSuccessJSON(tool: "shell_run", data: [
+            var data: [String: Any] = [
                 "stdout": cleanStdout.isEmpty ? "Command succeeded with no output." : cleanStdout,
                 "exit_code": 0
-            ])
+            ]
+            // The marker alone leaves the model trying to "get the full file"
+            // again, which is how a large dump turns into a retry loop. Say what
+            // to do instead.
+            if cleanStdout.contains("<<<TRUNCATED") || cleanStdout.contains("<<<LINE TRUNCATED") {
+                data["note"] = "Output was truncated for the context budget. Do NOT re-run the same command to print it in full. Narrow the command (head/tail/grep/sed for just the fields you need), or have it write a summary to a file and read that with file_read (which pages with start_line)."
+            }
+            let res = AgentHarness.toolSuccessJSON(tool: "shell_run", data: data)
             return (res, cleanStdout, nil, false)
         } else {
             print("🛠 [shell_run] exit=\(exitCode) cmd='\(String(command.prefix(100)))' stderr='\(String(cleanStderr.prefix(160)))' stdout='\(String(cleanStdout.prefix(80)))'")
@@ -191,9 +198,11 @@ public final class ShellRunTool: AgentTool {
             // otherwise retries the same broken shape until it degenerates.
             let syntaxSignals = ["unmatched", "syntax error", "parse error", "bad pattern", "no matches found"]
             let looksLikeSyntaxError = syntaxSignals.contains { cleanStderr.lowercased().contains($0) }
-            let hint = looksLikeSyntaxError
+            let syntaxHint = looksLikeSyntaxError
                 ? "\nHint: this is a shell quoting/syntax error. To read a web page, call web_fetch with a url from the web_search results instead of piping curl into grep. Otherwise simplify the command: avoid nested quotes and hand-written regexes with brackets or pipes in them."
                 : ""
+            let missingPathHint = AgentHarness.missingPathRepairHint(command: command, stderr: cleanStderr, stdout: cleanStdout)
+            let hint = syntaxHint + missingPathHint
             let baseError = cleanStderr.isEmpty ? cleanStdout : cleanStderr
             let res = AgentHarness.toolErrorJSON(tool: "shell_run", error: baseError + hint, extra: [
                 "exit_code": exitCode,
@@ -2756,6 +2765,9 @@ public final class AgentHarness {
         webSearchDisabled = false
         lastSearchGuardAction = .none
         consecutiveEmptyToolCalls = 0
+        consecutiveFailedToolCalls = 0
+        lastFailedToolName = nil
+        totalFailedToolCalls = 0
         recentSearchResultURLs.removeAll()
         consecutiveWebFetchFailures = 0
         if tools["web_search"] != nil && loadedTools["web_search"] == nil {
@@ -2918,6 +2930,36 @@ public final class AgentHarness {
             consecutiveEmptyToolCalls = 0
         } else {
             consecutiveEmptyToolCalls += 1
+        }
+    }
+
+    /// Consecutive tool calls (across agent steps) that all FAILED and all targeted
+    /// the same tool. A model that keeps re-issuing a call that cannot succeed
+    /// (e.g. the same unreadable path, or a malformed command it repeats) burns
+    /// its whole step budget on guaranteed errors; this streak lets the harness
+    /// escalate to a forced synthesis turn instead.
+    public private(set) var consecutiveFailedToolCalls: Int = 0
+    private var lastFailedToolName: String?
+    /// Consecutive same-tool failures before the run is ended with a synthesis turn.
+    public var failedToolCallLimit: Int = 4
+    /// ALL failed tool calls in the run, regardless of interspersed successes. A
+    /// model can thrash with a success every few steps (write a script, then fail
+    /// to run it), so the consecutive streak never trips; this bounds the total.
+    public private(set) var totalFailedToolCalls: Int = 0
+    public var failedToolCallTotalLimit: Int = 6
+
+    public func recordToolCallOutcome(toolName: String, succeeded: Bool) {
+        if succeeded {
+            consecutiveFailedToolCalls = 0
+            lastFailedToolName = nil
+        } else {
+            totalFailedToolCalls += 1
+            if lastFailedToolName == toolName {
+                consecutiveFailedToolCalls += 1
+            } else {
+                consecutiveFailedToolCalls = 1
+                lastFailedToolName = toolName
+            }
         }
     }
 
@@ -3149,6 +3191,20 @@ public final class AgentHarness {
         Truncation markers (`<<<TRUNCATED: ... omitted>>>`, `<<<LINE TRUNCATED>>>`) mark spans cut for context budget — they are harness annotations, NOT file content. When a result reports `next_start_line` or `continuation_hint`, call the tool again with that `start_line` to page through the rest instead of assuming the document is broken.
 
         Documents exported from editors often contain harmless artifacts that are NOT corruption: image placeholders like `![][image12]` (missing embedded images/formulas), citation footnote digits glued to sentence ends (e.g. "hardware1", "clusters1"), and escaped punctuation (`\\_`, `\\~`, `\\=`, `\\-`). Also ignore `[inline base64 data omitted ...]` placeholders where binary images were stripped. Interpret these as export artifacts and read the text around them; never conclude that a product, file, or document "is corrupted", "is not real", or "does not exist" because of them.
+        """
+
+        prompt += """
+
+        # Local Environment & Homebrew
+
+        This is macOS, and Homebrew is the usual way developer tools, languages, and libraries get installed. Installs that only look at the system Python, `/usr/local`, or a bare `which <tool>` routinely MISS brew-managed packages, leading to false "not installed" conclusions and wasted steps. Treat Homebrew as a first-class source and check it BEFORE concluding anything is missing:
+
+        - Is Homebrew present? `brew --version`. If it is, you can use it.
+        - What is installed? `brew list --formula` and `brew list --cask` (you may filter, e.g. `brew list --formula | grep -i python`).
+        - Where does a given package live? `brew --prefix <formula>` (e.g. `brew --prefix python@3.14`). Brew installs under `/opt/homebrew` on Apple Silicon and `/usr/local` on Intel; both bin dirs are already on your PATH.
+        - For an executable, check every copy, not just the first: `which -a <tool>`.
+        - For a language runtime or library, enumerate the real installs before assuming absence. Python example: `which -a python3 python | cat; ls /opt/homebrew/opt 2>/dev/null | grep -i python; brew list --formula | grep -i python`, and query a specific interpreter directly with `<interpreter> -c "import module"` rather than trusting the default `python3`.
+        - Do NOT install or upgrade anything unless the user asked you to. When you report a dependency as missing, say explicitly that you checked Homebrew and what you found.
         """
 
         if isLingModel {
@@ -3391,8 +3447,7 @@ public final class AgentHarness {
     /// closing angle bracket. The parser drops such fragments silently, so the
     /// turn would otherwise end with the intended action never executed and no
     /// recovery nudge (observed: a function tag cut off before its parameters).
-    public func hasTruncatedToolCall(in text: String) -> Bool {
-        if let openRange = text.range(of: StreamingToolParser.qwenToolCallOpen, options: .backwards) {
+    public func hasTruncatedToolCall(in text: String) -> Bool {        if let openRange = text.range(of: StreamingToolParser.qwenToolCallOpen, options: .backwards) {
             if text.range(of: StreamingToolParser.qwenToolCallClose, range: openRange.upperBound..<text.endIndex) == nil {
                 return true
             }
@@ -3405,6 +3460,29 @@ public final class AgentHarness {
             return true
         }
         return false
+    }
+
+    /// True when the text carries tool-call markup at all (`<tool_call>` / `<function=`),
+    /// regardless of whether it parsed. Used to recover a turn where the model ATTEMPTED
+    /// a call that the parser could not turn into a single actionable call — a truncated
+    /// fragment, a wrong dialect, or a body with no usable parameter. Without this the
+    /// agent run ended silently mid-task: `hasTruncatedToolCall` misses a call that is
+    /// closed but malformed, and the recovery branch was gated to the first step only.
+    public func hasToolCallMarkup(in text: String) -> Bool {
+        text.contains(StreamingToolParser.qwenToolCallOpen)
+            || text.contains(StreamingToolParser.qwenFunctionOpen)
+    }
+
+    /// Response text with every `<tool_call>…</tool_call>` block removed, so callers can
+    /// ask whether the model actually WROTE an answer this turn (as opposed to only
+    /// emitting tool-call markup). Used to decide whether a gesture-ended turn still
+    /// owes the user a final answer.
+    public func responseTextWithoutToolCalls(_ text: String) -> String {
+        guard let re = try? NSRegularExpression(
+            pattern: "<tool_call>[\\s\\S]*?</tool_call>", options: []
+        ) else { return text }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return re.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: " ")
     }
 
     /// Recovery nudge for a truncated tool call. System-framed for the same
@@ -3570,9 +3648,9 @@ public final class AgentHarness {
                     if let data = pValStr.data(using: .utf8),
                        let jsonVal = try? JSONSerialization.jsonObject(with: data, options: .fragmentsAllowed),
                        (jsonVal is [String: Any] || jsonVal is [Any] || jsonVal is NSNumber) {
-                        args[pName] = jsonVal
+                        StreamingToolParser.assignParameter(&args, key: pName, value: jsonVal)
                     } else {
-                        args[pName] = pValStr
+                        StreamingToolParser.assignParameter(&args, key: pName, value: pValStr)
                     }
                 }
             }
@@ -3769,6 +3847,55 @@ public final class AgentHarness {
     public static func looksLikeWebFetchCommand(_ command: String?) -> Bool {
         guard let lowered = command?.lowercased(), !lowered.isEmpty else { return false }
         return lowered.contains("curl") || lowered.contains("wget")
+    }
+
+    /// When a command fails because a user path does not exist, name the files that
+    /// actually live in that directory so the model can copy the exact name instead
+    /// of mangling it again. Observed failure: after a ~10k-token CSV dump the model
+    /// drops the date suffix from the path, then invents "/Users/derek Harris", and
+    /// burns its whole step budget re-issuing the same FileNotFound command.
+    static func missingPathRepairHint(command: String, stderr: String, stdout: String) -> String {
+        let errorText = (stderr + "\n" + stdout).lowercased()
+        let missingSignals = ["no such file", "filenotfound", "cannot find", "does not exist", "not found"]
+        guard missingSignals.contains(where: { errorText.contains($0) }) else { return "" }
+
+        let separators = CharacterSet(charactersIn: " \t\n'\"`;|&()[]{}<>=,")
+        var seen = Set<String>()
+        for raw in command.components(separatedBy: separators) {
+            // Only the user's own data paths: /tmp script paths and system dirs are
+            // never the intended attachment.
+            guard raw.hasPrefix("/Users/") || raw.hasPrefix("/home/") else { continue }
+            var token = raw
+            while let last = token.last, ".,:".contains(last) { token.removeLast() }
+            guard token.count > 1, !seen.contains(token) else { continue }
+            seen.insert(token)
+
+            let url = URL(fileURLWithPath: token)
+            let dir = url.deletingLastPathComponent()
+            let fm = FileManager.default
+            guard !fm.fileExists(atPath: token), fm.fileExists(atPath: dir.path) else { continue }
+            let entries = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
+            let wanted = url.lastPathComponent.lowercased()
+            guard !wanted.isEmpty else { continue }
+            let ranked = entries
+                .filter { $0.lowercased() != wanted }
+                .sorted { sharedPrefixLength($0.lowercased(), wanted) > sharedPrefixLength($1.lowercased(), wanted) }
+            guard let best = ranked.first, sharedPrefixLength(best.lowercased(), wanted) >= 3 else { continue }
+            let list = ranked.prefix(6).map { "  \($0)" }.joined(separator: "\n")
+            return "\nHint: \(token) does not exist. The actual names in \(dir.path) are:\n\(list)\nUse one of these EXACT names, copied in full (spaces, commas and underscores included)."
+        }
+        return ""
+    }
+
+    private static func sharedPrefixLength(_ a: String, _ b: String) -> Int {
+        var count = 0
+        var i = a.startIndex, j = b.startIndex
+        while i < a.endIndex, j < b.endIndex, a[i] == b[j] {
+            count += 1
+            i = a.index(after: i)
+            j = b.index(after: j)
+        }
+        return count
     }
 
     /// Appends guidance once web fetches keep failing. Without it the model invents
