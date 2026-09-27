@@ -39,6 +39,7 @@ struct SettingsSheetView: View {
     @State private var repackError: String? = nil
     @ObservedObject var localModelManager: LocalModelManager = LocalModelManager.shared
     @AppStorage("dynamoe_agent_tools_enabled") private var isAgentToolsGloballyEnabled: Bool = true
+    @AppStorage("dynamoe_reasoning_expanded_by_default") private var reasoningExpandedByDefault: Bool = false
     @AppStorage("dynamoe_agent_turbo_mode") private var isTurboModeEnabled: Bool = false
     @AppStorage("dynamoe_agent_grammar_masking") private var isGrammarMaskingEnabled: Bool = true
     @AppStorage("dynamoe_agent_working_directory") private var agentWorkingDirectory: String = ""
@@ -277,6 +278,25 @@ struct SettingsSheetView: View {
                         .background(Color.secondary.opacity(0.06))
                         .cornerRadius(6)
                 }
+
+                Divider()
+
+                // Reasoning Accordion Default
+                Toggle(isOn: $reasoningExpandedByDefault) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text("Expand Thinking by Default")
+                                .font(.system(size: 13, weight: .medium))
+                            Image(systemName: "brain.head.profile")
+                                .foregroundColor(.accentColor)
+                                .font(.system(size: 11))
+                        }
+                        Text("Show the thinking/reasoning accordion expanded when a message first appears. When off, reasoning starts collapsed and can be opened manually.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
             }
         }
     }
