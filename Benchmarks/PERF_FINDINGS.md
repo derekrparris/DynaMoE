@@ -2344,3 +2344,9 @@ no-op end-of-turn call).
 Tests: gesture assertions added to `testDuplicateParameterPrefersRealValue` (answer+gesture
 still counts as an answer; gesture-only strips to empty). Verified: `swiftc -parse` clean,
 `testDuplicateParameterPrefersRealValue` and `testNoOpGestureToolCallDetection` pass.
+
+Review follow-up (Copilot, Medium on `hasToolCallMarkup`): the predicate checked only the
+Qwen markers, but the parser also accepts Llama 3 calls introduced by `<|python_tag|>`
+(`StreamingToolParser.llamaTagOpen`), so a malformed Llama call would skip recovery. Added
+that marker (hermetic/Ling JSON already sits inside `<tool_call>`, so it was covered).
+Test asserts the Llama opener is detected.

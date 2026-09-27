@@ -7186,6 +7186,8 @@ final class DynaMoETests: XCTestCase {
         // the parser could not use must be recoverable at any agent step, not just the first.
         XCTAssertTrue(AgentHarness.shared.hasToolCallMarkup(in: dup))
         XCTAssertTrue(AgentHarness.shared.hasToolCallMarkup(in: "Let me look.<function=shell_run>"))
+        XCTAssertTrue(AgentHarness.shared.hasToolCallMarkup(in: "Now.<|python_tag|>{\"name\": \"shell_run\"}"),
+                      "recovery must also catch Llama 3 tool calls")
         XCTAssertFalse(AgentHarness.shared.hasToolCallMarkup(in: "Here is your report: all good."))
 
         // Gesture guard: a gesture commingled with a written answer must NOT trigger a

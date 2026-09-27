@@ -3462,15 +3462,18 @@ public final class AgentHarness {
         return false
     }
 
-    /// True when the text carries tool-call markup at all (`<tool_call>` / `<function=`),
-    /// regardless of whether it parsed. Used to recover a turn where the model ATTEMPTED
-    /// a call that the parser could not turn into a single actionable call — a truncated
-    /// fragment, a wrong dialect, or a body with no usable parameter. Without this the
-    /// agent run ended silently mid-task: `hasTruncatedToolCall` misses a call that is
-    /// closed but malformed, and the recovery branch was gated to the first step only.
+    /// True when the text carries tool-call markup from ANY dialect the parser accepts:
+    /// Qwen XML (`<tool_call>` / `<function=`), the hermetic/Ling JSON bodies that also sit
+    /// inside `<tool_call>`, and Llama 3's `<|python_tag|>` opener. Used to recover a turn
+    /// where the model ATTEMPTED a call that the parser could not turn into a single
+    /// actionable call — a truncated fragment, a wrong dialect, or a body with no usable
+    /// parameter. Without this the agent run ended silently mid-task:
+    /// `hasTruncatedToolCall` misses a call that is closed but malformed, and the recovery
+    /// branch was gated to the first step only.
     public func hasToolCallMarkup(in text: String) -> Bool {
         text.contains(StreamingToolParser.qwenToolCallOpen)
             || text.contains(StreamingToolParser.qwenFunctionOpen)
+            || text.contains(StreamingToolParser.llamaTagOpen)
     }
 
     /// Response text with every `<tool_call>…</tool_call>` block removed, so callers can
