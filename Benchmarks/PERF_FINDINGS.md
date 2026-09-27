@@ -2373,3 +2373,11 @@ across tokens (Ornith's vocab has no `<parameter` token at all; it is `<` + `par
 `=`/`>` token is still withheld. Updated `testGrammarMaskBlocksNestedTagInParameterValue`
 accordingly (bare `<parameter` and a value containing it now pass; `=`/`>` completion is
 masked).
+
+Review follow-up (Copilot, Medium on `responseTextWithoutToolCalls`): it stripped only the
+Qwen `<tool_call>…</tool_call>` block, so a Llama 3 gesture turn (`<|python_tag|>…`) left
+raw markup in the response, made the caller believe an answer was written, and suppressed
+the gesture synthesis fallback — the run could still end with no user-visible answer. The
+regex now strips every dialect the parser accepts: `<tool_call>…</tool_call>`, the Llama
+`<|python_tag|>…</|python_tag|>` (or unclosed), and a bare `<function=…>…</function>`
+block. Test covers each dialect (and answer+Llama-call still counting as an answer).

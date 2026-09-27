@@ -7260,6 +7260,26 @@ final class DynaMoETests: XCTestCase {
             AgentHarness.shared.responseTextWithoutToolCalls(gestureOnly)
                 .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         )
+
+        // Every accepted dialect must be stripped, or a gesture-only turn in it would
+        // look like it wrote an answer and the synthesis fallback would not fire.
+        let otherDialects = [
+            "<|python_tag|>{\"name\":\"shell_run\",\"parameters\":{\"command\":\"echo done\"}}</|python_tag|>",
+            "<|python_tag|>{\"name\":\"shell_run\",\"parameters\":{\"command\":\"echo done\"}}",
+            "<function=shell_run><parameter=command>echo done</parameter></function>"
+        ]
+        for call in otherDialects {
+            XCTAssertTrue(
+                AgentHarness.shared.responseTextWithoutToolCalls(call)
+                    .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                "dialect must be stripped: \(call)"
+            )
+        }
+        XCTAssertEqual(
+            AgentHarness.shared.responseTextWithoutToolCalls("Here you go.<|python_tag|>{\"name\":\"shell_run\"}</|python_tag|>")
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            "Here you go."
+        )
     }
 
     /// `tools_load` hard-failed on any dialect other than a clean string array, and

@@ -3480,10 +3480,15 @@ public final class AgentHarness {
     /// ask whether the model actually WROTE an answer this turn (as opposed to only
     /// emitting tool-call markup). Used to decide whether a gesture-ended turn still
     /// owes the user a final answer.
+    ///
+    /// Strips every dialect the parser accepts, not just Qwen: the Llama 3
+    /// `<|python_tag|>…</|python_tag|>` block (often left unclosed — the parser accepts a
+    /// bare opener), and a bare `<function=…>…</function>` block (which the XML parser
+    /// matches without a surrounding `<tool_call>`). Missing any of these would leave raw
+    /// markup behind, making the caller think the model wrote an answer.
     public func responseTextWithoutToolCalls(_ text: String) -> String {
-        guard let re = try? NSRegularExpression(
-            pattern: "<tool_call>[\\s\\S]*?</tool_call>", options: []
-        ) else { return text }
+        let pattern = #"<tool_call>[\s\S]*?</tool_call>|<\|python_tag\|>[\s\S]*?(?:</\|python_tag\|>|$)|<function=[^>]*>[\s\S]*?(?:</function>|$)"#
+        guard let re = try? NSRegularExpression(pattern: pattern, options: []) else { return text }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         return re.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: " ")
     }
