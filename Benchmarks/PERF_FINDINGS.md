@@ -2350,3 +2350,13 @@ Qwen markers, but the parser also accepts Llama 3 calls introduced by `<|python_
 (`StreamingToolParser.llamaTagOpen`), so a malformed Llama call would skip recovery. Added
 that marker (hermetic/Ling JSON already sits inside `<tool_call>`, so it was covered).
 Test asserts the Llama opener is detected.
+
+Review follow-up (Copilot, Medium on `GrammarConstrainedSampler.ensureOpenerTokenIds`): the
+nested-opener cache was keyed on `vocabSize` alone, but the decoder closure comes from the
+ACTIVE tokenizer and the sampler is a singleton that outlives model switches. Two models
+can share a vocab size with different token→text mappings, so a stale cache would mask the
+old tokenizer's ids and leave the new tokenizer's opener tokens unmasked. Added
+`GrammarConstrainedSampler.invalidateTokenizerCaches()`, called wherever `self.tokenizer`
+is reassigned (`loadTokenizer` and the model-load completion). Test
+`testGrammarOpenerCacheInvalidatedOnTokenizerChange` demonstrates the stale-cache mask on
+the wrong id and the corrected mask after invalidation.

@@ -1799,6 +1799,8 @@ struct ContentView: View {
         do {
             let tok = try DynaMoeTokenizer(tokenizerPath: filePath)
             self.tokenizer = tok
+            // New tokenizer: drop the grammar sampler's vocab-size-keyed token caches.
+            GrammarConstrainedSampler.shared.invalidateTokenizerCaches()
             runTokenization(text: promptInput)
         } catch {
             tokenIDsOutput = "❌ Failed to load tokenizer.json: \(error.localizedDescription)"
@@ -12108,6 +12110,9 @@ if layer.attnGateProjTensor != nil,
                     }
                     if let tok = tok {
                         self.tokenizer = tok
+                        // New model's tokenizer: drop the grammar sampler's
+                        // vocab-size-keyed token caches, which do not encode identity.
+                        GrammarConstrainedSampler.shared.invalidateTokenizerCaches()
                     }
                     self.errorMessage = nil
                     self.selectedTensorID = nil

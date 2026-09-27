@@ -206,6 +206,18 @@ nonisolated public final class GrammarConstrainedSampler {
         _ = beginGeneration()
     }
 
+    /// Drops the per-tokenizer derived caches. `ensureOpenerTokenIds` keys its cache on
+    /// vocab size alone, but the decoder closure comes from the ACTIVE tokenizer — two
+    /// models can share a vocab size with different token→text mappings, so reusing the
+    /// ids after a model switch would mask real value tokens while leaving the new
+    /// tokenizer's opener tokens unmasked. Call this whenever the active tokenizer is set.
+    public func invalidateTokenizerCaches() {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        openerTokenIds = []
+        openerTokenIdsVocabSize = -1
+    }
+
     /// True when `token` still identifies the live generation.
     ///
     /// The mask is silently skipped for a superseded generation, so the sampling

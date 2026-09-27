@@ -6624,6 +6624,50 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(sampler.currentState, .outsideToolCall)
     }
 
+    /// The opener-token cache is keyed only by vocab size, but the decoder closure comes
+    /// from the active tokenizer. Two models can share a vocab size with different
+    /// token→text mappings, so the cache must be dropped when the tokenizer changes —
+    /// otherwise the ids of the previous tokenizer are masked and the new tokenizer's
+    /// opener tokens stay unmasked (and value tokens get wrongly masked).
+    func testGrammarOpenerCacheInvalidatedOnTokenizerChange() {
+        let sampler = GrammarConstrainedSampler.shared
+        sampler.reset()
+        sampler.registerTools(AgentHarness.shared.availableToolDefinitions)
+        sampler.updateState(emittedText: "<tool_call><function=shell_run><parameter=command>ls")
+        guard case .insideParameterValue = sampler.currentState else {
+            return XCTFail("Expected insideParameterValue, got \(sampler.currentState)")
+        }
+
+        // Tokenizer A: id 1 is the opener, id 2 is a normal value token.
+        let decoderA: (UInt32) -> String? = { ["hello", "<parameter=x>", "world"][Int($0)] }
+        var logitsA = [Float](repeating: 0, count: 3)
+        logitsA.withUnsafeMutableBufferPointer { buf in
+            sampler.applyLogitMask(logits: buf.baseAddress!, vocabSize: 3, tokenDecoder: decoderA)
+        }
+        XCTAssertEqual(logitsA[1], -Float.infinity, "tokenizer A's opener id must be masked")
+        XCTAssertNotEqual(logitsA[2], -Float.infinity)
+
+        // Tokenizer B, SAME vocab size: the opener moved to id 2. Without invalidation the
+        // stale cache still masks id 1 (the bug); after invalidation it masks id 2.
+        let decoderB: (UInt32) -> String? = { ["hello", "world", "<parameter=y>"][Int($0)] }
+        var staleLogits = [Float](repeating: 0, count: 3)
+        staleLogits.withUnsafeMutableBufferPointer { buf in
+            sampler.applyLogitMask(logits: buf.baseAddress!, vocabSize: 3, tokenDecoder: decoderB)
+        }
+        XCTAssertEqual(staleLogits[1], -Float.infinity, "stale cache demonstrably masks the wrong id")
+        XCTAssertNotEqual(staleLogits[2], -Float.infinity, "stale cache leaves the new opener unmasked")
+
+        sampler.invalidateTokenizerCaches()
+        var logitsB = [Float](repeating: 0, count: 3)
+        logitsB.withUnsafeMutableBufferPointer { buf in
+            sampler.applyLogitMask(logits: buf.baseAddress!, vocabSize: 3, tokenDecoder: decoderB)
+        }
+        XCTAssertNotEqual(logitsB[1], -Float.infinity, "after invalidation the old opener is free")
+        XCTAssertEqual(logitsB[2], -Float.infinity, "after invalidation the new opener is masked")
+
+        sampler.reset()
+    }
+
     /// Regression for the `web_search_fetch` failure loop: after the model had
     /// typed a complete tool name ("web_search"), the function-name mask
     /// allowed ANY continuation of it ("web_search" + "_fetch"), minting an
