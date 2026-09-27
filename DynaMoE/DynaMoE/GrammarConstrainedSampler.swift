@@ -133,6 +133,15 @@ nonisolated public final class GrammarConstrainedSampler {
     // can withhold `</function>` until a tool's required parameters are present.
     private var currentToolName: String?
     private var seenParameterKeys: Set<String> = []
+    /// Tail of the value currently being written (text after the open
+    /// `<parameter=key>`). Lets the value-state mask see whether the model is
+    /// about to re-open a nested tag instead of writing the value.
+    private var parameterValueTail: String = ""
+    /// Vocab ids whose decoded text already contains a nested-tag opener. Built
+    /// once per tokenizer so the (hot) value state never has to re-decode the
+    /// whole vocab for the common case.
+    private var openerTokenIds: Set<UInt32> = []
+    private var openerTokenIdsVocabSize: Int = -1
 
     // Structural Tag constants
     private let toolCallOpen = "<tool_call>"
@@ -189,11 +198,24 @@ nonisolated public final class GrammarConstrainedSampler {
         _currentState = .outsideToolCall
         currentToolName = nil
         seenParameterKeys.removeAll()
+        parameterValueTail = ""
         return generationToken
     }
 
     public func reset() {
         _ = beginGeneration()
+    }
+
+    /// Drops the per-tokenizer derived caches. `ensureOpenerTokenIds` keys its cache on
+    /// vocab size alone, but the decoder closure comes from the ACTIVE tokenizer — two
+    /// models can share a vocab size with different token→text mappings, so reusing the
+    /// ids after a model switch would mask real value tokens while leaving the new
+    /// tokenizer's opener tokens unmasked. Call this whenever the active tokenizer is set.
+    public func invalidateTokenizerCaches() {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        openerTokenIds = []
+        openerTokenIdsVocabSize = -1
     }
 
     /// True when `token` still identifies the live generation.
@@ -279,6 +301,7 @@ nonisolated public final class GrammarConstrainedSampler {
                                 _currentState = .closingFunction(matchedPrefix: afterClose)
                             }
                         } else {
+                            parameterValueTail = String(afterValue.suffix(24))
                             _currentState = .insideParameterValue(toolName: fnName, paramKey: pKey)
                         }
                     } else {
@@ -439,6 +462,35 @@ nonisolated public final class GrammarConstrainedSampler {
             }
             if allowedCount == 0, let valve = valveIndex { logits[valve] = valveLogit }
 
+        case .insideParameterValue:
+            // A value is otherwise unconstrained (commands, URLs, prose), but it
+            // must never re-open a tag: a model that starts echoing `<parameter`
+            // inside the value loops there forever (observed: `<parameter=command>`
+            // then a run of bare `<parameter>` openers, no value written, shell
+            // parse error, repeated across every following step). Nested tags are
+            // never valid (the parser already rewrites them as a repair), so
+            // withhold any token that would open `<parameter` or `<arg_value`.
+            ensureOpenerTokenIds(vocabSize: vocabSize, tokenDecoder: tokenDecoder)
+            for id in openerTokenIds where Int(id) < vocabSize {
+                logits[Int(id)] = -Float.infinity
+            }
+            // Cross-boundary case: the opener is split across tokens, so the model
+            // is sitting on a partial (`<`, `<pa`, …) or has just completed the bare
+            // opener. Only then do the O(vocab) completion scan; the cached set covers
+            // single-token completed openers. The probe is long enough to hold the whole
+            // `<parameter=` / `<parameter>` boundary so the completing `=`/`>` is caught
+            // even when the opener itself arrived split. Only COMPLETED openers are
+            // withheld, so a legitimate `<parameter` in a value is still writable.
+            if endsWithOpenerPartial(parameterValueTail) {
+                let probeTail = String(parameterValueTail.suffix(16))
+                for v in 0..<vocabSize {
+                    guard let str = tokenDecoder(UInt32(v)) else { continue }
+                    if containsCompletedNestedOpener(probeTail + str) {
+                        logits[v] = -Float.infinity
+                    }
+                }
+            }
+
         case .closingFunction(let matchedPrefix):
             guard enforceStructuralTagContinuation else { return }
             applyTagChoiceMask(
@@ -495,6 +547,46 @@ nonisolated public final class GrammarConstrainedSampler {
             var rest = cand.dropFirst(word.count)
             while rest.first == " " || rest.first == "\t" { rest = rest.dropFirst() }
             if rest.first == ">" { return true }
+        }
+        return false
+    }
+
+    /// True when `s` contains a COMPLETED nested-tag opener — `<parameter=`,
+    /// `<parameter>`, or `<arg_value>`. The value-state mask must reject these, but a
+    /// bare `<parameter` prefix is legitimate value text (observed need: a command such
+    /// as `grep -F '<parameter' file`, or prose that quotes the tag). Matching only the
+    /// completed forms keeps the re-open loop blocked while not rejecting valid values;
+    /// the split-across-tokens case is still covered by `endsWithOpenerPartial`.
+    private func containsCompletedNestedOpener(_ s: String) -> Bool {
+        s.contains("<parameter=") || s.contains("<parameter>") || s.contains("<arg_value>")
+    }
+
+    /// Builds (once per tokenizer) the set of vocab ids whose decoded text already
+    /// contains a completed nested-tag opener, so the value-state mask can withhold them
+    /// cheaply instead of re-decoding the whole vocab every token.
+    private func ensureOpenerTokenIds(vocabSize: Int, tokenDecoder: (UInt32) -> String?) {
+        guard openerTokenIdsVocabSize != vocabSize else { return }
+        var ids = Set<UInt32>()
+        for v in 0..<vocabSize {
+            guard let s = tokenDecoder(UInt32(v)) else { continue }
+            if containsCompletedNestedOpener(s) { ids.insert(UInt32(v)) }
+        }
+        openerTokenIds = ids
+        openerTokenIdsVocabSize = vocabSize
+    }
+
+    /// True when `tail` ends with a prefix of a nested-tag opener (`<`, `<p`, …,
+    /// `<parameter`), i.e. the model is mid-way through — or has just finished — opening
+    /// one. The FULL opener counts: a token that is exactly `<parameter` is no longer
+    /// masked by the cache (it can be legitimate value text), so the next token must be
+    /// scanned to stop the tag being completed with `=` or `>`.
+    private func endsWithOpenerPartial(_ tail: String) -> Bool {
+        for opener in ["<parameter", "<arg_value"] {
+            let maxLen = min(opener.count, tail.count)
+            if maxLen < 1 { continue }
+            for len in 1...maxLen where tail.hasSuffix(String(opener.prefix(len))) {
+                return true
+            }
         }
         return false
     }

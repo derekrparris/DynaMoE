@@ -957,6 +957,11 @@ final class DynaMoETests: XCTestCase {
         let formatted = harness.buildSystemPrompt(baseSystem: "You are an assistant.")
         XCTAssertTrue(formatted.contains("# Tools"))
         XCTAssertTrue(formatted.contains("shell_run"))
+        // Homebrew guidance: agents must not miss brew-managed installs.
+        XCTAssertTrue(formatted.contains("# Local Environment & Homebrew"))
+        XCTAssertTrue(formatted.contains("brew list --formula"))
+        XCTAssertTrue(formatted.contains("brew --prefix"))
+        XCTAssertTrue(formatted.contains("which -a"))
 
         // 2. Parse Tool Calls
         let modelOutput = """
@@ -4279,6 +4284,8 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(defaultOrnithCoder.topP, 0.95, accuracy: 0.01)
         XCTAssertEqual(defaultOrnithCoder.minP, 0.00, accuracy: 0.01)
         XCTAssertEqual(defaultOrnithCoder.topK, 20)
+        // Official 1.00: a repetition penalty perturbs verbatim copying (paths),
+        // so loop damage is handled by the parser repair + failure caps instead.
         XCTAssertEqual(defaultOrnithCoder.repetitionPenalty, 1.00, accuracy: 0.01)
         XCTAssertEqual(defaultOrnithCoder.presencePenalty, 0.00, accuracy: 0.01)
         XCTAssertEqual(defaultOrnithCoder.maxNewTokens, 8192)
@@ -4363,6 +4370,33 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(ModelProfileType.assistant.profileDisplayName(for: testQwenId), "General Assistant (Instruct Mode)")
 
         print("  ✅ [TEST] Official Ornith & Qwen model profiles verified with persistence, isolation, and metadata.")
+    }
+
+    // Guards the launch path: switchModel -> applyProfile resolves the active profile
+    // for the loaded model. The Ornith 35B model is not one of the seeded 9B keys, so it
+    // must still resolve through normalizeKey + family matching. If Assistant is the
+    // active profile, getProfile(for:type:.assistant) must return assistant settings --
+    // never the coder prompt that used to leak in via the async model-load completion.
+    func testOrnith35BFamilyProfileResolution() throws {
+        let manager = ModelProfileManager.shared
+
+        let repoId = "ornith-ai/Ornith-1.5-35B-A3B-FP8"
+        let normalized = manager.normalizeKey(repoId)
+        XCTAssertEqual(normalized, "ornith-ai/ornith-1.5-35b-a3b-fp8")
+
+        // Every call site (repoId, snapshot path) must normalize to the same key so the
+        // active-profile lookup and setActiveProfile agree.
+        let snapshotPath = "/Users/x/.cache/huggingface/hub/models--ornith-ai--Ornith-1.5-35B-A3B-FP8/snapshots/0123456789abcdef0123456789abcdef01234567"
+        XCTAssertEqual(manager.normalizeKey(snapshotPath), normalized)
+
+        let assistant = manager.getProfile(for: repoId, type: .assistant)
+        XCTAssertEqual(assistant.temperature, 1.00, accuracy: 0.01)
+        XCTAssertEqual(assistant.presencePenalty, 1.50, accuracy: 0.01)
+        XCTAssertEqual(assistant.maxNewTokens, 4096)
+        XCTAssertTrue(assistant.systemPrompt.contains("helpful, respectful"),
+                      "Assistant resolution for the 35B must not return the coder prompt")
+
+        print("  ✅ [TEST] Ornith 35B profile resolution verified (normalizeKey + family match).")
     }
 
     func testHelpTopicsAndSettingsGuideCoverage() throws {
@@ -6590,6 +6624,50 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(sampler.currentState, .outsideToolCall)
     }
 
+    /// The opener-token cache is keyed only by vocab size, but the decoder closure comes
+    /// from the active tokenizer. Two models can share a vocab size with different
+    /// token→text mappings, so the cache must be dropped when the tokenizer changes —
+    /// otherwise the ids of the previous tokenizer are masked and the new tokenizer's
+    /// opener tokens stay unmasked (and value tokens get wrongly masked).
+    func testGrammarOpenerCacheInvalidatedOnTokenizerChange() {
+        let sampler = GrammarConstrainedSampler.shared
+        sampler.reset()
+        sampler.registerTools(AgentHarness.shared.availableToolDefinitions)
+        sampler.updateState(emittedText: "<tool_call><function=shell_run><parameter=command>ls")
+        guard case .insideParameterValue = sampler.currentState else {
+            return XCTFail("Expected insideParameterValue, got \(sampler.currentState)")
+        }
+
+        // Tokenizer A: id 1 is the opener, id 2 is a normal value token.
+        let decoderA: (UInt32) -> String? = { ["hello", "<parameter=x>", "world"][Int($0)] }
+        var logitsA = [Float](repeating: 0, count: 3)
+        logitsA.withUnsafeMutableBufferPointer { buf in
+            sampler.applyLogitMask(logits: buf.baseAddress!, vocabSize: 3, tokenDecoder: decoderA)
+        }
+        XCTAssertEqual(logitsA[1], -Float.infinity, "tokenizer A's opener id must be masked")
+        XCTAssertNotEqual(logitsA[2], -Float.infinity)
+
+        // Tokenizer B, SAME vocab size: the opener moved to id 2. Without invalidation the
+        // stale cache still masks id 1 (the bug); after invalidation it masks id 2.
+        let decoderB: (UInt32) -> String? = { ["hello", "world", "<parameter=y>"][Int($0)] }
+        var staleLogits = [Float](repeating: 0, count: 3)
+        staleLogits.withUnsafeMutableBufferPointer { buf in
+            sampler.applyLogitMask(logits: buf.baseAddress!, vocabSize: 3, tokenDecoder: decoderB)
+        }
+        XCTAssertEqual(staleLogits[1], -Float.infinity, "stale cache demonstrably masks the wrong id")
+        XCTAssertNotEqual(staleLogits[2], -Float.infinity, "stale cache leaves the new opener unmasked")
+
+        sampler.invalidateTokenizerCaches()
+        var logitsB = [Float](repeating: 0, count: 3)
+        logitsB.withUnsafeMutableBufferPointer { buf in
+            sampler.applyLogitMask(logits: buf.baseAddress!, vocabSize: 3, tokenDecoder: decoderB)
+        }
+        XCTAssertNotEqual(logitsB[1], -Float.infinity, "after invalidation the old opener is free")
+        XCTAssertEqual(logitsB[2], -Float.infinity, "after invalidation the new opener is masked")
+
+        sampler.reset()
+    }
+
     /// Regression for the `web_search_fetch` failure loop: after the model had
     /// typed a complete tool name ("web_search"), the function-name mask
     /// allowed ANY continuation of it ("web_search" + "_fetch"), minting an
@@ -6669,6 +6747,118 @@ final class DynaMoETests: XCTestCase {
             [true, false],
             "the dead-end valve must keep exactly one continuation alive"
         )
+    }
+
+    /// Regression for the malformed-call loop: after `<parameter=command>` the
+    /// value state is otherwise unconstrained, so a model that starts echoing
+    /// `<parameter` inside the value loops there (observed: `<parameter=command>`
+    /// then a run of bare `<parameter>` openers, no value written, shell parse
+    /// error, repeated every following step). A value must never re-open a tag.
+    func testGrammarMaskBlocksNestedTagInParameterValue() {
+        let harness = AgentHarness.shared
+        let sampler = GrammarConstrainedSampler.shared
+        try? harness.loadTool(named: "shell_run")
+        defer {
+            harness.resetLoadedToolsToCore()
+            sampler.reset()
+        }
+
+        sampler.isEnabled = true
+        sampler.reset()
+
+        func masked(_ text: String, tokens: [String]) -> [Bool] {
+            sampler.updateState(emittedText: text)
+            // Treat each call as a fresh tokenizer so the vocab-size-keyed opener cache
+            // is rebuilt from THIS token list rather than reused from the previous call.
+            sampler.invalidateTokenizerCaches()
+            var logits = [Float](repeating: 0, count: tokens.count)
+            logits.withUnsafeMutableBufferPointer { buf in
+                sampler.applyLogitMask(
+                    logits: buf.baseAddress!,
+                    vocabSize: tokens.count,
+                    tokenDecoder: { tokens[Int($0)] }
+                )
+            }
+            return logits.map { $0 == -.infinity }
+        }
+
+        let open = "<tool_call>\n<function=shell_run>\n<parameter=command>\n"
+
+        // COMPLETED nested openers (or `<arg_value>`) are withheld; real values,
+        // including the legitimate `</parameter>` closer, pass. A bare `<parameter`
+        // token is NOT withheld — it is legitimate value text (e.g. `grep '<parameter'
+        // file`) — and a value containing that substring but no completed opener passes.
+        XCTAssertEqual(
+            masked(open + "wc -l x", tokens: [
+                "<parameter>", "<parameter=command>", "<parameter",
+                "grep -F '<parameter' file", "echo hi", "</parameter>", "<arg_value>"
+            ]),
+            [true, true, false, false, false, false, true],
+            "only a completed nested opener may be withheld; a `<parameter` prefix is a valid value"
+        )
+
+        // Split opener: the bare `<parameter` accumulation is allowed, but the token
+        // that COMPLETES it (`=` / `>`) is withheld, so the tag still cannot re-open.
+        XCTAssertEqual(
+            masked(open + "echo <p", tokens: ["arameter"]),
+            [false],
+            "the split prefix itself is not a completed opener"
+        )
+        XCTAssertEqual(
+            masked(open + "echo <parameter", tokens: ["=", ">", "command>", " '"]),
+            [true, true, false, false],
+            "completing a split `<parameter` with `=` or `>` must be masked"
+        )
+    }
+
+    /// The same-tool failure streak that lets the harness end a run the model is
+    /// burning on guaranteed errors (observed: the same unreadable `wc` path or a
+    /// malformed command re-issued every step).
+    func testConsecutiveFailedToolCallStreak() {
+        let harness = AgentHarness.shared
+        harness.beginAgentSearchGuard()
+
+        harness.recordToolCallOutcome(toolName: "shell_run", succeeded: false)
+        harness.recordToolCallOutcome(toolName: "shell_run", succeeded: false)
+        XCTAssertEqual(harness.consecutiveFailedToolCalls, 2, "same-tool failures accumulate")
+        XCTAssertEqual(harness.totalFailedToolCalls, 2, "the total counts failures too")
+
+        harness.recordToolCallOutcome(toolName: "shell_run", succeeded: true)
+        XCTAssertEqual(harness.consecutiveFailedToolCalls, 0, "a success resets the streak")
+        XCTAssertEqual(harness.totalFailedToolCalls, 2, "but the total survives interspersed successes")
+
+        harness.recordToolCallOutcome(toolName: "shell_run", succeeded: false)
+        harness.recordToolCallOutcome(toolName: "web_fetch", succeeded: false)
+        XCTAssertEqual(harness.consecutiveFailedToolCalls, 1, "switching tools restarts the streak")
+        XCTAssertEqual(harness.totalFailedToolCalls, 4)
+
+        XCTAssertGreaterThanOrEqual(harness.failedToolCallLimit, 2)
+        XCTAssertGreaterThanOrEqual(harness.failedToolCallTotalLimit, 2)
+    }
+
+    /// A path that does not exist should come back with the real sibling names, so
+    /// the model can copy the exact name instead of mangling it again (observed:
+    /// the model drops the date suffix, then invents "/Users/derek Harris").
+    func testMissingPathRepairHintSuggestsRealSibling() {
+        let fm = FileManager.default
+        let dir = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library/Caches/DynaMoE-test-\(UUID().uuidString)")
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let real = dir.appendingPathComponent("LDW End of Engagement Survey_September 25, 2026_14.06.csv")
+        _ = fm.createFile(atPath: real.path, contents: Data("x".utf8))
+        defer { try? fm.removeItem(at: dir) }
+
+        let mangled = dir.appendingPathComponent("LDW End of Engagement Survey.csv").path
+        let hint = AgentHarness.missingPathRepairHint(
+            command: "python3 - <<'EOF'\npath = '\(mangled)'\nEOF",
+            stderr: "FileNotFoundError: [Errno 2] No such file or directory: '\(mangled)'",
+            stdout: ""
+        )
+        XCTAssertTrue(hint.contains(real.lastPathComponent), "hint must name the real file, got: \(hint)")
+        XCTAssertTrue(hint.contains("does not exist"))
+
+        // No missing-file signal means no hint.
+        XCTAssertEqual(AgentHarness.missingPathRepairHint(command: "ls /Users", stderr: "", stdout: ""), "")
     }
 
     /// Pure-logic coverage for the uncalled-action nudge. A false positive here
@@ -6978,6 +7168,118 @@ final class DynaMoETests: XCTestCase {
         let noGestures = AgentHarness.splitGestureCalls([call("web_fetch", nil)])
         XCTAssertEqual(noGestures.actionableIndices, [0])
         XCTAssertTrue(noGestures.skipNotices.isEmpty)
+    }
+
+    /// The model can re-emit the key terminator as the value's first line
+    /// (`<parameter=command>` then `command>`), so the command became
+    /// `command>\npython3 …` and zsh failed with "parse error near '\n'", looping
+    /// every step. The duplicated markup must be stripped so the intended command
+    /// survives, without touching a legitimate value or a real redirect.
+    func testSpuriousKeyTerminatorInParameterValue() {
+        let malformed = "<tool_call>\n<function=shell_run>\n<parameter=command>\ncommand>\npython3 << 'EOF'\nprint(1)\nEOF\n</parameter>\n</function>\n</tool_call>"
+        let expected = "python3 << 'EOF'\nprint(1)\nEOF"
+
+        let direct = AgentHarness.shared.parseAllXMLFunctionCalls(malformed)
+        XCTAssertEqual(direct.count, 1)
+        XCTAssertEqual(direct.first?.arguments["command"] as? String, expected)
+
+        let live = StreamingToolParser.shared.parseStreamingToolCalls(from: malformed)
+        XCTAssertEqual(live.calls.count, 1)
+        XCTAssertEqual(live.calls.first?.arguments["command"] as? String, expected)
+
+        XCTAssertEqual(
+            StreamingToolParser.unwrapNestedParameterTag("python3 << 'EOF'\nprint(1)\nEOF"),
+            "python3 << 'EOF'\nprint(1)\nEOF",
+            "a normal multi-line value is untouched"
+        )
+        XCTAssertEqual(
+            StreamingToolParser.unwrapNestedParameterTag("> out.txt\nfoo"),
+            "> out.txt\nfoo",
+            "a real redirect line is not markup"
+        )
+
+        // A value that is ONLY made-up tag noise collapses to empty so the
+        // empty-argument guard handles it, instead of a shell parse error every
+        // step (observed: `<parameter=command>` then a run of bare `<command>`).
+        XCTAssertEqual(
+            StreamingToolParser.unwrapNestedParameterTag("<command>\n<command>\n<command>"),
+            ""
+        )
+        XCTAssertEqual(StreamingToolParser.unwrapNestedParameterTag("</command>"), "")
+        XCTAssertEqual(StreamingToolParser.unwrapNestedParameterTag("command>"), "")
+
+        // The live parser must surface that as an empty command, so the harness's
+        // empty-argument guard catches it instead of executing tag noise.
+        let tagNoise = "<tool_call>\n<function=shell_run>\n<parameter=command>\n<command>\n<command>\n<command>\n</parameter>\n</function>\n</tool_call>"
+        let liveNoise = StreamingToolParser.shared.parseStreamingToolCalls(from: tagNoise)
+        XCTAssertEqual(liveNoise.calls.count, 1)
+        XCTAssertEqual(liveNoise.calls.first?.arguments["command"] as? String, "")
+    }
+
+    /// Observed in a real run: a `shell_run` call carried TWO `<parameter=command>`
+    /// blocks — the real command first, then a human-language echo ("echo check
+    /// python pandas availability"). Last-wins executed the echo and silently dropped
+    /// the real command, wasting the step.
+    func testDuplicateParameterPrefersRealValue() {
+        let dup = "<tool_call>\n<function=shell_run>\n<parameter=command>\npython3 -c \"import pandas\"\n</parameter>\n<parameter=command>\necho check python pandas availability\n</parameter>\n</function>\n</tool_call>"
+        let expected = "python3 -c \"import pandas\""
+
+        let live = StreamingToolParser.shared.parseStreamingToolCalls(from: dup)
+        XCTAssertEqual(live.calls.count, 1)
+        XCTAssertEqual(live.calls.first?.arguments["command"] as? String, expected,
+                       "the first (real) value must win over the trailing echo")
+
+        let direct = AgentHarness.shared.parseAllXMLFunctionCalls(dup)
+        XCTAssertEqual(direct.count, 1)
+        XCTAssertEqual(direct.first?.arguments["command"] as? String, expected)
+
+        // A noise-only first value collapses to empty, so a later real value must be
+        // allowed to replace it — both orderings recover the command.
+        let noiseFirst = "<tool_call>\n<function=shell_run>\n<parameter=command>\n<command>\n</parameter>\n<parameter=command>\necho real\n</parameter>\n</function>\n</tool_call>"
+        let liveNoiseFirst = StreamingToolParser.shared.parseStreamingToolCalls(from: noiseFirst)
+        XCTAssertEqual(liveNoiseFirst.calls.first?.arguments["command"] as? String, "echo real")
+
+        // The any-step recovery relies on this markup check: a turn that ATTEMPTED a call
+        // the parser could not use must be recoverable at any agent step, not just the first.
+        XCTAssertTrue(AgentHarness.shared.hasToolCallMarkup(in: dup))
+        XCTAssertTrue(AgentHarness.shared.hasToolCallMarkup(in: "Let me look.<function=shell_run>"))
+        XCTAssertTrue(AgentHarness.shared.hasToolCallMarkup(in: "Now.<|python_tag|>{\"name\": \"shell_run\"}"),
+                      "recovery must also catch Llama 3 tool calls")
+        XCTAssertFalse(AgentHarness.shared.hasToolCallMarkup(in: "Here is your report: all good."))
+
+        // Gesture guard: a gesture commingled with a written answer must NOT trigger a
+        // forced synthesis (QA #31); a gesture-only turn must (leaves the user nothing).
+        let answerPlusGesture = "Here is your report: all good.<tool_call>\n<function=shell_run>\n<parameter=command>\necho done\n</parameter>\n</function>\n</tool_call>"
+        XCTAssertEqual(
+            AgentHarness.shared.responseTextWithoutToolCalls(answerPlusGesture)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            "Here is your report: all good."
+        )
+        let gestureOnly = "<tool_call>\n<function=shell_run>\n<parameter=command>\n</parameter>\n</function>\n</tool_call>"
+        XCTAssertTrue(
+            AgentHarness.shared.responseTextWithoutToolCalls(gestureOnly)
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        )
+
+        // Every accepted dialect must be stripped, or a gesture-only turn in it would
+        // look like it wrote an answer and the synthesis fallback would not fire.
+        let otherDialects = [
+            "<|python_tag|>{\"name\":\"shell_run\",\"parameters\":{\"command\":\"echo done\"}}</|python_tag|>",
+            "<|python_tag|>{\"name\":\"shell_run\",\"parameters\":{\"command\":\"echo done\"}}",
+            "<function=shell_run><parameter=command>echo done</parameter></function>"
+        ]
+        for call in otherDialects {
+            XCTAssertTrue(
+                AgentHarness.shared.responseTextWithoutToolCalls(call)
+                    .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                "dialect must be stripped: \(call)"
+            )
+        }
+        XCTAssertEqual(
+            AgentHarness.shared.responseTextWithoutToolCalls("Here you go.<|python_tag|>{\"name\":\"shell_run\"}</|python_tag|>")
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            "Here you go."
+        )
     }
 
     /// `tools_load` hard-failed on any dialect other than a clean string array, and
