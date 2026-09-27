@@ -475,14 +475,17 @@ nonisolated public final class GrammarConstrainedSampler {
                 logits[Int(id)] = -Float.infinity
             }
             // Cross-boundary case: the opener is split across tokens, so the model
-            // is sitting on a partial (`<`, `<pa`, …). Only then do the O(vocab)
-            // completion scan; the cached set covers the single-token opener.
+            // is sitting on a partial (`<`, `<pa`, …) or has just completed the bare
+            // opener. Only then do the O(vocab) completion scan; the cached set covers
+            // single-token completed openers. The probe is long enough to hold the whole
+            // `<parameter=` / `<parameter>` boundary so the completing `=`/`>` is caught
+            // even when the opener itself arrived split. Only COMPLETED openers are
+            // withheld, so a legitimate `<parameter` in a value is still writable.
             if endsWithOpenerPartial(parameterValueTail) {
-                let probeTail = String(parameterValueTail.suffix(9))
+                let probeTail = String(parameterValueTail.suffix(16))
                 for v in 0..<vocabSize {
                     guard let str = tokenDecoder(UInt32(v)) else { continue }
-                    let combined = probeTail + str
-                    if combined.contains("<parameter") || combined.contains("<arg_value") {
+                    if containsCompletedNestedOpener(probeTail + str) {
                         logits[v] = -Float.infinity
                     }
                 }
@@ -548,25 +551,38 @@ nonisolated public final class GrammarConstrainedSampler {
         return false
     }
 
+    /// True when `s` contains a COMPLETED nested-tag opener — `<parameter=`,
+    /// `<parameter>`, or `<arg_value>`. The value-state mask must reject these, but a
+    /// bare `<parameter` prefix is legitimate value text (observed need: a command such
+    /// as `grep -F '<parameter' file`, or prose that quotes the tag). Matching only the
+    /// completed forms keeps the re-open loop blocked while not rejecting valid values;
+    /// the split-across-tokens case is still covered by `endsWithOpenerPartial`.
+    private func containsCompletedNestedOpener(_ s: String) -> Bool {
+        s.contains("<parameter=") || s.contains("<parameter>") || s.contains("<arg_value>")
+    }
+
     /// Builds (once per tokenizer) the set of vocab ids whose decoded text already
-    /// contains a nested-tag opener, so the value-state mask can withhold them
+    /// contains a completed nested-tag opener, so the value-state mask can withhold them
     /// cheaply instead of re-decoding the whole vocab every token.
     private func ensureOpenerTokenIds(vocabSize: Int, tokenDecoder: (UInt32) -> String?) {
         guard openerTokenIdsVocabSize != vocabSize else { return }
         var ids = Set<UInt32>()
         for v in 0..<vocabSize {
             guard let s = tokenDecoder(UInt32(v)) else { continue }
-            if s.contains("<parameter") || s.contains("<arg_value") { ids.insert(UInt32(v)) }
+            if containsCompletedNestedOpener(s) { ids.insert(UInt32(v)) }
         }
         openerTokenIds = ids
         openerTokenIdsVocabSize = vocabSize
     }
 
-    /// True when `tail` ends with a non-empty proper prefix of a nested-tag opener
-    /// (`<`, `<p`, …, `<paramete`), i.e. the model is mid-way through opening one.
+    /// True when `tail` ends with a prefix of a nested-tag opener (`<`, `<p`, …,
+    /// `<parameter`), i.e. the model is mid-way through — or has just finished — opening
+    /// one. The FULL opener counts: a token that is exactly `<parameter` is no longer
+    /// masked by the cache (it can be legitimate value text), so the next token must be
+    /// scanned to stop the tag being completed with `=` or `>`.
     private func endsWithOpenerPartial(_ tail: String) -> Bool {
         for opener in ["<parameter", "<arg_value"] {
-            let maxLen = min(opener.count - 1, tail.count)
+            let maxLen = min(opener.count, tail.count)
             if maxLen < 1 { continue }
             for len in 1...maxLen where tail.hasSuffix(String(opener.prefix(len))) {
                 return true

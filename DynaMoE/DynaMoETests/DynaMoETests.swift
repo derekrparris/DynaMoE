@@ -6768,6 +6768,9 @@ final class DynaMoETests: XCTestCase {
 
         func masked(_ text: String, tokens: [String]) -> [Bool] {
             sampler.updateState(emittedText: text)
+            // Treat each call as a fresh tokenizer so the vocab-size-keyed opener cache
+            // is rebuilt from THIS token list rather than reused from the previous call.
+            sampler.invalidateTokenizerCaches()
             var logits = [Float](repeating: 0, count: tokens.count)
             logits.withUnsafeMutableBufferPointer { buf in
                 sampler.applyLogitMask(
@@ -6781,20 +6784,30 @@ final class DynaMoETests: XCTestCase {
 
         let open = "<tool_call>\n<function=shell_run>\n<parameter=command>\n"
 
-        // A whole nested opener (or an `<arg_value>` opener) is withheld; real
-        // values, including the legitimate `</parameter>` closer, pass.
+        // COMPLETED nested openers (or `<arg_value>`) are withheld; real values,
+        // including the legitimate `</parameter>` closer, pass. A bare `<parameter`
+        // token is NOT withheld — it is legitimate value text (e.g. `grep '<parameter'
+        // file`) — and a value containing that substring but no completed opener passes.
         XCTAssertEqual(
-            masked(open + "wc -l x", tokens: ["<parameter>", "<parameter", "echo hi", "ls -la", "</parameter>", "<arg_value>"]),
-            [true, true, false, false, false, true],
-            "a parameter value must not be able to re-open a tag"
+            masked(open + "wc -l x", tokens: [
+                "<parameter>", "<parameter=command>", "<parameter",
+                "grep -F '<parameter' file", "echo hi", "</parameter>", "<arg_value>"
+            ]),
+            [true, true, false, false, false, false, true],
+            "only a completed nested opener may be withheld; a `<parameter` prefix is a valid value"
         )
 
-        // Cross-boundary: the opener is split, so the model sits on a partial and
-        // the completing token must be withheld too.
+        // Split opener: the bare `<parameter` accumulation is allowed, but the token
+        // that COMPLETES it (`=` / `>`) is withheld, so the tag still cannot re-open.
         XCTAssertEqual(
-            masked(open + "echo <p", tokens: ["arameter", "echo hi"]),
-            [true, false],
-            "completing a split opener must be masked"
+            masked(open + "echo <p", tokens: ["arameter"]),
+            [false],
+            "the split prefix itself is not a completed opener"
+        )
+        XCTAssertEqual(
+            masked(open + "echo <parameter", tokens: ["=", ">", "command>", " '"]),
+            [true, true, false, false],
+            "completing a split `<parameter` with `=` or `>` must be masked"
         )
     }
 

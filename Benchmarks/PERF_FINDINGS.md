@@ -2360,3 +2360,16 @@ old tokenizer's ids and leave the new tokenizer's opener tokens unmasked. Added
 is reassigned (`loadTokenizer` and the model-load completion). Test
 `testGrammarOpenerCacheInvalidatedOnTokenizerChange` demonstrates the stale-cache mask on
 the wrong id and the corrected mask after invalidation.
+
+Review follow-up (Copilot, High on the opener mask): the value-state mask withheld any
+token whose decoded text merely CONTAINED the prefix `<parameter`, which also rejects
+legitimate values such as `grep -F '<parameter' file` (and the split-boundary scan used
+the same over-broad `contains`). Narrowed both to COMPLETED openers — `<parameter=`,
+`<parameter>`, `<arg_value>` — so a `<parameter` prefix can appear in a value while the
+re-open loop stays blocked. To keep the blocked path closed when the opener arrives split
+across tokens (Ornith's vocab has no `<parameter` token at all; it is `<` + `parameter` +
+`=`), the boundary scan's probe now holds the whole `<parameter=`/`<parameter>` boundary
+(suffix 16) and `endsWithOpenerPartial` also recognizes the FULL opener, so the completing
+`=`/`>` token is still withheld. Updated `testGrammarMaskBlocksNestedTagInParameterValue`
+accordingly (bare `<parameter` and a value containing it now pass; `=`/`>` completion is
+masked).
