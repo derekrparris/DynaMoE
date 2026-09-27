@@ -39,6 +39,7 @@ struct ChatDetailView: View {
     var onToggleSidebar: (() -> Void)? = nil
 
     @FocusState private var isInputFocused: Bool
+    @AppStorage("dynamoe_reasoning_expanded_by_default") private var reasoningExpandedByDefault: Bool = false
     @State private var isReasoningExpanded: [UUID: Bool] = [:]
     @State private var promptTokenCount: Int = 0
     @State private var tokenCountTask: Task<Void, Never>? = nil
@@ -238,7 +239,7 @@ struct ChatDetailView: View {
                                         isGenerating: isGenerating && message.id == session.messages.last?.id,
                                         isStreamingOffDisk: isStreamingOffDisk,
                                         isExpanded: Binding(
-                                            get: { isReasoningExpanded[message.id] ?? false },
+                                            get: { isReasoningExpanded[message.id] ?? reasoningExpandedByDefault },
                                             set: { isReasoningExpanded[message.id] = $0 }
                                         )
                                     )
