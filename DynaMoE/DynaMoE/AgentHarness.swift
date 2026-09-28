@@ -198,9 +198,9 @@ public final class ShellRunTool: AgentTool {
             // its error to stderr while the pipeline's status is the LAST command's
             // (0). Dropping it left the model reading empty stdout as a real result
             // and re-running the same broken command for the rest of the run.
-            // Surfaced as text only: the command still succeeded, so the tool is not
-            // reclassified as a failure (which would trip the failure-loop guard on
-            // benign warnings like brew's progress output).
+            // Surfaced as text for the model either way; only a stderr line that names
+            // an outright-failed element is additionally returned below as a soft
+            // failure, so benign warnings (brew's progress output) never trip the guard.
             if !cleanStderr.isEmpty {
                 // A masked failure is often a missing path (`head missing | sed | wc`),
                 // so offer the same exact-name repair hint the error path uses; the
@@ -209,7 +209,13 @@ public final class ShellRunTool: AgentTool {
                 data["stderr"] = cleanStderr + pathHint
             }
             let res = AgentHarness.toolSuccessJSON(tool: "shell_run", data: data)
-            return (res, cleanStdout, nil, false)
+            // The command exited 0, but stderr may still name an element that failed
+            // outright (`cd` into a mangled path, a binary that does not exist). The
+            // result stays "success" for the model, but flagging it as a soft failure
+            // lets the loop guard escalate instead of burning the whole step budget on
+            // a command that never ran where the model intended.
+            let softFailure = AgentHarness.shellRunSoftFailure(stderr: cleanStderr)
+            return (res, cleanStdout, softFailure ? cleanStderr : nil, false)
         } else {
             print("🛠 [shell_run] exit=\(exitCode) cmd='\(String(command.prefix(100)))' stderr='\(String(cleanStderr.prefix(160)))' stdout='\(String(cleanStdout.prefix(80)))'")
             // A quoting/syntax failure is almost always a hand-written curl+
@@ -3878,6 +3884,43 @@ public final class AgentHarness {
     public static func looksLikeWebFetchCommand(_ command: String?) -> Bool {
         guard let lowered = command?.lowercased(), !lowered.isEmpty else { return false }
         return lowered.contains("curl") || lowered.contains("wget")
+    }
+
+    /// True when a shell run exited 0 yet stderr still names an element that failed
+    /// outright (a `cd` into a mangled path, a missing binary, an unreadable file).
+    /// Such a command did not run where the model intended, but exit status still
+    /// reports success, so the failure streak never trips and a model that mangles
+    /// the same path keeps re-inspecting until its step budget is gone. Flagging it
+    /// as a soft failure lets the loop guard escalate without reclassifying benign
+    /// stderr chatter (brew/pip progress, compiler notes) as a failure.
+    public static func shellRunSoftFailure(stderr: String) -> Bool {
+        let trimmed = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let benignMarkers = ["warning:", "note:", "notice:", "info:", "deprecated"]
+        let failureMarkers = [
+            "no such file or directory",
+            "command not found",
+            "permission denied",
+            "not a directory",
+            "is a directory",
+            "too many arguments",
+            "invalid option",
+            "unrecognized option",
+            "unmatched",
+            "syntax error",
+            "parse error"
+        ]
+        for rawLine in trimmed.split(separator: "\n") {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            let lower = line.lowercased()
+            if benignMarkers.contains(where: { lower.contains($0) }) { continue }
+            // Attribute the diagnostic to a command/builtin (`zsh:cd:1: too many
+            // arguments`, `head: -: No such file or directory`) so a stray phrase in a
+            // tool's own prose output is ignored.
+            guard line.contains(":") else { continue }
+            if failureMarkers.contains(where: { lower.contains($0) }) { return true }
+        }
+        return false
     }
 
     /// When a command fails because a user path does not exist, name the real

@@ -11596,7 +11596,7 @@ if layer.attnGateProjTensor != nil,
                             let toolResponseContext = toolResponses.map { AgentHarness.renderToolResultForModel($0) }.joined(separator: "\n")
                             let synthesisDirective = """
                             \n\n<system>
-                            IMPORTANT: All tool use is now DISABLED for this task. You consumed your search budget by repeatedly searching, or your recent tool calls carried empty arguments and could not be executed. The run was forcibly ended to protect the conversation from looping.
+                            IMPORTANT: All tool use is now DISABLED for this task. You consumed your search budget by repeatedly searching, or your recent tool calls carried empty arguments or failed outright (a bad path, a missing binary) and could not advance the task. The run was forcibly ended to protect the conversation from looping.
                             Using ONLY the search results and tool outputs already shown above in this conversation — plus your own knowledge — now write your complete, self-contained final answer to the user's original question.
                             Do not emit any tool calls. Do not search again. Just answer.
                             </system>

@@ -7020,6 +7020,33 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(split.skipNotices.keys.sorted(), [1])
     }
 
+    /// A shell run that exits 0 but whose stderr names a failed element still reads as
+    /// "success", so a model thrashing on a mangled path never trips the failure-loop
+    /// guard and burns its whole step budget. The observed spiral produced
+    /// `zsh:cd:1: too many arguments`, `cd: /Users/derek: No such file or directory`,
+    /// and `head: -: No such file or directory` — all on exit status 0.
+    func testShellRunSoftFailureDetection() {
+        XCTAssertTrue(AgentHarness.shellRunSoftFailure(
+            stderr: "zsh:cd:1: too many arguments"))
+        XCTAssertTrue(AgentHarness.shellRunSoftFailure(
+            stderr: "cd: /Users/derek: No such file or directory"))
+        XCTAssertTrue(AgentHarness.shellRunSoftFailure(
+            stderr: "head: -: No such file or directory\nhead: 30: No such file or directory"))
+        XCTAssertTrue(AgentHarness.shellRunSoftFailure(
+            stderr: "zsh: command not found: pythn"))
+
+        // Benign stderr chatter must not count, or ordinary warnings would trip the guard.
+        XCTAssertFalse(AgentHarness.shellRunSoftFailure(stderr: ""))
+        XCTAssertFalse(AgentHarness.shellRunSoftFailure(stderr: "   \n  "))
+        XCTAssertFalse(AgentHarness.shellRunSoftFailure(
+            stderr: "warning: no such file or directory in manifest"))
+        XCTAssertFalse(AgentHarness.shellRunSoftFailure(
+            stderr: "==> Downloading https://example.com/pkg"))
+        XCTAssertFalse(AgentHarness.shellRunSoftFailure(
+            stderr: "no such file or directory"))
+    }
+
+
     /// The pre-execution freeze cuts generation at `</function>`, so the model's
     /// own tool calls are committed to context without a `</tool_call>` closer
     /// (7 of 9 calls in one observed run). That history teaches the model invalid
