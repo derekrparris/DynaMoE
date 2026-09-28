@@ -6632,6 +6632,10 @@ final class DynaMoETests: XCTestCase {
     func testGrammarOpenerCacheInvalidatedOnTokenizerChange() {
         let sampler = GrammarConstrainedSampler.shared
         sampler.reset()
+        // The opener cache is keyed on vocab size, and earlier tests can leave a
+        // cache built at this test's size; drop it so the first decoderA mask is a
+        // real build rather than a stale reuse.
+        sampler.invalidateTokenizerCaches()
         sampler.registerTools(AgentHarness.shared.availableToolDefinitions)
         sampler.updateState(emittedText: "<tool_call><function=shell_run><parameter=command>ls")
         guard case .insideParameterValue = sampler.currentState else {
@@ -6818,6 +6822,22 @@ final class DynaMoETests: XCTestCase {
             masked(open + "wc -l x</parameter", tokens: [">", ">=", "=\n  >", "\n>", "x"]),
             [false, true, true, true, true],
             "only the canonical `>` may complete `</parameter`"
+        )
+
+        // Belt and suspenders: a tokenizer that merges the closer with a diverging
+        // char in ONE token (`</parameter=`) must still be refused, even from plain
+        // value text where the tail carries no closer partial.
+        XCTAssertEqual(
+            masked(open + "wc -l x", tokens: ["</parameter=", "</parameter>", "hi"]),
+            [true, false, false],
+            "a self-contained malformed closer token must be masked"
+        )
+        // Cross-boundary assembly: the tail ends mid-closer and the candidate
+        // completes it with a diverging `=` rather than `>`.
+        XCTAssertEqual(
+            masked(open + "wc -l x</", tokens: ["parameter=", "parameter>", "parameter"]),
+            [true, false, false],
+            "a malformed closer assembled across the token boundary must be masked"
         )
     }
 

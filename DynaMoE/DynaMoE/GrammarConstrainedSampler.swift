@@ -143,6 +143,14 @@ nonisolated public final class GrammarConstrainedSampler {
     private var openerTokenIds: Set<UInt32> = []
     private var openerTokenIdsVocabSize: Int = -1
 
+    /// Vocab ids whose decoded text contains a malformed parameter closer
+    /// (`</parameter` immediately followed by something other than `>`, e.g.
+    /// `</parameter=` or `</parameter\n>`). A tokenizer that merges the closer with
+    /// its `=` into one token would otherwise bypass the tail-boundary closer mask;
+    /// withholding these outright closes that hole. Built once per tokenizer.
+    private var malformedCloserTokenIds: Set<UInt32> = []
+    private var malformedCloserTokenIdsVocabSize: Int = -1
+
     // Structural Tag constants
     private let toolCallOpen = "<tool_call>"
     private let toolCallClose = "</tool_call>"
@@ -216,6 +224,8 @@ nonisolated public final class GrammarConstrainedSampler {
         defer { stateLock.unlock() }
         openerTokenIds = []
         openerTokenIdsVocabSize = -1
+        malformedCloserTokenIds = []
+        malformedCloserTokenIdsVocabSize = -1
     }
 
     /// True when `token` still identifies the live generation.
@@ -498,7 +508,8 @@ nonisolated public final class GrammarConstrainedSampler {
             // example. Firing only on the complete word leaves legitimate `<`/`</`
             // value text (shell redirects, HTML) untouched.
             if parameterValueTail.hasSuffix("</parameter") {
-                // Exclude the trailing word itself so the choice mask anchors on it.
+                // Anchor the choice mask on the closer word itself (the tail also
+                // carries the value text before it).
                 applyTagChoiceMask(
                     logits: logits,
                     vocabSize: vocabSize,
@@ -506,6 +517,25 @@ nonisolated public final class GrammarConstrainedSampler {
                     tokenDecoder: tokenDecoder,
                     options: [paramClose]
                 )
+            }
+            // Belt and suspenders for the same shape. (1) A token that itself
+            // contains a malformed closer (`</parameter=`) is refused outright, so a
+            // tokenizer that merges the word with its `=` cannot slip the boundary
+            // mask. (2) When the tail is mid-closer, any token that would ASSEMBLE a
+            // malformed closer across the boundary is refused too (e.g. the tail
+            // ends with `</` and the candidate is `parameter=`).
+            ensureMalformedCloserTokenIds(vocabSize: vocabSize, tokenDecoder: tokenDecoder)
+            for id in malformedCloserTokenIds where Int(id) < vocabSize {
+                logits[Int(id)] = -Float.infinity
+            }
+            if endsWithCloserPartial(parameterValueTail) {
+                let probeTail = String(parameterValueTail.suffix(16))
+                for v in 0..<vocabSize {
+                    guard let str = tokenDecoder(UInt32(v)) else { continue }
+                    if containsMalformedParameterCloser(probeTail + str) {
+                        logits[v] = -Float.infinity
+                    }
+                }
             }
 
         case .closingFunction(let matchedPrefix):
@@ -604,6 +634,49 @@ nonisolated public final class GrammarConstrainedSampler {
             for len in 1...maxLen where tail.hasSuffix(String(opener.prefix(len))) {
                 return true
             }
+        }
+        return false
+    }
+
+    /// True when `s` contains a malformed parameter closer: the `</parameter` word
+    /// immediately followed by something other than `>` (e.g. `</parameter=`,
+    /// `</parameter\n`). A `</parameter` that ends `s` is a legitimate partial — the
+    /// next token must complete it — so it does NOT count.
+    private func containsMalformedParameterCloser(_ s: String) -> Bool {
+        let word = "</parameter"
+        var searchStart = s.startIndex
+        while let r = s.range(of: word, range: searchStart..<s.endIndex) {
+            let after = r.upperBound
+            if after < s.endIndex, s[after] != ">" { return true }
+            searchStart = r.upperBound
+        }
+        return false
+    }
+
+    /// Builds (once per tokenizer) the set of vocab ids whose decoded text already
+    /// contains a malformed closer, so the value state can withhold them cheaply.
+    private func ensureMalformedCloserTokenIds(vocabSize: Int, tokenDecoder: (UInt32) -> String?) {
+        guard malformedCloserTokenIdsVocabSize != vocabSize else { return }
+        var ids = Set<UInt32>()
+        for v in 0..<vocabSize {
+            guard let s = tokenDecoder(UInt32(v)) else { continue }
+            if containsMalformedParameterCloser(s) { ids.insert(UInt32(v)) }
+        }
+        malformedCloserTokenIds = ids
+        malformedCloserTokenIdsVocabSize = vocabSize
+    }
+
+    /// True when `tail` ends with a prefix of `</parameter` of length >= 2 (`</`, …,
+    /// `</parameter`), i.e. the model is mid-way through the closer. The two-char
+    /// floor is deliberate: a tokenizer could carry the completion of the word and
+    /// its diverging `=` in one token (`parameter=`), which is only catchable when
+    /// the partial spans the `</` boundary.
+    private func endsWithCloserPartial(_ tail: String) -> Bool {
+        let word = "</parameter"
+        let maxLen = min(word.count, tail.count)
+        if maxLen < 2 { return false }
+        for len in 2...maxLen where tail.hasSuffix(String(word.prefix(len))) {
+            return true
         }
         return false
     }
