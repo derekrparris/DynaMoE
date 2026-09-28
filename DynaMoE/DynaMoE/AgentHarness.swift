@@ -2738,6 +2738,11 @@ public final class AgentHarness {
     /// Subset of `tools` currently exposed to the model in the prompt and grammar.
     public private(set) var loadedTools: [String: AgentTool] = [:]
     public var defaultWorkingDirectory: URL? = nil
+    /// The exact prompt text the model is currently attending over (system + full
+    /// conversation). Tools that must offer a path-repair hint read the absolute
+    /// paths the user named from here, since a tool result is the only place the
+    /// model gets told which path it should have used.
+    public var lastPromptText: String = ""
     /// Token budget for a single tool result (converted to characters conservatively
     /// via `charBudget(forTokenBudget:)` before tools truncate their output).
     public var maxToolOutputLength: Int = 4000
@@ -3253,6 +3258,7 @@ public final class AgentHarness {
             - Required parameters MUST be specified
             - You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
             - When the user asks to inspect, read, edit, modify, or process a file, or run terminal commands, you MUST call the function immediately without conversational promises
+            - For any file the user names, use its EXACT absolute path (e.g. /Users/me/Downloads/data.csv) in the command. Never `cd` into a folder and then reference a bare filename, and never assume the working directory already contains the file.
             - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
 
             Web Research Grounding Rules:
@@ -3289,6 +3295,7 @@ public final class AgentHarness {
             - Required parameters MUST be specified
             - You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
             - When the user asks to inspect, read, edit, modify, or process a file, or run terminal commands, you MUST call the function immediately without conversational promises
+            - For any file the user names, use its EXACT absolute path (e.g. /Users/me/Downloads/data.csv) in the command. Never `cd` into a folder and then reference a bare filename, and never assume the working directory already contains the file.
             - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
 
             Web Research Grounding Rules:
@@ -3933,10 +3940,23 @@ public final class AgentHarness {
     /// has no existing parent, so requiring the immediate parent to exist skipped the
     /// hint entirely and left the model with a bare "No such file". Walk up to the
     /// nearest ancestor that does exist and name the component the model must correct.
+    ///
+    /// Also handles the relative-name case: a bare `survey.csv` that is not in the
+    /// working directory is matched by basename against the absolute paths in
+    /// `lastPromptText` and echoed back, so a model that drops to a relative filename
+    /// under a different cwd is steered to the exact path the user gave.
     static func missingPathRepairHint(command: String, stderr: String, stdout: String) -> String {
         let errorText = (stderr + "\n" + stdout).lowercased()
         let missingSignals = ["no such file", "filenotfound", "cannot find", "does not exist", "not found"]
-        guard missingSignals.contains(where: { errorText.contains($0) }) else { return "" }
+        // A failed `cd` carries no missing-path phrase (`zsh:cd:1: too many arguments`
+        // for `/Users/derek Harris Downloads`), so the guard skipped the hint and the
+        // model was left guessing. Treat a cd diagnostic as a missing-path signal too;
+        // the absolute-path pass then names the real sibling directories.
+        let cdFailurePhrases = ["too many arguments", "no such file", "not a directory", "permission denied", "string not in pwd", "invalid option"]
+        let looksLikeFailedCd = errorText.split(separator: "\n").contains { line in
+            line.contains("cd:") && cdFailurePhrases.contains { line.contains($0) }
+        }
+        guard missingSignals.contains(where: { errorText.contains($0) }) || looksLikeFailedCd else { return "" }
 
         let separators = CharacterSet(charactersIn: " \t\n'\"`;|&()[]{}<>=,")
         var seen = Set<String>()
@@ -3973,7 +3993,47 @@ public final class AgentHarness {
             let list = ranked.prefix(6).map { "  \($0)" }.joined(separator: "\n")
             return "\nHint: \(token) does not exist. The nearest existing directory is \(ancestor.path); the actual names there are:\n\(list)\nRebuild the path using one of these EXACT names (spaces, commas and underscores included) in place of \"\(missingComponent)\"."
         }
+
+        // Second pass: the model referenced a BARE relative filename that is not in
+        // the working directory. Observed: given `/Users/…/Downloads/survey.csv`, it
+        // ran `open('survey.csv')`, which only worked because the process cwd happened
+        // to hold the file. Echo back the absolute path the user named so a different
+        // cwd cannot send the run back into a path-guessing loop.
+        let fm = FileManager.default
+        let cwd = fm.currentDirectoryPath
+        for raw in command.components(separatedBy: separators) {
+            var token = raw
+            while let last = token.last, ".,:".contains(last) { token.removeLast() }
+            guard token.count > 1, !token.hasPrefix("/"), !token.hasPrefix("-"),
+                  !seen.contains(token) else { continue }
+            // Only path-like tokens: a filename carries a dot, or an interior slash.
+            guard token.contains(".") || token.contains("/") else { continue }
+            seen.insert(token)
+            guard !fm.fileExists(atPath: cwd + "/" + token) else { continue }
+            let basename = (token as NSString).lastPathComponent
+            guard basename.contains(".") else { continue }
+            if let match = absolutePath(in: AgentHarness.shared.lastPromptText, matchingLastComponent: basename) {
+                return "\nHint: '\(token)' does not exist under the current working directory (\(cwd)). The user's file is at \(match). Use that EXACT absolute path."
+            }
+        }
         return ""
+    }
+
+    /// Finds an absolute path whose final component equals `component` inside the
+    /// prompt text. Paths are delimited by whitespace and shell punctuation; a
+    /// trailing period/comma/colon is trimmed before the name is compared.
+    private static func absolutePath(in prompt: String, matchingLastComponent component: String) -> String? {
+        guard !prompt.isEmpty else { return nil }
+        let separators = CharacterSet(charactersIn: " \t\n'\"`;|&()[]{}<>=,")
+        let wanted = component.lowercased()
+        for raw in prompt.components(separatedBy: separators) {
+            guard raw.hasPrefix("/Users/") || raw.hasPrefix("/home/") else { continue }
+            var token = raw
+            while let last = token.last, ".,:".contains(last) { token.removeLast() }
+            guard (token as NSString).lastPathComponent.lowercased() == wanted else { continue }
+            return token
+        }
+        return nil
     }
 
     private static func sharedPrefixLength(_ a: String, _ b: String) -> Int {

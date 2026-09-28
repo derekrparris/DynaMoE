@@ -2415,3 +2415,34 @@ Tests: `testShellRunSoftFailureDetection` (the three observed diagnostics count;
 whitespace, a `warning:` line, a download-progress line, and an unattributed phrase do
 not). Verified: `swiftc -parse` clean, `testShellRunSoftFailureDetection` and
 `testNoOpGestureToolCallDetection` pass.
+
+**Follow-up — the model drops to a bare relative filename.** The next run
+(`prompt-step5-…20-49-03Z.txt`) showed the mirror-image problem: handed
+`/Users/derekparris/Downloads/survey.csv`, the model ran `open('survey.csv')`. That
+worked only because the app's process cwd happened to contain the file
+(`dynamoe_agent_working_directory` was unset, so `shell_run` fell back to
+`FileManager.default.currentDirectoryPath`, `AgentHarness.swift:166`). Under a different
+cwd the relative command is a guaranteed FileNotFound, and `missingPathRepairHint` —
+which only inspects `/Users/…` and `/home/…` tokens — offered no guidance. Two fixes:
+
+1. Prompt rule (both tool-format branches): "For any file the user names, use its EXACT
+   absolute path … Never `cd` into a folder and then reference a bare filename, and never
+   assume the working directory already contains the file."
+2. `missingPathRepairHint` second pass: a bare relative token that (a) carries a dot or an
+   interior slash and (b) does not exist under the cwd is matched by basename against the
+   absolute paths in the new `AgentHarness.lastPromptText` (set from `formattedPrompt` in
+   `startAutoregressiveGeneration`) and echoed back as the exact path to use. Non-path
+   tokens (`csv`, `import`) are skipped because they carry no dot and never match.
+
+Tests: `testMissingPathRepairHintResolvesRelativeName` (echoes the user's absolute path
+for `open('<name>')`; a dotless module token yields no hint). Verified: `swiftc -parse`
+clean, test passes.
+
+Also widened `missingPathRepairHint`'s trigger: a failed `cd` writes
+`zsh:cd:1: too many arguments` (the mangled `/Users/derek Harris Downloads`) with no
+missing-path phrase, so the guard bailed and the hint never ran on the very first
+mangled-path command. A line containing `cd:` plus a cd diagnostic
+(`too many arguments`, `no such file`, `not a directory`, `permission denied`,
+`string not in pwd`, `invalid option`) now counts as a missing-path signal, so the
+absolute-path pass names the real sibling directory. Test:
+`testMissingPathRepairHintHandlesFailedCd`. Verified: passes.

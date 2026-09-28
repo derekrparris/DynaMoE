@@ -7046,6 +7046,49 @@ final class DynaMoETests: XCTestCase {
             stderr: "no such file or directory"))
     }
 
+    /// Given an absolute path in the prompt, a model that drops to a bare relative
+    /// filename under a different working directory must be steered back to the exact
+    /// path the user named instead of guessing. Observed: `open('survey.csv')`
+    /// succeeded only because the process cwd happened to contain the file.
+    func testMissingPathRepairHintResolvesRelativeName() {
+        let probe = "dynamoe_hint_probe_4821.csv"
+        let absolute = "/Users/example/Downloads/\(probe)"
+        let priorPrompt = AgentHarness.shared.lastPromptText
+        defer { AgentHarness.shared.lastPromptText = priorPrompt }
+
+        AgentHarness.shared.lastPromptText = "analyze the survey at \(absolute) and report"
+        let hint = AgentHarness.missingPathRepairHint(
+            command: "python3 -c \"open('\(probe)')\"",
+            stderr: "FileNotFoundError: [Errno 2] No such file or directory: '\(probe)'",
+            stdout: ""
+        )
+        XCTAssertTrue(hint.contains(absolute), "hint should echo the user's absolute path")
+        XCTAssertTrue(hint.contains("EXACT"))
+
+        // A non-path token (a module name with no dot) must not produce a hint.
+        let noHint = AgentHarness.missingPathRepairHint(
+            command: "python3 -c \"import csv\"",
+            stderr: "No such file or directory",
+            stdout: ""
+        )
+        XCTAssertFalse(noHint.contains(absolute))
+    }
+
+    /// A failed `cd` (`zsh:cd:1: too many arguments` for a mangled path) carries no
+    /// missing-path phrase, so the repair hint used to bail and the model guessed on.
+    /// The hint must now fire and name the real sibling directory.
+    func testMissingPathRepairHintHandlesFailedCd() {
+        let home = "/Users/\(NSUserName())"
+        let hint = AgentHarness.missingPathRepairHint(
+            command: "cd \(home)/DownloadsQ desc; echo hi",
+            stderr: "zsh:cd:1: too many arguments",
+            stdout: ""
+        )
+        XCTAssertTrue(hint.contains("Hint:"), "a failed cd must produce a repair hint")
+        XCTAssertTrue(hint.contains(home))
+        XCTAssertTrue(hint.lowercased().contains("downloads"), "should name the real sibling directory")
+    }
+
 
     /// The pre-execution freeze cuts generation at `</function>`, so the model's
     /// own tool calls are committed to context without a `</tool_call>` closer

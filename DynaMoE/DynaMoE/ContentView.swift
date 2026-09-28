@@ -3633,6 +3633,11 @@ struct ContentView: View {
             formattedPrompt = "<|im_start|>user\n\(prompt)<|im_end|>\n<|im_start|>assistant\n\(thinkSuffix)"
         }
 
+        // Expose the exact prompt text to the harness: the path-repair hint uses it
+        // to echo back the absolute path the user named when a tool call used a bare
+        // relative filename that does not exist under the working directory.
+        AgentHarness.shared.lastPromptText = formattedPrompt
+
         let promptTokenIds: [UInt32]
         do {
             if let spliced = promptTokens, !spliced.isEmpty {
