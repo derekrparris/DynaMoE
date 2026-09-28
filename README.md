@@ -43,8 +43,8 @@ DynaMoE supports sparse Mixture-of-Experts, hybrid recurrent SSM/attention archi
 
 ---
 
-<img width="1918" height="1080" alt="Screenshot 2026-09-14 at 5 15 50 PM" src="https://github.com/user-attachments/assets/59e68a69-fd98-4d79-bc05-3ef804fcede8" />  
-*screenshot from version 0.8.2 depicting results from a file read done by a subagent*
+<img width="2048" height="2048" alt="DynaMoE_T_H" src="https://github.com/user-attachments/assets/7b31de51-4a73-426f-83f3-24cd421784ec" />
+
 
 
 ---
