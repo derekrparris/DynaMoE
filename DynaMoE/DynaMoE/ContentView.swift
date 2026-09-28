@@ -11841,12 +11841,18 @@ if layer.attnGateProjTensor != nil,
     private static let openTags = ["<think>", "<thought>", "<|thought|>"]
     private static let closeTags = ["</think>", "</thought>", "</|thought|>"]
 
-    /// Matches a free-standing "response" word preceded by whitespace or a dot, e.g.
-    /// "\nresponseHello" or "helpfully.responseHello!". The trailing lookbehind-ish guard
-    /// (next char not a lowercase letter / digit / '@' / '_' / '.') prevents matching within
-    /// words like "responses" or "response." used as plain prose.
+    /// Matches a bare "response" delimiter, never the ordinary English word. It must
+    /// either start a line (optionally indented) or be glued to a preceding dot with
+    /// a non-space following, and when line-leading it must not run into prose
+    /// ("response counts"). Without the prose guard, reasoning that mentions the word
+    /// ("1. Overall stats subagent: response counts, NPS…") split the thinking block
+    /// mid-stream until the real ` response` arrived, briefly leaking reasoning into
+    /// the response body.
     private static let responseBoundaryRegex: NSRegularExpression? = {
-        try? NSRegularExpression(pattern: "(?<=[\\s.])response(?![a-z@_.0-9])", options: [])
+        try? NSRegularExpression(
+            pattern: "(?:(?<=\\.)response(?![a-z@_.0-9\\s])|(?m)^[ \\t]*response(?![a-z@_.0-9])(?![ \\t]+[a-z]))",
+            options: []
+        )
     }()
 
     /// Matches a "response" marker on its own line ("\n response \n"). Delimiter emitted

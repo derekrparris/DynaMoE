@@ -9043,6 +9043,27 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         XCTAssertTrue(splitThought.thinkClose)
         XCTAssertEqual(splitThought.think, "Some internal thought.")
         XCTAssertEqual(splitThought.resp, "Final output.")
+
+        // Scenario 7: reasoning that merely mentions the word "response" must not be
+        // split mid-stream (observed live: "1. Overall stats subagent: response
+        // counts, NPS…" cut the accordion until the real closing tag arrived).
+        let proseRaw = """
+        Let me plan the subagent work.
+        1. Overall stats subagent: response counts, NPS, coach ratings average
+        2. Text feedback subagent: group by sentiment
+        """
+        let splitProse = ContentView.splitThinkingAndResponse(raw: proseRaw, promptRequestsThinking: true)
+        XCTAssertTrue(splitProse.thinkOpen, "prose 'response' must not close the thinking block")
+        XCTAssertFalse(splitProse.thinkClose)
+        XCTAssertEqual(splitProse.resp, "")
+
+        // The real delimiter still splits, and all the reasoning (including the word
+        // "response") lands in `think`.
+        let proseThenClose = proseRaw + "\n</think>\nHere is the report."
+        let splitProseClose = ContentView.splitThinkingAndResponse(raw: proseThenClose, promptRequestsThinking: true)
+        XCTAssertTrue(splitProseClose.thinkClose)
+        XCTAssertTrue(splitProseClose.think.contains("response counts"))
+        XCTAssertEqual(splitProseClose.resp, "Here is the report.")
     }
 
     func testSparkForwardDiagnostics() throws {
