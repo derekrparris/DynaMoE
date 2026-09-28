@@ -9177,12 +9177,8 @@ if layer.attnGateProjTensor != nil,
                             let effectiveTokensProcessed = Double(P) * (Double(passIdx) / Double(totalPasses))
                             let promptSpeed = effectiveTokensProcessed / elapsed
                             let pct = Int((Double(passIdx) / Double(totalPasses)) * 100)
-                            let remainingPasses = totalPasses - passIdx
-                            let timePerPass = elapsed / Double(passIdx)
-                            let etaSec = Double(remainingPasses) * timePerPass
-                            let etaStr = etaSec >= 60 ? String(format: "%dm %02ds", Int(etaSec) / 60, Int(etaSec) % 60) : String(format: "%.0fs", etaSec)
                             let speedStr = promptSpeed >= 10 ? String(format: "%.0f", promptSpeed) : String(format: "%.1f", promptSpeed)
-                            let prefillStr = "Ingesting prompt: Layer \(passIdx)/\(totalPasses) (\(pct)%) • \(speedStr) tok/s • ETA: \(etaStr)"
+                            let prefillStr = "Ingesting prompt: Layer \(passIdx)/\(totalPasses) (\(pct)%) • \(speedStr) tok/s"
                             let currentRss = WorkingSetManager.shared.effectiveResidentMemoryGB
 
                             Task { @MainActor in
@@ -10659,11 +10655,8 @@ if layer.attnGateProjTensor != nil,
                                 let elapsed = max(0.001, now - prefillStartTime)
                                 let promptSpeed = Double(idx + 1) / elapsed
                                 let pct = Int((Double(idx + 1) / Double(totalTokens)) * 100)
-                                let remaining = totalTokens - (idx + 1)
-                                let etaSec = Double(remaining) * (elapsed / Double(idx + 1))
-                                let etaStr = etaSec >= 60 ? String(format: "%dm %02ds", Int(etaSec) / 60, Int(etaSec) % 60) : String(format: "%.0fs", etaSec)
                                 let speedStr = promptSpeed >= 10 ? String(format: "%.0f", promptSpeed) : String(format: "%.1f", promptSpeed)
-                                let prefillStr = "Ingesting prompt: Token \(idx + 1)/\(totalTokens) (\(pct)%) • \(speedStr) tok/s • ETA: \(etaStr)"
+                                let prefillStr = "Ingesting prompt: Token \(idx + 1)/\(totalTokens) (\(pct)%) • \(speedStr) tok/s"
                                 let currentRss = WorkingSetManager.shared.effectiveResidentMemoryGB
 
                                 Task { @MainActor in
