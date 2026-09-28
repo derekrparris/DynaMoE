@@ -148,10 +148,14 @@ public final class ShellRunTool: AgentTool {
     )
 
     public func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
-        guard let command = arguments["command"] as? String, !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard let rawCommand = arguments["command"] as? String, !rawCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             let err = "Error: missing or empty 'command' parameter in shell_run"
             return (AgentHarness.toolErrorJSON(tool: "shell_run", error: err), nil, err, false)
         }
+        // A heredoc the model over-ran (`PYEOF` repeated after the terminator) would
+        // otherwise run a dozen failing `PYEOF` commands after the script succeeded,
+        // flipping a good run into exit_code 127. Trim to the intended heredoc first.
+        let command = StreamingToolParser.truncateHeredocOverrun(rawCommand)
 
         let targetDir: URL
         if let customCwd = arguments["cwd"] as? String, !customCwd.isEmpty {
@@ -3876,11 +3880,16 @@ public final class AgentHarness {
         return lowered.contains("curl") || lowered.contains("wget")
     }
 
-    /// When a command fails because a user path does not exist, name the files that
-    /// actually live in that directory so the model can copy the exact name instead
-    /// of mangling it again. Observed failure: after a ~10k-token CSV dump the model
-    /// drops the date suffix from the path, then invents "/Users/derek Harris", and
-    /// burns its whole step budget re-issuing the same FileNotFound command.
+    /// When a command fails because a user path does not exist, name the real
+    /// sibling names so the model can copy the exact name instead of mangling it
+    /// again. Observed failure: after a ~10k-token CSV dump the model drops the date
+    /// suffix from the path, then invents "/Users/derek Harris", and burns its whole
+    /// step budget re-issuing the same FileNotFound command.
+    ///
+    /// Handles a typo in a DIRECTORY component too: `/Users/derepdarrs/Downloads/x`
+    /// has no existing parent, so requiring the immediate parent to exist skipped the
+    /// hint entirely and left the model with a bare "No such file". Walk up to the
+    /// nearest ancestor that does exist and name the component the model must correct.
     static func missingPathRepairHint(command: String, stderr: String, stdout: String) -> String {
         let errorText = (stderr + "\n" + stdout).lowercased()
         let missingSignals = ["no such file", "filenotfound", "cannot find", "does not exist", "not found"]
@@ -3897,19 +3906,29 @@ public final class AgentHarness {
             guard token.count > 1, !seen.contains(token) else { continue }
             seen.insert(token)
 
-            let url = URL(fileURLWithPath: token)
-            let dir = url.deletingLastPathComponent()
             let fm = FileManager.default
-            guard !fm.fileExists(atPath: token), fm.fileExists(atPath: dir.path) else { continue }
-            let entries = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
-            let wanted = url.lastPathComponent.lowercased()
+            let url = URL(fileURLWithPath: token)
+            guard !fm.fileExists(atPath: token) else { continue }
+
+            // Deepest existing ancestor; the component directly below it is what the
+            // model got wrong (a file name, or a directory name higher up).
+            var ancestor = url.deletingLastPathComponent()
+            var missingComponent = url.lastPathComponent
+            while ancestor.path != "/", !fm.fileExists(atPath: ancestor.path) {
+                missingComponent = ancestor.lastPathComponent
+                ancestor = ancestor.deletingLastPathComponent()
+            }
+            guard fm.fileExists(atPath: ancestor.path) else { continue }
+
+            let entries = (try? fm.contentsOfDirectory(atPath: ancestor.path)) ?? []
+            let wanted = missingComponent.lowercased()
             guard !wanted.isEmpty else { continue }
             let ranked = entries
                 .filter { $0.lowercased() != wanted }
                 .sorted { sharedPrefixLength($0.lowercased(), wanted) > sharedPrefixLength($1.lowercased(), wanted) }
             guard let best = ranked.first, sharedPrefixLength(best.lowercased(), wanted) >= 3 else { continue }
             let list = ranked.prefix(6).map { "  \($0)" }.joined(separator: "\n")
-            return "\nHint: \(token) does not exist. The actual names in \(dir.path) are:\n\(list)\nUse one of these EXACT names, copied in full (spaces, commas and underscores included)."
+            return "\nHint: \(token) does not exist. The nearest existing directory is \(ancestor.path); the actual names there are:\n\(list)\nRebuild the path using one of these EXACT names (spaces, commas and underscores included) in place of \"\(missingComponent)\"."
         }
         return ""
     }

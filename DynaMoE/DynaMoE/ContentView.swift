@@ -3455,21 +3455,17 @@ struct ContentView: View {
         encode: (String) throws -> [UInt32]
     ) -> [UInt32]? {
         var tokens = basePromptTokens
-        // A turn whose parameter closer was split across lines (`</parameter=\n>`)
-        // cannot be spliced verbatim: the raw ids would teach the model its own
-        // malformed call. Repair the text and re-encode the turn instead. That
-        // costs one full re-prefill for the turn (the pin no longer matches
-        // byte-for-byte), which is cheaper than feeding the loop the broken shape.
-        let repairedTurn = StreamingToolParser.repairSplitParameterClosers(turnText)
-        if repairedTurn != turnText {
-            guard let repairedIds = try? encode(repairedTurn), !repairedIds.isEmpty else { return nil }
-            tokens.append(contentsOf: repairedIds)
-            guard let closure = StreamingToolParser.turnClosureSuffix(
-                forRawDecodedTurn: repairedTurn,
-                endTag: endTag,
-                encode: encode
-            ) else { return nil }
-            tokens.append(contentsOf: closure)
+        // A turn whose CONTENT had to be rewritten — a parameter closer split across
+        // lines (`</parameter=\n>`), or a heredoc the model over-ran — cannot be
+        // spliced from the raw ids without teaching the model its own broken shape.
+        // Re-encode the prepared turn instead. That costs one full re-prefill for the
+        // turn (the pin no longer matches byte-for-byte), which is cheaper than the
+        // loop. Closers/end-tag appended only for structure do NOT count as a content
+        // change, so the common freeze case keeps the cheap exact splice.
+        let prepared = prepareAssistantTurnText(turnText, endTag: endTag)
+        if prepared.contentChanged {
+            guard let preparedIds = try? encode(prepared.text), !preparedIds.isEmpty else { return nil }
+            tokens.append(contentsOf: preparedIds)
         } else {
             tokens.append(contentsOf: generatedTokenIds)
             // `turnText` MUST be the raw decoded turn, never a normalized copy: the
@@ -3486,6 +3482,27 @@ struct ContentView: View {
         return tokens
     }
 
+    /// The assistant turn text as it should be committed, plus whether the CONTENT
+    /// (not just appended closers/end tag) changed. Repairs a split parameter closer,
+    /// restores structural closers the freeze or token cap cut, and trims a heredoc
+    /// the model over-ran. `contentChanged == false` means the raw generated ids plus
+    /// the closure tokens reproduce it, so the caller can splice cheaply.
+    private func prepareAssistantTurnText(_ decoded: String, endTag: String) -> (text: String, contentChanged: Bool) {
+        var text = StreamingToolParser.repairSplitParameterClosers(decoded)
+        var contentChanged = text != decoded
+        for tag in StreamingToolParser.structuralClosureTags(forRawDecodedTurn: text) {
+            text += tag
+        }
+        // Truncation needs the value closed to find it, so it runs after the closers.
+        let beforeTruncate = text
+        text = StreamingToolParser.truncateHeredocOverruns(inTurnText: text)
+        if text != beforeTruncate { contentChanged = true }
+        if !text.contains(endTag) {
+            text += endTag
+        }
+        return (text, contentChanged)
+    }
+
     /// The pre-execution freeze fires the moment `</function>` closes, so a frozen
     /// tool call is routinely committed to context WITHOUT its `</tool_call>`
     /// closer. Spliced into the next prompt verbatim, the model's own history
@@ -3496,18 +3513,7 @@ struct ContentView: View {
     /// examples of its own format. Paired with `buildSplicedContinuationTokens`,
     /// which performs the same normalization on the token stream.
     private func closedAssistantTurnText(_ decoded: String, endTag: String) -> String {
-        // Repair a parameter closer the model split across lines before the turn is
-        // committed to history. Left in, the model reads its own malformed call back
-        // and re-emits the same broken shape on later steps.
-        var text = StreamingToolParser.repairSplitParameterClosers(decoded)
-        let unclosed = StreamingToolParser.unclosedToolCallCount(text)
-        if unclosed > 0 {
-            for _ in 0..<unclosed { text += StreamingToolParser.qwenToolCallClose }
-        }
-        if !text.contains(endTag) {
-            text += endTag
-        }
-        return text
+        prepareAssistantTurnText(decoded, endTag: endTag).text
     }
 
     private func startAutoregressiveGeneration(customPrompt: String? = nil, promptTokens: [UInt32]? = nil, sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false, forceSynthesis: Bool = false) {
@@ -10822,26 +10828,17 @@ if layer.attnGateProjTensor != nil,
                     // Degenerate-loop guard: models occasionally fall into verbatim
                     // token cycles (the same 1-8 tokens repeating forever, EOS never
                     // sampled). Stop cleanly once the tail is an exact repeating
-                    // cycle. Period-1 runs need 32 repeats so legitimate whitespace
-                    // runs in code are never caught.
-                    if generatedTokenIds.count >= 8 {
-                        let tail = Array(generatedTokenIds.suffix(40))
-                        for period in 1...8 {
-                            let minCycles = (period == 1) ? 32 : 4
-                            let needed = period * minCycles
-                            if tail.count < needed { continue }
-                            var isCycle = true
-                            for i in period..<tail.count where tail[i] != tail[i - period] {
-                                isCycle = false
-                                break
-                            }
-                            if isCycle {
-                                shouldBreak = true
-                                breakReason = "degenerate-cycle"
-                                break
-                            }
-                        }
-                        if shouldBreak { break }
+                    // cycle. Period-1 runs need more repeats so legitimate whitespace
+                    // runs in code are never caught, and only a cycle whose unit
+                    // carries a letter or digit counts (a run of blank lines or
+                    // closing braces is formatting, not a loop).
+                    if let period = Self.detectDegenerateCycle(
+                        tokenIds: generatedTokenIds,
+                        decodeUnit: { ids in (try? tokenizer.decode(ids: ids)) ?? "" }
+                    ) {
+                        shouldBreak = true
+                        breakReason = "degenerate-cycle(p\(period))"
+                        break
                     }
 
                     if tokensGenerated == 1 {
@@ -11316,7 +11313,13 @@ if layer.attnGateProjTensor != nil,
                     let call = parsedResult.calls[idx]
                     var stringArgs: [String: String] = [:]
                     for (k, v) in call.arguments {
-                        stringArgs[k] = "\(v)"
+                        // Show the command that actually ran, not a heredoc over-run
+                        // the tool trimmed before executing.
+                        if call.name == "shell_run", k == "command", let s = v as? String {
+                            stringArgs[k] = StreamingToolParser.truncateHeredocOverrun(s)
+                        } else {
+                            stringArgs[k] = "\(v)"
+                        }
                     }
                     recordsByCallIndex[idx] = ToolCallRecord(
                         name: call.name,
@@ -11860,6 +11863,40 @@ if layer.attnGateProjTensor != nil,
     private static let standaloneResponseRegex: NSRegularExpression? = {
         try? NSRegularExpression(pattern: "(?m)^\\s*response\\s*$", options: [])
     }()
+
+    /// Returns the period of a verbatim token cycle at the end of `tokenIds`, or nil
+    /// when the tail is not a degenerate repeat.
+    ///
+    /// Checks only the LAST `period * minCycles` tokens, not a fixed window: a repeat
+    /// that begins partway through the recent history (e.g. a heredoc terminator
+    /// repeated after a long script) must still be caught. `minCycles` is 24 for
+    /// period 1 — legitimate whitespace runs are long — and 4 otherwise. A cycle is
+    /// only accepted when its decoded unit carries a letter or digit, so a run of
+    /// blank lines, closing braces, or dashes (all legitimate formatting) never
+    /// truncates a healthy turn.
+    static func detectDegenerateCycle(
+        tokenIds: [UInt32],
+        decodeUnit: ([UInt32]) -> String
+    ) -> Int? {
+        guard tokenIds.count >= 8 else { return nil }
+        for period in 1...8 {
+            let minCycles = (period == 1) ? 24 : 4
+            let needed = period * minCycles
+            guard tokenIds.count >= needed else { continue }
+            let window = Array(tokenIds.suffix(needed))
+            var isCycle = true
+            for i in period..<window.count where window[i] != window[i - period] {
+                isCycle = false
+                break
+            }
+            guard isCycle else { continue }
+            let unit = Array(window[0..<period])
+            let text = decodeUnit(unit)
+            guard text.contains(where: { $0.isLetter || $0.isNumber }) else { continue }
+            return period
+        }
+        return nil
+    }
 
     /// Locates the thinking->response boundary in streamed text, or nil when absent.
     static func locateThinkingBoundary(in raw: String, promptRequestsThinking: Bool) -> NSRange? {

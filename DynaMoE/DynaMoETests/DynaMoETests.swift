@@ -6887,6 +6887,24 @@ final class DynaMoETests: XCTestCase {
         XCTAssertTrue(hint.contains(real.lastPathComponent), "hint must name the real file, got: \(hint)")
         XCTAssertTrue(hint.contains("does not exist"))
 
+        // A typo in a DIRECTORY component: the file's parent does not exist either,
+        // so the hint must walk up to the nearest existing ancestor and name the real
+        // sibling directory (observed live: "/Users/derepdarrs/…", where the old
+        // "parent exists" precondition skipped the hint and the model got no help).
+        let parent = dir.deletingLastPathComponent()
+        let realDir = parent.appendingPathComponent("DynaMoE-sample-dir")
+        try? fm.createDirectory(at: realDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: realDir) }
+        let mangledDir = parent.appendingPathComponent("DynaMoE-sample-dirX")
+            .appendingPathComponent("survey.csv").path
+        let dirHint = AgentHarness.missingPathRepairHint(
+            command: "head -20 \(mangledDir)",
+            stderr: "head: \(mangledDir): No such file or directory",
+            stdout: ""
+        )
+        XCTAssertTrue(dirHint.contains(realDir.lastPathComponent), "hint must name the real directory, got: \(dirHint)")
+        XCTAssertTrue(dirHint.contains("does not exist"))
+
         // No missing-file signal means no hint.
         XCTAssertEqual(AgentHarness.missingPathRepairHint(command: "ls /Users", stderr: "", stdout: ""), "")
     }
@@ -7098,6 +7116,111 @@ final class DynaMoETests: XCTestCase {
         // A well-formed closer and an unrelated `</parameter=foo>` are untouched.
         XCTAssertEqual(StreamingToolParser.repairSplitParameterClosers("</parameter>"), "</parameter>")
         XCTAssertEqual(StreamingToolParser.repairSplitParameterClosers("</parameter=foo>"), "</parameter=foo>")
+    }
+
+    /// A turn cut before its closers (pre-execution freeze or max-token cap) must be
+    /// committed with the missing inner tags restored, so the model never reads back
+    /// a `<parameter>` that never closed. Observed live: a turn ended with
+    /// `<parameter=command>…PYEOF` and no `</parameter></function>`, the malformed
+    /// example stayed in context, and the run spiralled.
+    func testStructuralClosureTagsRepairTruncatedTurns() {
+        let TC_OPEN = "<tool_call>"
+        let TC_CLOSE = "</tool_call>"
+        let FN_OPEN = "<function="
+        let FN_CLOSE = "</function>"
+        let P_OPEN = "<parameter="
+        let P_CLOSE = "</parameter>"
+
+        // Unterminated value with no closers: all three restored, innermost first.
+        let truncated = TC_OPEN + "\n" + FN_OPEN + "shell_run>\n"
+            + P_OPEN + "command>\npython3 << 'PYEOF'\nprint(1)\nPYEOF"
+        XCTAssertEqual(
+            StreamingToolParser.structuralClosureTags(forRawDecodedTurn: truncated),
+            [P_CLOSE, FN_CLOSE, TC_CLOSE]
+        )
+
+        // Frozen at `</function>` (the common pre-execution freeze): only the block closer.
+        let frozen = TC_OPEN + "\n" + FN_OPEN + "shell_run>\n"
+            + P_OPEN + "command>\nls\n" + P_CLOSE + "\n" + FN_CLOSE
+        XCTAssertEqual(
+            StreamingToolParser.structuralClosureTags(forRawDecodedTurn: frozen),
+            [TC_CLOSE]
+        )
+
+        // A fully closed call needs nothing.
+        let closed = TC_OPEN + "\n" + FN_OPEN + "shell_run>\n"
+            + P_OPEN + "command>\nls\n" + P_CLOSE + "\n" + FN_CLOSE + "\n" + TC_CLOSE
+        XCTAssertEqual(StreamingToolParser.structuralClosureTags(forRawDecodedTurn: closed), [])
+
+        // Ling's native <arg_value> dialect: unterminated value inside an open call.
+        let ling = TC_OPEN + "shell_run\n<arg_key>command</arg_key>\n<arg_value>ls"
+        XCTAssertEqual(
+            StreamingToolParser.structuralClosureTags(forRawDecodedTurn: ling),
+            ["</arg_value>", TC_CLOSE]
+        )
+
+        // A closer emitted out of order (tool_call closed while the value never was)
+        // abandons its inner tags instead of producing `</tool_call></parameter>`.
+        let outOfOrder = TC_OPEN + "\n" + FN_OPEN + "shell_run>\n"
+            + P_OPEN + "command>\nls\n" + TC_CLOSE
+        XCTAssertEqual(StreamingToolParser.structuralClosureTags(forRawDecodedTurn: outOfOrder), [])
+    }
+
+    /// A shell heredoc the model over-ran (the terminator repeated after the script
+    /// finished) must be trimmed to the intended script, so the shell does not run the
+    /// extra terminators as failing commands and flip a good run into exit 127.
+    func testHeredocOverrunTruncation() {
+        let overrun = "python3 << 'PYEOF'\nimport csv\nprint(1)\nPYEOF\nPYEOF\nPYEOF"
+        XCTAssertEqual(
+            StreamingToolParser.truncateHeredocOverrun(overrun),
+            "python3 << 'PYEOF'\nimport csv\nprint(1)\nPYEOF"
+        )
+
+        // A real command legitimately has live lines after the heredoc: untouched.
+        let legit = "python3 <<'EOF'\nprint(1)\nEOF\necho done"
+        XCTAssertEqual(StreamingToolParser.truncateHeredocOverrun(legit), legit)
+
+        // Tab-stripping heredoc (`<<-`) and no-heredoc command are both left alone.
+        let tabbed = "cat <<-EOF\n\tbody\nEOF\nEOF"
+        XCTAssertEqual(StreamingToolParser.truncateHeredocOverrun(tabbed), "cat <<-EOF\n\tbody\nEOF")
+        let plain = "ls -la /tmp && wc -l /tmp/x"
+        XCTAssertEqual(StreamingToolParser.truncateHeredocOverrun(plain), plain)
+
+        // Turn-level: the `command` value is trimmed; other parameters are untouched.
+        let turn = "<tool_call>\n<function=shell_run>\n<parameter=command>\n"
+            + overrun
+            + "\n</parameter>\n<parameter=cwd>\n/tmp\n</parameter>\n</function></tool_call>"
+        let cleaned = StreamingToolParser.truncateHeredocOverruns(inTurnText: turn)
+        XCTAssertTrue(cleaned.contains("print(1)\nPYEOF</parameter>"))
+        XCTAssertFalse(cleaned.contains("PYEOF\nPYEOF"))
+        XCTAssertTrue(cleaned.contains("<parameter=cwd>\n/tmp\n</parameter>"))
+
+        // A non-command parameter carrying heredoc-like text is never touched.
+        let fileWrite = "<parameter=content>\ndoc <<EOF\ntext\nEOF\nEOF\n</parameter>"
+        XCTAssertEqual(StreamingToolParser.truncateHeredocOverruns(inTurnText: fileWrite), fileWrite)
+    }
+
+    /// The degenerate-cycle guard must catch a repeat that starts partway through the
+    /// recent history (a fixed whole-window check missed the heredoc-sentinel spam),
+    /// while never firing on formatting runs like blank lines or closing braces.
+    func testDegenerateCycleDetection() {
+        // Period-3 sentinel cycle after a varied prefix: caught.
+        let prefix: [UInt32] = [100, 101, 102, 103, 104, 105, 106, 107, 108, 109]
+        let cycle: [UInt32] = [10, 11, 12]
+        let spam: [UInt32] = prefix + Array(repeating: cycle, count: 13).flatMap { $0 }
+        let sentinelDecode: ([UInt32]) -> String = { ids in
+            ids.map { $0 == 10 ? "PY" : ($0 == 11 ? "EOF" : "\n") }.joined()
+        }
+        XCTAssertEqual(ContentView.detectDegenerateCycle(tokenIds: spam, decodeUnit: sentinelDecode), 3)
+
+        // A long run of `}\n` is legitimate formatting: the unit has no letter/digit.
+        let braces: [UInt32] = Array(repeating: [UInt32(20), UInt32(21)] as [UInt32], count: 40).flatMap { $0 }
+        let braceDecode: ([UInt32]) -> String = { ids in ids.map { $0 == 20 ? "}" : "\n" }.joined() }
+        XCTAssertNil(ContentView.detectDegenerateCycle(tokenIds: braces, decodeUnit: braceDecode))
+
+        // Diverse output never trips.
+        let diverse: [UInt32] = (0..<80).map { UInt32($0) }
+        XCTAssertNil(ContentView.detectDegenerateCycle(tokenIds: diverse, decodeUnit: { _ in "word" }))
     }
 
     /// When reads keep failing the model invents hosts instead of reusing the ones

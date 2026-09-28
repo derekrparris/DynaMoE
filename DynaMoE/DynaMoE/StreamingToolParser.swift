@@ -106,14 +106,89 @@ public final class StreamingToolParser {
         return depth
     }
 
+    /// The closing tags a raw (frozen or truncated) turn is missing, innermost
+    /// first, so a committed turn always reads back as a structurally valid example.
+    ///
+    /// The pre-execution freeze and the max-token cap both routinely cut a call
+    /// before its closers. `unclosedToolCallCount` only sees block depth, so it
+    /// appends a bare `</tool_call>` and leaves the inner tags dangling — observed
+    /// live: the model opened `<parameter=command>`, ended the turn with no
+    /// `</parameter></function>`, and the committed example was a parameter tag that
+    /// never closed, which the next steps imitated. This scanner tracks the open
+    /// parameter/function/tool-call tags (skipping parameter values, which are data)
+    /// and returns exactly the closers needed, in order.
+    public static func structuralClosureTags(forRawDecodedTurn text: String) -> [String] {
+        let text = repairSplitParameterClosers(text)
+        // Expected closers, outermost first.
+        var stack: [String] = []
+        var valueTerminator: String? = nil
+        var index = text.startIndex
+        while index < text.endIndex {
+            let remaining = text[index...]
+            if let terminator = valueTerminator {
+                if remaining.hasPrefix(terminator) {
+                    popFrom(&stack, tag: terminator)
+                    valueTerminator = nil
+                    index = text.index(index, offsetBy: terminator.count)
+                } else if remaining.hasPrefix(qwenFunctionClose) || remaining.hasPrefix(qwenToolCallClose) {
+                    // The value never terminated before a structural closer: treat it
+                    // as abandoned and let the closer be handled as structure.
+                    valueTerminator = nil
+                } else {
+                    index = text.index(after: index)
+                }
+                continue
+            }
+            if remaining.hasPrefix(parameterOpen) {
+                stack.append(parameterClose); valueTerminator = parameterClose
+                index = text.index(index, offsetBy: parameterOpen.count); continue
+            }
+            if remaining.hasPrefix(parameterOpenBare) {
+                stack.append(parameterClose); valueTerminator = parameterClose
+                index = text.index(index, offsetBy: parameterOpenBare.count); continue
+            }
+            if remaining.hasPrefix(argValueOpen) {
+                stack.append(argValueClose); valueTerminator = argValueClose
+                index = text.index(index, offsetBy: argValueOpen.count); continue
+            }
+            if remaining.hasPrefix(qwenFunctionOpen) {
+                stack.append(qwenFunctionClose)
+                index = text.index(index, offsetBy: qwenFunctionOpen.count); continue
+            }
+            if remaining.hasPrefix(qwenFunctionClose) {
+                popFrom(&stack, tag: qwenFunctionClose)
+                index = text.index(index, offsetBy: qwenFunctionClose.count); continue
+            }
+            if remaining.hasPrefix(qwenToolCallOpen) {
+                stack.append(qwenToolCallClose)
+                index = text.index(index, offsetBy: qwenToolCallOpen.count); continue
+            }
+            if remaining.hasPrefix(qwenToolCallClose) {
+                popFrom(&stack, tag: qwenToolCallClose)
+                index = text.index(index, offsetBy: qwenToolCallClose.count); continue
+            }
+            index = text.index(after: index)
+        }
+        // Innermost open tag was pushed last, so its closer must be appended first.
+        return Array(stack.reversed())
+    }
+
+    /// Removes `tag` and everything opened after it: an out-of-order closer abandons
+    /// its inner tags rather than producing a `</tool_call></parameter>` jumble.
+    private static func popFrom(_ stack: inout [String], tag: String) {
+        if let idx = stack.lastIndex(of: tag) {
+            stack.removeSubrange(idx...)
+        }
+    }
+
     /// The tokens that must be appended after a turn's generated ids so the turn
-    /// the model reads back next time is well-formed: a `</tool_call>` closer when
-    /// the freeze cut the call at `</function>`, then the model's end tag when the
-    /// turn never emitted one.
+    /// the model reads back next time is well-formed: the inner closers the freeze
+    /// or token cap cut (`</parameter>`, `</function>`, `</tool_call>`), then the
+    /// model's end tag when the turn never emitted one.
     ///
     /// MUST be fed the RAW decoded turn text. Feeding an already-normalized string
-    /// makes `hasUnclosedToolCallBlock` read the closer the caller just added and
-    /// skip appending it to the token stream, so the model sees a turn that the
+    /// makes `structuralClosureTags` read the closers the caller just added and
+    /// skip appending them to the token stream, so the model sees a turn that the
     /// string path claims is closed but the token path left open (observed: every
     /// continuation in one run lost both its closer AND its end tag).
     public static func turnClosureSuffix(
@@ -122,10 +197,9 @@ public final class StreamingToolParser {
         encode: (String) throws -> [UInt32]
     ) -> [UInt32]? {
         var ids: [UInt32] = []
-        let unclosed = unclosedToolCallCount(decodedTurn)
-        if unclosed > 0 {
-            guard let closeIds = try? encode(qwenToolCallClose), !closeIds.isEmpty else { return nil }
-            for _ in 0..<unclosed { ids.append(contentsOf: closeIds) }
+        for tag in structuralClosureTags(forRawDecodedTurn: decodedTurn) {
+            guard let closeIds = try? encode(tag), !closeIds.isEmpty else { return nil }
+            ids.append(contentsOf: closeIds)
         }
         if !decodedTurn.contains(endTag) {
             guard let endIds = try? encode(endTag), !endIds.isEmpty else { return nil }
@@ -298,6 +372,77 @@ public final class StreamingToolParser {
             range: NSRange(location: 0, length: ns.length),
             withTemplate: parameterClose
         )
+    }
+
+    /// Trims a shell heredoc the model over-ran. Observed live: after the intended
+    /// terminator line (`PYEOF`) the model kept emitting the same delimiter a dozen
+    /// more times, so zsh ran twelve failing `PYEOF` commands after the script
+    /// succeeded, flipping a working command into `exit_code: 127` and feeding the
+    /// loop a confusing error. Cut the value at the FIRST terminator when everything
+    /// after it is only more copies of that terminator (or blank). A real command
+    /// legitimately has live lines after a heredoc (`EOF` then `echo done`), so those
+    /// are left untouched.
+    public static func truncateHeredocOverrun(_ value: String) -> String {
+        let lines = value.components(separatedBy: "\n")
+        guard let opener = firstHeredocOpener(in: lines) else { return value }
+        var index = opener.index + 1
+        var terminator: Int? = nil
+        while index < lines.count {
+            let candidate = opener.stripsTabs ? String(lines[index].drop(while: { $0 == "\t" })) : lines[index]
+            if candidate == opener.delimiter { terminator = index; break }
+            index += 1
+        }
+        guard let term = terminator else { return value }
+        let trailing = lines[(term + 1)...]
+        guard !trailing.isEmpty else { return value }
+        let allDuplicates = trailing.allSatisfy { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            return trimmed.isEmpty || trimmed == opener.delimiter
+        }
+        guard allDuplicates else { return value }
+        return lines[0...term].joined(separator: "\n")
+    }
+
+    /// First heredoc opener in a value: `<<EOF`, `<<-EOF` (tab-stripping), `<<'EOF'`,
+    /// `<<"EOF"`, or `<<\EOF`. Returns its line index, delimiter, and tab-strip flag.
+    private static func firstHeredocOpener(in lines: [String]) -> (index: Int, delimiter: String, stripsTabs: Bool)? {
+        guard let re = try? NSRegularExpression(
+            pattern: "<<(-?)\\s*(?:'([^']+)'|\"([^\"]+)\"|\\\\([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*))",
+            options: []
+        ) else { return nil }
+        for (i, line) in lines.enumerated() {
+            let ns = line as NSString
+            guard let m = re.firstMatch(in: line, options: [], range: NSRange(location: 0, length: ns.length)),
+                  m.numberOfRanges >= 6 else { continue }
+            for group in 2...5 where m.range(at: group).location != NSNotFound {
+                let delimiter = ns.substring(with: m.range(at: group))
+                if !delimiter.isEmpty {
+                    return (i, delimiter, ns.substring(with: m.range(at: 1)) == "-")
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Applies `truncateHeredocOverrun` to every `command` parameter value in a turn,
+    /// so the committed example matches the command that actually ran. Restricted to
+    /// the `command` key so a `file_write` body containing heredoc-like text is never
+    /// touched.
+    public static func truncateHeredocOverruns(inTurnText text: String) -> String {
+        guard text.contains("<<") else { return text }
+        guard let re = try? NSRegularExpression(pattern: "<parameter=([A-Za-z_][A-Za-z0-9_]*)>([\\s\\S]*?)</parameter>", options: []) else { return text }
+        var result = text
+        let ns = result as NSString
+        let matches = re.matches(in: result, options: [], range: NSRange(location: 0, length: ns.length))
+        for m in matches.reversed() {
+            guard m.numberOfRanges >= 3 else { continue }
+            guard ns.substring(with: m.range(at: 1)) == "command" else { continue }
+            let value = ns.substring(with: m.range(at: 2))
+            let truncated = truncateHeredocOverrun(value)
+            guard truncated != value else { continue }
+            result = (result as NSString).replacingCharacters(in: m.range(at: 2), with: truncated)
+        }
+        return result
     }
 
     /// The model sometimes opens a parameter tag and then opens it AGAIN inside
