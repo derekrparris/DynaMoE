@@ -189,6 +189,21 @@ public final class ShellRunTool: AgentTool {
             if cleanStdout.contains("<<<TRUNCATED") || cleanStdout.contains("<<<LINE TRUNCATED") {
                 data["note"] = "Output was truncated for the context budget. Do NOT re-run the same command to print it in full. Narrow the command (head/tail/grep/sed for just the fields you need), or have it write a summary to a file and read that with file_read (which pages with start_line)."
             }
+            // stderr text must reach the model even when the pipeline exited 0: a
+            // failing element inside a pipeline (`head missing | sed | wc`) writes
+            // its error to stderr while the pipeline's status is the LAST command's
+            // (0). Dropping it left the model reading empty stdout as a real result
+            // and re-running the same broken command for the rest of the run.
+            // Surfaced as text only: the command still succeeded, so the tool is not
+            // reclassified as a failure (which would trip the failure-loop guard on
+            // benign warnings like brew's progress output).
+            if !cleanStderr.isEmpty {
+                // A masked failure is often a missing path (`head missing | sed | wc`),
+                // so offer the same exact-name repair hint the error path uses; the
+                // model otherwise keeps guessing mangled paths with no feedback.
+                let pathHint = AgentHarness.missingPathRepairHint(command: command, stderr: cleanStderr, stdout: cleanStdout)
+                data["stderr"] = cleanStderr + pathHint
+            }
             let res = AgentHarness.toolSuccessJSON(tool: "shell_run", data: data)
             return (res, cleanStdout, nil, false)
         } else {
@@ -3530,6 +3545,10 @@ public final class AgentHarness {
     // MARK: - Tolerant Tool Call Parser (XML + JSON + Multi-Call + Truncation Recovery)
 
     public func parseToolCalls(from text: String) -> (calls: [ParsedToolCall], brokenFragments: [String]) {
+        // A parameter closer the model split across lines (`</parameter=\n>`) would
+        // otherwise be absorbed into the argument value and handed to the tool as
+        // literal markup. Normalize before any of the parsers below look at it.
+        let text = StreamingToolParser.repairSplitParameterClosers(text)
         var calls: [ParsedToolCall] = []
         var broken: [String] = []
 

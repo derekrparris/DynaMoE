@@ -3455,15 +3455,32 @@ struct ContentView: View {
         encode: (String) throws -> [UInt32]
     ) -> [UInt32]? {
         var tokens = basePromptTokens
-        tokens.append(contentsOf: generatedTokenIds)
-        // `turnText` MUST be the raw decoded turn, never a normalized copy: the
-        // closure decision has to be made against what the model actually emitted.
-        guard let closure = StreamingToolParser.turnClosureSuffix(
-            forRawDecodedTurn: turnText,
-            endTag: endTag,
-            encode: encode
-        ) else { return nil }
-        tokens.append(contentsOf: closure)
+        // A turn whose parameter closer was split across lines (`</parameter=\n>`)
+        // cannot be spliced verbatim: the raw ids would teach the model its own
+        // malformed call. Repair the text and re-encode the turn instead. That
+        // costs one full re-prefill for the turn (the pin no longer matches
+        // byte-for-byte), which is cheaper than feeding the loop the broken shape.
+        let repairedTurn = StreamingToolParser.repairSplitParameterClosers(turnText)
+        if repairedTurn != turnText {
+            guard let repairedIds = try? encode(repairedTurn), !repairedIds.isEmpty else { return nil }
+            tokens.append(contentsOf: repairedIds)
+            guard let closure = StreamingToolParser.turnClosureSuffix(
+                forRawDecodedTurn: repairedTurn,
+                endTag: endTag,
+                encode: encode
+            ) else { return nil }
+            tokens.append(contentsOf: closure)
+        } else {
+            tokens.append(contentsOf: generatedTokenIds)
+            // `turnText` MUST be the raw decoded turn, never a normalized copy: the
+            // closure decision has to be made against what the model actually emitted.
+            guard let closure = StreamingToolParser.turnClosureSuffix(
+                forRawDecodedTurn: turnText,
+                endTag: endTag,
+                encode: encode
+            ) else { return nil }
+            tokens.append(contentsOf: closure)
+        }
         guard let suffixIds = try? encode(suffix), !suffixIds.isEmpty else { return nil }
         tokens.append(contentsOf: suffixIds)
         return tokens
@@ -3479,7 +3496,10 @@ struct ContentView: View {
     /// examples of its own format. Paired with `buildSplicedContinuationTokens`,
     /// which performs the same normalization on the token stream.
     private func closedAssistantTurnText(_ decoded: String, endTag: String) -> String {
-        var text = decoded
+        // Repair a parameter closer the model split across lines before the turn is
+        // committed to history. Left in, the model reads its own malformed call back
+        // and re-emits the same broken shape on later steps.
+        var text = StreamingToolParser.repairSplitParameterClosers(decoded)
         let unclosed = StreamingToolParser.unclosedToolCallCount(text)
         if unclosed > 0 {
             for _ in 0..<unclosed { text += StreamingToolParser.qwenToolCallClose }

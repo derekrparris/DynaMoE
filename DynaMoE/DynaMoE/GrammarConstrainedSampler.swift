@@ -490,6 +490,23 @@ nonisolated public final class GrammarConstrainedSampler {
                     }
                 }
             }
+            // The closer must be canonical. Once the FULL `</parameter` word sits
+            // on the tail, the only legal next token is the `>` that completes it;
+            // left free, the model splits the tag (`</parameter=` newline `>`),
+            // which no tolerant parser recognizes, so the fragment is swallowed
+            // into the value and the model reads the broken shape back as its own
+            // example. Firing only on the complete word leaves legitimate `<`/`</`
+            // value text (shell redirects, HTML) untouched.
+            if parameterValueTail.hasSuffix("</parameter") {
+                // Exclude the trailing word itself so the choice mask anchors on it.
+                applyTagChoiceMask(
+                    logits: logits,
+                    vocabSize: vocabSize,
+                    currentPrefix: "</parameter",
+                    tokenDecoder: tokenDecoder,
+                    options: [paramClose]
+                )
+            }
 
         case .closingFunction(let matchedPrefix):
             guard enforceStructuralTagContinuation else { return }

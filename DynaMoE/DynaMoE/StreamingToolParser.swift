@@ -55,6 +55,13 @@ public final class StreamingToolParser {
     /// `</tool_call>` and persisted an unmatched closer into the next prompt,
     /// the history corruption this suffix exists to prevent.
     public static func unclosedToolCallCount(_ text: String) -> Int {
+        // A parameter whose closer was split across lines (`</parameter=\n>`) never
+        // matches the literal `</parameter>` terminator below, so the value scan
+        // runs to the end of the turn and the structural `</tool_call>` closers
+        // hiding inside it are never counted — every call then looks unclosed and
+        // the caller appends a duplicate closer. Normalize the closer first so the
+        // scanner can return to structure.
+        let text = repairSplitParameterClosers(text)
         var depth = 0
         var valueTerminator: String? = nil
         var index = text.startIndex
@@ -271,6 +278,28 @@ public final class StreamingToolParser {
         return out
     }
 
+    /// The model occasionally splits the parameter close tag across lines —
+    /// `</parameter` then `=` and/or whitespace, then `>` — because the grammar
+    /// constrains call structure but not the byte-precise closer. Left alone the
+    /// tolerant `<parameter=([^>]+)>([\s\S]*?)(?:</parameter>|$)` regex falls through
+    /// to its end-of-input alternative and swallows the broken closer into the
+    /// VALUE, so `shell_run` executes a command whose last line is a bare `>` and
+    /// zsh dies with "parse error near '>'"; the model reads that as a command
+    /// error, retries, and spirals. Rewrite the malformed closer back to canonical
+    /// so the value ends where the model meant it to. Only whitespace may separate
+    /// the `=` from the `>`, so a legitimate `</parameter=foo>` is left untouched.
+    public static func repairSplitParameterClosers(_ text: String) -> String {
+        guard text.contains("</parameter") else { return text }
+        guard let re = try? NSRegularExpression(pattern: "</parameter\\s*=?\\s*>", options: []) else { return text }
+        let ns = text as NSString
+        return re.stringByReplacingMatches(
+            in: text,
+            options: [],
+            range: NSRange(location: 0, length: ns.length),
+            withTemplate: parameterClose
+        )
+    }
+
     /// The model sometimes opens a parameter tag and then opens it AGAIN inside
     /// the value it is writing:
     ///
@@ -390,7 +419,7 @@ public final class StreamingToolParser {
         //    of the internal <parameter=k>v</parameter> form. Rewrite those into canonical
         //    <parameter=...> blocks so the tolerant parser actually executes the call instead
         //    of silently dropping it (which previously left only prose in the reply).
-        var text = Self.normalizeArgKeyDialect(text)
+        var text = Self.repairSplitParameterClosers(Self.normalizeArgKeyDialect(text))
 
         // 1. Check for Qwen XML with JSON arguments body: <function=name>{"arg": "val"}</function>
         let fnRegex = try? NSRegularExpression(pattern: "<function=([^>]+)>([\\s\\S]*?)</function>", options: [])

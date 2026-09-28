@@ -6809,6 +6809,16 @@ final class DynaMoETests: XCTestCase {
             [true, true, false, false],
             "completing a split `<parameter` with `=` or `>` must be masked"
         )
+
+        // The closer must be canonical too. After the full `</parameter` word the
+        // only legal next token is the `>` that completes it; otherwise the model
+        // splits the tag (`</parameter=` newline `>`), which the parser cannot
+        // recognize and then reads back to itself as an example.
+        XCTAssertEqual(
+            masked(open + "wc -l x</parameter", tokens: [">", ">=", "=\n  >", "\n>", "x"]),
+            [false, true, true, true, true],
+            "only the canonical `>` may complete `</parameter`"
+        )
     }
 
     /// The same-tool failure streak that lets the harness end a run the model is
@@ -7039,6 +7049,35 @@ final class DynaMoETests: XCTestCase {
             "curl -s https://fortune.com/2025/10/106932.html",
             "the live parser must descend into a re-opened parameter tag"
         )
+
+        // Observed in a later dump: the parameter closer split across lines
+        // (`</parameter=` newline `>`). The tolerant regex fell through to its
+        // end-of-input alternative and swallowed the fragment into the command, so
+        // zsh failed with "parse error near '>'" on every step and the model
+        // spiralled. The split closer must be normalized before parsing.
+        let splitCloser = TC_OPEN + "\n" + FN_OPEN + "shell_run>\n"
+            + P_OPEN + "command>\n"
+            + "brew list --formula | grep -i python; which python3 | cat\n"
+            + "</parameter=\n  >\n"
+            + FN_CLOSE + TC_CLOSE
+        let splitLive = StreamingToolParser.shared.parseStreamingToolCalls(from: splitCloser)
+        XCTAssertEqual(splitLive.calls.count, 1)
+        XCTAssertEqual(splitLive.calls.first?.name, "shell_run")
+        XCTAssertEqual(
+            splitLive.calls.first?.arguments["command"] as? String,
+            "brew list --formula | grep -i python; which python3 | cat",
+            "a line-split parameter closer must not leak into the command value"
+        )
+        // The split closer previously hid the structural </tool_call> from the value
+        // scanner, so a closed call was miscounted and got a duplicate closer.
+        XCTAssertEqual(StreamingToolParser.unclosedToolCallCount(splitCloser), 0)
+        XCTAssertEqual(
+            StreamingToolParser.repairSplitParameterClosers("</parameter=\n  >"),
+            "</parameter>"
+        )
+        // A well-formed closer and an unrelated `</parameter=foo>` are untouched.
+        XCTAssertEqual(StreamingToolParser.repairSplitParameterClosers("</parameter>"), "</parameter>")
+        XCTAssertEqual(StreamingToolParser.repairSplitParameterClosers("</parameter=foo>"), "</parameter=foo>")
     }
 
     /// When reads keep failing the model invents hosts instead of reusing the ones
