@@ -154,6 +154,24 @@ public final class ShellRunTool: AgentTool {
             let err = "Error: missing or empty 'command' parameter in shell_run"
             return (AgentHarness.toolErrorJSON(tool: "shell_run", error: err), nil, err, false)
         }
+        // A degenerating generation repeats a short motif until it runs out of room
+        // (observed: 12,647 characters of `'''"""`). Running that as an unterminated
+        // heredoc yields a ~22k-character syntax error, which is then fed straight
+        // back as the next tool result and accelerates the collapse. Reject the call
+        // before execution and tell the model to restate it small, so the loop gets a
+        // short corrective turn instead of echoing its own garbage. A genuine long
+        // program belongs in a file written with file_write, never inline here.
+        let maxShellCommandCharacters = 12000
+        if rawCommand.count > maxShellCommandCharacters {
+            let err = "Error: rejected a \(rawCommand.count)-character shell_run command before execution (limit \(maxShellCommandCharacters)). This is a runaway argument, not a shell error. Do NOT resend the same text. Restate the command as a short script (under ~40 lines); if the program is genuinely that large, write it to a file first and run the file."
+            print("🛠 [shell_run] rejected oversized command (\(rawCommand.count) chars)")
+            return (AgentHarness.toolErrorJSON(tool: "shell_run", error: err), nil, err, false)
+        }
+        if let collapse = StreamingToolParser.repetitionCollapse(in: rawCommand) {
+            let err = "Error: rejected the shell_run command before execution as degenerate repetition (\(collapse)). This is a generation collapse, not a shell problem. Do NOT resend the same text. Restate the command as a short script (under ~40 lines), one statement per line, printing only the fields you need."
+            print("🛠 [shell_run] rejected degenerate command (\(collapse))")
+            return (AgentHarness.toolErrorJSON(tool: "shell_run", error: err), nil, err, false)
+        }
         // A heredoc the model over-ran (`PYEOF` repeated after the terminator) would
         // otherwise run a dozen failing `PYEOF` commands after the script succeeded,
         // flipping a good run into exit_code 127. Trim to the intended heredoc first.

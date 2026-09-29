@@ -502,6 +502,90 @@ public final class StreamingToolParser {
         return result
     }
 
+    /// Identical characters in a row that mark a collapse. Set well above any real
+    /// banner/separator rule so a `####…` comment line is never mistaken for one.
+    static let degenerateCharacterRun = 200
+    /// A short motif copied for this many characters without interruption is a
+    /// collapse. Real script text has no exact repeat this long.
+    static let degenerateRepeatSpan = 160
+    /// Longest motif period considered a repeat; genuine text repeats shorter
+    /// fragments, never a 25+ character block verbatim.
+    static let degenerateMaxPeriod = 24
+
+    /// Detects the repetition collapse that ends a degenerating generation: the model
+    /// stops producing new tokens and copies a short motif (`'''"""'''"""…`) until the
+    /// context fills. Observed: a 12,647-character `shell_run` argument made almost
+    /// entirely of `'''"""`, run as an unterminated Python heredoc, whose 22,357-
+    /// character syntax error was then fed straight back as the next tool result — the
+    /// collapse ate the rest of the run. A match means the text is not a command or
+    /// program at all, so callers reject it instead of executing it.
+    ///
+    /// Returns a short description of the repeat when found, else nil.
+    public static func repetitionCollapse(in text: String) -> String? {
+        let chars = Array(text)
+        guard chars.count >= degenerateRepeatSpan else { return nil }
+
+        var runLength = 1
+        var bestRun = 1
+        var bestRunChar = chars[0]
+        for i in 1..<chars.count {
+            if chars[i] == chars[i - 1] {
+                runLength += 1
+                if runLength > bestRun { bestRun = runLength; bestRunChar = chars[i] }
+            } else {
+                runLength = 1
+            }
+        }
+        if bestRun >= degenerateCharacterRun {
+            return "\(bestRun) identical '\(bestRunChar)' characters in a row"
+        }
+
+        // A motif of period p repeated back to back shows up as a long run where
+        // chars[i] == chars[i - p]. Walk every candidate period and keep the longest
+        // uninterrupted match; a real program never matches for this many characters.
+        var bestSpan = 0
+        var bestPeriod = 0
+        var bestEnd = 0
+        for period in 1...degenerateMaxPeriod {
+            var span = 0
+            var i = period
+            while i < chars.count {
+                if chars[i] == chars[i - period] {
+                    span += 1
+                    if span > bestSpan { bestSpan = span; bestPeriod = period; bestEnd = i }
+                } else {
+                    span = 0
+                }
+                i += 1
+            }
+        }
+        guard bestSpan >= degenerateRepeatSpan, bestEnd >= bestPeriod else { return nil }
+        let motif = String(chars[(bestEnd - bestPeriod + 1)...bestEnd])
+        return "a \(bestPeriod)-character motif (\(motif.debugDescription)) copied about \(bestSpan / bestPeriod) times"
+    }
+
+    /// Rewrites a collapsed `command` parameter in a turn to a short placeholder so
+    /// the committed history never carries tens of thousands of repeated characters
+    /// that the model would keep attending to (and imitating). Scoped to `command`
+    /// only: a `file_write` body is real content even when long, and the caller
+    /// re-encodes the whole turn whenever this changes anything.
+    public static func compressDegenerateCommandArguments(inTurnText text: String) -> String {
+        guard text.contains("</parameter>") else { return text }
+        guard let re = try? NSRegularExpression(pattern: "<parameter=([A-Za-z_][A-Za-z0-9_]*)>([\\s\\S]*?)</parameter>", options: []) else { return text }
+        var result = text
+        let ns = result as NSString
+        let matches = re.matches(in: result, options: [], range: NSRange(location: 0, length: ns.length))
+        for m in matches.reversed() {
+            guard m.numberOfRanges >= 3 else { continue }
+            guard ns.substring(with: m.range(at: 1)) == "command" else { continue }
+            let value = ns.substring(with: m.range(at: 2))
+            guard let collapse = repetitionCollapse(in: value) else { continue }
+            let replacement = "[collapsed generation omitted: \(value.count) characters, \(collapse)]"
+            result = (result as NSString).replacingCharacters(in: m.range(at: 2), with: replacement)
+        }
+        return result
+    }
+
     /// The model sometimes opens a parameter tag and then opens it AGAIN inside
     /// the value it is writing:
     ///

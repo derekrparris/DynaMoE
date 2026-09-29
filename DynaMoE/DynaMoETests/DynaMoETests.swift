@@ -6524,6 +6524,63 @@ final class DynaMoETests: XCTestCase {
         XCTAssertFalse(StreamingToolParser.repairSplitParameterClosers(raw).contains("<parameter|"))
     }
 
+    /// A degenerating generation copies a short motif until it runs out of context.
+    /// The harness must recognize the collapse (not a command or program) so
+    /// `shell_run` refuses to execute it and the committed turn carries a short
+    /// placeholder instead of tens of thousands of repeated characters.
+    func testRepetitionCollapseDetectionAndCommitCompression() {
+        // The observed shape: `'''"""` copied far past any real source line.
+        let collapse = String(repeating: "'''\"\"\"", count: 900)
+        XCTAssertNotNil(StreamingToolParser.repetitionCollapse(in: collapse))
+        // A single character repeated far past any banner/separator rule.
+        XCTAssertNotNil(StreamingToolParser.repetitionCollapse(in: String(repeating: "=", count: 3000)))
+
+        // A plausible real script (a heredoc report generator) is left alone.
+        let script = """
+        python3 - << 'PYEOF'
+        import csv
+        with open('/Users/x/Downloads/survey.csv') as f:
+            reader = csv.reader(f)
+            header = next(reader)
+            for i, c in enumerate(header):
+                print(i + 1, "|", c)
+        PYEOF
+        """
+        XCTAssertNil(StreamingToolParser.repetitionCollapse(in: script))
+
+        // The committed turn shrinks the collapsed argument to a placeholder.
+        let raw = """
+        <tool_call>
+        <function=shell_run>
+        <parameter=command>
+        \(collapse)
+        </parameter>
+        </function></tool_call>
+        """
+        let committed = StreamingToolParser.compressDegenerateCommandArguments(inTurnText: raw)
+        XCTAssertTrue(committed.contains("[collapsed generation omitted:"))
+        XCTAssertLessThan(committed.count, 400)
+
+        // A normal command argument and a non-command parameter are both untouched.
+        XCTAssertEqual(StreamingToolParser.compressDegenerateCommandArguments(inTurnText: script), script)
+    }
+
+    func testShellRunRejectsDegenerateAndOversizedCommand() async throws {
+        let tool = ShellRunTool()
+
+        let collapse = String(repeating: "'''\"\"\"", count: 900)
+        let rejected = try await tool.execute(arguments: ["command": collapse], workingDirectory: nil, maxOutputLength: 4000)
+        XCTAssertNotNil(rejected.stderr)
+        XCTAssertFalse(rejected.isCompleted)
+        XCTAssertTrue(rejected.resultJSON.contains("degenerate"))
+
+        // A runaway argument is rejected before the repetition scan reports it.
+        let oversized = String(repeating: "echo x; ", count: 1600)
+        let bigResult = try await tool.execute(arguments: ["command": oversized], workingDirectory: nil, maxOutputLength: 4000)
+        XCTAssertNotNil(bigResult.stderr)
+        XCTAssertTrue(bigResult.resultJSON.contains("runaway argument"))
+    }
+
     func testLingUnclosedThinkingToolCallBoundary() {
         // Ling 3.0 often emits a tool call without closing its <think> block. The implicit
         // boundary must keep the call out of the thinking half so the card renders and the

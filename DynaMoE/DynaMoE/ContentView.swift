@@ -3497,6 +3497,12 @@ struct ContentView: View {
         let beforeTruncate = text
         text = StreamingToolParser.truncateHeredocOverruns(inTurnText: text)
         if text != beforeTruncate { contentChanged = true }
+        // A collapsed command argument (a repetition degeneration) must not be pinned
+        // into history: the model would keep attending to — and imitating — tens of
+        // thousands of repeated characters. Replace it with a short placeholder.
+        let beforeCompress = text
+        text = StreamingToolParser.compressDegenerateCommandArguments(inTurnText: text)
+        if text != beforeCompress { contentChanged = true }
         if !text.contains(endTag) {
             text += endTag
         }
