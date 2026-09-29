@@ -11479,6 +11479,10 @@ if layer.attnGateProjTensor != nil,
                             toolName: call.name,
                             succeeded: execResult.record.status == .success
                         )
+                        AgentHarness.shared.recordToolCallFingerprint(
+                            toolName: call.name,
+                            arguments: call.arguments
+                        )
                         if execResult.isCompleted {
                             anyCompleted = true
                         }
@@ -11516,12 +11520,13 @@ if layer.attnGateProjTensor != nil,
                     // gestures included.
                     let toolResponses = responseSlots.compactMap { $0 }
 
-                    // A same-tool failure streak, or too many failed calls overall,
-                    // means the model is re-issuing calls that cannot succeed; stop
-                    // spending steps and force a synthesis turn instead.
+                    // A same-tool failure streak, too many failed calls overall, or one
+                    // identical call re-issued past its limit means the model is stuck;
+                    // stop spending steps and force a synthesis turn instead.
                     let agent = AgentHarness.shared
                     let toolFailureLoop = agent.consecutiveFailedToolCalls >= agent.failedToolCallLimit
                         || agent.totalFailedToolCalls >= agent.failedToolCallTotalLimit
+                        || agent.maxRepeatedToolCallCount >= agent.repeatedToolCallLimit
 
                     // If not finished and steps remaining, invoke next step
                     if !anyCompleted && !toolFailureLoop && (agentStep + 1 < self.maxAgentSteps) {
@@ -11595,6 +11600,7 @@ if layer.attnGateProjTensor != nil,
                         let escalateToSynthesis = AgentHarness.shared.consecutiveEmptyToolCalls >= 2
                             || AgentHarness.shared.consecutiveFailedToolCalls >= AgentHarness.shared.failedToolCallLimit
                             || AgentHarness.shared.totalFailedToolCalls >= AgentHarness.shared.failedToolCallTotalLimit
+                            || AgentHarness.shared.maxRepeatedToolCallCount >= AgentHarness.shared.repeatedToolCallLimit
                         if (AgentHarness.shared.lastSearchGuardAction == .forceSynthesis || escalateToSynthesis) && !ranCompleteTool {
                             let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
                             let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)

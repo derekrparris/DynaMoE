@@ -6473,6 +6473,57 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(qwenParsed.calls.first?.arguments["path"] as? String, "README.md")
     }
 
+    /// The model can open a parameter with a pipe and an attribute quote
+    /// (`<parameter|command="…`) nested inside the real opener. Handed to zsh that
+    /// reads as a stdin redirect from a file named `parameter`, which the model
+    /// mistook for the environment mangling its commands and spiralled. The repair
+    /// must rewrite the opener to canonical form and drop the quote pair so the real
+    /// command runs and the committed example reads back as valid markup.
+    func testStreamingToolParserMalformedPipeParameterOpener() {
+        let parser = StreamingToolParser.shared
+
+        // Direct normalization: pipe + attribute quote, pipe + bare `=`, pipe + `>`.
+        XCTAssertEqual(
+            StreamingToolParser.repairMalformedParameterOpeners(
+                "<parameter|command=\"sed -n '2p' /tmp/survey.csv\"; echo done"
+            ),
+            "<parameter=command>sed -n '2p' /tmp/survey.csv; echo done"
+        )
+        XCTAssertEqual(
+            StreamingToolParser.repairMalformedParameterOpeners("<parameter|command=echo hi</parameter>"),
+            "<parameter=command>echo hi</parameter>"
+        )
+        XCTAssertEqual(
+            StreamingToolParser.repairMalformedParameterOpeners("<parameter|path>a.txt</parameter>"),
+            "<parameter=path>a.txt</parameter>"
+        )
+        // Unrelated prose mentioning a bare `<parameter|` is untouched.
+        XCTAssertEqual(
+            StreamingToolParser.repairMalformedParameterOpeners("prose <parameter| mention"),
+            "prose <parameter| mention"
+        )
+
+        // End-to-end: the observed turn shape yields the real command, not markup.
+        let raw = """
+        <tool_call>
+        <function=shell_run>
+        <parameter=command>
+        <parameter|command="sed -n '2p' /tmp/survey.csv"; echo "---HEAD2---"; wc -l /tmp/survey.csv
+        </parameter>
+        </function></tool_call>
+        """
+        let parsed = parser.parseStreamingToolCalls(from: raw)
+        XCTAssertEqual(parsed.calls.count, 1)
+        XCTAssertEqual(parsed.calls.first?.name, "shell_run")
+        XCTAssertEqual(
+            parsed.calls.first?.arguments["command"] as? String,
+            "sed -n '2p' /tmp/survey.csv; echo \"---HEAD2---\"; wc -l /tmp/survey.csv"
+        )
+
+        // The turn committed back to context must read as valid markup.
+        XCTAssertFalse(StreamingToolParser.repairSplitParameterClosers(raw).contains("<parameter|"))
+    }
+
     func testLingUnclosedThinkingToolCallBoundary() {
         // Ling 3.0 often emits a tool call without closing its <think> block. The implicit
         // boundary must keep the call out of the thinking half so the card renders and the
@@ -6864,6 +6915,39 @@ final class DynaMoETests: XCTestCase {
 
         XCTAssertGreaterThanOrEqual(harness.failedToolCallLimit, 2)
         XCTAssertGreaterThanOrEqual(harness.failedToolCallTotalLimit, 2)
+    }
+
+    /// A stuck model re-issues the SAME successful call (observed: the same
+    /// header-reading `sed`/`wc` inspection repeated while it narrated "now I
+    /// understand the structure"). The failure streaks miss it because it succeeds,
+    /// so identical calls are counted separately and cleared when a mutation runs.
+    func testRepeatedIdenticalToolCallGuard() {
+        let harness = AgentHarness.shared
+        harness.beginAgentSearchGuard()
+
+        let command = "wc -l /Users/me/Downloads/survey.csv"
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": command]), 1)
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": command]), 2)
+        // Whitespace/case-only differences still match the earlier call.
+        XCTAssertEqual(
+            harness.recordToolCallFingerprint(
+                toolName: "shell_run",
+                arguments: ["command": "wc  -l   /users/me/downloads/survey.csv"]
+            ),
+            3
+        )
+        XCTAssertEqual(harness.maxRepeatedToolCallCount, 3)
+        XCTAssertGreaterThanOrEqual(harness.repeatedToolCallLimit, 3)
+        XCTAssertGreaterThanOrEqual(harness.maxRepeatedToolCallCount, harness.repeatedToolCallLimit)
+
+        // A different call does not inflate the identical-call count.
+        _ = harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": "ls"])
+        XCTAssertEqual(harness.maxRepeatedToolCallCount, 3)
+
+        // A state-mutating tool clears the counts: a re-read after an edit is legit.
+        _ = harness.recordToolCallFingerprint(toolName: "file_edit", arguments: ["path": "survey.csv"])
+        XCTAssertEqual(harness.maxRepeatedToolCallCount, 0)
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": command]), 1)
     }
 
     /// A path that does not exist should come back with the real sibling names, so

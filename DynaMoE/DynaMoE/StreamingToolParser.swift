@@ -352,6 +352,57 @@ public final class StreamingToolParser {
         return out
     }
 
+    /// The model sometimes opens a parameter with a pipe separator and an
+    /// attribute-style quote instead of the canonical `=`, and nests it inside the
+    /// real opener:
+    ///
+    ///     <parameter=command>
+    ///     <parameter|command="sed -n '2p' file.csv"; echo done
+    ///     </parameter>
+    ///
+    /// Observed live: emitted right after a run of failing steps, then zsh read the
+    /// first line as a stdin redirect from a file named `parameter`
+    /// ("zsh:1: no such file or directory: parameter"). The model took that for the
+    /// environment mangling its commands and spiralled, while the broken shape got
+    /// committed verbatim to its own history as the next example to imitate.
+    /// Rewrite the opener to the canonical nested form so `unwrapNestedParameterTag`
+    /// descends into the real value and the committed turn reads back as valid
+    /// markup. The trailing quote the model may or may not add is consumed when
+    /// present, and nothing else is touched.
+    public static func repairMalformedParameterOpeners(_ text: String) -> String {
+        guard text.contains("<parameter|") else { return text }
+        var result = text
+        // Attribute-quoted form: <parameter|key="value" — the model opens a quote
+        // after the `=` and (usually) closes it early, then keeps writing the rest
+        // of the command outside it. Pair and drop both quotes so the value reads
+        // as one command instead of leaving an unbalanced `"`.
+        if let pairRe = try? NSRegularExpression(
+            pattern: "<parameter\\|([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*\"([^\"]*)\"",
+            options: []
+        ) {
+            let ns = result as NSString
+            result = pairRe.stringByReplacingMatches(
+                in: result,
+                options: [],
+                range: NSRange(location: 0, length: ns.length),
+                withTemplate: "<parameter=$1>$2"
+            )
+        }
+        // Bare forms: <parameter|key>, <parameter|key=value, <parameter|key="value
+        // with no closing quote. Consume the separator (and any opening quote) only.
+        guard let re = try? NSRegularExpression(
+            pattern: "<parameter\\|([A-Za-z_][A-Za-z0-9_]*)\\s*(?:=\\s*\"?|>)",
+            options: []
+        ) else { return result }
+        let ns = result as NSString
+        return re.stringByReplacingMatches(
+            in: result,
+            options: [],
+            range: NSRange(location: 0, length: ns.length),
+            withTemplate: "<parameter=$1>"
+        )
+    }
+
     /// The model occasionally splits the parameter close tag across lines —
     /// `</parameter` then `=` and/or whitespace, then `>` — because the grammar
     /// constrains call structure but not the byte-precise closer. Left alone the
@@ -362,7 +413,13 @@ public final class StreamingToolParser {
     /// error, retries, and spirals. Rewrite the malformed closer back to canonical
     /// so the value ends where the model meant it to. Only whitespace may separate
     /// the `=` from the `>`, so a legitimate `</parameter=foo>` is left untouched.
+    ///
+    /// Also normalizes the pipe-separated opener dialect (see
+    /// `repairMalformedParameterOpeners`) so every caller that repairs parameter
+    /// markup gets both directions. Runs before the closer guard so a turn frozen
+    /// mid-value still gets its opener fixed even when no `</parameter>` exists yet.
     public static func repairSplitParameterClosers(_ text: String) -> String {
+        let text = repairMalformedParameterOpeners(text)
         guard text.contains("</parameter") else { return text }
         guard let re = try? NSRegularExpression(pattern: "</parameter\\s*=?\\s*>", options: []) else { return text }
         let ns = text as NSString

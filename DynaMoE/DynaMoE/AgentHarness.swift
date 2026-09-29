@@ -2802,6 +2802,8 @@ public final class AgentHarness {
         consecutiveFailedToolCalls = 0
         lastFailedToolName = nil
         totalFailedToolCalls = 0
+        repeatedToolCallCounts.removeAll()
+        maxRepeatedToolCallCount = 0
         recentSearchResultURLs.removeAll()
         consecutiveWebFetchFailures = 0
         if tools["web_search"] != nil && loadedTools["web_search"] == nil {
@@ -2995,6 +2997,66 @@ public final class AgentHarness {
                 lastFailedToolName = toolName
             }
         }
+    }
+
+    // MARK: - Redundant Tool Call Guard
+    // A model that has stopped making progress re-issues the SAME call it already
+    // ran (observed: the same header-reading `sed`/`wc` inspection repeated while
+    // the model narrated "now I understand the structure" each time). The failure
+    // streaks above miss it because those calls SUCCEED. This counts identical
+    // calls (tool + normalized arguments) and lets the run escalate once one has
+    // repeated past the limit. Counts are cleared whenever a state-mutating tool
+    // runs, because that invalidates the assumption the answer is unchanged — so a
+    // legitimate re-run of a test after an edit is not penalized.
+
+    /// Identical calls re-issued within the run, keyed by fingerprint.
+    private var repeatedToolCallCounts: [String: Int] = [:]
+    /// The highest still-valid repeat count (cleared when a mutation resets the run).
+    public private(set) var maxRepeatedToolCallCount: Int = 0
+    /// How many times one identical call may recur before the run escalates.
+    public var repeatedToolCallLimit: Int = 3
+
+    /// Tools that change on-disk or repo state, so a re-issued read afterwards is
+    /// no longer redundant.
+    private static let mutatingToolNames: Set<String> = ["file_write", "file_edit", "git_commit"]
+
+    /// Stable fingerprint for a call: tool name plus its arguments, whitespace
+    /// collapsed and lowercased so trivial re-renders (path case, extra spacing)
+    /// still match the earlier call. Dictionary keys are sorted for determinism.
+    public static func toolCallFingerprint(toolName: String, arguments: [String: Any]) -> String {
+        func normalized(_ value: Any) -> String {
+            if let s = value as? String {
+                return s.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" })
+                    .joined(separator: " ")
+                    .lowercased()
+            }
+            if let array = value as? [Any] {
+                return array.map(normalized).joined(separator: ",")
+            }
+            if let dict = value as? [String: Any] {
+                return dict.keys.sorted().map { "\($0)=\(normalized(dict[$0]!))" }.joined(separator: ",")
+            }
+            return String(describing: value).lowercased()
+        }
+        let argsPart = arguments.keys.sorted().map { "\($0)=\(normalized(arguments[$0]!))" }.joined(separator: "&")
+        return "\(toolName)|\(argsPart)"
+    }
+
+    /// Records an executed call and returns how many times this exact call has now
+    /// run since the last state-mutating tool. Callers escalate when the returned
+    /// count (or `maxRepeatedToolCallCount`) reaches `repeatedToolCallLimit`.
+    @discardableResult
+    public func recordToolCallFingerprint(toolName: String, arguments: [String: Any]) -> Int {
+        if Self.mutatingToolNames.contains(toolName) {
+            repeatedToolCallCounts.removeAll()
+            maxRepeatedToolCallCount = 0
+            return 0
+        }
+        let fingerprint = Self.toolCallFingerprint(toolName: toolName, arguments: arguments)
+        let count = (repeatedToolCallCounts[fingerprint] ?? 0) + 1
+        repeatedToolCallCounts[fingerprint] = count
+        maxRepeatedToolCallCount = max(maxRepeatedToolCallCount, count)
+        return count
     }
 
     /// Tools seeded into the prompt on startup — the "fundamental" set.
