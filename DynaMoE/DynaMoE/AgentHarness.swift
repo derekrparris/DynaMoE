@@ -107,7 +107,9 @@ public extension AgentTool {
 
     /// Estimated prompt tokens consumed when this tool's schema is loaded into context.
     func approximatePromptTokens() -> Int {
-        guard let data = try? JSONEncoder().encode(definition) else { return 0 }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(definition) else { return 0 }
         return max(1, data.count / 4)
     }
 
@@ -1857,7 +1859,9 @@ public final class ToolLoadTool: AgentTool {
             }
             do {
                 let definition = try harness.loadTool(named: name)
-                let schemaData = try? JSONEncoder().encode(definition)
+                let schemaEncoder = JSONEncoder()
+                schemaEncoder.outputFormatting = [.sortedKeys]
+                let schemaData = try? schemaEncoder.encode(definition)
                 schemas[name] = schemaData.flatMap { String(data: $0, encoding: .utf8) } ?? ""
                 loadedResults.append([
                     "tool_name": name,
@@ -3170,8 +3174,10 @@ public final class AgentHarness {
         }
 
         prompt += "# Tools\n\nOnly the following functions are currently loaded and callable:\n\n<tools>\n"
+        let toolSchemaEncoder = JSONEncoder()
+        toolSchemaEncoder.outputFormatting = [.sortedKeys]
         for tool in availableToolDefinitions {
-            if let data = try? JSONEncoder().encode(tool),
+            if let data = try? toolSchemaEncoder.encode(tool),
                let jsonStr = String(data: data, encoding: .utf8) {
                 prompt += jsonStr + "\n"
             }
