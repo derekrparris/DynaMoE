@@ -6993,6 +6993,36 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(AgentHarness.missingPathRepairHint(command: "ls /Users", stderr: "", stdout: ""), "")
     }
 
+    /// Observed live: the model dropped a directory component, naming
+    /// `/Users/…/survey.csv` for `/Users/…/Downloads/survey.csv`. The parent exists
+    /// and no sibling shares a prefix with the file name, so the directory-repair
+    /// pass found nothing and the model got no correction. The hint must instead
+    /// echo the path the user actually named in the prompt.
+    func testMissingPathRepairHintEchoesUserPathWhenDirectoryDropped() {
+        let fm = FileManager.default
+        let base = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library/Caches/DynaMoE-pathhint-\(UUID().uuidString)")
+        let downloads = base.appendingPathComponent("Downloads")
+        try? fm.createDirectory(at: downloads, withIntermediateDirectories: true)
+        let real = downloads.appendingPathComponent("survey.csv")
+        _ = fm.createFile(atPath: real.path, contents: Data("x".utf8))
+        defer { try? fm.removeItem(at: base) }
+
+        // Same parent, missing the Downloads/ component.
+        let mangled = base.appendingPathComponent("survey.csv").path
+        let priorPrompt = AgentHarness.shared.lastPromptText
+        defer { AgentHarness.shared.lastPromptText = priorPrompt }
+        AgentHarness.shared.lastPromptText = "analyze the survey at \(real.path) then report"
+
+        let hint = AgentHarness.missingPathRepairHint(
+            command: "head -n1 '\(mangled)'",
+            stderr: "head: \(mangled): No such file or directory",
+            stdout: ""
+        )
+        XCTAssertTrue(hint.contains(real.path), "hint must echo the user's real path, got: \(hint)")
+        XCTAssertTrue(hint.contains("EXACT"))
+    }
+
     /// Pure-logic coverage for the uncalled-action nudge. A false positive here
     /// injects a synthetic turn and the model answers its own closing message,
     /// while a false negative drops a narrated action the model never executed.

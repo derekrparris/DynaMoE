@@ -191,9 +191,14 @@ public final class ShellRunTool: AgentTool {
             ]
             // The marker alone leaves the model trying to "get the full file"
             // again, which is how a large dump turns into a retry loop. Say what
-            // to do instead.
+            // to do instead. Only recommend `file_read` when it is actually loaded:
+            // advising an unloaded tool (the default prompt exposes only shell_run)
+            // sends the model hunting for a capability it cannot call.
             if cleanStdout.contains("<<<TRUNCATED") || cleanStdout.contains("<<<LINE TRUNCATED") {
-                data["note"] = "Output was truncated for the context budget. Do NOT re-run the same command to print it in full. Narrow the command (head/tail/grep/sed for just the fields you need), or have it write a summary to a file and read that with file_read (which pages with start_line)."
+                let readerAdvice = AgentHarness.shared.loadedTools["file_read"] != nil
+                    ? "or have it write a summary to a file and read that with file_read (which pages with start_line)."
+                    : "or load file_read via tools_load and page through the file with it (file_read supports start_line)."
+                data["note"] = "Output was truncated for the context budget. Do NOT re-run the same command to print it in full. Narrow the command (head/tail/grep/sed for just the fields you need), \(readerAdvice)"
             }
             // stderr text must reach the model even when the pipeline exited 0: a
             // failing element inside a pipeline (`head missing | sed | wc`) writes
@@ -4028,6 +4033,7 @@ public final class AgentHarness {
 
         let separators = CharacterSet(charactersIn: " \t\n'\"`;|&()[]{}<>=,")
         var seen = Set<String>()
+        var hints: [String] = []
         for raw in command.components(separatedBy: separators) {
             // Only the user's own data paths: /tmp script paths and system dirs are
             // never the intended attachment.
@@ -4057,9 +4063,24 @@ public final class AgentHarness {
             let ranked = entries
                 .filter { $0.lowercased() != wanted }
                 .sorted { sharedPrefixLength($0.lowercased(), wanted) > sharedPrefixLength($1.lowercased(), wanted) }
-            guard let best = ranked.first, sharedPrefixLength(best.lowercased(), wanted) >= 3 else { continue }
-            let list = ranked.prefix(6).map { "  \($0)" }.joined(separator: "\n")
-            return "\nHint: \(token) does not exist. The nearest existing directory is \(ancestor.path); the actual names there are:\n\(list)\nRebuild the path using one of these EXACT names (spaces, commas and underscores included) in place of \"\(missingComponent)\"."
+            if let best = ranked.first, sharedPrefixLength(best.lowercased(), wanted) >= 3 {
+                let list = ranked.prefix(6).map { "  \($0)" }.joined(separator: "\n")
+                hints.append("Hint: \(token) does not exist. The nearest existing directory is \(ancestor.path); the actual names there are:\n\(list)\nRebuild the path using one of these EXACT names (spaces, commas and underscores included) in place of \"\(missingComponent)\".")
+                continue
+            }
+
+            // The parent exists and the missing name is not a near-miss of any
+            // sibling — observed: the model dropped a directory component and wrote
+            // `/Users/…/survey.csv` for `/Users/…/Downloads/survey.csv`, so nothing
+            // above matched and the model got no correction at all. Echo the path the
+            // user actually named with the same file name.
+            if let match = absolutePath(in: AgentHarness.shared.lastPromptText, matchingLastComponent: missingComponent),
+               match != token {
+                hints.append("Hint: \(token) does not exist. The user's file is at \(match). Use that EXACT absolute path.")
+            }
+        }
+        if !hints.isEmpty {
+            return "\n" + hints.prefix(2).joined(separator: "\n")
         }
 
         // Second pass: the model referenced a BARE relative filename that is not in
