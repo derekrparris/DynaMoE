@@ -3040,7 +3040,9 @@ public final class AgentHarness {
     public var repeatedToolCallLimit: Int = 3
 
     /// Tools that change on-disk or repo state, so a re-issued read afterwards is
-    /// no longer redundant.
+    /// no longer redundant. `shell_run` is state-changing too but is handled in
+    /// `recordToolCallFingerprint` by dropping only the read fingerprints, so a shell
+    /// loop still accumulates.
     private static let mutatingToolNames: Set<String> = ["file_write", "file_edit", "git_commit"]
 
     /// Stable fingerprint for a call: tool name plus its arguments, whitespace
@@ -3074,6 +3076,16 @@ public final class AgentHarness {
             repeatedToolCallCounts.removeAll()
             maxRepeatedToolCallCount = 0
             return 0
+        }
+        // A shell command may have rewritten anything the model read, so a re-issued
+        // read afterwards is legitimate (`isStateChanging` treats `shell_run` as
+        // state-changing for the same reason). Drop the READ fingerprints so that case
+        // cannot force synthesis. Shell fingerprints are kept: an identical (or
+        // alternating) shell loop is the pattern this guard most needs to catch, and
+        // clearing them here would reset the count on every new command and never fire.
+        if toolName == "shell_run" {
+            repeatedToolCallCounts = repeatedToolCallCounts.filter { $0.key.hasPrefix("shell_run|") }
+            maxRepeatedToolCallCount = repeatedToolCallCounts.values.max() ?? 0
         }
         let fingerprint = Self.toolCallFingerprint(toolName: toolName, arguments: arguments)
         let count = (repeatedToolCallCounts[fingerprint] ?? 0) + 1

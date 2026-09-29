@@ -403,6 +403,38 @@ public final class StreamingToolParser {
         )
     }
 
+    /// A parameter opener the model duplicated inside its own value:
+    /// `<parameter=command>` immediately followed by a second `<parameter=command>`.
+    /// `repairMalformedParameterOpeners` canonicalizes the pipe dialect
+    /// (`<parameter|command="…`) into exactly this shape, and the model also emits the
+    /// plain duplicate directly. The real payload is the inner one, so the outer
+    /// duplicate is dropped; otherwise the committed turn carries two openers and a
+    /// single `</parameter>`, and `structuralClosureTags` will not balance it (tags
+    /// inside a value are data), teaching the model a malformed example to imitate.
+    /// Collapsing them at text level is equivalent to what `unwrapNestedParameterTag`
+    /// already does for the value, just earlier so the markup stays well-formed too.
+    public static func collapseRedundantNestedParameterOpeners(_ text: String) -> String {
+        guard text.contains("<parameter=") else { return text }
+        guard let re = try? NSRegularExpression(
+            pattern: "(<parameter=([A-Za-z_][A-Za-z0-9_]*)>)[ \\t\\r\\n]*(<parameter=\\2>)",
+            options: []
+        ) else { return text }
+        var current = text
+        // Left-to-right replacement is non-overlapping, so a triple needs a repeat pass.
+        for _ in 0..<4 {
+            let ns = current as NSString
+            let replaced = re.stringByReplacingMatches(
+                in: current,
+                options: [],
+                range: NSRange(location: 0, length: ns.length),
+                withTemplate: "$1"
+            )
+            if replaced == current { break }
+            current = replaced
+        }
+        return current
+    }
+
     /// The model occasionally splits the parameter close tag across lines —
     /// `</parameter` then `=` and/or whitespace, then `>` — because the grammar
     /// constrains call structure but not the byte-precise closer. Left alone the
@@ -419,12 +451,12 @@ public final class StreamingToolParser {
     /// markup gets both directions. Runs before the closer guard so a turn frozen
     /// mid-value still gets its opener fixed even when no `</parameter>` exists yet.
     public static func repairSplitParameterClosers(_ text: String) -> String {
-        let text = repairMalformedParameterOpeners(text)
-        guard text.contains("</parameter") else { return text }
-        guard let re = try? NSRegularExpression(pattern: "</parameter\\s*=?\\s*>", options: []) else { return text }
-        let ns = text as NSString
+        let repaired = collapseRedundantNestedParameterOpeners(repairMalformedParameterOpeners(text))
+        guard repaired.contains("</parameter") else { return repaired }
+        guard let re = try? NSRegularExpression(pattern: "</parameter\\s*=?\\s*>", options: []) else { return repaired }
+        let ns = repaired as NSString
         return re.stringByReplacingMatches(
-            in: text,
+            in: repaired,
             options: [],
             range: NSRange(location: 0, length: ns.length),
             withTemplate: parameterClose

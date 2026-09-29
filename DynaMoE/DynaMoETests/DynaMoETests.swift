@@ -6520,8 +6520,25 @@ final class DynaMoETests: XCTestCase {
             "sed -n '2p' /tmp/survey.csv; echo \"---HEAD2---\"; wc -l /tmp/survey.csv"
         )
 
-        // The turn committed back to context must read as valid markup.
-        XCTAssertFalse(StreamingToolParser.repairSplitParameterClosers(raw).contains("<parameter|"))
+        // The turn committed back to context must read as valid markup: the redundant
+        // nested opener the repair just canonicalized has to be collapsed too, or the
+        // turn commits with two openers and one closer and the model imitates that.
+        let committed = StreamingToolParser.repairSplitParameterClosers(raw)
+        XCTAssertFalse(committed.contains("<parameter|"))
+        XCTAssertEqual(committed.components(separatedBy: "<parameter=command>").count - 1, 1)
+        XCTAssertEqual(committed.components(separatedBy: "</parameter>").count - 1, 1)
+
+        // The plain duplicate the model also emits directly is collapsed the same way.
+        let plainNested = """
+        <tool_call>
+        <function=shell_run>
+        <parameter=command>
+        <parameter=command>echo hi
+        </parameter>
+        </function></tool_call>
+        """
+        let plainCommitted = StreamingToolParser.repairSplitParameterClosers(plainNested)
+        XCTAssertEqual(plainCommitted.components(separatedBy: "<parameter=command>").count - 1, 1)
     }
 
     /// A degenerating generation copies a short motif until it runs out of context.
@@ -7005,6 +7022,33 @@ final class DynaMoETests: XCTestCase {
         _ = harness.recordToolCallFingerprint(toolName: "file_edit", arguments: ["path": "survey.csv"])
         XCTAssertEqual(harness.maxRepeatedToolCallCount, 0)
         XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": command]), 1)
+    }
+
+    /// A shell command can rewrite what the model read, so a read repeated after one
+    /// must not be treated as the same observation; the pre-mutation count would
+    /// otherwise escalate on the first legitimate post-mutation read. But an identical
+    /// (or alternating) SHELL loop must still accumulate, or the guard could never
+    /// fire on the pattern it exists for.
+    func testRepeatedToolCallGuardInvalidatesReadsAfterShellButNotShellLoops() {
+        let harness = AgentHarness.shared
+
+        // read → read → shell mutation → read: the third read is a fresh observation.
+        harness.beginAgentSearchGuard()
+        let read = ["path": "survey.csv"]
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "file_read", arguments: read), 1)
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "file_read", arguments: read), 2)
+        _ = harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": "python3 gen.py"])
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "file_read", arguments: read), 1)
+
+        // An alternating shell loop keeps accumulating even though each command is new.
+        harness.beginAgentSearchGuard()
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": "ls"]), 1)
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": "cat a.txt"]), 1)
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": "ls"]), 2)
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": "cat a.txt"]), 2)
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": "ls"]), 3)
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": "cat a.txt"]), 3)
+        XCTAssertEqual(harness.maxRepeatedToolCallCount, 3)
     }
 
     /// A path that does not exist should come back with the real sibling names, so
