@@ -25,13 +25,22 @@ final class ChatSessionStore {
     private let directory: URL
     private let fileManager: FileManager
     private let ioQueue = DispatchQueue(label: "com.dynamoe.chatsessionstore.io", qos: .utility)
-    private let encoder = JSONEncoder()
+    /// Canonical (`sortedKeys`) encoding is required for the byte signature to be
+    /// stable: `JSONEncoder` otherwise emits `ChatSession`'s keys in an unstable
+    /// order, which would make every save look like a change.
+    private let encoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
     private let decoder = JSONDecoder()
 
-    /// Signature of the bytes last written per conversation. A debounced save
-    /// pass compares against this so streaming updates to one conversation do
-    /// not rewrite every other file on disk.
-    private var writtenSignatures: [UUID: Int] = [:]
+    /// Signature of the bytes last **successfully written** per conversation.
+    /// Only updated after a write actually lands, so a failed write (disk full,
+    /// permissions) is retried on the next save instead of being treated as
+    /// already durable. Access is serialized on `ioQueue` and never touched from
+    /// the main actor, which is what makes the unchecked isolation safe.
+    nonisolated(unsafe) private var writtenSignatures: [UUID: Int] = [:]
 
     init(directory: URL? = nil, fileManager: FileManager = .default) {
         self.fileManager = fileManager
@@ -54,10 +63,6 @@ final class ChatSessionStore {
         directory.appendingPathComponent("\(id.uuidString).json", isDirectory: false)
     }
 
-    private func ensureDirectory() {
-        try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
-    }
-
     private func enumerateSessionFiles() -> [URL] {
         guard let urls = try? fileManager.contentsOfDirectory(
             at: directory,
@@ -71,17 +76,39 @@ final class ChatSessionStore {
 
     /// Reads every persisted conversation, most-recently-updated first to match
     /// the sidebar order.
+    ///
+    /// Each loaded conversation's canonical signature is seeded into
+    /// `writtenSignatures` so the first debounced save after launch does not
+    /// rewrite files whose contents are already up to date.
     func loadSessions() -> [ChatSession] {
-        var sessions: [ChatSession] = []
+        var decoded: [(session: ChatSession, signature: Int?)] = []
         for url in enumerateSessionFiles() {
             guard let data = try? Data(contentsOf: url) else { continue }
             if let envelope = try? decoder.decode(PersistedChatSession.self, from: data) {
-                sessions.append(envelope.session)
+                decoded.append((envelope.session, canonicalSignature(for: envelope.session)))
             } else if let bare = try? decoder.decode(ChatSession.self, from: data) {
-                sessions.append(bare)
+                decoded.append((bare, canonicalSignature(for: bare)))
             }
         }
-        return sessions.sorted { $0.updatedAt > $1.updatedAt }
+
+        let signatures = decoded.compactMap { pair -> (UUID, Int)? in
+            guard let signature = pair.signature else { return nil }
+            return (pair.session.id, signature)
+        }
+        ioQueue.sync { [self] in
+            for (id, signature) in signatures where writtenSignatures[id] == nil {
+                writtenSignatures[id] = signature
+            }
+        }
+
+        return decoded.map(\.session).sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    private func canonicalSignature(for session: ChatSession) -> Int? {
+        guard let data = try? encoder.encode(
+            PersistedChatSession(schemaVersion: ChatSessionStore.currentSchemaVersion, session: session)
+        ) else { return nil }
+        return data.hashValue
     }
 
     // MARK: - Saving
@@ -89,50 +116,62 @@ final class ChatSessionStore {
     /// Writes every conversation that changed and removes files for
     /// conversations no longer present. The caller debounces this, so it is
     /// safe to call repeatedly; unchanged conversations are skipped.
-    @discardableResult
-    func saveAll(_ sessions: [ChatSession]) -> [UUID] {
-        ensureDirectory()
-        let liveIds = Set(sessions.map(\.id))
-
-        var payloads: [(url: URL, data: Data)] = []
+    ///
+    /// Encoding happens here (the `ChatSession` conformance is main-actor
+    /// isolated); the actual compare-write-commit cycle runs on `ioQueue`, where
+    /// a signature is recorded only after its write succeeds.
+    func saveAll(_ sessions: [ChatSession]) {
+        var payloads: [(id: UUID, url: URL, data: Data, signature: Int)] = []
         for session in sessions {
             guard let data = try? encoder.encode(
                 PersistedChatSession(schemaVersion: ChatSessionStore.currentSchemaVersion, session: session)
             ) else { continue }
-            let signature = data.hashValue
-            guard writtenSignatures[session.id] != signature else { continue }
-            writtenSignatures[session.id] = signature
-            payloads.append((fileURL(for: session.id), data))
+            payloads.append((session.id, fileURL(for: session.id), data, data.hashValue))
         }
 
-        let orphanURLs = orphanURLs(keeping: liveIds)
+        let directory = self.directory
+        let liveIds = Set(sessions.map(\.id))
 
-        if payloads.isEmpty && orphanURLs.isEmpty { return [] }
-
-        ioQueue.async {
+        ioQueue.async { [self] in
             let fm = FileManager()
+            try? fm.createDirectory(at: directory, withIntermediateDirectories: true)
+
             for payload in payloads {
-                try? payload.data.write(to: payload.url, options: .atomic)
+                if writtenSignatures[payload.id] == payload.signature { continue }
+                do {
+                    try payload.data.write(to: payload.url, options: .atomic)
+                    writtenSignatures[payload.id] = payload.signature
+                } catch {
+                    // Leave no signature so the conversation is retried rather
+                    // than assumed durable for the rest of the process.
+                    writtenSignatures[payload.id] = nil
+                    print("⚠️ [ChatSessionStore] failed to persist session \(payload.id): \(error.localizedDescription)")
+                }
             }
-            for url in orphanURLs {
+
+            guard let urls = try? fm.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) else { return }
+            for url in urls where url.pathExtension == "json" {
+                guard let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent),
+                      !liveIds.contains(id) else { continue }
                 try? fm.removeItem(at: url)
+                writtenSignatures[id] = nil
             }
         }
-
-        return orphanURLs.compactMap { UUID(uuidString: $0.deletingPathExtension().lastPathComponent) }
     }
 
     /// Deletes the given conversations from disk immediately.
     func delete(sessionIds: [UUID]) {
+        guard !sessionIds.isEmpty else { return }
         let urls = sessionIds.map { fileURL(for: $0) }
-        for id in sessionIds {
-            writtenSignatures[id] = nil
-        }
-        guard !urls.isEmpty else { return }
-        ioQueue.async {
+        ioQueue.async { [self] in
             let fm = FileManager()
-            for url in urls {
+            for (index, url) in urls.enumerated() {
                 try? fm.removeItem(at: url)
+                writtenSignatures[sessionIds[index]] = nil
             }
         }
     }
@@ -141,18 +180,6 @@ final class ChatSessionStore {
     /// caller ever needs a synchronous barrier).
     func flushPendingIO() {
         ioQueue.sync {}
-    }
-
-    private func orphanURLs(keeping liveIds: Set<UUID>) -> [URL] {
-        var orphans: [URL] = []
-        for url in enumerateSessionFiles() {
-            guard let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent) else { continue }
-            if !liveIds.contains(id) {
-                writtenSignatures[id] = nil
-                orphans.append(url)
-            }
-        }
-        return orphans
     }
 
     // MARK: - Retention

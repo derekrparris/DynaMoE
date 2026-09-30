@@ -11689,6 +11689,58 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertNotNil(firstMod)
         XCTAssertEqual(firstMod, secondMod, "Unchanged conversations should not be rewritten")
     }
+
+    func testLoadingSeedsSignaturesSoUnchangedSessionsAreNotRewritten() {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let writer = ChatSessionStore(directory: dir)
+        let only = session(title: "Loaded", updatedAt: Date())
+        let file = dir.appendingPathComponent("\(only.id.uuidString).json")
+        writer.saveAll([only])
+        writer.flushPendingIO()
+        let firstMod = (try? FileManager.default.attributesOfItem(atPath: file.path))?[.modificationDate] as? Date
+
+        // A fresh store models an app relaunch: it has written nothing yet.
+        let relaunched = ChatSessionStore(directory: dir)
+        let loaded = relaunched.loadSessions()
+        XCTAssertEqual(loaded.map(\.id), [only.id])
+
+        relaunched.saveAll(loaded)
+        relaunched.flushPendingIO()
+        let secondMod = (try? FileManager.default.attributesOfItem(atPath: file.path))?[.modificationDate] as? Date
+
+        XCTAssertNotNil(firstMod)
+        XCTAssertEqual(firstMod, secondMod, "Loaded conversations should not be rewritten on launch")
+    }
+
+    func testFailedWriteIsRetriedRatherThanMarkedDurable() throws {
+        let dir = makeTempDirectory()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let store = ChatSessionStore(directory: dir)
+        let only = session(title: "Retry", updatedAt: Date())
+        let file = dir.appendingPathComponent("\(only.id.uuidString).json")
+
+        // Remove write permission so the atomic write fails, as it would on a
+        // full or permission-denied disk.
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: dir.path)
+        store.saveAll([only])
+        store.flushPendingIO()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+
+        // Once writable again, the same bytes must be written instead of being
+        // skipped as already-durable.
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+        store.saveAll([only])
+        store.flushPendingIO()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path), "A failed save must be retried")
+        XCTAssertEqual(store.loadSessions().map(\.id), [only.id])
+    }
 }
 
 
