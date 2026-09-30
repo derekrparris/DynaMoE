@@ -74,7 +74,7 @@ final class ChatSessionStore {
 
     // MARK: - Loading
 
-    /// Reads every persisted conversation, most-recently-updated first to match
+    /// Reads every persisted conversation, most-recently-active first to match
     /// the sidebar order.
     ///
     /// Each loaded conversation's canonical signature is seeded into
@@ -101,7 +101,11 @@ final class ChatSessionStore {
             }
         }
 
-        return decoded.map(\.session).sorted { $0.updatedAt > $1.updatedAt }
+        return decoded
+            .map(\.session)
+            .map { (session: $0, activity: $0.lastActivityAt) }
+            .sorted { $0.activity > $1.activity }
+            .map(\.session)
     }
 
     private func canonicalSignature(for session: ChatSession) -> Int? {
@@ -187,11 +191,13 @@ final class ChatSessionStore {
     /// Decides which conversations survive a retention pass.
     ///
     /// - `limit == nil` means "never auto-delete"; everything is kept.
+    /// - Recency comes from `lastActivityAt`, not `updatedAt`, so a conversation
+    ///   used recently is not pruned just because it was created long ago.
     /// - The active conversation is always kept even if it falls outside the
     ///   most-recent window, so the user is never yanked out of an open chat.
     /// - Returns the originals in their existing order, split into survivors
     ///   and the removed tail.
-    nonisolated static func retentionPlan(
+    static func retentionPlan(
         sessions: [ChatSession],
         limit: Int?,
         protectedId: UUID?
@@ -199,8 +205,10 @@ final class ChatSessionStore {
         guard let limit, limit > 0, sessions.count > limit else {
             return (sessions, [])
         }
-        let mostRecent = sessions.sorted { $0.updatedAt > $1.updatedAt }
-        var keepIds = Set(mostRecent.prefix(limit).map(\.id))
+        let mostRecent = sessions
+            .map { (session: $0, activity: $0.lastActivityAt) }
+            .sorted { $0.activity > $1.activity }
+        var keepIds = Set(mostRecent.prefix(limit).map(\.session.id))
         if let protectedId {
             keepIds.insert(protectedId)
         }

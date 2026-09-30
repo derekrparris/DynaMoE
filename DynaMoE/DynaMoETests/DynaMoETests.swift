@@ -11628,6 +11628,27 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertTrue(plan.removed.isEmpty)
     }
 
+    func testRetentionUsesMessageActivityNotStaleUpdatedAt() {
+        let now = Date()
+        // Created long ago (stale updatedAt) but messages show it was used recently.
+        var recentlyUsed = session(title: "Recently Used", updatedAt: now.addingTimeInterval(-3_600))
+        recentlyUsed.messages = [
+            ChatMessage(role: .user, content: "hello", timestamp: now.addingTimeInterval(-10)),
+            ChatMessage(role: .assistant, content: "hi", timestamp: now)
+        ]
+        let createdLater = session(title: "Created Later", updatedAt: now.addingTimeInterval(-60))
+        let oldest = session(title: "Oldest", updatedAt: now.addingTimeInterval(-7_200))
+
+        let plan = ChatSessionStore.retentionPlan(
+            sessions: [recentlyUsed, createdLater, oldest],
+            limit: 2,
+            protectedId: nil
+        )
+
+        XCTAssertTrue(plan.kept.contains(where: { $0.id == recentlyUsed.id }), "A recently active conversation must outrank a stale updatedAt")
+        XCTAssertEqual(plan.removed.map(\.id), [oldest.id])
+    }
+
     // MARK: - Disk persistence
 
     func testStoreRoundTripsSessionsMostRecentFirst() {
@@ -11648,6 +11669,22 @@ final class ChatSessionPersistenceTests: XCTestCase {
         let loaded = store.loadSessions()
         XCTAssertEqual(loaded.map(\.title), ["Second", "First"], "Most recently updated conversation should load first")
         XCTAssertEqual(loaded.first?.messages.map(\.content), ["hello", "hi there"])
+    }
+
+    func testLoadOrderUsesLatestMessageActivity() {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        var older = session(title: "Older", updatedAt: Date(timeIntervalSince1970: 1_000))
+        older.messages = [ChatMessage(role: .user, content: "recent", timestamp: Date(timeIntervalSince1970: 5_000))]
+        let newer = session(title: "Newer", updatedAt: Date(timeIntervalSince1970: 2_000))
+
+        store.saveAll([older, newer])
+        store.flushPendingIO()
+
+        let loaded = store.loadSessions()
+        XCTAssertEqual(loaded.map(\.title), ["Older", "Newer"], "Load order should follow latest activity, not stale updatedAt")
     }
 
     func testStoreRemovesOrphanedFilesForDeletedConversations() {

@@ -200,3 +200,23 @@ public struct ChatSession: Identifiable, Codable, Equatable {
         try container.encode(queuedPrompts, forKey: .queuedPrompts)
     }
 }
+
+public extension ChatSession {
+    /// The most recent timestamp we can actually trust for a conversation.
+    ///
+    /// `updatedAt` is only set at creation/decode; the UI mutation paths that
+    /// append messages, stream tokens, edit titles, and change queued prompts do
+    /// not touch it, so it cannot mean "last used". Message and queued-prompt
+    /// timestamps are maintained on those paths, so prefer the newest of them and
+    /// only fall back to `updatedAt`/`createdAt`.
+    var lastActivityAt: Date {
+        var latest = max(updatedAt, createdAt)
+        for message in messages {
+            latest = max(latest, message.timestamp)
+        }
+        for prompt in queuedPrompts {
+            latest = max(latest, prompt.timestamp)
+        }
+        return latest
+    }
+}
