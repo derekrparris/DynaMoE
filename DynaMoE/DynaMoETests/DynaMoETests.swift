@@ -11929,6 +11929,52 @@ final class ChatSessionPersistenceTests: XCTestCase {
         store.flushPendingIO()
         XCTAssertFalse(FileManager.default.fileExists(atPath: file.path), "A failed removal must be retried")
     }
+
+    func testPersistenceAvailableForWritableDirectory() {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        XCTAssertTrue(store.isPersistenceAvailable)
+    }
+
+    func testUncreatableSessionsDirectoryReportsPersistenceUnavailable() throws {
+        let parent = makeTempDirectory()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parent.path)
+            try? FileManager.default.removeItem(at: parent)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: parent.path)
+
+        let sessionsDir = parent.appendingPathComponent("sessions", isDirectory: true)
+        let store = ChatSessionStore(directory: sessionsDir)
+
+        XCTAssertFalse(store.isPersistenceAvailable, "An uncreatable sessions directory must report persistence as unavailable")
+        store.saveAll([session(title: "Nope", updatedAt: Date())])
+        store.flushPendingIO()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sessionsDir.path))
+    }
+
+    func testWriteFailureFlipsPersistenceAvailability() async throws {
+        let dir = makeTempDirectory()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let store = ChatSessionStore(directory: dir)
+        XCTAssertTrue(store.isPersistenceAvailable)
+        store.saveAll([session(title: "First", updatedAt: Date())])
+        store.flushPendingIO()
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: dir.path)
+        store.saveAll([session(title: "Blocked", updatedAt: Date())])
+        store.flushPendingIO()
+
+        // The availability update hops back to the main actor; give it a moment.
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(store.isPersistenceAvailable, "A failed write must mark persistence as unavailable")
+    }
 }
 
 

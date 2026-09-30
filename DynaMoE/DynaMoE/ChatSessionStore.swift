@@ -11,23 +11,31 @@
 //
 
 import Foundation
+import Combine
 import CryptoKit
 
 /// Keeps conversations on disk across launches. Durable data lives in
 /// ~/Library/Application Support so it is backed up and never purged like the
 /// regenerable index cache in ~/Library/Caches.
-final class ChatSessionStore {
+final class ChatSessionStore: ObservableObject {
     static let shared = ChatSessionStore()
 
     /// Stamped into every file so a future format change can migrate old
     /// conversations instead of silently discarding them.
     nonisolated static let currentSchemaVersion = 1
 
-    /// `nil` when Application Support could not be resolved. In that case the
-    /// store refuses to persist rather than silently writing durable history to
-    /// a purgeable temporary directory.
+    /// `nil` when Application Support could not be resolved *or* the sessions
+    /// directory could not be created. In that case the store refuses to persist
+    /// rather than silently writing durable history to a purgeable temporary
+    /// directory.
     private let directory: URL?
     private let ioQueue = DispatchQueue(label: "com.dynamoe.chatsessionstore.io", qos: .utility)
+
+    /// True while the store has a usable directory. Starts from an up-front
+    /// create check in `init` and flips out of `ioQueue` when a write or
+    /// directory creation later fails (or recovers), so callers can surface the
+    /// real state instead of assuming conversations are being saved.
+    @Published private(set) var isPersistenceAvailable: Bool
 
     /// Collision-resistant digest of the canonical bytes last **successfully
     /// written** per conversation. A cryptographic digest (not `hashValue`, whose
@@ -47,7 +55,10 @@ final class ChatSessionStore {
     nonisolated(unsafe) private var managedIds: Set<UUID> = []
 
     init(directory: URL? = nil, fileManager: FileManager = .default) {
-        self.directory = directory ?? ChatSessionStore.defaultDirectory(using: fileManager)
+        let resolved = directory ?? ChatSessionStore.defaultDirectory(using: fileManager)
+        let prepared = resolved.flatMap { ChatSessionStore.preparedDirectory($0) }
+        self.directory = prepared
+        self.isPersistenceAvailable = prepared != nil
     }
 
     // MARK: - Locations
@@ -67,9 +78,26 @@ final class ChatSessionStore {
         }
     }
 
-    /// False when the store has nowhere durable to write. Callers can surface
-    /// this instead of assuming conversations are being saved.
-    var isPersistenceAvailable: Bool { directory != nil }
+    /// Confirms the sessions directory actually exists and is creatable before it
+    /// is reported as usable.
+    nonisolated static func preparedDirectory(_ directory: URL) -> URL? {
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            return directory
+        } catch {
+            print("⚠️ [ChatSessionStore] could not create the sessions directory at \(directory.path), so chat history will not be persisted: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Mirrors a write-path outcome onto `isPersistenceAvailable` on the main
+    /// actor. No-ops when the value is unchanged.
+    nonisolated private func reportPersistenceAvailability(_ available: Bool) {
+        Task { @MainActor [weak self] in
+            guard let self, self.isPersistenceAvailable != available else { return }
+            self.isPersistenceAvailable = available
+        }
+    }
 
     // MARK: - Loading
 
@@ -164,11 +192,18 @@ final class ChatSessionStore {
         let snapshot = sessions
         ioQueue.async { [self] in
             let fm = FileManager()
-            try? fm.createDirectory(at: directory, withIntermediateDirectories: true)
+            do {
+                try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+            } catch {
+                print("⚠️ [ChatSessionStore] could not open the sessions directory: \(error.localizedDescription)")
+                reportPersistenceAvailability(false)
+                return
+            }
 
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
             let liveIds = Set(snapshot.map(\.id))
+            var reportedAvailable = false
 
             for session in snapshot {
                 guard let data = try? encoder.encode(
@@ -184,10 +219,15 @@ final class ChatSessionStore {
                     try data.write(to: url, options: .atomic)
                     writtenSignatures[session.id] = signature
                     managedIds.insert(session.id)
+                    if !reportedAvailable {
+                        reportPersistenceAvailability(true)
+                        reportedAvailable = true
+                    }
                 } catch {
                     // Leave no signature so the conversation is retried rather
                     // than assumed durable for the rest of the process.
                     writtenSignatures[session.id] = nil
+                    reportPersistenceAvailability(false)
                     print("⚠️ [ChatSessionStore] failed to persist session \(session.id): \(error.localizedDescription)")
                 }
             }

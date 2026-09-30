@@ -972,6 +972,7 @@ struct ContentView: View {
 
     // Multi-Session Chat UI State (Antigravity Style)
     @ObservedObject private var zoomManager = AppZoomManager.shared
+    @ObservedObject private var sessionStore = ChatSessionStore.shared
     @ObservedObject var localModelManager: LocalModelManager = LocalModelManager.shared
     @State private var activeLoadedModelPath: String? = nil
     @State private var isLoadingModel: Bool = false
@@ -1383,7 +1384,7 @@ struct ContentView: View {
                     }
                 )
                 .safeAreaInset(edge: .top, spacing: 0) {
-                    if !ChatSessionStore.shared.isPersistenceAvailable {
+                    if !sessionStore.isPersistenceAvailable {
                         chatPersistenceWarningBanner
                     }
                 }
