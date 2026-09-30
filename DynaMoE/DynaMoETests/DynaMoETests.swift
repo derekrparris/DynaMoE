@@ -6473,6 +6473,131 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(qwenParsed.calls.first?.arguments["path"] as? String, "README.md")
     }
 
+    /// The model can open a parameter with a pipe and an attribute quote
+    /// (`<parameter|command="…`) nested inside the real opener. Handed to zsh that
+    /// reads as a stdin redirect from a file named `parameter`, which the model
+    /// mistook for the environment mangling its commands and spiralled. The repair
+    /// must rewrite the opener to canonical form and drop the quote pair so the real
+    /// command runs and the committed example reads back as valid markup.
+    func testStreamingToolParserMalformedPipeParameterOpener() {
+        let parser = StreamingToolParser.shared
+
+        // Direct normalization: pipe + attribute quote, pipe + bare `=`, pipe + `>`.
+        XCTAssertEqual(
+            StreamingToolParser.repairMalformedParameterOpeners(
+                "<parameter|command=\"sed -n '2p' /tmp/survey.csv\"; echo done"
+            ),
+            "<parameter=command>sed -n '2p' /tmp/survey.csv; echo done"
+        )
+        XCTAssertEqual(
+            StreamingToolParser.repairMalformedParameterOpeners("<parameter|command=echo hi</parameter>"),
+            "<parameter=command>echo hi</parameter>"
+        )
+        XCTAssertEqual(
+            StreamingToolParser.repairMalformedParameterOpeners("<parameter|path>a.txt</parameter>"),
+            "<parameter=path>a.txt</parameter>"
+        )
+        // Unrelated prose mentioning a bare `<parameter|` is untouched.
+        XCTAssertEqual(
+            StreamingToolParser.repairMalformedParameterOpeners("prose <parameter| mention"),
+            "prose <parameter| mention"
+        )
+
+        // End-to-end: the observed turn shape yields the real command, not markup.
+        let raw = """
+        <tool_call>
+        <function=shell_run>
+        <parameter=command>
+        <parameter|command="sed -n '2p' /tmp/survey.csv"; echo "---HEAD2---"; wc -l /tmp/survey.csv
+        </parameter>
+        </function></tool_call>
+        """
+        let parsed = parser.parseStreamingToolCalls(from: raw)
+        XCTAssertEqual(parsed.calls.count, 1)
+        XCTAssertEqual(parsed.calls.first?.name, "shell_run")
+        XCTAssertEqual(
+            parsed.calls.first?.arguments["command"] as? String,
+            "sed -n '2p' /tmp/survey.csv; echo \"---HEAD2---\"; wc -l /tmp/survey.csv"
+        )
+
+        // The turn committed back to context must read as valid markup: the redundant
+        // nested opener the repair just canonicalized has to be collapsed too, or the
+        // turn commits with two openers and one closer and the model imitates that.
+        let committed = StreamingToolParser.repairSplitParameterClosers(raw)
+        XCTAssertFalse(committed.contains("<parameter|"))
+        XCTAssertEqual(committed.components(separatedBy: "<parameter=command>").count - 1, 1)
+        XCTAssertEqual(committed.components(separatedBy: "</parameter>").count - 1, 1)
+
+        // The plain duplicate the model also emits directly is collapsed the same way.
+        let plainNested = """
+        <tool_call>
+        <function=shell_run>
+        <parameter=command>
+        <parameter=command>echo hi
+        </parameter>
+        </function></tool_call>
+        """
+        let plainCommitted = StreamingToolParser.repairSplitParameterClosers(plainNested)
+        XCTAssertEqual(plainCommitted.components(separatedBy: "<parameter=command>").count - 1, 1)
+    }
+
+    /// A degenerating generation copies a short motif until it runs out of context.
+    /// The harness must recognize the collapse (not a command or program) so
+    /// `shell_run` refuses to execute it and the committed turn carries a short
+    /// placeholder instead of tens of thousands of repeated characters.
+    func testRepetitionCollapseDetectionAndCommitCompression() {
+        // The observed shape: `'''"""` copied far past any real source line.
+        let collapse = String(repeating: "'''\"\"\"", count: 900)
+        XCTAssertNotNil(StreamingToolParser.repetitionCollapse(in: collapse))
+        // A single character repeated far past any banner/separator rule.
+        XCTAssertNotNil(StreamingToolParser.repetitionCollapse(in: String(repeating: "=", count: 3000)))
+
+        // A plausible real script (a heredoc report generator) is left alone.
+        let script = """
+        python3 - << 'PYEOF'
+        import csv
+        with open('/Users/x/Downloads/survey.csv') as f:
+            reader = csv.reader(f)
+            header = next(reader)
+            for i, c in enumerate(header):
+                print(i + 1, "|", c)
+        PYEOF
+        """
+        XCTAssertNil(StreamingToolParser.repetitionCollapse(in: script))
+
+        // The committed turn shrinks the collapsed argument to a placeholder.
+        let raw = """
+        <tool_call>
+        <function=shell_run>
+        <parameter=command>
+        \(collapse)
+        </parameter>
+        </function></tool_call>
+        """
+        let committed = StreamingToolParser.compressDegenerateCommandArguments(inTurnText: raw)
+        XCTAssertTrue(committed.contains("[collapsed generation omitted:"))
+        XCTAssertLessThan(committed.count, 400)
+
+        // A normal command argument and a non-command parameter are both untouched.
+        XCTAssertEqual(StreamingToolParser.compressDegenerateCommandArguments(inTurnText: script), script)
+    }
+
+    func testShellRunRejectsDegenerateAndOversizedCommand() async throws {
+        let tool = ShellRunTool()
+
+        let collapse = String(repeating: "'''\"\"\"", count: 900)
+        let rejected = try await tool.execute(arguments: ["command": collapse], workingDirectory: nil, maxOutputLength: 4000)
+        XCTAssertNotNil(rejected.stderr)
+        XCTAssertFalse(rejected.isCompleted)
+        XCTAssertTrue(rejected.resultJSON.contains("degenerate"))
+
+        // A runaway argument is rejected before the repetition scan reports it.
+        let oversized = String(repeating: "echo x; ", count: 1600)
+        let bigResult = try await tool.execute(arguments: ["command": oversized], workingDirectory: nil, maxOutputLength: 4000)
+        XCTAssertNotNil(bigResult.stderr)
+        XCTAssertTrue(bigResult.resultJSON.contains("runaway argument"))
+    }
+
     func testLingUnclosedThinkingToolCallBoundary() {
         // Ling 3.0 often emits a tool call without closing its <think> block. The implicit
         // boundary must keep the call out of the thinking half so the card renders and the
@@ -6632,6 +6757,10 @@ final class DynaMoETests: XCTestCase {
     func testGrammarOpenerCacheInvalidatedOnTokenizerChange() {
         let sampler = GrammarConstrainedSampler.shared
         sampler.reset()
+        // The opener cache is keyed on vocab size, and earlier tests can leave a
+        // cache built at this test's size; drop it so the first decoderA mask is a
+        // real build rather than a stale reuse.
+        sampler.invalidateTokenizerCaches()
         sampler.registerTools(AgentHarness.shared.availableToolDefinitions)
         sampler.updateState(emittedText: "<tool_call><function=shell_run><parameter=command>ls")
         guard case .insideParameterValue = sampler.currentState else {
@@ -6809,6 +6938,32 @@ final class DynaMoETests: XCTestCase {
             [true, true, false, false],
             "completing a split `<parameter` with `=` or `>` must be masked"
         )
+
+        // The closer must be canonical too. After the full `</parameter` word the
+        // only legal next token is the `>` that completes it; otherwise the model
+        // splits the tag (`</parameter=` newline `>`), which the parser cannot
+        // recognize and then reads back to itself as an example.
+        XCTAssertEqual(
+            masked(open + "wc -l x</parameter", tokens: [">", ">=", "=\n  >", "\n>", "x"]),
+            [false, true, true, true, true],
+            "only the canonical `>` may complete `</parameter`"
+        )
+
+        // Belt and suspenders: a tokenizer that merges the closer with a diverging
+        // char in ONE token (`</parameter=`) must still be refused, even from plain
+        // value text where the tail carries no closer partial.
+        XCTAssertEqual(
+            masked(open + "wc -l x", tokens: ["</parameter=", "</parameter>", "hi"]),
+            [true, false, false],
+            "a self-contained malformed closer token must be masked"
+        )
+        // Cross-boundary assembly: the tail ends mid-closer and the candidate
+        // completes it with a diverging `=` rather than `>`.
+        XCTAssertEqual(
+            masked(open + "wc -l x</", tokens: ["parameter=", "parameter>", "parameter"]),
+            [true, false, false],
+            "a malformed closer assembled across the token boundary must be masked"
+        )
     }
 
     /// The same-tool failure streak that lets the harness end a run the model is
@@ -6836,6 +6991,69 @@ final class DynaMoETests: XCTestCase {
         XCTAssertGreaterThanOrEqual(harness.failedToolCallTotalLimit, 2)
     }
 
+    /// A stuck model re-issues the SAME successful call (observed: the same
+    /// header-reading `sed`/`wc` inspection repeated while it narrated "now I
+    /// understand the structure"). The failure streaks miss it because it succeeds,
+    /// so identical calls are counted separately and cleared when a mutation runs.
+    func testRepeatedIdenticalToolCallGuard() {
+        let harness = AgentHarness.shared
+        harness.beginAgentSearchGuard()
+
+        let command = "wc -l /Users/me/Downloads/survey.csv"
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": command]), 1)
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": command]), 2)
+        // A case/whitespace variant is a DIFFERENT command in a shell, so it must not
+        // count as the same call — three semantic variants would otherwise collate and
+        // force synthesis. Only the exact text repeats, and it keeps accumulating.
+        XCTAssertEqual(
+            harness.recordToolCallFingerprint(
+                toolName: "shell_run",
+                arguments: ["command": "wc  -l   /users/me/downloads/survey.csv"]
+            ),
+            1
+        )
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": command]), 3)
+        XCTAssertEqual(harness.maxRepeatedToolCallCount, 3)
+        XCTAssertGreaterThanOrEqual(harness.repeatedToolCallLimit, 3)
+        XCTAssertGreaterThanOrEqual(harness.maxRepeatedToolCallCount, harness.repeatedToolCallLimit)
+
+        // A different call does not inflate the identical-call count.
+        _ = harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": "ls"])
+        XCTAssertEqual(harness.maxRepeatedToolCallCount, 3)
+
+        // A state-mutating tool clears the counts: a re-read after an edit is legit.
+        _ = harness.recordToolCallFingerprint(toolName: "file_edit", arguments: ["path": "survey.csv"])
+        XCTAssertEqual(harness.maxRepeatedToolCallCount, 0)
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": command]), 1)
+    }
+
+    /// A shell command can rewrite what the model read, so a read repeated after one
+    /// must not be treated as the same observation; the pre-mutation count would
+    /// otherwise escalate on the first legitimate post-mutation read. But an identical
+    /// (or alternating) SHELL loop must still accumulate, or the guard could never
+    /// fire on the pattern it exists for.
+    func testRepeatedToolCallGuardInvalidatesReadsAfterShellButNotShellLoops() {
+        let harness = AgentHarness.shared
+
+        // read → read → shell mutation → read: the third read is a fresh observation.
+        harness.beginAgentSearchGuard()
+        let read = ["path": "survey.csv"]
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "file_read", arguments: read), 1)
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "file_read", arguments: read), 2)
+        _ = harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": "python3 gen.py"])
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "file_read", arguments: read), 1)
+
+        // An alternating shell loop keeps accumulating even though each command is new.
+        harness.beginAgentSearchGuard()
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": "ls"]), 1)
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": "cat a.txt"]), 1)
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": "ls"]), 2)
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": "cat a.txt"]), 2)
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": "ls"]), 3)
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": "cat a.txt"]), 3)
+        XCTAssertEqual(harness.maxRepeatedToolCallCount, 3)
+    }
+
     /// A path that does not exist should come back with the real sibling names, so
     /// the model can copy the exact name instead of mangling it again (observed:
     /// the model drops the date suffix, then invents "/Users/derek Harris").
@@ -6857,8 +7075,56 @@ final class DynaMoETests: XCTestCase {
         XCTAssertTrue(hint.contains(real.lastPathComponent), "hint must name the real file, got: \(hint)")
         XCTAssertTrue(hint.contains("does not exist"))
 
+        // A typo in a DIRECTORY component: the file's parent does not exist either,
+        // so the hint must walk up to the nearest existing ancestor and name the real
+        // sibling directory (observed live: "/Users/derepdarrs/…", where the old
+        // "parent exists" precondition skipped the hint and the model got no help).
+        let parent = dir.deletingLastPathComponent()
+        let realDir = parent.appendingPathComponent("DynaMoE-sample-dir")
+        try? fm.createDirectory(at: realDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: realDir) }
+        let mangledDir = parent.appendingPathComponent("DynaMoE-sample-dirX")
+            .appendingPathComponent("survey.csv").path
+        let dirHint = AgentHarness.missingPathRepairHint(
+            command: "head -20 \(mangledDir)",
+            stderr: "head: \(mangledDir): No such file or directory",
+            stdout: ""
+        )
+        XCTAssertTrue(dirHint.contains(realDir.lastPathComponent), "hint must name the real directory, got: \(dirHint)")
+        XCTAssertTrue(dirHint.contains("does not exist"))
+
         // No missing-file signal means no hint.
         XCTAssertEqual(AgentHarness.missingPathRepairHint(command: "ls /Users", stderr: "", stdout: ""), "")
+    }
+
+    /// Observed live: the model dropped a directory component, naming
+    /// `/Users/…/survey.csv` for `/Users/…/Downloads/survey.csv`. The parent exists
+    /// and no sibling shares a prefix with the file name, so the directory-repair
+    /// pass found nothing and the model got no correction. The hint must instead
+    /// echo the path the user actually named in the prompt.
+    func testMissingPathRepairHintEchoesUserPathWhenDirectoryDropped() {
+        let fm = FileManager.default
+        let base = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library/Caches/DynaMoE-pathhint-\(UUID().uuidString)")
+        let downloads = base.appendingPathComponent("Downloads")
+        try? fm.createDirectory(at: downloads, withIntermediateDirectories: true)
+        let real = downloads.appendingPathComponent("survey.csv")
+        _ = fm.createFile(atPath: real.path, contents: Data("x".utf8))
+        defer { try? fm.removeItem(at: base) }
+
+        // Same parent, missing the Downloads/ component.
+        let mangled = base.appendingPathComponent("survey.csv").path
+        let priorPrompt = AgentHarness.shared.lastPromptText
+        defer { AgentHarness.shared.lastPromptText = priorPrompt }
+        AgentHarness.shared.lastPromptText = "analyze the survey at \(real.path) then report"
+
+        let hint = AgentHarness.missingPathRepairHint(
+            command: "head -n1 '\(mangled)'",
+            stderr: "head: \(mangled): No such file or directory",
+            stdout: ""
+        )
+        XCTAssertTrue(hint.contains(real.path), "hint must echo the user's real path, got: \(hint)")
+        XCTAssertTrue(hint.contains("EXACT"))
     }
 
     /// Pure-logic coverage for the uncalled-action nudge. A false positive here
@@ -6972,6 +7238,76 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(split.skipNotices.keys.sorted(), [1])
     }
 
+    /// A shell run that exits 0 but whose stderr names a failed element still reads as
+    /// "success", so a model thrashing on a mangled path never trips the failure-loop
+    /// guard and burns its whole step budget. The observed spiral produced
+    /// `zsh:cd:1: too many arguments`, `cd: /Users/derek: No such file or directory`,
+    /// and `head: -: No such file or directory` — all on exit status 0.
+    func testShellRunSoftFailureDetection() {
+        XCTAssertTrue(AgentHarness.shellRunSoftFailure(
+            stderr: "zsh:cd:1: too many arguments"))
+        XCTAssertTrue(AgentHarness.shellRunSoftFailure(
+            stderr: "cd: /Users/derek: No such file or directory"))
+        XCTAssertTrue(AgentHarness.shellRunSoftFailure(
+            stderr: "head: -: No such file or directory\nhead: 30: No such file or directory"))
+        XCTAssertTrue(AgentHarness.shellRunSoftFailure(
+            stderr: "zsh: command not found: pythn"))
+
+        // Benign stderr chatter must not count, or ordinary warnings would trip the guard.
+        XCTAssertFalse(AgentHarness.shellRunSoftFailure(stderr: ""))
+        XCTAssertFalse(AgentHarness.shellRunSoftFailure(stderr: "   \n  "))
+        XCTAssertFalse(AgentHarness.shellRunSoftFailure(
+            stderr: "warning: no such file or directory in manifest"))
+        XCTAssertFalse(AgentHarness.shellRunSoftFailure(
+            stderr: "==> Downloading https://example.com/pkg"))
+        XCTAssertFalse(AgentHarness.shellRunSoftFailure(
+            stderr: "no such file or directory"))
+    }
+
+    /// Given an absolute path in the prompt, a model that drops to a bare relative
+    /// filename under a different working directory must be steered back to the exact
+    /// path the user named instead of guessing. Observed: `open('survey.csv')`
+    /// succeeded only because the process cwd happened to contain the file.
+    func testMissingPathRepairHintResolvesRelativeName() {
+        let probe = "dynamoe_hint_probe_4821.csv"
+        let absolute = "/Users/example/Downloads/\(probe)"
+        let priorPrompt = AgentHarness.shared.lastPromptText
+        defer { AgentHarness.shared.lastPromptText = priorPrompt }
+
+        AgentHarness.shared.lastPromptText = "analyze the survey at \(absolute) and report"
+        let hint = AgentHarness.missingPathRepairHint(
+            command: "python3 -c \"open('\(probe)')\"",
+            stderr: "FileNotFoundError: [Errno 2] No such file or directory: '\(probe)'",
+            stdout: ""
+        )
+        XCTAssertTrue(hint.contains(absolute), "hint should echo the user's absolute path")
+        XCTAssertTrue(hint.contains("EXACT"))
+
+        // A non-path token (a module name with no dot) must not produce a hint.
+        let noHint = AgentHarness.missingPathRepairHint(
+            command: "python3 -c \"import csv\"",
+            stderr: "No such file or directory",
+            stdout: ""
+        )
+        XCTAssertFalse(noHint.contains(absolute))
+    }
+
+    /// A failed `cd` (`zsh:cd:1: too many arguments` for a mangled path) carries no
+    /// missing-path phrase, so the repair hint used to bail and the model guessed on.
+    /// The hint must now fire and name the real sibling directory.
+    func testMissingPathRepairHintHandlesFailedCd() {
+        let home = "/Users/\(NSUserName())"
+        let hint = AgentHarness.missingPathRepairHint(
+            command: "cd \(home)/DownloadsQ desc; echo hi",
+            stderr: "zsh:cd:1: too many arguments",
+            stdout: ""
+        )
+        XCTAssertTrue(hint.contains("Hint:"), "a failed cd must produce a repair hint")
+        XCTAssertTrue(hint.contains(home))
+        XCTAssertTrue(hint.lowercased().contains("downloads"), "should name the real sibling directory")
+    }
+
+
     /// The pre-execution freeze cuts generation at `</function>`, so the model's
     /// own tool calls are committed to context without a `</tool_call>` closer
     /// (7 of 9 calls in one observed run). That history teaches the model invalid
@@ -7039,6 +7375,158 @@ final class DynaMoETests: XCTestCase {
             "curl -s https://fortune.com/2025/10/106932.html",
             "the live parser must descend into a re-opened parameter tag"
         )
+
+        // Observed in a later dump: the parameter closer split across lines
+        // (`</parameter=` newline `>`). The tolerant regex fell through to its
+        // end-of-input alternative and swallowed the fragment into the command, so
+        // zsh failed with "parse error near '>'" on every step and the model
+        // spiralled. The split closer must be normalized before parsing.
+        let splitCloser = TC_OPEN + "\n" + FN_OPEN + "shell_run>\n"
+            + P_OPEN + "command>\n"
+            + "brew list --formula | grep -i python; which python3 | cat\n"
+            + "</parameter=\n  >\n"
+            + FN_CLOSE + TC_CLOSE
+        let splitLive = StreamingToolParser.shared.parseStreamingToolCalls(from: splitCloser)
+        XCTAssertEqual(splitLive.calls.count, 1)
+        XCTAssertEqual(splitLive.calls.first?.name, "shell_run")
+        XCTAssertEqual(
+            splitLive.calls.first?.arguments["command"] as? String,
+            "brew list --formula | grep -i python; which python3 | cat",
+            "a line-split parameter closer must not leak into the command value"
+        )
+        // The split closer previously hid the structural </tool_call> from the value
+        // scanner, so a closed call was miscounted and got a duplicate closer.
+        XCTAssertEqual(StreamingToolParser.unclosedToolCallCount(splitCloser), 0)
+        XCTAssertEqual(
+            StreamingToolParser.repairSplitParameterClosers("</parameter=\n  >"),
+            "</parameter>"
+        )
+        // A well-formed closer and an unrelated `</parameter=foo>` are untouched.
+        XCTAssertEqual(StreamingToolParser.repairSplitParameterClosers("</parameter>"), "</parameter>")
+        XCTAssertEqual(StreamingToolParser.repairSplitParameterClosers("</parameter=foo>"), "</parameter=foo>")
+    }
+
+    /// A turn cut before its closers (pre-execution freeze or max-token cap) must be
+    /// committed with the missing inner tags restored, so the model never reads back
+    /// a `<parameter>` that never closed. Observed live: a turn ended with
+    /// `<parameter=command>…PYEOF` and no `</parameter></function>`, the malformed
+    /// example stayed in context, and the run spiralled.
+    func testStructuralClosureTagsRepairTruncatedTurns() {
+        let TC_OPEN = "<tool_call>"
+        let TC_CLOSE = "</tool_call>"
+        let FN_OPEN = "<function="
+        let FN_CLOSE = "</function>"
+        let P_OPEN = "<parameter="
+        let P_CLOSE = "</parameter>"
+
+        // Unterminated value with no closers: all three restored, innermost first.
+        let truncated = TC_OPEN + "\n" + FN_OPEN + "shell_run>\n"
+            + P_OPEN + "command>\npython3 << 'PYEOF'\nprint(1)\nPYEOF"
+        XCTAssertEqual(
+            StreamingToolParser.structuralClosureTags(forRawDecodedTurn: truncated),
+            [P_CLOSE, FN_CLOSE, TC_CLOSE]
+        )
+
+        // Frozen at `</function>` (the common pre-execution freeze): only the block closer.
+        let frozen = TC_OPEN + "\n" + FN_OPEN + "shell_run>\n"
+            + P_OPEN + "command>\nls\n" + P_CLOSE + "\n" + FN_CLOSE
+        XCTAssertEqual(
+            StreamingToolParser.structuralClosureTags(forRawDecodedTurn: frozen),
+            [TC_CLOSE]
+        )
+
+        // A fully closed call needs nothing.
+        let closed = TC_OPEN + "\n" + FN_OPEN + "shell_run>\n"
+            + P_OPEN + "command>\nls\n" + P_CLOSE + "\n" + FN_CLOSE + "\n" + TC_CLOSE
+        XCTAssertEqual(StreamingToolParser.structuralClosureTags(forRawDecodedTurn: closed), [])
+
+        // Ling's native <arg_value> dialect: unterminated value inside an open call.
+        let ling = TC_OPEN + "shell_run\n<arg_key>command</arg_key>\n<arg_value>ls"
+        XCTAssertEqual(
+            StreamingToolParser.structuralClosureTags(forRawDecodedTurn: ling),
+            ["</arg_value>", TC_CLOSE]
+        )
+
+        // A closer emitted out of order (tool_call closed while the value never was)
+        // abandons its inner tags instead of producing `</tool_call></parameter>`.
+        let outOfOrder = TC_OPEN + "\n" + FN_OPEN + "shell_run>\n"
+            + P_OPEN + "command>\nls\n" + TC_CLOSE
+        XCTAssertEqual(StreamingToolParser.structuralClosureTags(forRawDecodedTurn: outOfOrder), [])
+
+        // A LITERAL `</function>` inside a value (a command echoing markup, a file body
+        // with XML) is data, not the end of the call. When the value's own closer still
+        // follows, the scanner must not discard the open parameter/function, or the
+        // truncated turn commits without its closers.
+        let literalCloser = TC_OPEN + "\n" + FN_OPEN + "shell_run>\n"
+            + P_OPEN + "command>\nprintf '%s' '</function>'\n" + P_CLOSE + "\n"
+            + P_OPEN + "cwd>\n/tmp"
+        XCTAssertEqual(
+            StreamingToolParser.structuralClosureTags(forRawDecodedTurn: literalCloser),
+            [P_CLOSE, FN_CLOSE, TC_CLOSE]
+        )
+    }
+
+    /// A shell heredoc the model over-ran (the terminator repeated after the script
+    /// finished) must be trimmed to the intended script, so the shell does not run the
+    /// extra terminators as failing commands and flip a good run into exit 127.
+    func testHeredocOverrunTruncation() {
+        let overrun = "python3 << 'PYEOF'\nimport csv\nprint(1)\nPYEOF\nPYEOF\nPYEOF"
+        XCTAssertEqual(
+            StreamingToolParser.truncateHeredocOverrun(overrun),
+            "python3 << 'PYEOF'\nimport csv\nprint(1)\nPYEOF"
+        )
+
+        // A real command legitimately has live lines after the heredoc: untouched.
+        let legit = "python3 <<'EOF'\nprint(1)\nEOF\necho done"
+        XCTAssertEqual(StreamingToolParser.truncateHeredocOverrun(legit), legit)
+
+        // Tab-stripping heredoc (`<<-`) and no-heredoc command are both left alone.
+        let tabbed = "cat <<-EOF\n\tbody\nEOF\nEOF"
+        XCTAssertEqual(StreamingToolParser.truncateHeredocOverrun(tabbed), "cat <<-EOF\n\tbody\nEOF")
+        let plain = "ls -la /tmp && wc -l /tmp/x"
+        XCTAssertEqual(StreamingToolParser.truncateHeredocOverrun(plain), plain)
+
+        // Turn-level: the `command` value is trimmed; other parameters are untouched.
+        let turn = "<tool_call>\n<function=shell_run>\n<parameter=command>\n"
+            + overrun
+            + "\n</parameter>\n<parameter=cwd>\n/tmp\n</parameter>\n</function></tool_call>"
+        let cleaned = StreamingToolParser.truncateHeredocOverruns(inTurnText: turn)
+        XCTAssertTrue(cleaned.contains("print(1)\nPYEOF</parameter>"))
+        XCTAssertFalse(cleaned.contains("PYEOF\nPYEOF"))
+        XCTAssertTrue(cleaned.contains("<parameter=cwd>\n/tmp\n</parameter>"))
+
+        // A non-command parameter carrying heredoc-like text is never touched.
+        let fileWrite = "<parameter=content>\ndoc <<EOF\ntext\nEOF\nEOF\n</parameter>"
+        XCTAssertEqual(StreamingToolParser.truncateHeredocOverruns(inTurnText: fileWrite), fileWrite)
+    }
+
+    /// The degenerate-cycle guard must catch a repeat that starts partway through the
+    /// recent history (a fixed whole-window check missed the heredoc-sentinel spam),
+    /// while never firing on formatting runs like blank lines or closing braces.
+    func testDegenerateCycleDetection() {
+        // Period-3 sentinel cycle after a varied prefix: caught.
+        let prefix: [UInt32] = [100, 101, 102, 103, 104, 105, 106, 107, 108, 109]
+        let cycle: [UInt32] = [10, 11, 12]
+        let spam: [UInt32] = prefix + Array(repeating: cycle, count: 13).flatMap { $0 }
+        let sentinelDecode: ([UInt32]) -> String = { ids in
+            ids.map { $0 == 10 ? "PY" : ($0 == 11 ? "EOF" : "\n") }.joined()
+        }
+        XCTAssertEqual(ContentView.detectDegenerateCycle(tokenIds: spam, decodeUnit: sentinelDecode), 3)
+
+        // A long run of `}\n` is legitimate formatting: the unit has no letter/digit.
+        let braces: [UInt32] = Array(repeating: [UInt32(20), UInt32(21)] as [UInt32], count: 40).flatMap { $0 }
+        let braceDecode: ([UInt32]) -> String = { ids in ids.map { $0 == 20 ? "}" : "\n" }.joined() }
+        XCTAssertNil(ContentView.detectDegenerateCycle(tokenIds: braces, decodeUnit: braceDecode))
+
+        // A short alphanumeric repeat is legitimate output, not degeneration: an
+        // alternating data column (`yes`, `no`) four times must not truncate the turn.
+        let shortAlternating: [UInt32] = Array(repeating: [UInt32(30), UInt32(31)] as [UInt32], count: 4).flatMap { $0 }
+        let yesNoDecode: ([UInt32]) -> String = { ids in ids.map { $0 == 30 ? "yes" : "no" }.joined(separator: " ") }
+        XCTAssertNil(ContentView.detectDegenerateCycle(tokenIds: shortAlternating, decodeUnit: yesNoDecode))
+
+        // Diverse output never trips.
+        let diverse: [UInt32] = (0..<80).map { UInt32($0) }
+        XCTAssertNil(ContentView.detectDegenerateCycle(tokenIds: diverse, decodeUnit: { _ in "word" }))
     }
 
     /// When reads keep failing the model invents hosts instead of reusing the ones
@@ -8984,6 +9472,27 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         XCTAssertTrue(splitThought.thinkClose)
         XCTAssertEqual(splitThought.think, "Some internal thought.")
         XCTAssertEqual(splitThought.resp, "Final output.")
+
+        // Scenario 7: reasoning that merely mentions the word "response" must not be
+        // split mid-stream (observed live: "1. Overall stats subagent: response
+        // counts, NPS…" cut the accordion until the real closing tag arrived).
+        let proseRaw = """
+        Let me plan the subagent work.
+        1. Overall stats subagent: response counts, NPS, coach ratings average
+        2. Text feedback subagent: group by sentiment
+        """
+        let splitProse = ContentView.splitThinkingAndResponse(raw: proseRaw, promptRequestsThinking: true)
+        XCTAssertTrue(splitProse.thinkOpen, "prose 'response' must not close the thinking block")
+        XCTAssertFalse(splitProse.thinkClose)
+        XCTAssertEqual(splitProse.resp, "")
+
+        // The real delimiter still splits, and all the reasoning (including the word
+        // "response") lands in `think`.
+        let proseThenClose = proseRaw + "\n</think>\nHere is the report."
+        let splitProseClose = ContentView.splitThinkingAndResponse(raw: proseThenClose, promptRequestsThinking: true)
+        XCTAssertTrue(splitProseClose.thinkClose)
+        XCTAssertTrue(splitProseClose.think.contains("response counts"))
+        XCTAssertEqual(splitProseClose.resp, "Here is the report.")
     }
 
     func testSparkForwardDiagnostics() throws {

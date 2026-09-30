@@ -55,6 +55,13 @@ public final class StreamingToolParser {
     /// `</tool_call>` and persisted an unmatched closer into the next prompt,
     /// the history corruption this suffix exists to prevent.
     public static func unclosedToolCallCount(_ text: String) -> Int {
+        // A parameter whose closer was split across lines (`</parameter=\n>`) never
+        // matches the literal `</parameter>` terminator below, so the value scan
+        // runs to the end of the turn and the structural `</tool_call>` closers
+        // hiding inside it are never counted — every call then looks unclosed and
+        // the caller appends a duplicate closer. Normalize the closer first so the
+        // scanner can return to structure.
+        let text = repairSplitParameterClosers(text)
         var depth = 0
         var valueTerminator: String? = nil
         var index = text.startIndex
@@ -99,14 +106,118 @@ public final class StreamingToolParser {
         return depth
     }
 
+    /// The closing tags a raw (frozen or truncated) turn is missing, innermost
+    /// first, so a committed turn always reads back as a structurally valid example.
+    ///
+    /// The pre-execution freeze and the max-token cap both routinely cut a call
+    /// before its closers. `unclosedToolCallCount` only sees block depth, so it
+    /// appends a bare `</tool_call>` and leaves the inner tags dangling — observed
+    /// live: the model opened `<parameter=command>`, ended the turn with no
+    /// `</parameter></function>`, and the committed example was a parameter tag that
+    /// never closed, which the next steps imitated. This scanner tracks the open
+    /// parameter/function/tool-call tags (skipping parameter values, which are data)
+    /// and returns exactly the closers needed, in order.
+    public static func structuralClosureTags(forRawDecodedTurn text: String) -> [String] {
+        let text = repairSplitParameterClosers(text)
+        // Expected closers, outermost first.
+        var stack: [String] = []
+        var valueTerminator: String? = nil
+        var index = text.startIndex
+        while index < text.endIndex {
+            let remaining = text[index...]
+            if let terminator = valueTerminator {
+                if remaining.hasPrefix(terminator) {
+                    popFrom(&stack, tag: terminator)
+                    valueTerminator = nil
+                    index = text.index(index, offsetBy: terminator.count)
+                } else if remaining.hasPrefix(qwenFunctionClose) || remaining.hasPrefix(qwenToolCallClose) {
+                    // A closer here is usually the real end of the call: the value was
+                    // cut before its own terminator and the closer must be handled as
+                    // structure. But a value can legitimately CONTAIN a literal closer
+                    // (a command echoing markup, a file body with XML), and treating
+                    // that as structure silently drops the parameter/function closers
+                    // from the committed turn. If the value's own terminator still
+                    // appears before any further structural closer, this is value text;
+                    // otherwise it is the real closer.
+                    if valueCloseOccursBeforeNextStructuralCloser(in: text, from: index, terminator: terminator) {
+                        index = text.index(after: index)
+                    } else {
+                        valueTerminator = nil
+                    }
+                } else {
+                    index = text.index(after: index)
+                }
+                continue
+            }
+            if remaining.hasPrefix(parameterOpen) {
+                stack.append(parameterClose); valueTerminator = parameterClose
+                index = text.index(index, offsetBy: parameterOpen.count); continue
+            }
+            if remaining.hasPrefix(parameterOpenBare) {
+                stack.append(parameterClose); valueTerminator = parameterClose
+                index = text.index(index, offsetBy: parameterOpenBare.count); continue
+            }
+            if remaining.hasPrefix(argValueOpen) {
+                stack.append(argValueClose); valueTerminator = argValueClose
+                index = text.index(index, offsetBy: argValueOpen.count); continue
+            }
+            if remaining.hasPrefix(qwenFunctionOpen) {
+                stack.append(qwenFunctionClose)
+                index = text.index(index, offsetBy: qwenFunctionOpen.count); continue
+            }
+            if remaining.hasPrefix(qwenFunctionClose) {
+                popFrom(&stack, tag: qwenFunctionClose)
+                index = text.index(index, offsetBy: qwenFunctionClose.count); continue
+            }
+            if remaining.hasPrefix(qwenToolCallOpen) {
+                stack.append(qwenToolCallClose)
+                index = text.index(index, offsetBy: qwenToolCallOpen.count); continue
+            }
+            if remaining.hasPrefix(qwenToolCallClose) {
+                popFrom(&stack, tag: qwenToolCallClose)
+                index = text.index(index, offsetBy: qwenToolCallClose.count); continue
+            }
+            index = text.index(after: index)
+        }
+        // Innermost open tag was pushed last, so its closer must be appended first.
+        return Array(stack.reversed())
+    }
+
+    /// Removes `tag` and everything opened after it: an out-of-order closer abandons
+    /// its inner tags rather than producing a `</tool_call></parameter>` jumble.
+    private static func popFrom(_ stack: inout [String], tag: String) {
+        if let idx = stack.lastIndex(of: tag) {
+            stack.removeSubrange(idx...)
+        }
+    }
+
+    /// True when a value's own close tag (`terminator`) appears in `text` after `index`
+    /// before any further structural closer. Distinguishes a literal closer embedded in
+    /// a parameter value (editing XML, echoing markup) from the real end of the call,
+    /// so the literal one does not silently drop the parameter/function closers.
+    private static func valueCloseOccursBeforeNextStructuralCloser(
+        in text: String,
+        from index: String.Index,
+        terminator: String
+    ) -> Bool {
+        var i = text.index(after: index)
+        while i < text.endIndex {
+            let remaining = text[i...]
+            if remaining.hasPrefix(terminator) { return true }
+            if remaining.hasPrefix(qwenFunctionClose) || remaining.hasPrefix(qwenToolCallClose) { return false }
+            i = text.index(after: i)
+        }
+        return false
+    }
+
     /// The tokens that must be appended after a turn's generated ids so the turn
-    /// the model reads back next time is well-formed: a `</tool_call>` closer when
-    /// the freeze cut the call at `</function>`, then the model's end tag when the
-    /// turn never emitted one.
+    /// the model reads back next time is well-formed: the inner closers the freeze
+    /// or token cap cut (`</parameter>`, `</function>`, `</tool_call>`), then the
+    /// model's end tag when the turn never emitted one.
     ///
     /// MUST be fed the RAW decoded turn text. Feeding an already-normalized string
-    /// makes `hasUnclosedToolCallBlock` read the closer the caller just added and
-    /// skip appending it to the token stream, so the model sees a turn that the
+    /// makes `structuralClosureTags` read the closers the caller just added and
+    /// skip appending them to the token stream, so the model sees a turn that the
     /// string path claims is closed but the token path left open (observed: every
     /// continuation in one run lost both its closer AND its end tag).
     public static func turnClosureSuffix(
@@ -115,10 +226,9 @@ public final class StreamingToolParser {
         encode: (String) throws -> [UInt32]
     ) -> [UInt32]? {
         var ids: [UInt32] = []
-        let unclosed = unclosedToolCallCount(decodedTurn)
-        if unclosed > 0 {
-            guard let closeIds = try? encode(qwenToolCallClose), !closeIds.isEmpty else { return nil }
-            for _ in 0..<unclosed { ids.append(contentsOf: closeIds) }
+        for tag in structuralClosureTags(forRawDecodedTurn: decodedTurn) {
+            guard let closeIds = try? encode(tag), !closeIds.isEmpty else { return nil }
+            ids.append(contentsOf: closeIds)
         }
         if !decodedTurn.contains(endTag) {
             guard let endIds = try? encode(endTag), !endIds.isEmpty else { return nil }
@@ -271,6 +381,272 @@ public final class StreamingToolParser {
         return out
     }
 
+    /// The model sometimes opens a parameter with a pipe separator and an
+    /// attribute-style quote instead of the canonical `=`, and nests it inside the
+    /// real opener:
+    ///
+    ///     <parameter=command>
+    ///     <parameter|command="sed -n '2p' file.csv"; echo done
+    ///     </parameter>
+    ///
+    /// Observed live: emitted right after a run of failing steps, then zsh read the
+    /// first line as a stdin redirect from a file named `parameter`
+    /// ("zsh:1: no such file or directory: parameter"). The model took that for the
+    /// environment mangling its commands and spiralled, while the broken shape got
+    /// committed verbatim to its own history as the next example to imitate.
+    /// Rewrite the opener to the canonical nested form so `unwrapNestedParameterTag`
+    /// descends into the real value and the committed turn reads back as valid
+    /// markup. The trailing quote the model may or may not add is consumed when
+    /// present, and nothing else is touched.
+    public static func repairMalformedParameterOpeners(_ text: String) -> String {
+        guard text.contains("<parameter|") else { return text }
+        var result = text
+        // Attribute-quoted form: <parameter|key="value" — the model opens a quote
+        // after the `=` and (usually) closes it early, then keeps writing the rest
+        // of the command outside it. Pair and drop both quotes so the value reads
+        // as one command instead of leaving an unbalanced `"`.
+        if let pairRe = try? NSRegularExpression(
+            pattern: "<parameter\\|([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*\"([^\"]*)\"",
+            options: []
+        ) {
+            let ns = result as NSString
+            result = pairRe.stringByReplacingMatches(
+                in: result,
+                options: [],
+                range: NSRange(location: 0, length: ns.length),
+                withTemplate: "<parameter=$1>$2"
+            )
+        }
+        // Bare forms: <parameter|key>, <parameter|key=value, <parameter|key="value
+        // with no closing quote. Consume the separator (and any opening quote) only.
+        guard let re = try? NSRegularExpression(
+            pattern: "<parameter\\|([A-Za-z_][A-Za-z0-9_]*)\\s*(?:=\\s*\"?|>)",
+            options: []
+        ) else { return result }
+        let ns = result as NSString
+        return re.stringByReplacingMatches(
+            in: result,
+            options: [],
+            range: NSRange(location: 0, length: ns.length),
+            withTemplate: "<parameter=$1>"
+        )
+    }
+
+    /// A parameter opener the model duplicated inside its own value:
+    /// `<parameter=command>` immediately followed by a second `<parameter=command>`.
+    /// `repairMalformedParameterOpeners` canonicalizes the pipe dialect
+    /// (`<parameter|command="…`) into exactly this shape, and the model also emits the
+    /// plain duplicate directly. The real payload is the inner one, so the outer
+    /// duplicate is dropped; otherwise the committed turn carries two openers and a
+    /// single `</parameter>`, and `structuralClosureTags` will not balance it (tags
+    /// inside a value are data), teaching the model a malformed example to imitate.
+    /// Collapsing them at text level is equivalent to what `unwrapNestedParameterTag`
+    /// already does for the value, just earlier so the markup stays well-formed too.
+    public static func collapseRedundantNestedParameterOpeners(_ text: String) -> String {
+        guard text.contains("<parameter=") else { return text }
+        guard let re = try? NSRegularExpression(
+            pattern: "(<parameter=([A-Za-z_][A-Za-z0-9_]*)>)[ \\t\\r\\n]*(<parameter=\\2>)",
+            options: []
+        ) else { return text }
+        var current = text
+        // Left-to-right replacement is non-overlapping, so a triple needs a repeat pass.
+        for _ in 0..<4 {
+            let ns = current as NSString
+            let replaced = re.stringByReplacingMatches(
+                in: current,
+                options: [],
+                range: NSRange(location: 0, length: ns.length),
+                withTemplate: "$1"
+            )
+            if replaced == current { break }
+            current = replaced
+        }
+        return current
+    }
+
+    /// The model occasionally splits the parameter close tag across lines —
+    /// `</parameter` then `=` and/or whitespace, then `>` — because the grammar
+    /// constrains call structure but not the byte-precise closer. Left alone the
+    /// tolerant `<parameter=([^>]+)>([\s\S]*?)(?:</parameter>|$)` regex falls through
+    /// to its end-of-input alternative and swallows the broken closer into the
+    /// VALUE, so `shell_run` executes a command whose last line is a bare `>` and
+    /// zsh dies with "parse error near '>'"; the model reads that as a command
+    /// error, retries, and spirals. Rewrite the malformed closer back to canonical
+    /// so the value ends where the model meant it to. Only whitespace may separate
+    /// the `=` from the `>`, so a legitimate `</parameter=foo>` is left untouched.
+    ///
+    /// Also normalizes the pipe-separated opener dialect (see
+    /// `repairMalformedParameterOpeners`) so every caller that repairs parameter
+    /// markup gets both directions. Runs before the closer guard so a turn frozen
+    /// mid-value still gets its opener fixed even when no `</parameter>` exists yet.
+    public static func repairSplitParameterClosers(_ text: String) -> String {
+        let repaired = collapseRedundantNestedParameterOpeners(repairMalformedParameterOpeners(text))
+        guard repaired.contains("</parameter") else { return repaired }
+        guard let re = try? NSRegularExpression(pattern: "</parameter\\s*=?\\s*>", options: []) else { return repaired }
+        let ns = repaired as NSString
+        return re.stringByReplacingMatches(
+            in: repaired,
+            options: [],
+            range: NSRange(location: 0, length: ns.length),
+            withTemplate: parameterClose
+        )
+    }
+
+    /// Trims a shell heredoc the model over-ran. Observed live: after the intended
+    /// terminator line (`PYEOF`) the model kept emitting the same delimiter a dozen
+    /// more times, so zsh ran twelve failing `PYEOF` commands after the script
+    /// succeeded, flipping a working command into `exit_code: 127` and feeding the
+    /// loop a confusing error. Cut the value at the FIRST terminator when everything
+    /// after it is only more copies of that terminator (or blank). A real command
+    /// legitimately has live lines after a heredoc (`EOF` then `echo done`), so those
+    /// are left untouched.
+    public static func truncateHeredocOverrun(_ value: String) -> String {
+        let lines = value.components(separatedBy: "\n")
+        guard let opener = firstHeredocOpener(in: lines) else { return value }
+        var index = opener.index + 1
+        var terminator: Int? = nil
+        while index < lines.count {
+            let candidate = opener.stripsTabs ? String(lines[index].drop(while: { $0 == "\t" })) : lines[index]
+            if candidate == opener.delimiter { terminator = index; break }
+            index += 1
+        }
+        guard let term = terminator else { return value }
+        let trailing = lines[(term + 1)...]
+        guard !trailing.isEmpty else { return value }
+        let allDuplicates = trailing.allSatisfy { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            return trimmed.isEmpty || trimmed == opener.delimiter
+        }
+        guard allDuplicates else { return value }
+        return lines[0...term].joined(separator: "\n")
+    }
+
+    /// First heredoc opener in a value: `<<EOF`, `<<-EOF` (tab-stripping), `<<'EOF'`,
+    /// `<<"EOF"`, or `<<\EOF`. Returns its line index, delimiter, and tab-strip flag.
+    private static func firstHeredocOpener(in lines: [String]) -> (index: Int, delimiter: String, stripsTabs: Bool)? {
+        guard let re = try? NSRegularExpression(
+            pattern: "<<(-?)\\s*(?:'([^']+)'|\"([^\"]+)\"|\\\\([A-Za-z_][A-Za-z0-9_]*)|([A-Za-z_][A-Za-z0-9_]*))",
+            options: []
+        ) else { return nil }
+        for (i, line) in lines.enumerated() {
+            let ns = line as NSString
+            guard let m = re.firstMatch(in: line, options: [], range: NSRange(location: 0, length: ns.length)),
+                  m.numberOfRanges >= 6 else { continue }
+            for group in 2...5 where m.range(at: group).location != NSNotFound {
+                let delimiter = ns.substring(with: m.range(at: group))
+                if !delimiter.isEmpty {
+                    return (i, delimiter, ns.substring(with: m.range(at: 1)) == "-")
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Applies `truncateHeredocOverrun` to every `command` parameter value in a turn,
+    /// so the committed example matches the command that actually ran. Restricted to
+    /// the `command` key so a `file_write` body containing heredoc-like text is never
+    /// touched.
+    public static func truncateHeredocOverruns(inTurnText text: String) -> String {
+        guard text.contains("<<") else { return text }
+        guard let re = try? NSRegularExpression(pattern: "<parameter=([A-Za-z_][A-Za-z0-9_]*)>([\\s\\S]*?)</parameter>", options: []) else { return text }
+        var result = text
+        let ns = result as NSString
+        let matches = re.matches(in: result, options: [], range: NSRange(location: 0, length: ns.length))
+        for m in matches.reversed() {
+            guard m.numberOfRanges >= 3 else { continue }
+            guard ns.substring(with: m.range(at: 1)) == "command" else { continue }
+            let value = ns.substring(with: m.range(at: 2))
+            let truncated = truncateHeredocOverrun(value)
+            guard truncated != value else { continue }
+            result = (result as NSString).replacingCharacters(in: m.range(at: 2), with: truncated)
+        }
+        return result
+    }
+
+    /// Identical characters in a row that mark a collapse. Set well above any real
+    /// banner/separator rule so a `####…` comment line is never mistaken for one.
+    static let degenerateCharacterRun = 200
+    /// A short motif copied for this many characters without interruption is a
+    /// collapse. Real script text has no exact repeat this long.
+    static let degenerateRepeatSpan = 160
+    /// Longest motif period considered a repeat; genuine text repeats shorter
+    /// fragments, never a 25+ character block verbatim.
+    static let degenerateMaxPeriod = 24
+
+    /// Detects the repetition collapse that ends a degenerating generation: the model
+    /// stops producing new tokens and copies a short motif (`'''"""'''"""…`) until the
+    /// context fills. Observed: a 12,647-character `shell_run` argument made almost
+    /// entirely of `'''"""`, run as an unterminated Python heredoc, whose 22,357-
+    /// character syntax error was then fed straight back as the next tool result — the
+    /// collapse ate the rest of the run. A match means the text is not a command or
+    /// program at all, so callers reject it instead of executing it.
+    ///
+    /// Returns a short description of the repeat when found, else nil.
+    public static func repetitionCollapse(in text: String) -> String? {
+        let chars = Array(text)
+        guard chars.count >= degenerateRepeatSpan else { return nil }
+
+        var runLength = 1
+        var bestRun = 1
+        var bestRunChar = chars[0]
+        for i in 1..<chars.count {
+            if chars[i] == chars[i - 1] {
+                runLength += 1
+                if runLength > bestRun { bestRun = runLength; bestRunChar = chars[i] }
+            } else {
+                runLength = 1
+            }
+        }
+        if bestRun >= degenerateCharacterRun {
+            return "\(bestRun) identical '\(bestRunChar)' characters in a row"
+        }
+
+        // A motif of period p repeated back to back shows up as a long run where
+        // chars[i] == chars[i - p]. Walk every candidate period and keep the longest
+        // uninterrupted match; a real program never matches for this many characters.
+        var bestSpan = 0
+        var bestPeriod = 0
+        var bestEnd = 0
+        for period in 1...degenerateMaxPeriod {
+            var span = 0
+            var i = period
+            while i < chars.count {
+                if chars[i] == chars[i - period] {
+                    span += 1
+                    if span > bestSpan { bestSpan = span; bestPeriod = period; bestEnd = i }
+                } else {
+                    span = 0
+                }
+                i += 1
+            }
+        }
+        guard bestSpan >= degenerateRepeatSpan, bestEnd >= bestPeriod else { return nil }
+        let motif = String(chars[(bestEnd - bestPeriod + 1)...bestEnd])
+        return "a \(bestPeriod)-character motif (\(motif.debugDescription)) copied about \(bestSpan / bestPeriod) times"
+    }
+
+    /// Rewrites a collapsed `command` parameter in a turn to a short placeholder so
+    /// the committed history never carries tens of thousands of repeated characters
+    /// that the model would keep attending to (and imitating). Scoped to `command`
+    /// only: a `file_write` body is real content even when long, and the caller
+    /// re-encodes the whole turn whenever this changes anything.
+    public static func compressDegenerateCommandArguments(inTurnText text: String) -> String {
+        guard text.contains("</parameter>") else { return text }
+        guard let re = try? NSRegularExpression(pattern: "<parameter=([A-Za-z_][A-Za-z0-9_]*)>([\\s\\S]*?)</parameter>", options: []) else { return text }
+        var result = text
+        let ns = result as NSString
+        let matches = re.matches(in: result, options: [], range: NSRange(location: 0, length: ns.length))
+        for m in matches.reversed() {
+            guard m.numberOfRanges >= 3 else { continue }
+            guard ns.substring(with: m.range(at: 1)) == "command" else { continue }
+            let value = ns.substring(with: m.range(at: 2))
+            guard let collapse = repetitionCollapse(in: value) else { continue }
+            let replacement = "[collapsed generation omitted: \(value.count) characters, \(collapse)]"
+            result = (result as NSString).replacingCharacters(in: m.range(at: 2), with: replacement)
+        }
+        return result
+    }
+
     /// The model sometimes opens a parameter tag and then opens it AGAIN inside
     /// the value it is writing:
     ///
@@ -390,7 +766,7 @@ public final class StreamingToolParser {
         //    of the internal <parameter=k>v</parameter> form. Rewrite those into canonical
         //    <parameter=...> blocks so the tolerant parser actually executes the call instead
         //    of silently dropping it (which previously left only prose in the reply).
-        var text = Self.normalizeArgKeyDialect(text)
+        var text = Self.repairSplitParameterClosers(Self.normalizeArgKeyDialect(text))
 
         // 1. Check for Qwen XML with JSON arguments body: <function=name>{"arg": "val"}</function>
         let fnRegex = try? NSRegularExpression(pattern: "<function=([^>]+)>([\\s\\S]*?)</function>", options: [])

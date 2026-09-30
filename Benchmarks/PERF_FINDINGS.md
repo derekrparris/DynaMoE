@@ -2381,3 +2381,68 @@ the gesture synthesis fallback — the run could still end with no user-visible 
 regex now strips every dialect the parser accepts: `<tool_call>…</tool_call>`, the Llama
 `<|python_tag|>…</|python_tag|>` (or unclosed), and a bare `<function=…>…</function>`
 block. Test covers each dialect (and answer+Llama-call still counting as an answer).
+
+### QA #49 — exit-0 shell runs that failed outright still counted as successes, so the loop guard never escalated
+
+The latest dumps (`prompt-step0-…18-51-20Z.txt` through `step5`) show the same
+mangled-path spiral QA #31/#32 named (`/Users/derekparris/Downloads/survey.csv` →
+`/Users/derek Harris Downloads` → `/Users Derek` → `/Path Space`), but the run was
+never stopped. Six `shell_run` calls in a row, none of which inspected the data:
+`head - 30 <path>` (stray space), `cd <mangled>; awk …` (cd failed, awk ran in the old
+cwd), and two `cd <mangled>; python3 …` heredocs with `NameError`s. Every one exited 0,
+so `recordToolCallOutcome(succeeded: execResult.record.status == .success)` saw six
+successes, `consecutiveFailedToolCalls` stayed 0, and the forced-synthesis escalation
+(`escalateToSynthesis`) never fired.
+
+Prompt hygiene was NOT the cause: prefix reuse was full on steps 1-3 and 5 (step4's
+`prefixReused=0/pin=6864` is the intended `contentChanged → re-encode` fallback from
+`buildSplicedContinuationTokens`, not a fault), the tag counts were balanced every step
+(QA #32 holding), and step5's `splice-vs-reencode DIVERGES at 8307` is the known-benign
+case (splice=string=8841; the two decode windows are byte-identical).
+
+The defect was failure classification: `shell_run` returns `stderr: nil` on exit 0
+(deliberately, so benign brew/pip chatter never trips the guard), which also swallowed
+the failed elements. Fix: `AgentHarness.shellRunSoftFailure(stderr:)` — true only when an
+exit-0 stderr line is attributed to a command/builtin (`zsh:cd:1: too many arguments`,
+`head: -: No such file or directory`, `zsh: command not found: …`) and is not a benign
+`warning:`/`note:`/`notice:`/`info:` line. `ShellRunTool` now returns that stderr as the
+soft-failure signal, so the model still reads the success JSON + stderr text (unchanged
+context) while the streak increments and the guard escalates; `succeeded` flips on the
+UI/guard side only. The synthesis directive now also names "a bad path, a missing binary"
+as a cause.
+
+Tests: `testShellRunSoftFailureDetection` (the three observed diagnostics count; empty,
+whitespace, a `warning:` line, a download-progress line, and an unattributed phrase do
+not). Verified: `swiftc -parse` clean, `testShellRunSoftFailureDetection` and
+`testNoOpGestureToolCallDetection` pass.
+
+**Follow-up — the model drops to a bare relative filename.** The next run
+(`prompt-step5-…20-49-03Z.txt`) showed the mirror-image problem: handed
+`/Users/derekparris/Downloads/survey.csv`, the model ran `open('survey.csv')`. That
+worked only because the app's process cwd happened to contain the file
+(`dynamoe_agent_working_directory` was unset, so `shell_run` fell back to
+`FileManager.default.currentDirectoryPath`, `AgentHarness.swift:166`). Under a different
+cwd the relative command is a guaranteed FileNotFound, and `missingPathRepairHint` —
+which only inspects `/Users/…` and `/home/…` tokens — offered no guidance. Two fixes:
+
+1. Prompt rule (both tool-format branches): "For any file the user names, use its EXACT
+   absolute path … Never `cd` into a folder and then reference a bare filename, and never
+   assume the working directory already contains the file."
+2. `missingPathRepairHint` second pass: a bare relative token that (a) carries a dot or an
+   interior slash and (b) does not exist under the cwd is matched by basename against the
+   absolute paths in the new `AgentHarness.lastPromptText` (set from `formattedPrompt` in
+   `startAutoregressiveGeneration`) and echoed back as the exact path to use. Non-path
+   tokens (`csv`, `import`) are skipped because they carry no dot and never match.
+
+Tests: `testMissingPathRepairHintResolvesRelativeName` (echoes the user's absolute path
+for `open('<name>')`; a dotless module token yields no hint). Verified: `swiftc -parse`
+clean, test passes.
+
+Also widened `missingPathRepairHint`'s trigger: a failed `cd` writes
+`zsh:cd:1: too many arguments` (the mangled `/Users/derek Harris Downloads`) with no
+missing-path phrase, so the guard bailed and the hint never ran on the very first
+mangled-path command. A line containing `cd:` plus a cd diagnostic
+(`too many arguments`, `no such file`, `not a directory`, `permission denied`,
+`string not in pwd`, `invalid option`) now counts as a missing-path signal, so the
+absolute-path pass names the real sibling directory. Test:
+`testMissingPathRepairHintHandlesFailedCd`. Verified: passes.

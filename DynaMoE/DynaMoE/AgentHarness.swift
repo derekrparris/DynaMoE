@@ -107,7 +107,9 @@ public extension AgentTool {
 
     /// Estimated prompt tokens consumed when this tool's schema is loaded into context.
     func approximatePromptTokens() -> Int {
-        guard let data = try? JSONEncoder().encode(definition) else { return 0 }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(definition) else { return 0 }
         return max(1, data.count / 4)
     }
 
@@ -148,10 +150,32 @@ public final class ShellRunTool: AgentTool {
     )
 
     public func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
-        guard let command = arguments["command"] as? String, !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        guard let rawCommand = arguments["command"] as? String, !rawCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             let err = "Error: missing or empty 'command' parameter in shell_run"
             return (AgentHarness.toolErrorJSON(tool: "shell_run", error: err), nil, err, false)
         }
+        // A degenerating generation repeats a short motif until it runs out of room
+        // (observed: 12,647 characters of `'''"""`). Running that as an unterminated
+        // heredoc yields a ~22k-character syntax error, which is then fed straight
+        // back as the next tool result and accelerates the collapse. Reject the call
+        // before execution and tell the model to restate it small, so the loop gets a
+        // short corrective turn instead of echoing its own garbage. A genuine long
+        // program belongs in a file written with file_write, never inline here.
+        let maxShellCommandCharacters = 12000
+        if rawCommand.count > maxShellCommandCharacters {
+            let err = "Error: rejected a \(rawCommand.count)-character shell_run command before execution (limit \(maxShellCommandCharacters)). This is a runaway argument, not a shell error. Do NOT resend the same text. Restate the command as a short script (under ~40 lines); if the program is genuinely that large, write it to a file first and run the file."
+            print("🛠 [shell_run] rejected oversized command (\(rawCommand.count) chars)")
+            return (AgentHarness.toolErrorJSON(tool: "shell_run", error: err), nil, err, false)
+        }
+        if let collapse = StreamingToolParser.repetitionCollapse(in: rawCommand) {
+            let err = "Error: rejected the shell_run command before execution as degenerate repetition (\(collapse)). This is a generation collapse, not a shell problem. Do NOT resend the same text. Restate the command as a short script (under ~40 lines), one statement per line, printing only the fields you need."
+            print("🛠 [shell_run] rejected degenerate command (\(collapse))")
+            return (AgentHarness.toolErrorJSON(tool: "shell_run", error: err), nil, err, false)
+        }
+        // A heredoc the model over-ran (`PYEOF` repeated after the terminator) would
+        // otherwise run a dozen failing `PYEOF` commands after the script succeeded,
+        // flipping a good run into exit_code 127. Trim to the intended heredoc first.
+        let command = StreamingToolParser.truncateHeredocOverrun(rawCommand)
 
         let targetDir: URL
         if let customCwd = arguments["cwd"] as? String, !customCwd.isEmpty {
@@ -185,12 +209,38 @@ public final class ShellRunTool: AgentTool {
             ]
             // The marker alone leaves the model trying to "get the full file"
             // again, which is how a large dump turns into a retry loop. Say what
-            // to do instead.
+            // to do instead. Only recommend `file_read` when it is actually loaded:
+            // advising an unloaded tool (the default prompt exposes only shell_run)
+            // sends the model hunting for a capability it cannot call.
             if cleanStdout.contains("<<<TRUNCATED") || cleanStdout.contains("<<<LINE TRUNCATED") {
-                data["note"] = "Output was truncated for the context budget. Do NOT re-run the same command to print it in full. Narrow the command (head/tail/grep/sed for just the fields you need), or have it write a summary to a file and read that with file_read (which pages with start_line)."
+                let readerAdvice = AgentHarness.shared.loadedTools["file_read"] != nil
+                    ? "or have it write a summary to a file and read that with file_read (which pages with start_line)."
+                    : "or load file_read via tools_load and page through the file with it (file_read supports start_line)."
+                data["note"] = "Output was truncated for the context budget. Do NOT re-run the same command to print it in full. Narrow the command (head/tail/grep/sed for just the fields you need), \(readerAdvice)"
+            }
+            // stderr text must reach the model even when the pipeline exited 0: a
+            // failing element inside a pipeline (`head missing | sed | wc`) writes
+            // its error to stderr while the pipeline's status is the LAST command's
+            // (0). Dropping it left the model reading empty stdout as a real result
+            // and re-running the same broken command for the rest of the run.
+            // Surfaced as text for the model either way; only a stderr line that names
+            // an outright-failed element is additionally returned below as a soft
+            // failure, so benign warnings (brew's progress output) never trip the guard.
+            if !cleanStderr.isEmpty {
+                // A masked failure is often a missing path (`head missing | sed | wc`),
+                // so offer the same exact-name repair hint the error path uses; the
+                // model otherwise keeps guessing mangled paths with no feedback.
+                let pathHint = AgentHarness.missingPathRepairHint(command: command, stderr: cleanStderr, stdout: cleanStdout)
+                data["stderr"] = cleanStderr + pathHint
             }
             let res = AgentHarness.toolSuccessJSON(tool: "shell_run", data: data)
-            return (res, cleanStdout, nil, false)
+            // The command exited 0, but stderr may still name an element that failed
+            // outright (`cd` into a mangled path, a binary that does not exist). The
+            // result stays "success" for the model, but flagging it as a soft failure
+            // lets the loop guard escalate instead of burning the whole step budget on
+            // a command that never ran where the model intended.
+            let softFailure = AgentHarness.shellRunSoftFailure(stderr: cleanStderr)
+            return (res, cleanStdout, softFailure ? cleanStderr : nil, false)
         } else {
             print("🛠 [shell_run] exit=\(exitCode) cmd='\(String(command.prefix(100)))' stderr='\(String(cleanStderr.prefix(160)))' stdout='\(String(cleanStdout.prefix(80)))'")
             // A quoting/syntax failure is almost always a hand-written curl+
@@ -1832,7 +1882,9 @@ public final class ToolLoadTool: AgentTool {
             }
             do {
                 let definition = try harness.loadTool(named: name)
-                let schemaData = try? JSONEncoder().encode(definition)
+                let schemaEncoder = JSONEncoder()
+                schemaEncoder.outputFormatting = [.sortedKeys]
+                let schemaData = try? schemaEncoder.encode(definition)
                 schemas[name] = schemaData.flatMap { String(data: $0, encoding: .utf8) } ?? ""
                 loadedResults.append([
                     "tool_name": name,
@@ -2713,6 +2765,11 @@ public final class AgentHarness {
     /// Subset of `tools` currently exposed to the model in the prompt and grammar.
     public private(set) var loadedTools: [String: AgentTool] = [:]
     public var defaultWorkingDirectory: URL? = nil
+    /// The exact prompt text the model is currently attending over (system + full
+    /// conversation). Tools that must offer a path-repair hint read the absolute
+    /// paths the user named from here, since a tool result is the only place the
+    /// model gets told which path it should have used.
+    public var lastPromptText: String = ""
     /// Token budget for a single tool result (converted to characters conservatively
     /// via `charBudget(forTokenBudget:)` before tools truncate their output).
     public var maxToolOutputLength: Int = 4000
@@ -2768,6 +2825,8 @@ public final class AgentHarness {
         consecutiveFailedToolCalls = 0
         lastFailedToolName = nil
         totalFailedToolCalls = 0
+        repeatedToolCallCounts.removeAll()
+        maxRepeatedToolCallCount = 0
         recentSearchResultURLs.removeAll()
         consecutiveWebFetchFailures = 0
         if tools["web_search"] != nil && loadedTools["web_search"] == nil {
@@ -2963,6 +3022,79 @@ public final class AgentHarness {
         }
     }
 
+    // MARK: - Redundant Tool Call Guard
+    // A model that has stopped making progress re-issues the SAME call it already
+    // ran (observed: the same header-reading `sed`/`wc` inspection repeated while
+    // the model narrated "now I understand the structure" each time). The failure
+    // streaks above miss it because those calls SUCCEED. This counts identical
+    // calls (tool + normalized arguments) and lets the run escalate once one has
+    // repeated past the limit. Counts are cleared whenever a state-mutating tool
+    // runs, because that invalidates the assumption the answer is unchanged — so a
+    // legitimate re-run of a test after an edit is not penalized.
+
+    /// Identical calls re-issued within the run, keyed by fingerprint.
+    private var repeatedToolCallCounts: [String: Int] = [:]
+    /// The highest still-valid repeat count (cleared when a mutation resets the run).
+    public private(set) var maxRepeatedToolCallCount: Int = 0
+    /// How many times one identical call may recur before the run escalates.
+    public var repeatedToolCallLimit: Int = 3
+
+    /// Tools that change on-disk or repo state, so a re-issued read afterwards is
+    /// no longer redundant. `shell_run` is state-changing too but is handled in
+    /// `recordToolCallFingerprint` by dropping only the read fingerprints, so a shell
+    /// loop still accumulates.
+    private static let mutatingToolNames: Set<String> = ["file_write", "file_edit", "git_commit"]
+
+    /// Stable fingerprint for a call: tool name plus its arguments, with only the
+    /// surrounding whitespace of each value trimmed. The value is otherwise preserved
+    /// EXACTLY — a command, code body, or query is case- and whitespace-sensitive, so
+    /// lowercasing or collapsing interior whitespace would map genuinely distinct calls
+    /// (`print 'A B'` vs `print 'a b'`) to one fingerprint and could force synthesis on
+    /// the third legitimate variant. Dictionary keys are sorted for determinism.
+    public static func toolCallFingerprint(toolName: String, arguments: [String: Any]) -> String {
+        func normalized(_ value: Any) -> String {
+            if let s = value as? String {
+                return s.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            if let array = value as? [Any] {
+                return array.map(normalized).joined(separator: ",")
+            }
+            if let dict = value as? [String: Any] {
+                return dict.keys.sorted().map { "\($0)=\(normalized(dict[$0]!))" }.joined(separator: ",")
+            }
+            return String(describing: value)
+        }
+        let argsPart = arguments.keys.sorted().map { "\($0)=\(normalized(arguments[$0]!))" }.joined(separator: "&")
+        return "\(toolName)|\(argsPart)"
+    }
+
+    /// Records an executed call and returns how many times this exact call has now
+    /// run since the last state-mutating tool. Callers escalate when the returned
+    /// count (or `maxRepeatedToolCallCount`) reaches `repeatedToolCallLimit`.
+    @discardableResult
+    public func recordToolCallFingerprint(toolName: String, arguments: [String: Any]) -> Int {
+        if Self.mutatingToolNames.contains(toolName) {
+            repeatedToolCallCounts.removeAll()
+            maxRepeatedToolCallCount = 0
+            return 0
+        }
+        // A shell command may have rewritten anything the model read, so a re-issued
+        // read afterwards is legitimate (`isStateChanging` treats `shell_run` as
+        // state-changing for the same reason). Drop the READ fingerprints so that case
+        // cannot force synthesis. Shell fingerprints are kept: an identical (or
+        // alternating) shell loop is the pattern this guard most needs to catch, and
+        // clearing them here would reset the count on every new command and never fire.
+        if toolName == "shell_run" {
+            repeatedToolCallCounts = repeatedToolCallCounts.filter { $0.key.hasPrefix("shell_run|") }
+            maxRepeatedToolCallCount = repeatedToolCallCounts.values.max() ?? 0
+        }
+        let fingerprint = Self.toolCallFingerprint(toolName: toolName, arguments: arguments)
+        let count = (repeatedToolCallCounts[fingerprint] ?? 0) + 1
+        repeatedToolCallCounts[fingerprint] = count
+        maxRepeatedToolCallCount = max(maxRepeatedToolCallCount, count)
+        return count
+    }
+
     /// Tools seeded into the prompt on startup — the "fundamental" set.
     /// Kept minimal: every schema here costs prefill tokens on every turn, and each
     /// load/unload event invalidates the KV-cache prefix (full re-prefill). The model
@@ -3140,8 +3272,10 @@ public final class AgentHarness {
         }
 
         prompt += "# Tools\n\nOnly the following functions are currently loaded and callable:\n\n<tools>\n"
+        let toolSchemaEncoder = JSONEncoder()
+        toolSchemaEncoder.outputFormatting = [.sortedKeys]
         for tool in availableToolDefinitions {
-            if let data = try? JSONEncoder().encode(tool),
+            if let data = try? toolSchemaEncoder.encode(tool),
                let jsonStr = String(data: data, encoding: .utf8) {
                 prompt += jsonStr + "\n"
             }
@@ -3228,6 +3362,7 @@ public final class AgentHarness {
             - Required parameters MUST be specified
             - You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
             - When the user asks to inspect, read, edit, modify, or process a file, or run terminal commands, you MUST call the function immediately without conversational promises
+            - For any file the user names, use its EXACT absolute path (e.g. /Users/me/Downloads/data.csv) in the command. Never `cd` into a folder and then reference a bare filename, and never assume the working directory already contains the file.
             - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
 
             Web Research Grounding Rules:
@@ -3264,6 +3399,7 @@ public final class AgentHarness {
             - Required parameters MUST be specified
             - You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
             - When the user asks to inspect, read, edit, modify, or process a file, or run terminal commands, you MUST call the function immediately without conversational promises
+            - For any file the user names, use its EXACT absolute path (e.g. /Users/me/Downloads/data.csv) in the command. Never `cd` into a folder and then reference a bare filename, and never assume the working directory already contains the file.
             - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
 
             Web Research Grounding Rules:
@@ -3530,6 +3666,10 @@ public final class AgentHarness {
     // MARK: - Tolerant Tool Call Parser (XML + JSON + Multi-Call + Truncation Recovery)
 
     public func parseToolCalls(from text: String) -> (calls: [ParsedToolCall], brokenFragments: [String]) {
+        // A parameter closer the model split across lines (`</parameter=\n>`) would
+        // otherwise be absorbed into the argument value and handed to the tool as
+        // literal markup. Normalize before any of the parsers below look at it.
+        let text = StreamingToolParser.repairSplitParameterClosers(text)
         var calls: [ParsedToolCall] = []
         var broken: [String] = []
 
@@ -3857,18 +3997,74 @@ public final class AgentHarness {
         return lowered.contains("curl") || lowered.contains("wget")
     }
 
-    /// When a command fails because a user path does not exist, name the files that
-    /// actually live in that directory so the model can copy the exact name instead
-    /// of mangling it again. Observed failure: after a ~10k-token CSV dump the model
-    /// drops the date suffix from the path, then invents "/Users/derek Harris", and
-    /// burns its whole step budget re-issuing the same FileNotFound command.
+    /// True when a shell run exited 0 yet stderr still names an element that failed
+    /// outright (a `cd` into a mangled path, a missing binary, an unreadable file).
+    /// Such a command did not run where the model intended, but exit status still
+    /// reports success, so the failure streak never trips and a model that mangles
+    /// the same path keeps re-inspecting until its step budget is gone. Flagging it
+    /// as a soft failure lets the loop guard escalate without reclassifying benign
+    /// stderr chatter (brew/pip progress, compiler notes) as a failure.
+    public static func shellRunSoftFailure(stderr: String) -> Bool {
+        let trimmed = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let benignMarkers = ["warning:", "note:", "notice:", "info:", "deprecated"]
+        let failureMarkers = [
+            "no such file or directory",
+            "command not found",
+            "permission denied",
+            "not a directory",
+            "is a directory",
+            "too many arguments",
+            "invalid option",
+            "unrecognized option",
+            "unmatched",
+            "syntax error",
+            "parse error"
+        ]
+        for rawLine in trimmed.split(separator: "\n") {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            let lower = line.lowercased()
+            if benignMarkers.contains(where: { lower.contains($0) }) { continue }
+            // Attribute the diagnostic to a command/builtin (`zsh:cd:1: too many
+            // arguments`, `head: -: No such file or directory`) so a stray phrase in a
+            // tool's own prose output is ignored.
+            guard line.contains(":") else { continue }
+            if failureMarkers.contains(where: { lower.contains($0) }) { return true }
+        }
+        return false
+    }
+
+    /// When a command fails because a user path does not exist, name the real
+    /// sibling names so the model can copy the exact name instead of mangling it
+    /// again. Observed failure: after a ~10k-token CSV dump the model drops the date
+    /// suffix from the path, then invents "/Users/derek Harris", and burns its whole
+    /// step budget re-issuing the same FileNotFound command.
+    ///
+    /// Handles a typo in a DIRECTORY component too: `/Users/derepdarrs/Downloads/x`
+    /// has no existing parent, so requiring the immediate parent to exist skipped the
+    /// hint entirely and left the model with a bare "No such file". Walk up to the
+    /// nearest ancestor that does exist and name the component the model must correct.
+    ///
+    /// Also handles the relative-name case: a bare `survey.csv` that is not in the
+    /// working directory is matched by basename against the absolute paths in
+    /// `lastPromptText` and echoed back, so a model that drops to a relative filename
+    /// under a different cwd is steered to the exact path the user gave.
     static func missingPathRepairHint(command: String, stderr: String, stdout: String) -> String {
         let errorText = (stderr + "\n" + stdout).lowercased()
         let missingSignals = ["no such file", "filenotfound", "cannot find", "does not exist", "not found"]
-        guard missingSignals.contains(where: { errorText.contains($0) }) else { return "" }
+        // A failed `cd` carries no missing-path phrase (`zsh:cd:1: too many arguments`
+        // for `/Users/derek Harris Downloads`), so the guard skipped the hint and the
+        // model was left guessing. Treat a cd diagnostic as a missing-path signal too;
+        // the absolute-path pass then names the real sibling directories.
+        let cdFailurePhrases = ["too many arguments", "no such file", "not a directory", "permission denied", "string not in pwd", "invalid option"]
+        let looksLikeFailedCd = errorText.split(separator: "\n").contains { line in
+            line.contains("cd:") && cdFailurePhrases.contains { line.contains($0) }
+        }
+        guard missingSignals.contains(where: { errorText.contains($0) }) || looksLikeFailedCd else { return "" }
 
         let separators = CharacterSet(charactersIn: " \t\n'\"`;|&()[]{}<>=,")
         var seen = Set<String>()
+        var hints: [String] = []
         for raw in command.components(separatedBy: separators) {
             // Only the user's own data paths: /tmp script paths and system dirs are
             // never the intended attachment.
@@ -3878,21 +4074,86 @@ public final class AgentHarness {
             guard token.count > 1, !seen.contains(token) else { continue }
             seen.insert(token)
 
-            let url = URL(fileURLWithPath: token)
-            let dir = url.deletingLastPathComponent()
             let fm = FileManager.default
-            guard !fm.fileExists(atPath: token), fm.fileExists(atPath: dir.path) else { continue }
-            let entries = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
-            let wanted = url.lastPathComponent.lowercased()
+            let url = URL(fileURLWithPath: token)
+            guard !fm.fileExists(atPath: token) else { continue }
+
+            // Deepest existing ancestor; the component directly below it is what the
+            // model got wrong (a file name, or a directory name higher up).
+            var ancestor = url.deletingLastPathComponent()
+            var missingComponent = url.lastPathComponent
+            while ancestor.path != "/", !fm.fileExists(atPath: ancestor.path) {
+                missingComponent = ancestor.lastPathComponent
+                ancestor = ancestor.deletingLastPathComponent()
+            }
+            guard fm.fileExists(atPath: ancestor.path) else { continue }
+
+            let entries = (try? fm.contentsOfDirectory(atPath: ancestor.path)) ?? []
+            let wanted = missingComponent.lowercased()
             guard !wanted.isEmpty else { continue }
             let ranked = entries
                 .filter { $0.lowercased() != wanted }
                 .sorted { sharedPrefixLength($0.lowercased(), wanted) > sharedPrefixLength($1.lowercased(), wanted) }
-            guard let best = ranked.first, sharedPrefixLength(best.lowercased(), wanted) >= 3 else { continue }
-            let list = ranked.prefix(6).map { "  \($0)" }.joined(separator: "\n")
-            return "\nHint: \(token) does not exist. The actual names in \(dir.path) are:\n\(list)\nUse one of these EXACT names, copied in full (spaces, commas and underscores included)."
+            if let best = ranked.first, sharedPrefixLength(best.lowercased(), wanted) >= 3 {
+                let list = ranked.prefix(6).map { "  \($0)" }.joined(separator: "\n")
+                hints.append("Hint: \(token) does not exist. The nearest existing directory is \(ancestor.path); the actual names there are:\n\(list)\nRebuild the path using one of these EXACT names (spaces, commas and underscores included) in place of \"\(missingComponent)\".")
+                continue
+            }
+
+            // The parent exists and the missing name is not a near-miss of any
+            // sibling — observed: the model dropped a directory component and wrote
+            // `/Users/…/survey.csv` for `/Users/…/Downloads/survey.csv`, so nothing
+            // above matched and the model got no correction at all. Echo the path the
+            // user actually named with the same file name.
+            if let match = absolutePath(in: AgentHarness.shared.lastPromptText, matchingLastComponent: missingComponent),
+               match != token {
+                hints.append("Hint: \(token) does not exist. The user's file is at \(match). Use that EXACT absolute path.")
+            }
+        }
+        if !hints.isEmpty {
+            return "\n" + hints.prefix(2).joined(separator: "\n")
+        }
+
+        // Second pass: the model referenced a BARE relative filename that is not in
+        // the working directory. Observed: given `/Users/…/Downloads/survey.csv`, it
+        // ran `open('survey.csv')`, which only worked because the process cwd happened
+        // to hold the file. Echo back the absolute path the user named so a different
+        // cwd cannot send the run back into a path-guessing loop.
+        let fm = FileManager.default
+        let cwd = fm.currentDirectoryPath
+        for raw in command.components(separatedBy: separators) {
+            var token = raw
+            while let last = token.last, ".,:".contains(last) { token.removeLast() }
+            guard token.count > 1, !token.hasPrefix("/"), !token.hasPrefix("-"),
+                  !seen.contains(token) else { continue }
+            // Only path-like tokens: a filename carries a dot, or an interior slash.
+            guard token.contains(".") || token.contains("/") else { continue }
+            seen.insert(token)
+            guard !fm.fileExists(atPath: cwd + "/" + token) else { continue }
+            let basename = (token as NSString).lastPathComponent
+            guard basename.contains(".") else { continue }
+            if let match = absolutePath(in: AgentHarness.shared.lastPromptText, matchingLastComponent: basename) {
+                return "\nHint: '\(token)' does not exist under the current working directory (\(cwd)). The user's file is at \(match). Use that EXACT absolute path."
+            }
         }
         return ""
+    }
+
+    /// Finds an absolute path whose final component equals `component` inside the
+    /// prompt text. Paths are delimited by whitespace and shell punctuation; a
+    /// trailing period/comma/colon is trimmed before the name is compared.
+    private static func absolutePath(in prompt: String, matchingLastComponent component: String) -> String? {
+        guard !prompt.isEmpty else { return nil }
+        let separators = CharacterSet(charactersIn: " \t\n'\"`;|&()[]{}<>=,")
+        let wanted = component.lowercased()
+        for raw in prompt.components(separatedBy: separators) {
+            guard raw.hasPrefix("/Users/") || raw.hasPrefix("/home/") else { continue }
+            var token = raw
+            while let last = token.last, ".,:".contains(last) { token.removeLast() }
+            guard (token as NSString).lastPathComponent.lowercased() == wanted else { continue }
+            return token
+        }
+        return nil
     }
 
     private static func sharedPrefixLength(_ a: String, _ b: String) -> Int {
