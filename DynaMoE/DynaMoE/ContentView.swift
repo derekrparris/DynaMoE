@@ -991,6 +991,7 @@ struct ContentView: View {
     @AppStorage("dynamoe_chat_auto_delete_enabled") private var chatAutoDeleteEnabled: Bool = true
     @AppStorage("dynamoe_chat_retention_limit") private var chatRetentionLimit: Int = 10
     @State private var hasLoadedPersistedSessions: Bool = false
+    @State private var isLoadingPersistedSessions: Bool = false
     @State private var sessionPersistTask: Task<Void, Never>? = nil
     @State private var hasPendingSessionPersist: Bool = false
 
@@ -1172,16 +1173,39 @@ struct ContentView: View {
     }
 
     private func loadPersistedSessionsIfNeeded() async {
-        guard !hasLoadedPersistedSessions else { return }
-        hasLoadedPersistedSessions = true
+        guard !hasLoadedPersistedSessions, !isLoadingPersistedSessions else { return }
+        isLoadingPersistedSessions = true
 
+        // Saves stay suppressed until `hasLoadedPersistedSessions` flips below,
+        // so no in-flight placeholder snapshot can reach the store while the
+        // load is still populating `managedIds`.
+        let preExistingIds = Set(sessions.map(\.id))
         let loaded = await ChatSessionStore.shared.loadSessionsAsync()
+
         if loaded.isEmpty {
-            // Nothing on disk yet: persist the fresh in-memory conversation.
+            // Nothing on disk yet: the in-memory session becomes the starting
+            // point rather than being discarded.
+            hasLoadedPersistedSessions = true
+            isLoadingPersistedSessions = false
             ChatSessionStore.shared.saveAll(sessions)
-        } else {
-            sessions = loaded
-            selectedSessionId = loaded.first?.id
+            applyChatRetention()
+            return
+        }
+
+        // Preserve anything the user started while the load was in flight instead
+        // of clobbering it with the persisted set.
+        let loadedIds = Set(loaded.map(\.id))
+        let createdWhileLoading = sessions.filter { !loadedIds.contains($0.id) && !preExistingIds.contains($0.id) }
+
+        sessions = createdWhileLoading + loaded
+        selectedSessionId = sessions.first?.id
+
+        hasLoadedPersistedSessions = true
+        isLoadingPersistedSessions = false
+
+        // Conversations created during loading were never written; persist now.
+        if !createdWhileLoading.isEmpty {
+            ChatSessionStore.shared.saveAll(sessions)
         }
         applyChatRetention()
     }
@@ -1557,6 +1581,7 @@ struct ContentView: View {
     }
 
     private func handleQueuePrompt(_ text: String) {
+        guard hasLoadedPersistedSessions else { return }
         guard let currentSessionId = selectedSessionId ?? sessions.first?.id else { return }
         guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1571,6 +1596,7 @@ struct ContentView: View {
     }
 
     private func interruptAndSendMessage(_ text: String) {
+        guard hasLoadedPersistedSessions else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         if isGeneratingText {
@@ -1655,6 +1681,9 @@ struct ContentView: View {
     }
 
     private func handleSendMessage(_ text: String) {
+        // Never touch chat state before persisted sessions finish loading, or the
+        // turn could land in a placeholder the load then replaces.
+        guard hasLoadedPersistedSessions else { return }
         // Backstop for the send button's isModelLoaded gate: sending before the
         // engine is ready must not touch chat or harness state — a pre-load
         // prompt was observed to poison later sessions (garbled output even in
