@@ -134,7 +134,12 @@ struct DynaMoEApp: App {
     }
 
     var body: some Scene {
-        WindowGroup {
+        // A single main window, not a WindowGroup. Chat sessions are per-window
+        // `@State` and the model/engine/KV cache are process-wide singletons, so a
+        // second window could never run inference safely and would race on saves
+        // (one window's full-snapshot save overwriting or orphan-deleting another
+        // window's conversations). One window makes the snapshot save authoritative.
+        Window("DynaMoE", id: "dynamoe-main") {
             if isTesting {
                 Text("Running XCTest...")
             } else {

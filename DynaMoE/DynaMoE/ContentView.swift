@@ -1622,9 +1622,12 @@ struct ContentView: View {
     }
 
     private func handleRemoveQueuedPrompt(id: UUID) {
-        guard let currentSessionId = selectedSessionId ?? sessions.first?.id else { return }
-        guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return }
-        sessions[sessionIdx].queuedPrompts.removeAll(where: { $0.id == id })
+        // Resolve by identity across every conversation, not by the current
+        // selection: an async "Send Now" removes the item after an await, during
+        // which the user may have switched chats.
+        for idx in sessions.indices where sessions[idx].queuedPrompts.contains(where: { $0.id == id }) {
+            sessions[idx].queuedPrompts.removeAll(where: { $0.id == id })
+        }
     }
 
     /// Returns whether the prompt was accepted. When a turn is already running
@@ -1635,7 +1638,11 @@ struct ContentView: View {
         guard hasLoadedPersistedSessions else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
-        guard isGeneratingText else { return handleSendMessage(trimmed) }
+        // Resolve the target conversation before suspending: the user may switch
+        // chats while we wait for the cancelled generation to stop, and the
+        // replacement turn must still land in the conversation that was active.
+        let targetSessionId = selectedSessionId ?? sessions.first?.id
+        guard isGeneratingText else { return handleSendMessage(trimmed, sessionId: targetSessionId) }
         print("⏹ [INT] interrupt requested — cancelling current generation and sending a fresh turn")
         let previous = generationTask
         stopAutoregressiveGeneration()
@@ -1648,7 +1655,7 @@ struct ContentView: View {
         // loops check cancellation at every layer boundary, so this bounds the
         // wait to one layer (one token during decode).
         await previous?.value
-        return handleSendMessage(trimmed)
+        return handleSendMessage(trimmed, sessionId: targetSessionId)
     }
 
     private func dequeueAndRunNextPromptIfNeeded(sessionId: UUID?) {
@@ -1657,9 +1664,11 @@ struct ContentView: View {
         guard !sessions[sessionIdx].queuedPrompts.isEmpty else { return }
         let next = sessions[sessionIdx].queuedPrompts.removeFirst()
         Task { @MainActor in
-            // Smooth transition to next turn
+            // Smooth transition to next turn. Pin the conversation resolved above:
+            // the sleep can span a selection change, and the dequeued prompt must
+            // run in the conversation it was queued for.
             try? await Task.sleep(nanoseconds: 80_000_000)
-            _ = self.handleSendMessage(next.text)
+            _ = self.handleSendMessage(next.text, sessionId: currentSessionId)
         }
     }
 
@@ -1712,7 +1721,11 @@ struct ContentView: View {
 
     /// Returns whether the prompt was accepted. A `false` result means nothing
     /// was sent, so the composer must keep the text instead of clearing it.
-    private func handleSendMessage(_ text: String) -> Bool {
+    ///
+    /// `sessionId` lets an async caller pin the conversation it resolved before
+    /// suspending, so a send started in chat A cannot land in chat B if the user
+    /// switches selection while the caller is awaiting.
+    private func handleSendMessage(_ text: String, sessionId explicitSessionId: UUID? = nil) -> Bool {
         // Never touch chat state before persisted sessions finish loading, or the
         // turn could land in a placeholder the load then replaces.
         guard hasLoadedPersistedSessions else { return false }
@@ -1726,7 +1739,7 @@ struct ContentView: View {
             gpuComputeOutput = err
             return false
         }
-        guard let currentSessionId = selectedSessionId ?? sessions.first?.id else { return false }
+        guard let currentSessionId = explicitSessionId ?? selectedSessionId ?? sessions.first?.id else { return false }
         guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return false }
         
         let userMsg = ChatMessage(role: .user, content: text)
