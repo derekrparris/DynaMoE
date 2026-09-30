@@ -23,17 +23,7 @@ final class ChatSessionStore {
     static let currentSchemaVersion = 1
 
     private let directory: URL
-    private let fileManager: FileManager
     private let ioQueue = DispatchQueue(label: "com.dynamoe.chatsessionstore.io", qos: .utility)
-    /// Canonical (`sortedKeys`) encoding is required for the byte signature to be
-    /// stable: `JSONEncoder` otherwise emits `ChatSession`'s keys in an unstable
-    /// order, which would make every save look like a change.
-    private let encoder: JSONEncoder = {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.sortedKeys]
-        return encoder
-    }()
-    private let decoder = JSONDecoder()
 
     /// Signature of the bytes last **successfully written** per conversation.
     /// Only updated after a write actually lands, so a failed write (disk full,
@@ -43,7 +33,6 @@ final class ChatSessionStore {
     nonisolated(unsafe) private var writtenSignatures: [UUID: Int] = [:]
 
     init(directory: URL? = nil, fileManager: FileManager = .default) {
-        self.fileManager = fileManager
         self.directory = directory ?? ChatSessionStore.defaultDirectory(using: fileManager)
     }
 
@@ -63,19 +52,13 @@ final class ChatSessionStore {
         directory.appendingPathComponent("\(id.uuidString).json", isDirectory: false)
     }
 
-    private func enumerateSessionFiles() -> [URL] {
-        guard let urls = try? fileManager.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        ) else { return [] }
-        return urls.filter { $0.pathExtension == "json" }
-    }
-
     // MARK: - Loading
 
     /// Reads every persisted conversation, most-recently-active first to match
     /// the sidebar order.
+    ///
+    /// Decoding (and the canonical re-encode used for change detection) runs on
+    /// `ioQueue`, so large histories never serialize on the main actor.
     ///
     /// A versioned conversation's canonical signature is seeded into
     /// `writtenSignatures` so the first debounced save after launch does not
@@ -83,38 +66,41 @@ final class ChatSessionStore {
     /// files are deliberately left unsigned so the next save rewrites them into
     /// the versioned envelope instead of leaving them unstamped forever.
     func loadSessions() -> [ChatSession] {
-        var decoded: [(session: ChatSession, signature: Int?)] = []
-        for url in enumerateSessionFiles() {
-            guard let data = try? Data(contentsOf: url) else { continue }
-            if let envelope = try? decoder.decode(PersistedChatSession.self, from: data) {
-                decoded.append((envelope.session, canonicalSignature(for: envelope.session)))
-            } else if let bare = try? decoder.decode(ChatSession.self, from: data) {
-                decoded.append((bare, nil))
+        let directory = self.directory
+        return ioQueue.sync { [self] in
+            let fm = FileManager()
+            guard let urls = try? fm.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            ) else { return [] }
+
+            let decoder = JSONDecoder()
+            let encoder = JSONEncoder()
+            // Canonical (`sortedKeys`) encoding is required for the byte
+            // signature to be stable: JSONEncoder otherwise emits ChatSession's
+            // keys in an unstable order, making every save look like a change.
+            encoder.outputFormatting = [.sortedKeys]
+
+            var decoded: [ChatSession] = []
+            for url in urls where url.pathExtension == "json" {
+                guard let data = try? Data(contentsOf: url) else { continue }
+                if let envelope = try? decoder.decode(PersistedChatSession.self, from: data) {
+                    decoded.append(envelope.session)
+                    if writtenSignatures[envelope.session.id] == nil,
+                       let encoded = try? encoder.encode(envelope) {
+                        writtenSignatures[envelope.session.id] = encoded.hashValue
+                    }
+                } else if let bare = try? decoder.decode(ChatSession.self, from: data) {
+                    decoded.append(bare)
+                }
             }
-        }
 
-        let signatures = decoded.compactMap { pair -> (UUID, Int)? in
-            guard let signature = pair.signature else { return nil }
-            return (pair.session.id, signature)
+            return decoded
+                .map { (session: $0, activity: $0.lastActivityAt) }
+                .sorted { $0.activity > $1.activity }
+                .map(\.session)
         }
-        ioQueue.sync { [self] in
-            for (id, signature) in signatures where writtenSignatures[id] == nil {
-                writtenSignatures[id] = signature
-            }
-        }
-
-        return decoded
-            .map(\.session)
-            .map { (session: $0, activity: $0.lastActivityAt) }
-            .sorted { $0.activity > $1.activity }
-            .map(\.session)
-    }
-
-    private func canonicalSignature(for session: ChatSession) -> Int? {
-        guard let data = try? encoder.encode(
-            PersistedChatSession(schemaVersion: ChatSessionStore.currentSchemaVersion, session: session)
-        ) else { return nil }
-        return data.hashValue
     }
 
     // MARK: - Saving
@@ -123,35 +109,35 @@ final class ChatSessionStore {
     /// conversations no longer present. The caller debounces this, so it is
     /// safe to call repeatedly; unchanged conversations are skipped.
     ///
-    /// Encoding happens here (the `ChatSession` conformance is main-actor
-    /// isolated); the actual compare-write-commit cycle runs on `ioQueue`, where
-    /// a signature is recorded only after its write succeeds.
+    /// Serialization and the compare-write-commit cycle all run on `ioQueue`, so
+    /// large histories never encode on the main actor. A signature is recorded
+    /// only after its write succeeds.
     func saveAll(_ sessions: [ChatSession]) {
-        var payloads: [(id: UUID, url: URL, data: Data, signature: Int)] = []
-        for session in sessions {
-            guard let data = try? encoder.encode(
-                PersistedChatSession(schemaVersion: ChatSessionStore.currentSchemaVersion, session: session)
-            ) else { continue }
-            payloads.append((session.id, fileURL(for: session.id), data, data.hashValue))
-        }
-
         let directory = self.directory
-        let liveIds = Set(sessions.map(\.id))
-
+        let snapshot = sessions
         ioQueue.async { [self] in
             let fm = FileManager()
             try? fm.createDirectory(at: directory, withIntermediateDirectories: true)
 
-            for payload in payloads {
-                if writtenSignatures[payload.id] == payload.signature { continue }
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            let liveIds = Set(snapshot.map(\.id))
+
+            for session in snapshot {
+                guard let data = try? encoder.encode(
+                    PersistedChatSession(schemaVersion: ChatSessionStore.currentSchemaVersion, session: session)
+                ) else { continue }
+                let signature = data.hashValue
+                if writtenSignatures[session.id] == signature { continue }
+                let url = directory.appendingPathComponent("\(session.id.uuidString).json", isDirectory: false)
                 do {
-                    try payload.data.write(to: payload.url, options: .atomic)
-                    writtenSignatures[payload.id] = payload.signature
+                    try data.write(to: url, options: .atomic)
+                    writtenSignatures[session.id] = signature
                 } catch {
                     // Leave no signature so the conversation is retried rather
                     // than assumed durable for the rest of the process.
-                    writtenSignatures[payload.id] = nil
-                    print("⚠️ [ChatSessionStore] failed to persist session \(payload.id): \(error.localizedDescription)")
+                    writtenSignatures[session.id] = nil
+                    print("⚠️ [ChatSessionStore] failed to persist session \(session.id): \(error.localizedDescription)")
                 }
             }
 
@@ -221,7 +207,7 @@ final class ChatSessionStore {
 }
 
 /// Versioned on-disk envelope for a single conversation.
-private struct PersistedChatSession: Codable {
+nonisolated private struct PersistedChatSession: Codable, Sendable {
     let schemaVersion: Int
     let session: ChatSession
 }

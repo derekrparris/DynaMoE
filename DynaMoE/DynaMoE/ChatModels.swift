@@ -5,13 +5,13 @@
 
 import Foundation
 
-public enum MessageRole: String, Codable, Equatable {
+nonisolated public enum MessageRole: String, Codable, Equatable, Sendable {
     case user
     case assistant
     case system
 }
 
-public enum ToolExecutionStatus: String, Codable, Equatable {
+nonisolated public enum ToolExecutionStatus: String, Codable, Equatable, Sendable {
     case running
     case success
     case error
@@ -19,7 +19,7 @@ public enum ToolExecutionStatus: String, Codable, Equatable {
     case rejected
 }
 
-public struct ToolCallRecord: Identifiable, Codable, Equatable {
+nonisolated public struct ToolCallRecord: Identifiable, Codable, Equatable, Sendable {
     public var id: UUID
     public var name: String
     public var arguments: [String: String]
@@ -59,7 +59,7 @@ public struct ToolCallRecord: Identifiable, Codable, Equatable {
     }
 }
 
-public struct ChatMessage: Identifiable, Codable, Equatable {
+nonisolated public struct ChatMessage: Identifiable, Codable, Equatable, Sendable {
     public var id: UUID
     public var role: MessageRole
     public var content: String
@@ -108,7 +108,7 @@ public struct ChatMessage: Identifiable, Codable, Equatable {
     }
 }
 
-public struct QueuedPrompt: Identifiable, Codable, Equatable {
+nonisolated public struct QueuedPrompt: Identifiable, Codable, Equatable, Sendable {
     public var id: UUID
     public var text: String
     public var timestamp: Date
@@ -124,7 +124,7 @@ public struct QueuedPrompt: Identifiable, Codable, Equatable {
     }
 }
 
-public struct ChatSession: Identifiable, Codable, Equatable {
+nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendable {
     public var id: UUID
     public var title: String
     public var messages: [ChatMessage]
