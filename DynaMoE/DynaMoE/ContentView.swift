@@ -1212,12 +1212,13 @@ struct ContentView: View {
     }
 
     /// Drops conversations beyond the retention window and deletes their files.
-    /// The active conversation is always preserved.
+    /// The active conversation and any session with a generation in flight are
+    /// always preserved.
     private func applyChatRetention() {
         let plan = ChatSessionStore.retentionPlan(
             sessions: sessions,
             limit: chatRetentionLimitOrNil,
-            protectedId: selectedSessionId ?? sessions.first?.id
+            protectedIds: chatRetentionProtectedIds
         )
         guard !plan.removed.isEmpty else { return }
 
@@ -1227,6 +1228,22 @@ struct ContentView: View {
             selectedSessionId = sessions.first?.id
         }
         ChatSessionStore.shared.delete(sessionIds: removedIds)
+    }
+
+    /// Sessions retention must never evict: the one the user is viewing and the
+    /// one actively generating (which may differ after switching chats mid-turn,
+    /// since the generation loop still appends to its own session).
+    private var chatRetentionProtectedIds: Set<UUID> {
+        var ids: Set<UUID> = []
+        if let selected = selectedSessionId {
+            ids.insert(selected)
+        } else if let first = sessions.first?.id {
+            ids.insert(first)
+        }
+        if isGeneratingText, let generating = generatingSessionId {
+            ids.insert(generating)
+        }
+        return ids
     }
 
     /// Coalesces the rapid session mutations that happen during streaming into a

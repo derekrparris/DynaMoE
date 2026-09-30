@@ -290,14 +290,15 @@ final class ChatSessionStore: ObservableObject {
     /// - `limit == nil` means "never auto-delete"; everything is kept.
     /// - Recency comes from `lastActivityAt`, not `updatedAt`, so a conversation
     ///   used recently is not pruned just because it was created long ago.
-    /// - The active conversation is always kept even if it falls outside the
-    ///   most-recent window, so the user is never yanked out of an open chat.
+    /// - Protected conversations are always kept even if they fall outside the
+    ///   most-recent window, so the user is never yanked out of an open chat and
+    ///   an in-flight generation can still append to its session.
     /// - Returns the originals in their existing order, split into survivors
     ///   and the removed tail.
     nonisolated static func retentionPlan(
         sessions: [ChatSession],
         limit: Int?,
-        protectedId: UUID?
+        protectedIds: Set<UUID>
     ) -> (kept: [ChatSession], removed: [ChatSession]) {
         guard let limit, limit > 0, sessions.count > limit else {
             return (sessions, [])
@@ -306,9 +307,7 @@ final class ChatSessionStore: ObservableObject {
             .map { (session: $0, activity: $0.lastActivityAt) }
             .sorted { $0.activity > $1.activity }
         var keepIds = Set(mostRecent.prefix(limit).map(\.session.id))
-        if let protectedId {
-            keepIds.insert(protectedId)
-        }
+        keepIds.formUnion(protectedIds)
         let kept = sessions.filter { keepIds.contains($0.id) }
         let removed = sessions.filter { !keepIds.contains($0.id) }
         return (kept, removed)

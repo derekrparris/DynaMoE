@@ -11584,7 +11584,7 @@ final class ChatSessionPersistenceTests: XCTestCase {
         let plan = ChatSessionStore.retentionPlan(
             sessions: [newest, middle, oldest],
             limit: 2,
-            protectedId: nil
+            protectedIds: []
         )
 
         XCTAssertEqual(plan.kept.map(\.id), [newest.id, middle.id])
@@ -11595,7 +11595,7 @@ final class ChatSessionPersistenceTests: XCTestCase {
         let now = Date()
         let sessions = (0..<25).map { session(title: "Chat \($0)", updatedAt: now.addingTimeInterval(Double(-$0))) }
 
-        let plan = ChatSessionStore.retentionPlan(sessions: sessions, limit: nil, protectedId: nil)
+        let plan = ChatSessionStore.retentionPlan(sessions: sessions, limit: nil, protectedIds: [])
 
         XCTAssertEqual(plan.kept.count, 25)
         XCTAssertTrue(plan.removed.isEmpty)
@@ -11605,7 +11605,7 @@ final class ChatSessionPersistenceTests: XCTestCase {
         let now = Date()
         let sessions = (0..<10).map { session(title: "Chat \($0)", updatedAt: now.addingTimeInterval(Double(-$0))) }
 
-        let plan = ChatSessionStore.retentionPlan(sessions: sessions, limit: 10, protectedId: nil)
+        let plan = ChatSessionStore.retentionPlan(sessions: sessions, limit: 10, protectedIds: [])
 
         XCTAssertEqual(plan.kept.count, 10)
         XCTAssertTrue(plan.removed.isEmpty)
@@ -11620,12 +11620,31 @@ final class ChatSessionPersistenceTests: XCTestCase {
         let plan = ChatSessionStore.retentionPlan(
             sessions: [newest, middle, activeOld],
             limit: 2,
-            protectedId: activeOld.id
+            protectedIds: [activeOld.id]
         )
 
         XCTAssertTrue(plan.kept.contains(where: { $0.id == activeOld.id }), "Active conversation must survive retention")
         XCTAssertEqual(plan.kept.count, 3)
         XCTAssertTrue(plan.removed.isEmpty)
+    }
+
+    func testRetentionPlanProtectsGeneratingSessionOutsideWindow() {
+        let now = Date()
+        let newest = session(title: "Newest", updatedAt: now)
+        let middle = session(title: "Middle", updatedAt: now.addingTimeInterval(-60))
+        // Selected conversation (newest) and an in-flight generation (old) both
+        // fall outside a limit-1 window; both must survive.
+        let generatingOld = session(title: "Generating Old", updatedAt: now.addingTimeInterval(-600))
+
+        let plan = ChatSessionStore.retentionPlan(
+            sessions: [newest, middle, generatingOld],
+            limit: 1,
+            protectedIds: [newest.id, generatingOld.id]
+        )
+
+        XCTAssertTrue(plan.kept.contains(where: { $0.id == newest.id }), "Selected conversation must survive retention")
+        XCTAssertTrue(plan.kept.contains(where: { $0.id == generatingOld.id }), "In-flight generating session must survive retention")
+        XCTAssertEqual(plan.removed.map(\.id), [middle.id])
     }
 
     func testRetentionUsesMessageActivityNotStaleUpdatedAt() {
@@ -11642,7 +11661,7 @@ final class ChatSessionPersistenceTests: XCTestCase {
         let plan = ChatSessionStore.retentionPlan(
             sessions: [recentlyUsed, createdLater, oldest],
             limit: 2,
-            protectedId: nil
+            protectedIds: []
         )
 
         XCTAssertTrue(plan.kept.contains(where: { $0.id == recentlyUsed.id }), "A recently active conversation must outrank a stale updatedAt")
@@ -11883,7 +11902,7 @@ final class ChatSessionPersistenceTests: XCTestCase {
         let newer = ChatSession(title: "Newer", createdAt: now, updatedAt: now)
         let older = ChatSession(title: "Older", createdAt: now.addingTimeInterval(-30), updatedAt: now.addingTimeInterval(-30))
 
-        let plan = ChatSessionStore.retentionPlan(sessions: [newer, older], limit: 1, protectedId: nil)
+        let plan = ChatSessionStore.retentionPlan(sessions: [newer, older], limit: 1, protectedIds: [])
 
         XCTAssertEqual(plan.kept.map(\.id), [newer.id])
         XCTAssertEqual(plan.removed.map(\.id), [older.id])
