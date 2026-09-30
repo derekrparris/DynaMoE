@@ -1163,18 +1163,40 @@ struct ContentView: View {
         ModelProfileManager.shared.saveProfile(for: modelKey, type: profile, settings: settings)
     }
 
-    private func switchModel(to model: DiscoveredModel) {
+    private func switchModel(to model: DiscoveredModel, sessionId: UUID? = nil) {
+        // Capture the conversation this switch is for before any suspension, so
+        // a deferred switch still records the model on the intended session even
+        // if the user selects another conversation while it waits.
+        let targetSessionId = sessionId ?? selectedSessionId ?? sessions.first?.id
         // Never swap the engine/buffers out from under an in-flight generation:
         // its mmaps are unmapped when the old engine releases, which would fault
         // any GPU work still in progress.
         if isGeneratingText {
             stopAutoregressiveGeneration()
         }
+        if let teardown = generationTeardownTask {
+            // A cancelled generation is still unwinding and may still be inside a
+            // kernel dispatch. Loading a new engine now would unmap its mmaps and
+            // reset the shared buffers out from under it, so wait for the teardown
+            // and re-enter: a generation may have started during the wait, and
+            // this must stop it before swapping rather than completing over it.
+            Task { @MainActor in
+                await teardown.value
+                self.switchModel(to: model, sessionId: targetSessionId)
+            }
+            return
+        }
+        completeModelSwitch(to: model, sessionId: targetSessionId)
+    }
+
+    /// The non-suspending half of a model switch. Runs only once no cancelled
+    /// generation is still using the shared engine and buffers.
+    private func completeModelSwitch(to model: DiscoveredModel, sessionId targetSessionId: UUID?) {
         PrefixCacheManager.shared.invalidate()
         loadAndBridgeToMetal(filePath: model.snapshotPath)
         activeLoadedModelPath = model.snapshotPath
         localModelManager.setLastUsedModel(id: model.id)
-        if let sid = selectedSessionId ?? sessions.first?.id,
+        if let sid = targetSessionId,
            let idx = sessions.firstIndex(where: { $0.id == sid }) {
             sessions[idx].selectedModelId = model.id
             sessions[idx].selectedModelName = model.displayName
@@ -1182,6 +1204,27 @@ struct ContentView: View {
         }
         let preferredProfile = ModelProfileManager.shared.getActiveProfile(for: model.id)
         applyProfile(preferredProfile, for: model.id)
+    }
+
+    /// Makes the model a conversation expects the active one before an async
+    /// send. A send that waited out a teardown can resume after the user selected
+    /// another chat and ran `switchModel`, which would otherwise leave the
+    /// replacement turn running against the newly loaded model while targeting
+    /// the old conversation.
+    private func ensureModelLoaded(forSession sessionId: UUID?) {
+        guard let sessionId,
+              let session = sessions.first(where: { $0.id == sessionId }),
+              let targetPath = session.selectedModelPath,
+              !targetPath.isEmpty,
+              activeLoadedModelPath != targetPath else { return }
+        if let model = localModelManager.getModel(byId: targetPath) ?? localModelManager.getModel(byId: session.selectedModelId ?? "") {
+            switchModel(to: model)
+        } else {
+            loadAndBridgeToMetal(filePath: targetPath)
+            activeLoadedModelPath = targetPath
+            let preferredProfile = ModelProfileManager.shared.getActiveProfile(for: targetPath)
+            applyProfile(preferredProfile, for: targetPath)
+        }
     }
 
     // MARK: - Chat Session Persistence & Retention
@@ -1199,7 +1242,15 @@ struct ContentView: View {
         // so no in-flight placeholder snapshot can reach the store while the
         // load is still populating `managedIds`.
         let preExistingIds = Set(sessions.map(\.id))
-        let loaded = await ChatSessionStore.shared.loadSessionsAsync()
+        guard let loaded = await ChatSessionStore.shared.loadSessionsAsync() else {
+            // The store could not read its history, so an empty result here
+            // cannot be told apart from a failed read. Leave loading incomplete
+            // (and thus retryable) instead of replacing the visible
+            // conversations with nothing; the store's own availability banner
+            // tells the user persistence is down.
+            isLoadingPersistedSessions = false
+            return
+        }
 
         if loaded.isEmpty {
             // Nothing on disk yet: the in-memory session becomes the starting
@@ -1294,7 +1345,16 @@ struct ContentView: View {
     /// Writes immediately, used when the app leaves the foreground or quits so
     /// an in-flight conversation is not lost. No-op when nothing is pending.
     private func flushSessionPersist() {
-        guard hasLoadedPersistedSessions, hasPendingSessionPersist else { return }
+        guard hasLoadedPersistedSessions else {
+            // The initial load may still be in flight, so any conversations the
+            // user created during it have never been persisted. Write them now
+            // without the orphan-cleanup pass: `managedIds` is not populated
+            // yet, so cleanup would treat the not-yet-merged files on disk as
+            // deleted conversations and remove them.
+            ChatSessionStore.shared.saveAll(sessions, cleanOrphans: false)
+            return
+        }
+        guard hasPendingSessionPersist else { return }
         sessionPersistTask?.cancel()
         hasPendingSessionPersist = false
         ChatSessionStore.shared.saveAll(sessions)
@@ -1536,7 +1596,11 @@ struct ContentView: View {
             }
         }
         .onChange(of: scenePhase) { phase in
-            if phase != .active {
+            if phase == .active {
+                // Retry a history load that failed or never ran, so a transient
+                // read failure does not hide every conversation for the whole run.
+                Task { await loadPersistedSessionsIfNeeded() }
+            } else {
                 flushSessionPersist()
             }
         }
@@ -1713,7 +1777,20 @@ struct ContentView: View {
         // wait to one layer (one token during decode).
         await previous?.value
         await teardown?.value
-        let accepted = handleSendMessage(trimmed, sessionId: targetSessionId)
+        let accepted: Bool
+        if isGeneratingText {
+            // A different turn started while we were waiting (the user sent
+            // another prompt), so starting ours too would run two generations
+            // against the shared KV buffers. Report rejection so the caller keeps
+            // the draft or queued item.
+            accepted = false
+        } else {
+            // The user may have switched conversations (and models) during the
+            // wait; make the target's model active so the replacement turn runs
+            // against the one the conversation expects.
+            ensureModelLoaded(forSession: targetSessionId)
+            accepted = handleSendMessage(trimmed, sessionId: targetSessionId)
+        }
         if let targetSessionId {
             releaseRetentionProtection(targetSessionId)
             applyChatRetention()
@@ -1737,10 +1814,31 @@ struct ContentView: View {
             // A stopped generation may still be winding down; wait for it so the
             // send is not rejected and the already-dequeued prompt is not lost.
             await self.generationTeardownTask?.value
-            _ = self.handleSendMessage(next.text, sessionId: currentSessionId)
+            // A user send can slip in during that wait and start a generation,
+            // and the send can still be refused (no model loaded). Neither may
+            // start a second generation against the shared KV buffers, and the
+            // already-dequeued prompt must not be lost, so put it back at the
+            // front of the queue instead.
+            if self.isGeneratingText {
+                self.requeuePromptFront(next, sessionId: currentSessionId)
+            } else {
+                self.ensureModelLoaded(forSession: currentSessionId)
+                if !self.handleSendMessage(next.text, sessionId: currentSessionId) {
+                    self.requeuePromptFront(next, sessionId: currentSessionId)
+                }
+            }
             self.releaseRetentionProtection(currentSessionId)
             self.applyChatRetention()
         }
+    }
+
+    /// Returns a dequeued prompt to the front of its conversation's queue when
+    /// it could not be sent, so an interrupted turn never drops it. Guarded by
+    /// identity so a queue edit during the wait cannot duplicate it.
+    private func requeuePromptFront(_ prompt: QueuedPrompt, sessionId: UUID) {
+        guard let idx = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
+        guard !sessions[idx].queuedPrompts.contains(where: { $0.id == prompt.id }) else { return }
+        sessions[idx].queuedPrompts.insert(prompt, at: 0)
     }
 
     // MARK: - Subagent Result Auto-Relay

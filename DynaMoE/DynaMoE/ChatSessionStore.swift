@@ -108,9 +108,11 @@ final class ChatSessionStore: ObservableObject {
 
     /// Synchronous load. Convenient for tests, but blocks the caller until every
     /// file has been read and decoded, so app code should prefer
-    /// `loadSessionsAsync`.
-    func loadSessions() -> [ChatSession] {
-        guard let directory else { return [] }
+    /// `loadSessionsAsync`. Returns `nil` when the history cannot be read (no
+    /// usable directory, or the directory could not be listed), which callers
+    /// must treat as a retryable failure rather than an empty history.
+    func loadSessions() -> [ChatSession]? {
+        guard let directory else { return nil }
         return ioQueue.sync { [self] in
             loadSessionsLocked(in: directory)
         }
@@ -118,8 +120,9 @@ final class ChatSessionStore: ObservableObject {
 
     /// Loads conversations without blocking the caller. The read, decode, and
     /// signature work still runs on `ioQueue`; only the result hops back.
-    func loadSessionsAsync() async -> [ChatSession] {
-        guard let directory else { return [] }
+    /// Returns `nil` when the history cannot be read; see `loadSessions`.
+    func loadSessionsAsync() async -> [ChatSession]? {
+        guard let directory else { return nil }
         return await withCheckedContinuation { continuation in
             ioQueue.async { [self] in
                 continuation.resume(returning: loadSessionsLocked(in: directory))
@@ -139,13 +142,25 @@ final class ChatSessionStore: ObservableObject {
     /// Files stamped with a schema version this build does not understand are
     /// skipped and left on disk untouched, so a newer build's conversations are
     /// never silently downgraded to the current format.
-    nonisolated private func loadSessionsLocked(in directory: URL) -> [ChatSession] {
+    ///
+    /// Returns `nil` when the directory itself cannot be listed. That is not an
+    /// empty history: reporting it as one would make the caller replace the
+    /// visible conversations with nothing and stop retrying, so the failure is
+    /// surfaced (and persisted as unavailable) and the caller can retry.
+    nonisolated private func loadSessionsLocked(in directory: URL) -> [ChatSession]? {
         let fm = FileManager()
-        guard let urls = try? fm.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        ) else { return [] }
+        let urls: [URL]
+        do {
+            urls = try fm.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles]
+            )
+        } catch {
+            print("⚠️ [ChatSessionStore] could not read the sessions directory: \(error.localizedDescription)")
+            reportPersistenceAvailability(false)
+            return nil
+        }
 
         let decoder = JSONDecoder()
         let encoder = JSONEncoder()
@@ -195,7 +210,13 @@ final class ChatSessionStore: ObservableObject {
     /// Serialization and the compare-write-commit cycle all run on `ioQueue`, so
     /// large histories never encode on the main actor. A signature is recorded
     /// only after its write succeeds.
-    func saveAll(_ sessions: [ChatSession]) {
+    ///
+    /// `cleanOrphans` defaults to true. Pass `false` to write conversations
+    /// without the deletion pass — needed when persisting in-memory sessions
+    /// before a load has populated `managedIds`, since cleanup would otherwise
+    /// treat every not-yet-loaded file on disk as a deleted conversation and
+    /// remove it.
+    func saveAll(_ sessions: [ChatSession], cleanOrphans: Bool = true) {
         guard let directory else { return }
         let snapshot = sessions
         ioQueue.async { [self] in
@@ -237,12 +258,18 @@ final class ChatSessionStore: ObservableObject {
                 }
                 let signature = SHA256.hash(data: data)
                 let url = directory.appendingPathComponent("\(session.id.uuidString).json", isDirectory: false)
-                // Only skip a write when the bytes are unchanged *and* the file
-                // is still on disk: a cached signature alone must not leave the
-                // conversation absent if the file (or the whole directory) was
-                // removed while the app was running.
+                // Only skip a write when the bytes are unchanged *and* a regular
+                // file is still on disk: a cached signature alone must not leave
+                // the conversation absent if the file (or the whole directory) was
+                // removed while the app was running. `fileExists` alone is not
+                // enough because it is also true for a directory, which would let
+                // a replaced path report the conversation as durable even though
+                // it cannot be read back next launch, so confirm the path is not
+                // a directory before trusting it.
+                var isDirectory: ObjCBool = false
                 if writtenSignatures[session.id] == signature,
-                   fm.fileExists(atPath: url.path) {
+                   fm.fileExists(atPath: url.path, isDirectory: &isDirectory),
+                   !isDirectory.boolValue {
                     managedIds.insert(session.id)
                     continue
                 }
@@ -260,41 +287,43 @@ final class ChatSessionStore: ObservableObject {
                 }
             }
 
-            do {
-                let urls = try fm.contentsOfDirectory(
-                    at: directory,
-                    includingPropertiesForKeys: nil,
-                    options: [.skipsHiddenFiles]
-                )
-                enumeratedAny = true
-                for url in urls where url.pathExtension == "json" {
-                    // Only ever remove conversations this build loaded or wrote.
-                    // Files from a newer schema (or otherwise unrecognized) are not
-                    // managed and must survive untouched.
-                    guard let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent),
-                          managedIds.contains(id),
-                          !liveIds.contains(id) else { continue }
-                    // Keep the state only if the file is actually gone, so a failed
-                    // removal is retried on the next save.
-                    do {
-                        try fm.removeItem(at: url)
-                        writtenSignatures[id] = nil
-                        managedIds.remove(id)
-                        removedAny = true
-                    } catch {
-                        // A failed cleanup is not durable state either: surface it so
-                        // the warning shows and the removal is retried, and let a
-                        // successful retry restore availability below.
-                        failedAny = true
-                        print("⚠️ [ChatSessionStore] failed to remove session \(id): \(error.localizedDescription)")
+            if cleanOrphans {
+                do {
+                    let urls = try fm.contentsOfDirectory(
+                        at: directory,
+                        includingPropertiesForKeys: nil,
+                        options: [.skipsHiddenFiles]
+                    )
+                    enumeratedAny = true
+                    for url in urls where url.pathExtension == "json" {
+                        // Only ever remove conversations this build loaded or wrote.
+                        // Files from a newer schema (or otherwise unrecognized) are not
+                        // managed and must survive untouched.
+                        guard let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent),
+                              managedIds.contains(id),
+                              !liveIds.contains(id) else { continue }
+                        // Keep the state only if the file is actually gone, so a failed
+                        // removal is retried on the next save.
+                        do {
+                            try fm.removeItem(at: url)
+                            writtenSignatures[id] = nil
+                            managedIds.remove(id)
+                            removedAny = true
+                        } catch {
+                            // A failed cleanup is not durable state either: surface it so
+                            // the warning shows and the removal is retried, and let a
+                            // successful retry restore availability below.
+                            failedAny = true
+                            print("⚠️ [ChatSessionStore] failed to remove session \(id): \(error.localizedDescription)")
+                        }
                     }
+                } catch {
+                    // If the directory cannot be listed, deleted conversations are never
+                    // removed and would reappear later, so the pass must not report
+                    // healthy. `managedIds` keeps them queued for the next attempt.
+                    failedAny = true
+                    print("⚠️ [ChatSessionStore] could not enumerate the sessions directory for cleanup: \(error.localizedDescription)")
                 }
-            } catch {
-                // If the directory cannot be listed, deleted conversations are never
-                // removed and would reappear later, so the pass must not report
-                // healthy. `managedIds` keeps them queued for the next attempt.
-                failedAny = true
-                print("⚠️ [ChatSessionStore] could not enumerate the sessions directory for cleanup: \(error.localizedDescription)")
             }
 
             if failedAny {
