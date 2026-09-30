@@ -1227,6 +1227,30 @@ struct ContentView: View {
         ChatSessionStore.shared.saveAll(sessions)
     }
 
+    /// Shown only when the store has nowhere durable to write, so the user is not
+    /// misled into thinking history is being saved.
+    @ViewBuilder
+    private var chatPersistenceWarningBanner: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundColor(.orange)
+                .font(.system(size: 13))
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Chat history can't be saved")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("DynaMoE couldn't open its storage folder, so conversations won't persist between launches.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.14))
+        .overlay(alignment: .bottom) { Divider() }
+    }
+
     var body: some View {
         ZStack {
             NavigationSplitView(columnVisibility: $columnVisibility) {
@@ -1334,6 +1358,11 @@ struct ContentView: View {
                         }
                     }
                 )
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    if !ChatSessionStore.shared.isPersistenceAvailable {
+                        chatPersistenceWarningBanner
+                    }
+                }
             }
 
             if let hud = zoomManager.hudText {
