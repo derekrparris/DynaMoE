@@ -11,6 +11,7 @@
 //
 
 import Foundation
+import CryptoKit
 
 /// Keeps conversations on disk across launches. Durable data lives in
 /// ~/Library/Application Support so it is backed up and never purged like the
@@ -28,12 +29,15 @@ final class ChatSessionStore {
     private let directory: URL?
     private let ioQueue = DispatchQueue(label: "com.dynamoe.chatsessionstore.io", qos: .utility)
 
-    /// Signature of the bytes last **successfully written** per conversation.
-    /// Only updated after a write actually lands, so a failed write (disk full,
-    /// permissions) is retried on the next save instead of being treated as
-    /// already durable. Access is serialized on `ioQueue` and never touched from
-    /// the main actor, which is what makes the unchecked isolation safe.
-    nonisolated(unsafe) private var writtenSignatures: [UUID: Int] = [:]
+    /// Collision-resistant digest of the canonical bytes last **successfully
+    /// written** per conversation. A cryptographic digest (not `hashValue`, whose
+    /// 64 bits could collide and silently skip a changed conversation) is what
+    /// makes "digest matches" a safe stand-in for "bytes unchanged". Only updated
+    /// after a write actually lands, so a failed write (disk full, permissions)
+    /// is retried on the next save instead of being treated as already durable.
+    /// Access is serialized on `ioQueue` and never touched from the main actor,
+    /// which is what makes the unchecked isolation safe.
+    nonisolated(unsafe) private var writtenSignatures: [UUID: SHA256Digest] = [:]
 
     /// Conversations this build is allowed to rewrite or delete: the ones it has
     /// loaded or written. Files for newer, unsupported schema versions (or
@@ -126,7 +130,7 @@ final class ChatSessionStore {
                 managedIds.insert(envelope.session.id)
                 if writtenSignatures[envelope.session.id] == nil,
                    let encoded = try? encoder.encode(envelope) {
-                    writtenSignatures[envelope.session.id] = encoded.hashValue
+                    writtenSignatures[envelope.session.id] = SHA256.hash(data: encoded)
                 }
             } else if let bare = try? decoder.decode(ChatSession.self, from: data) {
                 decoded.append(bare)
@@ -170,7 +174,7 @@ final class ChatSessionStore {
                 guard let data = try? encoder.encode(
                     PersistedChatSession(schemaVersion: ChatSessionStore.currentSchemaVersion, session: session)
                 ) else { continue }
-                let signature = data.hashValue
+                let signature = SHA256.hash(data: data)
                 if writtenSignatures[session.id] == signature {
                     managedIds.insert(session.id)
                     continue

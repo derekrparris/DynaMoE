@@ -11727,6 +11727,27 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertEqual(firstMod, secondMod, "Unchanged conversations should not be rewritten")
     }
 
+    func testChangedSessionContentIsRewritten() {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        var chat = session(title: "Changed", updatedAt: Date())
+        let file = dir.appendingPathComponent("\(chat.id.uuidString).json")
+
+        store.saveAll([chat])
+        store.flushPendingIO()
+        let firstBytes = try? Data(contentsOf: file)
+
+        chat.messages = [ChatMessage(role: .user, content: "brand new content", timestamp: Date())]
+        store.saveAll([chat])
+        store.flushPendingIO()
+        let secondBytes = try? Data(contentsOf: file)
+
+        XCTAssertNotEqual(firstBytes, secondBytes, "Changed content must be rewritten")
+        XCTAssertEqual(store.loadSessions().first?.messages.first?.content, "brand new content")
+    }
+
     func testLoadingSeedsSignaturesSoUnchangedSessionsAreNotRewritten() {
         let dir = makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
