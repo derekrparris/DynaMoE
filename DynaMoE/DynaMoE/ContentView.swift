@@ -1431,6 +1431,9 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
             flushSessionPersist()
+            // flushSessionPersist only enqueues the write; block until the
+            // utility queue drains so the process cannot exit first.
+            ChatSessionStore.shared.flushPendingIO()
         }
         .task {
             while !Task.isCancelled {
