@@ -12281,6 +12281,60 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertEqual(loaded?.count, 0, "A freshly created directory holds no history")
         XCTAssertTrue(FileManager.default.fileExists(atPath: sessionsDir.path))
     }
+
+    func testRestoreNormalizesInterruptedToolCallsAndThinking() {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        var doomed = session(title: "Interrupted", updatedAt: Date())
+        var assistant = ChatMessage(role: .assistant, content: "", isThinking: true)
+        assistant.prefillStatus = "Prefilling..."
+        assistant.toolCalls = [
+            ToolCallRecord(name: "shell_run", status: .running, timestamp: Date()),
+            ToolCallRecord(name: "file_write", status: .awaitingApproval, timestamp: Date()),
+            ToolCallRecord(name: "grep_search", status: .success, output: "ok", timestamp: Date())
+        ]
+        doomed.messages = [assistant]
+        store.saveAll([doomed])
+        store.flushPendingIO()
+
+        let restored = store.loadSessions()?.first
+        XCTAssertNotNil(restored)
+        let message = restored?.messages.first
+        XCTAssertEqual(message?.isThinking, false, "A transient thinking flag must not survive a restore")
+        XCTAssertNil(message?.prefillStatus, "Transient prefill status must not survive a restore")
+        XCTAssertEqual(message?.toolCalls?[0].status, .error, "A running call must restore as a terminal error")
+        XCTAssertEqual(message?.toolCalls?[1].status, .error, "An approval-pending call must restore as a terminal error")
+        XCTAssertNotNil(message?.toolCalls?[0].error)
+        XCTAssertEqual(message?.toolCalls?[2].status, .success, "A completed call must keep its status")
+        XCTAssertEqual(message?.toolCalls?[2].output, "ok")
+    }
+
+    func testSuccessfulLoadRestoresPersistenceAvailability() async throws {
+        let dir = makeTempDirectory()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let store = ChatSessionStore(directory: dir)
+        XCTAssertTrue(store.isPersistenceAvailable)
+
+        // A listing failure reports persistence unavailable...
+        try FileManager.default.setAttributes([.posixPermissions: 0o300], ofItemAtPath: dir.path)
+        XCTAssertNil(store.loadSessions())
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(store.isPersistenceAvailable)
+
+        // ...and a later successful load, even with nothing new to save, must
+        // clear the warning instead of leaving it up until the next edit.
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+        let reloaded = store.loadSessions()
+        XCTAssertNotNil(reloaded)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertTrue(store.isPersistenceAvailable, "A successful load must restore availability")
+    }
 }
 
 

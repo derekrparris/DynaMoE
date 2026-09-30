@@ -172,6 +172,11 @@ final class ChatSessionStore: ObservableObject {
             reportPersistenceAvailability(false)
             return nil
         }
+        // A readable directory is the store working again. Report it here rather
+        // than relying on a later save: the non-empty load path never saves, so a
+        // recovered directory would otherwise leave the warning up until the user
+        // happened to edit a conversation.
+        reportPersistenceAvailability(true)
 
         let decoder = JSONDecoder()
         let encoder = JSONEncoder()
@@ -185,14 +190,14 @@ final class ChatSessionStore: ObservableObject {
             guard let data = try? Data(contentsOf: url) else { continue }
             if let envelope = try? decoder.decode(PersistedChatSession.self, from: data) {
                 guard ChatSessionStore.isSupportedSchema(envelope.schemaVersion) else { continue }
-                decoded.append(envelope.session)
+                decoded.append(ChatSessionStore.normalizedForRestore(envelope.session))
                 managedIds.insert(envelope.session.id)
                 if writtenSignatures[envelope.session.id] == nil,
                    let encoded = try? encoder.encode(envelope) {
                     writtenSignatures[envelope.session.id] = SHA256.hash(data: encoded)
                 }
             } else if let bare = try? decoder.decode(ChatSession.self, from: data) {
-                decoded.append(bare)
+                decoded.append(ChatSessionStore.normalizedForRestore(bare))
                 managedIds.insert(bare.id)
             }
         }
@@ -210,6 +215,34 @@ final class ChatSessionStore: ObservableObject {
     /// ingested and rewritten.
     nonisolated static func isSupportedSchema(_ version: Int) -> Bool {
         version >= 1 && version <= currentSchemaVersion
+    }
+
+    /// Resets runtime-only state on a conversation decoded from disk. A chat
+    /// saved mid-turn can carry a tool call still marked `running` or
+    /// `awaitingApproval` and a transient thinking flag. Restoring those verbatim
+    /// makes the next launch show a call permanently stuck in progress (with an
+    /// approval action that has no continuation to finish it) and a message that
+    /// looks like it is still thinking, so interrupted calls become a terminal
+    /// error and transient flags clear.
+    nonisolated static func normalizedForRestore(_ session: ChatSession) -> ChatSession {
+        var restored = session
+        for idx in restored.messages.indices {
+            restored.messages[idx].isThinking = false
+            restored.messages[idx].prefillStatus = nil
+            guard var calls = restored.messages[idx].toolCalls, !calls.isEmpty else { continue }
+            for cIdx in calls.indices {
+                switch calls[cIdx].status {
+                case .running, .awaitingApproval:
+                    calls[cIdx].status = .error
+                    calls[cIdx].error = "Interrupted when the app closed."
+                    calls[cIdx].output = nil
+                case .success, .error, .rejected:
+                    break
+                }
+            }
+            restored.messages[idx].toolCalls = calls
+        }
+        return restored
     }
 
     // MARK: - Saving

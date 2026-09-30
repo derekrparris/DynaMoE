@@ -997,6 +997,10 @@ struct ContentView: View {
     /// The in-flight engine load, so an async send can wait for the specific
     /// model it needs instead of racing the detached load.
     @State private var modelLoadTask: Task<Void, Never>? = nil
+    /// Monotonic id of the most recent engine load. A stale load consults it and
+    /// refuses to install its engine or clear `isLoadingModel` once a newer
+    /// request has superseded it.
+    @State private var modelLoadToken: UInt64 = 0
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var sessions: [ChatSession] = [
         ChatSession(title: "New Chat")
@@ -1809,7 +1813,7 @@ struct ContentView: View {
         let prior = interruptSendTask
         let token = UUID()
         let operation = Task { @MainActor in
-            await prior?.value
+            _ = await prior?.value
             let result = await self.performInterruptSend(trimmed, sessionId: targetSessionId)
             if self.interruptSendToken == token {
                 self.interruptSendTask = nil
@@ -1987,6 +1991,17 @@ struct ContentView: View {
         // send (leaving the draft intact) until its teardown finishes. Async callers
         // that need to send anyway await `generationTeardownTask` first.
         guard generationTeardownTask == nil else { return false }
+        // The send paths that must run while another turn is active (interrupt,
+        // dequeued prompts) stop it and resolve the model load first, then call
+        // here. A plain send reaching this point with a turn running elsewhere
+        // (the composer's `isGenerating` is session-scoped, so switching chats
+        // exposes the normal send path) would overwrite `generationTask` and race
+        // the shared KV buffers, so reject it.
+        guard !isGeneratingText else { return false }
+        // During a model load the outgoing tokenizer/summary are still non-nil,
+        // so a send could run on the old engine; async callers await the specific
+        // load before calling here.
+        guard !isLoadingModel else { return false }
         // Backstop for the send button's isModelLoaded gate: sending before the
         // engine is ready must not touch chat or harness state — a pre-load
         // prompt was observed to poison later sessions (garbled output even in
@@ -12555,12 +12570,24 @@ if layer.attnGateProjTensor != nil,
     private func loadAndBridgeToMetal(filePath: String) -> Task<Void, Never> {
         self.isLoadingModel = true
         self.metalStatus = "⏳ Loading model engine & zero-copy weights..."
-        
+
+        // Tag this request and chain it onto the previous load: a stale load must
+        // never install its engine over a newer one, and two loads must never
+        // mutate the shared engine/buffer state concurrently.
+        modelLoadToken &+= 1
+        let token = modelLoadToken
+        let previousLoad = modelLoadTask
+
         let memoryExecutionMode = self.memoryExecutionMode
         let memoryBudgetMode = self.memoryBudgetMode
         let shouldPinBackbone = pinBackboneWeights
 
         let loadTask = Task.detached(priority: .userInitiated) {
+            await previousLoad?.value
+            // If a newer load was requested while we waited, skip this stale
+            // request entirely instead of mutating shared state under it.
+            let isStale = await MainActor.run { self.modelLoadToken != token }
+            if isStale { return }
             // Drop file descriptors cached from a previously loaded model; they are
             // keyed by layerIndex only, so a new model with the same layer numbering
             // would otherwise pread the old model's packed expert files.
@@ -12571,6 +12598,7 @@ if layer.attnGateProjTensor != nil,
                 
                 guard let device = MTLCreateSystemDefaultDevice() else {
                     await MainActor.run {
+                        guard self.modelLoadToken == token else { return }
                         self.metalStatus = "❌ Failed to initialize Metal GPU."
                         self.isLoadingModel = false
                     }
@@ -12637,6 +12665,7 @@ if layer.attnGateProjTensor != nil,
                             let fd = open(pinPath.path, O_RDONLY | O_CLOEXEC)
                             if fd >= 0 {
                                 await MainActor.run {
+                                    guard self.modelLoadToken == token else { return }
                                     self.metalStatus = "⚡ Pinning backbone weights (\(String(format: "%.1f", Double(length) / 1073741824.0)) GB) into RAM..."
                                 }
                                 if let elapsed = ExpertIOThreadPool.preadFileIntoBuffer(fd: fd, dst: pinned.contents(), length: length, threads: 8) {
@@ -12662,6 +12691,9 @@ if layer.attnGateProjTensor != nil,
                 }
                 
                 await MainActor.run {
+                    // A newer load superseded this one; drop the result rather than
+                    // replacing the requested engine with this stale one.
+                    guard self.modelLoadToken == token else { return }
                     self.engine = loadedEngine
                     self.summary = loadedSummary
                     self.shardBuffers = buffers
@@ -12702,6 +12734,9 @@ if layer.attnGateProjTensor != nil,
                 }
             } catch {
                 await MainActor.run {
+                    // Only the current load may report its failure; a stale one
+                    // must not clobber the engine a newer load installed.
+                    guard self.modelLoadToken == token else { return }
                     self.errorMessage = "Core Engine Error: \(error.localizedDescription)"
                     self.summary = nil
                     self.engine = nil
