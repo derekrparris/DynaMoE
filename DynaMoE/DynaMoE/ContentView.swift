@@ -919,6 +919,11 @@ struct ContentView: View {
     @State private var activeProfile: ModelProfileType = .coder
     @State private var isGeneratingText: Bool = false
     @State private var generatingSessionId: UUID? = nil
+    /// Session ids whose generation task is still unwinding after the user
+    /// stopped it. `stopAutoregressiveGeneration` flips `isGeneratingText` false
+    /// immediately, but the cancelled task can still append to its session for up
+    /// to one layer, so retention must keep guarding it until the task exits.
+    @State private var cancellingGenerationSessionIds: Set<UUID> = []
     @State private var generatedStreamText: String = ""
     @State private var thinkingText: String = ""
     @State private var responseText: String = ""
@@ -1243,6 +1248,7 @@ struct ContentView: View {
         if isGeneratingText, let generating = generatingSessionId {
             ids.insert(generating)
         }
+        ids.formUnion(cancellingGenerationSessionIds)
         return ids
     }
 
@@ -3604,6 +3610,19 @@ struct ContentView: View {
     }
 
     private func stopAutoregressiveGeneration() {
+        // Shield the generating session from retention *before* flipping
+        // `isGeneratingText` false, since that flip can trigger a retention pass
+        // while the cancelled task is still unwinding and appending to it. The
+        // session stays protected until the task actually exits, then retention
+        // runs again to prune it if it truly fell out of the window.
+        if let cancelled = generationTask, let sessionId = generatingSessionId {
+            cancellingGenerationSessionIds.insert(sessionId)
+            Task { @MainActor in
+                await cancelled.value
+                self.cancellingGenerationSessionIds.remove(sessionId)
+                self.applyChatRetention()
+            }
+        }
         isGeneratingText = false
         generationTask?.cancel()
         generationTask = nil

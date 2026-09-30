@@ -457,8 +457,13 @@ struct ChatDetailView: View {
                             let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
                             guard !trimmed.isEmpty else { return }
                             if let immediate = onSendImmediate {
+                                // Capture the submitted draft so a newer edit made
+                                // while the send is in flight survives.
+                                let submitted = promptText
                                 Task {
-                                    if await immediate(trimmed) { promptText = "" }
+                                    if await immediate(trimmed), promptText == submitted {
+                                        promptText = ""
+                                    }
                                 }
                             } else if onSendMessage(trimmed) {
                                 promptText = ""
@@ -778,8 +783,14 @@ struct ChatDetailView: View {
                                         let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
                                         guard !trimmed.isEmpty else { return }
                                         if let immediate = onSendImmediate {
+                                            // Capture the submitted draft so a newer
+                                            // edit made while the send is in flight
+                                            // survives.
+                                            let submitted = promptText
                                             Task {
-                                                if await immediate(trimmed) { promptText = "" }
+                                                if await immediate(trimmed), promptText == submitted {
+                                                    promptText = ""
+                                                }
                                             }
                                         } else if onSendMessage(trimmed) {
                                             promptText = ""
