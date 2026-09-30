@@ -994,6 +994,9 @@ struct ContentView: View {
     @ObservedObject var localModelManager: LocalModelManager = LocalModelManager.shared
     @State private var activeLoadedModelPath: String? = nil
     @State private var isLoadingModel: Bool = false
+    /// The in-flight engine load, so an async send can wait for the specific
+    /// model it needs instead of racing the detached load.
+    @State private var modelLoadTask: Task<Void, Never>? = nil
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var sessions: [ChatSession] = [
         ChatSession(title: "New Chat")
@@ -1010,6 +1013,11 @@ struct ContentView: View {
     @AppStorage("dynamoe_chat_auto_delete_enabled") private var chatAutoDeleteEnabled: Bool = true
     @AppStorage("dynamoe_chat_retention_limit") private var chatRetentionLimit: Int = 10
     @State private var hasLoadedPersistedSessions: Bool = false
+    /// True once the first history-load attempt has finished, whether it
+    /// succeeded or failed. Gates in-memory chat readiness so a persistence
+    /// outage does not leave the chat UI unable to send, while
+    /// `hasLoadedPersistedSessions` still guards the merge and orphan cleanup.
+    @State private var hasAttemptedInitialLoad: Bool = false
     @State private var isLoadingPersistedSessions: Bool = false
     @State private var sessionPersistTask: Task<Void, Never>? = nil
     @State private var hasPendingSessionPersist: Bool = false
@@ -1101,6 +1109,43 @@ struct ContentView: View {
         return defaultThinkingEnabled
     }
 
+    /// Display name for a specific conversation's model. An async send that
+    /// resumed after the user switched chats must format with the model it is
+    /// actually running on, not whatever is selected now.
+    private func modelDisplayName(for session: ChatSession?) -> String? {
+        if let name = session?.selectedModelName, !name.isEmpty { return name }
+        return activeModelDisplayName
+    }
+
+    /// Whether a specific conversation's model supports thinking, derived from
+    /// that conversation rather than the current selection.
+    private func supportsThinking(for session: ChatSession?) -> Bool {
+        if ModelConfig.supportsThinking(
+            config: modelConfig,
+            summary: summary,
+            modelName: modelDisplayName(for: session),
+            modelPath: session?.selectedModelPath ?? activeLoadedModelPath
+        ) {
+            return true
+        }
+        if let session,
+           let model = localModelManager.discoveredModels.first(where: {
+               $0.id == (session.selectedModelId ?? "") || $0.snapshotPath == (session.selectedModelPath ?? "")
+           }),
+           model.supportsThinking {
+            return true
+        }
+        return ModelConfig.supportsThinking(
+            modelName: session?.selectedModelName,
+            modelPath: session?.selectedModelPath
+        )
+    }
+
+    /// Thinking toggle for a specific conversation, defaulting to the app default.
+    private func isThinkingEnabled(for session: ChatSession?) -> Bool {
+        session?.isThinkingEnabled ?? defaultThinkingEnabled
+    }
+
     var activeSessionBinding: Binding<ChatSession?> {
         Binding<ChatSession?>(
             get: {
@@ -1163,7 +1208,11 @@ struct ContentView: View {
         ModelProfileManager.shared.saveProfile(for: modelKey, type: profile, settings: settings)
     }
 
-    private func switchModel(to model: DiscoveredModel, sessionId: UUID? = nil) {
+    /// Starts a model switch. Returns the task that finishes once the requested
+    /// model's engine and buffers are installed (or the load fails), so callers
+    /// that must run against the new model can await it; UI callers ignore it.
+    @discardableResult
+    private func switchModel(to model: DiscoveredModel, sessionId: UUID? = nil) -> Task<Void, Never>? {
         // Capture the conversation this switch is for before any suspension, so
         // a deferred switch still records the model on the intended session even
         // if the user selects another conversation while it waits.
@@ -1180,20 +1229,21 @@ struct ContentView: View {
             // reset the shared buffers out from under it, so wait for the teardown
             // and re-enter: a generation may have started during the wait, and
             // this must stop it before swapping rather than completing over it.
-            Task { @MainActor in
+            return Task { @MainActor in
                 await teardown.value
-                self.switchModel(to: model, sessionId: targetSessionId)
+                await self.switchModel(to: model, sessionId: targetSessionId)?.value
             }
-            return
         }
-        completeModelSwitch(to: model, sessionId: targetSessionId)
+        return completeModelSwitch(to: model, sessionId: targetSessionId)
     }
 
     /// The non-suspending half of a model switch. Runs only once no cancelled
-    /// generation is still using the shared engine and buffers.
-    private func completeModelSwitch(to model: DiscoveredModel, sessionId targetSessionId: UUID?) {
+    /// generation is still using the shared engine and buffers, and returns the
+    /// load task so a caller can wait for that specific model to be ready.
+    @discardableResult
+    private func completeModelSwitch(to model: DiscoveredModel, sessionId targetSessionId: UUID?) -> Task<Void, Never> {
         PrefixCacheManager.shared.invalidate()
-        loadAndBridgeToMetal(filePath: model.snapshotPath)
+        let loadTask = loadAndBridgeToMetal(filePath: model.snapshotPath)
         activeLoadedModelPath = model.snapshotPath
         localModelManager.setLastUsedModel(id: model.id)
         if let sid = targetSessionId,
@@ -1204,26 +1254,39 @@ struct ContentView: View {
         }
         let preferredProfile = ModelProfileManager.shared.getActiveProfile(for: model.id)
         applyProfile(preferredProfile, for: model.id)
+        return loadTask
     }
 
-    /// Makes the model a conversation expects the active one before an async
-    /// send. A send that waited out a teardown can resume after the user selected
-    /// another chat and ran `switchModel`, which would otherwise leave the
-    /// replacement turn running against the newly loaded model while targeting
-    /// the old conversation.
-    private func ensureModelLoaded(forSession sessionId: UUID?) {
+    /// Makes the model a conversation expects the active one, and waits for it to
+    /// finish installing, before an async send. A send that waited out a teardown
+    /// can resume after the user selected another chat and ran `switchModel`,
+    /// which would otherwise leave the replacement turn running against the newly
+    /// loaded model while targeting the old conversation. The await matters
+    /// because `loadAndBridgeToMetal` returns while the previous engine and
+    /// buffers are still installed.
+    private func ensureModelLoaded(forSession sessionId: UUID?) async {
         guard let sessionId,
               let session = sessions.first(where: { $0.id == sessionId }),
               let targetPath = session.selectedModelPath,
-              !targetPath.isEmpty,
-              activeLoadedModelPath != targetPath else { return }
+              !targetPath.isEmpty else { return }
+        if activeLoadedModelPath == targetPath {
+            // The engine for this path may still be installing; wait for that
+            // specific load rather than sending against the previous model.
+            if isLoadingModel { await modelLoadTask?.value }
+            return
+        }
         if let model = localModelManager.getModel(byId: targetPath) ?? localModelManager.getModel(byId: session.selectedModelId ?? "") {
-            switchModel(to: model)
+            await switchModel(to: model, sessionId: sessionId)?.value
         } else {
-            loadAndBridgeToMetal(filePath: targetPath)
+            PrefixCacheManager.shared.invalidate()
+            let loadTask = loadAndBridgeToMetal(filePath: targetPath)
             activeLoadedModelPath = targetPath
+            if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
+                sessions[idx].selectedModelPath = targetPath
+            }
             let preferredProfile = ModelProfileManager.shared.getActiveProfile(for: targetPath)
             applyProfile(preferredProfile, for: targetPath)
+            await loadTask.value
         }
     }
 
@@ -1238,16 +1301,14 @@ struct ContentView: View {
         guard !hasLoadedPersistedSessions, !isLoadingPersistedSessions else { return }
         isLoadingPersistedSessions = true
 
-        // Saves stay suppressed until `hasLoadedPersistedSessions` flips below,
-        // so no in-flight placeholder snapshot can reach the store while the
-        // load is still populating `managedIds`.
-        let preExistingIds = Set(sessions.map(\.id))
         guard let loaded = await ChatSessionStore.shared.loadSessionsAsync() else {
             // The store could not read its history, so an empty result here
-            // cannot be told apart from a failed read. Leave loading incomplete
-            // (and thus retryable) instead of replacing the visible
-            // conversations with nothing; the store's own availability banner
-            // tells the user persistence is down.
+            // cannot be told apart from a failed read. Leave the persistence load
+            // incomplete (and thus retryable) instead of replacing the visible
+            // conversations with nothing, but mark the initial attempt as done so
+            // the user can still chat; the store's own availability banner tells
+            // them persistence is down.
+            hasAttemptedInitialLoad = true
             isLoadingPersistedSessions = false
             return
         }
@@ -1255,6 +1316,7 @@ struct ContentView: View {
         if loaded.isEmpty {
             // Nothing on disk yet: the in-memory session becomes the starting
             // point rather than being discarded.
+            hasAttemptedInitialLoad = true
             hasLoadedPersistedSessions = true
             isLoadingPersistedSessions = false
             ChatSessionStore.shared.saveAll(sessions)
@@ -1262,19 +1324,22 @@ struct ContentView: View {
             return
         }
 
-        // Preserve anything the user started while the load was in flight instead
-        // of clobbering it with the persisted set.
+        // Preserve every in-memory conversation the user actually used while the
+        // load was pending or after a failed attempt, so a retry that finally
+        // succeeds does not discard their work. The empty launch placeholder (no
+        // messages) is dropped instead of being merged as a duplicate.
         let loadedIds = Set(loaded.map(\.id))
-        let createdWhileLoading = sessions.filter { !loadedIds.contains($0.id) && !preExistingIds.contains($0.id) }
+        let inMemoryOnly = sessions.filter { !loadedIds.contains($0.id) && !$0.messages.isEmpty }
 
-        sessions = createdWhileLoading + loaded
+        sessions = inMemoryOnly + loaded
         selectedSessionId = sessions.first?.id
 
+        hasAttemptedInitialLoad = true
         hasLoadedPersistedSessions = true
         isLoadingPersistedSessions = false
 
-        // Conversations created during loading were never written; persist now.
-        if !createdWhileLoading.isEmpty {
+        // Conversations kept from memory were never written; persist now.
+        if !inMemoryOnly.isEmpty {
             ChatSessionStore.shared.saveAll(sessions)
         }
         applyChatRetention()
@@ -1331,37 +1396,41 @@ struct ContentView: View {
     /// Coalesces the rapid session mutations that happen during streaming into a
     /// single disk write once the conversation settles.
     private func scheduleSessionPersist() {
-        guard hasLoadedPersistedSessions else { return }
+        // Wait for the first load attempt so a save never races the load, but do
+        // not require it to have succeeded: with persistence down the user can
+        // still chat, and those conversations must still reach disk when it
+        // recovers.
+        guard hasAttemptedInitialLoad else { return }
         hasPendingSessionPersist = true
         sessionPersistTask?.cancel()
         sessionPersistTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 800_000_000)
             guard !Task.isCancelled else { return }
             self.hasPendingSessionPersist = false
-            ChatSessionStore.shared.saveAll(self.sessions)
+            // Orphan cleanup is only safe once the load has populated
+            // `managedIds`; before that it would delete not-yet-loaded files.
+            ChatSessionStore.shared.saveAll(self.sessions, cleanOrphans: self.hasLoadedPersistedSessions)
         }
     }
 
     /// Writes immediately, used when the app leaves the foreground or quits so
     /// an in-flight conversation is not lost. No-op when nothing is pending.
     private func flushSessionPersist() {
-        guard hasLoadedPersistedSessions else {
-            // The initial load may still be in flight, so any conversations the
-            // user created during it have never been persisted. Write them now
-            // without the orphan-cleanup pass: `managedIds` is not populated
-            // yet, so cleanup would treat the not-yet-merged files on disk as
-            // deleted conversations and remove them.
-            ChatSessionStore.shared.saveAll(sessions, cleanOrphans: false)
-            return
+        if hasLoadedPersistedSessions {
+            guard hasPendingSessionPersist else { return }
         }
-        guard hasPendingSessionPersist else { return }
         sessionPersistTask?.cancel()
         hasPendingSessionPersist = false
-        ChatSessionStore.shared.saveAll(sessions)
+        // Before the load has populated `managedIds`, skip orphan cleanup: it
+        // would treat the not-yet-merged files on disk as deleted conversations
+        // and remove them. Writing without cleanup is safe and is what preserves
+        // conversations created while the load was still running (or failed).
+        ChatSessionStore.shared.saveAll(sessions, cleanOrphans: hasLoadedPersistedSessions)
     }
 
-    /// Shown only when the store has nowhere durable to write, so the user is not
-    /// misled into thinking history is being saved.
+    /// Shown when the store reports persistence as unavailable. The specific
+    /// cause varies (unopenable folder, a failed write, encoding failure, failed
+    /// cleanup), so the message stays generic rather than blaming the folder.
     @ViewBuilder
     private var chatPersistenceWarningBanner: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -1371,7 +1440,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text("Chat history can't be saved")
                     .font(.system(size: 12, weight: .semibold))
-                Text("DynaMoE couldn't open its storage folder, so conversations won't persist between launches.")
+                Text("DynaMoE couldn't save chat history. Recent conversations may not persist between launches.")
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
             }
@@ -1701,7 +1770,7 @@ struct ContentView: View {
     }
 
     private func handleQueuePrompt(_ text: String) -> Bool {
-        guard hasLoadedPersistedSessions else { return false }
+        guard hasAttemptedInitialLoad else { return false }
         guard let currentSessionId = selectedSessionId ?? sessions.first?.id else { return false }
         guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1729,7 +1798,7 @@ struct ContentView: View {
     /// operation instead of starting its own replacement, which would reset the
     /// shared KV buffers the cancelled task may still be using.
     private func interruptAndSendMessage(_ text: String) async -> Bool {
-        guard hasLoadedPersistedSessions else { return false }
+        guard hasAttemptedInitialLoad else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         // Capture the conversation before any suspension, so a send that waits
@@ -1756,6 +1825,11 @@ struct ContentView: View {
     /// The body of an interrupt send, run only after any earlier one completes.
     private func performInterruptSend(_ trimmed: String, sessionId targetSessionId: UUID?) async -> Bool {
         guard isGeneratingText || generationTeardownTask != nil else {
+            // Nothing to interrupt, but the target's model must still be the
+            // loaded one (the user may have switched chats since the send was
+            // requested), and that load must finish before the turn starts.
+            await ensureModelLoaded(forSession: targetSessionId)
+            guard !isGeneratingText else { return false }
             return handleSendMessage(trimmed, sessionId: targetSessionId)
         }
         print("⏹ [INT] interrupt requested — cancelling current generation and sending a fresh turn")
@@ -1786,10 +1860,16 @@ struct ContentView: View {
             accepted = false
         } else {
             // The user may have switched conversations (and models) during the
-            // wait; make the target's model active so the replacement turn runs
-            // against the one the conversation expects.
-            ensureModelLoaded(forSession: targetSessionId)
-            accepted = handleSendMessage(trimmed, sessionId: targetSessionId)
+            // wait; make the target's model active and loaded so the replacement
+            // turn runs against the one the conversation expects.
+            await ensureModelLoaded(forSession: targetSessionId)
+            // The load suspends, so another turn may have started; starting ours
+            // too would run two generations against the shared KV buffers.
+            if isGeneratingText {
+                accepted = false
+            } else {
+                accepted = handleSendMessage(trimmed, sessionId: targetSessionId)
+            }
         }
         if let targetSessionId {
             releaseRetentionProtection(targetSessionId)
@@ -1822,8 +1902,10 @@ struct ContentView: View {
             if self.isGeneratingText {
                 self.requeuePromptFront(next, sessionId: currentSessionId)
             } else {
-                self.ensureModelLoaded(forSession: currentSessionId)
-                if !self.handleSendMessage(next.text, sessionId: currentSessionId) {
+                await self.ensureModelLoaded(forSession: currentSessionId)
+                // The load suspends, so a turn may have started; requeue instead
+                // of running two generations against the shared KV buffers.
+                if self.isGeneratingText || !self.handleSendMessage(next.text, sessionId: currentSessionId) {
                     self.requeuePromptFront(next, sessionId: currentSessionId)
                 }
             }
@@ -1895,9 +1977,11 @@ struct ContentView: View {
     /// suspending, so a send started in chat A cannot land in chat B if the user
     /// switches selection while the caller is awaiting.
     private func handleSendMessage(_ text: String, sessionId explicitSessionId: UUID? = nil) -> Bool {
-        // Never touch chat state before persisted sessions finish loading, or the
-        // turn could land in a placeholder the load then replaces.
-        guard hasLoadedPersistedSessions else { return false }
+        // Wait for the first load attempt before touching chat state, or the turn
+        // could land in the launch placeholder the merge then replaces. The load
+        // need not have succeeded: with persistence down the user can still chat,
+        // and the merge preserves any in-memory conversation with real messages.
+        guard hasAttemptedInitialLoad else { return false }
         // A stopped generation may still be unwinding. Starting now would reset the
         // shared KV buffers the cancelled task can still be using, so reject the
         // send (leaving the draft intact) until its teardown finishes. Async callers
@@ -1926,8 +2010,12 @@ struct ContentView: View {
             sessions[sessionIdx].createdAt = Date()
         }
         
-        let modelSupportsThinking = activeModelSupportsThinking
-        let thinkingEnabled = (sessions[sessionIdx].isThinkingEnabled ?? defaultThinkingEnabled) && modelSupportsThinking
+        // Derive thinking/model from this conversation, not the current
+        // selection: an async send may have resumed after the user switched chats.
+        let sendSession = sessions[sessionIdx]
+        let sessionModelName = modelDisplayName(for: sendSession)
+        let modelSupportsThinking = supportsThinking(for: sendSession)
+        let thinkingEnabled = isThinkingEnabled(for: sendSession) && modelSupportsThinking
 
         let assistantMsgId = UUID()
         let assistantMsg = ChatMessage(id: assistantMsgId, role: .assistant, content: "", thinkingContent: nil, isThinking: thinkingEnabled)
@@ -1940,7 +2028,7 @@ struct ContentView: View {
             userPrompt: systemPrompt,
             config: modelConfig,
             summary: summary,
-            modelName: activeModelDisplayName,
+            modelName: sessionModelName,
             modelPath: activeLoadedModelPath,
             currentDate: conversationDate
         ).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1949,7 +2037,7 @@ struct ContentView: View {
         if agentToolsEnabled {
             effectiveSystem = AgentHarness.shared.buildSystemPrompt(
                 baseSystem: effectiveSystem,
-                modelName: activeModelDisplayName,
+                modelName: sessionModelName,
                 currentDate: conversationDate,
                 isLingModel: modelConfig?.isLingModel == true
             )
@@ -3961,17 +4049,22 @@ struct ContentView: View {
             generationDate = Date()
         }
 
+        // Derive model/thinking from the session this generation belongs to, not
+        // the current selection, so an async send that resumed after a selection
+        // change still formats with the conversation's own model.
+        let generationSession = sessionId.flatMap { id in sessions.first(where: { $0.id == id }) }
+        let generationModelName = modelDisplayName(for: generationSession)
         let cleanSystem = ModelConfig.buildEffectiveSystemPrompt(
             userPrompt: systemPrompt,
             config: modelConfig,
             summary: summary,
-            modelName: activeModelDisplayName,
+            modelName: generationModelName,
             modelPath: activeLoadedModelPath,
             currentDate: generationDate
         ).trimmingCharacters(in: .whitespacesAndNewlines)
 
-        let modelSupportsThinking = activeModelSupportsThinking
-        let thinkingEnabled = isThinkingEnabledForActiveSession && modelSupportsThinking
+        let modelSupportsThinking = supportsThinking(for: generationSession)
+        let thinkingEnabled = isThinkingEnabled(for: generationSession) && modelSupportsThinking
 
         let thinkSuffix: String
         if thinkingEnabled {
@@ -12455,7 +12548,11 @@ if layer.attnGateProjTensor != nil,
         syncSettingsWindowIfNeeded()
     }
 
-    private func loadAndBridgeToMetal(filePath: String) {
+    /// Starts loading a model's engine, summary, and Metal buffers. Returns the
+    /// load task so callers that must run against the new model can await the
+    /// specific load instead of racing it; UI callers ignore the result.
+    @discardableResult
+    private func loadAndBridgeToMetal(filePath: String) -> Task<Void, Never> {
         self.isLoadingModel = true
         self.metalStatus = "⏳ Loading model engine & zero-copy weights..."
         
@@ -12463,7 +12560,7 @@ if layer.attnGateProjTensor != nil,
         let memoryBudgetMode = self.memoryBudgetMode
         let shouldPinBackbone = pinBackboneWeights
 
-        Task.detached(priority: .userInitiated) {
+        let loadTask = Task.detached(priority: .userInitiated) {
             // Drop file descriptors cached from a previously loaded model; they are
             // keyed by layerIndex only, so a new model with the same layer numbering
             // would otherwise pread the old model's packed expert files.
@@ -12614,6 +12711,8 @@ if layer.attnGateProjTensor != nil,
                 }
             }
         }
+        modelLoadTask = loadTask
+        return loadTask
     }
 
     private func executeGpuShader(on tensor: TensorMetadata) {

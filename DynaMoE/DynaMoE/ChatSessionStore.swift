@@ -149,6 +149,17 @@ final class ChatSessionStore: ObservableObject {
     /// surfaced (and persisted as unavailable) and the caller can retry.
     nonisolated private func loadSessionsLocked(in directory: URL) -> [ChatSession]? {
         let fm = FileManager()
+        // Retry directory creation before listing, exactly as the save path does.
+        // A launch-time creation failure otherwise makes every retry enumerate a
+        // still-missing directory and fail again, so restoring access while the
+        // app stays open could never recover the history.
+        do {
+            try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        } catch {
+            print("⚠️ [ChatSessionStore] could not open the sessions directory for reading: \(error.localizedDescription)")
+            reportPersistenceAvailability(false)
+            return nil
+        }
         let urls: [URL]
         do {
             urls = try fm.contentsOfDirectory(

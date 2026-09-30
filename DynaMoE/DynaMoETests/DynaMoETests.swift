@@ -12257,6 +12257,30 @@ final class ChatSessionPersistenceTests: XCTestCase {
             "The in-memory conversation must still be written"
         )
     }
+
+    func testLoadRetryRecreatesMissingSessionsDirectory() {
+        let parent = makeTempDirectory()
+        let sessionsDir = parent.appendingPathComponent("sessions", isDirectory: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parent.path)
+            try? FileManager.default.removeItem(at: parent)
+        }
+        // Parent not writable, so the sessions directory cannot be created.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: parent.path)
+
+        let store = ChatSessionStore(directory: sessionsDir)
+        XCTAssertFalse(store.isPersistenceAvailable, "An uncreatable directory starts unavailable")
+        XCTAssertNil(store.loadSessions(), "A load must fail while the directory cannot be created")
+
+        // Restore access while the app is still running: the next load must
+        // recreate the directory and succeed instead of enumerating a missing
+        // directory forever.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parent.path)
+        let loaded = store.loadSessions()
+        XCTAssertNotNil(loaded, "A load retry must recreate the directory and succeed")
+        XCTAssertEqual(loaded?.count, 0, "A freshly created directory holds no history")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sessionsDir.path))
+    }
 }
 
 
