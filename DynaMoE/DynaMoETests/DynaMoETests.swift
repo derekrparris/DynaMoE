@@ -12141,6 +12141,36 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertTrue(store.isPersistenceAvailable, "A successful cleanup retry must restore availability")
         XCTAssertFalse(FileManager.default.fileExists(atPath: removedFile.path))
     }
+
+    func testEnumerationFailureDuringCleanupAffectsAvailabilityAndRecovers() async throws {
+        let dir = makeTempDirectory()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let store = ChatSessionStore(directory: dir)
+        let kept = session(title: "Kept", updatedAt: Date())
+        store.saveAll([kept])
+        store.flushPendingIO()
+        XCTAssertTrue(store.isPersistenceAvailable)
+
+        // Write + execute but no read: the unchanged write is skipped and the
+        // directory cannot be listed, so cleanup silently failing must not read
+        // as healthy.
+        try FileManager.default.setAttributes([.posixPermissions: 0o300], ofItemAtPath: dir.path)
+        store.saveAll([kept])
+        store.flushPendingIO()
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(store.isPersistenceAvailable, "A failed cleanup enumeration must mark persistence unavailable")
+
+        // Restoring read access lets the next pass list the directory and recover.
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+        store.saveAll([kept])
+        store.flushPendingIO()
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertTrue(store.isPersistenceAvailable, "A successful retry must restore availability")
+    }
 }
 
 

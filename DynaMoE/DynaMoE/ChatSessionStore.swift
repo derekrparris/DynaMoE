@@ -219,6 +219,7 @@ final class ChatSessionStore: ObservableObject {
             // availability too, so `removedAny` counts alongside `wroteAny`.
             var wroteAny = false
             var removedAny = false
+            var enumeratedAny = false
             var failedAny = false
 
             for session in snapshot {
@@ -259,11 +260,13 @@ final class ChatSessionStore: ObservableObject {
                 }
             }
 
-            if let urls = try? fm.contentsOfDirectory(
-                at: directory,
-                includingPropertiesForKeys: nil,
-                options: [.skipsHiddenFiles]
-            ) {
+            do {
+                let urls = try fm.contentsOfDirectory(
+                    at: directory,
+                    includingPropertiesForKeys: nil,
+                    options: [.skipsHiddenFiles]
+                )
+                enumeratedAny = true
                 for url in urls where url.pathExtension == "json" {
                     // Only ever remove conversations this build loaded or wrote.
                     // Files from a newer schema (or otherwise unrecognized) are not
@@ -286,11 +289,17 @@ final class ChatSessionStore: ObservableObject {
                         print("⚠️ [ChatSessionStore] failed to remove session \(id): \(error.localizedDescription)")
                     }
                 }
+            } catch {
+                // If the directory cannot be listed, deleted conversations are never
+                // removed and would reappear later, so the pass must not report
+                // healthy. `managedIds` keeps them queued for the next attempt.
+                failedAny = true
+                print("⚠️ [ChatSessionStore] could not enumerate the sessions directory for cleanup: \(error.localizedDescription)")
             }
 
             if failedAny {
                 reportPersistenceAvailability(false)
-            } else if wroteAny || removedAny {
+            } else if wroteAny || removedAny || enumeratedAny {
                 reportPersistenceAvailability(true)
             }
         }

@@ -1668,12 +1668,16 @@ struct ContentView: View {
         guard hasLoadedPersistedSessions else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
+        // Capture the conversation before any suspension, so a send that waits
+        // behind an earlier interrupt still lands in the chat that was active
+        // when the user pressed send, not whatever is selected once it runs.
+        let targetSessionId = selectedSessionId ?? sessions.first?.id
 
         let prior = interruptSendTask
         let token = UUID()
         let operation = Task { @MainActor in
             await prior?.value
-            let result = await self.performInterruptSend(trimmed)
+            let result = await self.performInterruptSend(trimmed, sessionId: targetSessionId)
             if self.interruptSendToken == token {
                 self.interruptSendTask = nil
                 self.interruptSendToken = nil
@@ -1686,11 +1690,7 @@ struct ContentView: View {
     }
 
     /// The body of an interrupt send, run only after any earlier one completes.
-    private func performInterruptSend(_ trimmed: String) async -> Bool {
-        // Resolve the target conversation before suspending: the user may switch
-        // chats while we wait for the cancelled generation to stop, and the
-        // replacement turn must still land in the conversation that was active.
-        let targetSessionId = selectedSessionId ?? sessions.first?.id
+    private func performInterruptSend(_ trimmed: String, sessionId targetSessionId: UUID?) async -> Bool {
         guard isGeneratingText || generationTeardownTask != nil else {
             return handleSendMessage(trimmed, sessionId: targetSessionId)
         }
@@ -1734,6 +1734,9 @@ struct ContentView: View {
             // Smooth transition to next turn. The conversation is pinned and the
             // id captured, so a selection change cannot misroute the send.
             try? await Task.sleep(nanoseconds: 80_000_000)
+            // A stopped generation may still be winding down; wait for it so the
+            // send is not rejected and the already-dequeued prompt is not lost.
+            await self.generationTeardownTask?.value
             _ = self.handleSendMessage(next.text, sessionId: currentSessionId)
             self.releaseRetentionProtection(currentSessionId)
             self.applyChatRetention()
@@ -1797,6 +1800,11 @@ struct ContentView: View {
         // Never touch chat state before persisted sessions finish loading, or the
         // turn could land in a placeholder the load then replaces.
         guard hasLoadedPersistedSessions else { return false }
+        // A stopped generation may still be unwinding. Starting now would reset the
+        // shared KV buffers the cancelled task can still be using, so reject the
+        // send (leaving the draft intact) until its teardown finishes. Async callers
+        // that need to send anyway await `generationTeardownTask` first.
+        guard generationTeardownTask == nil else { return false }
         // Backstop for the send button's isModelLoaded gate: sending before the
         // engine is ready must not touch chat or harness state — a pre-load
         // prompt was observed to poison later sessions (garbled output even in
