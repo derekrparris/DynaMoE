@@ -928,6 +928,15 @@ struct ContentView: View {
     /// session at once, and either releasing first must not drop the guard the
     /// other still needs.
     @State private var retentionProtectionCounts: [UUID: Int] = [:]
+    /// The task waiting for a cancelled generation to actually exit before its
+    /// replacement may start. Held so a second interrupt can await the same
+    /// teardown instead of launching a replacement while the old task still uses
+    /// the shared KV buffers.
+    @State private var generationTeardownTask: Task<Void, Never>? = nil
+    /// The in-flight interrupt-and-send operation, chained so concurrent
+    /// immediate sends run one after another rather than racing on cancellation.
+    @State private var interruptSendTask: Task<Bool, Never>? = nil
+    @State private var interruptSendToken: UUID? = nil
     @State private var generatedStreamText: String = ""
     @State private var thinkingText: String = ""
     @State private var responseText: String = ""
@@ -1650,18 +1659,45 @@ struct ContentView: View {
     /// this waits for the cancelled generation to stop and reports the result of
     /// the replacement send, so a caller only clears/removes the prompt once the
     /// new turn has actually started.
+    ///
+    /// Interrupts are serialized: a second immediate send that arrives while the
+    /// first is still waiting for its cancelled task chains onto the in-flight
+    /// operation instead of starting its own replacement, which would reset the
+    /// shared KV buffers the cancelled task may still be using.
     private func interruptAndSendMessage(_ text: String) async -> Bool {
         guard hasLoadedPersistedSessions else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
+
+        let prior = interruptSendTask
+        let token = UUID()
+        let operation = Task { @MainActor in
+            await prior?.value
+            let result = await self.performInterruptSend(trimmed)
+            if self.interruptSendToken == token {
+                self.interruptSendTask = nil
+                self.interruptSendToken = nil
+            }
+            return result
+        }
+        interruptSendTask = operation
+        interruptSendToken = token
+        return await operation.value
+    }
+
+    /// The body of an interrupt send, run only after any earlier one completes.
+    private func performInterruptSend(_ trimmed: String) async -> Bool {
         // Resolve the target conversation before suspending: the user may switch
         // chats while we wait for the cancelled generation to stop, and the
         // replacement turn must still land in the conversation that was active.
         let targetSessionId = selectedSessionId ?? sessions.first?.id
-        guard isGeneratingText else { return handleSendMessage(trimmed, sessionId: targetSessionId) }
+        guard isGeneratingText || generationTeardownTask != nil else {
+            return handleSendMessage(trimmed, sessionId: targetSessionId)
+        }
         print("⏹ [INT] interrupt requested — cancelling current generation and sending a fresh turn")
         let previous = generationTask
         stopAutoregressiveGeneration()
+        let teardown = generationTeardownTask
         // Hold our own pin on the target across the wait: `stopAutoregressiveGeneration`
         // schedules a cleanup that releases its pin once the cancelled task exits,
         // which can run before this replacement send and leave the target prunable.
@@ -1676,6 +1712,7 @@ struct ContentView: View {
         // loops check cancellation at every layer boundary, so this bounds the
         // wait to one layer (one token during decode).
         await previous?.value
+        await teardown?.value
         let accepted = handleSendMessage(trimmed, sessionId: targetSessionId)
         if let targetSessionId {
             releaseRetentionProtection(targetSessionId)
@@ -1689,12 +1726,17 @@ struct ContentView: View {
         guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return }
         guard !sessions[sessionIdx].queuedPrompts.isEmpty else { return }
         let next = sessions[sessionIdx].queuedPrompts.removeFirst()
+        // Pin the conversation across the delay: once generation has ended the
+        // retention observer can prune a background conversation during the
+        // sleep, which would make the send fail and drop the dequeued prompt.
+        retainRetentionProtection(currentSessionId)
         Task { @MainActor in
-            // Smooth transition to next turn. Pin the conversation resolved above:
-            // the sleep can span a selection change, and the dequeued prompt must
-            // run in the conversation it was queued for.
+            // Smooth transition to next turn. The conversation is pinned and the
+            // id captured, so a selection change cannot misroute the send.
             try? await Task.sleep(nanoseconds: 80_000_000)
             _ = self.handleSendMessage(next.text, sessionId: currentSessionId)
+            self.releaseRetentionProtection(currentSessionId)
+            self.applyChatRetention()
         }
     }
 
@@ -3656,11 +3698,13 @@ struct ContentView: View {
         // runs again to prune it if it truly fell out of the window.
         if let cancelled = generationTask, let sessionId = generatingSessionId {
             retainRetentionProtection(sessionId)
-            Task { @MainActor in
+            let teardown = Task { @MainActor in
                 await cancelled.value
                 self.releaseRetentionProtection(sessionId)
                 self.applyChatRetention()
+                self.generationTeardownTask = nil
             }
+            generationTeardownTask = teardown
         }
         isGeneratingText = false
         generationTask?.cancel()
@@ -11233,6 +11277,11 @@ if layer.attnGateProjTensor != nil,
 
                                 self.sessions[sIdx].messages[mIdx].thinkingContent = combinedThinking
                                 self.sessions[sIdx].messages[mIdx].content = combinedContent
+                                // Keep activity fresh while a turn streams: the
+                                // message timestamp is otherwise frozen at
+                                // placeholder creation, so a long response would
+                                // look stale to retention as soon as it finishes.
+                                self.sessions[sIdx].messages[mIdx].timestamp = Date()
                                 self.sessions[sIdx].messages[mIdx].isThinking = activeThink
                                 self.sessions[sIdx].messages[mIdx].tokenCount = tokensGenerated
                                 self.sessions[sIdx].messages[mIdx].tokensPerSec = tokPerSec
@@ -11452,6 +11501,7 @@ if layer.attnGateProjTensor != nil,
 
                         self.sessions[sIdx].messages[mIdx].thinkingContent = combinedFinalThinking
                         self.sessions[sIdx].messages[mIdx].content = combinedFinalContent
+                        self.sessions[sIdx].messages[mIdx].timestamp = Date()
                         self.sessions[sIdx].messages[mIdx].isThinking = false
                         self.sessions[sIdx].messages[mIdx].tokenCount = tokensGenerated
                         self.sessions[sIdx].messages[mIdx].tokensPerSec = finalTokPerSec
