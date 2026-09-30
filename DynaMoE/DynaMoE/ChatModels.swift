@@ -209,7 +209,7 @@ public extension ChatSession {
     /// not touch it, so it cannot mean "last used". Message and queued-prompt
     /// timestamps are maintained on those paths, so prefer the newest of them and
     /// only fall back to `updatedAt`/`createdAt`.
-    var lastActivityAt: Date {
+    nonisolated var lastActivityAt: Date {
         var latest = max(updatedAt, createdAt)
         for message in messages {
             latest = max(latest, message.timestamp)

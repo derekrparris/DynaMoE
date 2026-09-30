@@ -215,7 +215,7 @@ final class ChatSessionStore {
     ///   most-recent window, so the user is never yanked out of an open chat.
     /// - Returns the originals in their existing order, split into survivors
     ///   and the removed tail.
-    static func retentionPlan(
+    nonisolated static func retentionPlan(
         sessions: [ChatSession],
         limit: Int?,
         protectedId: UUID?

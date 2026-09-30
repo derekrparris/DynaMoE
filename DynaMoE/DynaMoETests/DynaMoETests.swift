@@ -11853,6 +11853,20 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: file.path), "A failed save must be retried")
         XCTAssertEqual(store.loadSessions().map(\.id), [only.id])
     }
+
+    /// The retention API is pure logic and must be usable off the main actor.
+    /// This only compiles while `retentionPlan` (and `lastActivityAt`) stay
+    /// nonisolated.
+    nonisolated func testRetentionPlanIsCallableFromNonisolatedContext() {
+        let now = Date()
+        let newer = ChatSession(title: "Newer", createdAt: now, updatedAt: now)
+        let older = ChatSession(title: "Older", createdAt: now.addingTimeInterval(-30), updatedAt: now.addingTimeInterval(-30))
+
+        let plan = ChatSessionStore.retentionPlan(sessions: [newer, older], limit: 1, protectedId: nil)
+
+        XCTAssertEqual(plan.kept.map(\.id), [newer.id])
+        XCTAssertEqual(plan.removed.map(\.id), [older.id])
+    }
 }
 
 
