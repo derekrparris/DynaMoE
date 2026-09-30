@@ -2,6 +2,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 import Metal
 import Foundation
+import AppKit
 import Accelerate
 
 /// Central gate for chat-tab diagnostic logging. Off by default; enable individual flags from
@@ -849,6 +850,7 @@ extension TensorMetadata: Identifiable {
 }
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @State private var engine: DynaMoeEngine? = nil
     @State private var tokenizer: DynaMoeTokenizer? = nil
     @State private var summary: ModelSummary? = nil
@@ -986,6 +988,11 @@ struct ContentView: View {
     @AppStorage("dynamoe_agent_working_directory") private var agentWorkingDirectory: String = ""
     @AppStorage("dynamoe_max_tool_output_length") private var maxToolOutputLength: Int = 4000
     @AppStorage("dynamoe_max_agent_steps") private var maxAgentSteps: Int = 15
+    @AppStorage("dynamoe_chat_auto_delete_enabled") private var chatAutoDeleteEnabled: Bool = true
+    @AppStorage("dynamoe_chat_retention_limit") private var chatRetentionLimit: Int = 10
+    @State private var hasLoadedPersistedSessions: Bool = false
+    @State private var sessionPersistTask: Task<Void, Never>? = nil
+    @State private var hasPendingSessionPersist: Bool = false
 
     var isAgentToolsEnabledForActiveSession: Bool {
         if let active = activeSessionBinding.wrappedValue, let enabled = active.isAgentToolsEnabled {
@@ -1157,6 +1164,69 @@ struct ContentView: View {
         applyProfile(preferredProfile, for: model.id)
     }
 
+    // MARK: - Chat Session Persistence & Retention
+
+    /// `nil` means "never auto-delete".
+    private var chatRetentionLimitOrNil: Int? {
+        chatAutoDeleteEnabled ? max(1, chatRetentionLimit) : nil
+    }
+
+    private func loadPersistedSessionsIfNeeded() {
+        guard !hasLoadedPersistedSessions else { return }
+        hasLoadedPersistedSessions = true
+
+        let loaded = ChatSessionStore.shared.loadSessions()
+        if loaded.isEmpty {
+            // Nothing on disk yet: persist the fresh in-memory conversation.
+            ChatSessionStore.shared.saveAll(sessions)
+        } else {
+            sessions = loaded
+            selectedSessionId = loaded.first?.id
+        }
+        applyChatRetention()
+    }
+
+    /// Drops conversations beyond the retention window and deletes their files.
+    /// The active conversation is always preserved.
+    private func applyChatRetention() {
+        let plan = ChatSessionStore.retentionPlan(
+            sessions: sessions,
+            limit: chatRetentionLimitOrNil,
+            protectedId: selectedSessionId ?? sessions.first?.id
+        )
+        guard !plan.removed.isEmpty else { return }
+
+        let removedIds = plan.removed.map(\.id)
+        sessions = plan.kept
+        if let selected = selectedSessionId, removedIds.contains(selected) {
+            selectedSessionId = sessions.first?.id
+        }
+        ChatSessionStore.shared.delete(sessionIds: removedIds)
+    }
+
+    /// Coalesces the rapid session mutations that happen during streaming into a
+    /// single disk write once the conversation settles.
+    private func scheduleSessionPersist() {
+        guard hasLoadedPersistedSessions else { return }
+        hasPendingSessionPersist = true
+        sessionPersistTask?.cancel()
+        sessionPersistTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard !Task.isCancelled else { return }
+            self.hasPendingSessionPersist = false
+            ChatSessionStore.shared.saveAll(self.sessions)
+        }
+    }
+
+    /// Writes immediately, used when the app leaves the foreground or quits so
+    /// an in-flight conversation is not lost. No-op when nothing is pending.
+    private func flushSessionPersist() {
+        guard hasLoadedPersistedSessions, hasPendingSessionPersist else { return }
+        sessionPersistTask?.cancel()
+        hasPendingSessionPersist = false
+        ChatSessionStore.shared.saveAll(sessions)
+    }
+
     var body: some View {
         ZStack {
             NavigationSplitView(columnVisibility: $columnVisibility) {
@@ -1178,6 +1248,7 @@ struct ContentView: View {
                         )
                         sessions.insert(newSession, at: 0)
                         selectedSessionId = newSession.id
+                        applyChatRetention()
                         if let model = defModel, activeLoadedModelPath != model.snapshotPath {
                             switchModel(to: model)
                         }
@@ -1316,6 +1387,7 @@ struct ContentView: View {
             syncSettingsWindowIfNeeded()
         }
         .onAppear {
+            loadPersistedSessionsIfNeeded()
             if selectedSessionId == nil {
                 selectedSessionId = sessions.first?.id
             }
@@ -1342,6 +1414,23 @@ struct ContentView: View {
                     applyProfile(preferredProfile, for: targetPath)
                 }
             }
+        }
+        .onChange(of: sessions) { _ in
+            scheduleSessionPersist()
+        }
+        .onChange(of: chatRetentionLimit) { _ in
+            applyChatRetention()
+        }
+        .onChange(of: chatAutoDeleteEnabled) { _ in
+            applyChatRetention()
+        }
+        .onChange(of: scenePhase) { phase in
+            if phase != .active {
+                flushSessionPersist()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+            flushSessionPersist()
         }
         .task {
             while !Task.isCancelled {

@@ -11559,6 +11559,138 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
     }
 }
 
+@MainActor
+final class ChatSessionPersistenceTests: XCTestCase {
+
+    private func makeTempDirectory() -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ChatSessionPersistenceTests_\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    private func session(title: String, updatedAt: Date) -> ChatSession {
+        ChatSession(title: title, messages: [], createdAt: updatedAt, updatedAt: updatedAt)
+    }
+
+    // MARK: - Retention plan (pure logic)
+
+    func testRetentionPlanKeepsMostRecentWithinLimit() {
+        let now = Date()
+        let newest = session(title: "Newest", updatedAt: now)
+        let middle = session(title: "Middle", updatedAt: now.addingTimeInterval(-60))
+        let oldest = session(title: "Oldest", updatedAt: now.addingTimeInterval(-120))
+
+        let plan = ChatSessionStore.retentionPlan(
+            sessions: [newest, middle, oldest],
+            limit: 2,
+            protectedId: nil
+        )
+
+        XCTAssertEqual(plan.kept.map(\.id), [newest.id, middle.id])
+        XCTAssertEqual(plan.removed.map(\.id), [oldest.id])
+    }
+
+    func testRetentionPlanNilLimitNeverDeletes() {
+        let now = Date()
+        let sessions = (0..<25).map { session(title: "Chat \($0)", updatedAt: now.addingTimeInterval(Double(-$0))) }
+
+        let plan = ChatSessionStore.retentionPlan(sessions: sessions, limit: nil, protectedId: nil)
+
+        XCTAssertEqual(plan.kept.count, 25)
+        XCTAssertTrue(plan.removed.isEmpty)
+    }
+
+    func testRetentionPlanNoOpAtOrBelowLimit() {
+        let now = Date()
+        let sessions = (0..<10).map { session(title: "Chat \($0)", updatedAt: now.addingTimeInterval(Double(-$0))) }
+
+        let plan = ChatSessionStore.retentionPlan(sessions: sessions, limit: 10, protectedId: nil)
+
+        XCTAssertEqual(plan.kept.count, 10)
+        XCTAssertTrue(plan.removed.isEmpty)
+    }
+
+    func testRetentionPlanProtectsActiveConversationOutsideWindow() {
+        let now = Date()
+        let newest = session(title: "Newest", updatedAt: now)
+        let middle = session(title: "Middle", updatedAt: now.addingTimeInterval(-60))
+        let activeOld = session(title: "Active Old", updatedAt: now.addingTimeInterval(-600))
+
+        let plan = ChatSessionStore.retentionPlan(
+            sessions: [newest, middle, activeOld],
+            limit: 2,
+            protectedId: activeOld.id
+        )
+
+        XCTAssertTrue(plan.kept.contains(where: { $0.id == activeOld.id }), "Active conversation must survive retention")
+        XCTAssertEqual(plan.kept.count, 3)
+        XCTAssertTrue(plan.removed.isEmpty)
+    }
+
+    // MARK: - Disk persistence
+
+    func testStoreRoundTripsSessionsMostRecentFirst() {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        let first = session(title: "First", updatedAt: Date(timeIntervalSince1970: 1_000))
+        var second = session(title: "Second", updatedAt: Date(timeIntervalSince1970: 2_000))
+        second.messages = [
+            ChatMessage(role: .user, content: "hello"),
+            ChatMessage(role: .assistant, content: "hi there")
+        ]
+
+        store.saveAll([first, second])
+        store.flushPendingIO()
+
+        let loaded = store.loadSessions()
+        XCTAssertEqual(loaded.map(\.title), ["Second", "First"], "Most recently updated conversation should load first")
+        XCTAssertEqual(loaded.first?.messages.map(\.content), ["hello", "hi there"])
+    }
+
+    func testStoreRemovesOrphanedFilesForDeletedConversations() {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        let keep = session(title: "Keep", updatedAt: Date())
+        let drop = session(title: "Drop", updatedAt: Date())
+        store.saveAll([keep, drop])
+        store.flushPendingIO()
+
+        let droppedFile = dir.appendingPathComponent("\(drop.id.uuidString).json")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: droppedFile.path))
+
+        store.saveAll([keep])
+        store.flushPendingIO()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: droppedFile.path), "Deleted conversation file should be removed")
+        XCTAssertEqual(store.loadSessions().map(\.id), [keep.id])
+    }
+
+    func testStoreChangeDetectionSkipsUnchangedWrites() {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        let only = session(title: "Stable", updatedAt: Date())
+        let file = dir.appendingPathComponent("\(only.id.uuidString).json")
+
+        store.saveAll([only])
+        store.flushPendingIO()
+        let firstMod = (try? FileManager.default.attributesOfItem(atPath: file.path))?[.modificationDate] as? Date
+
+        store.saveAll([only])
+        store.flushPendingIO()
+        let secondMod = (try? FileManager.default.attributesOfItem(atPath: file.path))?[.modificationDate] as? Date
+
+        XCTAssertNotNil(firstMod)
+        XCTAssertEqual(firstMod, secondMod, "Unchanged conversations should not be rewritten")
+    }
+}
+
 
 
 
