@@ -11772,6 +11772,38 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertTrue(json.contains("schemaVersion"), "Legacy bare sessions should be migrated to the versioned envelope")
     }
 
+    func testUnsupportedSchemaVersionIsNotIngestedOrRewritten() throws {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let future = session(title: "From Future", updatedAt: Date())
+        let futureFile = dir.appendingPathComponent("\(future.id.uuidString).json")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        try encoder
+            .encode(PersistedChatSession(schemaVersion: ChatSessionStore.currentSchemaVersion + 1, session: future))
+            .write(to: futureFile)
+        let originalBytes = try Data(contentsOf: futureFile)
+
+        let store = ChatSessionStore(directory: dir)
+        XCTAssertTrue(store.loadSessions().isEmpty, "A file from a newer schema must not be ingested")
+
+        // Saving other work must neither rewrite nor delete the newer file.
+        let mine = session(title: "Mine", updatedAt: Date())
+        store.saveAll([mine])
+        store.flushPendingIO()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: futureFile.path), "An unsupported-schema file must not be deleted")
+        XCTAssertEqual(try Data(contentsOf: futureFile), originalBytes, "An unsupported-schema file must not be rewritten")
+        XCTAssertEqual(store.loadSessions().map(\.id), [mine.id])
+    }
+
+    func testSupportedSchemaPredicateAcceptsCurrentAndOlderOnly() {
+        XCTAssertTrue(ChatSessionStore.isSupportedSchema(1))
+        XCTAssertTrue(ChatSessionStore.isSupportedSchema(ChatSessionStore.currentSchemaVersion))
+        XCTAssertFalse(ChatSessionStore.isSupportedSchema(ChatSessionStore.currentSchemaVersion + 1))
+    }
+
     func testFailedWriteIsRetriedRatherThanMarkedDurable() throws {
         let dir = makeTempDirectory()
         defer {

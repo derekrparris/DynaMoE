@@ -20,7 +20,7 @@ final class ChatSessionStore {
 
     /// Stamped into every file so a future format change can migrate old
     /// conversations instead of silently discarding them.
-    static let currentSchemaVersion = 1
+    nonisolated static let currentSchemaVersion = 1
 
     private let directory: URL
     private let ioQueue = DispatchQueue(label: "com.dynamoe.chatsessionstore.io", qos: .utility)
@@ -31,6 +31,13 @@ final class ChatSessionStore {
     /// already durable. Access is serialized on `ioQueue` and never touched from
     /// the main actor, which is what makes the unchecked isolation safe.
     nonisolated(unsafe) private var writtenSignatures: [UUID: Int] = [:]
+
+    /// Conversations this build is allowed to rewrite or delete: the ones it has
+    /// loaded or written. Files for newer, unsupported schema versions (or
+    /// otherwise unrecognized files) never enter this set, so a save pass leaves
+    /// them untouched rather than downgrading or deleting them. Serialized on
+    /// `ioQueue` like `writtenSignatures`.
+    nonisolated(unsafe) private var managedIds: Set<UUID> = []
 
     init(directory: URL? = nil, fileManager: FileManager = .default) {
         self.directory = directory ?? ChatSessionStore.defaultDirectory(using: fileManager)
@@ -65,6 +72,10 @@ final class ChatSessionStore {
     /// rewrite files whose contents are already up to date. Legacy bare-session
     /// files are deliberately left unsigned so the next save rewrites them into
     /// the versioned envelope instead of leaving them unstamped forever.
+    ///
+    /// Files stamped with a schema version this build does not understand are
+    /// skipped and left on disk untouched, so a newer build's conversations are
+    /// never silently downgraded to the current format.
     func loadSessions() -> [ChatSession] {
         let directory = self.directory
         return ioQueue.sync { [self] in
@@ -86,13 +97,16 @@ final class ChatSessionStore {
             for url in urls where url.pathExtension == "json" {
                 guard let data = try? Data(contentsOf: url) else { continue }
                 if let envelope = try? decoder.decode(PersistedChatSession.self, from: data) {
+                    guard ChatSessionStore.isSupportedSchema(envelope.schemaVersion) else { continue }
                     decoded.append(envelope.session)
+                    managedIds.insert(envelope.session.id)
                     if writtenSignatures[envelope.session.id] == nil,
                        let encoded = try? encoder.encode(envelope) {
                         writtenSignatures[envelope.session.id] = encoded.hashValue
                     }
                 } else if let bare = try? decoder.decode(ChatSession.self, from: data) {
                     decoded.append(bare)
+                    managedIds.insert(bare.id)
                 }
             }
 
@@ -101,6 +115,12 @@ final class ChatSessionStore {
                 .sorted { $0.activity > $1.activity }
                 .map(\.session)
         }
+    }
+
+    /// Whether this build can faithfully round-trip a schema version. Newer
+    /// versions may carry fields we would drop on rewrite, so they are refused.
+    nonisolated static func isSupportedSchema(_ version: Int) -> Bool {
+        version <= currentSchemaVersion
     }
 
     // MARK: - Saving
@@ -128,11 +148,15 @@ final class ChatSessionStore {
                     PersistedChatSession(schemaVersion: ChatSessionStore.currentSchemaVersion, session: session)
                 ) else { continue }
                 let signature = data.hashValue
-                if writtenSignatures[session.id] == signature { continue }
+                if writtenSignatures[session.id] == signature {
+                    managedIds.insert(session.id)
+                    continue
+                }
                 let url = directory.appendingPathComponent("\(session.id.uuidString).json", isDirectory: false)
                 do {
                     try data.write(to: url, options: .atomic)
                     writtenSignatures[session.id] = signature
+                    managedIds.insert(session.id)
                 } catch {
                     // Leave no signature so the conversation is retried rather
                     // than assumed durable for the rest of the process.
@@ -147,10 +171,15 @@ final class ChatSessionStore {
                 options: [.skipsHiddenFiles]
             ) else { return }
             for url in urls where url.pathExtension == "json" {
+                // Only ever remove conversations this build loaded or wrote.
+                // Files from a newer schema (or otherwise unrecognized) are not
+                // managed and must survive untouched.
                 guard let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent),
+                      managedIds.contains(id),
                       !liveIds.contains(id) else { continue }
                 try? fm.removeItem(at: url)
                 writtenSignatures[id] = nil
+                managedIds.remove(id)
             }
         }
     }
@@ -164,6 +193,7 @@ final class ChatSessionStore {
             for (index, url) in urls.enumerated() {
                 try? fm.removeItem(at: url)
                 writtenSignatures[sessionIds[index]] = nil
+                managedIds.remove(sessionIds[index])
             }
         }
     }
@@ -206,8 +236,9 @@ final class ChatSessionStore {
     }
 }
 
-/// Versioned on-disk envelope for a single conversation.
-nonisolated private struct PersistedChatSession: Codable, Sendable {
+/// Versioned on-disk envelope for a single conversation. Internal rather than
+/// private so tests can construct envelopes of arbitrary schema versions.
+nonisolated struct PersistedChatSession: Codable, Sendable {
     let schemaVersion: Int
     let session: ChatSession
 }
