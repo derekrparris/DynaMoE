@@ -77,9 +77,11 @@ final class ChatSessionStore {
     /// Reads every persisted conversation, most-recently-active first to match
     /// the sidebar order.
     ///
-    /// Each loaded conversation's canonical signature is seeded into
+    /// A versioned conversation's canonical signature is seeded into
     /// `writtenSignatures` so the first debounced save after launch does not
-    /// rewrite files whose contents are already up to date.
+    /// rewrite files whose contents are already up to date. Legacy bare-session
+    /// files are deliberately left unsigned so the next save rewrites them into
+    /// the versioned envelope instead of leaving them unstamped forever.
     func loadSessions() -> [ChatSession] {
         var decoded: [(session: ChatSession, signature: Int?)] = []
         for url in enumerateSessionFiles() {
@@ -87,7 +89,7 @@ final class ChatSessionStore {
             if let envelope = try? decoder.decode(PersistedChatSession.self, from: data) {
                 decoded.append((envelope.session, canonicalSignature(for: envelope.session)))
             } else if let bare = try? decoder.decode(ChatSession.self, from: data) {
-                decoded.append((bare, canonicalSignature(for: bare)))
+                decoded.append((bare, nil))
             }
         }
 

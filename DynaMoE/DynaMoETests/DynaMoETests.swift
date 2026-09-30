@@ -11751,6 +11751,27 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertEqual(firstMod, secondMod, "Loaded conversations should not be rewritten on launch")
     }
 
+    func testLegacyBareSessionIsMigratedToVersionedEnvelope() throws {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        // Simulate a file written before the versioned envelope existed.
+        let legacy = session(title: "Legacy", updatedAt: Date())
+        let file = dir.appendingPathComponent("\(legacy.id.uuidString).json")
+        try JSONEncoder().encode(legacy).write(to: file)
+
+        let store = ChatSessionStore(directory: dir)
+        let loaded = store.loadSessions()
+        XCTAssertEqual(loaded.map(\.id), [legacy.id])
+
+        store.saveAll(loaded)
+        store.flushPendingIO()
+
+        let rewritten = try Data(contentsOf: file)
+        let json = String(data: rewritten, encoding: .utf8) ?? ""
+        XCTAssertTrue(json.contains("schemaVersion"), "Legacy bare sessions should be migrated to the versioned envelope")
+    }
+
     func testFailedWriteIsRetriedRatherThanMarkedDurable() throws {
         let dir = makeTempDirectory()
         defer {
