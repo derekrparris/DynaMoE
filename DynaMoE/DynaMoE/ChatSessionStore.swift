@@ -22,7 +22,10 @@ final class ChatSessionStore {
     /// conversations instead of silently discarding them.
     nonisolated static let currentSchemaVersion = 1
 
-    private let directory: URL
+    /// `nil` when Application Support could not be resolved. In that case the
+    /// store refuses to persist rather than silently writing durable history to
+    /// a purgeable temporary directory.
+    private let directory: URL?
     private let ioQueue = DispatchQueue(label: "com.dynamoe.chatsessionstore.io", qos: .utility)
 
     /// Signature of the bytes last **successfully written** per conversation.
@@ -45,27 +48,50 @@ final class ChatSessionStore {
 
     // MARK: - Locations
 
-    nonisolated static func defaultDirectory(using fileManager: FileManager = .default) -> URL {
-        let base = (try? fileManager.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )) ?? fileManager.temporaryDirectory
-        return base.appendingPathComponent("DynaMoE/sessions", isDirectory: true)
+    nonisolated static func defaultDirectory(using fileManager: FileManager = .default) -> URL? {
+        do {
+            let base = try fileManager.url(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask,
+                appropriateFor: nil,
+                create: true
+            )
+            return base.appendingPathComponent("DynaMoE/sessions", isDirectory: true)
+        } catch {
+            print("⚠️ [ChatSessionStore] Application Support is unavailable, so chat history will not be persisted: \(error.localizedDescription)")
+            return nil
+        }
     }
 
-    private func fileURL(for id: UUID) -> URL {
-        directory.appendingPathComponent("\(id.uuidString).json", isDirectory: false)
-    }
+    /// False when the store has nowhere durable to write. Callers can surface
+    /// this instead of assuming conversations are being saved.
+    var isPersistenceAvailable: Bool { directory != nil }
 
     // MARK: - Loading
 
-    /// Reads every persisted conversation, most-recently-active first to match
-    /// the sidebar order.
-    ///
-    /// Decoding (and the canonical re-encode used for change detection) runs on
-    /// `ioQueue`, so large histories never serialize on the main actor.
+    /// Synchronous load. Convenient for tests, but blocks the caller until every
+    /// file has been read and decoded, so app code should prefer
+    /// `loadSessionsAsync`.
+    func loadSessions() -> [ChatSession] {
+        guard let directory else { return [] }
+        return ioQueue.sync { [self] in
+            loadSessionsLocked(in: directory)
+        }
+    }
+
+    /// Loads conversations without blocking the caller. The read, decode, and
+    /// signature work still runs on `ioQueue`; only the result hops back.
+    func loadSessionsAsync() async -> [ChatSession] {
+        guard let directory else { return [] }
+        return await withCheckedContinuation { continuation in
+            ioQueue.async { [self] in
+                continuation.resume(returning: loadSessionsLocked(in: directory))
+            }
+        }
+    }
+
+    /// Reads every persisted conversation on `ioQueue`, most-recently-active
+    /// first to match the sidebar order.
     ///
     /// A versioned conversation's canonical signature is seeded into
     /// `writtenSignatures` so the first debounced save after launch does not
@@ -76,45 +102,42 @@ final class ChatSessionStore {
     /// Files stamped with a schema version this build does not understand are
     /// skipped and left on disk untouched, so a newer build's conversations are
     /// never silently downgraded to the current format.
-    func loadSessions() -> [ChatSession] {
-        let directory = self.directory
-        return ioQueue.sync { [self] in
-            let fm = FileManager()
-            guard let urls = try? fm.contentsOfDirectory(
-                at: directory,
-                includingPropertiesForKeys: nil,
-                options: [.skipsHiddenFiles]
-            ) else { return [] }
+    nonisolated private func loadSessionsLocked(in directory: URL) -> [ChatSession] {
+        let fm = FileManager()
+        guard let urls = try? fm.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
 
-            let decoder = JSONDecoder()
-            let encoder = JSONEncoder()
-            // Canonical (`sortedKeys`) encoding is required for the byte
-            // signature to be stable: JSONEncoder otherwise emits ChatSession's
-            // keys in an unstable order, making every save look like a change.
-            encoder.outputFormatting = [.sortedKeys]
+        let decoder = JSONDecoder()
+        let encoder = JSONEncoder()
+        // Canonical (`sortedKeys`) encoding is required for the byte signature to
+        // be stable: JSONEncoder otherwise emits ChatSession's keys in an
+        // unstable order, making every save look like a change.
+        encoder.outputFormatting = [.sortedKeys]
 
-            var decoded: [ChatSession] = []
-            for url in urls where url.pathExtension == "json" {
-                guard let data = try? Data(contentsOf: url) else { continue }
-                if let envelope = try? decoder.decode(PersistedChatSession.self, from: data) {
-                    guard ChatSessionStore.isSupportedSchema(envelope.schemaVersion) else { continue }
-                    decoded.append(envelope.session)
-                    managedIds.insert(envelope.session.id)
-                    if writtenSignatures[envelope.session.id] == nil,
-                       let encoded = try? encoder.encode(envelope) {
-                        writtenSignatures[envelope.session.id] = encoded.hashValue
-                    }
-                } else if let bare = try? decoder.decode(ChatSession.self, from: data) {
-                    decoded.append(bare)
-                    managedIds.insert(bare.id)
+        var decoded: [ChatSession] = []
+        for url in urls where url.pathExtension == "json" {
+            guard let data = try? Data(contentsOf: url) else { continue }
+            if let envelope = try? decoder.decode(PersistedChatSession.self, from: data) {
+                guard ChatSessionStore.isSupportedSchema(envelope.schemaVersion) else { continue }
+                decoded.append(envelope.session)
+                managedIds.insert(envelope.session.id)
+                if writtenSignatures[envelope.session.id] == nil,
+                   let encoded = try? encoder.encode(envelope) {
+                    writtenSignatures[envelope.session.id] = encoded.hashValue
                 }
+            } else if let bare = try? decoder.decode(ChatSession.self, from: data) {
+                decoded.append(bare)
+                managedIds.insert(bare.id)
             }
-
-            return decoded
-                .map { (session: $0, activity: $0.lastActivityAt) }
-                .sorted { $0.activity > $1.activity }
-                .map(\.session)
         }
+
+        return decoded
+            .map { (session: $0, activity: $0.lastActivityAt) }
+            .sorted { $0.activity > $1.activity }
+            .map(\.session)
     }
 
     /// Whether this build can faithfully round-trip a schema version. Newer
@@ -133,7 +156,7 @@ final class ChatSessionStore {
     /// large histories never encode on the main actor. A signature is recorded
     /// only after its write succeeds.
     func saveAll(_ sessions: [ChatSession]) {
-        let directory = self.directory
+        guard let directory else { return }
         let snapshot = sessions
         ioQueue.async { [self] in
             let fm = FileManager()
@@ -177,23 +200,35 @@ final class ChatSessionStore {
                 guard let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent),
                       managedIds.contains(id),
                       !liveIds.contains(id) else { continue }
-                try? fm.removeItem(at: url)
-                writtenSignatures[id] = nil
-                managedIds.remove(id)
+                // Keep the state only if the file is actually gone, so a failed
+                // removal is retried on the next save.
+                do {
+                    try fm.removeItem(at: url)
+                    writtenSignatures[id] = nil
+                    managedIds.remove(id)
+                } catch {
+                    print("⚠️ [ChatSessionStore] failed to remove session \(id): \(error.localizedDescription)")
+                }
             }
         }
     }
 
     /// Deletes the given conversations from disk immediately.
     func delete(sessionIds: [UUID]) {
-        guard !sessionIds.isEmpty else { return }
-        let urls = sessionIds.map { fileURL(for: $0) }
+        guard !sessionIds.isEmpty, let directory else { return }
+        let urls = sessionIds.map { (id: $0, url: directory.appendingPathComponent("\($0.uuidString).json", isDirectory: false)) }
         ioQueue.async { [self] in
             let fm = FileManager()
-            for (index, url) in urls.enumerated() {
-                try? fm.removeItem(at: url)
-                writtenSignatures[sessionIds[index]] = nil
-                managedIds.remove(sessionIds[index])
+            for entry in urls {
+                // Keep the state only if the file is actually gone, so a failed
+                // removal is retried on the next save.
+                do {
+                    try fm.removeItem(at: entry.url)
+                    writtenSignatures[entry.id] = nil
+                    managedIds.remove(entry.id)
+                } catch {
+                    print("⚠️ [ChatSessionStore] failed to remove session \(entry.id): \(error.localizedDescription)")
+                }
             }
         }
     }

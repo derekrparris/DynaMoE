@@ -335,7 +335,7 @@ struct SettingsSheetView: View {
                             Text("\(chatRetentionLimit)")
                                 .font(.system(size: 12, design: .monospaced))
                                 .frame(minWidth: 24, alignment: .trailing)
-                            Stepper("", value: $chatRetentionLimit, in: 1...100)
+                            Stepper("Conversations to keep", value: $chatRetentionLimit, in: 1...100)
                                 .labelsHidden()
                         }
                     }

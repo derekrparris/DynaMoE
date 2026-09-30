@@ -11867,6 +11867,47 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertEqual(plan.kept.map(\.id), [newer.id])
         XCTAssertEqual(plan.removed.map(\.id), [older.id])
     }
+
+    func testAsyncLoadMatchesPersistedOrder() async {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        let newer = session(title: "Newer", updatedAt: Date(timeIntervalSince1970: 2_000))
+        let older = session(title: "Older", updatedAt: Date(timeIntervalSince1970: 1_000))
+        store.saveAll([newer, older])
+        store.flushPendingIO()
+
+        let loaded = await store.loadSessionsAsync()
+        XCTAssertEqual(loaded.map(\.id), [newer.id, older.id])
+    }
+
+    func testFailedOrphanRemovalKeepsFileManagedForRetry() throws {
+        let dir = makeTempDirectory()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let store = ChatSessionStore(directory: dir)
+        let doomed = session(title: "Doomed", updatedAt: Date())
+        store.saveAll([doomed])
+        store.flushPendingIO()
+        let file = dir.appendingPathComponent("\(doomed.id.uuidString).json")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+
+        // Removal cannot succeed without write permission on the directory.
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: dir.path)
+        store.saveAll([])
+        store.flushPendingIO()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path), "A failed removal must leave the file")
+
+        // Once writable again, the retry must still know the file is managed.
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+        store.saveAll([])
+        store.flushPendingIO()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path), "A failed removal must be retried")
+    }
 }
 
 

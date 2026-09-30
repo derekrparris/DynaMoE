@@ -1171,11 +1171,11 @@ struct ContentView: View {
         chatAutoDeleteEnabled ? max(1, chatRetentionLimit) : nil
     }
 
-    private func loadPersistedSessionsIfNeeded() {
+    private func loadPersistedSessionsIfNeeded() async {
         guard !hasLoadedPersistedSessions else { return }
         hasLoadedPersistedSessions = true
 
-        let loaded = ChatSessionStore.shared.loadSessions()
+        let loaded = await ChatSessionStore.shared.loadSessionsAsync()
         if loaded.isEmpty {
             // Nothing on disk yet: persist the fresh in-memory conversation.
             ChatSessionStore.shared.saveAll(sessions)
@@ -1387,7 +1387,6 @@ struct ContentView: View {
             syncSettingsWindowIfNeeded()
         }
         .onAppear {
-            loadPersistedSessionsIfNeeded()
             if selectedSessionId == nil {
                 selectedSessionId = sessions.first?.id
             }
@@ -1403,6 +1402,9 @@ struct ContentView: View {
             updatePagingStats()
         }
         .onChange(of: selectedSessionId) { newId in
+            // The session that was protected from pruning may have just changed,
+            // so re-run retention before switching models.
+            applyChatRetention()
             guard let newId = newId, let session = sessions.first(where: { $0.id == newId }) else { return }
             if let targetPath = session.selectedModelPath, !targetPath.isEmpty, activeLoadedModelPath != targetPath {
                 if let model = localModelManager.getModel(byId: targetPath) ?? localModelManager.getModel(byId: session.selectedModelId ?? "") {
@@ -1434,6 +1436,9 @@ struct ContentView: View {
             // flushSessionPersist only enqueues the write; block until the
             // utility queue drains so the process cannot exit first.
             ChatSessionStore.shared.flushPendingIO()
+        }
+        .task {
+            await loadPersistedSessionsIfNeeded()
         }
         .task {
             while !Task.isCancelled {
