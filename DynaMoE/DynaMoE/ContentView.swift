@@ -11886,18 +11886,19 @@ if layer.attnGateProjTensor != nil,
     ///
     /// Checks only the LAST `period * minCycles` tokens, not a fixed window: a repeat
     /// that begins partway through the recent history (e.g. a heredoc terminator
-    /// repeated after a long script) must still be caught. `minCycles` is 24 for
-    /// period 1 — legitimate whitespace runs are long — and 4 otherwise. A cycle is
-    /// only accepted when its decoded unit carries a letter or digit, so a run of
-    /// blank lines, closing braces, or dashes (all legitimate formatting) never
-    /// truncates a healthy turn.
+    /// repeated after a long script) must still be caught. Every accepted cycle must
+    /// span at least 24 tokens, so a short verbatim run that is legitimate output (an
+    /// alternating data column, repeated table cells, a list of `yes`/`no` values)
+    /// never truncates a healthy turn; a real degeneration runs for hundreds. A cycle
+    /// is only accepted when its decoded unit carries a letter or digit, so a run of
+    /// blank lines, closing braces, or dashes (all legitimate formatting) is ignored.
     static func detectDegenerateCycle(
         tokenIds: [UInt32],
         decodeUnit: ([UInt32]) -> String
     ) -> Int? {
         guard tokenIds.count >= 8 else { return nil }
         for period in 1...8 {
-            let minCycles = (period == 1) ? 24 : 4
+            let minCycles = max((period == 1) ? 24 : 4, Int((24.0 / Double(period)).rounded(.up)))
             let needed = period * minCycles
             guard tokenIds.count >= needed else { continue }
             let window = Array(tokenIds.suffix(needed))

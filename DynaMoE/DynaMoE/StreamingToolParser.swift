@@ -131,9 +131,19 @@ public final class StreamingToolParser {
                     valueTerminator = nil
                     index = text.index(index, offsetBy: terminator.count)
                 } else if remaining.hasPrefix(qwenFunctionClose) || remaining.hasPrefix(qwenToolCallClose) {
-                    // The value never terminated before a structural closer: treat it
-                    // as abandoned and let the closer be handled as structure.
-                    valueTerminator = nil
+                    // A closer here is usually the real end of the call: the value was
+                    // cut before its own terminator and the closer must be handled as
+                    // structure. But a value can legitimately CONTAIN a literal closer
+                    // (a command echoing markup, a file body with XML), and treating
+                    // that as structure silently drops the parameter/function closers
+                    // from the committed turn. If the value's own terminator still
+                    // appears before any further structural closer, this is value text;
+                    // otherwise it is the real closer.
+                    if valueCloseOccursBeforeNextStructuralCloser(in: text, from: index, terminator: terminator) {
+                        index = text.index(after: index)
+                    } else {
+                        valueTerminator = nil
+                    }
                 } else {
                     index = text.index(after: index)
                 }
@@ -179,6 +189,25 @@ public final class StreamingToolParser {
         if let idx = stack.lastIndex(of: tag) {
             stack.removeSubrange(idx...)
         }
+    }
+
+    /// True when a value's own close tag (`terminator`) appears in `text` after `index`
+    /// before any further structural closer. Distinguishes a literal closer embedded in
+    /// a parameter value (editing XML, echoing markup) from the real end of the call,
+    /// so the literal one does not silently drop the parameter/function closers.
+    private static func valueCloseOccursBeforeNextStructuralCloser(
+        in text: String,
+        from index: String.Index,
+        terminator: String
+    ) -> Bool {
+        var i = text.index(after: index)
+        while i < text.endIndex {
+            let remaining = text[i...]
+            if remaining.hasPrefix(terminator) { return true }
+            if remaining.hasPrefix(qwenFunctionClose) || remaining.hasPrefix(qwenToolCallClose) { return false }
+            i = text.index(after: i)
+        }
+        return false
     }
 
     /// The tokens that must be appended after a turn's generated ids so the turn

@@ -3045,15 +3045,16 @@ public final class AgentHarness {
     /// loop still accumulates.
     private static let mutatingToolNames: Set<String> = ["file_write", "file_edit", "git_commit"]
 
-    /// Stable fingerprint for a call: tool name plus its arguments, whitespace
-    /// collapsed and lowercased so trivial re-renders (path case, extra spacing)
-    /// still match the earlier call. Dictionary keys are sorted for determinism.
+    /// Stable fingerprint for a call: tool name plus its arguments, with only the
+    /// surrounding whitespace of each value trimmed. The value is otherwise preserved
+    /// EXACTLY — a command, code body, or query is case- and whitespace-sensitive, so
+    /// lowercasing or collapsing interior whitespace would map genuinely distinct calls
+    /// (`print 'A B'` vs `print 'a b'`) to one fingerprint and could force synthesis on
+    /// the third legitimate variant. Dictionary keys are sorted for determinism.
     public static func toolCallFingerprint(toolName: String, arguments: [String: Any]) -> String {
         func normalized(_ value: Any) -> String {
             if let s = value as? String {
-                return s.split(whereSeparator: { $0 == " " || $0 == "\n" || $0 == "\t" })
-                    .joined(separator: " ")
-                    .lowercased()
+                return s.trimmingCharacters(in: .whitespacesAndNewlines)
             }
             if let array = value as? [Any] {
                 return array.map(normalized).joined(separator: ",")
@@ -3061,7 +3062,7 @@ public final class AgentHarness {
             if let dict = value as? [String: Any] {
                 return dict.keys.sorted().map { "\($0)=\(normalized(dict[$0]!))" }.joined(separator: ",")
             }
-            return String(describing: value).lowercased()
+            return String(describing: value)
         }
         let argsPart = arguments.keys.sorted().map { "\($0)=\(normalized(arguments[$0]!))" }.joined(separator: "&")
         return "\(toolName)|\(argsPart)"

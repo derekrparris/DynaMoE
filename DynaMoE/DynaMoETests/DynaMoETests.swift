@@ -7002,14 +7002,17 @@ final class DynaMoETests: XCTestCase {
         let command = "wc -l /Users/me/Downloads/survey.csv"
         XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": command]), 1)
         XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": command]), 2)
-        // Whitespace/case-only differences still match the earlier call.
+        // A case/whitespace variant is a DIFFERENT command in a shell, so it must not
+        // count as the same call — three semantic variants would otherwise collate and
+        // force synthesis. Only the exact text repeats, and it keeps accumulating.
         XCTAssertEqual(
             harness.recordToolCallFingerprint(
                 toolName: "shell_run",
                 arguments: ["command": "wc  -l   /users/me/downloads/survey.csv"]
             ),
-            3
+            1
         )
+        XCTAssertEqual(harness.recordToolCallFingerprint(toolName: "shell_run", arguments: ["command": command]), 3)
         XCTAssertEqual(harness.maxRepeatedToolCallCount, 3)
         XCTAssertGreaterThanOrEqual(harness.repeatedToolCallLimit, 3)
         XCTAssertGreaterThanOrEqual(harness.maxRepeatedToolCallCount, harness.repeatedToolCallLimit)
@@ -7449,6 +7452,18 @@ final class DynaMoETests: XCTestCase {
         let outOfOrder = TC_OPEN + "\n" + FN_OPEN + "shell_run>\n"
             + P_OPEN + "command>\nls\n" + TC_CLOSE
         XCTAssertEqual(StreamingToolParser.structuralClosureTags(forRawDecodedTurn: outOfOrder), [])
+
+        // A LITERAL `</function>` inside a value (a command echoing markup, a file body
+        // with XML) is data, not the end of the call. When the value's own closer still
+        // follows, the scanner must not discard the open parameter/function, or the
+        // truncated turn commits without its closers.
+        let literalCloser = TC_OPEN + "\n" + FN_OPEN + "shell_run>\n"
+            + P_OPEN + "command>\nprintf '%s' '</function>'\n" + P_CLOSE + "\n"
+            + P_OPEN + "cwd>\n/tmp"
+        XCTAssertEqual(
+            StreamingToolParser.structuralClosureTags(forRawDecodedTurn: literalCloser),
+            [P_CLOSE, FN_CLOSE, TC_CLOSE]
+        )
     }
 
     /// A shell heredoc the model over-ran (the terminator repeated after the script
@@ -7502,6 +7517,12 @@ final class DynaMoETests: XCTestCase {
         let braces: [UInt32] = Array(repeating: [UInt32(20), UInt32(21)] as [UInt32], count: 40).flatMap { $0 }
         let braceDecode: ([UInt32]) -> String = { ids in ids.map { $0 == 20 ? "}" : "\n" }.joined() }
         XCTAssertNil(ContentView.detectDegenerateCycle(tokenIds: braces, decodeUnit: braceDecode))
+
+        // A short alphanumeric repeat is legitimate output, not degeneration: an
+        // alternating data column (`yes`, `no`) four times must not truncate the turn.
+        let shortAlternating: [UInt32] = Array(repeating: [UInt32(30), UInt32(31)] as [UInt32], count: 4).flatMap { $0 }
+        let yesNoDecode: ([UInt32]) -> String = { ids in ids.map { $0 == 30 ? "yes" : "no" }.joined(separator: " ") }
+        XCTAssertNil(ContentView.detectDegenerateCycle(tokenIds: shortAlternating, decodeUnit: yesNoDecode))
 
         // Diverse output never trips.
         let diverse: [UInt32] = (0..<80).map { UInt32($0) }
