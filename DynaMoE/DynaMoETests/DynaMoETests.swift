@@ -11668,6 +11668,27 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertEqual(plan.removed.map(\.id), [oldest.id])
     }
 
+    func testLastActivityAtIncludesToolCallTimestamps() {
+        let now = Date()
+        // The message is old, but a tool call it carries ran just now — that is
+        // the conversation's real last activity.
+        var agent = session(title: "Agent", updatedAt: now.addingTimeInterval(-3_600))
+        var message = ChatMessage(role: .assistant, content: "done", timestamp: now.addingTimeInterval(-3_600))
+        message.toolCalls = [ToolCallRecord(name: "shell_run", timestamp: now)]
+        agent.messages = [message]
+
+        let stale = session(title: "Stale", updatedAt: now.addingTimeInterval(-60))
+        let plan = ChatSessionStore.retentionPlan(
+            sessions: [agent, stale],
+            limit: 1,
+            protectedIds: []
+        )
+
+        XCTAssertEqual(agent.lastActivityAt, now, "Tool-call time must count as activity")
+        XCTAssertTrue(plan.kept.contains(where: { $0.id == agent.id }), "A chat with fresh tool activity must outrank a newer-but-idle chat")
+        XCTAssertEqual(plan.removed.map(\.id), [stale.id])
+    }
+
     // MARK: - Disk persistence
 
     func testStoreRoundTripsSessionsMostRecentFirst() {
@@ -11842,6 +11863,8 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertTrue(ChatSessionStore.isSupportedSchema(1))
         XCTAssertTrue(ChatSessionStore.isSupportedSchema(ChatSessionStore.currentSchemaVersion))
         XCTAssertFalse(ChatSessionStore.isSupportedSchema(ChatSessionStore.currentSchemaVersion + 1))
+        XCTAssertFalse(ChatSessionStore.isSupportedSchema(0), "Version 0 is not a valid stamped format")
+        XCTAssertFalse(ChatSessionStore.isSupportedSchema(-1), "Negative versions are not valid")
     }
 
     func testUnreadableSessionFileIsPreservedDuringOrphanCleanup() throws {
@@ -12064,6 +12087,59 @@ final class ChatSessionPersistenceTests: XCTestCase {
         // The availability update hops back to the main actor; give it a moment.
         try await Task.sleep(nanoseconds: 150_000_000)
         XCTAssertFalse(store.isPersistenceAvailable, "A later successful write must not mask an earlier failure")
+    }
+
+    func testEncodingFailureMarksPersistenceUnavailable() async throws {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        XCTAssertTrue(store.isPersistenceAvailable)
+
+        // A non-finite metric (JSONEncoder rejects it) makes the conversation
+        // unencodable; that must count as a failed save, not a healthy pass.
+        var broken = session(title: "Broken", updatedAt: Date())
+        broken.messages = [ChatMessage(role: .assistant, content: "x", tokensPerSec: .infinity)]
+
+        store.saveAll([broken])
+        store.flushPendingIO()
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(store.isPersistenceAvailable, "An unencodable conversation must mark persistence unavailable")
+    }
+
+    func testOrphanRemovalFailureAffectsAvailabilityAndRecovers() async throws {
+        let dir = makeTempDirectory()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let store = ChatSessionStore(directory: dir)
+        let kept = session(title: "Kept", updatedAt: Date())
+        let removed = session(title: "Removed", updatedAt: Date().addingTimeInterval(-10))
+        store.saveAll([kept, removed])
+        store.flushPendingIO()
+        XCTAssertTrue(store.isPersistenceAvailable)
+
+        let removedFile = dir.appendingPathComponent("\(removed.id.uuidString).json")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: removedFile.path))
+
+        // `removed` becomes an orphan, but a read-only directory blocks its file
+        // removal (the unchanged `kept` write is skipped). The failure must show.
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: dir.path)
+        store.saveAll([kept])
+        store.flushPendingIO()
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(store.isPersistenceAvailable, "A failed orphan removal must mark persistence unavailable")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: removedFile.path), "A failed removal must be retried, not lost")
+
+        // Restoring write access lets the retry succeed and clears the warning.
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+        store.saveAll([kept])
+        store.flushPendingIO()
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertTrue(store.isPersistenceAvailable, "A successful cleanup retry must restore availability")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: removedFile.path))
     }
 }
 

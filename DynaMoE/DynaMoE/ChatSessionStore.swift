@@ -178,9 +178,12 @@ final class ChatSessionStore: ObservableObject {
     }
 
     /// Whether this build can faithfully round-trip a schema version. Newer
-    /// versions may carry fields we would drop on rewrite, so they are refused.
+    /// versions may carry fields we would drop on rewrite, so they are refused;
+    /// version 0 and negatives are not valid stamped versions either, so a
+    /// malformed envelope carrying one is preserved as unsupported rather than
+    /// ingested and rewritten.
     nonisolated static func isSupportedSchema(_ version: Int) -> Bool {
-        version <= currentSchemaVersion
+        version >= 1 && version <= currentSchemaVersion
     }
 
     // MARK: - Saving
@@ -208,17 +211,29 @@ final class ChatSessionStore: ObservableObject {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
             let liveIds = Set(snapshot.map(\.id))
-            // Net outcome for the pass, reported once the loop finishes. Any
-            // failure wins: if even one conversation is not durable the pass must
-            // not report healthy just because another write succeeded, and a
-            // later success must not hide an earlier failure (or vice versa).
+            // Net outcome for the pass, reported once every write and cleanup has
+            // been attempted. Any failure wins: if even one conversation is not
+            // durable the pass must not report healthy just because another write
+            // succeeded, and a later success must not hide an earlier failure (or
+            // vice versa). A pass that only re-runs cleanup can restore
+            // availability too, so `removedAny` counts alongside `wroteAny`.
             var wroteAny = false
+            var removedAny = false
             var failedAny = false
 
             for session in snapshot {
-                guard let data = try? encoder.encode(
-                    PersistedChatSession(schemaVersion: ChatSessionStore.currentSchemaVersion, session: session)
-                ) else { continue }
+                let data: Data
+                do {
+                    data = try encoder.encode(
+                        PersistedChatSession(schemaVersion: ChatSessionStore.currentSchemaVersion, session: session)
+                    )
+                } catch {
+                    // An unencodable conversation (e.g. a non-finite metric) never
+                    // reaches disk, so the pass must not report healthy.
+                    failedAny = true
+                    print("⚠️ [ChatSessionStore] failed to encode session \(session.id): \(error.localizedDescription)")
+                    continue
+                }
                 let signature = SHA256.hash(data: data)
                 let url = directory.appendingPathComponent("\(session.id.uuidString).json", isDirectory: false)
                 // Only skip a write when the bytes are unchanged *and* the file
@@ -243,33 +258,40 @@ final class ChatSessionStore: ObservableObject {
                     print("⚠️ [ChatSessionStore] failed to persist session \(session.id): \(error.localizedDescription)")
                 }
             }
-            if failedAny {
-                reportPersistenceAvailability(false)
-            } else if wroteAny {
-                reportPersistenceAvailability(true)
-            }
 
-            guard let urls = try? fm.contentsOfDirectory(
+            if let urls = try? fm.contentsOfDirectory(
                 at: directory,
                 includingPropertiesForKeys: nil,
                 options: [.skipsHiddenFiles]
-            ) else { return }
-            for url in urls where url.pathExtension == "json" {
-                // Only ever remove conversations this build loaded or wrote.
-                // Files from a newer schema (or otherwise unrecognized) are not
-                // managed and must survive untouched.
-                guard let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent),
-                      managedIds.contains(id),
-                      !liveIds.contains(id) else { continue }
-                // Keep the state only if the file is actually gone, so a failed
-                // removal is retried on the next save.
-                do {
-                    try fm.removeItem(at: url)
-                    writtenSignatures[id] = nil
-                    managedIds.remove(id)
-                } catch {
-                    print("⚠️ [ChatSessionStore] failed to remove session \(id): \(error.localizedDescription)")
+            ) {
+                for url in urls where url.pathExtension == "json" {
+                    // Only ever remove conversations this build loaded or wrote.
+                    // Files from a newer schema (or otherwise unrecognized) are not
+                    // managed and must survive untouched.
+                    guard let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent),
+                          managedIds.contains(id),
+                          !liveIds.contains(id) else { continue }
+                    // Keep the state only if the file is actually gone, so a failed
+                    // removal is retried on the next save.
+                    do {
+                        try fm.removeItem(at: url)
+                        writtenSignatures[id] = nil
+                        managedIds.remove(id)
+                        removedAny = true
+                    } catch {
+                        // A failed cleanup is not durable state either: surface it so
+                        // the warning shows and the removal is retried, and let a
+                        // successful retry restore availability below.
+                        failedAny = true
+                        print("⚠️ [ChatSessionStore] failed to remove session \(id): \(error.localizedDescription)")
+                    }
                 }
+            }
+
+            if failedAny {
+                reportPersistenceAvailability(false)
+            } else if wroteAny || removedAny {
+                reportPersistenceAvailability(true)
             }
         }
     }

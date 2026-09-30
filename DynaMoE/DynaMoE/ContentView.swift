@@ -919,11 +919,15 @@ struct ContentView: View {
     @State private var activeProfile: ModelProfileType = .coder
     @State private var isGeneratingText: Bool = false
     @State private var generatingSessionId: UUID? = nil
-    /// Session ids whose generation task is still unwinding after the user
-    /// stopped it. `stopAutoregressiveGeneration` flips `isGeneratingText` false
-    /// immediately, but the cancelled task can still append to its session for up
-    /// to one layer, so retention must keep guarding it until the task exits.
-    @State private var cancellingGenerationSessionIds: Set<UUID> = []
+    /// Sessions pinned against retention while a generation unwinds or a
+    /// replacement is being sent. `stopAutoregressiveGeneration` flips
+    /// `isGeneratingText` false immediately, but the cancelled task can still
+    /// append to its session for up to one layer, so retention must keep guarding
+    /// it until the task exits. Counted rather than a plain set because the
+    /// cancellation cleanup and an interrupt-and-send can both hold the same
+    /// session at once, and either releasing first must not drop the guard the
+    /// other still needs.
+    @State private var retentionProtectionCounts: [UUID: Int] = [:]
     @State private var generatedStreamText: String = ""
     @State private var thinkingText: String = ""
     @State private var responseText: String = ""
@@ -1248,8 +1252,20 @@ struct ContentView: View {
         if isGeneratingText, let generating = generatingSessionId {
             ids.insert(generating)
         }
-        ids.formUnion(cancellingGenerationSessionIds)
+        ids.formUnion(retentionProtectionCounts.keys)
         return ids
+    }
+
+    /// Pins a session against retention until a matching `release` runs.
+    private func retainRetentionProtection(_ id: UUID) {
+        retentionProtectionCounts[id, default: 0] += 1
+    }
+
+    /// Drops one retention pin; the session becomes prunable again once its last
+    /// holder releases.
+    private func releaseRetentionProtection(_ id: UUID) {
+        guard let count = retentionProtectionCounts[id] else { return }
+        retentionProtectionCounts[id] = count > 1 ? count - 1 : nil
     }
 
     /// Coalesces the rapid session mutations that happen during streaming into a
@@ -1646,6 +1662,11 @@ struct ContentView: View {
         print("⏹ [INT] interrupt requested — cancelling current generation and sending a fresh turn")
         let previous = generationTask
         stopAutoregressiveGeneration()
+        // Hold our own pin on the target across the wait: `stopAutoregressiveGeneration`
+        // schedules a cleanup that releases its pin once the cancelled task exits,
+        // which can run before this replacement send and leave the target prunable.
+        // The count keeps the session guarded until the replacement has started.
+        if let targetSessionId { retainRetentionProtection(targetSessionId) }
         // Wait for the cancelled generation to actually stop instead of guessing
         // with a fixed delay. Its replacement resets the shared KV cache here in
         // startAutoregressiveGeneration, and with no prefix to preserve that reset
@@ -1655,7 +1676,12 @@ struct ContentView: View {
         // loops check cancellation at every layer boundary, so this bounds the
         // wait to one layer (one token during decode).
         await previous?.value
-        return handleSendMessage(trimmed, sessionId: targetSessionId)
+        let accepted = handleSendMessage(trimmed, sessionId: targetSessionId)
+        if let targetSessionId {
+            releaseRetentionProtection(targetSessionId)
+            applyChatRetention()
+        }
+        return accepted
     }
 
     private func dequeueAndRunNextPromptIfNeeded(sessionId: UUID?) {
@@ -3629,10 +3655,10 @@ struct ContentView: View {
         // session stays protected until the task actually exits, then retention
         // runs again to prune it if it truly fell out of the window.
         if let cancelled = generationTask, let sessionId = generatingSessionId {
-            cancellingGenerationSessionIds.insert(sessionId)
+            retainRetentionProtection(sessionId)
             Task { @MainActor in
                 await cancelled.value
-                self.cancellingGenerationSessionIds.remove(sessionId)
+                self.releaseRetentionProtection(sessionId)
                 self.applyChatRetention()
             }
         }

@@ -213,6 +213,11 @@ public extension ChatSession {
         var latest = max(updatedAt, createdAt)
         for message in messages {
             latest = max(latest, message.timestamp)
+            // Tool calls are appended after the message is created, so a long
+            // agent run's freshest activity lives on them, not on the message.
+            for call in message.toolCalls ?? [] {
+                latest = max(latest, call.timestamp)
+            }
         }
         for prompt in queuedPrompts {
             latest = max(latest, prompt.timestamp)
