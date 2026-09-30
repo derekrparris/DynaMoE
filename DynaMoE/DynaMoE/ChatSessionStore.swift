@@ -24,10 +24,12 @@ final class ChatSessionStore: ObservableObject {
     /// conversations instead of silently discarding them.
     nonisolated static let currentSchemaVersion = 1
 
-    /// `nil` when Application Support could not be resolved *or* the sessions
-    /// directory could not be created. In that case the store refuses to persist
-    /// rather than silently writing durable history to a purgeable temporary
-    /// directory.
+    /// `nil` only when Application Support itself could not be resolved, in which
+    /// case there is no durable location to fall back to and the store refuses to
+    /// persist rather than silently writing durable history to a purgeable
+    /// temporary directory. A resolved-but-uncreatable directory is kept so the
+    /// write paths can retry creation; availability, not this URL, tracks whether
+    /// that succeeded.
     private let directory: URL?
     private let ioQueue = DispatchQueue(label: "com.dynamoe.chatsessionstore.io", qos: .utility)
 
@@ -56,9 +58,12 @@ final class ChatSessionStore: ObservableObject {
 
     init(directory: URL? = nil, fileManager: FileManager = .default) {
         let resolved = directory ?? ChatSessionStore.defaultDirectory(using: fileManager)
-        let prepared = resolved.flatMap { ChatSessionStore.preparedDirectory($0) }
-        self.directory = prepared
-        self.isPersistenceAvailable = prepared != nil
+        // Retain the resolved URL even if the up-front create check fails: every
+        // write path retries `createDirectory` and re-reports availability, so a
+        // transient launch-time permission or filesystem failure can recover
+        // without a relaunch. `prepared` only seeds the initial UI state.
+        self.directory = resolved
+        self.isPersistenceAvailable = resolved.flatMap { ChatSessionStore.preparedDirectory($0) } != nil
     }
 
     // MARK: - Locations

@@ -11974,6 +11974,30 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: sessionsDir.path))
     }
 
+    func testPersistenceRecoversAfterTransientDirectoryFailure() async throws {
+        let parent = makeTempDirectory()
+        let sessionsDir = parent.appendingPathComponent("sessions", isDirectory: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parent.path)
+            try? FileManager.default.removeItem(at: parent)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: parent.path)
+
+        let store = ChatSessionStore(directory: sessionsDir)
+        XCTAssertFalse(store.isPersistenceAvailable, "Uncreatable directory starts unavailable")
+
+        // Restore write access. The store must retry directory creation on the
+        // next save and recover instead of staying disabled until a relaunch.
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parent.path)
+        store.saveAll([session(title: "Recovered", updatedAt: Date())])
+        store.flushPendingIO()
+
+        // Availability hops back to the main actor; give it a moment.
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertTrue(store.isPersistenceAvailable, "A later successful write must restore persistence availability")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sessionsDir.path))
+    }
+
     func testWriteFailureFlipsPersistenceAvailability() async throws {
         let dir = makeTempDirectory()
         defer {

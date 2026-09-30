@@ -355,12 +355,16 @@ struct ChatDetailView: View {
                                 HStack(spacing: 6) {
                                     Button(action: {
                                         let textToSend = item.text
-                                        onRemoveQueuedPrompt?(item.id)
+                                        let accepted: Bool
                                         if let immediate = onSendImmediate {
-                                            _ = immediate(textToSend)
+                                            accepted = immediate(textToSend)
                                         } else {
-                                            _ = onSendMessage(textToSend)
+                                            accepted = onSendMessage(textToSend)
                                         }
+                                        // Only drop the queued prompt once the send
+                                        // actually lands, so a rejected send (no
+                                        // model, still loading) does not lose it.
+                                        if accepted { onRemoveQueuedPrompt?(item.id) }
                                     }) {
                                         HStack(spacing: 3) {
                                             Image(systemName: "bolt.fill")
