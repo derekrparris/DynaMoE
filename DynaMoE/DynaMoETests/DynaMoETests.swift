@@ -11804,6 +11804,28 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertFalse(ChatSessionStore.isSupportedSchema(ChatSessionStore.currentSchemaVersion + 1))
     }
 
+    func testUnreadableSessionFileIsPreservedDuringOrphanCleanup() throws {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        // A UUID-named file whose contents cannot be decoded at all.
+        let corruptId = UUID()
+        let corruptFile = dir.appendingPathComponent("\(corruptId.uuidString).json")
+        let garbage = Data("{ this is not valid json".utf8)
+        try garbage.write(to: corruptFile)
+
+        let store = ChatSessionStore(directory: dir)
+        XCTAssertTrue(store.loadSessions().isEmpty, "Unreadable files must be skipped, not fatal")
+
+        // A save pass must not treat the unreadable file as an orphan.
+        let mine = session(title: "Mine", updatedAt: Date())
+        store.saveAll([mine])
+        store.flushPendingIO()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: corruptFile.path), "An unreadable file must not be deleted by orphan cleanup")
+        XCTAssertEqual(try Data(contentsOf: corruptFile), garbage, "An unreadable file must not be rewritten")
+    }
+
     func testFailedWriteIsRetriedRatherThanMarkedDurable() throws {
         let dir = makeTempDirectory()
         defer {
