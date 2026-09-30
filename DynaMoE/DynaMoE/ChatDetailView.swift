@@ -27,10 +27,10 @@ struct ChatDetailView: View {
     var isThinkingEnabled: Bool = true
     var isAgentToolsEnabled: Bool = true
     var isModelLoaded: Bool = true
-    var onSendMessage: (String) -> Void
+    var onSendMessage: (String) -> Bool
     var onStopGeneration: () -> Void
-    var onQueuePrompt: ((String) -> Void)? = nil
-    var onSendImmediate: ((String) -> Void)? = nil
+    var onQueuePrompt: ((String) -> Bool)? = nil
+    var onSendImmediate: ((String) -> Bool)? = nil
     var onRemoveQueuedPrompt: ((UUID) -> Void)? = nil
     var onSelectDiscoveredModel: ((DiscoveredModel) -> Void)? = nil
     var onOpenSettings: (() -> Void)? = nil
@@ -357,9 +357,9 @@ struct ChatDetailView: View {
                                         let textToSend = item.text
                                         onRemoveQueuedPrompt?(item.id)
                                         if let immediate = onSendImmediate {
-                                            immediate(textToSend)
+                                            _ = immediate(textToSend)
                                         } else {
-                                            onSendMessage(textToSend)
+                                            _ = onSendMessage(textToSend)
                                         }
                                     }) {
                                         HStack(spacing: 3) {
@@ -438,26 +438,19 @@ struct ChatDetailView: View {
                         onCommit: {
                             let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
                             guard !trimmed.isEmpty else { return }
+                            let accepted: Bool
                             if isGenerating {
-                                if let queueAction = onQueuePrompt {
-                                    queueAction(trimmed)
-                                } else {
-                                    onSendMessage(trimmed)
-                                }
+                                accepted = onQueuePrompt?(trimmed) ?? onSendMessage(trimmed)
                             } else {
-                                onSendMessage(trimmed)
+                                accepted = onSendMessage(trimmed)
                             }
-                            promptText = ""
+                            if accepted { promptText = "" }
                         },
                         onCommitImmediate: {
                             let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
                             guard !trimmed.isEmpty else { return }
-                            if let immediateAction = onSendImmediate {
-                                immediateAction(trimmed)
-                            } else {
-                                onSendMessage(trimmed)
-                            }
-                            promptText = ""
+                            let accepted = onSendImmediate?(trimmed) ?? onSendMessage(trimmed)
+                            if accepted { promptText = "" }
                         }
                     )
                     .frame(minHeight: max(21, 25 * zoomManager.zoomScale), maxHeight: max(100, 140 * zoomManager.zoomScale))
@@ -751,12 +744,13 @@ struct ChatDetailView: View {
                                     Button(action: {
                                         let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
                                         guard !trimmed.isEmpty else { return }
+                                        let accepted: Bool
                                         if let queueAction = onQueuePrompt {
-                                            queueAction(trimmed)
+                                            accepted = queueAction(trimmed)
                                         } else {
-                                            onSendMessage(trimmed)
+                                            accepted = onSendMessage(trimmed)
                                         }
-                                        promptText = ""
+                                        if accepted { promptText = "" }
                                     }) {
                                         Image(systemName: "tray.and.arrow.down.fill")
                                             .font(.system(size: max(11, 14 * zoomManager.zoomScale), weight: .semibold))
@@ -771,12 +765,8 @@ struct ChatDetailView: View {
                                     Button(action: {
                                         let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
                                         guard !trimmed.isEmpty else { return }
-                                        if let immediateAction = onSendImmediate {
-                                            immediateAction(trimmed)
-                                        } else {
-                                            onSendMessage(trimmed)
-                                        }
-                                        promptText = ""
+                                        let accepted = onSendImmediate?(trimmed) ?? onSendMessage(trimmed)
+                                        if accepted { promptText = "" }
                                     }) {
                                         Image(systemName: "bolt.circle.fill")
                                             .font(.system(size: max(20, 26 * zoomManager.zoomScale)))
@@ -798,8 +788,7 @@ struct ChatDetailView: View {
                             Button(action: {
                                 let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
                                 if !trimmed.isEmpty && isModelLoaded {
-                                    onSendMessage(trimmed)
-                                    promptText = ""
+                                    if onSendMessage(trimmed) { promptText = "" }
                                 }
                             }) {
                                 Image(systemName: "arrow.right.circle.fill")

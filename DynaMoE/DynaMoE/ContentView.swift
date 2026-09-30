@@ -1598,13 +1598,14 @@ struct ContentView: View {
         }
     }
 
-    private func handleQueuePrompt(_ text: String) {
-        guard hasLoadedPersistedSessions else { return }
-        guard let currentSessionId = selectedSessionId ?? sessions.first?.id else { return }
-        guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return }
+    private func handleQueuePrompt(_ text: String) -> Bool {
+        guard hasLoadedPersistedSessions else { return false }
+        guard let currentSessionId = selectedSessionId ?? sessions.first?.id else { return false }
+        guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty else { return false }
         sessions[sessionIdx].queuedPrompts.append(QueuedPrompt(text: trimmed))
+        return true
     }
 
     private func handleRemoveQueuedPrompt(id: UUID) {
@@ -1613,10 +1614,10 @@ struct ContentView: View {
         sessions[sessionIdx].queuedPrompts.removeAll(where: { $0.id == id })
     }
 
-    private func interruptAndSendMessage(_ text: String) {
-        guard hasLoadedPersistedSessions else { return }
+    private func interruptAndSendMessage(_ text: String) -> Bool {
+        guard hasLoadedPersistedSessions else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty else { return false }
         if isGeneratingText {
             print("⏹ [INT] interrupt requested — cancelling current generation and sending a fresh turn")
             let previous = generationTask
@@ -1632,10 +1633,11 @@ struct ContentView: View {
                 // cancellation at every layer boundary, so this bounds the wait to
                 // one layer (one token during decode).
                 await previous?.value
-                self.handleSendMessage(trimmed)
+                _ = self.handleSendMessage(trimmed)
             }
+            return true
         } else {
-            handleSendMessage(trimmed)
+            return handleSendMessage(trimmed)
         }
     }
 
@@ -1647,7 +1649,7 @@ struct ContentView: View {
         Task { @MainActor in
             // Smooth transition to next turn
             try? await Task.sleep(nanoseconds: 80_000_000)
-            self.handleSendMessage(next.text)
+            _ = self.handleSendMessage(next.text)
         }
     }
 
@@ -1698,10 +1700,12 @@ struct ContentView: View {
         }
     }
 
-    private func handleSendMessage(_ text: String) {
+    /// Returns whether the prompt was accepted. A `false` result means nothing
+    /// was sent, so the composer must keep the text instead of clearing it.
+    private func handleSendMessage(_ text: String) -> Bool {
         // Never touch chat state before persisted sessions finish loading, or the
         // turn could land in a placeholder the load then replaces.
-        guard hasLoadedPersistedSessions else { return }
+        guard hasLoadedPersistedSessions else { return false }
         // Backstop for the send button's isModelLoaded gate: sending before the
         // engine is ready must not touch chat or harness state — a pre-load
         // prompt was observed to poison later sessions (garbled output even in
@@ -1710,10 +1714,10 @@ struct ContentView: View {
             let err = "⚠️ No model loaded — select a model in Settings (bottom left) before sending."
             generationStatusText = err
             gpuComputeOutput = err
-            return
+            return false
         }
-        guard let currentSessionId = selectedSessionId ?? sessions.first?.id else { return }
-        guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return }
+        guard let currentSessionId = selectedSessionId ?? sessions.first?.id else { return false }
+        guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return false }
         
         let userMsg = ChatMessage(role: .user, content: text)
         sessions[sessionIdx].messages.append(userMsg)
@@ -1965,6 +1969,7 @@ struct ContentView: View {
         
         AgentHarness.shared.beginAgentSearchGuard()
         startAutoregressiveGeneration(customPrompt: promptString, sessionId: currentSessionId, messageId: assistantMsgId)
+        return true
     }
 
     // MARK: - Tokenizer Execution
