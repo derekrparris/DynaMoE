@@ -1369,7 +1369,7 @@ struct ContentView: View {
                         handleQueuePrompt(text)
                     },
                     onSendImmediate: { text in
-                        interruptAndSendMessage(text)
+                        await interruptAndSendMessage(text)
                     },
                     onRemoveQueuedPrompt: { id in
                         handleRemoveQueuedPrompt(id: id)
@@ -1497,6 +1497,13 @@ struct ContentView: View {
         .onChange(of: chatAutoDeleteEnabled) { _ in
             applyChatRetention()
         }
+        .onChange(of: isGeneratingText) { generating in
+            // A session kept alive only because it was generating becomes
+            // prunable the moment generation stops, so recheck retention then.
+            if !generating {
+                applyChatRetention()
+            }
+        }
         .onChange(of: scenePhase) { phase in
             if phase != .active {
                 flushSessionPersist()
@@ -1614,31 +1621,28 @@ struct ContentView: View {
         sessions[sessionIdx].queuedPrompts.removeAll(where: { $0.id == id })
     }
 
-    private func interruptAndSendMessage(_ text: String) -> Bool {
+    /// Returns whether the prompt was accepted. When a turn is already running
+    /// this waits for the cancelled generation to stop and reports the result of
+    /// the replacement send, so a caller only clears/removes the prompt once the
+    /// new turn has actually started.
+    private func interruptAndSendMessage(_ text: String) async -> Bool {
         guard hasLoadedPersistedSessions else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
-        if isGeneratingText {
-            print("⏹ [INT] interrupt requested — cancelling current generation and sending a fresh turn")
-            let previous = generationTask
-            stopAutoregressiveGeneration()
-            Task { @MainActor in
-                // Wait for the cancelled generation to actually stop instead of
-                // guessing with a fixed delay. Its replacement resets the shared KV
-                // cache here in startAutoregressiveGeneration, and with no prefix to
-                // preserve that reset drops the buffers and allocates fresh ones, so
-                // starting the replacement while the old task is still inside a
-                // kernel dispatch would let that task write into the replacement's
-                // buffers. Both the decode and prefill layer loops check
-                // cancellation at every layer boundary, so this bounds the wait to
-                // one layer (one token during decode).
-                await previous?.value
-                _ = self.handleSendMessage(trimmed)
-            }
-            return true
-        } else {
-            return handleSendMessage(trimmed)
-        }
+        guard isGeneratingText else { return handleSendMessage(trimmed) }
+        print("⏹ [INT] interrupt requested — cancelling current generation and sending a fresh turn")
+        let previous = generationTask
+        stopAutoregressiveGeneration()
+        // Wait for the cancelled generation to actually stop instead of guessing
+        // with a fixed delay. Its replacement resets the shared KV cache here in
+        // startAutoregressiveGeneration, and with no prefix to preserve that reset
+        // drops the buffers and allocates fresh ones, so starting the replacement
+        // while the old task is still inside a kernel dispatch would let that task
+        // write into the replacement's buffers. Both the decode and prefill layer
+        // loops check cancellation at every layer boundary, so this bounds the
+        // wait to one layer (one token during decode).
+        await previous?.value
+        return handleSendMessage(trimmed)
     }
 
     private func dequeueAndRunNextPromptIfNeeded(sessionId: UUID?) {

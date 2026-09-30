@@ -12018,6 +12018,53 @@ final class ChatSessionPersistenceTests: XCTestCase {
         try await Task.sleep(nanoseconds: 150_000_000)
         XCTAssertFalse(store.isPersistenceAvailable, "A failed write must mark persistence as unavailable")
     }
+
+    func testCachedDigestRestoresFileRemovedWhileRunning() {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        let kept = session(title: "Kept", updatedAt: Date())
+        store.saveAll([kept])
+        store.flushPendingIO()
+
+        let file = dir.appendingPathComponent("\(kept.id.uuidString).json")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+
+        // A file (or the whole directory) can vanish while the app is running.
+        try? FileManager.default.removeItem(at: file)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+
+        // Same content, but the file is gone: the cached signature must not make
+        // the save skip it and leave the conversation absent.
+        store.saveAll([kept])
+        store.flushPendingIO()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path), "A missing file must be rewritten even when its content is unchanged")
+    }
+
+    func testLaterSuccessDoesNotMaskEarlierWriteFailure() async throws {
+        let dir = makeTempDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let store = ChatSessionStore(directory: dir)
+        XCTAssertTrue(store.isPersistenceAvailable)
+
+        let failing = session(title: "Failing", updatedAt: Date())
+        let succeeding = session(title: "Succeeding", updatedAt: Date().addingTimeInterval(-1))
+        // Occupy the failing session's file path with a directory so its atomic
+        // write cannot land, while the other conversation writes normally.
+        let blockingPath = dir.appendingPathComponent("\(failing.id.uuidString).json", isDirectory: true)
+        try FileManager.default.createDirectory(at: blockingPath, withIntermediateDirectories: true)
+
+        store.saveAll([failing, succeeding])
+        store.flushPendingIO()
+
+        // The availability update hops back to the main actor; give it a moment.
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(store.isPersistenceAvailable, "A later successful write must not mask an earlier failure")
+    }
 }
 
 

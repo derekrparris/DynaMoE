@@ -30,7 +30,7 @@ struct ChatDetailView: View {
     var onSendMessage: (String) -> Bool
     var onStopGeneration: () -> Void
     var onQueuePrompt: ((String) -> Bool)? = nil
-    var onSendImmediate: ((String) -> Bool)? = nil
+    var onSendImmediate: ((String) async -> Bool)? = nil
     var onRemoveQueuedPrompt: ((UUID) -> Void)? = nil
     var onSelectDiscoveredModel: ((DiscoveredModel) -> Void)? = nil
     var onOpenSettings: (() -> Void)? = nil
@@ -355,16 +355,19 @@ struct ChatDetailView: View {
                                 HStack(spacing: 6) {
                                     Button(action: {
                                         let textToSend = item.text
-                                        let accepted: Bool
                                         if let immediate = onSendImmediate {
-                                            accepted = immediate(textToSend)
-                                        } else {
-                                            accepted = onSendMessage(textToSend)
+                                            // Only drop the queued prompt once the
+                                            // send actually lands, so a rejected
+                                            // send (no model, still loading) does
+                                            // not lose it.
+                                            Task {
+                                                if await immediate(textToSend) {
+                                                    onRemoveQueuedPrompt?(item.id)
+                                                }
+                                            }
+                                        } else if onSendMessage(textToSend) {
+                                            onRemoveQueuedPrompt?(item.id)
                                         }
-                                        // Only drop the queued prompt once the send
-                                        // actually lands, so a rejected send (no
-                                        // model, still loading) does not lose it.
-                                        if accepted { onRemoveQueuedPrompt?(item.id) }
                                     }) {
                                         HStack(spacing: 3) {
                                             Image(systemName: "bolt.fill")
@@ -453,8 +456,13 @@ struct ChatDetailView: View {
                         onCommitImmediate: {
                             let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
                             guard !trimmed.isEmpty else { return }
-                            let accepted = onSendImmediate?(trimmed) ?? onSendMessage(trimmed)
-                            if accepted { promptText = "" }
+                            if let immediate = onSendImmediate {
+                                Task {
+                                    if await immediate(trimmed) { promptText = "" }
+                                }
+                            } else if onSendMessage(trimmed) {
+                                promptText = ""
+                            }
                         }
                     )
                     .frame(minHeight: max(21, 25 * zoomManager.zoomScale), maxHeight: max(100, 140 * zoomManager.zoomScale))
@@ -769,8 +777,13 @@ struct ChatDetailView: View {
                                     Button(action: {
                                         let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
                                         guard !trimmed.isEmpty else { return }
-                                        let accepted = onSendImmediate?(trimmed) ?? onSendMessage(trimmed)
-                                        if accepted { promptText = "" }
+                                        if let immediate = onSendImmediate {
+                                            Task {
+                                                if await immediate(trimmed) { promptText = "" }
+                                            }
+                                        } else if onSendMessage(trimmed) {
+                                            promptText = ""
+                                        }
                                     }) {
                                         Image(systemName: "bolt.circle.fill")
                                             .font(.system(size: max(20, 26 * zoomManager.zoomScale)))

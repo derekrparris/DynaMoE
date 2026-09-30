@@ -208,33 +208,45 @@ final class ChatSessionStore: ObservableObject {
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
             let liveIds = Set(snapshot.map(\.id))
-            var reportedAvailable = false
+            // Net outcome for the pass, reported once the loop finishes. Any
+            // failure wins: if even one conversation is not durable the pass must
+            // not report healthy just because another write succeeded, and a
+            // later success must not hide an earlier failure (or vice versa).
+            var wroteAny = false
+            var failedAny = false
 
             for session in snapshot {
                 guard let data = try? encoder.encode(
                     PersistedChatSession(schemaVersion: ChatSessionStore.currentSchemaVersion, session: session)
                 ) else { continue }
                 let signature = SHA256.hash(data: data)
-                if writtenSignatures[session.id] == signature {
+                let url = directory.appendingPathComponent("\(session.id.uuidString).json", isDirectory: false)
+                // Only skip a write when the bytes are unchanged *and* the file
+                // is still on disk: a cached signature alone must not leave the
+                // conversation absent if the file (or the whole directory) was
+                // removed while the app was running.
+                if writtenSignatures[session.id] == signature,
+                   fm.fileExists(atPath: url.path) {
                     managedIds.insert(session.id)
                     continue
                 }
-                let url = directory.appendingPathComponent("\(session.id.uuidString).json", isDirectory: false)
                 do {
                     try data.write(to: url, options: .atomic)
                     writtenSignatures[session.id] = signature
                     managedIds.insert(session.id)
-                    if !reportedAvailable {
-                        reportPersistenceAvailability(true)
-                        reportedAvailable = true
-                    }
+                    wroteAny = true
                 } catch {
                     // Leave no signature so the conversation is retried rather
                     // than assumed durable for the rest of the process.
                     writtenSignatures[session.id] = nil
-                    reportPersistenceAvailability(false)
+                    failedAny = true
                     print("⚠️ [ChatSessionStore] failed to persist session \(session.id): \(error.localizedDescription)")
                 }
+            }
+            if failedAny {
+                reportPersistenceAvailability(false)
+            } else if wroteAny {
+                reportPersistenceAvailability(true)
             }
 
             guard let urls = try? fm.contentsOfDirectory(
