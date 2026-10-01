@@ -1082,6 +1082,7 @@ struct ChatMessageView: View {
                             .foregroundColor(.primary)
                             .cornerRadius(14)
                             .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 } else {
                     // Assistant Thinking / Reasoning Accordion (Osaurus Style)
@@ -1174,6 +1175,7 @@ struct ChatMessageView: View {
                                             .padding(.horizontal, 14)
                                             .padding(.vertical, 10)
                                             .frame(maxWidth: .infinity, alignment: .leading)
+                                            .fixedSize(horizontal: false, vertical: true)
                                             .background(Color.secondary.opacity(0.035))
                                             .cornerRadius(8)
                                             .overlay(
@@ -1549,6 +1551,7 @@ struct MarkdownMessageView: View {
                 .padding(.top, topPad)
                 .padding(.bottom, botPad)
                 .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
         } else {
             Text(LocalizedStringKey(text))
                 .font(.system(size: max(9, size), weight: weight))
@@ -1556,6 +1559,7 @@ struct MarkdownMessageView: View {
                 .padding(.top, topPad)
                 .padding(.bottom, botPad)
                 .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -1568,6 +1572,7 @@ struct MarkdownMessageView: View {
                 .lineSpacing(4)
                 .foregroundColor(.primary)
                 .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else {
             Text(LocalizedStringKey(text))
@@ -1575,6 +1580,7 @@ struct MarkdownMessageView: View {
                 .lineSpacing(4)
                 .foregroundColor(.primary)
                 .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
@@ -1600,6 +1606,7 @@ struct MarkdownMessageView: View {
                     .foregroundColor(.secondary)
                     .lineSpacing(3.5)
                     .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
             } else {
                 Text(LocalizedStringKey(text))
                     .font(.system(size: fontSize))
@@ -1607,6 +1614,7 @@ struct MarkdownMessageView: View {
                     .foregroundColor(.secondary)
                     .lineSpacing(3.5)
                     .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(.vertical, 6)
@@ -1637,12 +1645,14 @@ struct MarkdownMessageView: View {
                     .lineSpacing(3)
                     .foregroundColor(.primary)
                     .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
             } else {
                 Text(LocalizedStringKey(text))
                     .font(.system(size: fontSize))
                     .lineSpacing(3)
                     .foregroundColor(.primary)
                     .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(.vertical, 1.5)
