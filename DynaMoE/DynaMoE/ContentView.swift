@@ -1013,11 +1013,20 @@ struct ContentView: View {
     /// selection from superseding the user's newer one.
     @State private var modelSwitchRequestId: UInt64 = 0
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
-    /// Backing storage for `sessions`. Kept separate so the computed `sessions`
-    /// below can bump `sessionPersistRevision` on every mutation.
-    @State private var storedSessions: [ChatSession] = [
+    /// Reference box holding the `sessions` array. SwiftUI's `@State` exposes only
+    /// get/set for its value, so a computed proxy that yields `&storedSessions`
+    /// during a nested write (for example `sessions[i].messages[j].content = ...`,
+    /// which streaming runs every token) would copy-on-write the whole array on
+    /// each statement. Keeping the array in a class and yielding into the class's
+    /// stored property mutates it in place.
+    private final class SessionStorage {
+        var sessions: [ChatSession]
+        init(_ sessions: [ChatSession]) { self.sessions = sessions }
+    }
+    /// Backing storage for `sessions`.
+    @State private var sessionStorage = SessionStorage([
         ChatSession(title: "New Chat")
-    ]
+    ])
     /// Bumped on every `sessions` mutation, whole-value or in place. Watching this
     /// O(1) counter replaces observing the full `[ChatSession]` array (or a
     /// length-based fingerprint): the array's synthesized `Equatable` compared
@@ -1026,9 +1035,13 @@ struct ContentView: View {
     /// history per token.
     @State private var sessionPersistRevision: UInt64 = 0
     private var sessions: [ChatSession] {
-        get { storedSessions }
+        get { sessionStorage.sessions }
         nonmutating set {
-            storedSessions = newValue
+            sessionStorage.sessions = newValue
+            sessionPersistRevision &+= 1
+        }
+        nonmutating _modify {
+            yield &sessionStorage.sessions
             sessionPersistRevision &+= 1
         }
     }
@@ -1422,17 +1435,21 @@ struct ContentView: View {
 
         // Preserve every in-memory conversation the user actually used while the
         // load was pending or after a failed attempt, so a retry that finally
-        // succeeds does not discard their work. Only the untouched launch
-        // placeholder is dropped, and by identity rather than by being empty: a New
-        // Chat created before the load finished must survive even with no messages.
-        let loadedIds = Set(loaded.map(\.id))
-        let inMemoryOnly = sessions.filter { session in
-            guard !loadedIds.contains(session.id) else { return false }
+        // succeeds does not discard their work. A conversation already in memory
+        // is at least as fresh as the disk copy: if the user kept chatting while
+        // this load decoded, a debounced save may have written an older snapshot
+        // to disk. So keep the live value on overlap and append only history that
+        // memory does not already have. The untouched launch placeholder is
+        // dropped by identity rather than by being empty, so a New Chat created
+        // before the load finished survives even with no messages.
+        let memoryIds = Set(sessions.map(\.id))
+        let diskOnly = loaded.filter { !memoryIds.contains($0.id) }
+        let keptFromMemory = sessions.filter { session in
             if session.id == launchPlaceholderId, session.messages.isEmpty { return false }
             return true
         }
 
-        sessions = inMemoryOnly + loaded
+        sessions = keptFromMemory + diskOnly
         // Preserve the user's current selection across a retry: they may have
         // used and selected an in-memory chat while the first load failed or was
         // pending, and jumping to `sessions.first` would yank them out of it.
@@ -1449,7 +1466,7 @@ struct ContentView: View {
         isLoadingPersistedSessions = false
 
         // Conversations kept from memory were never written; persist now.
-        if !inMemoryOnly.isEmpty {
+        if !keptFromMemory.isEmpty {
             ChatSessionStore.shared.saveAll(sessions)
         }
         applyChatRetention()
