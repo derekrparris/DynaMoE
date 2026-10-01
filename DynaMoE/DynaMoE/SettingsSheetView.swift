@@ -378,6 +378,50 @@ struct SettingsSheetView: View {
         return "v\(shortVersion) (\(buildVersion))"
     }
 
+    /// Single-line summary of a model's author, architecture, quantization, and size.
+    private func modelMetadataLine(_ model: DiscoveredModel) -> String {
+        var parts: [String] = [model.author, model.architectureName]
+        if let quant = model.quantization, !quant.isEmpty {
+            parts.append(quant)
+        }
+        parts.append(model.formattedSize)
+        return parts.joined(separator: "  •  ")
+    }
+
+    /// Bridges an `Int` binding into the `Double` numeric control.
+    private func doubleBinding(_ source: Binding<Int>) -> Binding<Double> {
+        Binding(
+            get: { Double(source.wrappedValue) },
+            set: { source.wrappedValue = Int($0.rounded()) }
+        )
+    }
+
+    /// Bridges a `Float` binding into the `Double` numeric control.
+    private func doubleBinding(_ source: Binding<Float>) -> Binding<Double> {
+        Binding(
+            get: { Double(source.wrappedValue) },
+            set: { source.wrappedValue = Float($0) }
+        )
+    }
+
+    /// Labeled compact numeric control used across the sampling and JetSpec grids.
+    private func samplingControl(
+        _ title: String,
+        value: Binding<Double>,
+        range: ClosedRange<Double>,
+        step: Double,
+        digits: Int = 2
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+            SettingsNumericField(value: value, range: range, step: step, fractionDigits: digits)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     // MARK: - Tab 1: Models & Weights Management
     private var modelsSettingsSection: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -435,6 +479,7 @@ struct SettingsSheetView: View {
                     ForEach(localModelManager.discoveredModels) { model in
                         let isDefault = localModelManager.defaultModelId == model.id || localModelManager.defaultModelId == model.repoId
                         let isCurrentActive = (activeModelPath != nil && (activeModelPath == model.snapshotPath || activeModelPath == model.weightsEntryPath || (summary != nil && (modelConfig?.modelType ?? "").localizedCaseInsensitiveContains(model.displayName))))
+                        let isFlashMoEPacked = ExpertRepacker.isPackedFormat(dir: URL(fileURLWithPath: model.snapshotPath))
 
                         VStack(alignment: .leading, spacing: 8) {
                             HStack(alignment: .center, spacing: 14) {
@@ -449,187 +494,111 @@ struct SettingsSheetView: View {
                             }
 
                             // Model Info
-                            VStack(alignment: .leading, spacing: 4) {
-                                HStack(spacing: 6) {
-                                    Text(model.displayName)
-                                        .font(.system(size: 13.5, weight: .semibold))
-                                        .foregroundColor(.primary)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(model.displayName)
+                                    .font(.system(size: 13.5, weight: .semibold))
+                                    .foregroundColor(.primary)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
 
-                                    if isDefault {
-                                        Text("★ DEFAULT")
-                                            .font(.system(size: 9.5, weight: .bold))
-                                            .foregroundColor(.purple)
-                                            .padding(.horizontal, 6)
-                                            .padding(.vertical, 2)
-                                            .background(Color.purple.opacity(0.12))
-                                            .cornerRadius(4)
-                                    }
-
-                                    if isCurrentActive {
-                                        Text("● ACTIVE")
-                                            .font(.system(size: 9.5, weight: .bold))
-                                            .foregroundColor(.green)
-                                            .padding(.horizontal, 6)
-                                            .padding(.vertical, 2)
-                                            .background(Color.green.opacity(0.12))
-                                            .cornerRadius(4)
-                                    }
-
-                                    let isFlashMoEPacked = ExpertRepacker.isPackedFormat(dir: URL(fileURLWithPath: model.snapshotPath))
-                                    if model.isMoE && isFlashMoEPacked {
-                                        HStack(spacing: 3) {
-                                            Image(systemName: "bolt.fill")
-                                                .font(.system(size: 8))
-                                                .foregroundColor(.green)
-                                            Text("⚡ FlashMoE")
-                                                .font(.system(size: 9.5, weight: .bold))
-                                                .foregroundColor(.green)
+                                if isDefault || isCurrentActive || (model.isMoE && isFlashMoEPacked) {
+                                    HStack(spacing: 6) {
+                                        if isDefault {
+                                            SettingsStatusBadge(text: "Default", tint: .purple)
                                         }
-                                        .padding(.horizontal, 6)
-                                        .padding(.vertical, 2)
-                                        .background(Color.green.opacity(0.12))
-                                        .cornerRadius(4)
+                                        if isCurrentActive {
+                                            SettingsStatusBadge(text: "Active", tint: .green)
+                                        }
+                                        if model.isMoE && isFlashMoEPacked {
+                                            SettingsStatusBadge(text: "FlashMoE", systemImage: "bolt.fill", tint: .orange)
+                                        }
                                     }
                                 }
 
-                                HStack(spacing: 8) {
-                                    Text(model.author)
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-
-                                    Text("•")
-                                        .foregroundColor(.secondary.opacity(0.4))
-
-                                    Text(model.architectureName)
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-
-                                    if let quant = model.quantization {
-                                        Text("•")
-                                            .foregroundColor(.secondary.opacity(0.4))
-                                        Text(quant)
-                                            .font(.system(size: 10, weight: .medium, design: .monospaced))
-                                            .foregroundColor(.indigo)
-                                    }
-
-                                    Text("•")
-                                        .foregroundColor(.secondary.opacity(0.4))
-
-                                    Text(model.formattedSize)
-                                        .font(.system(size: 11, design: .monospaced))
-                                        .foregroundColor(.secondary)
-                                }
+                                Text(modelMetadataLine(model))
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
                             }
 
                             Spacer()
 
-                            // Action Buttons: FlashMoE Repack, Default toggle & Load button
+                            // Actions: secondary actions live in an overflow menu so the
+                            // row stays uncluttered and text never competes with controls.
                             HStack(spacing: 8) {
-                                let isFlashMoEPacked = ExpertRepacker.isPackedFormat(dir: URL(fileURLWithPath: model.snapshotPath))
-                                if model.isMoE && !isFlashMoEPacked {
-                                    if repackingModelId == model.id {
-                                        VStack(alignment: .trailing, spacing: 2) {
-                                            ProgressView(value: repackProgress)
-                                                .progressViewStyle(.linear)
-                                                .frame(width: 80)
-                                            Text(repackStatus)
-                                                .font(.system(size: 8))
-                                                .foregroundColor(.secondary)
-                                                .lineLimit(1)
-                                        }
-                                    } else {
-                                        Button(action: {
-                                            repackModel(model)
-                                        }) {
-                                            HStack(spacing: 4) {
-                                                Image(systemName: "bolt.badge.automatic.fill")
-                                                    .font(.system(size: 10))
-                                                    .foregroundColor(.yellow)
-                                                Text("FlashMoE Repack")
-                                                    .font(.caption2)
-                                                    .fontWeight(.medium)
+                                if repackingModelId == model.id {
+                                    VStack(alignment: .trailing, spacing: 2) {
+                                        ProgressView(value: repackProgress)
+                                            .progressViewStyle(.linear)
+                                            .frame(width: 80)
+                                        Text(repackStatus)
+                                            .font(.system(size: 9))
+                                            .foregroundColor(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                } else {
+                                    Menu {
+                                        Button {
+                                            if isDefault {
+                                                localModelManager.setDefaultModel(id: nil)
+                                            } else {
+                                                localModelManager.setDefaultModel(id: model.id)
                                             }
-                                            .padding(.horizontal, 8)
-                                            .padding(.vertical, 5)
-                                            .background(Color.yellow.opacity(0.12))
-                                            .cornerRadius(6)
+                                        } label: {
+                                            Label(isDefault ? "Clear Default" : "Set as Default",
+                                                  systemImage: isDefault ? "star.slash" : "star")
                                         }
-                                        .buttonStyle(.plain)
-                                        .help("Losslessly repack weights into FlashMoE layout for ~100x faster generation")
-                                    }
-                                }
 
-                                Button(action: {
-                                    if isDefault {
-                                        localModelManager.setDefaultModel(id: nil)
-                                    } else {
-                                        localModelManager.setDefaultModel(id: model.id)
-                                    }
-                                }) {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: isDefault ? "star.fill" : "star")
-                                            .font(.system(size: 11))
-                                            .foregroundColor(isDefault ? .orange : .secondary)
-                                        Text(isDefault ? "Default" : "Set Default")
-                                            .font(.caption)
-                                    }
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 5)
-                                    .background(isDefault ? Color.orange.opacity(0.1) : Color.secondary.opacity(0.06))
-                                    .cornerRadius(6)
-                                }
-                                .buttonStyle(.plain)
-                                .help("Make this model load by default for all new conversations")
-
-                                Button(action: {
-                                    withAnimation(.easeInOut(duration: 0.2)) {
-                                        if selectedModelForProfiles == model.id {
-                                            selectedModelForProfiles = nil
-                                        } else {
-                                            selectedModelForProfiles = model.id
-                                            loadProfileDraft(modelId: model.id, type: inspectingProfileType)
+                                        Button {
+                                            withAnimation(.easeInOut(duration: 0.2)) {
+                                                if selectedModelForProfiles == model.id {
+                                                    selectedModelForProfiles = nil
+                                                } else {
+                                                    selectedModelForProfiles = model.id
+                                                    loadProfileDraft(modelId: model.id, type: inspectingProfileType)
+                                                }
+                                            }
+                                        } label: {
+                                            Label(selectedModelForProfiles == model.id ? "Hide Profiles" : "Configure Profiles…",
+                                                  systemImage: "slider.horizontal.3")
                                         }
+
+                                        if model.isMoE && !isFlashMoEPacked {
+                                            Divider()
+                                            Button {
+                                                repackModel(model)
+                                            } label: {
+                                                Label("FlashMoE Repack", systemImage: "bolt.badge.automatic.fill")
+                                            }
+                                        }
+                                    } label: {
+                                        Image(systemName: "ellipsis.circle")
+                                            .font(.system(size: 15))
                                     }
-                                }) {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: selectedModelForProfiles == model.id ? "slider.horizontal.3" : "slider.horizontal.2.square")
-                                            .font(.system(size: 11))
-                                            .foregroundColor(.purple)
-                                        Text("Profiles")
-                                            .font(.caption)
-                                            .fontWeight(selectedModelForProfiles == model.id ? .semibold : .regular)
-                                    }
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 5)
-                                    .background(selectedModelForProfiles == model.id ? Color.purple.opacity(0.18) : Color.purple.opacity(0.08))
-                                    .cornerRadius(6)
+                                    .menuStyle(.borderlessButton)
+                                    .menuIndicator(.hidden)
+                                    .fixedSize()
+                                    .help("Model actions")
                                 }
-                                .buttonStyle(.plain)
-                                .help("Configure Coder and Assistant generation profiles for \(model.displayName)")
 
                                 if isCurrentActive {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: "checkmark.circle.fill")
-                                            .font(.system(size: 11))
-                                            .foregroundColor(.green)
-                                        Text("Loaded")
-                                            .font(.caption)
-                                            .fontWeight(.semibold)
-                                            .foregroundColor(.green)
-                                    }
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 5)
-                                    .background(Color.green.opacity(0.1))
-                                    .cornerRadius(6)
+                                    Label("Loaded", systemImage: "checkmark.circle.fill")
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .foregroundColor(.green)
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 5)
+                                        .background(Color.green.opacity(0.12))
+                                        .clipShape(Capsule())
                                 } else {
-                                    Button(action: {
+                                    Button {
                                         onLoadDiscoveredModel(model)
-                                    }) {
-                                        Text("Load Model")
-                                            .font(.caption)
-                                            .fontWeight(.semibold)
+                                    } label: {
+                                        Text("Load")
+                                            .font(.system(size: 12, weight: .semibold))
                                     }
                                     .buttonStyle(.borderedProminent)
+                                    .controlSize(.small)
                                 }
                             }
                         }
@@ -695,28 +664,34 @@ struct SettingsSheetView: View {
                     .font(.system(size: 20))
                     .foregroundColor(.purple)
                 let currentModelIdentifier = activeModelPath ?? modelConfig?.modelType ?? localModelManager.defaultModelId
-                VStack(alignment: .leading, spacing: 2) {
+                let modelDisplayText: String = {
+                    if let path = activeModelPath,
+                       let model = localModelManager.discoveredModels.first(where: { $0.snapshotPath == path || $0.weightsEntryPath == path }) {
+                        return model.displayName
+                    } else if let modelType = modelConfig?.modelType {
+                        return modelType
+                    } else {
+                        return detectedArchitecture.rawValue
+                    }
+                }()
+                VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 6) {
                         Text("Active Profile: \(activeProfile.profileDisplayName(for: currentModelIdentifier))")
                             .font(.system(size: 13, weight: .bold))
-                        if let path = activeModelPath,
-                           let model = localModelManager.discoveredModels.first(where: { $0.snapshotPath == path || $0.weightsEntryPath == path }) {
-                            Text("• \(model.displayName)")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        } else if let modelType = modelConfig?.modelType {
-                            Text("• \(modelType)")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        } else {
-                            Text("• \(detectedArchitecture.rawValue)")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+
+                        Image(systemName: "info.circle")
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
+                            .help(activeProfile.description(for: currentModelIdentifier))
                     }
-                    Text(activeProfile.description(for: currentModelIdentifier))
-                        .font(.caption2)
+
+                    Text("• \(modelDisplayText)")
+                        .font(.caption)
                         .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
 
                 Spacer()
@@ -762,107 +737,40 @@ struct SettingsSheetView: View {
             .background(Color.purple.opacity(0.08))
             .cornerRadius(10)
 
-            SettingsCard(header: "Sampling", spacing: 16) {
-                // Temperature
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Temperature")
-                            .font(.subheadline)
-                        Spacer()
-                        Text(String(format: "%.2f", temperature))
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.purple)
+            SettingsCard(header: "Sampling") {
+                Grid(alignment: .leading, horizontalSpacing: 28, verticalSpacing: 14) {
+                    GridRow {
+                        samplingControl("Temperature", value: doubleBinding($temperature), range: 0.0...2.0, step: 0.05)
+                        samplingControl("Top-P (Nucleus)", value: doubleBinding($topP), range: 0.0...1.0, step: 0.05)
                     }
-                    Slider(value: $temperature, in: 0.0...2.0, step: 0.05)
+                    GridRow {
+                        samplingControl("Min-P (Confidence)", value: doubleBinding($minP), range: 0.0...0.5, step: 0.01)
+                        samplingControl("Top-K", value: doubleBinding($topK), range: 1...100, step: 1, digits: 0)
+                    }
+                    GridRow {
+                        samplingControl("Repetition Penalty", value: doubleBinding($repetitionPenalty), range: 1.0...2.0, step: 0.05)
+                        samplingControl("Presence Penalty", value: doubleBinding($presencePenalty), range: 0.0...2.0, step: 0.05)
+                    }
                 }
 
-                // Top-P (Nucleus Sampling)
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Top-P (Nucleus)")
-                            .font(.subheadline)
-                        Spacer()
-                        Text(String(format: "%.2f", topP))
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.purple)
-                    }
-                    Slider(value: $topP, in: 0.0...1.0, step: 0.05)
-                }
+                SettingsRowDivider()
 
-                // Min-P (Dynamic Truncation)
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Min-P (Confidence Truncation)")
-                            .font(.subheadline)
-                        Spacer()
-                        Text(String(format: "%.2f", minP))
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.purple)
-                    }
-                    Slider(value: $minP, in: 0.0...0.5, step: 0.01)
-                }
-
-                // Top-K Filtering
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Top-K")
-                            .font(.subheadline)
-                        Spacer()
-                        Text("\(topK)")
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.purple)
-                    }
-                    Slider(value: Binding(
-                        get: { Float(topK) },
-                        set: { topK = Int($0) }
-                    ), in: 1...100, step: 1)
-                }
-
-                // Repetition Penalty
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Repetition Penalty")
-                            .font(.subheadline)
-                        Spacer()
-                        Text(String(format: "%.2f", repetitionPenalty))
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.purple)
-                    }
-                    Slider(value: $repetitionPenalty, in: 1.0...2.0, step: 0.05)
-                }
-
-                // Presence Penalty
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Presence Penalty")
-                            .font(.subheadline)
-                        Spacer()
-                        Text(String(format: "%.2f", presencePenalty))
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.purple)
-                    }
-                    Slider(value: $presencePenalty, in: 0.0...2.0, step: 0.05)
-                }
-
-                // Max New Tokens
-                VStack(alignment: .leading, spacing: 6) {
+                // Max Output Tokens: precise field plus quick presets, full width.
+                VStack(alignment: .leading, spacing: 8) {
                     HStack {
                         Text("Max Output Tokens")
-                            .font(.subheadline)
-                            .fontWeight(.medium)
+                            .font(.system(size: 11.5, weight: .medium))
+                            .foregroundColor(.secondary)
                         Spacer()
-                        Text("\(maxNewTokens) tokens")
-                            .font(.system(.caption, design: .monospaced))
-                            .fontWeight(.bold)
-                            .foregroundColor(.purple)
+                        SettingsNumericField(
+                            value: doubleBinding($maxNewTokens),
+                            range: 32...10000,
+                            step: 32,
+                            fractionDigits: 0,
+                            fieldWidth: 72
+                        )
                     }
 
-                    Slider(value: Binding(
-                        get: { Float(maxNewTokens) },
-                        set: { maxNewTokens = Int($0) }
-                    ), in: 32...10000, step: 32)
-
-                    // Quick Token Presets
                     HStack(spacing: 6) {
                         Text("Presets:")
                             .font(.caption2)
@@ -904,52 +812,12 @@ struct SettingsSheetView: View {
                     }
 
                     if jetSpecEnabled {
-                        // Max Tree Depth
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Text("Max Tree Depth")
-                                    .font(.caption)
-                                Spacer()
-                                Text("\(jetSpecMaxDepth)")
-                                    .font(.system(.caption, design: .monospaced))
-                                    .foregroundColor(.purple)
+                        Grid(alignment: .leading, horizontalSpacing: 28, verticalSpacing: 14) {
+                            GridRow {
+                                samplingControl("Max Tree Depth", value: doubleBinding($jetSpecMaxDepth), range: 1...5, step: 1, digits: 0)
+                                samplingControl("Branching Factor", value: doubleBinding($jetSpecBranchingFactor), range: 1...4, step: 1, digits: 0)
+                                samplingControl("Max Expert Cap", value: doubleBinding($jetSpecMaxExpertCap), range: 2...16, step: 1, digits: 0)
                             }
-                            Slider(value: Binding(
-                                get: { Float(jetSpecMaxDepth) },
-                                set: { jetSpecMaxDepth = Int($0) }
-                            ), in: 1...5, step: 1)
-                        }
-
-                        // Branching Factor
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Text("Branching Factor")
-                                    .font(.caption)
-                                Spacer()
-                                Text("\(jetSpecBranchingFactor)")
-                                    .font(.system(.caption, design: .monospaced))
-                                    .foregroundColor(.purple)
-                            }
-                            Slider(value: Binding(
-                                get: { Float(jetSpecBranchingFactor) },
-                                set: { jetSpecBranchingFactor = Int($0) }
-                            ), in: 1...4, step: 1)
-                        }
-
-                        // Max Unique MoE Expert Cap
-                        VStack(alignment: .leading, spacing: 4) {
-                            HStack {
-                                Text("Max Expert Cap per Step")
-                                    .font(.caption)
-                                Spacer()
-                                Text("\(jetSpecMaxExpertCap) experts")
-                                    .font(.system(.caption, design: .monospaced))
-                                    .foregroundColor(.purple)
-                            }
-                            Slider(value: Binding(
-                                get: { Float(jetSpecMaxExpertCap) },
-                                set: { jetSpecMaxExpertCap = Int($0) }
-                            ), in: 2...16, step: 1)
                         }
                     }
                 }

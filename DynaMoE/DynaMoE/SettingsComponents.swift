@@ -160,3 +160,58 @@ struct SettingsValuePill: View {
             .cornerRadius(6)
     }
 }
+
+/// Compact capsule badge for state indicators (Default, Active, FlashMoE, ...).
+/// Kept visually distinct from controls so status text never reads as a button.
+struct SettingsStatusBadge: View {
+    let text: String
+    var systemImage: String? = nil
+    var tint: Color = .secondary
+
+    var body: some View {
+        HStack(spacing: 3) {
+            if let systemImage {
+                Image(systemName: systemImage)
+                    .font(.system(size: 8, weight: .bold))
+            }
+            Text(text.uppercased())
+                .font(.system(size: 9.5, weight: .bold))
+        }
+        .foregroundColor(tint)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(tint.opacity(0.12))
+        .clipShape(Capsule())
+        .fixedSize()
+    }
+}
+
+/// Compact numeric input for dialing in values precisely: an editable value
+/// field paired with a stepper. Replaces wide sliders for sampling settings.
+struct SettingsNumericField: View {
+    let value: Binding<Double>
+    let range: ClosedRange<Double>
+    let step: Double
+    var fractionDigits: Int = 2
+    var fieldWidth: CGFloat = 58
+
+    var body: some View {
+        HStack(spacing: 6) {
+            TextField("", value: clamped, format: .number.precision(.fractionLength(fractionDigits)))
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12, design: .monospaced))
+                .multilineTextAlignment(.trailing)
+                .frame(width: fieldWidth)
+
+            Stepper("", value: clamped, in: range, step: step)
+                .labelsHidden()
+        }
+    }
+
+    private var clamped: Binding<Double> {
+        Binding(
+            get: { value.wrappedValue },
+            set: { value.wrappedValue = min(max($0, range.lowerBound), range.upperBound) }
+        )
+    }
+}
