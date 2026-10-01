@@ -11559,6 +11559,784 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
     }
 }
 
+@MainActor
+final class ChatSessionPersistenceTests: XCTestCase {
+
+    private func makeTempDirectory() -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ChatSessionPersistenceTests_\(UUID().uuidString)", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    private func session(title: String, updatedAt: Date) -> ChatSession {
+        ChatSession(title: title, messages: [], createdAt: updatedAt, updatedAt: updatedAt)
+    }
+
+    // MARK: - Retention plan (pure logic)
+
+    func testRetentionPlanKeepsMostRecentWithinLimit() {
+        let now = Date()
+        let newest = session(title: "Newest", updatedAt: now)
+        let middle = session(title: "Middle", updatedAt: now.addingTimeInterval(-60))
+        let oldest = session(title: "Oldest", updatedAt: now.addingTimeInterval(-120))
+
+        let plan = ChatSessionStore.retentionPlan(
+            sessions: [newest, middle, oldest],
+            limit: 2,
+            protectedIds: []
+        )
+
+        XCTAssertEqual(plan.kept.map(\.id), [newest.id, middle.id])
+        XCTAssertEqual(plan.removed.map(\.id), [oldest.id])
+    }
+
+    func testRetentionPlanNilLimitNeverDeletes() {
+        let now = Date()
+        let sessions = (0..<25).map { session(title: "Chat \($0)", updatedAt: now.addingTimeInterval(Double(-$0))) }
+
+        let plan = ChatSessionStore.retentionPlan(sessions: sessions, limit: nil, protectedIds: [])
+
+        XCTAssertEqual(plan.kept.count, 25)
+        XCTAssertTrue(plan.removed.isEmpty)
+    }
+
+    func testRetentionPlanNoOpAtOrBelowLimit() {
+        let now = Date()
+        let sessions = (0..<10).map { session(title: "Chat \($0)", updatedAt: now.addingTimeInterval(Double(-$0))) }
+
+        let plan = ChatSessionStore.retentionPlan(sessions: sessions, limit: 10, protectedIds: [])
+
+        XCTAssertEqual(plan.kept.count, 10)
+        XCTAssertTrue(plan.removed.isEmpty)
+    }
+
+    func testRetentionPlanProtectsActiveConversationOutsideWindow() {
+        let now = Date()
+        let newest = session(title: "Newest", updatedAt: now)
+        let middle = session(title: "Middle", updatedAt: now.addingTimeInterval(-60))
+        let activeOld = session(title: "Active Old", updatedAt: now.addingTimeInterval(-600))
+
+        let plan = ChatSessionStore.retentionPlan(
+            sessions: [newest, middle, activeOld],
+            limit: 2,
+            protectedIds: [activeOld.id]
+        )
+
+        XCTAssertTrue(plan.kept.contains(where: { $0.id == activeOld.id }), "Active conversation must survive retention")
+        XCTAssertEqual(plan.kept.count, 3)
+        XCTAssertTrue(plan.removed.isEmpty)
+    }
+
+    func testRetentionPlanProtectsGeneratingSessionOutsideWindow() {
+        let now = Date()
+        let newest = session(title: "Newest", updatedAt: now)
+        let middle = session(title: "Middle", updatedAt: now.addingTimeInterval(-60))
+        // Selected conversation (newest) and an in-flight generation (old) both
+        // fall outside a limit-1 window; both must survive.
+        let generatingOld = session(title: "Generating Old", updatedAt: now.addingTimeInterval(-600))
+
+        let plan = ChatSessionStore.retentionPlan(
+            sessions: [newest, middle, generatingOld],
+            limit: 1,
+            protectedIds: [newest.id, generatingOld.id]
+        )
+
+        XCTAssertTrue(plan.kept.contains(where: { $0.id == newest.id }), "Selected conversation must survive retention")
+        XCTAssertTrue(plan.kept.contains(where: { $0.id == generatingOld.id }), "In-flight generating session must survive retention")
+        XCTAssertEqual(plan.removed.map(\.id), [middle.id])
+    }
+
+    func testRetentionUsesMessageActivityNotStaleUpdatedAt() {
+        let now = Date()
+        // Created long ago (stale updatedAt) but messages show it was used recently.
+        var recentlyUsed = session(title: "Recently Used", updatedAt: now.addingTimeInterval(-3_600))
+        recentlyUsed.messages = [
+            ChatMessage(role: .user, content: "hello", timestamp: now.addingTimeInterval(-10)),
+            ChatMessage(role: .assistant, content: "hi", timestamp: now)
+        ]
+        let createdLater = session(title: "Created Later", updatedAt: now.addingTimeInterval(-60))
+        let oldest = session(title: "Oldest", updatedAt: now.addingTimeInterval(-7_200))
+
+        let plan = ChatSessionStore.retentionPlan(
+            sessions: [recentlyUsed, createdLater, oldest],
+            limit: 2,
+            protectedIds: []
+        )
+
+        XCTAssertTrue(plan.kept.contains(where: { $0.id == recentlyUsed.id }), "A recently active conversation must outrank a stale updatedAt")
+        XCTAssertEqual(plan.removed.map(\.id), [oldest.id])
+    }
+
+    func testLastActivityAtIncludesToolCallTimestamps() {
+        let now = Date()
+        // The message is old, but a tool call it carries ran just now — that is
+        // the conversation's real last activity.
+        var agent = session(title: "Agent", updatedAt: now.addingTimeInterval(-3_600))
+        var message = ChatMessage(role: .assistant, content: "done", timestamp: now.addingTimeInterval(-3_600))
+        message.toolCalls = [ToolCallRecord(name: "shell_run", timestamp: now)]
+        agent.messages = [message]
+
+        let stale = session(title: "Stale", updatedAt: now.addingTimeInterval(-60))
+        let plan = ChatSessionStore.retentionPlan(
+            sessions: [agent, stale],
+            limit: 1,
+            protectedIds: []
+        )
+
+        XCTAssertEqual(agent.lastActivityAt, now, "Tool-call time must count as activity")
+        XCTAssertTrue(plan.kept.contains(where: { $0.id == agent.id }), "A chat with fresh tool activity must outrank a newer-but-idle chat")
+        XCTAssertEqual(plan.removed.map(\.id), [stale.id])
+    }
+
+    // MARK: - Disk persistence
+
+    func testStoreRoundTripsSessionsMostRecentFirst() {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        let first = session(title: "First", updatedAt: Date(timeIntervalSince1970: 1_000))
+        var second = session(title: "Second", updatedAt: Date(timeIntervalSince1970: 2_000))
+        second.messages = [
+            ChatMessage(role: .user, content: "hello"),
+            ChatMessage(role: .assistant, content: "hi there")
+        ]
+
+        store.saveAll([first, second])
+        store.flushPendingIO()
+
+        let loaded = store.loadSessions() ?? []
+        XCTAssertEqual(loaded.map(\.title), ["Second", "First"], "Most recently updated conversation should load first")
+        XCTAssertEqual(loaded.first?.messages.map(\.content), ["hello", "hi there"])
+    }
+
+    func testLoadOrderUsesLatestMessageActivity() {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        var older = session(title: "Older", updatedAt: Date(timeIntervalSince1970: 1_000))
+        older.messages = [ChatMessage(role: .user, content: "recent", timestamp: Date(timeIntervalSince1970: 5_000))]
+        let newer = session(title: "Newer", updatedAt: Date(timeIntervalSince1970: 2_000))
+
+        store.saveAll([older, newer])
+        store.flushPendingIO()
+
+        let loaded = store.loadSessions() ?? []
+        XCTAssertEqual(loaded.map(\.title), ["Older", "Newer"], "Load order should follow latest activity, not stale updatedAt")
+    }
+
+    func testStoreRemovesOrphanedFilesForDeletedConversations() {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        let keep = session(title: "Keep", updatedAt: Date())
+        let drop = session(title: "Drop", updatedAt: Date())
+        store.saveAll([keep, drop])
+        store.flushPendingIO()
+
+        let droppedFile = dir.appendingPathComponent("\(drop.id.uuidString).json")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: droppedFile.path))
+
+        store.saveAll([keep])
+        store.flushPendingIO()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: droppedFile.path), "Deleted conversation file should be removed")
+        XCTAssertEqual(store.loadSessions()?.map(\.id), [keep.id])
+    }
+
+    func testStoreChangeDetectionSkipsUnchangedWrites() {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        let only = session(title: "Stable", updatedAt: Date())
+        let file = dir.appendingPathComponent("\(only.id.uuidString).json")
+
+        store.saveAll([only])
+        store.flushPendingIO()
+        let firstMod = (try? FileManager.default.attributesOfItem(atPath: file.path))?[.modificationDate] as? Date
+
+        store.saveAll([only])
+        store.flushPendingIO()
+        let secondMod = (try? FileManager.default.attributesOfItem(atPath: file.path))?[.modificationDate] as? Date
+
+        XCTAssertNotNil(firstMod)
+        XCTAssertEqual(firstMod, secondMod, "Unchanged conversations should not be rewritten")
+    }
+
+    func testChangedSessionContentIsRewritten() {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        var chat = session(title: "Changed", updatedAt: Date())
+        let file = dir.appendingPathComponent("\(chat.id.uuidString).json")
+
+        store.saveAll([chat])
+        store.flushPendingIO()
+        let firstBytes = try? Data(contentsOf: file)
+
+        chat.messages = [ChatMessage(role: .user, content: "brand new content", timestamp: Date())]
+        store.saveAll([chat])
+        store.flushPendingIO()
+        let secondBytes = try? Data(contentsOf: file)
+
+        XCTAssertNotEqual(firstBytes, secondBytes, "Changed content must be rewritten")
+        XCTAssertEqual(store.loadSessions()?.first?.messages.first?.content, "brand new content")
+    }
+
+    func testLoadingSeedsSignaturesSoUnchangedSessionsAreNotRewritten() {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let writer = ChatSessionStore(directory: dir)
+        let only = session(title: "Loaded", updatedAt: Date())
+        let file = dir.appendingPathComponent("\(only.id.uuidString).json")
+        writer.saveAll([only])
+        writer.flushPendingIO()
+        let firstMod = (try? FileManager.default.attributesOfItem(atPath: file.path))?[.modificationDate] as? Date
+
+        // A fresh store models an app relaunch: it has written nothing yet.
+        let relaunched = ChatSessionStore(directory: dir)
+        let loaded = relaunched.loadSessions() ?? []
+        XCTAssertEqual(loaded.map(\.id), [only.id])
+
+        relaunched.saveAll(loaded)
+        relaunched.flushPendingIO()
+        let secondMod = (try? FileManager.default.attributesOfItem(atPath: file.path))?[.modificationDate] as? Date
+
+        XCTAssertNotNil(firstMod)
+        XCTAssertEqual(firstMod, secondMod, "Loaded conversations should not be rewritten on launch")
+    }
+
+    func testLegacyBareSessionIsMigratedToVersionedEnvelope() throws {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        // Simulate a file written before the versioned envelope existed.
+        let legacy = session(title: "Legacy", updatedAt: Date())
+        let file = dir.appendingPathComponent("\(legacy.id.uuidString).json")
+        try JSONEncoder().encode(legacy).write(to: file)
+
+        let store = ChatSessionStore(directory: dir)
+        let loaded = store.loadSessions() ?? []
+        XCTAssertEqual(loaded.map(\.id), [legacy.id])
+
+        store.saveAll(loaded)
+        store.flushPendingIO()
+
+        let rewritten = try Data(contentsOf: file)
+        let json = String(data: rewritten, encoding: .utf8) ?? ""
+        XCTAssertTrue(json.contains("schemaVersion"), "Legacy bare sessions should be migrated to the versioned envelope")
+    }
+
+    func testUnsupportedSchemaVersionIsNotIngestedOrRewritten() throws {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let future = session(title: "From Future", updatedAt: Date())
+        let futureFile = dir.appendingPathComponent("\(future.id.uuidString).json")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        try encoder
+            .encode(PersistedChatSession(schemaVersion: ChatSessionStore.currentSchemaVersion + 1, session: future))
+            .write(to: futureFile)
+        let originalBytes = try Data(contentsOf: futureFile)
+
+        let store = ChatSessionStore(directory: dir)
+        XCTAssertTrue((store.loadSessions() ?? []).isEmpty, "A file from a newer schema must not be ingested")
+
+        // Saving other work must neither rewrite nor delete the newer file.
+        let mine = session(title: "Mine", updatedAt: Date())
+        store.saveAll([mine])
+        store.flushPendingIO()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: futureFile.path), "An unsupported-schema file must not be deleted")
+        XCTAssertEqual(try Data(contentsOf: futureFile), originalBytes, "An unsupported-schema file must not be rewritten")
+        XCTAssertEqual(store.loadSessions()?.map(\.id), [mine.id])
+    }
+
+    func testSupportedSchemaPredicateAcceptsCurrentAndOlderOnly() {
+        XCTAssertTrue(ChatSessionStore.isSupportedSchema(1))
+        XCTAssertTrue(ChatSessionStore.isSupportedSchema(ChatSessionStore.currentSchemaVersion))
+        XCTAssertFalse(ChatSessionStore.isSupportedSchema(ChatSessionStore.currentSchemaVersion + 1))
+        XCTAssertFalse(ChatSessionStore.isSupportedSchema(0), "Version 0 is not a valid stamped format")
+        XCTAssertFalse(ChatSessionStore.isSupportedSchema(-1), "Negative versions are not valid")
+    }
+
+    func testUnreadableSessionFileIsPreservedDuringOrphanCleanup() throws {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        // A UUID-named file whose contents cannot be decoded at all.
+        let corruptId = UUID()
+        let corruptFile = dir.appendingPathComponent("\(corruptId.uuidString).json")
+        let garbage = Data("{ this is not valid json".utf8)
+        try garbage.write(to: corruptFile)
+
+        let store = ChatSessionStore(directory: dir)
+        XCTAssertTrue((store.loadSessions() ?? []).isEmpty, "Unreadable files must be skipped, not fatal")
+
+        // A save pass must not treat the unreadable file as an orphan.
+        let mine = session(title: "Mine", updatedAt: Date())
+        store.saveAll([mine])
+        store.flushPendingIO()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: corruptFile.path), "An unreadable file must not be deleted by orphan cleanup")
+        XCTAssertEqual(try Data(contentsOf: corruptFile), garbage, "An unreadable file must not be rewritten")
+    }
+
+    func testFailedWriteIsRetriedRatherThanMarkedDurable() throws {
+        let dir = makeTempDirectory()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let store = ChatSessionStore(directory: dir)
+        let only = session(title: "Retry", updatedAt: Date())
+        let file = dir.appendingPathComponent("\(only.id.uuidString).json")
+
+        // Remove write permission so the atomic write fails, as it would on a
+        // full or permission-denied disk.
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: dir.path)
+        store.saveAll([only])
+        store.flushPendingIO()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+
+        // Once writable again, the same bytes must be written instead of being
+        // skipped as already-durable.
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+        store.saveAll([only])
+        store.flushPendingIO()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path), "A failed save must be retried")
+        XCTAssertEqual(store.loadSessions()?.map(\.id), [only.id])
+    }
+
+    /// The retention API is pure logic and must be usable off the main actor.
+    /// This only compiles while `retentionPlan` (and `lastActivityAt`) stay
+    /// nonisolated.
+    nonisolated func testRetentionPlanIsCallableFromNonisolatedContext() {
+        let now = Date()
+        let newer = ChatSession(title: "Newer", createdAt: now, updatedAt: now)
+        let older = ChatSession(title: "Older", createdAt: now.addingTimeInterval(-30), updatedAt: now.addingTimeInterval(-30))
+
+        let plan = ChatSessionStore.retentionPlan(sessions: [newer, older], limit: 1, protectedIds: [])
+
+        XCTAssertEqual(plan.kept.map(\.id), [newer.id])
+        XCTAssertEqual(plan.removed.map(\.id), [older.id])
+    }
+
+    func testAsyncLoadMatchesPersistedOrder() async {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        let newer = session(title: "Newer", updatedAt: Date(timeIntervalSince1970: 2_000))
+        let older = session(title: "Older", updatedAt: Date(timeIntervalSince1970: 1_000))
+        store.saveAll([newer, older])
+        store.flushPendingIO()
+
+        let loaded = await store.loadSessionsAsync() ?? []
+        XCTAssertEqual(loaded.map(\.id), [newer.id, older.id])
+    }
+
+    func testFailedOrphanRemovalKeepsFileManagedForRetry() throws {
+        let dir = makeTempDirectory()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let store = ChatSessionStore(directory: dir)
+        let doomed = session(title: "Doomed", updatedAt: Date())
+        store.saveAll([doomed])
+        store.flushPendingIO()
+        let file = dir.appendingPathComponent("\(doomed.id.uuidString).json")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+
+        // Removal cannot succeed without write permission on the directory.
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: dir.path)
+        store.saveAll([])
+        store.flushPendingIO()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path), "A failed removal must leave the file")
+
+        // Once writable again, the retry must still know the file is managed.
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+        store.saveAll([])
+        store.flushPendingIO()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path), "A failed removal must be retried")
+    }
+
+    func testPersistenceAvailableForWritableDirectory() {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        XCTAssertTrue(store.isPersistenceAvailable)
+    }
+
+    func testUncreatableSessionsDirectoryReportsPersistenceUnavailable() throws {
+        let parent = makeTempDirectory()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parent.path)
+            try? FileManager.default.removeItem(at: parent)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: parent.path)
+
+        let sessionsDir = parent.appendingPathComponent("sessions", isDirectory: true)
+        let store = ChatSessionStore(directory: sessionsDir)
+
+        XCTAssertFalse(store.isPersistenceAvailable, "An uncreatable sessions directory must report persistence as unavailable")
+        store.saveAll([session(title: "Nope", updatedAt: Date())])
+        store.flushPendingIO()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sessionsDir.path))
+    }
+
+    func testPersistenceRecoversAfterTransientDirectoryFailure() async throws {
+        let parent = makeTempDirectory()
+        let sessionsDir = parent.appendingPathComponent("sessions", isDirectory: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parent.path)
+            try? FileManager.default.removeItem(at: parent)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: parent.path)
+
+        let store = ChatSessionStore(directory: sessionsDir)
+        XCTAssertFalse(store.isPersistenceAvailable, "Uncreatable directory starts unavailable")
+
+        // Restore write access. The store must retry directory creation on the
+        // next save and recover instead of staying disabled until a relaunch.
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parent.path)
+        store.saveAll([session(title: "Recovered", updatedAt: Date())])
+        store.flushPendingIO()
+
+        // Availability hops back to the main actor; give it a moment.
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertTrue(store.isPersistenceAvailable, "A later successful write must restore persistence availability")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sessionsDir.path))
+    }
+
+    func testWriteFailureFlipsPersistenceAvailability() async throws {
+        let dir = makeTempDirectory()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let store = ChatSessionStore(directory: dir)
+        XCTAssertTrue(store.isPersistenceAvailable)
+        store.saveAll([session(title: "First", updatedAt: Date())])
+        store.flushPendingIO()
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: dir.path)
+        store.saveAll([session(title: "Blocked", updatedAt: Date())])
+        store.flushPendingIO()
+
+        // The availability update hops back to the main actor; give it a moment.
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(store.isPersistenceAvailable, "A failed write must mark persistence as unavailable")
+    }
+
+    func testCachedDigestRestoresFileRemovedWhileRunning() {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        let kept = session(title: "Kept", updatedAt: Date())
+        store.saveAll([kept])
+        store.flushPendingIO()
+
+        let file = dir.appendingPathComponent("\(kept.id.uuidString).json")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path))
+
+        // A file (or the whole directory) can vanish while the app is running.
+        try? FileManager.default.removeItem(at: file)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+
+        // Same content, but the file is gone: the cached signature must not make
+        // the save skip it and leave the conversation absent.
+        store.saveAll([kept])
+        store.flushPendingIO()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path), "A missing file must be rewritten even when its content is unchanged")
+    }
+
+    func testLaterSuccessDoesNotMaskEarlierWriteFailure() async throws {
+        let dir = makeTempDirectory()
+        defer {
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let store = ChatSessionStore(directory: dir)
+        XCTAssertTrue(store.isPersistenceAvailable)
+
+        let failing = session(title: "Failing", updatedAt: Date())
+        let succeeding = session(title: "Succeeding", updatedAt: Date().addingTimeInterval(-1))
+        // Occupy the failing session's file path with a directory so its atomic
+        // write cannot land, while the other conversation writes normally.
+        let blockingPath = dir.appendingPathComponent("\(failing.id.uuidString).json", isDirectory: true)
+        try FileManager.default.createDirectory(at: blockingPath, withIntermediateDirectories: true)
+
+        store.saveAll([failing, succeeding])
+        store.flushPendingIO()
+
+        // The availability update hops back to the main actor; give it a moment.
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(store.isPersistenceAvailable, "A later successful write must not mask an earlier failure")
+    }
+
+    func testEncodingFailureMarksPersistenceUnavailable() async throws {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        XCTAssertTrue(store.isPersistenceAvailable)
+
+        // A non-finite metric (JSONEncoder rejects it) makes the conversation
+        // unencodable; that must count as a failed save, not a healthy pass.
+        var broken = session(title: "Broken", updatedAt: Date())
+        broken.messages = [ChatMessage(role: .assistant, content: "x", tokensPerSec: .infinity)]
+
+        store.saveAll([broken])
+        store.flushPendingIO()
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(store.isPersistenceAvailable, "An unencodable conversation must mark persistence unavailable")
+    }
+
+    func testOrphanRemovalFailureAffectsAvailabilityAndRecovers() async throws {
+        let dir = makeTempDirectory()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let store = ChatSessionStore(directory: dir)
+        let kept = session(title: "Kept", updatedAt: Date())
+        let removed = session(title: "Removed", updatedAt: Date().addingTimeInterval(-10))
+        store.saveAll([kept, removed])
+        store.flushPendingIO()
+        XCTAssertTrue(store.isPersistenceAvailable)
+
+        let removedFile = dir.appendingPathComponent("\(removed.id.uuidString).json")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: removedFile.path))
+
+        // `removed` becomes an orphan, but a read-only directory blocks its file
+        // removal (the unchanged `kept` write is skipped). The failure must show.
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: dir.path)
+        store.saveAll([kept])
+        store.flushPendingIO()
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(store.isPersistenceAvailable, "A failed orphan removal must mark persistence unavailable")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: removedFile.path), "A failed removal must be retried, not lost")
+
+        // Restoring write access lets the retry succeed and clears the warning.
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+        store.saveAll([kept])
+        store.flushPendingIO()
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertTrue(store.isPersistenceAvailable, "A successful cleanup retry must restore availability")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: removedFile.path))
+    }
+
+    func testEnumerationFailureDuringCleanupAffectsAvailabilityAndRecovers() async throws {
+        let dir = makeTempDirectory()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let store = ChatSessionStore(directory: dir)
+        let kept = session(title: "Kept", updatedAt: Date())
+        store.saveAll([kept])
+        store.flushPendingIO()
+        XCTAssertTrue(store.isPersistenceAvailable)
+
+        // Write + execute but no read: the unchanged write is skipped and the
+        // directory cannot be listed, so cleanup silently failing must not read
+        // as healthy.
+        try FileManager.default.setAttributes([.posixPermissions: 0o300], ofItemAtPath: dir.path)
+        store.saveAll([kept])
+        store.flushPendingIO()
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(store.isPersistenceAvailable, "A failed cleanup enumeration must mark persistence unavailable")
+
+        // Restoring read access lets the next pass list the directory and recover.
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+        store.saveAll([kept])
+        store.flushPendingIO()
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertTrue(store.isPersistenceAvailable, "A successful retry must restore availability")
+    }
+
+    func testReplacingSessionFileWithDirectoryIsNotTreatedAsDurable() async throws {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        let only = session(title: "Only", updatedAt: Date())
+        store.saveAll([only])
+        store.flushPendingIO()
+        XCTAssertTrue(store.isPersistenceAvailable)
+
+        // Replace the persisted file with a directory of the same name. The
+        // cached signature must not make the next save skip the write: a
+        // directory is not a durable, loadable conversation, so the save must
+        // attempt the write and surface the failure.
+        let file = dir.appendingPathComponent("\(only.id.uuidString).json")
+        try? FileManager.default.removeItem(at: file)
+        try? FileManager.default.createDirectory(at: file, withIntermediateDirectories: true)
+
+        store.saveAll([only])
+        store.flushPendingIO()
+
+        var isDir: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.path, isDirectory: &isDir))
+        XCTAssertTrue(isDir.boolValue, "The directory must not have been silently treated as a durable session file")
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(store.isPersistenceAvailable, "A directory where the session file belongs must not read as durable")
+    }
+
+    func testLoadFailureIsDistinguishableFromEmptyHistory() async throws {
+        let dir = makeTempDirectory()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let store = ChatSessionStore(directory: dir)
+        store.saveAll([session(title: "Kept", updatedAt: Date())])
+        store.flushPendingIO()
+        XCTAssertTrue(store.isPersistenceAvailable)
+
+        // Write + execute but no read: the directory cannot be listed, so a load
+        // must report failure rather than an empty, supposedly-complete history
+        // that would hide every conversation and never retry.
+        try FileManager.default.setAttributes([.posixPermissions: 0o300], ofItemAtPath: dir.path)
+        XCTAssertNil(store.loadSessions(), "A directory that cannot be listed must not read as an empty history")
+        let failedAsyncLoad = await store.loadSessionsAsync()
+        XCTAssertNil(failedAsyncLoad, "The async load must report the same failure")
+
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(store.isPersistenceAvailable, "A failed load must mark persistence unavailable")
+
+        // Restoring read access lets a later load succeed and return the history.
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+        let reloaded = store.loadSessions()
+        XCTAssertNotNil(reloaded, "A load must succeed once the directory is readable again")
+        XCTAssertEqual(reloaded?.count, 1)
+    }
+
+    func testSaveWithoutOrphanCleanupDoesNotDeleteUnloadedFiles() {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        // A file written by an earlier launch that a fresh store has not loaded.
+        let writer = ChatSessionStore(directory: dir)
+        let existing = session(title: "Existing", updatedAt: Date())
+        writer.saveAll([existing])
+        writer.flushPendingIO()
+        let existingFile = dir.appendingPathComponent("\(existing.id.uuidString).json")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: existingFile.path))
+
+        // A fresh store (as after a relaunch) persists an in-memory conversation
+        // created before its load finished, without the cleanup pass. Cleanup
+        // would treat the unloaded `existing` file as a deleted conversation
+        // because `managedIds` was never populated.
+        let fresh = ChatSessionStore(directory: dir)
+        let created = session(title: "Created While Loading", updatedAt: Date())
+        fresh.saveAll([created], cleanOrphans: false)
+        fresh.flushPendingIO()
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: existingFile.path), "A cleanup-less save must not delete unloaded conversations")
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: dir.appendingPathComponent("\(created.id.uuidString).json").path),
+            "The in-memory conversation must still be written"
+        )
+    }
+
+    func testLoadRetryRecreatesMissingSessionsDirectory() {
+        let parent = makeTempDirectory()
+        let sessionsDir = parent.appendingPathComponent("sessions", isDirectory: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parent.path)
+            try? FileManager.default.removeItem(at: parent)
+        }
+        // Parent not writable, so the sessions directory cannot be created.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: parent.path)
+
+        let store = ChatSessionStore(directory: sessionsDir)
+        XCTAssertFalse(store.isPersistenceAvailable, "An uncreatable directory starts unavailable")
+        XCTAssertNil(store.loadSessions(), "A load must fail while the directory cannot be created")
+
+        // Restore access while the app is still running: the next load must
+        // recreate the directory and succeed instead of enumerating a missing
+        // directory forever.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parent.path)
+        let loaded = store.loadSessions()
+        XCTAssertNotNil(loaded, "A load retry must recreate the directory and succeed")
+        XCTAssertEqual(loaded?.count, 0, "A freshly created directory holds no history")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: sessionsDir.path))
+    }
+
+    func testRestoreNormalizesInterruptedToolCallsAndThinking() {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let store = ChatSessionStore(directory: dir)
+        var doomed = session(title: "Interrupted", updatedAt: Date())
+        var assistant = ChatMessage(role: .assistant, content: "", isThinking: true)
+        assistant.prefillStatus = "Prefilling..."
+        assistant.toolCalls = [
+            ToolCallRecord(name: "shell_run", status: .running, timestamp: Date()),
+            ToolCallRecord(name: "file_write", status: .awaitingApproval, timestamp: Date()),
+            ToolCallRecord(name: "grep_search", status: .success, output: "ok", timestamp: Date())
+        ]
+        doomed.messages = [assistant]
+        store.saveAll([doomed])
+        store.flushPendingIO()
+
+        let restored = store.loadSessions()?.first
+        XCTAssertNotNil(restored)
+        let message = restored?.messages.first
+        XCTAssertEqual(message?.isThinking, false, "A transient thinking flag must not survive a restore")
+        XCTAssertNil(message?.prefillStatus, "Transient prefill status must not survive a restore")
+        XCTAssertEqual(message?.toolCalls?[0].status, .error, "A running call must restore as a terminal error")
+        XCTAssertEqual(message?.toolCalls?[1].status, .error, "An approval-pending call must restore as a terminal error")
+        XCTAssertNotNil(message?.toolCalls?[0].error)
+        XCTAssertEqual(message?.toolCalls?[2].status, .success, "A completed call must keep its status")
+        XCTAssertEqual(message?.toolCalls?[2].output, "ok")
+    }
+
+    func testSuccessfulLoadRestoresPersistenceAvailability() async throws {
+        let dir = makeTempDirectory()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        let store = ChatSessionStore(directory: dir)
+        XCTAssertTrue(store.isPersistenceAvailable)
+
+        // A listing failure reports persistence unavailable...
+        try FileManager.default.setAttributes([.posixPermissions: 0o300], ofItemAtPath: dir.path)
+        XCTAssertNil(store.loadSessions())
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(store.isPersistenceAvailable)
+
+        // ...and a later successful load, even with nothing new to save, must
+        // clear the warning instead of leaving it up until the next edit.
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+        let reloaded = store.loadSessions()
+        XCTAssertNotNil(reloaded)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertTrue(store.isPersistenceAvailable, "A successful load must restore availability")
+    }
+}
+
 
 
 

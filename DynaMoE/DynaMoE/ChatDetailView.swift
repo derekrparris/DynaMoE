@@ -27,10 +27,10 @@ struct ChatDetailView: View {
     var isThinkingEnabled: Bool = true
     var isAgentToolsEnabled: Bool = true
     var isModelLoaded: Bool = true
-    var onSendMessage: (String) -> Void
+    var onSendMessage: (String) -> Bool
     var onStopGeneration: () -> Void
-    var onQueuePrompt: ((String) -> Void)? = nil
-    var onSendImmediate: ((String) -> Void)? = nil
+    var onQueuePrompt: ((String) -> Bool)? = nil
+    var onSendImmediate: ((String) async -> Bool)? = nil
     var onRemoveQueuedPrompt: ((UUID) -> Void)? = nil
     var onSelectDiscoveredModel: ((DiscoveredModel) -> Void)? = nil
     var onOpenSettings: (() -> Void)? = nil
@@ -48,6 +48,20 @@ struct ChatDetailView: View {
     /// no-op when the target view is already on screen, so during streaming the
     /// marker's id is bumped every tick to force a real scroll to the bottom.
     @State private var scrollAnchorTick: Int = 0
+
+    /// The draft currently in flight through the async immediate-send path.
+    /// The send suspends while it waits out a generation teardown, so without
+    /// this a second Cmd-Return/bolt press would submit the same text again.
+    /// `nil` when no immediate send is pending.
+    @State private var pendingImmediateSend: String? = nil
+    /// Bumped on every edit to the draft. The immediate-send completion clears the
+    /// composer only when this still equals the revision it submitted, so a newer
+    /// draft is never clobbered even if the user edited away and back to the same
+    /// text.
+    @State private var draftRevision: UInt64 = 0
+    /// Queued prompts with an in-flight "Send Now", so re-activating the same
+    /// row cannot launch two tasks for it.
+    @State private var sendingQueuedIds: Set<UUID> = []
 
     /// Distance-from-bottom bookkeeping for the pin/detach logic.
     private struct ScrollSnapshot: Equatable {
@@ -355,11 +369,29 @@ struct ChatDetailView: View {
                                 HStack(spacing: 6) {
                                     Button(action: {
                                         let textToSend = item.text
-                                        onRemoveQueuedPrompt?(item.id)
+                                        // The row stays visible while the send
+                                        // waits out a generation teardown, so a
+                                        // second activation must be ignored until
+                                        // this one finishes or the prompt would
+                                        // be sent twice.
+                                        guard !sendingQueuedIds.contains(item.id) else { return }
+                                        sendingQueuedIds.insert(item.id)
                                         if let immediate = onSendImmediate {
-                                            immediate(textToSend)
+                                            // Only drop the queued prompt once the
+                                            // send actually lands, so a rejected
+                                            // send (no model, still loading) does
+                                            // not lose it.
+                                            Task {
+                                                if await immediate(textToSend) {
+                                                    onRemoveQueuedPrompt?(item.id)
+                                                }
+                                                sendingQueuedIds.remove(item.id)
+                                            }
                                         } else {
-                                            onSendMessage(textToSend)
+                                            if onSendMessage(textToSend) {
+                                                onRemoveQueuedPrompt?(item.id)
+                                            }
+                                            sendingQueuedIds.remove(item.id)
                                         }
                                     }) {
                                         HStack(spacing: 3) {
@@ -375,6 +407,7 @@ struct ChatDetailView: View {
                                         .cornerRadius(6)
                                     }
                                     .buttonStyle(.plain)
+                                    .disabled(sendingQueuedIds.contains(item.id))
                                     .help("Send this message now (interrupts current turn)")
 
                                     Button(action: {
@@ -389,6 +422,7 @@ struct ChatDetailView: View {
                                             .clipShape(Circle())
                                     }
                                     .buttonStyle(.plain)
+                                    .disabled(sendingQueuedIds.contains(item.id))
                                     .help("Edit prompt in composer")
 
                                     Button(action: {
@@ -402,6 +436,7 @@ struct ChatDetailView: View {
                                             .clipShape(Circle())
                                     }
                                     .buttonStyle(.plain)
+                                    .disabled(sendingQueuedIds.contains(item.id))
                                     .help("Remove from queue")
                                 }
                             }
@@ -438,26 +473,16 @@ struct ChatDetailView: View {
                         onCommit: {
                             let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
                             guard !trimmed.isEmpty else { return }
+                            let accepted: Bool
                             if isGenerating {
-                                if let queueAction = onQueuePrompt {
-                                    queueAction(trimmed)
-                                } else {
-                                    onSendMessage(trimmed)
-                                }
+                                accepted = onQueuePrompt?(trimmed) ?? onSendMessage(trimmed)
                             } else {
-                                onSendMessage(trimmed)
+                                accepted = onSendMessage(trimmed)
                             }
-                            promptText = ""
+                            if accepted { promptText = "" }
                         },
                         onCommitImmediate: {
-                            let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
-                            guard !trimmed.isEmpty else { return }
-                            if let immediateAction = onSendImmediate {
-                                immediateAction(trimmed)
-                            } else {
-                                onSendMessage(trimmed)
-                            }
-                            promptText = ""
+                            submitImmediateDraft()
                         }
                     )
                     .frame(minHeight: max(21, 25 * zoomManager.zoomScale), maxHeight: max(100, 140 * zoomManager.zoomScale))
@@ -751,12 +776,13 @@ struct ChatDetailView: View {
                                     Button(action: {
                                         let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
                                         guard !trimmed.isEmpty else { return }
+                                        let accepted: Bool
                                         if let queueAction = onQueuePrompt {
-                                            queueAction(trimmed)
+                                            accepted = queueAction(trimmed)
                                         } else {
-                                            onSendMessage(trimmed)
+                                            accepted = onSendMessage(trimmed)
                                         }
-                                        promptText = ""
+                                        if accepted { promptText = "" }
                                     }) {
                                         Image(systemName: "tray.and.arrow.down.fill")
                                             .font(.system(size: max(11, 14 * zoomManager.zoomScale), weight: .semibold))
@@ -769,20 +795,14 @@ struct ChatDetailView: View {
                                     .help("Queue message for next turn (↵)")
 
                                     Button(action: {
-                                        let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
-                                        guard !trimmed.isEmpty else { return }
-                                        if let immediateAction = onSendImmediate {
-                                            immediateAction(trimmed)
-                                        } else {
-                                            onSendMessage(trimmed)
-                                        }
-                                        promptText = ""
+                                        submitImmediateDraft()
                                     }) {
                                         Image(systemName: "bolt.circle.fill")
                                             .font(.system(size: max(20, 26 * zoomManager.zoomScale)))
                                             .foregroundColor(.orange)
                                     }
                                     .buttonStyle(.plain)
+                                    .disabled(pendingImmediateSend != nil)
                                     .help("Interrupt and send immediately (⌘↵)")
                                 }
 
@@ -798,8 +818,7 @@ struct ChatDetailView: View {
                             Button(action: {
                                 let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
                                 if !trimmed.isEmpty && isModelLoaded {
-                                    onSendMessage(trimmed)
-                                    promptText = ""
+                                    if onSendMessage(trimmed) { promptText = "" }
                                 }
                             }) {
                                 Image(systemName: "arrow.right.circle.fill")
@@ -843,10 +862,39 @@ struct ChatDetailView: View {
             updateTokenCount(for: promptText)
         }
         .onChange(of: promptText) { newText in
+            draftRevision &+= 1
             updateTokenCount(for: newText)
         }
         .onChange(of: tokenizer != nil) { _ in
             updateTokenCount(for: promptText)
+        }
+    }
+
+    /// Submits the current draft through the async immediate-send path
+    /// (Cmd-Return / bolt button). Rejects a second submission while one is in
+    /// flight: the send suspends until any generation teardown finishes, so
+    /// without this guard the same draft would be queued twice.
+    private func submitImmediateDraft() {
+        let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, pendingImmediateSend == nil else { return }
+        guard let immediate = onSendImmediate else {
+            if onSendMessage(trimmed) { promptText = "" }
+            return
+        }
+        // Capture the submitted draft so a newer edit made while the send is in
+        // flight survives. Compare the revision, not just the text: the user could
+        // edit away and back to the same string, and a text match would then clear
+        // a draft they intentionally re-typed.
+        let submitted = promptText
+        let submittedRevision = draftRevision
+        pendingImmediateSend = submitted
+        Task {
+            if await immediate(trimmed), draftRevision == submittedRevision {
+                promptText = ""
+            }
+            if pendingImmediateSend == submitted {
+                pendingImmediateSend = nil
+            }
         }
     }
 

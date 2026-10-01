@@ -5,13 +5,13 @@
 
 import Foundation
 
-public enum MessageRole: String, Codable, Equatable {
+nonisolated public enum MessageRole: String, Codable, Equatable, Sendable {
     case user
     case assistant
     case system
 }
 
-public enum ToolExecutionStatus: String, Codable, Equatable {
+nonisolated public enum ToolExecutionStatus: String, Codable, Equatable, Sendable {
     case running
     case success
     case error
@@ -19,7 +19,7 @@ public enum ToolExecutionStatus: String, Codable, Equatable {
     case rejected
 }
 
-public struct ToolCallRecord: Identifiable, Codable, Equatable {
+nonisolated public struct ToolCallRecord: Identifiable, Codable, Equatable, Sendable {
     public var id: UUID
     public var name: String
     public var arguments: [String: String]
@@ -59,7 +59,7 @@ public struct ToolCallRecord: Identifiable, Codable, Equatable {
     }
 }
 
-public struct ChatMessage: Identifiable, Codable, Equatable {
+nonisolated public struct ChatMessage: Identifiable, Codable, Equatable, Sendable {
     public var id: UUID
     public var role: MessageRole
     public var content: String
@@ -108,7 +108,7 @@ public struct ChatMessage: Identifiable, Codable, Equatable {
     }
 }
 
-public struct QueuedPrompt: Identifiable, Codable, Equatable {
+nonisolated public struct QueuedPrompt: Identifiable, Codable, Equatable, Sendable {
     public var id: UUID
     public var text: String
     public var timestamp: Date
@@ -124,7 +124,7 @@ public struct QueuedPrompt: Identifiable, Codable, Equatable {
     }
 }
 
-public struct ChatSession: Identifiable, Codable, Equatable {
+nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendable {
     public var id: UUID
     public var title: String
     public var messages: [ChatMessage]
@@ -198,5 +198,30 @@ public struct ChatSession: Identifiable, Codable, Equatable {
         try container.encodeIfPresent(isThinkingEnabled, forKey: .isThinkingEnabled)
         try container.encodeIfPresent(isAgentToolsEnabled, forKey: .isAgentToolsEnabled)
         try container.encode(queuedPrompts, forKey: .queuedPrompts)
+    }
+}
+
+public extension ChatSession {
+    /// The most recent timestamp we can actually trust for a conversation.
+    ///
+    /// `updatedAt` is only set at creation/decode; the UI mutation paths that
+    /// append messages, stream tokens, edit titles, and change queued prompts do
+    /// not touch it, so it cannot mean "last used". Message and queued-prompt
+    /// timestamps are maintained on those paths, so prefer the newest of them and
+    /// only fall back to `updatedAt`/`createdAt`.
+    nonisolated var lastActivityAt: Date {
+        var latest = max(updatedAt, createdAt)
+        for message in messages {
+            latest = max(latest, message.timestamp)
+            // Tool calls are appended after the message is created, so a long
+            // agent run's freshest activity lives on them, not on the message.
+            for call in message.toolCalls ?? [] {
+                latest = max(latest, call.timestamp)
+            }
+        }
+        for prompt in queuedPrompts {
+            latest = max(latest, prompt.timestamp)
+        }
+        return latest
     }
 }

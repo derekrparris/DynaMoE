@@ -40,6 +40,8 @@ struct SettingsSheetView: View {
     @ObservedObject var localModelManager: LocalModelManager = LocalModelManager.shared
     @AppStorage("dynamoe_agent_tools_enabled") private var isAgentToolsGloballyEnabled: Bool = true
     @AppStorage("dynamoe_reasoning_expanded_by_default") private var reasoningExpandedByDefault: Bool = false
+    @AppStorage("dynamoe_chat_auto_delete_enabled") private var chatAutoDeleteEnabled: Bool = true
+    @AppStorage("dynamoe_chat_retention_limit") private var chatRetentionLimit: Int = 10
     @AppStorage("dynamoe_agent_turbo_mode") private var isTurboModeEnabled: Bool = false
     @AppStorage("dynamoe_agent_grammar_masking") private var isGrammarMaskingEnabled: Bool = true
     @AppStorage("dynamoe_agent_working_directory") private var agentWorkingDirectory: String = ""
@@ -297,6 +299,47 @@ struct SettingsSheetView: View {
                     }
                 }
                 .toggleStyle(.switch)
+
+                Divider()
+
+                // Chat History Auto-Delete
+                Toggle(isOn: $chatAutoDeleteEnabled) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text("Auto-Delete Old Conversations")
+                                .font(.system(size: 13, weight: .medium))
+                            Image(systemName: "clock.arrow.circlepath")
+                                .foregroundColor(.accentColor)
+                                .font(.system(size: 11))
+                        }
+                        Text("Keep conversations saved between launches, removing the oldest automatically once the limit below is reached. Turn off to keep every conversation forever.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .toggleStyle(.switch)
+
+                if chatAutoDeleteEnabled {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Conversations to Keep")
+                                .font(.system(size: 13, weight: .medium))
+                            Text("The most-recently-updated conversations retained before older ones are deleted. The conversation you have open is always kept.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+
+                        Spacer()
+
+                        HStack(spacing: 8) {
+                            Text("\(chatRetentionLimit)")
+                                .font(.system(size: 12, design: .monospaced))
+                                .frame(minWidth: 24, alignment: .trailing)
+                            Stepper("Conversations to keep", value: $chatRetentionLimit, in: 1...100)
+                                .labelsHidden()
+                        }
+                    }
+                }
             }
         }
     }
