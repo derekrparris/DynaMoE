@@ -1011,6 +1011,10 @@ struct ContentView: View {
         ChatSession(title: "New Chat")
     ]
     @State private var selectedSessionId: UUID? = nil
+    /// Identity of the single empty conversation the view starts with, so a
+    /// successful history load drops only that placeholder and not a user-created
+    /// empty chat, which may already carry a chosen model or settings.
+    @State private var launchPlaceholderId: UUID? = nil
     @State private var isSettingsPresented: Bool = false
     @State private var chatPromptText: String = ""
     @State private var systemPrompt: String = ModelConfig.getUserDefaultSystemPrompt()
@@ -1289,16 +1293,22 @@ struct ContentView: View {
     /// loaded model while targeting the old conversation. The await matters
     /// because `loadAndBridgeToMetal` returns while the previous engine and
     /// buffers are still installed.
-    private func ensureModelLoaded(forSession sessionId: UUID?) async {
+    ///
+    /// Returns whether the requested path is the one actually installed. A switch
+    /// can drop this request when a newer one supersedes it (see
+    /// `modelSwitchRequestId`), so the awaited load may complete without this model
+    /// active; callers must then refuse to send rather than run on the old engine.
+    @discardableResult
+    private func ensureModelLoaded(forSession sessionId: UUID?) async -> Bool {
         guard let sessionId,
               let session = sessions.first(where: { $0.id == sessionId }),
               let targetPath = session.selectedModelPath,
-              !targetPath.isEmpty else { return }
+              !targetPath.isEmpty else { return true }
         if activeLoadedModelPath == targetPath {
             // The engine for this path may still be installing; wait for that
             // specific load rather than sending against the previous model.
             if isLoadingModel { await modelLoadTask?.value }
-            return
+            return activeLoadedModelPath == targetPath
         }
         if let model = localModelManager.getModel(byId: targetPath) ?? localModelManager.getModel(byId: session.selectedModelId ?? "") {
             await switchModel(to: model, sessionId: sessionId)?.value
@@ -1313,6 +1323,9 @@ struct ContentView: View {
             applyProfile(preferredProfile, for: targetPath)
             await loadTask.value
         }
+        // A newer load may still be in flight; only a settled engine matching the
+        // path is safe to send against.
+        return activeLoadedModelPath == targetPath && !isLoadingModel
     }
 
     /// Brings the process-wide engine back to the selected conversation's model
@@ -1401,6 +1414,11 @@ struct ContentView: View {
     private func loadPersistedSessionsIfNeeded() async {
         guard !hasLoadedPersistedSessions, !isLoadingPersistedSessions else { return }
         isLoadingPersistedSessions = true
+        // Identify the launch placeholder before merging even if `onAppear` has not
+        // run yet, so a user-created empty chat is not mistaken for it.
+        if launchPlaceholderId == nil, sessions.count == 1, sessions[0].messages.isEmpty {
+            launchPlaceholderId = sessions[0].id
+        }
 
         guard let loaded = await ChatSessionStore.shared.loadSessionsAsync() else {
             // The store could not read its history, so an empty result here
@@ -1427,10 +1445,15 @@ struct ContentView: View {
 
         // Preserve every in-memory conversation the user actually used while the
         // load was pending or after a failed attempt, so a retry that finally
-        // succeeds does not discard their work. The empty launch placeholder (no
-        // messages) is dropped instead of being merged as a duplicate.
+        // succeeds does not discard their work. Only the untouched launch
+        // placeholder is dropped, and by identity rather than by being empty: a New
+        // Chat created before the load finished must survive even with no messages.
         let loadedIds = Set(loaded.map(\.id))
-        let inMemoryOnly = sessions.filter { !loadedIds.contains($0.id) && !$0.messages.isEmpty }
+        let inMemoryOnly = sessions.filter { session in
+            guard !loadedIds.contains(session.id) else { return false }
+            if session.id == launchPlaceholderId, session.messages.isEmpty { return false }
+            return true
+        }
 
         sessions = inMemoryOnly + loaded
         // Preserve the user's current selection across a retry: they may have
@@ -1729,6 +1752,9 @@ struct ContentView: View {
             syncSettingsWindowIfNeeded()
         }
         .onAppear {
+            if launchPlaceholderId == nil, sessions.count == 1, sessions[0].messages.isEmpty {
+                launchPlaceholderId = sessions[0].id
+            }
             if selectedSessionId == nil {
                 selectedSessionId = sessions.first?.id
             }
@@ -1932,7 +1958,22 @@ struct ContentView: View {
 
         let prior = interruptSendTask
         let token = UUID()
+        // Pin the target for the whole operation: it can suspend behind an earlier
+        // interrupt or a model load, and a selection change during either can
+        // trigger retention that prunes this now-unselected session, after which
+        // the send fails and its draft or queued prompt is lost. `performInterruptSend`
+        // pins again for the generation branch; the count keeps the session guarded
+        // past that inner release until this operation finishes.
+        if let targetSessionId {
+            retainRetentionProtection(targetSessionId)
+        }
         let operation = Task { @MainActor in
+            defer {
+                if let targetSessionId {
+                    self.releaseRetentionProtection(targetSessionId)
+                    self.applyChatRetention()
+                }
+            }
             _ = await prior?.value
             let result = await self.performInterruptSend(trimmed, sessionId: targetSessionId)
             if self.interruptSendToken == token {
@@ -1951,8 +1992,10 @@ struct ContentView: View {
         guard isGeneratingText || generationTeardownTask != nil else {
             // Nothing to interrupt, but the target's model must still be the
             // loaded one (the user may have switched chats since the send was
-            // requested), and that load must finish before the turn starts.
-            await ensureModelLoaded(forSession: targetSessionId)
+            // requested), and that load must finish before the turn starts. Refuse
+            // the send if the switch was superseded, so it does not run on the old
+            // engine.
+            guard await ensureModelLoaded(forSession: targetSessionId) else { return false }
             guard !isGeneratingText else { return false }
             return handleSendMessage(trimmed, sessionId: targetSessionId)
         }
@@ -1986,10 +2029,11 @@ struct ContentView: View {
             // The user may have switched conversations (and models) during the
             // wait; make the target's model active and loaded so the replacement
             // turn runs against the one the conversation expects.
-            await ensureModelLoaded(forSession: targetSessionId)
+            let modelReady = await ensureModelLoaded(forSession: targetSessionId)
             // The load suspends, so another turn may have started; starting ours
-            // too would run two generations against the shared KV buffers.
-            if isGeneratingText {
+            // too would run two generations against the shared KV buffers. If the
+            // switch was superseded the model is not the target's, so also refuse.
+            if isGeneratingText || !modelReady {
                 accepted = false
             } else {
                 accepted = handleSendMessage(trimmed, sessionId: targetSessionId)
@@ -2026,10 +2070,12 @@ struct ContentView: View {
             if self.isGeneratingText {
                 self.requeuePromptFront(next, sessionId: currentSessionId)
             } else {
-                await self.ensureModelLoaded(forSession: currentSessionId)
+                let modelReady = await self.ensureModelLoaded(forSession: currentSessionId)
                 // The load suspends, so a turn may have started; requeue instead
-                // of running two generations against the shared KV buffers.
-                if self.isGeneratingText || !self.handleSendMessage(next.text, sessionId: currentSessionId) {
+                // of running two generations against the shared KV buffers. A
+                // superseded switch means the model is not the target's, so requeue
+                // rather than run on the wrong engine.
+                if self.isGeneratingText || !modelReady || !self.handleSendMessage(next.text, sessionId: currentSessionId) {
                     self.requeuePromptFront(next, sessionId: currentSessionId)
                 }
             }
