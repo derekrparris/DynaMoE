@@ -1001,6 +1001,11 @@ struct ContentView: View {
     /// refuses to install its engine or clear `isLoadingModel` once a newer
     /// request has superseded it.
     @State private var modelLoadToken: UInt64 = 0
+    /// Monotonic id of the most recent `switchModel` request. Requests that wait
+    /// out a generation teardown resume in an order Swift does not guarantee, so
+    /// only the latest request is allowed to install its engine, keeping an older
+    /// selection from superseding the user's newer one.
+    @State private var modelSwitchRequestId: UInt64 = 0
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var sessions: [ChatSession] = [
         ChatSession(title: "New Chat")
@@ -1221,24 +1226,40 @@ struct ContentView: View {
         // a deferred switch still records the model on the intended session even
         // if the user selects another conversation while it waits.
         let targetSessionId = sessionId ?? selectedSessionId ?? sessions.first?.id
+        // Mint a request id before any suspension. Requests that wait out a
+        // teardown resume in an order Swift does not guarantee, so without this an
+        // older selection could resume last and install its engine over a newer
+        // one; only the latest request is allowed to complete.
+        modelSwitchRequestId &+= 1
+        let requestId = modelSwitchRequestId
         // Never swap the engine/buffers out from under an in-flight generation:
         // its mmaps are unmapped when the old engine releases, which would fault
         // any GPU work still in progress.
         if isGeneratingText {
             stopAutoregressiveGeneration()
         }
-        if let teardown = generationTeardownTask {
-            // A cancelled generation is still unwinding and may still be inside a
-            // kernel dispatch. Loading a new engine now would unmap its mmaps and
-            // reset the shared buffers out from under it, so wait for the teardown
-            // and re-enter: a generation may have started during the wait, and
-            // this must stop it before swapping rather than completing over it.
-            return Task { @MainActor in
-                await teardown.value
-                await self.switchModel(to: model, sessionId: targetSessionId)?.value
-            }
+        guard let teardown = generationTeardownTask else {
+            return completeModelSwitch(to: model, sessionId: targetSessionId)
         }
-        return completeModelSwitch(to: model, sessionId: targetSessionId)
+        // A cancelled generation is still unwinding and may still be inside a
+        // kernel dispatch. Loading a new engine now would unmap its mmaps and
+        // reset the shared buffers out from under it, so wait for the teardown.
+        return Task { @MainActor in
+            await teardown.value
+            // A newer switch owns the outcome now; dropping this stale request
+            // keeps it from superseding the user's newer selection.
+            guard requestId == self.modelSwitchRequestId else { return }
+            // A generation may have started during the wait: stop it and wait for
+            // that teardown too, since swapping resets the shared buffers it uses.
+            if self.isGeneratingText {
+                self.stopAutoregressiveGeneration()
+            }
+            if let next = self.generationTeardownTask {
+                await next.value
+                guard requestId == self.modelSwitchRequestId else { return }
+            }
+            await self.completeModelSwitch(to: model, sessionId: targetSessionId).value
+        }
     }
 
     /// The non-suspending half of a model switch. Runs only once no cancelled
@@ -1291,6 +1312,27 @@ struct ContentView: View {
             let preferredProfile = ModelProfileManager.shared.getActiveProfile(for: targetPath)
             applyProfile(preferredProfile, for: targetPath)
             await loadTask.value
+        }
+    }
+
+    /// Brings the process-wide engine back to the selected conversation's model
+    /// after a turn ends. A queued or interrupted send can switch the engine to a
+    /// background conversation's model (see `ensureModelLoaded`), and nothing
+    /// restores the visible one because `selectedSessionId` never changed, so the
+    /// next ordinary send would otherwise run on the wrong model. A no-op when
+    /// the engine already matches the selection.
+    private func reconcileEngineWithSelection() {
+        guard let selectionId = selectedSessionId ?? sessions.first?.id,
+              let session = sessions.first(where: { $0.id == selectionId }),
+              let targetPath = session.selectedModelPath, !targetPath.isEmpty,
+              activeLoadedModelPath != targetPath else { return }
+        if let model = localModelManager.getModel(byId: targetPath) ?? localModelManager.getModel(byId: session.selectedModelId ?? "") {
+            switchModel(to: model, sessionId: selectionId)
+        } else {
+            loadAndBridgeToMetal(filePath: targetPath)
+            activeLoadedModelPath = targetPath
+            let preferredProfile = ModelProfileManager.shared.getActiveProfile(for: targetPath)
+            applyProfile(preferredProfile, for: targetPath)
         }
     }
 
@@ -1418,11 +1460,12 @@ struct ContentView: View {
     }
 
     /// Writes immediately, used when the app leaves the foreground or quits so
-    /// an in-flight conversation is not lost. No-op when nothing is pending.
+    /// an in-flight conversation is not lost. Always enqueues the current
+    /// snapshot: the debounced save clears `hasPendingSessionPersist` before its
+    /// I/O result is known, so gating on that flag here would skip the final save
+    /// after a *failed* write and lose the latest turn. `saveAll` skips
+    /// conversations whose bytes are already durable, so re-enqueuing is cheap.
     private func flushSessionPersist() {
-        if hasLoadedPersistedSessions {
-            guard hasPendingSessionPersist else { return }
-        }
         sessionPersistTask?.cancel()
         hasPendingSessionPersist = false
         // Before the load has populated `managedIds`, skip orphan cleanup: it
@@ -1666,6 +1709,16 @@ struct ContentView: View {
             // prunable the moment generation stops, so recheck retention then.
             if !generating {
                 applyChatRetention()
+                // A background/interrupted send may have switched the engine to
+                // another conversation's model; restore the selected one so the
+                // next ordinary send does not run on the wrong model. Skip while an
+                // interrupt replacement or teardown is still mid-flight: those
+                // paths intentionally target another conversation's model, and
+                // restoring the selection now would undo that switch. The
+                // replacement's own end-of-turn change re-runs this later.
+                if interruptSendTask == nil && generationTeardownTask == nil {
+                    reconcileEngineWithSelection()
+                }
             }
         }
         .onChange(of: scenePhase) { phase in

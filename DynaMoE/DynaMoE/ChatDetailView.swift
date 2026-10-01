@@ -54,6 +54,11 @@ struct ChatDetailView: View {
     /// this a second Cmd-Return/bolt press would submit the same text again.
     /// `nil` when no immediate send is pending.
     @State private var pendingImmediateSend: String? = nil
+    /// Bumped on every edit to the draft. The immediate-send completion clears the
+    /// composer only when this still equals the revision it submitted, so a newer
+    /// draft is never clobbered even if the user edited away and back to the same
+    /// text.
+    @State private var draftRevision: UInt64 = 0
     /// Queued prompts with an in-flight "Send Now", so re-activating the same
     /// row cannot launch two tasks for it.
     @State private var sendingQueuedIds: Set<UUID> = []
@@ -855,6 +860,7 @@ struct ChatDetailView: View {
             updateTokenCount(for: promptText)
         }
         .onChange(of: promptText) { newText in
+            draftRevision &+= 1
             updateTokenCount(for: newText)
         }
         .onChange(of: tokenizer != nil) { _ in
@@ -874,11 +880,14 @@ struct ChatDetailView: View {
             return
         }
         // Capture the submitted draft so a newer edit made while the send is in
-        // flight survives.
+        // flight survives. Compare the revision, not just the text: the user could
+        // edit away and back to the same string, and a text match would then clear
+        // a draft they intentionally re-typed.
         let submitted = promptText
+        let submittedRevision = draftRevision
         pendingImmediateSend = submitted
         Task {
-            if await immediate(trimmed), promptText == submitted {
+            if await immediate(trimmed), draftRevision == submittedRevision {
                 promptText = ""
             }
             if pendingImmediateSend == submitted {
