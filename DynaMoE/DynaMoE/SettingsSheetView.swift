@@ -26,12 +26,61 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .advanced: return "waveform.path.ecg"
         }
     }
+
+    /// Short description shown in the detail pane header banner.
+    var bannerSubtitle: String {
+        switch self {
+        case .general:
+            return "Manage your overall DynaMoE setup, including updates, chat history, and reasoning display preferences."
+        case .models:
+            return "Browse installed local models, set defaults, repack for FlashMoE, and configure per-model generation profiles."
+        case .generation:
+            return "Tune sampling hyperparameters, system prompts, and JetSpec speculative tree acceleration."
+        case .memory:
+            return "Control memory execution, RAM budgets, KV-cache precision, SSD expert paging, and live diagnostics."
+        case .agent:
+            return "Configure agent tools, workspace, safety limits, web search, codebase indexing, subagents, and developer tooling."
+        case .advanced:
+            return "Inspect sharded SafeTensors metadata and run direct Metal kernel execution harnesses."
+        }
+    }
+
+    /// Accent color for the detail pane header banner icon tile.
+    var bannerTint: Color {
+        switch self {
+        case .general: return .gray
+        case .models: return .indigo
+        case .generation: return .purple
+        case .memory: return .teal
+        case .agent: return .orange
+        case .advanced: return .pink
+        }
+    }
+
+    /// Extra search terms matched by the sidebar search field.
+    var keywords: [String] {
+        switch self {
+        case .general:
+            return ["updates", "version", "thinking", "reasoning", "chat", "history", "retention", "auto-delete"]
+        case .models:
+            return ["model", "weights", "safetensors", "flashmoe", "repack", "default", "tokenizer", "metal", "profile", "cache"]
+        case .generation:
+            return ["temperature", "top-p", "top-k", "min-p", "sampling", "penalty", "tokens", "jetspec", "speculative", "system prompt", "preset"]
+        case .memory:
+            return ["memory", "ram", "budget", "kv cache", "precision", "fp8", "fp16", "prefetch", "ssd", "paging", "diagnostics", "cache"]
+        case .agent:
+            return ["agent", "tools", "turbo", "grammar", "workspace", "directory", "search", "brave", "chrome", "index", "rag", "subagent", "git", "lint", "dogfood", "benchmark"]
+        case .advanced:
+            return ["diagnostics", "tensor", "inspector", "router", "metal", "kernel", "layer", "shard", "inspect"]
+        }
+    }
 }
 
 struct SettingsSheetView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.openWindow) private var openWindow
     @State private var selectedTab: SettingsTab = .models
+    @State private var sidebarSearchText: String = ""
     @State private var isPromptSavedFeedback: Bool = false
     @State private var repackingModelId: String? = nil
     @State private var repackProgress: Double = 0.0
@@ -137,13 +186,44 @@ struct SettingsSheetView: View {
     var isExecutingMultiLayer: Bool
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Header
-            HStack(spacing: 12) {
-                Text("Settings & Diagnostics")
-                    .font(.headline)
-                    .fontWeight(.bold)
+        NavigationSplitView(columnVisibility: .constant(.all)) {
+            settingsSidebar
+                .navigationSplitViewColumnWidth(min: 200, ideal: 224, max: 260)
+        } detail: {
+            settingsDetail
+        }
+        .navigationSplitViewStyle(.balanced)
+        .toolbar(removing: .sidebarToggle)
+        .frame(minWidth: 780, minHeight: 560)
+        .background(Color(NSColor.windowBackgroundColor))
+    }
 
+    // MARK: - Sidebar & Detail Shell
+    private var settingsSidebar: some View {
+        List(selection: $selectedTab) {
+            ForEach(filteredSettingsTabs) { tab in
+                Label(tab.rawValue, systemImage: tab.icon)
+                    .font(.system(size: 13, weight: .medium))
+                    .padding(.vertical, 3)
+                    .tag(tab)
+            }
+        }
+        .listStyle(.sidebar)
+        .searchable(text: $sidebarSearchText, placement: .sidebar, prompt: "Search Settings…")
+    }
+
+    private var filteredSettingsTabs: [SettingsTab] {
+        let query = sidebarSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return SettingsTab.allCases }
+        return SettingsTab.allCases.filter { tab in
+            tab.rawValue.localizedCaseInsensitiveContains(query)
+                || tab.keywords.contains { $0.localizedCaseInsensitiveContains(query) }
+        }
+    }
+
+    private var settingsDetail: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
                 Spacer()
 
                 Button(action: {
@@ -163,27 +243,19 @@ struct SettingsSheetView: View {
                 .buttonStyle(.borderedProminent)
             }
             .padding(.horizontal, 20)
-            .padding(.vertical, 14)
-            .background(Color(NSColor.windowBackgroundColor))
+            .padding(.vertical, 10)
 
             Divider()
 
-            // Tab Bar
-            Picker("Settings Tab", selection: $selectedTab) {
-                ForEach(SettingsTab.allCases) { tab in
-                    Label(tab.rawValue, systemImage: tab.icon).tag(tab)
-                }
-            }
-            .pickerStyle(.segmented)
-            .padding(.horizontal, 20)
-            .padding(.vertical, 12)
-            .background(Color(NSColor.controlBackgroundColor).opacity(0.5))
-
-            Divider()
-
-            // Tab Content
             ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 18) {
+                    SettingsSectionBanner(
+                        icon: selectedTab.icon,
+                        title: selectedTab.rawValue,
+                        subtitle: selectedTab.bannerSubtitle,
+                        tint: selectedTab.bannerTint
+                    )
+
                     switch selectedTab {
                     case .general:
                         generalSettingsSection
@@ -199,54 +271,38 @@ struct SettingsSheetView: View {
                         advancedDiagnosticsSection
                     }
                 }
-                .padding(20)
+                .padding(24)
+                .frame(maxWidth: 860, alignment: .leading)
+                .frame(maxWidth: .infinity)
             }
         }
-        .frame(minWidth: 680, minHeight: 560)
         .background(Color(NSColor.windowBackgroundColor))
     }
 
     // MARK: - Tab 0: General
     private var generalSettingsSection: some View {
         VStack(alignment: .leading, spacing: 18) {
-            Text("General Application Settings")
-                .font(.headline)
-
-            VStack(alignment: .leading, spacing: 14) {
-                // Auto-Updates Toggle
-                Toggle(isOn: Binding(
-                    get: { UpdaterViewModel.shared.automaticallyChecksForUpdates },
-                    set: { UpdaterViewModel.shared.automaticallyChecksForUpdates = $0 }
-                )) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 6) {
-                            Text("Enable Auto-Updates")
-                                .font(.system(size: 13, weight: .medium))
-                            Image(systemName: "arrow.triangle.2.circlepath")
-                                .foregroundColor(.accentColor)
-                                .font(.system(size: 11))
-                        }
-                        Text("Automatically check for new DynaMoE releases in the background. Updates are verified and installed safely; you can always check manually with ⌘U.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
+            SettingsCard(header: "Updates") {
+                SettingsRow(
+                    title: "Enable Auto-Updates",
+                    subtitle: "Automatically check for new DynaMoE releases in the background. Updates are verified and installed safely; you can always check manually with ⌘U.",
+                    icon: "arrow.triangle.2.circlepath"
+                ) {
+                    Toggle("", isOn: Binding(
+                        get: { UpdaterViewModel.shared.automaticallyChecksForUpdates },
+                        set: { UpdaterViewModel.shared.automaticallyChecksForUpdates = $0 }
+                    ))
+                    .toggleStyle(.switch)
+                    .labelsHidden()
                 }
-                .toggleStyle(.switch)
 
-                Divider()
+                SettingsRowDivider()
 
-                // Manual Check Now
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Check for Updates Now")
-                            .font(.system(size: 13, weight: .medium))
-                        Text("Manually query the update feed regardless of the automatic setting.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-
-                    Spacer()
-
+                SettingsRow(
+                    title: "Check for Updates Now",
+                    subtitle: "Manually query the update feed regardless of the automatic setting.",
+                    icon: "arrow.down.circle"
+                ) {
                     Button(action: {
                         UpdaterViewModel.shared.checkForUpdates()
                     }) {
@@ -258,79 +314,51 @@ struct SettingsSheetView: View {
                     .help("Check for updates now (⌘U)")
                 }
 
-                Divider()
+                SettingsRowDivider()
 
-                // Current Version
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Current Version")
-                            .font(.system(size: 13, weight: .medium))
-                        Text("The DynaMoE release currently installed.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
+                SettingsRow(
+                    title: "Current Version",
+                    subtitle: "The DynaMoE release currently installed.",
+                    icon: "number"
+                ) {
+                    SettingsValuePill(text: versionDisplayString)
+                }
+            }
 
-                    Spacer()
-
-                    Text(versionDisplayString)
-                        .font(.system(size: 12, design: .monospaced))
-                        .foregroundColor(.secondary)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 6)
-                        .background(Color.secondary.opacity(0.06))
-                        .cornerRadius(6)
+            SettingsCard(header: "Chat & Reasoning") {
+                SettingsRow(
+                    title: "Expand Thinking by Default",
+                    subtitle: "Show the thinking/reasoning accordion expanded when a message first appears. When off, reasoning starts collapsed and can be opened manually.",
+                    icon: "brain.head.profile",
+                    iconTint: .purple
+                ) {
+                    Toggle("", isOn: $reasoningExpandedByDefault)
+                        .toggleStyle(.switch)
+                        .labelsHidden()
                 }
 
-                Divider()
+                SettingsRowDivider()
 
-                // Reasoning Accordion Default
-                Toggle(isOn: $reasoningExpandedByDefault) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 6) {
-                            Text("Expand Thinking by Default")
-                                .font(.system(size: 13, weight: .medium))
-                            Image(systemName: "brain.head.profile")
-                                .foregroundColor(.accentColor)
-                                .font(.system(size: 11))
-                        }
-                        Text("Show the thinking/reasoning accordion expanded when a message first appears. When off, reasoning starts collapsed and can be opened manually.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
+                SettingsRow(
+                    title: "Auto-Delete Old Conversations",
+                    subtitle: "Keep conversations saved between launches, removing the oldest automatically once the limit below is reached. Turn off to keep every conversation forever.",
+                    icon: "clock.arrow.circlepath",
+                    iconTint: .orange
+                ) {
+                    Toggle("", isOn: $chatAutoDeleteEnabled)
+                        .toggleStyle(.switch)
+                        .labelsHidden()
                 }
-                .toggleStyle(.switch)
-
-                Divider()
-
-                // Chat History Auto-Delete
-                Toggle(isOn: $chatAutoDeleteEnabled) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 6) {
-                            Text("Auto-Delete Old Conversations")
-                                .font(.system(size: 13, weight: .medium))
-                            Image(systemName: "clock.arrow.circlepath")
-                                .foregroundColor(.accentColor)
-                                .font(.system(size: 11))
-                        }
-                        Text("Keep conversations saved between launches, removing the oldest automatically once the limit below is reached. Turn off to keep every conversation forever.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                }
-                .toggleStyle(.switch)
 
                 if chatAutoDeleteEnabled {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Conversations to Keep")
-                                .font(.system(size: 13, weight: .medium))
-                            Text("The most-recently-updated conversations retained before older ones are deleted. The conversation you have open is always kept.")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
+                    SettingsRowDivider()
 
-                        Spacer()
-
+                    SettingsRow(
+                        title: "Conversations to Keep",
+                        subtitle: "The most-recently-updated conversations retained before older ones are deleted. The conversation you have open is always kept.",
+                        icon: "tray.full",
+                        iconTint: .teal
+                    ) {
                         HStack(spacing: 8) {
                             Text("\(chatRetentionLimit)")
                                 .font(.system(size: 12, design: .monospaced))
@@ -621,81 +649,46 @@ struct SettingsSheetView: View {
                 }
             }
 
-            Divider()
-                .padding(.vertical, 4)
-
-            // Other Model Actions / Custom Folder Selector
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Custom Local Paths & Fallbacks")
-                    .font(.subheadline)
-                    .fontWeight(.semibold)
-
-                HStack {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Custom Folder or Safetensors File")
-                            .font(.system(size: 13, weight: .medium))
-                        Text("Load a model outside of Hugging Face cache (e.g. external SSD)")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                    Spacer()
+            SettingsCard(header: "Custom Paths & Fallbacks") {
+                SettingsRow(
+                    title: "Custom Folder or Safetensors File",
+                    subtitle: "Load a model outside of Hugging Face cache (e.g. external SSD)",
+                    icon: "folder.fill"
+                ) {
                     Button("Browse Folder / Index...", action: onSelectModel)
                         .buttonStyle(.bordered)
                 }
-                .padding(12)
-                .background(Color.secondary.opacity(0.04))
-                .cornerRadius(8)
 
-                // Tokenizer Card
-                HStack {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Custom Tokenizer (tokenizer.json)")
-                            .font(.system(size: 13, weight: .medium))
-                        Text(tokenizer != nil ? "Tokenizer Loaded & Ready ✅" : "No tokenizer loaded.")
-                            .font(.caption)
-                            .foregroundColor(tokenizer != nil ? .green : .secondary)
-                    }
-                    Spacer()
+                SettingsRowDivider()
+
+                SettingsRow(
+                    title: "Custom Tokenizer (tokenizer.json)",
+                    subtitle: tokenizer != nil ? "Tokenizer Loaded & Ready ✅" : "No tokenizer loaded.",
+                    icon: "textformat"
+                ) {
                     Button(tokenizer == nil ? "Load tokenizer.json" : "Replace Tokenizer", action: onSelectTokenizer)
                         .buttonStyle(.bordered)
                 }
-                .padding(12)
-                .background(Color.secondary.opacity(0.04))
-                .cornerRadius(8)
 
-                // GPU & Metal Backend Status
-                HStack {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text("Metal GPU Acceleration")
-                            .font(.system(size: 13, weight: .medium))
-                        Text(metalStatus)
-                            .font(.caption)
-                            .foregroundColor(metalStatus.contains("✅") ? .green : .secondary)
-                    }
-                    Spacer()
+                SettingsRowDivider()
+
+                SettingsRow(
+                    title: "Metal GPU Acceleration",
+                    subtitle: metalStatus,
+                    icon: "cpu",
+                    iconTint: .purple
+                ) {
                     if let device = MTLCreateSystemDefaultDevice() {
-                        Text(device.name)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.purple)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Color.purple.opacity(0.1))
-                            .cornerRadius(6)
+                        SettingsValuePill(text: device.name, tint: .purple)
                     }
                 }
-                .padding(12)
-                .background(Color.secondary.opacity(0.04))
-                .cornerRadius(8)
             }
         }
     }
 
     // MARK: - Tab 2: Generation & Sampler
     private var generationSettingsSection: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Inference & Sampling Parameters")
-                .font(.headline)
-
+        VStack(alignment: .leading, spacing: 18) {
             // Active Profile Banner
             HStack(spacing: 12) {
                 Image(systemName: activeProfile.icon)
@@ -769,7 +762,7 @@ struct SettingsSheetView: View {
             .background(Color.purple.opacity(0.08))
             .cornerRadius(10)
 
-            VStack(spacing: 16) {
+            SettingsCard(header: "Sampling", spacing: 16) {
                 // Temperature
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
@@ -888,9 +881,10 @@ struct SettingsSheetView: View {
                         }
                     }
                 }
+            }
 
-                // JetSpec Causal Speculative Tree Acceleration
-                VStack(alignment: .leading, spacing: 10) {
+            // JetSpec Causal Speculative Tree Acceleration
+            SettingsCard(header: "JetSpec Speculative Tree") {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
                             HStack(spacing: 6) {
@@ -959,12 +953,9 @@ struct SettingsSheetView: View {
                         }
                     }
                 }
-                .padding(12)
-                .background(Color.purple.opacity(0.06))
-                .cornerRadius(8)
 
-                // System Prompt Editor & Conjunction Combination
-                VStack(alignment: .leading, spacing: 8) {
+            // System Prompt Editor & Conjunction Combination
+            SettingsCard(header: "System Prompt", spacing: 8) {
                     HStack {
                         Text("User Default System Prompt")
                             .font(.subheadline)
@@ -1053,21 +1044,14 @@ struct SettingsSheetView: View {
                             .font(.caption2)
                             .foregroundColor(.secondary)
                     }
-                }
             }
-            .padding(14)
-            .background(Color.secondary.opacity(0.06))
-            .cornerRadius(10)
         }
     }
 
     // MARK: - Tab 3: Memory & Working Set
     private var memorySettingsSection: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Memory & Dynamic SSD Expert Paging")
-                .font(.headline)
-
-            VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 18) {
+            SettingsCard(header: "Execution", spacing: 16) {
                 // Execution Mode Picker
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Memory Execution Mode")
@@ -1123,9 +1107,10 @@ struct SettingsSheetView: View {
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
+            }
 
-                // Speculative Prefetching & Layer Lookahead
-                VStack(alignment: .leading, spacing: 8) {
+            // Speculative Prefetching & Layer Lookahead
+            SettingsCard(header: "Speculative Prefetching", spacing: 8) {
                     Toggle(isOn: $speculativePrefetchEnabled) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Speculative MoE Expert & Layer Prefetching")
@@ -1155,9 +1140,8 @@ struct SettingsSheetView: View {
                     }
                 }
 
-                Divider()
-
                 // Telemetry Metrics Grid
+                SettingsCard(header: "Live Diagnostics", spacing: 14) {
                 HStack(spacing: 14) {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 3) {
@@ -1208,8 +1192,6 @@ struct SettingsSheetView: View {
                     }
                 }
 
-                Divider()
-
                 // Cache Actions
                 HStack(spacing: 12) {
                     Button(action: onFlushCache) {
@@ -1223,19 +1205,13 @@ struct SettingsSheetView: View {
                     .buttonStyle(.bordered)
                 }
             }
-            .padding(14)
-            .background(Color.secondary.opacity(0.06))
-            .cornerRadius(10)
         }
     }
 
     // MARK: - Tab 4: Agent & Tool Execution Suite
     private var agentSettingsSection: some View {
         VStack(alignment: .leading, spacing: 18) {
-            Text("Agent Mode & Tool Calling Configuration")
-                .font(.headline)
-
-            VStack(alignment: .leading, spacing: 14) {
+            SettingsCard(header: "Agent Tools", spacing: 14) {
                 // Enable Agent Tools Toggle
                 Toggle(isOn: $isAgentToolsGloballyEnabled) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -1285,10 +1261,10 @@ struct SettingsSheetView: View {
                     }
                 }
                 .toggleStyle(.switch)
+            }
 
-                Divider()
-
-                // Working Directory Picker
+            // Working Directory Picker
+            SettingsCard(header: "Workspace") {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Agent Working Directory (CWD)")
                         .font(.system(size: 13, weight: .medium))
@@ -1344,10 +1320,10 @@ struct SettingsSheetView: View {
                         }
                     }
                 }
+            }
 
-                Divider()
-
-                // Output Length Slider
+            // Output Length Slider
+            SettingsCard(header: "Limits", spacing: 14) {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
@@ -1367,8 +1343,6 @@ struct SettingsSheetView: View {
                         set: { maxToolOutputLength = Int($0) }
                     ), in: 1000...16000, step: 500)
                 }
-
-                Divider()
 
                 // Max Agent Iteration Steps
                 VStack(alignment: .leading, spacing: 4) {
@@ -1391,12 +1365,9 @@ struct SettingsSheetView: View {
                     ), in: 1...30, step: 1)
                 }
             }
-            .padding(14)
-            .background(Color.secondary.opacity(0.04))
-            .cornerRadius(10)
 
             // Web Search Engine Configuration
-            VStack(alignment: .leading, spacing: 10) {
+            SettingsCard(header: "Web Search", spacing: 10) {
                 HStack {
                     Image(systemName: "globe")
                         .foregroundColor(.blue)
@@ -1469,12 +1440,9 @@ struct SettingsSheetView: View {
                         .foregroundColor(.secondary)
                 }
             }
-            .padding(14)
-            .background(Color.secondary.opacity(0.04))
-            .cornerRadius(10)
 
             // Semantic Codebase Indexing & Local RAG Configuration
-            VStack(alignment: .leading, spacing: 10) {
+            SettingsCard(header: "Codebase Indexing", spacing: 10) {
                 HStack {
                     Image(systemName: "sparkle.magnifyingglass")
                         .foregroundColor(.purple)
@@ -1554,12 +1522,9 @@ struct SettingsSheetView: View {
                     }
                 }
             }
-            .padding(14)
-            .background(Color.secondary.opacity(0.04))
-            .cornerRadius(10)
 
             // Subagent & Multi-Agent Delegation Card
-            VStack(alignment: .leading, spacing: 10) {
+            SettingsCard(header: "Subagents", spacing: 10) {
                 HStack(spacing: 8) {
                     Image(systemName: "square.2.layers.3d")
                         .font(.system(size: 16, weight: .semibold))
@@ -1603,12 +1568,9 @@ struct SettingsSheetView: View {
                         .foregroundColor(.secondary)
                 }
             }
-            .padding(14)
-            .background(Color.secondary.opacity(0.04))
-            .cornerRadius(10)
 
             // Deep Developer Tooling (Native Git & SourceKit-LSP) Card
-            VStack(alignment: .leading, spacing: 10) {
+            SettingsCard(header: "Developer Tooling", spacing: 10) {
                 HStack(spacing: 8) {
                     Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
                         .font(.system(size: 16, weight: .semibold))
@@ -1642,12 +1604,9 @@ struct SettingsSheetView: View {
                         .foregroundColor(.indigo)
                 }
             }
-            .padding(14)
-            .background(Color.secondary.opacity(0.04))
-            .cornerRadius(10)
 
             // Live Model Dogfooding & Benchmarking Card
-            VStack(alignment: .leading, spacing: 10) {
+            SettingsCard(header: "Dogfooding & Benchmarking", spacing: 10) {
                 HStack(spacing: 8) {
                     Image(systemName: "gauge.with.dots.needle.bottom.50percent")
                         .font(.system(size: 16, weight: .semibold))
@@ -1735,9 +1694,6 @@ struct SettingsSheetView: View {
                     }
                 }
             }
-            .padding(14)
-            .background(Color.secondary.opacity(0.04))
-            .cornerRadius(10)
             .sheet(isPresented: $showDogfoodReportModal) {
                 if let report = dogfoodRunner.latestReport {
                     VStack(alignment: .leading, spacing: 14) {
@@ -1762,7 +1718,7 @@ struct SettingsSheetView: View {
             }
 
             // Available Built-in Tools List
-            VStack(alignment: .leading, spacing: 10) {
+            SettingsCard(header: "Installed Tool Suite", spacing: 10) {
                 Text("Installed Tool Suite (\(AgentHarness.shared.loadedTools.count) Loaded / \(AgentHarness.shared.tools.count) Installed)")
                     .font(.subheadline)
                     .fontWeight(.semibold)
@@ -1826,10 +1782,7 @@ struct SettingsSheetView: View {
     // MARK: - Tab 5: Advanced Diagnostics & Inspector
     private var advancedDiagnosticsSection: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Advanced Tensor Diagnostics & Inspector")
-                .font(.headline)
-
-            VStack(alignment: .leading, spacing: 12) {
+            SettingsCard(spacing: 12) {
                 // Search & Filter
                 HStack(spacing: 8) {
                     TextField("Search tensors by name...", text: $searchText)
@@ -1906,9 +1859,6 @@ struct SettingsSheetView: View {
                 .background(Color(NSColor.controlBackgroundColor))
                 .cornerRadius(8)
             }
-            .padding(14)
-            .background(Color.secondary.opacity(0.06))
-            .cornerRadius(10)
         }
     }
 

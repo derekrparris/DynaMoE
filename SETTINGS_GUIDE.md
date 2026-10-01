@@ -1,6 +1,6 @@
 # DynaMoE Settings & User Guide
 
-A comprehensive, practical guide to configuring, tuning, and operating DynaMoE on Apple Silicon. This document details every tab in the **Settings & Diagnostics** panel (`⌘,`), explains the underlying mathematics and runtime mechanics, provides battle-tested presets for coding versus conversational assistance, and offers memory budgeting advice for Mac hardware configurations.
+A comprehensive, practical guide to configuring, tuning, and operating DynaMoE on Apple Silicon. This document details every section of the **Settings & Diagnostics** window (`⌘,`) — which presents a sidebar of sections on the left and their controls on the right, matching the macOS System Settings layout — explains the underlying mathematics and runtime mechanics, provides battle-tested presets for coding versus conversational assistance, and offers memory budgeting advice for Mac hardware configurations.
 
 ---
 
@@ -50,13 +50,13 @@ DynaMoE provides centralized control over model inference, GPU shader dispatch, 
 
 ### How to Open this Guide in the App
 - **Help Menu**: Select **Help $\to$ DynaMoE Help & Settings Guide** (or press `⌘?`).
-- **Settings Header**: Click the **Help & Guide** button located in the top-right of the Settings sheet.
+- **Settings Window**: Click the **Help & Guide** button located in the top-right of the Settings window. Sections are selected from the sidebar on the left.
 
 ---
 
 ## 2. Tab 1: Models & Binary Repackaging
 
-The **Models** tab acts as your local model registry and management hub.
+The **Models** section acts as your local model registry and management hub.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -135,7 +135,7 @@ DynaMoE automatically defaults to and persists the official publisher-tuned prof
 
 ## 3. Tab 2: Generation & Sampling Hyperparameters
 
-The **Generation** tab configures the mathematical sampling engine used during autoregressive token decoding.
+The **Generation** section configures the mathematical sampling engine used during autoregressive token decoding.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -225,7 +225,7 @@ JetSpec accelerates token generation by proposing structured trees of candidate 
 
 ## 4. Tab 3: Memory & SSD Management
 
-The **Memory & SSD** tab controls how model weights and runtime caches are allocated across Apple Silicon's Unified Memory Architecture (UMA) and NVMe storage.
+The **Memory & SSD** section controls how model weights and runtime caches are allocated across Apple Silicon's Unified Memory Architecture (UMA) and NVMe storage.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -278,7 +278,7 @@ When running sparse MoE models in SSD streaming mode:
 
 ## 5. Tab 4: Agent & Tools
 
-The **Agent & Tools** tab configures DynaMoE's autonomous agent engine, tool-calling loop, and external search integrations.
+The **Agent & Tools** section configures DynaMoE's autonomous agent engine, tool-calling loop, and external search integrations.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
@@ -325,7 +325,7 @@ DynaMoE equips models with the following native tools:
 
 ## 6. Tab 5: Advanced Diagnostics
 
-The **Advanced Diagnostics** tab is an engineering inspection suite for validating Metal shaders, examining raw SafeTensors tensors, and testing layer forward execution independently of chat generation.
+The **Advanced Diagnostics** section is an engineering inspection suite for validating Metal shaders, examining raw SafeTensors tensors, and testing layer forward execution independently of chat generation.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐

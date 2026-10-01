@@ -81,7 +81,7 @@ struct HelpAndSettingsGuideView: View {
                             .font(.system(size: 11, weight: .medium))
                     }
                     .buttonStyle(.bordered)
-                    .help("Open DynaMoE Settings Sheet (⌘,)")
+                    .help("Open DynaMoE Settings (⌘,)")
 
                     // Quick Preset Copy Button
                     Menu {
