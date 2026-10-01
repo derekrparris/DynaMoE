@@ -422,6 +422,7 @@ struct ChatDetailView: View {
                                             .clipShape(Circle())
                                     }
                                     .buttonStyle(.plain)
+                                    .disabled(sendingQueuedIds.contains(item.id))
                                     .help("Edit prompt in composer")
 
                                     Button(action: {
@@ -435,6 +436,7 @@ struct ChatDetailView: View {
                                             .clipShape(Circle())
                                     }
                                     .buttonStyle(.plain)
+                                    .disabled(sendingQueuedIds.contains(item.id))
                                     .help("Remove from queue")
                                 }
                             }

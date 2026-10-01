@@ -993,6 +993,12 @@ struct ContentView: View {
     @ObservedObject private var sessionStore = ChatSessionStore.shared
     @ObservedObject var localModelManager: LocalModelManager = LocalModelManager.shared
     @State private var activeLoadedModelPath: String? = nil
+    /// The path whose engine, summary, and tokenizer are actually installed.
+    /// `activeLoadedModelPath` is set optimistically before a load finishes (for
+    /// UI) and survives failures, so it cannot prove the engine is usable; this is
+    /// set only on a successful install and cleared on failure, which is what
+    /// `ensureModelLoaded` requires before an async send runs.
+    @State private var installedModelPath: String? = nil
     @State private var isLoadingModel: Bool = false
     /// The in-flight engine load, so an async send can wait for the specific
     /// model it needs instead of racing the detached load.
@@ -1007,9 +1013,25 @@ struct ContentView: View {
     /// selection from superseding the user's newer one.
     @State private var modelSwitchRequestId: UInt64 = 0
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
-    @State private var sessions: [ChatSession] = [
+    /// Backing storage for `sessions`. Kept separate so the computed `sessions`
+    /// below can bump `sessionPersistRevision` on every mutation.
+    @State private var storedSessions: [ChatSession] = [
         ChatSession(title: "New Chat")
     ]
+    /// Bumped on every `sessions` mutation, whole-value or in place. Watching this
+    /// O(1) counter replaces observing the full `[ChatSession]` array (or a
+    /// length-based fingerprint): the array's synthesized `Equatable` compared
+    /// every message's text on each streaming token, and a fingerprint of string
+    /// lengths still scanned the growing response, both of which scale with total
+    /// history per token.
+    @State private var sessionPersistRevision: UInt64 = 0
+    private var sessions: [ChatSession] {
+        get { storedSessions }
+        nonmutating set {
+            storedSessions = newValue
+            sessionPersistRevision &+= 1
+        }
+    }
     @State private var selectedSessionId: UUID? = nil
     /// Identity of the single empty conversation the view starts with, so a
     /// successful history load drops only that placeholder and not a user-created
@@ -1294,21 +1316,22 @@ struct ContentView: View {
     /// because `loadAndBridgeToMetal` returns while the previous engine and
     /// buffers are still installed.
     ///
-    /// Returns whether the requested path is the one actually installed. A switch
-    /// can drop this request when a newer one supersedes it (see
-    /// `modelSwitchRequestId`), so the awaited load may complete without this model
-    /// active; callers must then refuse to send rather than run on the old engine.
+    /// Returns whether the requested path is the one whose engine/summary/tokenizer
+    /// are actually installed. A switch can drop this request when a newer one
+    /// supersedes it (see `modelSwitchRequestId`), and a load can fail, so the
+    /// awaited work may complete without this model usable; callers must then
+    /// refuse to send rather than run on the old engine.
     @discardableResult
     private func ensureModelLoaded(forSession sessionId: UUID?) async -> Bool {
         guard let sessionId,
               let session = sessions.first(where: { $0.id == sessionId }),
               let targetPath = session.selectedModelPath,
               !targetPath.isEmpty else { return true }
-        if activeLoadedModelPath == targetPath {
+        if installedModelPath == targetPath {
             // The engine for this path may still be installing; wait for that
             // specific load rather than sending against the previous model.
             if isLoadingModel { await modelLoadTask?.value }
-            return activeLoadedModelPath == targetPath
+            return isEngineUsable(forPath: targetPath)
         }
         if let model = localModelManager.getModel(byId: targetPath) ?? localModelManager.getModel(byId: session.selectedModelId ?? "") {
             await switchModel(to: model, sessionId: sessionId)?.value
@@ -1323,9 +1346,18 @@ struct ContentView: View {
             applyProfile(preferredProfile, for: targetPath)
             await loadTask.value
         }
-        // A newer load may still be in flight; only a settled engine matching the
-        // path is safe to send against.
-        return activeLoadedModelPath == targetPath && !isLoadingModel
+        return isEngineUsable(forPath: targetPath)
+    }
+
+    /// Whether the engine, summary, and tokenizer for `path` are installed and
+    /// settled. `activeLoadedModelPath` is not used here because it is set before
+    /// a load finishes and left in place on failure, so it cannot prove usability.
+    private func isEngineUsable(forPath path: String) -> Bool {
+        installedModelPath == path
+            && engine != nil
+            && summary != nil
+            && tokenizer != nil
+            && !isLoadingModel
     }
 
     /// Brings the process-wide engine back to the selected conversation's model
@@ -1350,61 +1382,6 @@ struct ContentView: View {
     }
 
     // MARK: - Chat Session Persistence & Retention
-
-    /// A cheap fingerprint of everything persistence cares about. `[ChatSession]`
-    /// has synthesized deep `Equatable`, so observing `sessions` directly makes
-    /// SwiftUI compare every message's text on each streaming token, which costs
-    /// O(total history) in string comparisons per token and grows quadratically
-    /// over a long response. This summary compares the same content by length and
-    /// tool status instead of by string, so it is cheap per token yet still
-    /// changes on any edit that must reach disk.
-    private struct SessionPersistStamp: Equatable {
-        struct MessageStamp: Equatable {
-            var contentLength: Int
-            var thinkingLength: Int
-            var tokenCount: Int
-            var tokensPerSec: Double
-            var toolStatuses: [ToolExecutionStatus]
-            var isThinking: Bool
-            var prefillStatus: String?
-        }
-
-        var id: UUID
-        var title: String
-        var messageCount: Int
-        var queuedCount: Int
-        var thinking: Bool?
-        var tools: Bool?
-        var modelPath: String?
-        var updatedAt: Date
-        var lastMessage: MessageStamp?
-    }
-
-    private var sessionPersistStamp: [SessionPersistStamp] {
-        sessions.map { session in
-            SessionPersistStamp(
-                id: session.id,
-                title: session.title,
-                messageCount: session.messages.count,
-                queuedCount: session.queuedPrompts.count,
-                thinking: session.isThinkingEnabled,
-                tools: session.isAgentToolsEnabled,
-                modelPath: session.selectedModelPath,
-                updatedAt: session.updatedAt,
-                lastMessage: session.messages.last.map { message in
-                    SessionPersistStamp.MessageStamp(
-                        contentLength: message.content.count,
-                        thinkingLength: message.thinkingContent?.count ?? -1,
-                        tokenCount: message.tokenCount,
-                        tokensPerSec: message.tokensPerSec,
-                        toolStatuses: message.toolCalls?.map(\.status) ?? [],
-                        isThinking: message.isThinking,
-                        prefillStatus: message.prefillStatus
-                    )
-                }
-            )
-        }
-    }
 
     /// `nil` means "never auto-delete".
     private var chatRetentionLimitOrNil: Int? {
@@ -1591,7 +1568,12 @@ struct ContentView: View {
         ZStack {
             NavigationSplitView(columnVisibility: $columnVisibility) {
                 SidebarView(
-                    sessions: $sessions,
+                    // Route the binding through the computed `sessions` so sidebar
+                    // edits also bump the persistence revision.
+                    sessions: Binding(
+                        get: { sessions },
+                        set: { sessions = $0 }
+                    ),
                     selectedSessionId: $selectedSessionId,
                     isSettingsPresented: $isSettingsPresented,
                     modelName: activeModelDisplayName,
@@ -1785,9 +1767,9 @@ struct ContentView: View {
                 }
             }
         }
-        .onChange(of: sessionPersistStamp) { _ in
-            // Observe a cheap fingerprint rather than the whole `sessions` array:
-            // streaming updates every token, and deep-comparing all message text
+        .onChange(of: sessionPersistRevision) { _ in
+            // A revision counter rather than the whole `sessions` array: streaming
+            // mutates the array every token, and deep-comparing all message text
             // on the main actor each time scales with total history.
             scheduleSessionPersist()
         }
@@ -4078,6 +4060,15 @@ struct ContentView: View {
                 self.releaseRetentionProtection(sessionId)
                 self.applyChatRetention()
                 self.generationTeardownTask = nil
+                // The isGeneratingText observer deliberately skips reconciliation
+                // while a teardown is pending, and this clearing produces no later
+                // state change, so restore the selected conversation's model here
+                // unless an interrupt replacement is already taking over. Otherwise
+                // a stopped background turn would leave the engine on its model and
+                // the next ordinary send would run on it.
+                if self.interruptSendTask == nil {
+                    self.reconcileEngineWithSelection()
+                }
             }
             generationTeardownTask = teardown
         }
@@ -12873,8 +12864,13 @@ if layer.attnGateProjTensor != nil,
                     if self.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         self.systemPrompt = ModelConfig.getUserDefaultSystemPrompt()
                     }
-                    if let tok = tok {
-                        self.tokenizer = tok
+                    // Assign even when nil: a model with no tokenizer.json must
+                    // clear any previous model's tokenizer rather than tokenize new
+                    // prompts with the wrong vocabulary. Sends are gated on
+                    // `tokenizer != nil`, so this also disables chat for such a
+                    // model instead of silently mis-tokenizing.
+                    self.tokenizer = tok
+                    if tok != nil {
                         // New model's tokenizer: drop the grammar sampler's
                         // vocab-size-keyed token caches, which do not encode identity.
                         GrammarConstrainedSampler.shared.invalidateTokenizerCaches()
@@ -12883,6 +12879,9 @@ if layer.attnGateProjTensor != nil,
                     self.selectedTensorID = nil
                     self.gpuComputeOutput = nil
                     self.activeLoadedModelPath = filePath
+                    // The engine is actually installed now; this is what
+                    // `ensureModelLoaded` verifies before an async send.
+                    self.installedModelPath = filePath
                     self.isLoadingModel = false
 
                     if isFlashMoE {
@@ -12907,6 +12906,9 @@ if layer.attnGateProjTensor != nil,
                     self.summary = nil
                     self.engine = nil
                     self.shardBuffers.removeAll()
+                    // No usable engine is installed; clear the identity so an async
+                    // send cannot treat a stale `activeLoadedModelPath` as ready.
+                    self.installedModelPath = nil
                     self.isLoadingModel = false
                     self.metalStatus = "❌ Engine Load Error"
                 }
