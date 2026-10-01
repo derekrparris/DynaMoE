@@ -318,7 +318,7 @@
 </section>
 
 <footer>
-  <a class="btn" href="https://github.com/derekrparris/DynaMoE/releases/tag/v26.0">   <!-- EDIT: release URL -->
+  <a class="btn" href="https://github.com/derekrparris/DynaMoE/releases/tag/v26.3">   <!-- EDIT: release URL -->
     <svg viewBox="0 0 16 16" fill="currentColor"><path d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l1.66-1.66a2 2 0 0 0 0-2.83l-.94-.94a2 2 0 0 0-2.83 0L3.51 6.01a2 2 0 0 0 0 2.83l.94.94a.75.75 0 0 0 1.06-1.06l-.94-.94a.5.5 0 0 1 0-.71l2.35-2.35a.5.5 0 0 1 .71 0l.94.94a.5.5 0 0 1 0 .71L6.22 8.72Zm3.56-1.44a.75.75 0 0 0-1.06-1.06L7.06 7.88a2 2 0 0 0 0 2.83l.94.94a2 2 0 0 0 2.83 0l2.35-2.35a2 2 0 0 0 0-2.83l-.94-.94a.75.75 0 0 0-1.06 1.06l.94.94a.5.5 0 0 1 0 .71L9.77 9.59a.5.5 0 0 1-.71 0l-.94-.94a.5.5 0 0 1 0-.71l1.66-1.66Z"/></svg>
     GitHub Release
   </a>
