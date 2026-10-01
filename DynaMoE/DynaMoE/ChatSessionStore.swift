@@ -56,6 +56,17 @@ final class ChatSessionStore: ObservableObject {
     /// `ioQueue` like `writtenSignatures`.
     nonisolated(unsafe) private var managedIds: Set<UUID> = []
 
+    /// Monotonic id of the most recently *submitted* availability report. Bumped
+    /// on `ioQueue`, so it reflects submission order; the main actor compares it
+    /// against `appliedAvailabilitySequence` and ignores an older report.
+    nonisolated(unsafe) private var availabilitySequence: UInt64 = 0
+
+    /// Highest availability-report id applied on the main actor. Guards against
+    /// the unordered delivery of the `Task { @MainActor }` hops, which would
+    /// otherwise let a failure arrive after the succeeding retry and restore the
+    /// stale warning.
+    private var appliedAvailabilitySequence: UInt64 = 0
+
     init(directory: URL? = nil, fileManager: FileManager = .default) {
         let resolved = directory ?? ChatSessionStore.defaultDirectory(using: fileManager)
         // Retain the resolved URL even if the up-front create check fails: every
@@ -97,9 +108,19 @@ final class ChatSessionStore: ObservableObject {
 
     /// Mirrors a write-path outcome onto `isPersistenceAvailable` on the main
     /// actor. No-ops when the value is unchanged.
+    ///
+    /// Every caller runs on the serial `ioQueue`, but the `Task { @MainActor }`
+    /// hops are not ordered, so results carry a sequence id and only the newest
+    /// one is applied. Without that, a failure followed by a successful retry
+    /// could apply `true` first and stale `false` last, leaving the warning up
+    /// after persistence recovered.
     nonisolated private func reportPersistenceAvailability(_ available: Bool) {
+        availabilitySequence &+= 1
+        let sequence = availabilitySequence
         Task { @MainActor [weak self] in
-            guard let self, self.isPersistenceAvailable != available else { return }
+            guard let self, sequence > self.appliedAvailabilitySequence else { return }
+            self.appliedAvailabilitySequence = sequence
+            guard self.isPersistenceAvailable != available else { return }
             self.isPersistenceAvailable = available
         }
     }

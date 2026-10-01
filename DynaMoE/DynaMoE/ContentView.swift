@@ -1338,6 +1338,61 @@ struct ContentView: View {
 
     // MARK: - Chat Session Persistence & Retention
 
+    /// A cheap fingerprint of everything persistence cares about. `[ChatSession]`
+    /// has synthesized deep `Equatable`, so observing `sessions` directly makes
+    /// SwiftUI compare every message's text on each streaming token, which costs
+    /// O(total history) in string comparisons per token and grows quadratically
+    /// over a long response. This summary compares the same content by length and
+    /// tool status instead of by string, so it is cheap per token yet still
+    /// changes on any edit that must reach disk.
+    private struct SessionPersistStamp: Equatable {
+        struct MessageStamp: Equatable {
+            var contentLength: Int
+            var thinkingLength: Int
+            var tokenCount: Int
+            var tokensPerSec: Double
+            var toolStatuses: [ToolExecutionStatus]
+            var isThinking: Bool
+            var prefillStatus: String?
+        }
+
+        var id: UUID
+        var title: String
+        var messageCount: Int
+        var queuedCount: Int
+        var thinking: Bool?
+        var tools: Bool?
+        var modelPath: String?
+        var updatedAt: Date
+        var lastMessage: MessageStamp?
+    }
+
+    private var sessionPersistStamp: [SessionPersistStamp] {
+        sessions.map { session in
+            SessionPersistStamp(
+                id: session.id,
+                title: session.title,
+                messageCount: session.messages.count,
+                queuedCount: session.queuedPrompts.count,
+                thinking: session.isThinkingEnabled,
+                tools: session.isAgentToolsEnabled,
+                modelPath: session.selectedModelPath,
+                updatedAt: session.updatedAt,
+                lastMessage: session.messages.last.map { message in
+                    SessionPersistStamp.MessageStamp(
+                        contentLength: message.content.count,
+                        thinkingLength: message.thinkingContent?.count ?? -1,
+                        tokenCount: message.tokenCount,
+                        tokensPerSec: message.tokensPerSec,
+                        toolStatuses: message.toolCalls?.map(\.status) ?? [],
+                        isThinking: message.isThinking,
+                        prefillStatus: message.prefillStatus
+                    )
+                }
+            )
+        }
+    }
+
     /// `nil` means "never auto-delete".
     private var chatRetentionLimitOrNil: Int? {
         chatAutoDeleteEnabled ? max(1, chatRetentionLimit) : nil
@@ -1378,7 +1433,16 @@ struct ContentView: View {
         let inMemoryOnly = sessions.filter { !loadedIds.contains($0.id) && !$0.messages.isEmpty }
 
         sessions = inMemoryOnly + loaded
-        selectedSessionId = sessions.first?.id
+        // Preserve the user's current selection across a retry: they may have
+        // used and selected an in-memory chat while the first load failed or was
+        // pending, and jumping to `sessions.first` would yank them out of it.
+        // Only fall back when their selection is no longer present.
+        let selectionSurvived = selectedSessionId.map { selected in
+            sessions.contains { $0.id == selected }
+        } ?? false
+        if !selectionSurvived {
+            selectedSessionId = sessions.first?.id
+        }
 
         hasAttemptedInitialLoad = true
         hasLoadedPersistedSessions = true
@@ -1695,7 +1759,10 @@ struct ContentView: View {
                 }
             }
         }
-        .onChange(of: sessions) { _ in
+        .onChange(of: sessionPersistStamp) { _ in
+            // Observe a cheap fingerprint rather than the whole `sessions` array:
+            // streaming updates every token, and deep-comparing all message text
+            // on the main actor each time scales with total history.
             scheduleSessionPersist()
         }
         .onChange(of: chatRetentionLimit) { _ in
