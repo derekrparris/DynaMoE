@@ -1557,8 +1557,10 @@ struct ContentView: View {
     }
 
     /// Shown when the store reports persistence as unavailable. The specific
-    /// cause varies (unopenable folder, a failed write, encoding failure, failed
-    /// cleanup), so the message stays generic rather than blaming the folder.
+    /// cause varies (unopenable folder, a failed read or write, encoding failure,
+    /// failed cleanup), and a listing failure means existing conversations may not
+    /// have loaded, so the wording covers both reading and saving rather than
+    /// blaming the folder or promising the failure only affects future saves.
     @ViewBuilder
     private var chatPersistenceWarningBanner: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -1566,9 +1568,9 @@ struct ContentView: View {
                 .foregroundColor(.orange)
                 .font(.system(size: 13))
             VStack(alignment: .leading, spacing: 1) {
-                Text("Chat history can't be saved")
+                Text("Chat history is unavailable")
                     .font(.system(size: 12, weight: .semibold))
-                Text("DynaMoE couldn't save chat history. Recent conversations may not persist between launches.")
+                Text("DynaMoE couldn't read or save chat history. Existing conversations may not appear, and recent ones may not persist between launches.")
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
             }
@@ -12737,6 +12739,30 @@ if layer.attnGateProjTensor != nil,
         syncSettingsWindowIfNeeded()
     }
 
+    /// Stops any running generation and waits for its teardown before shared model
+    /// state is touched. A cancelled generation may still be inside a kernel
+    /// dispatch whose mmaps are unmapped when the old engine releases, and a load
+    /// closes the shared expert file descriptors and re-initializes the working
+    /// set. `switchModel` performs this dance for its callers, but direct loads
+    /// (the selected-session fallback, the open-panel loader) reach the load task
+    /// without it, so the coordination lives here too. A no-op when idle.
+    private func awaitGenerationTeardown() async {
+        if isGeneratingText {
+            stopAutoregressiveGeneration()
+        }
+        if let teardown = generationTeardownTask {
+            await teardown.value
+            // A generation may have started while we waited: stop it and wait for
+            // that teardown too, since the load resets the buffers it uses.
+            if isGeneratingText {
+                stopAutoregressiveGeneration()
+            }
+            if let next = generationTeardownTask {
+                await next.value
+            }
+        }
+    }
+
     /// Starts loading a model's engine, summary, and Metal buffers. Returns the
     /// load task so callers that must run against the new model can await the
     /// specific load instead of racing it; UI callers ignore the result.
@@ -12762,6 +12788,15 @@ if layer.attnGateProjTensor != nil,
             // request entirely instead of mutating shared state under it.
             let isStale = await MainActor.run { self.modelLoadToken != token }
             if isStale { return }
+            // A generation may still be using the shared engine, buffers, and
+            // expert descriptors that this load is about to replace. SwitchModel
+            // waits the generation out before loading; direct callers reach this
+            // task without it, so stop and await any generation here too.
+            await self.awaitGenerationTeardown()
+            // The wait can be long: a newer load may have superseded this one, in
+            // which case it must not touch the shared state the newer one owns.
+            let superseded = await MainActor.run { self.modelLoadToken != token }
+            if superseded { return }
             // Drop file descriptors cached from a previously loaded model; they are
             // keyed by layerIndex only, so a new model with the same layer numbering
             // would otherwise pread the old model's packed expert files.
