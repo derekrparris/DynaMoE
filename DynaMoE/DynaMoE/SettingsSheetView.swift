@@ -419,7 +419,7 @@ struct SettingsSheetView: View {
                 .lineLimit(1)
             SettingsNumericField(value: value, range: range, step: step, fractionDigits: digits)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(width: 150, alignment: .leading)
     }
 
     // MARK: - Tab 1: Models & Weights Management
@@ -738,16 +738,14 @@ struct SettingsSheetView: View {
             .cornerRadius(10)
 
             SettingsCard(header: "Sampling") {
-                Grid(alignment: .leading, horizontalSpacing: 28, verticalSpacing: 14) {
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 14) {
                     GridRow {
                         samplingControl("Temperature", value: doubleBinding($temperature), range: 0.0...2.0, step: 0.05)
                         samplingControl("Top-P (Nucleus)", value: doubleBinding($topP), range: 0.0...1.0, step: 0.05)
-                    }
-                    GridRow {
                         samplingControl("Min-P (Confidence)", value: doubleBinding($minP), range: 0.0...0.5, step: 0.01)
-                        samplingControl("Top-K", value: doubleBinding($topK), range: 1...100, step: 1, digits: 0)
                     }
                     GridRow {
+                        samplingControl("Top-K", value: doubleBinding($topK), range: 1...100, step: 1, digits: 0)
                         samplingControl("Repetition Penalty", value: doubleBinding($repetitionPenalty), range: 1.0...2.0, step: 0.05)
                         samplingControl("Presence Penalty", value: doubleBinding($presencePenalty), range: 0.0...2.0, step: 0.05)
                     }
@@ -757,11 +755,10 @@ struct SettingsSheetView: View {
 
                 // Max Output Tokens: precise field plus quick presets, full width.
                 VStack(alignment: .leading, spacing: 8) {
-                    HStack {
+                    HStack(spacing: 10) {
                         Text("Max Output Tokens")
                             .font(.system(size: 11.5, weight: .medium))
                             .foregroundColor(.secondary)
-                        Spacer()
                         SettingsNumericField(
                             value: doubleBinding($maxNewTokens),
                             range: 32...10000,
@@ -812,7 +809,7 @@ struct SettingsSheetView: View {
                     }
 
                     if jetSpecEnabled {
-                        Grid(alignment: .leading, horizontalSpacing: 28, verticalSpacing: 14) {
+                        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 14) {
                             GridRow {
                                 samplingControl("Max Tree Depth", value: doubleBinding($jetSpecMaxDepth), range: 1...5, step: 1, digits: 0)
                                 samplingControl("Branching Factor", value: doubleBinding($jetSpecBranchingFactor), range: 1...4, step: 1, digits: 0)
