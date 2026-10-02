@@ -4829,6 +4829,7 @@ final class DynaMoETests: XCTestCase {
         )
 
         let mgr = WorkingSetManager.shared
+        defer { mgr.residentMemoryProviderOverride = nil }
         mgr.initialize(summary: summary, shardBuffers: shardBuffers, mode: .balanced16GB)
 
         XCTAssertEqual(mgr.residentExpertsCount, 0)
@@ -4851,6 +4852,18 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(mgr.residentExpertsCount, 480, "All 480 active experts must be resident")
         let tok0Rss = mgr.effectiveResidentMemoryGB
         XCTAssertGreaterThanOrEqual(tok0Rss, initRss, "Effective RSS must increase with resident experts")
+
+        // Regression guard (QA #50): the working set must equal real process residency
+        // exactly — with experts tracked as resident, the manager must NOT add its
+        // tracked dense/expert bytes on top of a number that already counts every
+        // resident weight page (the old RSS + tracked-weights double count).
+        XCTAssertGreaterThan(mgr.residentExpertsCount, 0, "Need tracked experts resident for the regression guard")
+        mgr.residentMemoryProviderOverride = { 2.5 }
+        XCTAssertEqual(mgr.effectiveResidentMemoryGB, 2.5, accuracy: 0.0001,
+                       "effectiveResidentMemoryGB must not add tracked dense/expert bytes to residency")
+        mgr.residentMemoryProviderOverride = nil
+        XCTAssertEqual(mgr.effectiveResidentMemoryGB, getProcessResidentMemoryGB(), accuracy: 0.05,
+                       "effectiveResidentMemoryGB must track live process RSIZE")
 
         // Prune at Token 0 boundary: should NOT evict because 480 <= 1280
         mgr.trimToBudget(mode: .balanced16GB, shardBuffers: shardBuffers)
@@ -4948,7 +4961,7 @@ final class DynaMoETests: XCTestCase {
         )
 
         let mgr = WorkingSetManager.shared
-        mgr.initialize(summary: summary, shardBuffers: shardBuffers, mode: .balanced16GB, modelDir: tempDir)
+        mgr.initialize(summary: summary, shardBuffers: shardBuffers, mode: .balanced16GB)
 
         // Prime the active experts using bulk pread via touchAndEvict
         let t0 = CFAbsoluteTimeGetCurrent()
@@ -4959,10 +4972,18 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(mgr.residentExpertsCount, 2)
         XCTAssertGreaterThan(mgr.effectiveResidentMemoryGB, 0.0)
 
-        // Close file descriptors and verify cleanup
-        mgr.closeAllFileDescriptors()
+        // mincore() walker: residency measured directly over the registered shard
+        // mappings — a fully-touched buffer must report as fully resident.
+        memset(buffer.contents(), 0x5A, dummyDataSize)
+        XCTAssertEqual(mgr.residentShardBytesGB, Double(dummyDataSize) / 1073741824.0, accuracy: 0.0001,
+                       "Walked shard residency must count the fully-touched mock buffer")
+
+        // Release mappings and verify cleanup
+        mgr.releaseShardMappings()
         mgr.flushAllExperts(shardBuffers: shardBuffers)
         XCTAssertEqual(mgr.residentExpertsCount, 0)
+        XCTAssertEqual(mgr.residentShardBytesGB, 0.0, accuracy: 0.00001,
+                       "Released shard mappings must contribute no residency")
         print("🎉 [SUCCESS] Bulk pread priming test passed!")
     }
 

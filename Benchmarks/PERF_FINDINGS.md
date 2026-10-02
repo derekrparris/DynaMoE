@@ -2480,9 +2480,12 @@ Fixes (ContentView.swift, SidebarView.swift, SettingsSheetView.swift):
   for the "(Activity Monitor / Xcode)" number.
 - `effectiveResidentMemoryGB` and `trimToBudget` now use RSIZE alone; tracked
   dense/expert bytes remain LRU bookkeeping, not RAM added on top.
-- The "Unified Memory Cache" tooltip line is now real: RSIZE − footprint = the
-  resident clean file-backed pages (weights actually cached), replacing the
-  double-counted catalogue delta.
+- The "Unified Memory Cache" tooltip line now measures residency directly: a
+  mincore() walk over the registered shard mappings counts the resident weight
+  pages. RSIZE - footprint is only an accounting delta (it also contains clean
+  framework/library mappings and is offset by compressed/IOKit charges), so the
+  subtraction is not used; the displayed value supersedes the catalogue delta
+  shipped in the first round of this fix and is an exact page count.
 - Side finding from the same probe: the fd "fast path" in `primeSlices`/
   `preFaultAll` `pread()`s into the PROT_READ shard mapping, which returns
   EFAULT on the first chunk (`if n <= 0 { break }` swallowed it) — a silent
@@ -2493,10 +2496,21 @@ Fixes (ContentView.swift, SidebarView.swift, SettingsSheetView.swift):
   pressure exists (RSIZE held flat for 30 s after an "eviction"), so post-eviction
   RSIZE is the honest view while the catalogue's "evicted" bookkeeping is
   optimistic until the kernel actually reclaims.
+- Copilot review round on PR #25: the now-dead fd/path cache is removed
+  (`initialize` no longer opens one descriptor per shard;
+  `closeAllFileDescriptors` became `releaseShardMappings`, its only fd readers
+  having been the removed pread paths), and every "Process Heap" label is now
+  "Process Footprint" — phys_footprint includes compressed memory and IOKit
+  allocations, not just heap.
 
 Verification: probe on macOS 26.7.1 / M1 Pro (in-process metrics matched the
 `footprint` CLI and vmmap at every phase); Xcode build green;
 `testWorkingSetManagerTokenBoundaryEviction` and
-`testWorkingSetManagerBulkPreadPriming` pass (mock-buffer tests are unaffected —
-their writable `makeBuffer(length:)` shards always allowed the pread that the
-real read-only mmap forbids, which is why the old path looked tested).
+`testWorkingSetManagerBulkPreadPriming` pass. The former now pins the
+no-double-count contract through an injected resident-memory seam
+(`effectiveResidentMemoryGB` must equal the provided RSS exactly while 480
+experts are tracked); the latter exercises the mincore() walker over a
+fully-touched mock shard buffer and verifies release cleanup. The mock-buffer
+tests were also why the old pread path looked tested — their writable
+`makeBuffer(length:)` shards always allowed the pread that the real read-only
+mmap forbids.

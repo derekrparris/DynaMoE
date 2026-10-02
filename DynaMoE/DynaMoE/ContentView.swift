@@ -435,8 +435,8 @@ final class WorkingSetManager {
     private var prefetchHits: Int = 0
     private var lastPagingLatencyMs: Double = 0.0
     private var expertOnlyShardIndices: Set<UInt32> = []
-    private var shardFDs: [UInt32: Int32] = [:]
-    private var shardFilePaths: [UInt32: String] = [:]
+    private var shardMappings: [(base: UnsafeRawPointer, length: Int)] = []
+    var residentMemoryProviderOverride: (() -> Double)?
 
     var totalExpertKeysCount: Int {
         lock.lock()
@@ -475,25 +475,46 @@ final class WorkingSetManager {
         // — file-backed mmap pages and anonymous pinned/staging buffers alike.
         // Adding the catalog's tracked dense/expert bytes on top double-counted
         // them, inflating the reported working set by up to the full tracked size.
-        return getProcessResidentMemoryGB()
+        // residentMemoryProviderOverride is a test seam pinning that contract.
+        return residentMemoryProviderOverride?() ?? getProcessResidentMemoryGB()
+    }
+
+    // Unified Memory buffer-cache residency measured directly over the shard
+    // mappings via mincore(): the clean file-backed weight pages that Activity
+    // Monitor's footprint excludes. RSIZE - phys_footprint is NOT used — that is
+    // only an accounting delta (it also contains clean framework/library
+    // mappings and is offset by compressed/IOKit footprint charges).
+    var residentShardBytesGB: Double {
+        lock.lock()
+        let mappings = shardMappings
+        lock.unlock()
+
+        let pageSize = Int(vm_page_size) // 16384 bytes on Apple Silicon
+        var residentBytes: UInt64 = 0
+        for mapping in mappings {
+            let alignedLen = mapping.length & ~(pageSize - 1)
+            guard alignedLen > 0 else { continue }
+            var residencyMap = [UInt8](repeating: 0, count: (alignedLen + pageSize - 1) / pageSize)
+            let rc = mincore(mapping.base, alignedLen, &residencyMap)
+            guard rc == 0 else { continue } // mapping already unmapped (model switched out)
+            for flag in residencyMap where flag & 1 != 0 {
+                residentBytes &+= UInt64(pageSize)
+            }
+        }
+        return Double(residentBytes) / (1024.0 * 1024.0 * 1024.0)
     }
 
     private static var pageFaultSink: Int64 = 0
 
-    func closeAllFileDescriptors() {
+    func releaseShardMappings() {
         lock.lock()
         defer { lock.unlock() }
-        for (_, fd) in shardFDs {
-            close(fd)
-        }
-        shardFDs.removeAll()
-        shardFilePaths.removeAll()
+        shardMappings.removeAll()
     }
 
-    /// Coordinated parallel bulk POSIX pread priming across CPU cores.
-    /// Uses sequential NVMe DMA block transfers to fault entire contiguous slices directly
-    /// into Darwin's Unified Memory Buffer Cache at line rate (>2,500 MB/s), completely
-    /// eliminating the ~460,000+ random 16 KB CPU/GPU page fault traps.
+    /// Faults expert/backbone slices into the Unified Memory Buffer Cache by
+    /// touching one byte per page through the read-only shard mmap, in parallel
+    /// across CPU cores (measured 13-20 GB/s warm, PERF_FINDINGS T8).
     func primeSlices(_ slices: [ExpertSlice], shardBuffers: [UInt32: MTLBuffer]) {
         guard !slices.isEmpty else { return }
 
@@ -520,24 +541,9 @@ final class WorkingSetManager {
         }
     }
 
-    func initialize(summary: ModelSummary, shardBuffers: [UInt32: MTLBuffer], mode: MemoryBudgetMode, modelDir: URL? = nil) {
+    func initialize(summary: ModelSummary, shardBuffers: [UInt32: MTLBuffer], mode: MemoryBudgetMode) {
         lock.lock()
-        for (_, fd) in shardFDs {
-            close(fd)
-        }
-        shardFDs.removeAll()
-        shardFilePaths.removeAll()
-
-        if let dir = modelDir {
-            for shard in summary.shards {
-                let shardPath = dir.appendingPathComponent(shard.filename).path
-                shardFilePaths[shard.index] = shardPath
-                let fd = open(shardPath, O_RDONLY)
-                if fd >= 0 {
-                    shardFDs[shard.index] = fd
-                }
-            }
-        }
+        shardMappings = shardBuffers.values.map { (base: UnsafeRawPointer($0.contents()), length: $0.length) }
 
         expertSlices.removeAll()
         denseSlices.removeAll()
@@ -12711,7 +12717,7 @@ if layer.attnGateProjTensor != nil,
                 FileManager.default.fileExists(atPath: p, isDirectory: &isD)
                 return isD.boolValue ? URL(fileURLWithPath: p) : URL(fileURLWithPath: p).deletingLastPathComponent()
             }() : nil
-            WorkingSetManager.shared.initialize(summary: summary, shardBuffers: shardBuffers, mode: memoryBudgetMode, modelDir: dirUrl)
+            WorkingSetManager.shared.initialize(summary: summary, shardBuffers: shardBuffers, mode: memoryBudgetMode)
             pagingStatusMessage = "🌊 Operating in Dynamic SSD Streaming Mode"
             updatePagingStats()
             syncSettingsWindowIfNeeded()
@@ -12876,7 +12882,7 @@ if layer.attnGateProjTensor != nil,
                         }
                     }
                 } else {
-                    WorkingSetManager.shared.initialize(summary: loadedSummary, shardBuffers: buffers, mode: memoryBudgetMode, modelDir: dirUrl)
+                    WorkingSetManager.shared.initialize(summary: loadedSummary, shardBuffers: buffers, mode: memoryBudgetMode)
                     let effMode = memoryExecutionMode.resolveEffectiveMode(modelFootprintGB: mappedGB)
                     if effMode == .residentRAM {
                         WorkingSetManager.shared.preFaultAll(shardBuffers: buffers, summary: loadedSummary)
