@@ -2511,6 +2511,18 @@ Fixes (ContentView.swift, SidebarView.swift, SettingsSheetView.swift):
   `MTLBuffer(bytesNoCopy:)`: mincore reports ~0 residency before priming and the
   full 1 MB after, so the old pread EFAULT no-op (which left it cold) fails the
   test instead of passing silently.
+- Third Copilot round: the residency walk is now cached. The O(#pages) mincore
+  scan was evaluated eagerly inside the SwiftUI body — tooltips build their
+  format strings during every render and currentRssGB ticks ~10x/s during
+  prefill, so a 37 GB model would repeatedly scan ~2.4M page flags on the main
+  thread even with no tooltip visible. `residentShardBytesGB` is now an O(1)
+  cached read; a utility-queue loop walks at a bounded 2 s cadence (armed at
+  `initialize`, cancelled by `releaseShardMappings` via a generation counter),
+  and `refreshShardResidencyNow()` provides the synchronous walk for callers
+  that need determinism (tests assert both the walk result and its publication
+  into the view-facing cache). The read-only priming regression test also now
+  aborts before mmap when the temp-file write is short, instead of risking a
+  SIGBUS stride read over an undersized file.
 
 Verification: probe on macOS 26.7.1 / M1 Pro (in-process metrics matched the
 `footprint` CLI and vmmap at every phase); Xcode build green;

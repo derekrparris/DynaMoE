@@ -484,9 +484,29 @@ final class WorkingSetManager {
     // Monitor's footprint excludes. RSIZE - phys_footprint is NOT used — that is
     // only an accounting delta (it also contains clean framework/library
     // mappings and is offset by compressed/IOKit footprint charges).
+    // The walk is O(#pages) — a 37 GB model walks ~2.4M entries — and tooltip
+    // strings evaluate this getter eagerly during every SwiftUI body build
+    // (currentRssGB ticks ~10x/s during prefill), so the walk runs on a bounded
+    // cadence off the main thread and the view-facing getter is O(1).
+    private var cachedResidentShardBytesGB: Double = 0.0
+    private var shardWalkGeneration: UInt64 = 0
+    private static let shardWalkInterval: TimeInterval = 2.0
+    private let shardWalkQueue = DispatchQueue(label: "com.dynamoe.shardresidency", qos: .utility)
+
     var residentShardBytesGB: Double {
         lock.lock()
-        let mappings = shardMappings
+        defer { lock.unlock() }
+        return cachedResidentShardBytesGB
+    }
+
+    /// Synchronously walks the registered shard mappings with mincore() and
+    /// publishes the result into the cached, view-facing value. A utility-queue
+    /// loop calls this at a bounded cadence; tests call it for determinism.
+    @discardableResult
+    func refreshShardResidencyNow() -> Double {
+        let mappings: [(base: UnsafeRawPointer, length: Int)]
+        lock.lock()
+        mappings = shardMappings
         lock.unlock()
 
         let pageSize = Int(vm_page_size) // 16384 bytes on Apple Silicon
@@ -501,7 +521,29 @@ final class WorkingSetManager {
                 residentBytes &+= UInt64(pageSize)
             }
         }
-        return Double(residentBytes) / (1024.0 * 1024.0 * 1024.0)
+        let value = Double(residentBytes) / (1024.0 * 1024.0 * 1024.0)
+        lock.lock()
+        cachedResidentShardBytesGB = value
+        lock.unlock()
+        return value
+    }
+
+    private func scheduleShardResidencyWalks() {
+        lock.lock()
+        shardWalkGeneration &+= 1
+        let generation = shardWalkGeneration
+        lock.unlock()
+        shardWalkQueue.async { [weak self] in
+            guard let self = self else { return }
+            while true {
+                self.lock.lock()
+                let alive = (generation == self.shardWalkGeneration) && !self.shardMappings.isEmpty
+                self.lock.unlock()
+                guard alive else { return }
+                self.refreshShardResidencyNow()
+                Thread.sleep(forTimeInterval: WorkingSetManager.shardWalkInterval)
+            }
+        }
     }
 
     private static var pageFaultSink: Int64 = 0
@@ -509,7 +551,9 @@ final class WorkingSetManager {
     func releaseShardMappings() {
         lock.lock()
         defer { lock.unlock() }
+        shardWalkGeneration &+= 1 // stops any in-flight refresh loop
         shardMappings.removeAll()
+        cachedResidentShardBytesGB = 0.0
     }
 
     /// Faults expert/backbone slices into the Unified Memory Buffer Cache by
@@ -544,6 +588,7 @@ final class WorkingSetManager {
     func initialize(summary: ModelSummary, shardBuffers: [UInt32: MTLBuffer], mode: MemoryBudgetMode) {
         lock.lock()
         shardMappings = shardBuffers.values.map { (base: UnsafeRawPointer($0.contents()), length: $0.length) }
+        cachedResidentShardBytesGB = 0.0
 
         expertSlices.removeAll()
         denseSlices.removeAll()
@@ -587,6 +632,8 @@ final class WorkingSetManager {
         let allShardIndices = Set(summary.shards.map { $0.index })
         expertOnlyShardIndices = allShardIndices.filter { shardHasDense[$0] != true }
         lock.unlock()
+
+        scheduleShardResidencyWalks()
 
         if mode == .unrestricted {
             preFaultAll(shardBuffers: shardBuffers, summary: summary)

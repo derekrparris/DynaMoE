@@ -4975,8 +4975,10 @@ final class DynaMoETests: XCTestCase {
         // mincore() walker: residency measured directly over the registered shard
         // mappings — a fully-touched buffer must report as fully resident.
         memset(buffer.contents(), 0x5A, dummyDataSize)
-        XCTAssertEqual(mgr.residentShardBytesGB, Double(dummyDataSize) / 1073741824.0, accuracy: 0.0001,
+        XCTAssertEqual(mgr.refreshShardResidencyNow(), Double(dummyDataSize) / 1073741824.0, accuracy: 0.0001,
                        "Walked shard residency must count the fully-touched mock buffer")
+        XCTAssertEqual(mgr.residentShardBytesGB, Double(dummyDataSize) / 1073741824.0, accuracy: 0.0001,
+                       "The synchronous walk must publish through the O(1) view-facing cache")
 
         // Release mappings and verify cleanup
         mgr.releaseShardMappings()
@@ -5018,7 +5020,11 @@ final class DynaMoETests: XCTestCase {
             }
             return true
         }
-        XCTAssertTrue(wroteAll, "failed to write temp shard file")
+        if !wroteAll {
+            close(writeFd)
+            XCTFail("failed to write temp shard file; aborting before mmap to avoid SIGBUS on an undersized file")
+            return
+        }
         fsync(writeFd)
         close(writeFd)
 
@@ -5051,15 +5057,17 @@ final class DynaMoETests: XCTestCase {
         mgr.initialize(summary: summary, shardBuffers: shardBuffers, mode: .balanced16GB)
 
         let expectedGB = Double(fileSize) / 1073741824.0
-        if mgr.residentShardBytesGB > expectedGB / 2 {
+        if mgr.refreshShardResidencyNow() > expectedGB / 2 {
             throw XCTSkip("file pages pre-warmed in the unified page cache; cannot prove priming faults them")
         }
 
         mgr.primeSlices([ExpertSlice(shardIndex: 0, offset: 0, length: UInt64(fileSize))],
                         shardBuffers: shardBuffers)
 
-        XCTAssertEqual(mgr.residentShardBytesGB, expectedGB, accuracy: 0.00001,
+        XCTAssertEqual(mgr.refreshShardResidencyNow(), expectedGB, accuracy: 0.00001,
                        "stride touch must fault every page of the read-only bytesNoCopy mapping; the old pread fast path left them cold")
+        XCTAssertEqual(mgr.residentShardBytesGB, expectedGB, accuracy: 0.00001,
+                       "The synchronous walk must publish through the O(1) view-facing cache")
     }
 
     func testOrnithRMSNormIsNotUnitOffset() throws {
