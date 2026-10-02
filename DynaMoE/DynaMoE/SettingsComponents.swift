@@ -10,11 +10,20 @@ import SwiftUI
 
 // MARK: - Settings palette
 
+/// Explicit light/dark detection: both Aqua variants are candidates so the
+/// best-match result can be compared directly instead of assumed non-nil.
+private func isDarkAppearance(_ appearance: NSAppearance) -> Bool {
+    guard let match = appearance.bestMatch(from: [.aqua, .vibrantLight, .darkAqua, .vibrantDark]) else {
+        return false
+    }
+    return match == .darkAqua || match == .vibrantDark
+}
+
 extension Color {
     /// Detail-pane background for the settings window: white in light mode,
     /// near-black gray in dark mode, matching System Settings.
     static let settingsPaneBackground = Color(nsColor: NSColor(name: nil, dynamicProvider: { appearance in
-        appearance.bestMatch(from: [.darkAqua, .vibrantDark]) != nil
+        isDarkAppearance(appearance)
             ? NSColor(white: 0.118, alpha: 1.0)
             : NSColor.white
     }))
@@ -22,7 +31,7 @@ extension Color {
     /// Shaded group background used in place of a border, System Settings
     /// style: faint gray in light mode, slightly lifted from the pane in dark.
     static let settingsCardFill = Color(nsColor: NSColor(name: nil, dynamicProvider: { appearance in
-        appearance.bestMatch(from: [.darkAqua, .vibrantDark]) != nil
+        isDarkAppearance(appearance)
             ? NSColor(white: 0.165, alpha: 1.0)
             : NSColor(white: 0.972, alpha: 1.0)
     }))

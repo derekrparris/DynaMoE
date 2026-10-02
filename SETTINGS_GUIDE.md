@@ -6,36 +6,37 @@ A comprehensive, practical guide to configuring, tuning, and operating DynaMoE o
 
 ## Table of Contents
 1. [Overview & Accessing Settings](#1-overview--accessing-settings)
-2. [Models & Binary Repackaging](#2-models--binary-repackaging)
+2. [General: Updates & Chat History](#2-general-updates--chat-history)
+3. [Models & Binary Repackaging](#3-models--binary-repackaging)
    - [Local Model Discovery](#local-model-discovery)
    - [Default & Last Used Model](#default--last-used-model)
    - [MoE Contiguous Binary Repackaging (Flash-MoE)](#moe-contiguous-binary-repackaging-flash-moe)
    - [Model-Specific Profiles ("Coder" & "Assistant")](#model-specific-profiles-coder--assistant)
-3. [Generation & Sampling Hyperparameters](#3-generation--sampling-hyperparameters)
+4. [Generation & Sampling Hyperparameters](#4-generation--sampling-hyperparameters)
    - [Active Profile Banner & Fast Switching](#active-profile-banner--fast-switching)
    - [Sampling Parameters (Math & Practical Tuning)](#sampling-parameters-math--practical-tuning)
    - [System Prompts & Conjunction Merging](#system-prompts--conjunction-merging)
    - [JetSpec Speculative Tree Acceleration](#jetspec-speculative-tree-acceleration)
-4. [Memory & SSD Management](#4-memory--ssd-management)
+5. [Memory & SSD Management](#5-memory--ssd-management)
    - [Memory Execution Modes (Auto, Full RAM, SSD Streaming)](#memory-execution-modes)
    - [Memory Budget Modes & Limits](#memory-budget-modes--limits)
    - [KV Cache Precision (FP32, FP16, FP8 E4M3/E5M2)](#kv-cache-precision)
    - [Speculative MoE Lookahead Prefetching](#speculative-moe-lookahead-prefetching)
    - [Live Diagnostics & Working Set Metrics](#live-diagnostics--working-set-metrics)
    - [Cache Maintenance: Flush vs. Pre-Fault](#cache-maintenance-flush-vs-pre-fault)
-5. [Agent & Tools](#5-agent--tools)
+6. [Agent & Tools](#6-agent--tools)
    - [Global Agent Enablement & Sandbox Directory](#global-agent-enablement--sandbox-directory)
    - [Safety Limits (Max Output & Max Steps)](#safety-limits)
    - [Search Integrations (Headless Chrome & Brave Search)](#search-integrations)
    - [Built-In Local Tools Reference](#built-in-local-tools-reference)
-6. [Advanced Diagnostics](#6-advanced-diagnostics)
+7. [Advanced Diagnostics](#7-advanced-diagnostics)
    - [SafeTensors Sharded Metadata & Search](#safetensors-sharded-metadata--search)
    - [Direct Metal Kernel Execution Harness](#direct-metal-kernel-execution-harness)
-7. [Hardware Profiles & Recommended Configurations](#7-hardware-profiles--recommended-configurations)
+8. [Hardware Profiles & Recommended Configurations](#8-hardware-profiles--recommended-configurations)
    - [16 GB Unified RAM (M1/M2/M3/M4)](#16-gb-unified-ram-m1m2m3m4)
    - [24 GB – 36 GB Unified RAM](#24-gb--36-gb-unified-ram)
    - [64 GB – 128 GB+ Unified RAM (M-Max / M-Ultra)](#64-gb--128-gb-unified-ram-m-max--m-ultra)
-8. [Frequently Asked Questions & Troubleshooting](#8-frequently-asked-questions--troubleshooting)
+9. [Frequently Asked Questions & Troubleshooting](#9-frequently-asked-questions--troubleshooting)
 
 ---
 
@@ -54,7 +55,23 @@ DynaMoE provides centralized control over model inference, GPU shader dispatch, 
 
 ---
 
-## 2. Models & Binary Repackaging
+## 2. General: Updates & Chat History
+
+The **General** section covers app-wide housekeeping: software updates, and how conversations and reasoning displays behave.
+
+### Updates
+- **Enable Auto-Updates**: DynaMoE checks the Sparkle update feed in the background; new releases are verified and installed safely. You can always check manually with `⌘U`.
+- **Check for Updates Now**: Queries the update feed on demand, regardless of the automatic setting.
+- **Current Version**: The DynaMoE release and build currently installed.
+
+### Chat & Reasoning
+- **Expand Thinking by Default**: Show the thinking/reasoning accordion expanded when a message first appears. When off, reasoning starts collapsed and can be opened manually.
+- **Auto-Delete Old Conversations**: Conversations are kept between launches, with the oldest removed automatically once the limit below is reached. Turn this off to keep every conversation forever.
+- **Conversations to Keep**: How many of the most-recently-updated conversations are retained (1–100). The conversation you have open is always kept.
+
+---
+
+## 3. Models & Binary Repackaging
 
 The **Models** section acts as your local model registry and management hub.
 
@@ -62,11 +79,11 @@ The **Models** section acts as your local model registry and management hub.
 ┌────────────────────────────────────────────────────────────────────────┐
 │  Models Section                                                        │
 │  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │ 📦 mlx-community/Ornith-1.5-9B-OptiQ-4bit    [Active] [Profiles] │  │
+│  │ 📦 mlx-community/Ornith-1.5-9B-OptiQ-4bit   [Active] [⋯]  [Load]  │  │
 │  │    Architecture: Hybrid GDN + GQA | Precision: 4-bit | 5.4 GB    │  │
 │  └──────────────────────────────────────────────────────────────────┘  │
 │  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │ 📦 Qwen/Qwen3.8-Flash-Next-FP8               [Default] [Repack]  │  │
+│  │ 📦 Qwen/Qwen3.8-Flash-Next-FP8              [Default] [⋯]  [Load] │  │
 │  │    Architecture: MoE 512 Experts | Precision: FP8 | 48.2 GB      │  │
 │  └──────────────────────────────────────────────────────────────────┘  │
 └────────────────────────────────────────────────────────────────────────┘
@@ -133,7 +150,7 @@ DynaMoE automatically defaults to and persists the official publisher-tuned prof
 
 ---
 
-## 3. Generation & Sampling Hyperparameters
+## 4. Generation & Sampling Hyperparameters
 
 The **Generation** section configures the mathematical sampling engine used during autoregressive token decoding.
 
@@ -223,7 +240,7 @@ JetSpec accelerates token generation by proposing structured trees of candidate 
 
 ---
 
-## 4. Memory & SSD Management
+## 5. Memory & SSD Management
 
 The **Memory & SSD** section controls how model weights and runtime caches are allocated across Apple Silicon's Unified Memory Architecture (UMA) and NVMe storage.
 
@@ -276,7 +293,7 @@ When running sparse MoE models in SSD streaming mode:
 
 ---
 
-## 5. Agent & Tools
+## 6. Agent & Tools
 
 The **Agent & Tools** section configures DynaMoE's autonomous agent engine, tool-calling loop, and external search integrations.
 
@@ -323,7 +340,7 @@ DynaMoE equips models with the following native tools:
 
 ---
 
-## 6. Advanced Diagnostics
+## 7. Advanced Diagnostics
 
 The **Advanced Diagnostics** section is an engineering inspection suite for validating Metal shaders, examining raw SafeTensors tensors, and testing layer forward execution independently of chat generation.
 
@@ -354,7 +371,7 @@ Test GPU compute pipelines in isolation without running full autoregressive gene
 
 ---
 
-## 7. Hardware Profiles & Recommended Configurations
+## 8. Hardware Profiles & Recommended Configurations
 
 ### 16 GB Unified RAM (M1/M2/M3/M4)
 - **Primary Model**: `mlx-community/Ornith-1.5-9B-OptiQ-4bit` (Dense Hybrid GDN).
@@ -382,7 +399,7 @@ Test GPU compute pipelines in isolation without running full autoregressive gene
 
 ---
 
-## 8. Frequently Asked Questions & Troubleshooting
+## 9. Frequently Asked Questions & Troubleshooting
 
 #### Q: Why does token generation speed gradually decrease over a long thinking chain?
 **A:** This occurs primarily because of the model's hybrid architecture. For example, Ornith 1.5 9B has 24 Gated DeltaNet layers (which run in constant $O(1)$ time) and 8 full Grouped-Query Attention (GQA) layers (which must scan all previous tokens in the KV cache on every step, scaling $O(T)$). Additionally, the displayed tokens/sec is a cumulative running average from token 1, meaning as instantaneous speed naturally drops at 4,000+ tokens, the displayed average will gradually slide toward 1.5–2.0 tok/s.

@@ -61,15 +61,15 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     var keywords: [String] {
         switch self {
         case .general:
-            return ["updates", "version", "thinking", "reasoning", "chat", "history", "retention", "auto-delete"]
+            return ["updates", "version", "thinking", "reasoning", "chat", "history", "retention", "auto-delete", "conversations to keep", "expand thinking"]
         case .models:
             return ["model", "weights", "safetensors", "flashmoe", "repack", "default", "tokenizer", "metal", "profile", "cache"]
         case .generation:
-            return ["temperature", "top-p", "top-k", "min-p", "sampling", "penalty", "tokens", "jetspec", "speculative", "system prompt", "preset"]
+            return ["temperature", "top-p", "top-k", "min-p", "sampling", "penalty", "tokens", "jetspec", "speculative", "system prompt", "preset", "max output tokens", "repetition penalty", "presence penalty", "tree depth", "branching factor", "expert cap"]
         case .memory:
-            return ["memory", "ram", "budget", "kv cache", "precision", "fp8", "fp16", "prefetch", "ssd", "paging", "diagnostics", "cache"]
+            return ["memory", "ram", "budget", "kv cache", "precision", "fp8", "fp16", "prefetch", "ssd", "paging", "diagnostics", "cache", "lookahead depth", "execution mode", "working set budget"]
         case .agent:
-            return ["agent", "tools", "turbo", "grammar", "workspace", "directory", "search", "brave", "chrome", "index", "rag", "subagent", "git", "lint", "dogfood", "benchmark"]
+            return ["agent", "tools", "turbo", "grammar", "workspace", "directory", "search", "brave", "chrome", "index", "rag", "subagent", "git", "lint", "dogfood", "benchmark", "max multi-step agent iterations", "max tool output", "working directory"]
         case .advanced:
             return ["diagnostics", "tensor", "inspector", "router", "metal", "kernel", "layer", "shard", "inspect"]
         }
