@@ -490,6 +490,7 @@ final class WorkingSetManager {
     // cadence off the main thread and the view-facing getter is O(1).
     private var cachedResidentShardBytesGB: Double = 0.0
     private var shardWalkGeneration: UInt64 = 0
+    private var scheduledWalkGeneration: UInt64 = 0
     private static let shardWalkInterval: TimeInterval = 2.0
     private let shardWalkQueue = DispatchQueue(label: "com.dynamoe.shardresidency", qos: .utility)
 
@@ -502,11 +503,17 @@ final class WorkingSetManager {
     /// Synchronously walks the registered shard mappings with mincore() and
     /// publishes the result into the cached, view-facing value. A utility-queue
     /// loop calls this at a bounded cadence; tests call it for determinism.
+    /// The generation is snapshotted WITH the mappings and checked again before
+    /// publishing, so a walk that was in flight across a registry replacement
+    /// (`registerShardMappings`) or `releaseShardMappings` cannot republish the
+    /// previous model's residency into the new model's cache.
     @discardableResult
     func refreshShardResidencyNow() -> Double {
+        let generation: UInt64
         let mappings: [(base: UnsafeRawPointer, length: Int)]
         lock.lock()
         mappings = shardMappings
+        generation = shardWalkGeneration
         lock.unlock()
 
         let pageSize = Int(vm_page_size) // 16384 bytes on Apple Silicon
@@ -523,15 +530,34 @@ final class WorkingSetManager {
         }
         let value = Double(residentBytes) / (1024.0 * 1024.0 * 1024.0)
         lock.lock()
-        cachedResidentShardBytesGB = value
+        if generation == shardWalkGeneration {
+            cachedResidentShardBytesGB = value
+        }
         lock.unlock()
         return value
     }
 
-    private func scheduleShardResidencyWalks() {
+    /// Registers the loaded model's shard mappings for the cached residency walk,
+    /// invalidating any walk still running against a previous model's mappings.
+    /// Independent of `initialize`'s paging-catalog setup so every load path can
+    /// call it — FlashMoE loads never go through `initialize`.
+    func registerShardMappings(_ shardBuffers: [UInt32: MTLBuffer]) {
         lock.lock()
         shardWalkGeneration &+= 1
+        shardMappings = shardBuffers.values.map { (base: UnsafeRawPointer($0.contents()), length: $0.length) }
+        cachedResidentShardBytesGB = 0.0
+        lock.unlock()
+        scheduleShardResidencyWalks()
+    }
+
+    private func scheduleShardResidencyWalks() {
+        lock.lock()
         let generation = shardWalkGeneration
+        if generation == scheduledWalkGeneration {
+            lock.unlock()
+            return // a loop for this registry generation is already scheduled
+        }
+        scheduledWalkGeneration = generation
         lock.unlock()
         shardWalkQueue.async { [weak self] in
             guard let self = self else { return }
@@ -586,10 +612,9 @@ final class WorkingSetManager {
     }
 
     func initialize(summary: ModelSummary, shardBuffers: [UInt32: MTLBuffer], mode: MemoryBudgetMode) {
-        lock.lock()
-        shardMappings = shardBuffers.values.map { (base: UnsafeRawPointer($0.contents()), length: $0.length) }
-        cachedResidentShardBytesGB = 0.0
+        registerShardMappings(shardBuffers)
 
+        lock.lock()
         expertSlices.removeAll()
         denseSlices.removeAll()
         denseBytes = 0
@@ -632,8 +657,6 @@ final class WorkingSetManager {
         let allShardIndices = Set(summary.shards.map { $0.index })
         expertOnlyShardIndices = allShardIndices.filter { shardHasDense[$0] != true }
         lock.unlock()
-
-        scheduleShardResidencyWalks()
 
         if mode == .unrestricted {
             preFaultAll(shardBuffers: shardBuffers, summary: summary)
@@ -12894,6 +12917,7 @@ if layer.attnGateProjTensor != nil,
                 let isFlashMoE = ExpertRepacker.isPackedFormat(dir: dirUrl)
                 if isFlashMoE {
                     ExpertIOThreadPool.shared.initialize(numThreads: 8)
+                    var pinnedShardIndex: UInt32? = nil
 
                     // FlashMoE backbone pinning: the invariant weights (model_weights.bin —
                     // every layer's q/k/v/o/GDN projections, norms, lm_head, embeddings) are
@@ -12916,6 +12940,7 @@ if layer.attnGateProjTensor != nil,
                                 }
                                 if let elapsed = ExpertIOThreadPool.preadFileIntoBuffer(fd: fd, dst: pinned.contents(), length: length, threads: 8) {
                                     buffers[shard0.index] = pinned
+                                    pinnedShardIndex = shard0.index
                                     print("⚡ [FlashMoE] Pinned backbone (\(String(format: "%.2f", Double(length) / 1073741824.0)) GB) into anonymous GPU memory in \(String(format: "%.2f", elapsed))s — per-token mmap re-faults eliminated")
                                 } else {
                                     print("⚠️ [FlashMoE] Backbone pinning pread incomplete — falling back to mmap path")
@@ -12928,6 +12953,19 @@ if layer.attnGateProjTensor != nil,
                             print("⚠️ [FlashMoE] Backbone pinning skipped: length \(length) invalid or exceeds maxBufferLength (\(Double(device.maxBufferLength) / 1073741824.0) GB)")
                         }
                     }
+
+                    // FlashMoE loads never call WorkingSetManager.initialize, so the
+                    // residency registry must be adopted here, independently of the
+                    // paging-catalog initialization the regular path performs. A
+                    // pinned backbone is excluded: its anonymous pages are dirty heap
+                    // that the process footprint already counts, so including them
+                    // here would double-report them (and mislabel them as clean
+                    // unified-cache pages).
+                    var registryBuffers = buffers
+                    if let pinnedIdx = pinnedShardIndex {
+                        registryBuffers.removeValue(forKey: pinnedIdx)
+                    }
+                    WorkingSetManager.shared.registerShardMappings(registryBuffers)
                 } else {
                     WorkingSetManager.shared.initialize(summary: loadedSummary, shardBuffers: buffers, mode: memoryBudgetMode)
                     let effMode = memoryExecutionMode.resolveEffectiveMode(modelFootprintGB: mappedGB)

@@ -2523,6 +2523,21 @@ Fixes (ContentView.swift, SidebarView.swift, SettingsSheetView.swift):
   into the view-facing cache). The read-only priming regression test also now
   aborts before mmap when the temp-file write is short, instead of risking a
   SIGBUS stride read over an undersized file.
+- Fourth Copilot round: FlashMoE loads bypass `WorkingSetManager.initialize`
+  (only the regular path calls it), so the residency registry was never adopted
+  on a first packed load and kept walking the previous model's stale mappings
+  across a switch. Registration is now an independent call:
+  `registerShardMappings(_:)` bumps the walk generation, replaces the mapping
+  set, resets the cache, and (idempotently per generation) schedules the
+  utility-queue loop — `initialize` calls it, and the FlashMoE branch calls it
+  directly after backbone pinning, excluding the pinned backbone buffer (its
+  anonymous pages are dirty heap that the footprint line already counts; they
+  are not clean unified-cache pages). The stale-publication race Copilot
+  flagged is closed by snapshotting the generation with the mappings inside
+  `refreshShardResidencyNow` and publishing only if the generation is still
+  current, so a walk in flight across a registry swap or release cannot write
+  the old model's residency into the new model's cache. Regression test:
+  `testRegisterShardMappingsSwapsRegistryIndependently`.
 
 Verification: probe on macOS 26.7.1 / M1 Pro (in-process metrics matched the
 `footprint` CLI and vmmap at every phase); Xcode build green;

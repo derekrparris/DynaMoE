@@ -5070,6 +5070,40 @@ final class DynaMoETests: XCTestCase {
                        "The synchronous walk must publish through the O(1) view-facing cache")
     }
 
+    // FlashMoE loads bypass WorkingSetManager.initialize, so the residency
+    // registry must be adoptable independently. registerShardMappings must swap
+    // the registered set atomically: the previous model's mappings stop counting
+    // and the new set counts, without a full paging-catalog initialize.
+    func testRegisterShardMappingsSwapsRegistryIndependently() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("Metal not available")
+        }
+        guard let bufA = device.makeBuffer(length: 64 * 1024, options: .storageModeShared),
+              let bufB = device.makeBuffer(length: 256 * 1024, options: .storageModeShared) else {
+            XCTFail("could not allocate mock Metal buffers")
+            return
+        }
+        let aGB = Double(64 * 1024) / 1073741824.0
+        let bGB = Double(256 * 1024) / 1073741824.0
+
+        let mgr = WorkingSetManager.shared
+        defer { mgr.releaseShardMappings() }
+
+        memset(bufA.contents(), 0x33, 64 * 1024)
+        mgr.registerShardMappings([0: bufA])
+        XCTAssertEqual(mgr.refreshShardResidencyNow(), aGB, accuracy: 0.000001,
+                       "Registry must count the fully-touched first buffer")
+
+        // Swap to a new shard set without initialize(): the first model's mapping
+        // must stop counting entirely (a stale registry would report aGB + bGB).
+        mgr.registerShardMappings([5: bufB])
+        memset(bufB.contents(), 0x5A, 256 * 1024)
+        XCTAssertEqual(mgr.refreshShardResidencyNow(), bGB, accuracy: 0.000001,
+                       "Re-registration must fully replace the previous model's mappings")
+        XCTAssertEqual(mgr.residentShardBytesGB, bGB, accuracy: 0.000001,
+                       "The synchronous walk must publish through the O(1) view-facing cache")
+    }
+
     func testOrnithRMSNormIsNotUnitOffset() throws {
         print("=== TEST ORNITH & QWEN 3.8 RMSNORM & GATING CONFIGS ===")
         let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--mlx-community--Ornith-1.5-9B-OptiQ-4bit/snapshots/ad2e7748e8c9d36b82bb88307fd21c0d50be85b8"
