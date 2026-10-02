@@ -79,7 +79,7 @@ The **Models** section acts as your local model registry and management hub.
 ┌────────────────────────────────────────────────────────────────────────┐
 │  Models Section                                                        │
 │  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │ 📦 mlx-community/Ornith-1.5-9B-OptiQ-4bit   [Active] [⋯]  [Load]  │  │
+│  │ 📦 mlx-community/Ornith-1.5-9B-OptiQ-4bit   [Active] [⋯] [Loaded] │  │
 │  │    Architecture: Hybrid GDN + GQA | Precision: 4-bit | 5.4 GB    │  │
 │  └──────────────────────────────────────────────────────────────────┘  │
 │  ┌──────────────────────────────────────────────────────────────────┐  │

@@ -566,6 +566,7 @@ struct SettingsSheetView: View {
                                     .menuIndicator(.hidden)
                                     .fixedSize()
                                     .help("Model actions")
+                                    .accessibilityLabel("Actions for \(model.displayName)")
                                 }
 
                                 if isCurrentActive {
@@ -660,16 +661,11 @@ struct SettingsSheetView: View {
             SettingsCard {
                 SettingsRow(
                     title: "Active Profile: \(activeProfile.profileDisplayName(for: currentModelIdentifier))",
-                    subtitle: modelDisplayText,
+                    subtitle: "\(modelDisplayText), \(activeProfile.description(for: currentModelIdentifier))",
                     icon: activeProfile.icon,
                     iconTint: .purple
                 ) {
                     HStack(spacing: 8) {
-                        Image(systemName: "info.circle")
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                            .help(activeProfile.description(for: currentModelIdentifier))
-
                         Picker("Profile", selection: $activeProfile) {
                             ForEach(ModelProfileType.allCases) { profile in
                                 Text(profile.rawValue).tag(profile)
@@ -1590,10 +1586,9 @@ struct SettingsSheetView: View {
             }
 
             // Available Built-in Tools List
-            SettingsCard(header: "Installed Tool Suite", spacing: 10) {
+            SettingsCard(spacing: 10) {
                 Text("Installed Tool Suite (\(AgentHarness.shared.loadedTools.count) Loaded / \(AgentHarness.shared.tools.count) Installed)")
-                    .font(.subheadline)
-                    .fontWeight(.semibold)
+                    .font(.system(size: 12.5, weight: .semibold))
 
                 LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
                     toolSummaryCard(name: "shell_run", icon: "terminal.fill", desc: "Runs native /bin/zsh shell commands with timeout, stdout/stderr capture, and exit codes.")
