@@ -536,7 +536,7 @@ struct HelpAndSettingsGuideView: View {
 
             faqCard(
                 "How do I reset my settings to default?",
-                "Open Settings (⌘,) -> Models, choose 'Configure Profiles…' from your active model's ellipsis menu, and click 'Reset to Defaults'. This restores factory-tuned parameters for both Coder and Assistant profiles."
+                "Open Settings (⌘,) -> Models, choose 'Configure Profiles…' from your active model's ellipsis menu, and click 'Reset to Defaults'. This restores factory-tuned parameters for the profile you are currently editing (Coder or Assistant), not both at once; repeat for the other profile if needed. The running session keeps its current values until you click 'Apply to Session'."
             )
         }
     }

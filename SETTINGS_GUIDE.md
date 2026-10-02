@@ -411,4 +411,4 @@ Test GPU compute pipelines in isolation without running full autoregressive gene
 **A:** It converts scattered expert weights across multiple SafeTensors shards into contiguous per-layer binary files (`packed_experts/layer_XX.bin`), enabling DynaMoE to stream active MoE experts via high-speed POSIX direct I/O without disk seek latency.
 
 #### Q: How do I restore default settings?
-**A:** Open **Settings $\to$ Models**, click the **⋯** (ellipsis) menu on your active model, choose **"Configure Profiles…"**, and click **Reset to Defaults**. This will immediately restore factory-tuned parameters for both Coder and Assistant profiles.
+**A:** Open **Settings $\to$ Models**, click the **⋯** (ellipsis) menu on your active model, choose **"Configure Profiles…"**, and click **Reset to Defaults**. This restores factory-tuned parameters for the profile you are currently editing (Coder **or** Assistant), not both at once; repeat for the other profile if needed. The running session keeps its current values until you click **Apply to Session**.
