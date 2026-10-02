@@ -2568,3 +2568,49 @@ fully-touched mock shard buffer and verifies release cleanup. The mock-buffer
 tests were also why the old pread path looked tested — their writable
 `makeBuffer(length:)` shards always allowed the pread that the real read-only
 mmap forbids.
+
+---
+
+## FIX #11: FP8 KV FLASH-DECODING SPLIT-K (SHIPPED)
+
+The FP8 KV-cache path never received the Fix #4a flash-decoding kernels —
+`.fp8` decode ran the one-thread-per-head serial kernels
+(`gqa_attention_decode_headgate_fp8` / `_fused_fp8` / `_standard_fp8`), each
+thread dequantizing the INT8 cache sequentially over the whole context, so
+FP8 was latency-bound and dramatically slower than FP16 at long context (the
+"FP8 makes models run super slow" report).
+
+**Shipped:** `gqa_attention_decode_headgate_fp8_chunked` and
+`gqa_attention_decode_fused_fp8_chunked` scans (grid `(numQHeads, numChunks)`,
+per-head FP16 scales applied inside the chunk loop), reusing the
+precision-agnostic F16 chunked combine kernels (they only touch FP32 partials
+plus gate vectors). Wired into the `.fp8` decode branch mirroring the F16
+branch order (chunked headgate → serial headgate → serial standard → chunked
+fused → serial fused), with the same scan→combine memory barrier.
+
+Also fixed alongside (Copilot review round 1):
+- The flash-decoding partial buffers were hardcoded `16 * 256` heads×chunks
+  while dispatch used the model's `numHeads` — they are sized from `numHeads`
+  now (the F16 path shared the same latent overflow for >16-head models).
+- JetSpec is now disabled for FP8 KV: `runJetSpecTreeForward`'s tree
+  store/verify kernels are F16/FP32-only, and the FP32 fallback would write
+  4-byte elements into a 1-byte-per-element cache. `isJetSpecEligible(...)`
+  is the single source of truth, covered by
+  `testJetSpecEligibilityExcludesFP8KVCache`.
+
+**Verification (T17d in the bench, synthetic INT8 KV with per-head FP16
+scales, 16 Q-heads / 2 KV-heads / 256 dim):** outputs match the serial kernel
+to max rel diff ~4e-3 (FP reassociation noise, same as T17), and timing:
+
+| Context | Window | Serial (1 thread/head) | Chunked | Speedup |
+|---|---|---|---|---|
+| 1,000 | — | 21.4 ms | 2.8 ms | 7.7× |
+| 2,000 | — | 42.7 ms | 4.6 ms | 9.3× |
+| 4,000 | — | 85.6 ms | 11.0 ms | 7.8× |
+| 8,000 | — | 170.9 ms | 20.7 ms | 8.3× |
+| 4,000 | 512 | 10.9 ms | 3.4 ms | 3.2× |
+| 8,000 | 1,024 | 21.5 ms | 4.5 ms | 4.7× |
+
+The sliding-window headgate path wins less because the window already caps
+the per-thread scan; full-attention layers win ~8×. Xcode build green and
+`testJetSpecEligibilityExcludesFP8KVCache` passes on M1 Pro.

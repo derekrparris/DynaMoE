@@ -4147,6 +4147,21 @@ final class DynaMoETests: XCTestCase {
         XCTAssertLessThan(maxStateDiff, 1e-4, "Sequence prefill final state does not match autoregressive step final state")
     }
 
+    // Pure-logic coverage of the JetSpec eligibility gate (no model required).
+    // The FP8 exclusion is the only guard keeping the F16/FP32-only tree
+    // store/verify kernels away from the 1-byte-per-element FP8 cache.
+    func testJetSpecEligibilityExcludesFP8KVCache() {
+        // Non-recurrent, non-Spark, user-enabled: eligible under FP16 and FP32.
+        XCTAssertTrue(isJetSpecEligible(jetSpecEnabled: true, hasLinearRecurrence: false, isSparkModel: false, kvPrecision: .fp16))
+        XCTAssertTrue(isJetSpecEligible(jetSpecEnabled: true, hasLinearRecurrence: false, isSparkModel: false, kvPrecision: .fp32))
+        // FP8 must bypass even for an otherwise-eligible model.
+        XCTAssertFalse(isJetSpecEligible(jetSpecEnabled: true, hasLinearRecurrence: false, isSparkModel: false, kvPrecision: .fp8))
+        // Recurrence, Spark, and the user toggle still bypass regardless of precision.
+        XCTAssertFalse(isJetSpecEligible(jetSpecEnabled: true, hasLinearRecurrence: true, isSparkModel: false, kvPrecision: .fp16))
+        XCTAssertFalse(isJetSpecEligible(jetSpecEnabled: true, hasLinearRecurrence: false, isSparkModel: true, kvPrecision: .fp32))
+        XCTAssertFalse(isJetSpecEligible(jetSpecEnabled: false, hasLinearRecurrence: false, isSparkModel: false, kvPrecision: .fp16))
+    }
+
     func testOrnith9BCodingSettingsAutoregressive() throws {
         print("=== TEST ORNITH 1.5 9B AUTOREGRESSIVE WITH USER CODING SETTINGS ===")
         let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--mlx-community--Ornith-1.5-9B-OptiQ-4bit/snapshots/ad2e7748e8c9d36b82bb88307fd21c0d50be85b8"
@@ -4172,8 +4187,7 @@ final class DynaMoETests: XCTestCase {
         // Even when user has JetSpec enabled, recurrent Gated DeltaNet models MUST bypass speculative tree execution
         // because multi-node tree drafting disrupts continuous causal convolution and O(1) state updates.
         let userJetSpecEnabled = true
-        let packedExpertsDir: URL? = nil
-        let effectiveJetSpec = userJetSpecEnabled && !hasLinearRecurrence
+        let effectiveJetSpec = isJetSpecEligible(jetSpecEnabled: userJetSpecEnabled, hasLinearRecurrence: hasLinearRecurrence, isSparkModel: false, kvPrecision: .fp16)
         XCTAssertFalse(effectiveJetSpec, "effectiveJetSpec must be false for Ornith 1.5 9B to ensure 100% coherent execution")
 
         // 3. Verify high-performance Top-K / Top-P sampling with User's Exact Coding Settings:

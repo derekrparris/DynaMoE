@@ -88,6 +88,14 @@ enum KVCachePrecision: String, CaseIterable, Identifiable {
     }
 }
 
+/// Single source of truth for JetSpec eligibility (used by startAutoregressiveGeneration
+/// and covered by DynaMoETests). FP8 KV is excluded: the tree store/verify kernels are
+/// F16/FP32-only, and the FP32 fallback would write 4-byte elements into a
+/// 1-byte-per-element cache.
+nonisolated func isJetSpecEligible(jetSpecEnabled: Bool, hasLinearRecurrence: Bool, isSparkModel: Bool, kvPrecision: KVCachePrecision) -> Bool {
+    jetSpecEnabled && !hasLinearRecurrence && !isSparkModel && kvPrecision != .fp8
+}
+
 final class KVCacheManager {
     static let shared = KVCacheManager()
 
@@ -5187,9 +5195,11 @@ struct ContentView: View {
               let interBuffer = device.makeBuffer(length: max(Int(maxInterDim), 512) * max(1, Int(modelConfig?.effectiveNumExpertsPerTok ?? (numExperts >= 512 ? 10 : 8))) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let fusedSlotListBuffer = device.makeBuffer(length: 16 * MemoryLayout<UInt32>.stride, options: .storageModeShared),
               let fusedSlotWeightsBuffer = device.makeBuffer(length: 16 * MemoryLayout<Float>.stride, options: .storageModeShared),
-              let attnPartialMBuffer = device.makeBuffer(length: 16 * 256 * MemoryLayout<Float>.stride, options: .storageModeShared),
-              let attnPartialLBuffer = device.makeBuffer(length: 16 * 256 * MemoryLayout<Float>.stride, options: .storageModeShared),
-              let attnPartialAccBuffer = device.makeBuffer(length: 16 * 256 * Int(headDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
+              // Flash-decoding partials (256 = split-K chunk cap), sized from the
+              // model's head count — a fixed 16-head budget overruns on wider models.
+              let attnPartialMBuffer = device.makeBuffer(length: Int(numHeads) * 256 * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let attnPartialLBuffer = device.makeBuffer(length: Int(numHeads) * 256 * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let attnPartialAccBuffer = device.makeBuffer(length: Int(numHeads) * 256 * Int(headDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let expertStagingBuffer = device.makeBuffer(length: expertStagingSize, options: .storageModeShared),
               let expertStagingBufferB = device.makeBuffer(length: expertStagingSize, options: .storageModeShared),
               let hcStreamsBuffer = device.makeBuffer(length: max(4 * Int(hiddenDim), 10240) * MemoryLayout<Float>.stride, options: .storageModeShared),
@@ -10163,10 +10173,12 @@ if layer.attnGateProjTensor != nil,
             // hybrid models (maintaining continuous causal convolution and O(1) recurrent states)
             // execute via the direct single-token path for maximum throughput and state integrity.
             let hasLinearRecurrence = cachedLayers.contains { $0.attentionType == .linearAttention }
-            // FP8 KV is excluded: the tree store/verify kernels below are F16/FP32-only,
-            // and the FP32 fallback would write 4-byte elements into a 1-byte-per-element
-            // cache (slot offsets run past the buffer). FP8 decode uses the direct path.
-            let effectiveJetSpec = jetSpecEnabled && !hasLinearRecurrence && (modelConfig?.isSparkModel != true) && KVCacheManager.shared.activePrecision != .fp8
+            let effectiveJetSpec = isJetSpecEligible(
+                jetSpecEnabled: jetSpecEnabled,
+                hasLinearRecurrence: hasLinearRecurrence,
+                isSparkModel: modelConfig?.isSparkModel == true,
+                kvPrecision: KVCacheManager.shared.activePrecision
+            )
             let effectiveInterDim = modelConfig?.intermediateSize ?? Int(cachedLayers.first?.intermediateDim ?? 14336)
             let effectiveQkvDim = Int(max(hiddenDim * 2, 8192))
             let effectiveZDim = Int(max(hiddenDim * 2, 8192))
