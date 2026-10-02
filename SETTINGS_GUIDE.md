@@ -1,41 +1,42 @@
 # DynaMoE Settings & User Guide
 
-A comprehensive, practical guide to configuring, tuning, and operating DynaMoE on Apple Silicon. This document details every tab in the **Settings & Diagnostics** panel (`⌘,`), explains the underlying mathematics and runtime mechanics, provides battle-tested presets for coding versus conversational assistance, and offers memory budgeting advice for Mac hardware configurations.
+A comprehensive, practical guide to configuring, tuning, and operating DynaMoE on Apple Silicon. This document details every section of the **Settings & Diagnostics** window (`⌘,`) — which presents a sidebar of sections on the left and their controls on the right, matching the macOS System Settings layout — explains the underlying mathematics and runtime mechanics, provides battle-tested presets for coding versus conversational assistance, and offers memory budgeting advice for Mac hardware configurations.
 
 ---
 
 ## Table of Contents
 1. [Overview & Accessing Settings](#1-overview--accessing-settings)
-2. [Tab 1: Models & Binary Repackaging](#2-tab-1-models--binary-repackaging)
+2. [General: Updates & Chat History](#2-general-updates--chat-history)
+3. [Models & Binary Repackaging](#3-models--binary-repackaging)
    - [Local Model Discovery](#local-model-discovery)
    - [Default & Last Used Model](#default--last-used-model)
    - [MoE Contiguous Binary Repackaging (Flash-MoE)](#moe-contiguous-binary-repackaging-flash-moe)
    - [Model-Specific Profiles ("Coder" & "Assistant")](#model-specific-profiles-coder--assistant)
-3. [Tab 2: Generation & Sampling Hyperparameters](#3-tab-2-generation--sampling-hyperparameters)
+4. [Generation & Sampling Hyperparameters](#4-generation--sampling-hyperparameters)
    - [Active Profile Banner & Fast Switching](#active-profile-banner--fast-switching)
    - [Sampling Parameters (Math & Practical Tuning)](#sampling-parameters-math--practical-tuning)
    - [System Prompts & Conjunction Merging](#system-prompts--conjunction-merging)
    - [JetSpec Speculative Tree Acceleration](#jetspec-speculative-tree-acceleration)
-4. [Tab 3: Memory & SSD Management](#4-tab-3-memory--ssd-management)
+5. [Memory & SSD Management](#5-memory--ssd-management)
    - [Memory Execution Modes (Auto, Full RAM, SSD Streaming)](#memory-execution-modes)
    - [Memory Budget Modes & Limits](#memory-budget-modes--limits)
    - [KV Cache Precision (FP32, FP16, FP8 E4M3/E5M2)](#kv-cache-precision)
    - [Speculative MoE Lookahead Prefetching](#speculative-moe-lookahead-prefetching)
    - [Live Diagnostics & Working Set Metrics](#live-diagnostics--working-set-metrics)
    - [Cache Maintenance: Flush vs. Pre-Fault](#cache-maintenance-flush-vs-pre-fault)
-5. [Tab 4: Agent & Tools](#5-tab-4-agent--tools)
+6. [Agent & Tools](#6-agent--tools)
    - [Global Agent Enablement & Sandbox Directory](#global-agent-enablement--sandbox-directory)
    - [Safety Limits (Max Output & Max Steps)](#safety-limits)
    - [Search Integrations (Headless Chrome & Brave Search)](#search-integrations)
    - [Built-In Local Tools Reference](#built-in-local-tools-reference)
-6. [Tab 5: Advanced Diagnostics](#6-tab-5-advanced-diagnostics)
+7. [Advanced Diagnostics](#7-advanced-diagnostics)
    - [SafeTensors Sharded Metadata & Search](#safetensors-sharded-metadata--search)
    - [Direct Metal Kernel Execution Harness](#direct-metal-kernel-execution-harness)
-7. [Hardware Profiles & Recommended Configurations](#7-hardware-profiles--recommended-configurations)
+8. [Hardware Profiles & Recommended Configurations](#8-hardware-profiles--recommended-configurations)
    - [16 GB Unified RAM (M1/M2/M3/M4)](#16-gb-unified-ram-m1m2m3m4)
    - [24 GB – 36 GB Unified RAM](#24-gb--36-gb-unified-ram)
    - [64 GB – 128 GB+ Unified RAM (M-Max / M-Ultra)](#64-gb--128-gb-unified-ram-m-max--m-ultra)
-8. [Frequently Asked Questions & Troubleshooting](#8-frequently-asked-questions--troubleshooting)
+9. [Frequently Asked Questions & Troubleshooting](#9-frequently-asked-questions--troubleshooting)
 
 ---
 
@@ -50,23 +51,39 @@ DynaMoE provides centralized control over model inference, GPU shader dispatch, 
 
 ### How to Open this Guide in the App
 - **Help Menu**: Select **Help $\to$ DynaMoE Help & Settings Guide** (or press `⌘?`).
-- **Settings Header**: Click the **Help & Guide** button located in the top-right of the Settings sheet.
+- **Settings Window**: Click the **Help & Guide** button located in the top-right of the Settings window. Sections are selected from the sidebar on the left.
 
 ---
 
-## 2. Tab 1: Models & Binary Repackaging
+## 2. General: Updates & Chat History
 
-The **Models** tab acts as your local model registry and management hub.
+The **General** section covers app-wide housekeeping: software updates, and how conversations and reasoning displays behave.
+
+### Updates
+- **Enable Auto-Updates**: DynaMoE checks the Sparkle update feed in the background; new releases are verified and installed safely. You can always check manually with `⌘U`.
+- **Check for Updates Now**: Queries the update feed on demand, regardless of the automatic setting.
+- **Current Version**: The DynaMoE release and build currently installed.
+
+### Chat & Reasoning
+- **Expand Thinking by Default**: Show the thinking/reasoning accordion expanded when a message first appears. When off, reasoning starts collapsed and can be opened manually.
+- **Auto-Delete Old Conversations**: Conversations are kept between launches, with the oldest removed automatically once the limit below is reached. Turn this off to keep every conversation forever.
+- **Conversations to Keep**: How many of the most-recently-updated conversations are retained (1–100). The conversation you have open is always kept.
+
+---
+
+## 3. Models & Binary Repackaging
+
+The **Models** section acts as your local model registry and management hub.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
-│  Models Tab                                                            │
+│  Models Section                                                        │
 │  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │ 📦 mlx-community/Ornith-1.5-9B-OptiQ-4bit    [Active] [Profiles] │  │
+│  │ 📦 mlx-community/Ornith-1.5-9B-OptiQ-4bit   [Active] [⋯] [Loaded] │  │
 │  │    Architecture: Hybrid GDN + GQA | Precision: 4-bit | 5.4 GB    │  │
 │  └──────────────────────────────────────────────────────────────────┘  │
 │  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │ 📦 Qwen/Qwen3.8-Flash-Next-FP8               [Default] [Repack]  │  │
+│  │ 📦 Qwen/Qwen3.8-Flash-Next-FP8              [Default] [⋯]  [Load] │  │
 │  │    Architecture: MoE 512 Experts | Precision: FP8 | 48.2 GB      │  │
 │  └──────────────────────────────────────────────────────────────────┘  │
 └────────────────────────────────────────────────────────────────────────┘
@@ -125,22 +142,22 @@ DynaMoE automatically defaults to and persists the official publisher-tuned prof
   - **Max Tokens**: $4,096$ | **JetSpec**: Enabled (draft speculative decoding)
 
 #### Profile Customization & Persistence
-1. Click any model card in the **Models** tab or click its **"Profiles"** button.
-2. Select either the **Coder** or **Assistant** tab in the inspector.
+1. Open the **Models** section, click the **⋯** (ellipsis) menu on your model, and choose **"Configure Profiles…"**.
+2. Switch between the **Coder** and **Assistant** segments in the inspector.
 3. Customize hyperparameters specifically for that model (Temperature, Top-P, Min-P, Top-K, Repetition Penalty, Presence Penalty, Max Tokens, JetSpec, System Prompt).
-4. Click **Save Profile** to persist these settings permanently to `UserDefaults`.
+4. Click **Save [Coder/Assistant] Profile** to persist these settings permanently to `UserDefaults`.
 5. In the chat interface, toggle between **[ 💻 Coder ▾ ]** and **[ 💬 Assistant ▾ ]** right next to the model selector with zero friction.
 
 ---
 
-## 3. Tab 2: Generation & Sampling Hyperparameters
+## 4. Generation & Sampling Hyperparameters
 
-The **Generation** tab configures the mathematical sampling engine used during autoregressive token decoding.
+The **Generation** section configures the mathematical sampling engine used during autoregressive token decoding.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
-│  Generation Tab                                                        │
-│  Active Profile: [ 💻 Coder ]  [ 💬 Assistant ]   [ Save to Coder ]    │
+│  Generation Section                                                    │
+│  Active Profile: [ Coder ]  [ Assistant ]              [ Save ]       │
 │                                                                        │
 │  Temperature: 0.60 ────────●──────────────  Top-P: 0.95 ───────────●── │
 │  Min-P: 0.00 ●────────────────────────────  Top-K: 20   ─────●──────── │
@@ -150,7 +167,7 @@ The **Generation** tab configures the mathematical sampling engine used during a
 ```
 
 ### Active Profile Banner & Fast Switching
-At the top of the Generation tab, an active profile banner indicates which profile is currently governing the session. Any slider adjustments made here can be saved back to that profile using the **"Save to [Active Profile]"** button.
+At the top of the Generation section, an active profile banner indicates which profile is currently governing the session. Any adjustments made here can be saved back to that profile using the **"Save"** button.
 
 ### Sampling Parameters (Math & Practical Tuning)
 
@@ -223,13 +240,13 @@ JetSpec accelerates token generation by proposing structured trees of candidate 
 
 ---
 
-## 4. Tab 3: Memory & SSD Management
+## 5. Memory & SSD Management
 
-The **Memory & SSD** tab controls how model weights and runtime caches are allocated across Apple Silicon's Unified Memory Architecture (UMA) and NVMe storage.
+The **Memory & SSD** section controls how model weights and runtime caches are allocated across Apple Silicon's Unified Memory Architecture (UMA) and NVMe storage.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
-│  Memory & SSD Tab                                                      │
+│  Memory & SSD Section                                                  │
 │  Memory Execution Mode:  [ Auto (Smart) ]  [ Full RAM ]  [ SSD Stream ]│
 │  Memory Budget Mode:     [ Balanced (16GB) ▾ ]                         │
 │  KV Cache Precision:     [ FP16 ▾ ]                                    │
@@ -276,13 +293,13 @@ When running sparse MoE models in SSD streaming mode:
 
 ---
 
-## 5. Tab 4: Agent & Tools
+## 6. Agent & Tools
 
-The **Agent & Tools** tab configures DynaMoE's autonomous agent engine, tool-calling loop, and external search integrations.
+The **Agent & Tools** section configures DynaMoE's autonomous agent engine, tool-calling loop, and external search integrations.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
-│  Agent & Tools Tab                                                     │
+│  Agent & Tools Section                                                 │
 │  Autonomous Tool Calling:  [ON]                                        │
 │  Working Directory:        [/Users/username/Workspace/Projects] [Pick] │
 │  Max Tool Output:          [4000 characters ▾]                         │
@@ -323,13 +340,13 @@ DynaMoE equips models with the following native tools:
 
 ---
 
-## 6. Tab 5: Advanced Diagnostics
+## 7. Advanced Diagnostics
 
-The **Advanced Diagnostics** tab is an engineering inspection suite for validating Metal shaders, examining raw SafeTensors tensors, and testing layer forward execution independently of chat generation.
+The **Advanced Diagnostics** section is an engineering inspection suite for validating Metal shaders, examining raw SafeTensors tensors, and testing layer forward execution independently of chat generation.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
-│  Advanced Diagnostics Tab                                              │
+│  Advanced Diagnostics Section                                          │
 │  Category Filter: [ All ] [ Attention ] [ Experts ] [ Router ] [ Norm ]│
 │  Search Tensors:  [ model.layers.0.mlp... ]                            │
 │                                                                        │
@@ -354,7 +371,7 @@ Test GPU compute pipelines in isolation without running full autoregressive gene
 
 ---
 
-## 7. Hardware Profiles & Recommended Configurations
+## 8. Hardware Profiles & Recommended Configurations
 
 ### 16 GB Unified RAM (M1/M2/M3/M4)
 - **Primary Model**: `mlx-community/Ornith-1.5-9B-OptiQ-4bit` (Dense Hybrid GDN).
@@ -382,7 +399,7 @@ Test GPU compute pipelines in isolation without running full autoregressive gene
 
 ---
 
-## 8. Frequently Asked Questions & Troubleshooting
+## 9. Frequently Asked Questions & Troubleshooting
 
 #### Q: Why does token generation speed gradually decrease over a long thinking chain?
 **A:** This occurs primarily because of the model's hybrid architecture. For example, Ornith 1.5 9B has 24 Gated DeltaNet layers (which run in constant $O(1)$ time) and 8 full Grouped-Query Attention (GQA) layers (which must scan all previous tokens in the KV cache on every step, scaling $O(T)$). Additionally, the displayed tokens/sec is a cumulative running average from token 1, meaning as instantaneous speed naturally drops at 4,000+ tokens, the displayed average will gradually slide toward 1.5–2.0 tok/s.
@@ -394,4 +411,4 @@ Test GPU compute pipelines in isolation without running full autoregressive gene
 **A:** It converts scattered expert weights across multiple SafeTensors shards into contiguous per-layer binary files (`packed_experts/layer_XX.bin`), enabling DynaMoE to stream active MoE experts via high-speed POSIX direct I/O without disk seek latency.
 
 #### Q: How do I restore default settings?
-**A:** Open **Settings $\to$ Models**, click **"Profiles"** on your active model, and click **Reset to Defaults**. This will immediately restore factory-tuned parameters for both Coder and Assistant profiles.
+**A:** Open **Settings $\to$ Models**, click the **⋯** (ellipsis) menu on your active model, choose **"Configure Profiles…"**, and click **Reset to Defaults**. This restores factory-tuned parameters for the profile you are currently editing (Coder **or** Assistant), not both at once; repeat for the other profile if needed. The running session keeps its current values until you click **Apply to Session**.

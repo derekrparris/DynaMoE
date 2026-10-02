@@ -81,7 +81,7 @@ struct HelpAndSettingsGuideView: View {
                             .font(.system(size: 11, weight: .medium))
                     }
                     .buttonStyle(.bordered)
-                    .help("Open DynaMoE Settings Sheet (⌘,)")
+                    .help("Open DynaMoE Settings (⌘,)")
 
                     // Quick Preset Copy Button
                     Menu {
@@ -218,7 +218,7 @@ struct HelpAndSettingsGuideView: View {
     // MARK: - 2. Models & Repackaging
     private var modelsSection: some View {
         VStack(alignment: .leading, spacing: 16) {
-            headerBadge("Tab 2: Models", color: .purple)
+            headerBadge("Models Section", color: .purple)
 
             Text("Local Model Registry & Fast Repackaging")
                 .font(.title2).bold()
@@ -232,7 +232,7 @@ struct HelpAndSettingsGuideView: View {
                         .font(.system(size: 12))
                         .lineSpacing(2)
 
-                    Text("Clicking 'FlashMoE Repack' on a discovered MoE model losslessly restructures expert weights into contiguous per-layer binaries (`layer_XX.bin` + `layout.json`). An 8-thread POSIX `pread` pool can then stream active expert slices in a single contiguous I/O read (>3.5 GB/s on Apple internal SSDs), delivering ~100x faster generation.")
+                    Text("Choosing 'FlashMoE Repack' from a discovered MoE model's ellipsis menu losslessly restructures expert weights into contiguous per-layer binaries (`layer_XX.bin` + `layout.json`). An 8-thread POSIX `pread` pool can then stream active expert slices in a single contiguous I/O read (>3.5 GB/s on Apple internal SSDs), delivering ~100x faster generation.")
                         .font(.system(size: 12))
                         .lineSpacing(2)
 
@@ -247,7 +247,7 @@ struct HelpAndSettingsGuideView: View {
 
             VStack(alignment: .leading, spacing: 8) {
                 bulletPoint("Auto-Discovery", "Automatically parses config.json and SafeTensors headers to detect architecture, hidden dimensions, heads, and quantization.")
-                bulletPoint("Default Model", "Click 'Set Default' (star icon) on any discovered model to load it automatically on future launches.")
+                bulletPoint("Default Model", "Choose 'Set as Default' from any discovered model's ellipsis menu to load it automatically on future launches.")
                 bulletPoint("Last Used Retention", "DynaMoE remembers the last used model and automatically restores it across sessions.")
             }
         }
@@ -352,7 +352,7 @@ struct HelpAndSettingsGuideView: View {
     // MARK: - 4. Generation & Sampling Hyperparameters
     private var generationSection: some View {
         VStack(alignment: .leading, spacing: 16) {
-            headerBadge("Tab 3: Generation", color: .orange)
+            headerBadge("Generation Section", color: .orange)
 
             Text("Sampling Mathematics & Parameters")
                 .font(.title2).bold()
@@ -379,7 +379,7 @@ struct HelpAndSettingsGuideView: View {
     // MARK: - 5. Memory & SSD Management
     private var memorySection: some View {
         VStack(alignment: .leading, spacing: 16) {
-            headerBadge("Tab 4: Memory & SSD", color: .cyan)
+            headerBadge("Memory & SSD Section", color: .cyan)
 
             Text("Unified Memory Architecture (UMA) & SSD Paging")
                 .font(.title2).bold()
@@ -457,7 +457,7 @@ struct HelpAndSettingsGuideView: View {
     // MARK: - 8. Agent & Tool Execution
     private var agentSection: some View {
         VStack(alignment: .leading, spacing: 16) {
-            headerBadge("Tab 5: Agent & Tools", color: .teal)
+            headerBadge("Agent & Tools Section", color: .teal)
 
             Text("Autonomous Agent Engine & Function Calling")
                 .font(.title2).bold()
@@ -483,7 +483,7 @@ struct HelpAndSettingsGuideView: View {
     // MARK: - 9. Advanced Diagnostics
     private var diagnosticsSection: some View {
         VStack(alignment: .leading, spacing: 16) {
-            headerBadge("Tab 6: Advanced Diagnostics", color: .red)
+            headerBadge("Advanced Diagnostics Section", color: .red)
 
             Text("Metal Shaders & Tensor Inspector")
                 .font(.title2).bold()
@@ -536,7 +536,7 @@ struct HelpAndSettingsGuideView: View {
 
             faqCard(
                 "How do I reset my settings to default?",
-                "Open Settings (⌘,) -> Models, click 'Profiles' on your active model, and click 'Reset to Defaults'. This restores factory-tuned parameters for both Coder and Assistant profiles."
+                "Open Settings (⌘,) -> Models, choose 'Configure Profiles…' from your active model's ellipsis menu, and click 'Reset to Defaults'. This restores factory-tuned parameters for the profile you are currently editing (Coder or Assistant), not both at once; repeat for the other profile if needed. The running session keeps its current values until you click 'Apply to Session'."
             )
         }
     }

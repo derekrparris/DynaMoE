@@ -46,13 +46,13 @@ final class SettingsWindowManager: NSObject, NSWindowDelegate {
         self.hostingController = hc
 
         let newWindow = NSWindow(
-            contentRect: NSRect(x: 120, y: 120, width: 820, height: 680),
+            contentRect: NSRect(x: 120, y: 120, width: 900, height: 660),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         newWindow.title = title
-        newWindow.minSize = NSSize(width: 680, height: 540)
+        newWindow.contentMinSize = NSSize(width: 780, height: 560)
         newWindow.center()
         newWindow.setFrameAutosaveName("DynaMoESettingsWindowFrame")
         newWindow.contentViewController = hc
