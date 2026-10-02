@@ -4830,6 +4830,9 @@ final class DynaMoETests: XCTestCase {
 
         let mgr = WorkingSetManager.shared
         defer { mgr.residentMemoryProviderOverride = nil }
+        // initialize may install shard-registry state on the singleton; release it so
+        // later tests don't walk this test's dead buffers on the residency cadence.
+        defer { mgr.releaseShardMappings() }
         mgr.initialize(summary: summary, shardBuffers: shardBuffers, mode: .balanced16GB)
 
         XCTAssertEqual(mgr.residentExpertsCount, 0)
@@ -4962,6 +4965,9 @@ final class DynaMoETests: XCTestCase {
 
         let mgr = WorkingSetManager.shared
         mgr.initialize(summary: summary, shardBuffers: shardBuffers, mode: .balanced16GB)
+        // initialize builds the paging catalog only; the residency registry is
+        // adopted separately (the app does this inside the guarded load install).
+        mgr.registerShardMappings(shardBuffers)
 
         // Prime the active experts using bulk pread via touchAndEvict
         let t0 = CFAbsoluteTimeGetCurrent()
@@ -5055,6 +5061,9 @@ final class DynaMoETests: XCTestCase {
         let mgr = WorkingSetManager.shared
         defer { mgr.releaseShardMappings() }
         mgr.initialize(summary: summary, shardBuffers: shardBuffers, mode: .balanced16GB)
+        // initialize builds the paging catalog only; adopt the registry explicitly
+        // the way the guarded load install does in the app.
+        mgr.registerShardMappings(shardBuffers)
 
         let expectedGB = Double(fileSize) / 1073741824.0
         if mgr.refreshShardResidencyNow() > expectedGB / 2 {

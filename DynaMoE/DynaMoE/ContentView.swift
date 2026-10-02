@@ -520,12 +520,22 @@ final class WorkingSetManager {
         var residentBytes: UInt64 = 0
         for mapping in mappings {
             let alignedLen = mapping.length & ~(pageSize - 1)
-            guard alignedLen > 0 else { continue }
-            var residencyMap = [UInt8](repeating: 0, count: (alignedLen + pageSize - 1) / pageSize)
-            let rc = mincore(mapping.base, alignedLen, &residencyMap)
-            guard rc == 0 else { continue } // mapping already unmapped (model switched out)
-            for flag in residencyMap where flag & 1 != 0 {
-                residentBytes &+= UInt64(pageSize)
+            if alignedLen > 0 {
+                var residencyMap = [UInt8](repeating: 0, count: alignedLen / pageSize)
+                if mincore(mapping.base, alignedLen, &residencyMap) == 0 {
+                    for flag in residencyMap where flag & 1 != 0 {
+                        residentBytes &+= UInt64(pageSize)
+                    }
+                }
+            }
+            // An unaligned tail lives in the page spanning the mapping's end; probe
+            // it on its own so partial pages are not omitted (mincore fails cleanly
+            // when the page is no longer mapped, e.g. after the model unmaps).
+            if mapping.length > alignedLen {
+                var tailFlag: UInt8 = 0
+                if mincore(mapping.base + alignedLen, pageSize, &tailFlag) == 0, tailFlag & 1 != 0 {
+                    residentBytes &+= UInt64(pageSize)
+                }
             }
         }
         let value = Double(residentBytes) / (1024.0 * 1024.0 * 1024.0)
@@ -612,8 +622,6 @@ final class WorkingSetManager {
     }
 
     func initialize(summary: ModelSummary, shardBuffers: [UInt32: MTLBuffer], mode: MemoryBudgetMode) {
-        registerShardMappings(shardBuffers)
-
         lock.lock()
         expertSlices.removeAll()
         denseSlices.removeAll()
@@ -12914,10 +12922,12 @@ if layer.attnGateProjTensor != nil,
                     }
                 }
 
+                // Hoisted so the guarded install below can exclude the pinned backbone
+                // when it adopts the shard registry.
+                var pinnedShardIndex: UInt32? = nil
                 let isFlashMoE = ExpertRepacker.isPackedFormat(dir: dirUrl)
                 if isFlashMoE {
                     ExpertIOThreadPool.shared.initialize(numThreads: 8)
-                    var pinnedShardIndex: UInt32? = nil
 
                     // FlashMoE backbone pinning: the invariant weights (model_weights.bin —
                     // every layer's q/k/v/o/GDN projections, norms, lm_head, embeddings) are
@@ -12953,19 +12963,6 @@ if layer.attnGateProjTensor != nil,
                             print("⚠️ [FlashMoE] Backbone pinning skipped: length \(length) invalid or exceeds maxBufferLength (\(Double(device.maxBufferLength) / 1073741824.0) GB)")
                         }
                     }
-
-                    // FlashMoE loads never call WorkingSetManager.initialize, so the
-                    // residency registry must be adopted here, independently of the
-                    // paging-catalog initialization the regular path performs. A
-                    // pinned backbone is excluded: its anonymous pages are dirty heap
-                    // that the process footprint already counts, so including them
-                    // here would double-report them (and mislabel them as clean
-                    // unified-cache pages).
-                    var registryBuffers = buffers
-                    if let pinnedIdx = pinnedShardIndex {
-                        registryBuffers.removeValue(forKey: pinnedIdx)
-                    }
-                    WorkingSetManager.shared.registerShardMappings(registryBuffers)
                 } else {
                     WorkingSetManager.shared.initialize(summary: loadedSummary, shardBuffers: buffers, mode: memoryBudgetMode)
                     let effMode = memoryExecutionMode.resolveEffectiveMode(modelFootprintGB: mappedGB)
@@ -12981,6 +12978,18 @@ if layer.attnGateProjTensor != nil,
                     self.engine = loadedEngine
                     self.summary = loadedSummary
                     self.shardBuffers = buffers
+                    // Adopt the shard registry only now that this load is the accepted
+                    // one: a superseded task is dropped at the guard above and its
+                    // engine's mmaps can go away behind it, so registering any earlier
+                    // would leave the residency loop walking a rejected model's pointers.
+                    // A pinned backbone (FlashMoE) is excluded — its anonymous pages are
+                    // dirty heap that the footprint line already counts, not clean
+                    // unified-cache pages.
+                    var registryBuffers = buffers
+                    if let pinnedIdx = pinnedShardIndex {
+                        registryBuffers.removeValue(forKey: pinnedIdx)
+                    }
+                    WorkingSetManager.shared.registerShardMappings(registryBuffers)
                     self.modelConfig = cfg
                     self.detectedArchitecture = arch
                     // Do NOT restore a system prompt captured before the load here.

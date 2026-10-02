@@ -2538,6 +2538,17 @@ Fixes (ContentView.swift, SidebarView.swift, SettingsSheetView.swift):
   current, so a walk in flight across a registry swap or release cannot write
   the old model's residency into the new model's cache. Regression test:
   `testRegisterShardMappingsSwapsRegistryIndependently`.
+- Fifth Copilot round: registry adoption now happens inside the guarded load
+  install (after the `modelLoadToken` check), not before it — a superseded task
+  registering its engine's mappings and then being rejected would leave the
+  residency loop walking a dropped engine's pointers, stranded if the next
+  load also failed. `initialize` is back to paging-catalog-only duty; registry
+  adoption is exclusively `registerShardMappings`, called from the guarded
+  install for every load path (a pinned backbone still excluded). The walker
+  now probes a mapping's unaligned tail page separately instead of flooring
+  the length to page granularity, so partial pages are no longer omitted.
+  Tests release the singleton's registry when they're done with it, so the
+  background cadence never walks a completed test's dead mock buffers.
 
 Verification: probe on macOS 26.7.1 / M1 Pro (in-process metrics matched the
 `footprint` CLI and vmmap at every phase); Xcode build green;
