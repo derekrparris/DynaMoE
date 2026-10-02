@@ -2502,11 +2502,21 @@ Fixes (ContentView.swift, SidebarView.swift, SettingsSheetView.swift):
   having been the removed pread paths), and every "Process Heap" label is now
   "Process Footprint" — phys_footprint includes compressed memory and IOKit
   allocations, not just heap.
+- Second Copilot round: the injected resident-memory seam assertions now pin the
+  no-double-count contract exactly (the injected 2.5 GB must pass through even
+  with 480 experts tracked; the mock catalogue alone adds ~480 KiB of dense
+  bytes, an order of magnitude above the 1e-4 GB tolerance), and
+  `testPrimeSlicesFaultsReadOnlyMmapPages` proves the stride touch on a REAL
+  F_NOCACHE-cold file read-only-mmap'd and wrapped in
+  `MTLBuffer(bytesNoCopy:)`: mincore reports ~0 residency before priming and the
+  full 1 MB after, so the old pread EFAULT no-op (which left it cold) fails the
+  test instead of passing silently.
 
 Verification: probe on macOS 26.7.1 / M1 Pro (in-process metrics matched the
 `footprint` CLI and vmmap at every phase); Xcode build green;
-`testWorkingSetManagerTokenBoundaryEviction` and
-`testWorkingSetManagerBulkPreadPriming` pass. The former now pins the
+`testWorkingSetManagerTokenBoundaryEviction`,
+`testWorkingSetManagerBulkPreadPriming`, and
+`testPrimeSlicesFaultsReadOnlyMmapPages` pass. The first pins the
 no-double-count contract through an injected resident-memory seam
 (`effectiveResidentMemoryGB` must equal the provided RSS exactly while 480
 experts are tracked); the latter exercises the mincore() walker over a

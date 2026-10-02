@@ -4987,6 +4987,81 @@ final class DynaMoETests: XCTestCase {
         print("🎉 [SUCCESS] Bulk pread priming test passed!")
     }
 
+    // Regression test for the pread EFAULT no-op (QA #50): priming must fault the
+    // pages of a real read-only mmap wrapped in MTLBuffer(bytesNoCopy:), the app's
+    // exact shard strategy. The old fd-based pread path returned EFAULT on the
+    // first chunk and left the mapping untouched, so the mincore walk below would
+    // see ~0 residency; the stride touch must make every page resident.
+    func testPrimeSlicesFaultsReadOnlyMmapPages() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("Metal not available")
+        }
+
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        // 1 MB page-multiple file, written with F_NOCACHE so the unified page
+        // cache does not pre-warm the mapping: priming is what must fault it.
+        let fileURL = tempDir.appendingPathComponent("readonly_shard.bin")
+        let fileSize = 64 * 16384
+        let writeFd = open(fileURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        guard writeFd >= 0 else { XCTFail("could not create temp shard file"); return }
+        _ = fcntl(writeFd, F_NOCACHE, 1)
+        var pattern = [UInt8](repeating: 0xA5, count: fileSize)
+        let wroteAll = pattern.withUnsafeMutableBytes { raw in
+            var written = 0
+            while written < fileSize {
+                let n = write(writeFd, raw.baseAddress!.advanced(by: written), fileSize - written)
+                if n <= 0 { return false }
+                written += n
+            }
+            return true
+        }
+        XCTAssertTrue(wroteAll, "failed to write temp shard file")
+        fsync(writeFd)
+        close(writeFd)
+
+        // Read-only mmap + zero-copy Metal wrap: the app's real shard strategy.
+        let mapFd = open(fileURL.path, O_RDONLY)
+        guard mapFd >= 0 else { XCTFail("could not open temp shard file"); return }
+        defer { close(mapFd) }
+        let mapPtr = mmap(nil, fileSize, PROT_READ, MAP_SHARED, mapFd, 0)
+        guard Int(bitPattern: mapPtr) != -1 else { XCTFail("mmap failed, errno \(errno)"); return }
+        defer { munmap(mapPtr, fileSize) }
+        guard let buffer = device.makeBuffer(bytesNoCopy: mapPtr!, length: fileSize, options: .storageModeShared, deallocator: nil) else {
+            XCTFail("bytesNoCopy wrap of read-only mmap failed"); return
+        }
+        let shardBuffers: [UInt32: MTLBuffer] = [0: buffer]
+
+        let summary = ModelSummary(
+            sizeGb: 0.001,
+            tensorCount: 0,
+            layerCount: 0,
+            maxExpertId: 0,
+            shards: [ShardMetadata(index: 0, filename: "readonly_shard.bin",
+                                   baseAddress: UInt64(UInt(bitPattern: mapPtr!)),
+                                   length: UInt64(fileSize))],
+            tensors: [],
+            layers: []
+        )
+
+        let mgr = WorkingSetManager.shared
+        defer { mgr.releaseShardMappings() }
+        mgr.initialize(summary: summary, shardBuffers: shardBuffers, mode: .balanced16GB)
+
+        let expectedGB = Double(fileSize) / 1073741824.0
+        if mgr.residentShardBytesGB > expectedGB / 2 {
+            throw XCTSkip("file pages pre-warmed in the unified page cache; cannot prove priming faults them")
+        }
+
+        mgr.primeSlices([ExpertSlice(shardIndex: 0, offset: 0, length: UInt64(fileSize))],
+                        shardBuffers: shardBuffers)
+
+        XCTAssertEqual(mgr.residentShardBytesGB, expectedGB, accuracy: 0.00001,
+                       "stride touch must fault every page of the read-only bytesNoCopy mapping; the old pread fast path left them cold")
+    }
+
     func testOrnithRMSNormIsNotUnitOffset() throws {
         print("=== TEST ORNITH & QWEN 3.8 RMSNORM & GATING CONFIGS ===")
         let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--mlx-community--Ornith-1.5-9B-OptiQ-4bit/snapshots/ad2e7748e8c9d36b82bb88307fd21c0d50be85b8"
