@@ -125,10 +125,10 @@ DynaMoE automatically defaults to and persists the official publisher-tuned prof
   - **Max Tokens**: $4,096$ | **JetSpec**: Enabled (draft speculative decoding)
 
 #### Profile Customization & Persistence
-1. Click any model card in the **Models** tab or click its **"Profiles"** button.
-2. Select either the **Coder** or **Assistant** tab in the inspector.
+1. Open the **Models** section, click the **⋯** (ellipsis) menu on your model, and choose **"Configure Profiles…"**.
+2. Switch between the **Coder** and **Assistant** segments in the inspector.
 3. Customize hyperparameters specifically for that model (Temperature, Top-P, Min-P, Top-K, Repetition Penalty, Presence Penalty, Max Tokens, JetSpec, System Prompt).
-4. Click **Save Profile** to persist these settings permanently to `UserDefaults`.
+4. Click **Save [Coder/Assistant] Profile** to persist these settings permanently to `UserDefaults`.
 5. In the chat interface, toggle between **[ 💻 Coder ▾ ]** and **[ 💬 Assistant ▾ ]** right next to the model selector with zero friction.
 
 ---
@@ -140,7 +140,7 @@ The **Generation** section configures the mathematical sampling engine used duri
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
 │  Generation Section                                                    │
-│  Active Profile: [ 💻 Coder ]  [ 💬 Assistant ]   [ Save to Coder ]    │
+│  Active Profile: [ Coder ]  [ Assistant ]              [ Save ]       │
 │                                                                        │
 │  Temperature: 0.60 ────────●──────────────  Top-P: 0.95 ───────────●── │
 │  Min-P: 0.00 ●────────────────────────────  Top-K: 20   ─────●──────── │
@@ -150,7 +150,7 @@ The **Generation** section configures the mathematical sampling engine used duri
 ```
 
 ### Active Profile Banner & Fast Switching
-At the top of the Generation tab, an active profile banner indicates which profile is currently governing the session. Any slider adjustments made here can be saved back to that profile using the **"Save to [Active Profile]"** button.
+At the top of the Generation section, an active profile banner indicates which profile is currently governing the session. Any adjustments made here can be saved back to that profile using the **"Save"** button.
 
 ### Sampling Parameters (Math & Practical Tuning)
 
@@ -394,4 +394,4 @@ Test GPU compute pipelines in isolation without running full autoregressive gene
 **A:** It converts scattered expert weights across multiple SafeTensors shards into contiguous per-layer binary files (`packed_experts/layer_XX.bin`), enabling DynaMoE to stream active MoE experts via high-speed POSIX direct I/O without disk seek latency.
 
 #### Q: How do I restore default settings?
-**A:** Open **Settings $\to$ Models**, click **"Profiles"** on your active model, and click **Reset to Defaults**. This will immediately restore factory-tuned parameters for both Coder and Assistant profiles.
+**A:** Open **Settings $\to$ Models**, click the **⋯** (ellipsis) menu on your active model, choose **"Configure Profiles…"**, and click **Reset to Defaults**. This will immediately restore factory-tuned parameters for both Coder and Assistant profiles.
