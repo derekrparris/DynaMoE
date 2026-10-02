@@ -2549,6 +2549,12 @@ Fixes (ContentView.swift, SidebarView.swift, SettingsSheetView.swift):
   the length to page granularity, so partial pages are no longer omitted.
   Tests release the singleton's registry when they're done with it, so the
   background cadence never walks a completed test's dead mock buffers.
+- Sixth Copilot round (high finding): the failed-load catch path clears the
+  installed engine and `shardBuffers` but left the adopted registry probing
+  those addresses on the 2 s cadence — and if the next load reuses the virtual
+  addresses, mincore would report unrelated memory as shard residency.
+  `releaseShardMappings()` now runs in that catch block (teardown of the
+  installed set), alongside the engine/buffer clear.
 
 Verification: probe on macOS 26.7.1 / M1 Pro (in-process metrics matched the
 `footprint` CLI and vmmap at every phase); Xcode build green;

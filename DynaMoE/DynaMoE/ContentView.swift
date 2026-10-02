@@ -13042,6 +13042,12 @@ if layer.attnGateProjTensor != nil,
                     self.summary = nil
                     self.engine = nil
                     self.shardBuffers.removeAll()
+                    // The installed model is being torn down, so drop its shard registry
+                    // as well: the residency cadence would otherwise keep probing these
+                    // addresses every 2 s after their mmaps are gone — and if the next
+                    // load reuses the virtual addresses, mincore would report unrelated
+                    // memory as shard residency.
+                    WorkingSetManager.shared.releaseShardMappings()
                     // No usable engine is installed; clear the identity so an async
                     // send cannot treat a stale `activeLoadedModelPath` as ready.
                     self.installedModelPath = nil
