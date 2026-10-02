@@ -52,7 +52,7 @@ final class SettingsWindowManager: NSObject, NSWindowDelegate {
             defer: false
         )
         newWindow.title = title
-        newWindow.minSize = NSSize(width: 780, height: 520)
+        newWindow.contentMinSize = NSSize(width: 780, height: 560)
         newWindow.center()
         newWindow.setFrameAutosaveName("DynaMoESettingsWindowFrame")
         newWindow.contentViewController = hc

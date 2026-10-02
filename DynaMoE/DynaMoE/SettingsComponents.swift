@@ -200,6 +200,7 @@ struct SettingsStatusBadge: View {
 /// feel paired with a narrow editable field for typing exact values. Values in
 /// the field are clamped to the slider's range; there are no stepper arrows.
 struct SettingsValueSlider: View {
+    let label: String
     let value: Binding<Double>
     let range: ClosedRange<Double>
     let step: Double
@@ -211,12 +212,14 @@ struct SettingsValueSlider: View {
         HStack(spacing: 10) {
             Slider(value: clamped, in: range, step: step)
                 .frame(width: sliderWidth)
+                .accessibilityLabel(label)
 
             TextField("", value: clamped, format: .number.precision(.fractionLength(fractionDigits)))
                 .textFieldStyle(.roundedBorder)
                 .font(.system(size: 12, design: .monospaced))
                 .multilineTextAlignment(.trailing)
                 .frame(width: fieldWidth)
+                .accessibilityLabel("\(label) value")
         }
     }
 

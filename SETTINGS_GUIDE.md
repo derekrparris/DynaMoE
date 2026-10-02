@@ -6,29 +6,29 @@ A comprehensive, practical guide to configuring, tuning, and operating DynaMoE o
 
 ## Table of Contents
 1. [Overview & Accessing Settings](#1-overview--accessing-settings)
-2. [Tab 1: Models & Binary Repackaging](#2-tab-1-models--binary-repackaging)
+2. [Models & Binary Repackaging](#2-models--binary-repackaging)
    - [Local Model Discovery](#local-model-discovery)
    - [Default & Last Used Model](#default--last-used-model)
    - [MoE Contiguous Binary Repackaging (Flash-MoE)](#moe-contiguous-binary-repackaging-flash-moe)
    - [Model-Specific Profiles ("Coder" & "Assistant")](#model-specific-profiles-coder--assistant)
-3. [Tab 2: Generation & Sampling Hyperparameters](#3-tab-2-generation--sampling-hyperparameters)
+3. [Generation & Sampling Hyperparameters](#3-generation--sampling-hyperparameters)
    - [Active Profile Banner & Fast Switching](#active-profile-banner--fast-switching)
    - [Sampling Parameters (Math & Practical Tuning)](#sampling-parameters-math--practical-tuning)
    - [System Prompts & Conjunction Merging](#system-prompts--conjunction-merging)
    - [JetSpec Speculative Tree Acceleration](#jetspec-speculative-tree-acceleration)
-4. [Tab 3: Memory & SSD Management](#4-tab-3-memory--ssd-management)
+4. [Memory & SSD Management](#4-memory--ssd-management)
    - [Memory Execution Modes (Auto, Full RAM, SSD Streaming)](#memory-execution-modes)
    - [Memory Budget Modes & Limits](#memory-budget-modes--limits)
    - [KV Cache Precision (FP32, FP16, FP8 E4M3/E5M2)](#kv-cache-precision)
    - [Speculative MoE Lookahead Prefetching](#speculative-moe-lookahead-prefetching)
    - [Live Diagnostics & Working Set Metrics](#live-diagnostics--working-set-metrics)
    - [Cache Maintenance: Flush vs. Pre-Fault](#cache-maintenance-flush-vs-pre-fault)
-5. [Tab 4: Agent & Tools](#5-tab-4-agent--tools)
+5. [Agent & Tools](#5-agent--tools)
    - [Global Agent Enablement & Sandbox Directory](#global-agent-enablement--sandbox-directory)
    - [Safety Limits (Max Output & Max Steps)](#safety-limits)
    - [Search Integrations (Headless Chrome & Brave Search)](#search-integrations)
    - [Built-In Local Tools Reference](#built-in-local-tools-reference)
-6. [Tab 5: Advanced Diagnostics](#6-tab-5-advanced-diagnostics)
+6. [Advanced Diagnostics](#6-advanced-diagnostics)
    - [SafeTensors Sharded Metadata & Search](#safetensors-sharded-metadata--search)
    - [Direct Metal Kernel Execution Harness](#direct-metal-kernel-execution-harness)
 7. [Hardware Profiles & Recommended Configurations](#7-hardware-profiles--recommended-configurations)
@@ -54,13 +54,13 @@ DynaMoE provides centralized control over model inference, GPU shader dispatch, 
 
 ---
 
-## 2. Tab 1: Models & Binary Repackaging
+## 2. Models & Binary Repackaging
 
 The **Models** section acts as your local model registry and management hub.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
-│  Models Tab                                                            │
+│  Models Section                                                        │
 │  ┌──────────────────────────────────────────────────────────────────┐  │
 │  │ 📦 mlx-community/Ornith-1.5-9B-OptiQ-4bit    [Active] [Profiles] │  │
 │  │    Architecture: Hybrid GDN + GQA | Precision: 4-bit | 5.4 GB    │  │
@@ -133,13 +133,13 @@ DynaMoE automatically defaults to and persists the official publisher-tuned prof
 
 ---
 
-## 3. Tab 2: Generation & Sampling Hyperparameters
+## 3. Generation & Sampling Hyperparameters
 
 The **Generation** section configures the mathematical sampling engine used during autoregressive token decoding.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
-│  Generation Tab                                                        │
+│  Generation Section                                                    │
 │  Active Profile: [ 💻 Coder ]  [ 💬 Assistant ]   [ Save to Coder ]    │
 │                                                                        │
 │  Temperature: 0.60 ────────●──────────────  Top-P: 0.95 ───────────●── │
@@ -223,13 +223,13 @@ JetSpec accelerates token generation by proposing structured trees of candidate 
 
 ---
 
-## 4. Tab 3: Memory & SSD Management
+## 4. Memory & SSD Management
 
 The **Memory & SSD** section controls how model weights and runtime caches are allocated across Apple Silicon's Unified Memory Architecture (UMA) and NVMe storage.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
-│  Memory & SSD Tab                                                      │
+│  Memory & SSD Section                                                  │
 │  Memory Execution Mode:  [ Auto (Smart) ]  [ Full RAM ]  [ SSD Stream ]│
 │  Memory Budget Mode:     [ Balanced (16GB) ▾ ]                         │
 │  KV Cache Precision:     [ FP16 ▾ ]                                    │
@@ -276,13 +276,13 @@ When running sparse MoE models in SSD streaming mode:
 
 ---
 
-## 5. Tab 4: Agent & Tools
+## 5. Agent & Tools
 
 The **Agent & Tools** section configures DynaMoE's autonomous agent engine, tool-calling loop, and external search integrations.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
-│  Agent & Tools Tab                                                     │
+│  Agent & Tools Section                                                 │
 │  Autonomous Tool Calling:  [ON]                                        │
 │  Working Directory:        [/Users/username/Workspace/Projects] [Pick] │
 │  Max Tool Output:          [4000 characters ▾]                         │
@@ -323,13 +323,13 @@ DynaMoE equips models with the following native tools:
 
 ---
 
-## 6. Tab 5: Advanced Diagnostics
+## 6. Advanced Diagnostics
 
 The **Advanced Diagnostics** section is an engineering inspection suite for validating Metal shaders, examining raw SafeTensors tensors, and testing layer forward execution independently of chat generation.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
-│  Advanced Diagnostics Tab                                              │
+│  Advanced Diagnostics Section                                          │
 │  Category Filter: [ All ] [ Attention ] [ Experts ] [ Router ] [ Norm ]│
 │  Search Tensors:  [ model.layers.0.mlp... ]                            │
 │                                                                        │

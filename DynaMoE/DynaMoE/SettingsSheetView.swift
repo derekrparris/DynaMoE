@@ -283,7 +283,7 @@ struct SettingsSheetView: View {
                     title: "Enable Auto-Updates",
                     subtitle: "Automatically check for new DynaMoE releases in the background. Updates are verified and installed safely; you can always check manually with ⌘U."
                 ) {
-                    Toggle("", isOn: Binding(
+                    Toggle("Enable Auto-Updates", isOn: Binding(
                         get: { UpdaterViewModel.shared.automaticallyChecksForUpdates },
                         set: { UpdaterViewModel.shared.automaticallyChecksForUpdates = $0 }
                     ))
@@ -325,7 +325,7 @@ struct SettingsSheetView: View {
                     title: "Expand Thinking by Default",
                     subtitle: "Show the thinking/reasoning accordion expanded when a message first appears. When off, reasoning starts collapsed and can be opened manually."
                 ) {
-                    Toggle("", isOn: $reasoningExpandedByDefault)
+                    Toggle("Expand Thinking by Default", isOn: $reasoningExpandedByDefault)
                         .toggleStyle(.switch)
                         .labelsHidden()
                 }
@@ -336,7 +336,7 @@ struct SettingsSheetView: View {
                     title: "Auto-Delete Old Conversations",
                     subtitle: "Keep conversations saved between launches, removing the oldest automatically once the limit below is reached. Turn off to keep every conversation forever."
                 ) {
-                    Toggle("", isOn: $chatAutoDeleteEnabled)
+                    Toggle("Auto-Delete Old Conversations", isOn: $chatAutoDeleteEnabled)
                         .toggleStyle(.switch)
                         .labelsHidden()
                 }
@@ -404,7 +404,7 @@ struct SettingsSheetView: View {
         digits: Int = 2
     ) -> some View {
         SettingsRow(title: title, subtitle: subtitle) {
-            SettingsValueSlider(value: value, range: range, step: step, fractionDigits: digits)
+            SettingsValueSlider(label: title, value: value, range: range, step: step, fractionDigits: digits)
         }
     }
 
@@ -764,6 +764,7 @@ struct SettingsSheetView: View {
                     subtitle: "Hard cap on tokens generated per response."
                 ) {
                     SettingsValueSlider(
+                        label: "Max Output Tokens",
                         value: doubleBinding($maxNewTokens),
                         range: 32...10000,
                         step: 32,
@@ -801,7 +802,7 @@ struct SettingsSheetView: View {
                         icon: "arrow.triangle.branch",
                         iconTint: .purple
                     ) {
-                        Toggle("", isOn: $jetSpecEnabled)
+                        Toggle("Enable JetSpec", isOn: $jetSpecEnabled)
                             .toggleStyle(.switch)
                             .labelsHidden()
                     }
@@ -992,7 +993,7 @@ struct SettingsSheetView: View {
                     title: "MoE Expert & Layer Prefetching",
                     subtitle: "Asynchronously warms next-layer backbone weights and predicted expert slices in the background before GPU execution."
                 ) {
-                    Toggle("", isOn: $speculativePrefetchEnabled)
+                    Toggle("MoE Expert & Layer Prefetching", isOn: $speculativePrefetchEnabled)
                         .toggleStyle(.switch)
                         .labelsHidden()
                 }
@@ -1096,7 +1097,7 @@ struct SettingsSheetView: View {
                     subtitle: "Equips models with shell execution, file reading/writing, and semantic search via ChatML <tool_call> tags.",
                     icon: "terminal.fill"
                 ) {
-                    Toggle("", isOn: $isAgentToolsGloballyEnabled)
+                    Toggle("Enable Agent Tools by Default", isOn: $isAgentToolsGloballyEnabled)
                         .toggleStyle(.switch)
                         .labelsHidden()
                 }
@@ -1109,7 +1110,7 @@ struct SettingsSheetView: View {
                     icon: "bolt.fill",
                     iconTint: .orange
                 ) {
-                    Toggle("", isOn: $isTurboModeEnabled)
+                    Toggle("Agent Turbo Mode (Auto-Approve)", isOn: $isTurboModeEnabled)
                         .toggleStyle(.switch)
                         .labelsHidden()
                 }
@@ -1122,7 +1123,7 @@ struct SettingsSheetView: View {
                     icon: "checkmark.shield.fill",
                     iconTint: .green
                 ) {
-                    Toggle("", isOn: $isGrammarMaskingEnabled)
+                    Toggle("Grammar-Constrained Tool Sampling", isOn: $isGrammarMaskingEnabled)
                         .toggleStyle(.switch)
                         .labelsHidden()
                 }
@@ -1207,6 +1208,7 @@ struct SettingsSheetView: View {
                         get: { Double(maxToolOutputLength) },
                         set: { maxToolOutputLength = Int($0) }
                     ), in: 1000...16000, step: 500)
+                    .accessibilityLabel("Max Tool Output (tokens)")
                 }
                 .padding(.vertical, 8)
 
@@ -1231,6 +1233,7 @@ struct SettingsSheetView: View {
                         get: { Double(maxAgentSteps) },
                         set: { maxAgentSteps = Int($0) }
                     ), in: 1...30, step: 1)
+                    .accessibilityLabel("Max Multi-Step Agent Iterations")
                 }
                 .padding(.vertical, 8)
             }
@@ -1847,6 +1850,7 @@ struct SettingsSheetView: View {
                             .foregroundStyle(.secondary)
                     }
                     Slider(value: $editingDraft.temperature, in: 0.0...2.0, step: 0.05)
+                        .accessibilityLabel("Temperature")
                 }
 
                 // Top-P (Nucleus)
@@ -1861,6 +1865,7 @@ struct SettingsSheetView: View {
                             .foregroundStyle(.secondary)
                     }
                     Slider(value: $editingDraft.topP, in: 0.0...1.0, step: 0.05)
+                        .accessibilityLabel("Top-P (Nucleus)")
                 }
 
                 // Min-P
@@ -1875,6 +1880,7 @@ struct SettingsSheetView: View {
                             .foregroundStyle(.secondary)
                     }
                     Slider(value: $editingDraft.minP, in: 0.0...0.5, step: 0.01)
+                        .accessibilityLabel("Min-P (Dynamic Truncation)")
                 }
 
                 // Top-K
@@ -1892,6 +1898,7 @@ struct SettingsSheetView: View {
                         get: { Float(editingDraft.topK) },
                         set: { editingDraft.topK = Int($0) }
                     ), in: 1...100, step: 1)
+                    .accessibilityLabel("Top-K")
                 }
 
                 // Repetition Penalty
@@ -1906,6 +1913,7 @@ struct SettingsSheetView: View {
                             .foregroundStyle(.secondary)
                     }
                     Slider(value: $editingDraft.repetitionPenalty, in: 1.0...2.0, step: 0.05)
+                        .accessibilityLabel("Repetition Penalty")
                 }
 
                 // Presence Penalty
@@ -1920,6 +1928,7 @@ struct SettingsSheetView: View {
                             .foregroundStyle(.secondary)
                     }
                     Slider(value: $editingDraft.presencePenalty, in: 0.0...2.0, step: 0.05)
+                        .accessibilityLabel("Presence Penalty")
                 }
 
                 // Max Output Tokens
@@ -1937,6 +1946,7 @@ struct SettingsSheetView: View {
                         get: { Float(editingDraft.maxNewTokens) },
                         set: { editingDraft.maxNewTokens = Int($0) }
                     ), in: 32...10000, step: 32)
+                    .accessibilityLabel("Max Output Tokens")
 
                     HStack(spacing: 5) {
                         Text("Presets:")
