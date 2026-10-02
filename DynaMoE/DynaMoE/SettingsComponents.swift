@@ -8,8 +8,9 @@
 
 import SwiftUI
 
-/// Large header banner shown at the top of a settings detail pane: a tinted icon
-/// tile, a bold title, and a short descriptive subtitle.
+/// Pane header shown at the top of a settings detail pane, following the macOS
+/// System Settings pattern: a tinted icon tile, a bold pane title, and a short
+/// descriptive subtitle, centered with no enclosing card.
 struct SettingsSectionBanner: View {
     let icon: String
     let title: String
@@ -17,69 +18,77 @@ struct SettingsSectionBanner: View {
     var tint: Color = .accentColor
 
     var body: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 8) {
             Image(systemName: icon)
-                .font(.system(size: 26, weight: .semibold))
-                .foregroundColor(.white)
-                .frame(width: 54, height: 54)
+                .font(.system(size: 30, weight: .medium))
+                .foregroundStyle(.white)
+                .frame(width: 58, height: 58)
                 .background(tint.gradient)
-                .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .padding(.bottom, 4)
 
             Text(title)
                 .font(.system(size: 20, weight: .bold))
 
             Text(subtitle)
                 .font(.system(size: 12))
-                .foregroundColor(.secondary)
+                .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: 520)
+                .frame(maxWidth: 460)
         }
         .frame(maxWidth: .infinity)
-        .padding(.vertical, 22)
-        .padding(.horizontal, 24)
-        .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.6))
-        )
+        .padding(.top, 4)
+        .padding(.bottom, 8)
     }
 }
 
-/// A grouped, rounded container holding a set of related settings rows.
+/// A grouped, rounded container holding a set of related settings rows, modeled
+/// on System Settings' inset groups: a bold section label, a white card, and an
+/// optional gray support line under the card.
 struct SettingsCard<Content: View>: View {
     private let header: String?
+    private let footer: String?
     private let spacing: CGFloat
     private let content: Content
 
-    init(header: String? = nil, spacing: CGFloat = 0, @ViewBuilder content: () -> Content) {
+    init(header: String? = nil, footer: String? = nil, spacing: CGFloat = 0, @ViewBuilder content: () -> Content) {
         self.header = header
+        self.footer = footer
         self.spacing = spacing
         self.content = content()
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 7) {
             if let header {
-                Text(header.uppercased())
-                    .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundColor(.secondary)
-                    .padding(.leading, 4)
+                Text(header)
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .padding(.leading, 8)
             }
 
             VStack(alignment: .leading, spacing: spacing) {
                 content
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .fill(Color(nsColor: .controlBackgroundColor))
             )
             .overlay(
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(Color.primary.opacity(0.08), lineWidth: 1)
             )
+
+            if let footer {
+                Text(footer)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 8)
+            }
         }
     }
 }
@@ -92,8 +101,9 @@ struct SettingsRowDivider: View {
     }
 }
 
-/// A standard settings row: optional leading icon tile, a title with an optional
-/// subtitle, and a trailing accessory (control, button, or value label).
+/// A standard settings row: an optional leading icon tile, a title with an
+/// optional gray subtitle, and a trailing accessory (control, button, or value
+/// label). Rows sit edge-to-edge inside a `SettingsCard`.
 struct SettingsRow<Trailing: View>: View {
     private let title: String
     private let subtitle: String?
@@ -119,20 +129,20 @@ struct SettingsRow<Trailing: View>: View {
         HStack(alignment: .center, spacing: 12) {
             if let icon {
                 Image(systemName: icon)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(.white)
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white)
                     .frame(width: 26, height: 26)
                     .background(iconTint.gradient)
-                    .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: 6.5, style: .continuous))
             }
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
-                    .font(.system(size: 13, weight: .medium))
+                    .font(.system(size: 13))
                 if let subtitle {
                     Text(subtitle)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -141,23 +151,7 @@ struct SettingsRow<Trailing: View>: View {
 
             trailing
         }
-        .padding(.vertical, 10)
-    }
-}
-
-/// Small monospaced value pill used for read-only trailing values.
-struct SettingsValuePill: View {
-    let text: String
-    var tint: Color = .secondary
-
-    var body: some View {
-        Text(text)
-            .font(.system(size: 11, weight: .medium, design: .monospaced))
-            .foregroundColor(tint)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(tint.opacity(0.12))
-            .cornerRadius(6)
+        .padding(.vertical, 8)
     }
 }
 

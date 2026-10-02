@@ -194,6 +194,22 @@ struct SettingsSheetView: View {
         }
         .navigationSplitViewStyle(.balanced)
         .toolbar(removing: .sidebarToggle)
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button(action: {
+                    openWindow(id: "dynamoe-help")
+                }) {
+                    Label("Help & Guide", systemImage: "questionmark.circle")
+                }
+                .help("Open DynaMoE Help & Settings Guide (⌘?)")
+
+                Button("Done") {
+                    SettingsWindowManager.shared.close()
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
         .frame(minWidth: 780, minHeight: 560)
         .background(Color(NSColor.windowBackgroundColor))
     }
@@ -202,10 +218,15 @@ struct SettingsSheetView: View {
     private var settingsSidebar: some View {
         List(selection: $selectedTab) {
             ForEach(filteredSettingsTabs) { tab in
-                Label(tab.rawValue, systemImage: tab.icon)
-                    .font(.system(size: 13, weight: .medium))
-                    .padding(.vertical, 3)
-                    .tag(tab)
+                Label {
+                    Text(tab.rawValue)
+                } icon: {
+                    Image(systemName: tab.icon)
+                        .foregroundColor(tab.bannerTint)
+                }
+                .font(.system(size: 13))
+                .padding(.vertical, 2)
+                .tag(tab)
             }
         }
         .listStyle(.sidebar)
@@ -222,71 +243,45 @@ struct SettingsSheetView: View {
     }
 
     private var settingsDetail: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Spacer()
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                SettingsSectionBanner(
+                    icon: selectedTab.icon,
+                    title: selectedTab.rawValue,
+                    subtitle: selectedTab.bannerSubtitle,
+                    tint: selectedTab.bannerTint
+                )
 
-                Button(action: {
-                    openWindow(id: "dynamoe-help")
-                }) {
-                    Label("Help & Guide", systemImage: "questionmark.circle")
-                        .font(.system(size: 11, weight: .medium))
+                switch selectedTab {
+                case .general:
+                    generalSettingsSection
+                case .models:
+                    modelsSettingsSection
+                case .generation:
+                    generationSettingsSection
+                case .memory:
+                    memorySettingsSection
+                case .agent:
+                    agentSettingsSection
+                case .advanced:
+                    advancedDiagnosticsSection
                 }
-                .buttonStyle(.bordered)
-                .help("Open DynaMoE Help & Settings Guide (⌘?)")
-
-                Button("Done") {
-                    SettingsWindowManager.shared.close()
-                    dismiss()
-                }
-                .keyboardShortcut(.defaultAction)
-                .buttonStyle(.borderedProminent)
             }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 10)
-
-            Divider()
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    SettingsSectionBanner(
-                        icon: selectedTab.icon,
-                        title: selectedTab.rawValue,
-                        subtitle: selectedTab.bannerSubtitle,
-                        tint: selectedTab.bannerTint
-                    )
-
-                    switch selectedTab {
-                    case .general:
-                        generalSettingsSection
-                    case .models:
-                        modelsSettingsSection
-                    case .generation:
-                        generationSettingsSection
-                    case .memory:
-                        memorySettingsSection
-                    case .agent:
-                        agentSettingsSection
-                    case .advanced:
-                        advancedDiagnosticsSection
-                    }
-                }
-                .padding(24)
-                .frame(maxWidth: 860, alignment: .leading)
-                .frame(maxWidth: .infinity)
-            }
+            .padding(.horizontal, 28)
+            .padding(.vertical, 16)
+            .frame(maxWidth: 820, alignment: .leading)
+            .frame(maxWidth: .infinity)
         }
         .background(Color(NSColor.windowBackgroundColor))
     }
 
     // MARK: - Tab 0: General
     private var generalSettingsSection: some View {
-        VStack(alignment: .leading, spacing: 18) {
+        VStack(alignment: .leading, spacing: 22) {
             SettingsCard(header: "Updates") {
                 SettingsRow(
                     title: "Enable Auto-Updates",
-                    subtitle: "Automatically check for new DynaMoE releases in the background. Updates are verified and installed safely; you can always check manually with ⌘U.",
-                    icon: "arrow.triangle.2.circlepath"
+                    subtitle: "Automatically check for new DynaMoE releases in the background. Updates are verified and installed safely; you can always check manually with ⌘U."
                 ) {
                     Toggle("", isOn: Binding(
                         get: { UpdaterViewModel.shared.automaticallyChecksForUpdates },
@@ -300,16 +295,15 @@ struct SettingsSheetView: View {
 
                 SettingsRow(
                     title: "Check for Updates Now",
-                    subtitle: "Manually query the update feed regardless of the automatic setting.",
-                    icon: "arrow.down.circle"
+                    subtitle: "Manually query the update feed regardless of the automatic setting."
                 ) {
                     Button(action: {
                         UpdaterViewModel.shared.checkForUpdates()
                     }) {
                         Label("Check Now", systemImage: "arrow.down.circle")
-                            .font(.system(size: 12, weight: .medium))
                     }
                     .buttonStyle(.bordered)
+                    .controlSize(.small)
                     .disabled(!updaterViewModel.canCheckForUpdates)
                     .help("Check for updates now (⌘U)")
                 }
@@ -318,19 +312,18 @@ struct SettingsSheetView: View {
 
                 SettingsRow(
                     title: "Current Version",
-                    subtitle: "The DynaMoE release currently installed.",
-                    icon: "number"
+                    subtitle: "The DynaMoE release currently installed."
                 ) {
-                    SettingsValuePill(text: versionDisplayString)
+                    Text(versionDisplayString)
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
                 }
             }
 
             SettingsCard(header: "Chat & Reasoning") {
                 SettingsRow(
                     title: "Expand Thinking by Default",
-                    subtitle: "Show the thinking/reasoning accordion expanded when a message first appears. When off, reasoning starts collapsed and can be opened manually.",
-                    icon: "brain.head.profile",
-                    iconTint: .purple
+                    subtitle: "Show the thinking/reasoning accordion expanded when a message first appears. When off, reasoning starts collapsed and can be opened manually."
                 ) {
                     Toggle("", isOn: $reasoningExpandedByDefault)
                         .toggleStyle(.switch)
@@ -341,9 +334,7 @@ struct SettingsSheetView: View {
 
                 SettingsRow(
                     title: "Auto-Delete Old Conversations",
-                    subtitle: "Keep conversations saved between launches, removing the oldest automatically once the limit below is reached. Turn off to keep every conversation forever.",
-                    icon: "clock.arrow.circlepath",
-                    iconTint: .orange
+                    subtitle: "Keep conversations saved between launches, removing the oldest automatically once the limit below is reached. Turn off to keep every conversation forever."
                 ) {
                     Toggle("", isOn: $chatAutoDeleteEnabled)
                         .toggleStyle(.switch)
@@ -355,13 +346,11 @@ struct SettingsSheetView: View {
 
                     SettingsRow(
                         title: "Conversations to Keep",
-                        subtitle: "The most-recently-updated conversations retained before older ones are deleted. The conversation you have open is always kept.",
-                        icon: "tray.full",
-                        iconTint: .teal
+                        subtitle: "The most-recently-updated conversations retained before older ones are deleted. The conversation you have open is always kept."
                     ) {
-                        HStack(spacing: 8) {
+                        HStack(spacing: 6) {
                             Text("\(chatRetentionLimit)")
-                                .font(.system(size: 12, design: .monospaced))
+                                .font(.system(size: 13, design: .monospaced))
                                 .frame(minWidth: 24, alignment: .trailing)
                             Stepper("Conversations to keep", value: $chatRetentionLimit, in: 1...100)
                                 .labelsHidden()
@@ -426,14 +415,13 @@ struct SettingsSheetView: View {
     private var modelsSettingsSection: some View {
         VStack(alignment: .leading, spacing: 18) {
             // Section Header with Refresh Button
-            HStack {
-                VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
                     Text("Installed Local Models")
-                        .font(.headline)
-                        .fontWeight(.bold)
+                        .font(.system(size: 12.5, weight: .semibold))
                     Text("Auto-discovered from Hugging Face cache (~/.cache/huggingface/hub)")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                 }
 
                 Spacer()
@@ -449,12 +437,13 @@ struct SettingsSheetView: View {
                             Image(systemName: "arrow.clockwise")
                         }
                         Text(localModelManager.isScanning ? "Scanning..." : "Refresh Cache")
-                            .font(.caption)
                     }
                 }
                 .buttonStyle(.bordered)
+                .controlSize(.small)
                 .disabled(localModelManager.isScanning)
             }
+            .padding(.horizontal, 8)
 
             // Discovered Models List
             if localModelManager.discoveredModels.isEmpty {
@@ -621,34 +610,34 @@ struct SettingsSheetView: View {
             SettingsCard(header: "Custom Paths & Fallbacks") {
                 SettingsRow(
                     title: "Custom Folder or Safetensors File",
-                    subtitle: "Load a model outside of Hugging Face cache (e.g. external SSD)",
-                    icon: "folder.fill"
+                    subtitle: "Load a model outside of Hugging Face cache (e.g. external SSD)"
                 ) {
                     Button("Browse Folder / Index...", action: onSelectModel)
                         .buttonStyle(.bordered)
+                        .controlSize(.small)
                 }
 
                 SettingsRowDivider()
 
                 SettingsRow(
                     title: "Custom Tokenizer (tokenizer.json)",
-                    subtitle: tokenizer != nil ? "Tokenizer Loaded & Ready ✅" : "No tokenizer loaded.",
-                    icon: "textformat"
+                    subtitle: tokenizer != nil ? "Tokenizer loaded and ready" : "No tokenizer loaded."
                 ) {
                     Button(tokenizer == nil ? "Load tokenizer.json" : "Replace Tokenizer", action: onSelectTokenizer)
                         .buttonStyle(.bordered)
+                        .controlSize(.small)
                 }
 
                 SettingsRowDivider()
 
                 SettingsRow(
                     title: "Metal GPU Acceleration",
-                    subtitle: metalStatus,
-                    icon: "cpu",
-                    iconTint: .purple
+                    subtitle: metalStatus
                 ) {
                     if let device = MTLCreateSystemDefaultDevice() {
-                        SettingsValuePill(text: device.name, tint: .purple)
+                        Text(device.name)
+                            .font(.system(size: 13))
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
@@ -659,83 +648,69 @@ struct SettingsSheetView: View {
     private var generationSettingsSection: some View {
         VStack(alignment: .leading, spacing: 18) {
             // Active Profile Banner
-            HStack(spacing: 12) {
-                Image(systemName: activeProfile.icon)
-                    .font(.system(size: 20))
-                    .foregroundColor(.purple)
-                let currentModelIdentifier = activeModelPath ?? modelConfig?.modelType ?? localModelManager.defaultModelId
-                let modelDisplayText: String = {
-                    if let path = activeModelPath,
-                       let model = localModelManager.discoveredModels.first(where: { $0.snapshotPath == path || $0.weightsEntryPath == path }) {
-                        return model.displayName
-                    } else if let modelType = modelConfig?.modelType {
-                        return modelType
-                    } else {
-                        return detectedArchitecture.rawValue
-                    }
-                }()
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 6) {
-                        Text("Active Profile: \(activeProfile.profileDisplayName(for: currentModelIdentifier))")
-                            .font(.system(size: 13, weight: .bold))
-                            .lineLimit(1)
-                            .truncationMode(.tail)
+            let currentModelIdentifier = activeModelPath ?? modelConfig?.modelType ?? localModelManager.defaultModelId
+            let modelDisplayText: String = {
+                if let path = activeModelPath,
+                   let model = localModelManager.discoveredModels.first(where: { $0.snapshotPath == path || $0.weightsEntryPath == path }) {
+                    return model.displayName
+                } else if let modelType = modelConfig?.modelType {
+                    return modelType
+                } else {
+                    return detectedArchitecture.rawValue
+                }
+            }()
 
+            SettingsCard {
+                SettingsRow(
+                    title: "Active Profile: \(activeProfile.profileDisplayName(for: currentModelIdentifier))",
+                    subtitle: modelDisplayText,
+                    icon: activeProfile.icon,
+                    iconTint: .purple
+                ) {
+                    HStack(spacing: 8) {
                         Image(systemName: "info.circle")
                             .font(.system(size: 12))
-                            .foregroundColor(.secondary)
+                            .foregroundStyle(.secondary)
                             .help(activeProfile.description(for: currentModelIdentifier))
+
+                        Picker("Profile", selection: $activeProfile) {
+                            ForEach(ModelProfileType.allCases) { profile in
+                                Text(profile.rawValue).tag(profile)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 190)
+                        .onChange(of: activeProfile) { newProfile in
+                            let modelKey = activeModelPath ?? localModelManager.defaultModelId
+                            let settings = profileManager.getProfile(for: modelKey, type: newProfile)
+                            temperature = settings.temperature
+                            topP = settings.topP
+                            minP = settings.minP
+                            topK = settings.topK
+                            repetitionPenalty = settings.repetitionPenalty
+                            presencePenalty = settings.presencePenalty
+                            maxNewTokens = settings.maxNewTokens
+                            systemPrompt = settings.systemPrompt
+                            jetSpecEnabled = settings.jetSpecEnabled
+                            jetSpecMaxDepth = settings.jetSpecMaxDepth
+                            jetSpecBranchingFactor = settings.jetSpecBranchingFactor
+                            jetSpecMaxExpertCap = settings.jetSpecMaxExpertCap
+                            profileManager.setActiveProfile(for: modelKey, type: newProfile)
+                        }
+
+                        Button(action: {
+                            let modelKey = activeModelPath ?? localModelManager.defaultModelId
+                            saveCurrentGenerationToProfile(modelId: modelKey)
+                        }) {
+                            Label("Save", systemImage: "square.and.arrow.down")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .help("Save the current generation settings to the \(activeProfile.rawValue) profile")
                     }
-
-                    Text("• \(modelDisplayText)")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
                 }
-
-                Spacer()
-
-                Picker("Profile", selection: $activeProfile) {
-                    ForEach(ModelProfileType.allCases) { profile in
-                        Label(profile.rawValue, systemImage: profile.icon).tag(profile)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 220)
-                .onChange(of: activeProfile) { newProfile in
-                    let modelKey = activeModelPath ?? localModelManager.defaultModelId
-                    let settings = profileManager.getProfile(for: modelKey, type: newProfile)
-                    temperature = settings.temperature
-                    topP = settings.topP
-                    minP = settings.minP
-                    topK = settings.topK
-                    repetitionPenalty = settings.repetitionPenalty
-                    presencePenalty = settings.presencePenalty
-                    maxNewTokens = settings.maxNewTokens
-                    systemPrompt = settings.systemPrompt
-                    jetSpecEnabled = settings.jetSpecEnabled
-                    jetSpecMaxDepth = settings.jetSpecMaxDepth
-                    jetSpecBranchingFactor = settings.jetSpecBranchingFactor
-                    jetSpecMaxExpertCap = settings.jetSpecMaxExpertCap
-                    profileManager.setActiveProfile(for: modelKey, type: newProfile)
-                }
-
-                Button(action: {
-                    let modelKey = activeModelPath ?? localModelManager.defaultModelId
-                    saveCurrentGenerationToProfile(modelId: modelKey)
-                }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "square.and.arrow.down")
-                        Text("Save to \(activeProfile.rawValue)")
-                    }
-                    .font(.caption)
-                }
-                .buttonStyle(.bordered)
             }
-            .padding(12)
-            .background(Color.purple.opacity(0.08))
-            .cornerRadius(10)
 
             SettingsCard(header: "Sampling") {
                 Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 14) {
@@ -789,26 +764,21 @@ struct SettingsSheetView: View {
             }
 
             // JetSpec Causal Speculative Tree Acceleration
-            SettingsCard(header: "JetSpec Speculative Tree") {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 2) {
-                            HStack(spacing: 6) {
-                                Image(systemName: "arrow.triangle.branch")
-                                    .foregroundColor(.purple)
-                                Text("JetSpec Causal Speculative Tree")
-                                    .font(.subheadline)
-                                    .fontWeight(.semibold)
-                            }
-                            Text("Accelerates generation via parallel tree drafting and dynamic MoE budget pruning on resident standard attention models. Gated DeltaNet recurrent models (such as Ornith 1.5) and disk-streamed models automatically use optimized direct execution for maximum speed and state accuracy.")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                        }
-                        Spacer()
+            SettingsCard(header: "JetSpec Speculative Tree Acceleration") {
+                    SettingsRow(
+                        title: "Enable JetSpec",
+                        subtitle: "Accelerates generation via parallel tree drafting and dynamic MoE budget pruning on resident standard attention models. Gated DeltaNet recurrent models (such as Ornith 1.5) and disk-streamed models automatically use optimized direct execution for maximum speed and state accuracy.",
+                        icon: "arrow.triangle.branch",
+                        iconTint: .purple
+                    ) {
                         Toggle("", isOn: $jetSpecEnabled)
                             .toggleStyle(.switch)
+                            .labelsHidden()
                     }
 
                     if jetSpecEnabled {
+                        SettingsRowDivider()
+
                         Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 14) {
                             GridRow {
                                 samplingControl("Max Tree Depth", value: doubleBinding($jetSpecMaxDepth), range: 1...5, step: 1, digits: 0)
@@ -816,8 +786,9 @@ struct SettingsSheetView: View {
                                 samplingControl("Max Expert Cap", value: doubleBinding($jetSpecMaxExpertCap), range: 2...16, step: 1, digits: 0)
                             }
                         }
+                        .padding(.vertical, 8)
                     }
-                }
+            }
 
             // System Prompt Editor & Conjunction Combination
             SettingsCard(header: "System Prompt", spacing: 8) {
@@ -916,159 +887,159 @@ struct SettingsSheetView: View {
     // MARK: - Tab 3: Memory & Working Set
     private var memorySettingsSection: some View {
         VStack(alignment: .leading, spacing: 18) {
-            SettingsCard(header: "Execution", spacing: 16) {
-                // Execution Mode Picker
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Memory Execution Mode")
-                        .font(.subheadline)
-                        .fontWeight(.semibold)
-
+            SettingsCard(
+                header: "Execution",
+                footer: "FP16 (Half) cuts KV-cache memory by 50% with ~2x memory bandwidth during autoregressive GQA decoding. FP8 cuts memory footprint by 75% for ultra-long context windows."
+            ) {
+                SettingsRow(
+                    title: "Memory Execution Mode",
+                    subtitle: "How model weights are loaded: fully resident in RAM, or streamed from SSD on demand."
+                ) {
                     Picker("Mode", selection: $memoryExecutionMode) {
                         ForEach(MemoryExecutionMode.allCases) { mode in
                             Text(mode.rawValue).tag(mode)
                         }
                     }
                     .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .fixedSize()
                 }
 
-                // Budget Mode Picker
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("RAM Working Set Budget")
-                        .font(.subheadline)
-                        .fontWeight(.semibold)
+                SettingsRowDivider()
 
+                SettingsRow(
+                    title: "RAM Working Set Budget",
+                    subtitle: "Maximum resident working set before expert weights are evicted."
+                ) {
                     Picker("Budget", selection: $memoryBudgetMode) {
                         ForEach(MemoryBudgetMode.allCases) { mode in
                             Text(mode.rawValue).tag(mode)
                         }
                     }
                     .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .fixedSize()
                 }
 
-                // KV-Cache Precision Picker
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack {
-                        Text("KV-Cache Precision & Compression")
-                            .font(.subheadline)
-                            .fontWeight(.semibold)
-                        Spacer()
-                        Text(kvCachePrecision == .fp8 ? "75% VRAM Reduction" : (kvCachePrecision == .fp16 ? "50% VRAM Reduction" : "Original"))
-                            .font(.caption2)
-                            .foregroundColor(.indigo)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.indigo.opacity(0.1))
-                            .cornerRadius(4)
-                    }
+                SettingsRowDivider()
 
-                    Picker("KV Precision", selection: $kvCachePrecision) {
-                        ForEach(KVCachePrecision.allCases) { prec in
-                            Text(prec.rawValue).tag(prec)
+                SettingsRow(
+                    title: "KV-Cache Precision",
+                    subtitle: "Numeric precision used for the attention key/value history."
+                ) {
+                    HStack(spacing: 8) {
+                        SettingsStatusBadge(
+                            text: kvCachePrecision == .fp8 ? "75% VRAM Reduction" : (kvCachePrecision == .fp16 ? "50% VRAM Reduction" : "Full Precision"),
+                            tint: .indigo
+                        )
+                        Picker("KV Precision", selection: $kvCachePrecision) {
+                            ForEach(KVCachePrecision.allCases) { prec in
+                                Text(prec.rawValue).tag(prec)
+                            }
                         }
+                        .pickerStyle(.menu)
+                        .labelsHidden()
                     }
-                    .pickerStyle(.segmented)
-
-                    Text("FP16 (Half) cuts KV-cache memory by 50% with ~2x memory bandwidth during autoregressive GQA decoding. FP8 cuts memory footprint by 75% for ultra-long context windows.")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
                 }
             }
 
             // Speculative Prefetching & Layer Lookahead
-            SettingsCard(header: "Speculative Prefetching", spacing: 8) {
-                    Toggle(isOn: $speculativePrefetchEnabled) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Speculative MoE Expert & Layer Prefetching")
-                                .font(.subheadline)
-                                .fontWeight(.semibold)
-                            Text("Asynchronously warms next-layer backbone weights and predicted expert slices in background before GPU execution.")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                    .toggleStyle(.switch)
-
-                    if speculativePrefetchEnabled {
-                        HStack {
-                            Text("Prefetch Lookahead Depth:")
-                                .font(.caption)
-                                .fontWeight(.medium)
-                            Spacer()
-                            Picker("Lookahead", selection: $prefetchLookaheadDepth) {
-                                Text("1 Layer").tag(1)
-                                Text("2 Layers").tag(2)
-                            }
-                            .pickerStyle(.segmented)
-                            .frame(maxWidth: 180)
-                        }
-                        .padding(.top, 2)
-                    }
+            SettingsCard(header: "Speculative Prefetching") {
+                SettingsRow(
+                    title: "MoE Expert & Layer Prefetching",
+                    subtitle: "Asynchronously warms next-layer backbone weights and predicted expert slices in the background before GPU execution."
+                ) {
+                    Toggle("", isOn: $speculativePrefetchEnabled)
+                        .toggleStyle(.switch)
+                        .labelsHidden()
                 }
 
-                // Telemetry Metrics Grid
-                SettingsCard(header: "Live Diagnostics", spacing: 14) {
-                HStack(spacing: 14) {
-                    VStack(alignment: .leading, spacing: 2) {
+                if speculativePrefetchEnabled {
+                    SettingsRowDivider()
+
+                    SettingsRow(
+                        title: "Lookahead Depth",
+                        subtitle: "How many layers ahead the prefetcher should warm."
+                    ) {
+                        Picker("Lookahead", selection: $prefetchLookaheadDepth) {
+                            Text("1 Layer").tag(1)
+                            Text("2 Layers").tag(2)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .fixedSize()
+                    }
+                }
+            }
+
+            // Telemetry Metrics Grid
+            SettingsCard(header: "Live Diagnostics") {
+                HStack(alignment: .top, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 3) {
                             Text("WORKING SET RAM")
-                                .font(.system(size: 9, weight: .bold))
-                                .foregroundColor(.secondary)
+                                .font(.system(size: 9, weight: .semibold))
+                                .foregroundStyle(.secondary)
                             Image(systemName: "info.circle")
                                 .font(.system(size: 8))
-                                .foregroundColor(.secondary)
+                                .foregroundStyle(.secondary)
                         }
                         Text(String(format: "%.2f GB", currentRssGB))
-                            .font(.system(.subheadline, design: .monospaced))
-                            .fontWeight(.bold)
-                            .foregroundColor(.indigo)
+                            .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.indigo)
                         Text(String(format: "Heap: %.2f GB", getProcessResidentMemoryGB()))
-                            .font(.system(size: 8, design: .monospaced))
-                            .foregroundColor(.secondary)
+                            .font(.system(size: 9, design: .monospaced))
+                            .foregroundStyle(.tertiary)
                     }
                     .help(String(format: "Working Set RAM: %.2f GB\nProcess Heap (Activity Monitor): %.2f GB\nUnified Memory Cache: %.2f GB\n\nApple Silicon places clean zero-copy model weights in Darwin's Unified Memory Buffer Cache, which Activity Monitor excludes from process footprint.", currentRssGB, getProcessResidentMemoryGB(), max(0, currentRssGB - getProcessResidentMemoryGB())))
 
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: 3) {
                         Text("RESIDENT EXPERTS")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundColor(.secondary)
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.secondary)
                         Text("\(residentExpertCount) / \(totalExpertCount)")
-                            .font(.system(.subheadline, design: .monospaced))
-                            .fontWeight(.bold)
+                            .font(.system(size: 14, weight: .semibold, design: .monospaced))
                     }
 
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: 3) {
                         Text("CACHE HIT RATE")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundColor(.secondary)
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.secondary)
                         Text(String(format: "%.1f%%", cacheHitRate))
-                            .font(.system(.subheadline, design: .monospaced))
-                            .fontWeight(.bold)
-                            .foregroundColor(.green)
+                            .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.green)
                     }
 
-                    VStack(alignment: .leading, spacing: 2) {
+                    VStack(alignment: .leading, spacing: 3) {
                         Text("PREFETCH EFFICIENCY")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundColor(.secondary)
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(.secondary)
                         Text(String(format: "%.1f%%", prefetchEfficiency))
-                            .font(.system(.subheadline, design: .monospaced))
-                            .fontWeight(.bold)
-                            .foregroundColor(.purple)
+                            .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.purple)
                     }
+
+                    Spacer()
                 }
+                .padding(.vertical, 10)
+
+                SettingsRowDivider()
 
                 // Cache Actions
-                HStack(spacing: 12) {
+                HStack(spacing: 10) {
                     Button(action: onFlushCache) {
                         Label("Flush Expert Cache", systemImage: "trash")
                     }
                     .buttonStyle(.bordered)
+                    .controlSize(.small)
 
                     Button(action: onPreFaultAll) {
                         Label("Pre-Fault All Weights into RAM", systemImage: "bolt.fill")
                     }
                     .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
+                .padding(.vertical, 8)
             }
         }
     }
@@ -1076,56 +1047,42 @@ struct SettingsSheetView: View {
     // MARK: - Tab 4: Agent & Tool Execution Suite
     private var agentSettingsSection: some View {
         VStack(alignment: .leading, spacing: 18) {
-            SettingsCard(header: "Agent Tools", spacing: 14) {
-                // Enable Agent Tools Toggle
-                Toggle(isOn: $isAgentToolsGloballyEnabled) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Enable Agent Tools by Default")
-                            .font(.system(size: 13, weight: .medium))
-                        Text("Equips models with shell execution, file reading/writing, and semantic search via ChatML <tool_call> tags.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
+            SettingsCard(header: "Agent Tools") {
+                SettingsRow(
+                    title: "Enable Agent Tools by Default",
+                    subtitle: "Equips models with shell execution, file reading/writing, and semantic search via ChatML <tool_call> tags.",
+                    icon: "terminal.fill"
+                ) {
+                    Toggle("", isOn: $isAgentToolsGloballyEnabled)
+                        .toggleStyle(.switch)
+                        .labelsHidden()
                 }
-                .toggleStyle(.switch)
 
-                Divider()
+                SettingsRowDivider()
 
-                // Turbo Mode (Auto-Approve Mutations)
-                Toggle(isOn: $isTurboModeEnabled) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 6) {
-                            Text("Agent Turbo Mode (Auto-Approve)")
-                                .font(.system(size: 13, weight: .medium))
-                            Image(systemName: "bolt.fill")
-                                .foregroundColor(.orange)
-                                .font(.system(size: 11))
-                        }
-                        Text("When enabled, file writes, edits, and shell commands execute automatically without individual authorization prompts (similar to Antigravity). When disabled, actions require explicit approval.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
+                SettingsRow(
+                    title: "Agent Turbo Mode (Auto-Approve)",
+                    subtitle: "When enabled, file writes, edits, and shell commands execute automatically without individual authorization prompts (similar to Antigravity). When disabled, actions require explicit approval.",
+                    icon: "bolt.fill",
+                    iconTint: .orange
+                ) {
+                    Toggle("", isOn: $isTurboModeEnabled)
+                        .toggleStyle(.switch)
+                        .labelsHidden()
                 }
-                .toggleStyle(.switch)
 
-                Divider()
+                SettingsRowDivider()
 
-                // Grammar-Constrained Logit Masking
-                Toggle(isOn: $isGrammarMaskingEnabled) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 6) {
-                            Text("Grammar-Constrained Tool Sampling")
-                                .font(.system(size: 13, weight: .medium))
-                            Image(systemName: "checkmark.shield.fill")
-                                .foregroundColor(.green)
-                                .font(.system(size: 11))
-                        }
-                        Text("Dynamically sets disallowed token logits to -Float.infinity during tool calls, mathematically preventing syntax and schema errors.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
+                SettingsRow(
+                    title: "Grammar-Constrained Tool Sampling",
+                    subtitle: "Dynamically sets disallowed token logits to -Float.infinity during tool calls, mathematically preventing syntax and schema errors.",
+                    icon: "checkmark.shield.fill",
+                    iconTint: .green
+                ) {
+                    Toggle("", isOn: $isGrammarMaskingEnabled)
+                        .toggleStyle(.switch)
+                        .labelsHidden()
                 }
-                .toggleStyle(.switch)
             }
 
             // Working Directory Picker
@@ -1188,47 +1145,51 @@ struct SettingsSheetView: View {
             }
 
             // Output Length Slider
-            SettingsCard(header: "Limits", spacing: 14) {
+            SettingsCard(header: "Limits") {
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Max Tool Output (tokens)")
-                                .font(.system(size: 13, weight: .medium))
+                                .font(.system(size: 13))
                             Text("Token budget per tool result. Observations are rendered as plain text and truncated head/tail at line boundaries.")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
                         }
                         Spacer()
                         Text("\(maxToolOutputLength) tokens")
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.purple)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(.secondary)
                     }
                     Slider(value: Binding(
                         get: { Double(maxToolOutputLength) },
                         set: { maxToolOutputLength = Int($0) }
                     ), in: 1000...16000, step: 500)
                 }
+                .padding(.vertical, 8)
+
+                SettingsRowDivider()
 
                 // Max Agent Iteration Steps
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Max Multi-Step Agent Iterations")
-                                .font(.system(size: 13, weight: .medium))
+                                .font(.system(size: 13))
                             Text("Maximum number of reasoning and tool execution turns per user prompt.")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
                         }
                         Spacer()
                         Text("\(maxAgentSteps) steps")
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.purple)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(.secondary)
                     }
                     Slider(value: Binding(
                         get: { Double(maxAgentSteps) },
                         set: { maxAgentSteps = Int($0) }
                     ), in: 1...30, step: 1)
                 }
+                .padding(.vertical, 8)
             }
 
             // Web Search Engine Configuration
