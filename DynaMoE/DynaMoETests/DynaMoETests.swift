@@ -4829,12 +4829,16 @@ final class DynaMoETests: XCTestCase {
         )
 
         let mgr = WorkingSetManager.shared
+        defer { mgr.residentMemoryProviderOverride = nil }
+        // initialize may install shard-registry state on the singleton; release it so
+        // later tests don't walk this test's dead buffers on the residency cadence.
+        defer { mgr.releaseShardMappings() }
         mgr.initialize(summary: summary, shardBuffers: shardBuffers, mode: .balanced16GB)
 
         XCTAssertEqual(mgr.residentExpertsCount, 0)
         XCTAssertEqual(mgr.totalExpertKeysCount, 48 * 32)
         let initRss = mgr.effectiveResidentMemoryGB
-        XCTAssertGreaterThan(initRss, 0.0, "Effective resident memory should track process heap + dense backbone")
+        XCTAssertGreaterThan(initRss, 0.0, "Effective resident memory should track real process residency (RSIZE, which already includes resident weight pages)")
 
         // Verify primeSlices parallel page faulting
         let sampleSlices = [
@@ -4851,6 +4855,18 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(mgr.residentExpertsCount, 480, "All 480 active experts must be resident")
         let tok0Rss = mgr.effectiveResidentMemoryGB
         XCTAssertGreaterThanOrEqual(tok0Rss, initRss, "Effective RSS must increase with resident experts")
+
+        // Regression guard (QA #50): the working set must equal real process residency
+        // exactly — with experts tracked as resident, the manager must NOT add its
+        // tracked dense/expert bytes on top of a number that already counts every
+        // resident weight page (the old RSS + tracked-weights double count).
+        XCTAssertGreaterThan(mgr.residentExpertsCount, 0, "Need tracked experts resident for the regression guard")
+        mgr.residentMemoryProviderOverride = { 2.5 }
+        XCTAssertEqual(mgr.effectiveResidentMemoryGB, 2.5, accuracy: 0.0001,
+                       "effectiveResidentMemoryGB must not add tracked dense/expert bytes to residency")
+        mgr.residentMemoryProviderOverride = nil
+        XCTAssertEqual(mgr.effectiveResidentMemoryGB, getProcessResidentMemoryGB(), accuracy: 0.05,
+                       "effectiveResidentMemoryGB must track live process RSIZE")
 
         // Prune at Token 0 boundary: should NOT evict because 480 <= 1280
         mgr.trimToBudget(mode: .balanced16GB, shardBuffers: shardBuffers)
@@ -4948,7 +4964,10 @@ final class DynaMoETests: XCTestCase {
         )
 
         let mgr = WorkingSetManager.shared
-        mgr.initialize(summary: summary, shardBuffers: shardBuffers, mode: .balanced16GB, modelDir: tempDir)
+        mgr.initialize(summary: summary, shardBuffers: shardBuffers, mode: .balanced16GB)
+        // initialize builds the paging catalog only; the residency registry is
+        // adopted separately (the app does this inside the guarded load install).
+        mgr.registerShardMappings(shardBuffers)
 
         // Prime the active experts using bulk pread via touchAndEvict
         let t0 = CFAbsoluteTimeGetCurrent()
@@ -4959,11 +4978,139 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(mgr.residentExpertsCount, 2)
         XCTAssertGreaterThan(mgr.effectiveResidentMemoryGB, 0.0)
 
-        // Close file descriptors and verify cleanup
-        mgr.closeAllFileDescriptors()
+        // mincore() walker: residency measured directly over the registered shard
+        // mappings — a fully-touched buffer must report as fully resident.
+        memset(buffer.contents(), 0x5A, dummyDataSize)
+        XCTAssertEqual(mgr.refreshShardResidencyNow(), Double(dummyDataSize) / 1073741824.0, accuracy: 0.0001,
+                       "Walked shard residency must count the fully-touched mock buffer")
+        XCTAssertEqual(mgr.residentShardBytesGB, Double(dummyDataSize) / 1073741824.0, accuracy: 0.0001,
+                       "The synchronous walk must publish through the O(1) view-facing cache")
+
+        // Release mappings and verify cleanup
+        mgr.releaseShardMappings()
         mgr.flushAllExperts(shardBuffers: shardBuffers)
         XCTAssertEqual(mgr.residentExpertsCount, 0)
+        XCTAssertEqual(mgr.residentShardBytesGB, 0.0, accuracy: 0.00001,
+                       "Released shard mappings must contribute no residency")
         print("🎉 [SUCCESS] Bulk pread priming test passed!")
+    }
+
+    // Regression test for the pread EFAULT no-op (QA #50): priming must fault the
+    // pages of a real read-only mmap wrapped in MTLBuffer(bytesNoCopy:), the app's
+    // exact shard strategy. The old fd-based pread path returned EFAULT on the
+    // first chunk and left the mapping untouched, so the mincore walk below would
+    // see ~0 residency; the stride touch must make every page resident.
+    func testPrimeSlicesFaultsReadOnlyMmapPages() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("Metal not available")
+        }
+
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        // 1 MB page-multiple file, written with F_NOCACHE so the unified page
+        // cache does not pre-warm the mapping: priming is what must fault it.
+        let fileURL = tempDir.appendingPathComponent("readonly_shard.bin")
+        let fileSize = 64 * 16384
+        let writeFd = open(fileURL.path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
+        guard writeFd >= 0 else { XCTFail("could not create temp shard file"); return }
+        _ = fcntl(writeFd, F_NOCACHE, 1)
+        var pattern = [UInt8](repeating: 0xA5, count: fileSize)
+        let wroteAll = pattern.withUnsafeMutableBytes { raw in
+            var written = 0
+            while written < fileSize {
+                let n = write(writeFd, raw.baseAddress!.advanced(by: written), fileSize - written)
+                if n <= 0 { return false }
+                written += n
+            }
+            return true
+        }
+        if !wroteAll {
+            close(writeFd)
+            XCTFail("failed to write temp shard file; aborting before mmap to avoid SIGBUS on an undersized file")
+            return
+        }
+        fsync(writeFd)
+        close(writeFd)
+
+        // Read-only mmap + zero-copy Metal wrap: the app's real shard strategy.
+        let mapFd = open(fileURL.path, O_RDONLY)
+        guard mapFd >= 0 else { XCTFail("could not open temp shard file"); return }
+        defer { close(mapFd) }
+        let mapPtr = mmap(nil, fileSize, PROT_READ, MAP_SHARED, mapFd, 0)
+        guard Int(bitPattern: mapPtr) != -1 else { XCTFail("mmap failed, errno \(errno)"); return }
+        defer { munmap(mapPtr, fileSize) }
+        guard let buffer = device.makeBuffer(bytesNoCopy: mapPtr!, length: fileSize, options: .storageModeShared, deallocator: nil) else {
+            XCTFail("bytesNoCopy wrap of read-only mmap failed"); return
+        }
+        let shardBuffers: [UInt32: MTLBuffer] = [0: buffer]
+
+        let summary = ModelSummary(
+            sizeGb: 0.001,
+            tensorCount: 0,
+            layerCount: 0,
+            maxExpertId: 0,
+            shards: [ShardMetadata(index: 0, filename: "readonly_shard.bin",
+                                   baseAddress: UInt64(UInt(bitPattern: mapPtr!)),
+                                   length: UInt64(fileSize))],
+            tensors: [],
+            layers: []
+        )
+
+        let mgr = WorkingSetManager.shared
+        defer { mgr.releaseShardMappings() }
+        mgr.initialize(summary: summary, shardBuffers: shardBuffers, mode: .balanced16GB)
+        // initialize builds the paging catalog only; adopt the registry explicitly
+        // the way the guarded load install does in the app.
+        mgr.registerShardMappings(shardBuffers)
+
+        let expectedGB = Double(fileSize) / 1073741824.0
+        if mgr.refreshShardResidencyNow() > expectedGB / 2 {
+            throw XCTSkip("file pages pre-warmed in the unified page cache; cannot prove priming faults them")
+        }
+
+        mgr.primeSlices([ExpertSlice(shardIndex: 0, offset: 0, length: UInt64(fileSize))],
+                        shardBuffers: shardBuffers)
+
+        XCTAssertEqual(mgr.refreshShardResidencyNow(), expectedGB, accuracy: 0.00001,
+                       "stride touch must fault every page of the read-only bytesNoCopy mapping; the old pread fast path left them cold")
+        XCTAssertEqual(mgr.residentShardBytesGB, expectedGB, accuracy: 0.00001,
+                       "The synchronous walk must publish through the O(1) view-facing cache")
+    }
+
+    // FlashMoE loads bypass WorkingSetManager.initialize, so the residency
+    // registry must be adoptable independently. registerShardMappings must swap
+    // the registered set atomically: the previous model's mappings stop counting
+    // and the new set counts, without a full paging-catalog initialize.
+    func testRegisterShardMappingsSwapsRegistryIndependently() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("Metal not available")
+        }
+        guard let bufA = device.makeBuffer(length: 64 * 1024, options: .storageModeShared),
+              let bufB = device.makeBuffer(length: 256 * 1024, options: .storageModeShared) else {
+            XCTFail("could not allocate mock Metal buffers")
+            return
+        }
+        let aGB = Double(64 * 1024) / 1073741824.0
+        let bGB = Double(256 * 1024) / 1073741824.0
+
+        let mgr = WorkingSetManager.shared
+        defer { mgr.releaseShardMappings() }
+
+        memset(bufA.contents(), 0x33, 64 * 1024)
+        mgr.registerShardMappings([0: bufA])
+        XCTAssertEqual(mgr.refreshShardResidencyNow(), aGB, accuracy: 0.000001,
+                       "Registry must count the fully-touched first buffer")
+
+        // Swap to a new shard set without initialize(): the first model's mapping
+        // must stop counting entirely (a stale registry would report aGB + bGB).
+        mgr.registerShardMappings([5: bufB])
+        memset(bufB.contents(), 0x5A, 256 * 1024)
+        XCTAssertEqual(mgr.refreshShardResidencyNow(), bGB, accuracy: 0.000001,
+                       "Re-registration must fully replace the previous model's mappings")
+        XCTAssertEqual(mgr.residentShardBytesGB, bGB, accuracy: 0.000001,
+                       "The synchronous walk must publish through the O(1) view-facing cache")
     }
 
     func testOrnithRMSNormIsNotUnitOffset() throws {

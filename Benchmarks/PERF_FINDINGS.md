@@ -2446,3 +2446,125 @@ mangled-path command. A line containing `cd:` plus a cd diagnostic
 `string not in pwd`, `invalid option`) now counts as a missing-path signal, so the
 absolute-path pass names the real sibling directory. Test:
 `testMissingPathRepairHintHandlesFailedCd`. Verified: passes.
+
+### QA #50 — RAM telemetry displayed RSIZE as the "Activity Monitor" number and double-counted every resident weight page
+
+Found by probing the app's exact zero-copy strategy (read-only `memmap2` mmap of a
+3 GiB file wrapped in `MTLBuffer(bytesNoCopy:.storageModeShared)`, then faulting
+"backbone"/"expert" ranges), with every number cross-checked against `footprint`,
+`vmmap --summary`, and `ps` (all tools agreed at every phase):
+
+1. **"Process Heap (Activity Monitor / Xcode)" showed RSIZE.** The metric was
+   `mach_task_basic_info.resident_size`, which counts every resident page the task
+   maps — including the clean file-backed weight pages held by the unified page
+   cache. Activity Monitor's "Memory" column and Xcode's memory gauge display
+   `phys_footprint` (dirty + compressed + IOKit only). Probe: with a 512 MB heap
+   plus 2.25 GB of weights faulted in through the mapping, the displayed metric
+   read 2.79 GB while every ground-truth tool read **0.54 GB** — a 5.2x
+   overstatement. In-vivo (real Ornith 35B FP8 decode via the stream bench):
+   RSIZE 8.8–10.0 GB vs footprint 4.6–5.8 GB.
+2. **"Working Set RAM" = RSIZE + (denseBytes + residentExpertBytes) double-counted
+   the whole tracked catalogue.** RSIZE already contains every resident weight
+   page, file-backed (touching 1.25 GB of mapped weights raised RSIZE by exactly
+   1.25 GB) or anonymous (pinned backbone, ExpertIOThreadPool staging). The probe
+   state above displayed **5.04 GB against a true 2.79 GB** working set, and a
+   live 12.9 GB sidebar reading decomposes as 5.2 GB RSIZE + 7.7 GB tracked.
+   `trimToBudget` also made its over-budget trim decision on the same inflated
+   figure (ContentView.swift `effectiveResidentMemoryGB`/`trimToBudget`), evicting
+   experts early.
+
+Fixes (ContentView.swift, SidebarView.swift, SettingsSheetView.swift):
+
+- Added `getActivityMonitorFootprintGB()` (`task_vm_info.phys_footprint`);
+  the sidebar tooltip, the settings "Heap:" line, and both tooltips now show it
+  for the "(Activity Monitor / Xcode)" number.
+- `effectiveResidentMemoryGB` and `trimToBudget` now use RSIZE alone; tracked
+  dense/expert bytes remain LRU bookkeeping, not RAM added on top.
+- The "Unified Memory Cache" tooltip line now measures residency directly: a
+  mincore() walk over the registered shard mappings counts the resident weight
+  pages. RSIZE - footprint is only an accounting delta (it also contains clean
+  framework/library mappings and is offset by compressed/IOKit charges), so the
+  subtraction is not used; the displayed value supersedes the catalogue delta
+  shipped in the first round of this fix and is an exact page count.
+- Side finding from the same probe: the fd "fast path" in `primeSlices`/
+  `preFaultAll` `pread()`s into the PROT_READ shard mapping, which returns
+  EFAULT on the first chunk (`if n <= 0 { break }` swallowed it) — a silent
+  no-op, and `primeSlices` returned before ever running its own touch fallback,
+  so decode-time backbone prefetch never primed anything. Removed; the stride
+  touch (T8: 13–20 GB/s warm) now always runs. Also verified:
+  `posix_madvise(DONTNEED)` does not reclaim clean mapped pages until system
+  pressure exists (RSIZE held flat for 30 s after an "eviction"), so post-eviction
+  RSIZE is the honest view while the catalogue's "evicted" bookkeeping is
+  optimistic until the kernel actually reclaims.
+- Copilot review round on PR #25: the now-dead fd/path cache is removed
+  (`initialize` no longer opens one descriptor per shard;
+  `closeAllFileDescriptors` became `releaseShardMappings`, its only fd readers
+  having been the removed pread paths), and every "Process Heap" label is now
+  "Process Footprint" — phys_footprint includes compressed memory and IOKit
+  allocations, not just heap.
+- Second Copilot round: the injected resident-memory seam assertions now pin the
+  no-double-count contract exactly (the injected 2.5 GB must pass through even
+  with 480 experts tracked; the mock catalogue alone adds ~480 KiB of dense
+  bytes, an order of magnitude above the 1e-4 GB tolerance), and
+  `testPrimeSlicesFaultsReadOnlyMmapPages` proves the stride touch on a REAL
+  F_NOCACHE-cold file read-only-mmap'd and wrapped in
+  `MTLBuffer(bytesNoCopy:)`: mincore reports ~0 residency before priming and the
+  full 1 MB after, so the old pread EFAULT no-op (which left it cold) fails the
+  test instead of passing silently.
+- Third Copilot round: the residency walk is now cached. The O(#pages) mincore
+  scan was evaluated eagerly inside the SwiftUI body — tooltips build their
+  format strings during every render and currentRssGB ticks ~10x/s during
+  prefill, so a 37 GB model would repeatedly scan ~2.4M page flags on the main
+  thread even with no tooltip visible. `residentShardBytesGB` is now an O(1)
+  cached read; a utility-queue loop walks at a bounded 2 s cadence (armed at
+  `initialize`, cancelled by `releaseShardMappings` via a generation counter),
+  and `refreshShardResidencyNow()` provides the synchronous walk for callers
+  that need determinism (tests assert both the walk result and its publication
+  into the view-facing cache). The read-only priming regression test also now
+  aborts before mmap when the temp-file write is short, instead of risking a
+  SIGBUS stride read over an undersized file.
+- Fourth Copilot round: FlashMoE loads bypass `WorkingSetManager.initialize`
+  (only the regular path calls it), so the residency registry was never adopted
+  on a first packed load and kept walking the previous model's stale mappings
+  across a switch. Registration is now an independent call:
+  `registerShardMappings(_:)` bumps the walk generation, replaces the mapping
+  set, resets the cache, and (idempotently per generation) schedules the
+  utility-queue loop — `initialize` calls it, and the FlashMoE branch calls it
+  directly after backbone pinning, excluding the pinned backbone buffer (its
+  anonymous pages are dirty heap that the footprint line already counts; they
+  are not clean unified-cache pages). The stale-publication race Copilot
+  flagged is closed by snapshotting the generation with the mappings inside
+  `refreshShardResidencyNow` and publishing only if the generation is still
+  current, so a walk in flight across a registry swap or release cannot write
+  the old model's residency into the new model's cache. Regression test:
+  `testRegisterShardMappingsSwapsRegistryIndependently`.
+- Fifth Copilot round: registry adoption now happens inside the guarded load
+  install (after the `modelLoadToken` check), not before it — a superseded task
+  registering its engine's mappings and then being rejected would leave the
+  residency loop walking a dropped engine's pointers, stranded if the next
+  load also failed. `initialize` is back to paging-catalog-only duty; registry
+  adoption is exclusively `registerShardMappings`, called from the guarded
+  install for every load path (a pinned backbone still excluded). The walker
+  now probes a mapping's unaligned tail page separately instead of flooring
+  the length to page granularity, so partial pages are no longer omitted.
+  Tests release the singleton's registry when they're done with it, so the
+  background cadence never walks a completed test's dead mock buffers.
+- Sixth Copilot round (high finding): the failed-load catch path clears the
+  installed engine and `shardBuffers` but left the adopted registry probing
+  those addresses on the 2 s cadence — and if the next load reuses the virtual
+  addresses, mincore would report unrelated memory as shard residency.
+  `releaseShardMappings()` now runs in that catch block (teardown of the
+  installed set), alongside the engine/buffer clear.
+
+Verification: probe on macOS 26.7.1 / M1 Pro (in-process metrics matched the
+`footprint` CLI and vmmap at every phase); Xcode build green;
+`testWorkingSetManagerTokenBoundaryEviction`,
+`testWorkingSetManagerBulkPreadPriming`, and
+`testPrimeSlicesFaultsReadOnlyMmapPages` pass. The first pins the
+no-double-count contract through an injected resident-memory seam
+(`effectiveResidentMemoryGB` must equal the provided RSS exactly while 480
+experts are tracked); the latter exercises the mincore() walker over a
+fully-touched mock shard buffer and verifies release cleanup. The mock-buffer
+tests were also why the old pread path looked tested — their writable
+`makeBuffer(length:)` shards always allowed the pread that the real read-only
+mmap forbids.

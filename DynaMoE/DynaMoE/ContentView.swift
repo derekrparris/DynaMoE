@@ -309,8 +309,30 @@ func getProcessResidentMemoryGB() -> Double {
     }
     return 0.0
 }
+
+// phys_footprint: dirty + compressed + IOKit pages, EXCLUDING clean file-backed
+// pages such as the zero-copy mmap'd weight shards. This is the number Activity
+// Monitor's "Memory" column and Xcode's memory gauge actually display — it is
+// NOT the resident size above, which counts every resident page the task maps.
+func getActivityMonitorFootprintGB() -> Double {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / 4)
+    let kr = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: 1) {
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+        }
+    }
+    if kr == KERN_SUCCESS {
+        return Double(info.phys_footprint) / (1024.0 * 1024.0 * 1024.0)
+    }
+    return 0.0
+}
 #else
 func getProcessResidentMemoryGB() -> Double {
+    return 0.0
+}
+
+func getActivityMonitorFootprintGB() -> Double {
     return 0.0
 }
 #endif
@@ -413,8 +435,8 @@ final class WorkingSetManager {
     private var prefetchHits: Int = 0
     private var lastPagingLatencyMs: Double = 0.0
     private var expertOnlyShardIndices: Set<UInt32> = []
-    private var shardFDs: [UInt32: Int32] = [:]
-    private var shardFilePaths: [UInt32: String] = [:]
+    private var shardMappings: [(base: UnsafeRawPointer, length: Int)] = []
+    var residentMemoryProviderOverride: (() -> Double)?
 
     var totalExpertKeysCount: Int {
         lock.lock()
@@ -449,59 +471,137 @@ final class WorkingSetManager {
     }
 
     var effectiveResidentMemoryGB: Double {
+        // mach resident_size (RSIZE) already includes every resident weight page
+        // — file-backed mmap pages and anonymous pinned/staging buffers alike.
+        // Adding the catalog's tracked dense/expert bytes on top double-counted
+        // them, inflating the reported working set by up to the full tracked size.
+        // residentMemoryProviderOverride is a test seam pinning that contract.
+        return residentMemoryProviderOverride?() ?? getProcessResidentMemoryGB()
+    }
+
+    // Unified Memory buffer-cache residency measured directly over the shard
+    // mappings via mincore(): the clean file-backed weight pages that Activity
+    // Monitor's footprint excludes. RSIZE - phys_footprint is NOT used — that is
+    // only an accounting delta (it also contains clean framework/library
+    // mappings and is offset by compressed/IOKit footprint charges).
+    // The walk is O(#pages) — a 37 GB model walks ~2.4M entries — and tooltip
+    // strings evaluate this getter eagerly during every SwiftUI body build
+    // (currentRssGB ticks ~10x/s during prefill), so the walk runs on a bounded
+    // cadence off the main thread and the view-facing getter is O(1).
+    private var cachedResidentShardBytesGB: Double = 0.0
+    private var shardWalkGeneration: UInt64 = 0
+    private var scheduledWalkGeneration: UInt64 = 0
+    private static let shardWalkInterval: TimeInterval = 2.0
+    private let shardWalkQueue = DispatchQueue(label: "com.dynamoe.shardresidency", qos: .utility)
+
+    var residentShardBytesGB: Double {
         lock.lock()
-        let weightsGB = Double(denseBytes + residentExpertBytes) / (1024.0 * 1024.0 * 1024.0)
+        defer { lock.unlock() }
+        return cachedResidentShardBytesGB
+    }
+
+    /// Synchronously walks the registered shard mappings with mincore() and
+    /// publishes the result into the cached, view-facing value. A utility-queue
+    /// loop calls this at a bounded cadence; tests call it for determinism.
+    /// The generation is snapshotted WITH the mappings and checked again before
+    /// publishing, so a walk that was in flight across a registry replacement
+    /// (`registerShardMappings`) or `releaseShardMappings` cannot republish the
+    /// previous model's residency into the new model's cache.
+    @discardableResult
+    func refreshShardResidencyNow() -> Double {
+        let generation: UInt64
+        let mappings: [(base: UnsafeRawPointer, length: Int)]
+        lock.lock()
+        mappings = shardMappings
+        generation = shardWalkGeneration
         lock.unlock()
-        let heapGB = getProcessResidentMemoryGB()
-        return heapGB + weightsGB
+
+        let pageSize = Int(vm_page_size) // 16384 bytes on Apple Silicon
+        var residentBytes: UInt64 = 0
+        for mapping in mappings {
+            let alignedLen = mapping.length & ~(pageSize - 1)
+            if alignedLen > 0 {
+                var residencyMap = [UInt8](repeating: 0, count: alignedLen / pageSize)
+                if mincore(mapping.base, alignedLen, &residencyMap) == 0 {
+                    for flag in residencyMap where flag & 1 != 0 {
+                        residentBytes &+= UInt64(pageSize)
+                    }
+                }
+            }
+            // An unaligned tail lives in the page spanning the mapping's end; probe
+            // it on its own so partial pages are not omitted (mincore fails cleanly
+            // when the page is no longer mapped, e.g. after the model unmaps).
+            if mapping.length > alignedLen {
+                var tailFlag: UInt8 = 0
+                if mincore(mapping.base + alignedLen, pageSize, &tailFlag) == 0, tailFlag & 1 != 0 {
+                    residentBytes &+= UInt64(pageSize)
+                }
+            }
+        }
+        let value = Double(residentBytes) / (1024.0 * 1024.0 * 1024.0)
+        lock.lock()
+        if generation == shardWalkGeneration {
+            cachedResidentShardBytesGB = value
+        }
+        lock.unlock()
+        return value
+    }
+
+    /// Registers the loaded model's shard mappings for the cached residency walk,
+    /// invalidating any walk still running against a previous model's mappings.
+    /// Independent of `initialize`'s paging-catalog setup so every load path can
+    /// call it — FlashMoE loads never go through `initialize`.
+    func registerShardMappings(_ shardBuffers: [UInt32: MTLBuffer]) {
+        lock.lock()
+        shardWalkGeneration &+= 1
+        shardMappings = shardBuffers.values.map { (base: UnsafeRawPointer($0.contents()), length: $0.length) }
+        cachedResidentShardBytesGB = 0.0
+        lock.unlock()
+        scheduleShardResidencyWalks()
+    }
+
+    private func scheduleShardResidencyWalks() {
+        lock.lock()
+        let generation = shardWalkGeneration
+        if generation == scheduledWalkGeneration {
+            lock.unlock()
+            return // a loop for this registry generation is already scheduled
+        }
+        scheduledWalkGeneration = generation
+        lock.unlock()
+        shardWalkQueue.async { [weak self] in
+            guard let self = self else { return }
+            while true {
+                self.lock.lock()
+                let alive = (generation == self.shardWalkGeneration) && !self.shardMappings.isEmpty
+                self.lock.unlock()
+                guard alive else { return }
+                self.refreshShardResidencyNow()
+                Thread.sleep(forTimeInterval: WorkingSetManager.shardWalkInterval)
+            }
+        }
     }
 
     private static var pageFaultSink: Int64 = 0
 
-    func closeAllFileDescriptors() {
+    func releaseShardMappings() {
         lock.lock()
         defer { lock.unlock() }
-        for (_, fd) in shardFDs {
-            close(fd)
-        }
-        shardFDs.removeAll()
-        shardFilePaths.removeAll()
+        shardWalkGeneration &+= 1 // stops any in-flight refresh loop
+        shardMappings.removeAll()
+        cachedResidentShardBytesGB = 0.0
     }
 
-    /// Coordinated parallel bulk POSIX pread priming across CPU cores.
-    /// Uses sequential NVMe DMA block transfers to fault entire contiguous slices directly
-    /// into Darwin's Unified Memory Buffer Cache at line rate (>2,500 MB/s), completely
-    /// eliminating the ~460,000+ random 16 KB CPU/GPU page fault traps.
+    /// Faults expert/backbone slices into the Unified Memory Buffer Cache by
+    /// touching one byte per page through the read-only shard mmap, in parallel
+    /// across CPU cores (measured 13-20 GB/s warm, PERF_FINDINGS T8).
     func primeSlices(_ slices: [ExpertSlice], shardBuffers: [UInt32: MTLBuffer]) {
         guard !slices.isEmpty else { return }
 
-        lock.lock()
-        let fds = self.shardFDs
-        lock.unlock()
-
-        if !fds.isEmpty {
-            DispatchQueue.concurrentPerform(iterations: slices.count) { i in
-                let slice = slices[i]
-                guard let fd = fds[slice.shardIndex] else { return }
-                guard let buf = shardBuffers[slice.shardIndex] else { return }
-                let len = Int(slice.length)
-                let offset = off_t(slice.offset)
-                guard len > 0 else { return }
-
-                // Directly pread from file into MTLBuffer contents, eliminating scratch copy
-                let bufPtr = buf.contents().advanced(by: Int(slice.offset))
-                var bytesRead = 0
-                while bytesRead < len {
-                    let toRead = min(len - bytesRead, 262144)
-                    let n = pread(fd, bufPtr.advanced(by: bytesRead), toRead, offset + off_t(bytesRead))
-                    if n <= 0 { break }
-                    bytesRead += n
-                }
-            }
-            return
-        }
-
-        // Fallback: If shard file descriptors are not available, fault via mmap pointer
+        // Bring slices resident by faulting pages through the read-only shard mmap.
+        // pread() into a PROT_READ mapping returns EFAULT on the first chunk, so the
+        // old fd-based "fast path" silently primed nothing; the stride touch below
+        // is the only mechanism that actually pages the slices in (PERF_FINDINGS T8).
         let pageSize = Int(vm_page_size) // 16384 bytes on Apple Silicon
         DispatchQueue.concurrentPerform(iterations: slices.count) { i in
             let slice = slices[i]
@@ -521,25 +621,8 @@ final class WorkingSetManager {
         }
     }
 
-    func initialize(summary: ModelSummary, shardBuffers: [UInt32: MTLBuffer], mode: MemoryBudgetMode, modelDir: URL? = nil) {
+    func initialize(summary: ModelSummary, shardBuffers: [UInt32: MTLBuffer], mode: MemoryBudgetMode) {
         lock.lock()
-        for (_, fd) in shardFDs {
-            close(fd)
-        }
-        shardFDs.removeAll()
-        shardFilePaths.removeAll()
-
-        if let dir = modelDir {
-            for shard in summary.shards {
-                let shardPath = dir.appendingPathComponent(shard.filename).path
-                shardFilePaths[shard.index] = shardPath
-                let fd = open(shardPath, O_RDONLY)
-                if fd >= 0 {
-                    shardFDs[shard.index] = fd
-                }
-            }
-        }
-
         expertSlices.removeAll()
         denseSlices.removeAll()
         denseBytes = 0
@@ -590,7 +673,6 @@ final class WorkingSetManager {
 
     func preFaultAll(shardBuffers: [UInt32: MTLBuffer], summary: ModelSummary) {
         lock.lock()
-        let fds = self.shardFDs
         for key in expertSlices.keys {
             residentExperts.insert(key)
         }
@@ -602,25 +684,12 @@ final class WorkingSetManager {
         let shards = summary.shards
         let pageSize = Int(vm_page_size) // 16384 bytes on Apple Silicon
 
-        // Fast parallel sequential priming across CPU cores
+        // Parallel priming across CPU cores. Stride-touch only: pread() into the
+        // read-only mmap fails with EFAULT and never primed anything.
         DispatchQueue.concurrentPerform(iterations: shards.count) { i in
             let shard = shards[i]
             let len = Int(shard.length)
             guard len > 0 else { return }
-
-            if let fd = fds[shard.index] {
-                // Directly pread from file into MTLBuffer contents, eliminating scratch copy
-                if let buf = shardBuffers[shard.index] {
-                    let bufPtr = buf.contents()
-                    var bytesRead = 0
-                    while bytesRead < len {
-                        let toRead = min(len - bytesRead, 262144)
-                        let n = pread(fd, bufPtr.advanced(by: bytesRead), toRead, off_t(bytesRead))
-                        if n <= 0 { break }
-                        bytesRead += n
-                    }
-                }
-            }
 
             // Stride touch through mmap MTLBuffer to map hardware page tables directly
             if let buf = shardBuffers[shard.index] {
@@ -673,8 +742,7 @@ final class WorkingSetManager {
         lock.lock()
         let maxAllowed = mode.maxResidentExperts
         var excess = residentExperts.count - maxAllowed
-        let weightsGB = Double(denseBytes + residentExpertBytes) / (1024.0 * 1024.0 * 1024.0)
-        let currentRss = getProcessResidentMemoryGB() + weightsGB
+        let currentRss = getProcessResidentMemoryGB()
         if currentRss > mode.targetMaxRssGB {
             let overRssGB = currentRss - mode.targetMaxRssGB
             let extraExpertsToTrim = Int(ceil(overRssGB * 1024.0 / 4.9))
@@ -12727,7 +12795,7 @@ if layer.attnGateProjTensor != nil,
                 FileManager.default.fileExists(atPath: p, isDirectory: &isD)
                 return isD.boolValue ? URL(fileURLWithPath: p) : URL(fileURLWithPath: p).deletingLastPathComponent()
             }() : nil
-            WorkingSetManager.shared.initialize(summary: summary, shardBuffers: shardBuffers, mode: memoryBudgetMode, modelDir: dirUrl)
+            WorkingSetManager.shared.initialize(summary: summary, shardBuffers: shardBuffers, mode: memoryBudgetMode)
             pagingStatusMessage = "🌊 Operating in Dynamic SSD Streaming Mode"
             updatePagingStats()
             syncSettingsWindowIfNeeded()
@@ -12854,6 +12922,9 @@ if layer.attnGateProjTensor != nil,
                     }
                 }
 
+                // Hoisted so the guarded install below can exclude the pinned backbone
+                // when it adopts the shard registry.
+                var pinnedShardIndex: UInt32? = nil
                 let isFlashMoE = ExpertRepacker.isPackedFormat(dir: dirUrl)
                 if isFlashMoE {
                     ExpertIOThreadPool.shared.initialize(numThreads: 8)
@@ -12879,6 +12950,7 @@ if layer.attnGateProjTensor != nil,
                                 }
                                 if let elapsed = ExpertIOThreadPool.preadFileIntoBuffer(fd: fd, dst: pinned.contents(), length: length, threads: 8) {
                                     buffers[shard0.index] = pinned
+                                    pinnedShardIndex = shard0.index
                                     print("⚡ [FlashMoE] Pinned backbone (\(String(format: "%.2f", Double(length) / 1073741824.0)) GB) into anonymous GPU memory in \(String(format: "%.2f", elapsed))s — per-token mmap re-faults eliminated")
                                 } else {
                                     print("⚠️ [FlashMoE] Backbone pinning pread incomplete — falling back to mmap path")
@@ -12892,7 +12964,7 @@ if layer.attnGateProjTensor != nil,
                         }
                     }
                 } else {
-                    WorkingSetManager.shared.initialize(summary: loadedSummary, shardBuffers: buffers, mode: memoryBudgetMode, modelDir: dirUrl)
+                    WorkingSetManager.shared.initialize(summary: loadedSummary, shardBuffers: buffers, mode: memoryBudgetMode)
                     let effMode = memoryExecutionMode.resolveEffectiveMode(modelFootprintGB: mappedGB)
                     if effMode == .residentRAM {
                         WorkingSetManager.shared.preFaultAll(shardBuffers: buffers, summary: loadedSummary)
@@ -12906,6 +12978,18 @@ if layer.attnGateProjTensor != nil,
                     self.engine = loadedEngine
                     self.summary = loadedSummary
                     self.shardBuffers = buffers
+                    // Adopt the shard registry only now that this load is the accepted
+                    // one: a superseded task is dropped at the guard above and its
+                    // engine's mmaps can go away behind it, so registering any earlier
+                    // would leave the residency loop walking a rejected model's pointers.
+                    // A pinned backbone (FlashMoE) is excluded — its anonymous pages are
+                    // dirty heap that the footprint line already counts, not clean
+                    // unified-cache pages.
+                    var registryBuffers = buffers
+                    if let pinnedIdx = pinnedShardIndex {
+                        registryBuffers.removeValue(forKey: pinnedIdx)
+                    }
+                    WorkingSetManager.shared.registerShardMappings(registryBuffers)
                     self.modelConfig = cfg
                     self.detectedArchitecture = arch
                     // Do NOT restore a system prompt captured before the load here.
@@ -12958,6 +13042,12 @@ if layer.attnGateProjTensor != nil,
                     self.summary = nil
                     self.engine = nil
                     self.shardBuffers.removeAll()
+                    // The installed model is being torn down, so drop its shard registry
+                    // as well: the residency cadence would otherwise keep probing these
+                    // addresses every 2 s after their mmaps are gone — and if the next
+                    // load reuses the virtual addresses, mincore would report unrelated
+                    // memory as shard residency.
+                    WorkingSetManager.shared.releaseShardMappings()
                     // No usable engine is installed; clear the identity so an async
                     // send cannot treat a stale `activeLoadedModelPath` as ready.
                     self.installedModelPath = nil

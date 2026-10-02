@@ -1027,11 +1027,11 @@ struct SettingsSheetView: View {
                         Text(String(format: "%.2f GB", currentRssGB))
                             .font(.system(size: 14, weight: .semibold, design: .monospaced))
                             .foregroundStyle(.indigo)
-                        Text(String(format: "Heap: %.2f GB", getProcessResidentMemoryGB()))
+                        Text(String(format: "Footprint: %.2f GB", getActivityMonitorFootprintGB()))
                             .font(.system(size: 9, design: .monospaced))
                             .foregroundStyle(.tertiary)
                     }
-                    .help(String(format: "Working Set RAM: %.2f GB\nProcess Heap (Activity Monitor): %.2f GB\nUnified Memory Cache: %.2f GB\n\nApple Silicon places clean zero-copy model weights in Darwin's Unified Memory Buffer Cache, which Activity Monitor excludes from process footprint.", currentRssGB, getProcessResidentMemoryGB(), max(0, currentRssGB - getProcessResidentMemoryGB())))
+                    .help(String(format: "Working Set RAM: %.2f GB\nProcess Footprint (Activity Monitor): %.2f GB\nUnified Memory Cache: %.2f GB\n\nApple Silicon places clean zero-copy model weights in Darwin's Unified Memory Buffer Cache (residency measured directly over the shard mappings); Activity Monitor's 'Memory' column excludes these clean file-backed pages from the process footprint (dirty heap, compressed memory, IOKit) it displays.", currentRssGB, getActivityMonitorFootprintGB(), WorkingSetManager.shared.residentShardBytesGB))
 
                     VStack(alignment: .leading, spacing: 3) {
                         Text("RESIDENT EXPERTS")
