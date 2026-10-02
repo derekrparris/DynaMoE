@@ -8,6 +8,26 @@
 
 import SwiftUI
 
+// MARK: - Settings palette
+
+extension Color {
+    /// Detail-pane background for the settings window: white in light mode,
+    /// near-black gray in dark mode, matching System Settings.
+    static let settingsPaneBackground = Color(nsColor: NSColor(name: nil, dynamicProvider: { appearance in
+        appearance.bestMatch(from: [.darkAqua, .vibrantDark]) != nil
+            ? NSColor(white: 0.118, alpha: 1.0)
+            : NSColor.white
+    }))
+
+    /// Shaded group background used in place of a border, System Settings
+    /// style: faint gray in light mode, slightly lifted from the pane in dark.
+    static let settingsCardFill = Color(nsColor: NSColor(name: nil, dynamicProvider: { appearance in
+        appearance.bestMatch(from: [.darkAqua, .vibrantDark]) != nil
+            ? NSColor(white: 0.165, alpha: 1.0)
+            : NSColor(white: 0.972, alpha: 1.0)
+    }))
+}
+
 /// Pane header shown at the top of a settings detail pane, following the macOS
 /// System Settings pattern: a tinted icon tile, a bold pane title, and a short
 /// descriptive subtitle, centered with no enclosing card.
@@ -75,11 +95,7 @@ struct SettingsCard<Content: View>: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color(nsColor: .controlBackgroundColor))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+                    .fill(Color.settingsCardFill)
             )
 
             if let footer {

@@ -211,7 +211,7 @@ struct SettingsSheetView: View {
             }
         }
         .frame(minWidth: 780, minHeight: 560)
-        .background(Color(NSColor.windowBackgroundColor))
+        .background(Color.settingsPaneBackground)
     }
 
     // MARK: - Sidebar & Detail Shell
@@ -272,7 +272,7 @@ struct SettingsSheetView: View {
             .frame(maxWidth: 820, alignment: .leading)
             .frame(maxWidth: .infinity)
         }
-        .background(Color(NSColor.windowBackgroundColor))
+        .background(Color.settingsPaneBackground)
     }
 
     // MARK: - Tab 0: General
@@ -594,11 +594,11 @@ struct SettingsSheetView: View {
                         }
                     }
                     .padding(12)
-                    .background(Color(NSColor.controlBackgroundColor))
+                    .background(Color.settingsCardFill)
                     .cornerRadius(10)
                     .overlay(
                         RoundedRectangle(cornerRadius: 10)
-                            .stroke(selectedModelForProfiles == model.id ? Color.purple.opacity(0.4) : (isCurrentActive ? Color.purple.opacity(0.3) : Color.primary.opacity(0.06)), lineWidth: selectedModelForProfiles == model.id ? 1.5 : 1)
+                            .stroke(Color.purple.opacity(selectedModelForProfiles == model.id ? 0.45 : (isCurrentActive ? 0.3 : 0.0)), lineWidth: selectedModelForProfiles == model.id ? 1.5 : 1)
                     )
                 }
                 }
@@ -879,7 +879,7 @@ struct SettingsSheetView: View {
                         .font(.system(.caption, design: .monospaced))
                         .frame(height: 75)
                         .padding(6)
-                        .background(Color(NSColor.controlBackgroundColor))
+                        .background(Color.settingsPaneBackground)
                         .cornerRadius(8)
                         .overlay(
                             RoundedRectangle(cornerRadius: 8)
@@ -1640,12 +1640,8 @@ struct SettingsSheetView: View {
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(NSColor.controlBackgroundColor).opacity(0.7))
+        .background(Color.settingsCardFill)
         .cornerRadius(8)
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
-        )
     }
 
     // MARK: - Tab 5: Advanced Diagnostics & Inspector
@@ -1725,7 +1721,7 @@ struct SettingsSheetView: View {
                     }
                 }
                 .frame(height: 220)
-                .background(Color(NSColor.controlBackgroundColor))
+                .background(Color.settingsPaneBackground)
                 .cornerRadius(8)
             }
         }
@@ -1982,7 +1978,7 @@ struct SettingsSheetView: View {
                         .font(.system(.caption, design: .monospaced))
                         .frame(minHeight: 55, maxHeight: 90)
                         .padding(4)
-                        .background(Color(NSColor.controlBackgroundColor))
+                        .background(Color.settingsPaneBackground)
                         .cornerRadius(6)
                         .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.2), lineWidth: 1))
                 }
@@ -2040,12 +2036,8 @@ struct SettingsSheetView: View {
             }
         }
         .padding(12)
-        .background(Color.purple.opacity(0.03))
+        .background(Color.purple.opacity(0.05))
         .cornerRadius(10)
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(Color.purple.opacity(0.18), lineWidth: 1)
-        )
     }
 
     private func repackModel(_ model: DiscoveredModel) {
