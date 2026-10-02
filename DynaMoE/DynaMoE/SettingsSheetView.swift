@@ -393,22 +393,19 @@ struct SettingsSheetView: View {
         )
     }
 
-    /// Labeled compact numeric control used across the sampling and JetSpec grids.
-    private func samplingControl(
+    /// Label-left settings row carrying a slider-plus-field numeric control,
+    /// used across the Sampling and JetSpec parameter sets.
+    private func samplingSliderRow(
         _ title: String,
+        subtitle: String,
         value: Binding<Double>,
         range: ClosedRange<Double>,
         step: Double,
         digits: Int = 2
     ) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(title)
-                .font(.system(size: 11.5, weight: .medium))
-                .foregroundColor(.secondary)
-                .lineLimit(1)
-            SettingsNumericField(value: value, range: range, step: step, fractionDigits: digits)
+        SettingsRow(title: title, subtitle: subtitle) {
+            SettingsValueSlider(value: value, range: range, step: step, fractionDigits: digits)
         }
-        .frame(width: 150, alignment: .leading)
     }
 
     // MARK: - Tab 1: Models & Weights Management
@@ -713,61 +710,94 @@ struct SettingsSheetView: View {
             }
 
             SettingsCard(header: "Sampling") {
-                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 14) {
-                    GridRow {
-                        samplingControl("Temperature", value: doubleBinding($temperature), range: 0.0...2.0, step: 0.05)
-                        samplingControl("Top-P (Nucleus)", value: doubleBinding($topP), range: 0.0...1.0, step: 0.05)
-                        samplingControl("Min-P (Confidence)", value: doubleBinding($minP), range: 0.0...0.5, step: 0.01)
-                    }
-                    GridRow {
-                        samplingControl("Top-K", value: doubleBinding($topK), range: 1...100, step: 1, digits: 0)
-                        samplingControl("Repetition Penalty", value: doubleBinding($repetitionPenalty), range: 1.0...2.0, step: 0.05)
-                        samplingControl("Presence Penalty", value: doubleBinding($presencePenalty), range: 0.0...2.0, step: 0.05)
-                    }
-                }
+                samplingSliderRow(
+                    "Temperature",
+                    subtitle: "Controls randomness. Lower values are more focused and deterministic.",
+                    value: doubleBinding($temperature), range: 0.0...2.0, step: 0.05
+                )
 
                 SettingsRowDivider()
 
-                // Max Output Tokens: precise field plus quick presets, full width.
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 10) {
-                        Text("Max Output Tokens")
-                            .font(.system(size: 11.5, weight: .medium))
-                            .foregroundColor(.secondary)
-                        SettingsNumericField(
-                            value: doubleBinding($maxNewTokens),
-                            range: 32...10000,
-                            step: 32,
-                            fractionDigits: 0,
-                            fieldWidth: 72
-                        )
-                    }
+                samplingSliderRow(
+                    "Top-P (Nucleus)",
+                    subtitle: "Samples from the smallest set of tokens whose probabilities add up to P.",
+                    value: doubleBinding($topP), range: 0.0...1.0, step: 0.05
+                )
 
-                    HStack(spacing: 6) {
-                        Text("Presets:")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                        ForEach([512, 1024, 2048, 4096, 8192, 10000], id: \.self) { preset in
-                            Button("\(preset)") {
-                                maxNewTokens = preset
-                            }
-                            .buttonStyle(.plain)
-                            .font(.system(size: 10.5, weight: maxNewTokens == preset ? .bold : .regular, design: .monospaced))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2.5)
-                            .background(maxNewTokens == preset ? Color.purple.opacity(0.18) : Color.secondary.opacity(0.08))
-                            .foregroundColor(maxNewTokens == preset ? .purple : .primary)
-                            .cornerRadius(4)
+                SettingsRowDivider()
+
+                samplingSliderRow(
+                    "Min-P (Confidence)",
+                    subtitle: "Ignores tokens below this fraction of the most likely token's probability.",
+                    value: doubleBinding($minP), range: 0.0...0.5, step: 0.01
+                )
+
+                SettingsRowDivider()
+
+                samplingSliderRow(
+                    "Top-K",
+                    subtitle: "Restricts sampling to the K most likely tokens.",
+                    value: doubleBinding($topK), range: 1...100, step: 1, digits: 0
+                )
+
+                SettingsRowDivider()
+
+                samplingSliderRow(
+                    "Repetition Penalty",
+                    subtitle: "Downweights tokens that have already appeared. 1.00 disables the penalty.",
+                    value: doubleBinding($repetitionPenalty), range: 1.0...2.0, step: 0.05
+                )
+
+                SettingsRowDivider()
+
+                samplingSliderRow(
+                    "Presence Penalty",
+                    subtitle: "Penalizes any token already present to steer toward new topics.",
+                    value: doubleBinding($presencePenalty), range: 0.0...2.0, step: 0.05
+                )
+
+                SettingsRowDivider()
+
+                // Max Output Tokens: slider, editable field, and quick presets.
+                SettingsRow(
+                    title: "Max Output Tokens",
+                    subtitle: "Hard cap on tokens generated per response."
+                ) {
+                    SettingsValueSlider(
+                        value: doubleBinding($maxNewTokens),
+                        range: 32...10000,
+                        step: 32,
+                        fractionDigits: 0,
+                        fieldWidth: 64
+                    )
+                }
+
+                HStack(spacing: 6) {
+                    Text("Presets")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+
+                    ForEach([512, 1024, 2048, 4096, 8192, 10000], id: \.self) { preset in
+                        Button("\(preset)") {
+                            maxNewTokens = preset
                         }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 10.5, weight: maxNewTokens == preset ? .bold : .regular, design: .monospaced))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2.5)
+                        .background(maxNewTokens == preset ? Color.purple.opacity(0.18) : Color.secondary.opacity(0.08))
+                        .foregroundColor(maxNewTokens == preset ? .purple : .primary)
+                        .cornerRadius(4)
                     }
                 }
+                .padding(.vertical, 4)
             }
 
             // JetSpec Causal Speculative Tree Acceleration
             SettingsCard(header: "JetSpec Speculative Tree Acceleration") {
                     SettingsRow(
                         title: "Enable JetSpec",
-                        subtitle: "Accelerates generation via parallel tree drafting and dynamic MoE budget pruning on resident standard attention models. Gated DeltaNet recurrent models (such as Ornith 1.5) and disk-streamed models automatically use optimized direct execution for maximum speed and state accuracy.",
+                        subtitle: "Parallel tree drafting with dynamic MoE budget pruning for standard attention models. Gated DeltaNet recurrent models (like Ornith 1.5) and disk-streamed models use optimized direct execution automatically.",
                         icon: "arrow.triangle.branch",
                         iconTint: .purple
                     ) {
@@ -779,14 +809,27 @@ struct SettingsSheetView: View {
                     if jetSpecEnabled {
                         SettingsRowDivider()
 
-                        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 14) {
-                            GridRow {
-                                samplingControl("Max Tree Depth", value: doubleBinding($jetSpecMaxDepth), range: 1...5, step: 1, digits: 0)
-                                samplingControl("Branching Factor", value: doubleBinding($jetSpecBranchingFactor), range: 1...4, step: 1, digits: 0)
-                                samplingControl("Max Expert Cap", value: doubleBinding($jetSpecMaxExpertCap), range: 2...16, step: 1, digits: 0)
-                            }
-                        }
-                        .padding(.vertical, 8)
+                        samplingSliderRow(
+                            "Max Tree Depth",
+                            subtitle: "How far ahead the tree drafts tokens before verification.",
+                            value: doubleBinding($jetSpecMaxDepth), range: 1...5, step: 1, digits: 0
+                        )
+
+                        SettingsRowDivider()
+
+                        samplingSliderRow(
+                            "Branching Factor",
+                            subtitle: "Candidate continuations explored per tree node.",
+                            value: doubleBinding($jetSpecBranchingFactor), range: 1...4, step: 1, digits: 0
+                        )
+
+                        SettingsRowDivider()
+
+                        samplingSliderRow(
+                            "Max Expert Cap",
+                            subtitle: "Upper bound on MoE experts evaluated per drafted token.",
+                            value: doubleBinding($jetSpecMaxExpertCap), range: 2...16, step: 1, digits: 0
+                        )
                     }
             }
 
@@ -1805,7 +1848,7 @@ struct SettingsSheetView: View {
                         Spacer()
                         Text(String(format: "%.2f", editingDraft.temperature))
                             .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.purple)
+                            .foregroundStyle(.secondary)
                     }
                     Slider(value: $editingDraft.temperature, in: 0.0...2.0, step: 0.05)
                 }
@@ -1819,7 +1862,7 @@ struct SettingsSheetView: View {
                         Spacer()
                         Text(String(format: "%.2f", editingDraft.topP))
                             .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.purple)
+                            .foregroundStyle(.secondary)
                     }
                     Slider(value: $editingDraft.topP, in: 0.0...1.0, step: 0.05)
                 }
@@ -1833,7 +1876,7 @@ struct SettingsSheetView: View {
                         Spacer()
                         Text(String(format: "%.2f", editingDraft.minP))
                             .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.purple)
+                            .foregroundStyle(.secondary)
                     }
                     Slider(value: $editingDraft.minP, in: 0.0...0.5, step: 0.01)
                 }
@@ -1847,7 +1890,7 @@ struct SettingsSheetView: View {
                         Spacer()
                         Text("\(editingDraft.topK)")
                             .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.purple)
+                            .foregroundStyle(.secondary)
                     }
                     Slider(value: Binding(
                         get: { Float(editingDraft.topK) },
@@ -1864,7 +1907,7 @@ struct SettingsSheetView: View {
                         Spacer()
                         Text(String(format: "%.2f", editingDraft.repetitionPenalty))
                             .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.purple)
+                            .foregroundStyle(.secondary)
                     }
                     Slider(value: $editingDraft.repetitionPenalty, in: 1.0...2.0, step: 0.05)
                 }
@@ -1878,7 +1921,7 @@ struct SettingsSheetView: View {
                         Spacer()
                         Text(String(format: "%.2f", editingDraft.presencePenalty))
                             .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.purple)
+                            .foregroundStyle(.secondary)
                     }
                     Slider(value: $editingDraft.presencePenalty, in: 0.0...2.0, step: 0.05)
                 }
@@ -1892,7 +1935,7 @@ struct SettingsSheetView: View {
                         Spacer()
                         Text("\(editingDraft.maxNewTokens) tokens")
                             .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(.purple)
+                            .foregroundStyle(.secondary)
                     }
                     Slider(value: Binding(
                         get: { Float(editingDraft.maxNewTokens) },

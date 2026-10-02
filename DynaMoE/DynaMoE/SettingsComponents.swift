@@ -180,25 +180,27 @@ struct SettingsStatusBadge: View {
     }
 }
 
-/// Compact numeric input for dialing in values precisely: an editable value
-/// field paired with a stepper. Replaces wide sliders for sampling settings.
-struct SettingsNumericField: View {
+/// Pro-app numeric control (Final Cut/Motion inspector style): a slider for
+/// feel paired with a narrow editable field for typing exact values. Values in
+/// the field are clamped to the slider's range; there are no stepper arrows.
+struct SettingsValueSlider: View {
     let value: Binding<Double>
     let range: ClosedRange<Double>
     let step: Double
     var fractionDigits: Int = 2
-    var fieldWidth: CGFloat = 58
+    var sliderWidth: CGFloat = 200
+    var fieldWidth: CGFloat = 50
 
     var body: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 10) {
+            Slider(value: clamped, in: range, step: step)
+                .frame(width: sliderWidth)
+
             TextField("", value: clamped, format: .number.precision(.fractionLength(fractionDigits)))
                 .textFieldStyle(.roundedBorder)
                 .font(.system(size: 12, design: .monospaced))
                 .multilineTextAlignment(.trailing)
                 .frame(width: fieldWidth)
-
-            Stepper("", value: clamped, in: range, step: step)
-                .labelsHidden()
         }
     }
 
