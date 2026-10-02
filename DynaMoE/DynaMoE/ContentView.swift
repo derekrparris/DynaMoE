@@ -309,8 +309,30 @@ func getProcessResidentMemoryGB() -> Double {
     }
     return 0.0
 }
+
+// phys_footprint: dirty + compressed + IOKit pages, EXCLUDING clean file-backed
+// pages such as the zero-copy mmap'd weight shards. This is the number Activity
+// Monitor's "Memory" column and Xcode's memory gauge actually display — it is
+// NOT the resident size above, which counts every resident page the task maps.
+func getActivityMonitorFootprintGB() -> Double {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / 4)
+    let kr = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: 1) {
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+        }
+    }
+    if kr == KERN_SUCCESS {
+        return Double(info.phys_footprint) / (1024.0 * 1024.0 * 1024.0)
+    }
+    return 0.0
+}
 #else
 func getProcessResidentMemoryGB() -> Double {
+    return 0.0
+}
+
+func getActivityMonitorFootprintGB() -> Double {
     return 0.0
 }
 #endif
@@ -449,11 +471,11 @@ final class WorkingSetManager {
     }
 
     var effectiveResidentMemoryGB: Double {
-        lock.lock()
-        let weightsGB = Double(denseBytes + residentExpertBytes) / (1024.0 * 1024.0 * 1024.0)
-        lock.unlock()
-        let heapGB = getProcessResidentMemoryGB()
-        return heapGB + weightsGB
+        // mach resident_size (RSIZE) already includes every resident weight page
+        // — file-backed mmap pages and anonymous pinned/staging buffers alike.
+        // Adding the catalog's tracked dense/expert bytes on top double-counted
+        // them, inflating the reported working set by up to the full tracked size.
+        return getProcessResidentMemoryGB()
     }
 
     private static var pageFaultSink: Int64 = 0
@@ -475,33 +497,10 @@ final class WorkingSetManager {
     func primeSlices(_ slices: [ExpertSlice], shardBuffers: [UInt32: MTLBuffer]) {
         guard !slices.isEmpty else { return }
 
-        lock.lock()
-        let fds = self.shardFDs
-        lock.unlock()
-
-        if !fds.isEmpty {
-            DispatchQueue.concurrentPerform(iterations: slices.count) { i in
-                let slice = slices[i]
-                guard let fd = fds[slice.shardIndex] else { return }
-                guard let buf = shardBuffers[slice.shardIndex] else { return }
-                let len = Int(slice.length)
-                let offset = off_t(slice.offset)
-                guard len > 0 else { return }
-
-                // Directly pread from file into MTLBuffer contents, eliminating scratch copy
-                let bufPtr = buf.contents().advanced(by: Int(slice.offset))
-                var bytesRead = 0
-                while bytesRead < len {
-                    let toRead = min(len - bytesRead, 262144)
-                    let n = pread(fd, bufPtr.advanced(by: bytesRead), toRead, offset + off_t(bytesRead))
-                    if n <= 0 { break }
-                    bytesRead += n
-                }
-            }
-            return
-        }
-
-        // Fallback: If shard file descriptors are not available, fault via mmap pointer
+        // Bring slices resident by faulting pages through the read-only shard mmap.
+        // pread() into a PROT_READ mapping returns EFAULT on the first chunk, so the
+        // old fd-based "fast path" silently primed nothing; the stride touch below
+        // is the only mechanism that actually pages the slices in (PERF_FINDINGS T8).
         let pageSize = Int(vm_page_size) // 16384 bytes on Apple Silicon
         DispatchQueue.concurrentPerform(iterations: slices.count) { i in
             let slice = slices[i]
@@ -590,7 +589,6 @@ final class WorkingSetManager {
 
     func preFaultAll(shardBuffers: [UInt32: MTLBuffer], summary: ModelSummary) {
         lock.lock()
-        let fds = self.shardFDs
         for key in expertSlices.keys {
             residentExperts.insert(key)
         }
@@ -602,25 +600,12 @@ final class WorkingSetManager {
         let shards = summary.shards
         let pageSize = Int(vm_page_size) // 16384 bytes on Apple Silicon
 
-        // Fast parallel sequential priming across CPU cores
+        // Parallel priming across CPU cores. Stride-touch only: pread() into the
+        // read-only mmap fails with EFAULT and never primed anything.
         DispatchQueue.concurrentPerform(iterations: shards.count) { i in
             let shard = shards[i]
             let len = Int(shard.length)
             guard len > 0 else { return }
-
-            if let fd = fds[shard.index] {
-                // Directly pread from file into MTLBuffer contents, eliminating scratch copy
-                if let buf = shardBuffers[shard.index] {
-                    let bufPtr = buf.contents()
-                    var bytesRead = 0
-                    while bytesRead < len {
-                        let toRead = min(len - bytesRead, 262144)
-                        let n = pread(fd, bufPtr.advanced(by: bytesRead), toRead, off_t(bytesRead))
-                        if n <= 0 { break }
-                        bytesRead += n
-                    }
-                }
-            }
 
             // Stride touch through mmap MTLBuffer to map hardware page tables directly
             if let buf = shardBuffers[shard.index] {
@@ -673,8 +658,7 @@ final class WorkingSetManager {
         lock.lock()
         let maxAllowed = mode.maxResidentExperts
         var excess = residentExperts.count - maxAllowed
-        let weightsGB = Double(denseBytes + residentExpertBytes) / (1024.0 * 1024.0 * 1024.0)
-        let currentRss = getProcessResidentMemoryGB() + weightsGB
+        let currentRss = getProcessResidentMemoryGB()
         if currentRss > mode.targetMaxRssGB {
             let overRssGB = currentRss - mode.targetMaxRssGB
             let extraExpertsToTrim = Int(ceil(overRssGB * 1024.0 / 4.9))

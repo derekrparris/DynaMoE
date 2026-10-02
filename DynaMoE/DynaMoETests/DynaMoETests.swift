@@ -4834,7 +4834,7 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(mgr.residentExpertsCount, 0)
         XCTAssertEqual(mgr.totalExpertKeysCount, 48 * 32)
         let initRss = mgr.effectiveResidentMemoryGB
-        XCTAssertGreaterThan(initRss, 0.0, "Effective resident memory should track process heap + dense backbone")
+        XCTAssertGreaterThan(initRss, 0.0, "Effective resident memory should track real process residency (RSIZE, which already includes resident weight pages)")
 
         // Verify primeSlices parallel page faulting
         let sampleSlices = [

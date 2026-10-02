@@ -2446,3 +2446,57 @@ mangled-path command. A line containing `cd:` plus a cd diagnostic
 `string not in pwd`, `invalid option`) now counts as a missing-path signal, so the
 absolute-path pass names the real sibling directory. Test:
 `testMissingPathRepairHintHandlesFailedCd`. Verified: passes.
+
+### QA #50 — RAM telemetry displayed RSIZE as the "Activity Monitor" number and double-counted every resident weight page
+
+Found by probing the app's exact zero-copy strategy (read-only `memmap2` mmap of a
+3 GiB file wrapped in `MTLBuffer(bytesNoCopy:.storageModeShared)`, then faulting
+"backbone"/"expert" ranges), with every number cross-checked against `footprint`,
+`vmmap --summary`, and `ps` (all tools agreed at every phase):
+
+1. **"Process Heap (Activity Monitor / Xcode)" showed RSIZE.** The metric was
+   `mach_task_basic_info.resident_size`, which counts every resident page the task
+   maps — including the clean file-backed weight pages held by the unified page
+   cache. Activity Monitor's "Memory" column and Xcode's memory gauge display
+   `phys_footprint` (dirty + compressed + IOKit only). Probe: with a 512 MB heap
+   plus 2.25 GB of weights faulted in through the mapping, the displayed metric
+   read 2.79 GB while every ground-truth tool read **0.54 GB** — a 5.2x
+   overstatement. In-vivo (real Ornith 35B FP8 decode via the stream bench):
+   RSIZE 8.8–10.0 GB vs footprint 4.6–5.8 GB.
+2. **"Working Set RAM" = RSIZE + (denseBytes + residentExpertBytes) double-counted
+   the whole tracked catalogue.** RSIZE already contains every resident weight
+   page, file-backed (touching 1.25 GB of mapped weights raised RSIZE by exactly
+   1.25 GB) or anonymous (pinned backbone, ExpertIOThreadPool staging). The probe
+   state above displayed **5.04 GB against a true 2.79 GB** working set, and a
+   live 12.9 GB sidebar reading decomposes as 5.2 GB RSIZE + 7.7 GB tracked.
+   `trimToBudget` also made its over-budget trim decision on the same inflated
+   figure (ContentView.swift `effectiveResidentMemoryGB`/`trimToBudget`), evicting
+   experts early.
+
+Fixes (ContentView.swift, SidebarView.swift, SettingsSheetView.swift):
+
+- Added `getActivityMonitorFootprintGB()` (`task_vm_info.phys_footprint`);
+  the sidebar tooltip, the settings "Heap:" line, and both tooltips now show it
+  for the "(Activity Monitor / Xcode)" number.
+- `effectiveResidentMemoryGB` and `trimToBudget` now use RSIZE alone; tracked
+  dense/expert bytes remain LRU bookkeeping, not RAM added on top.
+- The "Unified Memory Cache" tooltip line is now real: RSIZE − footprint = the
+  resident clean file-backed pages (weights actually cached), replacing the
+  double-counted catalogue delta.
+- Side finding from the same probe: the fd "fast path" in `primeSlices`/
+  `preFaultAll` `pread()`s into the PROT_READ shard mapping, which returns
+  EFAULT on the first chunk (`if n <= 0 { break }` swallowed it) — a silent
+  no-op, and `primeSlices` returned before ever running its own touch fallback,
+  so decode-time backbone prefetch never primed anything. Removed; the stride
+  touch (T8: 13–20 GB/s warm) now always runs. Also verified:
+  `posix_madvise(DONTNEED)` does not reclaim clean mapped pages until system
+  pressure exists (RSIZE held flat for 30 s after an "eviction"), so post-eviction
+  RSIZE is the honest view while the catalogue's "evicted" bookkeeping is
+  optimistic until the kernel actually reclaims.
+
+Verification: probe on macOS 26.7.1 / M1 Pro (in-process metrics matched the
+`footprint` CLI and vmmap at every phase); Xcode build green;
+`testWorkingSetManagerTokenBoundaryEviction` and
+`testWorkingSetManagerBulkPreadPriming` pass (mock-buffer tests are unaffected —
+their writable `makeBuffer(length:)` shards always allowed the pread that the
+real read-only mmap forbids, which is why the old path looked tested).
