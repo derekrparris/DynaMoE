@@ -4175,6 +4175,15 @@ final class DynaMoETests: XCTestCase {
         let kvHeads = 8
         let tokenScaleFloats = kvHeads // one half per (token, kv-head)
 
+        // Review hardening: the scale-buffer allocation is capacity-based, so the
+        // singleton can enter this test with oversized buffers from an earlier,
+        // longer allocation (other tests, or this test's own prior runs) — then the
+        // 1024 setup below would NOT rebuild and the later growth assertions would
+        // depend on leftover state. Clear both buffers so this test deterministically
+        // exercises capacity growth from 1024 to 2048 on its own buffers.
+        KVCacheManager.shared.kScaleBuffer = nil
+        KVCacheManager.shared.vScaleBuffer = nil
+
         KVCacheManager.shared.reset(
             device: device, config: nil, actualLayers: 4, totalLoops: 1,
             numKvHeads: kvHeads, headDim: 64, maxSeqLen: 1024, precision: .fp8,
@@ -4223,6 +4232,51 @@ final class DynaMoETests: XCTestCase {
             }
             // Just past the restored prefix the rebuilt buffer must still be zero.
             XCTAssertEqual(newKS[newBase + pinTokens * tokenScaleFloats], 0)
+        }
+
+        // === Retained-capacity regression (Copilot review round): capacity left over
+        // from a longer earlier conversation must not turn a stride-change relayout
+        // into an in-place overwrite. The 2048-layout buffers allocated above are
+        // deliberately kept; a fresh 1024 reset fits inside that capacity and retains
+        // them, so the follow-up spliced grow back to 2048 has sufficient capacity —
+        // the restore must still go through freshly rebuilt buffers, and later slots'
+        // source data must survive slot 1's copy (the old code wrote slot 1's
+        // 2048-stride destination over slot 2's 1024-stride source mid-loop).
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: kvHeads, headDim: 64, maxSeqLen: 1024, precision: .fp8,
+            preservePrefixCount: 0
+        )
+        XCTAssertTrue(KVCacheManager.shared.kScaleBuffer === newKBuf,
+                      "a fresh 1024 reset fits inside the retained 2048 capacity and must keep the buffer")
+        for i in 0..<(newKBuf.length / 2) {
+            newKS[i] = UInt16(truncatingIfNeeded: 0x3400 &+ i)
+            newVS[i] = UInt16(truncatingIfNeeded: 0x3600 &+ i)
+        }
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: kvHeads, headDim: 64, maxSeqLen: 2048, precision: .fp8,
+            preservePrefixCount: pinTokens
+        )
+        guard let relaidKBuf = KVCacheManager.shared.kScaleBuffer,
+              let relaidVBuf = KVCacheManager.shared.vScaleBuffer else {
+            return XCTFail("FP8 KV cache did not allocate scale buffers after retained-capacity splice reset")
+        }
+        XCTAssertTrue(relaidKBuf !== newKBuf && relaidVBuf !== newVBuf,
+                      "a stride-change splice must rebuild the scale buffers even when the old capacity was sufficient")
+        let relaidKS = relaidKBuf.contents().bindMemory(to: UInt16.self, capacity: relaidKBuf.length / 2)
+        let relaidVS = relaidVBuf.contents().bindMemory(to: UInt16.self, capacity: relaidVBuf.length / 2)
+        for slot in 0..<4 {
+            let newBase = slot * 2048 * tokenScaleFloats
+            let oldBase = slot * 1024 * tokenScaleFloats
+            for t in 0..<(pinTokens * tokenScaleFloats) {
+                XCTAssertEqual(relaidKS[newBase + t], UInt16(truncatingIfNeeded: 0x3400 &+ (oldBase + t)),
+                               "retained-capacity splice corrupted kScale at slot \(slot), element \(t)")
+                XCTAssertEqual(relaidVS[newBase + t], UInt16(truncatingIfNeeded: 0x3600 &+ (oldBase + t)),
+                               "retained-capacity splice corrupted vScale at slot \(slot), element \(t)")
+            }
+            XCTAssertEqual(relaidKS[newBase + pinTokens * tokenScaleFloats], 0,
+                           "the rebuilt buffer's tail must be zero, not leftover source data")
         }
 
         // Leave the shared singleton in a small, conventional state for later tests.

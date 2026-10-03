@@ -2817,3 +2817,19 @@ models will NOT tools_load web_fetch on their own even when instructed to
 read pages via it, so leaving it opt-in just re-creates the loop.
 `testToolsLoadRewritesPromptToolSectionForNextStep` now drives the refresh
 regression with git_diff (a non-core tool) since web_fetch is core.
+
+**Review hardening (FIX #12 second round, Copilot review):** the scale-buffer
+allocation condition was capacity-based, so an earlier, longer conversation
+could leave scale buffers large enough for BOTH the old and new strides. A
+spliced reset that changed the stride then relaid out slots inside the SAME
+buffer — and the forward slot loop wrote slot 1's 2048-stride destination over
+slot 2's 1024-stride source before slot 2 was copied (unreachable with a
+max(8192, prompt+…) budget within one session, but reachable across sessions
+in a shared process, and memmove would not help — the overlap is between
+separate slot regions). Scale buffers now rebuild on every preserve-with-
+stride-change so the restore is always buffer-to-buffer; fresh resets keep the
+capacity-retention fast path. Test hardening: the FP8 splice test nils the
+singleton's scale buffers before setup (its assertions previously depended on
+leftover capacity from earlier tests) and adds a retained-capacity phase —
+fresh-drop to 1024 inside retained 2048 capacity, then spliced grow back to
+2048 — asserting a rebuilt buffer and byte-exact restore of every slot.

@@ -244,7 +244,18 @@ final class KVCacheManager {
             let scaleElemBytes = MemoryLayout<UInt16>.stride
             let oldKScale = self.kScaleBuffer
             let oldVScale = self.vScaleBuffer
-            if kScaleBuffer == nil || kScaleBuffer!.length < scaleBytes {
+            // The allocation condition below is capacity-based, so an earlier, longer
+            // conversation can leave scale buffers big enough for BOTH the old and new
+            // strides. A spliced reset that changes the stride must then relayout
+            // slot-by-slot between the oldMaxSeq and maxSeqLen layouts inside the SAME
+            // buffer — and a forward slot loop would overwrite a later slot's source
+            // data before it is copied (slot 1's 2048-stride destination overlaps slot
+            // 2's 1024-stride source). memmove would not help: the overlap is between
+            // separate slot regions, not within one copy. Rebuild both buffers on
+            // every preserve-with-stride-change so the restore is always
+            // buffer-to-buffer; fresh resets keep the capacity-retention fast path.
+            let scaleStrideChanged = (preservePrefixCount > 0 && maxSeqLen != oldMaxSeq)
+            if kScaleBuffer == nil || kScaleBuffer!.length < scaleBytes || scaleStrideChanged {
                 self.kScaleBuffer = device.makeBuffer(length: scaleBytes, options: .storageModeShared)
                 self.vScaleBuffer = device.makeBuffer(length: scaleBytes, options: .storageModeShared)
             }
@@ -258,6 +269,9 @@ final class KVCacheManager {
                 // Rebuilding the scale buffers on a grown maxSeqLen throws the pinned
                 // prefix's scales away — restore them slot-by-slot exactly like the
                 // K/V memcpy above (old layout stride oldMaxSeq, new stride maxSeqLen).
+                // scaleStrideChanged above guarantees src and dst are distinct buffers
+                // whenever the layouts differ; when the stride is unchanged a retained
+                // buffer means every newOff equals oldOff and the loop is a no-op.
                 let prefixScaleBytes = min(min(preservePrefixCount, oldMaxSeq), maxSeqLen) * kvHeads * scaleElemBytes
                 let scaleWasRebuilt = (kScaleBuffer !== oldKScale)
                 for slot in 0..<totalSlots {
