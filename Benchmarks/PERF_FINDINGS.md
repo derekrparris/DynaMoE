@@ -2633,3 +2633,179 @@ match `gqa_attention_decode_fused_fp8` to max rel diff ~4e-3, and timing
 | 2,000 | 42.6 ms | 4.8 ms | 8.8× |
 | 4,000 | 85.5 ms | 12.6 ms | 6.8× |
 | 8,000 | 171.5 ms | 28.0 ms | 6.1× |
+
+## FIX #12: FP8 SCALE PRESERVATION ON PREFIX-SPLICED RESET (SHIPPED)
+
+Symptom (live agent runs, FP8 KV, Ornith/spark-class models): spliced
+continuation turns degenerated into word salad ("within within within …") or
+silent token-burn with no tool calls, while full re-prefill turns of the same
+prompt were perfectly coherent. The prompt dumps proved the context itself was
+clean — `splice-vs-reencode` diverged only by the known-benign 2-token
+live-turn boundary merge, and a forced `prefixReused=0` retry of the exact
+3834-token step produced a good web_search call — so the corruption was in
+KV state, not the prompt build.
+
+**Root cause.** Agent prompts grow every step, so `neededSeqLen`
+(`max(8192, prompt + maxTokens + 512)`) grows too and
+`KVCacheManager.reset(preservePrefixCount:)` reallocates the cache on
+*spliced* turns specifically. The preserve path memcpy'd the pinned INT8
+K/V prefix into the new buffers, but the FP8 per-(token, kv-head) dequant
+scale buffers (`kScaleBuffer`/`vScaleBuffer`) were simply re-`makeBuffer`d —
+fresh zero-filled, old data dropped on the floor. Every restored prefix slot
+then dequantized against scale 0: all K scores and V reads collapse, and
+attention over the majority of the context returns noise. Full re-prefills
+rewrote the scales and stayed clean, which is why the bug only ever hit
+spliced steps (Spark's long chats, Ornith step ≥1) and why step0 was fine.
+
+**Why T17d/T17e missed it.** The bench tests the chunked FP8 *kernels*
+standalone with offset-0 synthetic buffers that live for one dispatch — the
+scale-restore bug wasn't in a kernel at all, it was in the transition between
+turns (buffer lifecycle), which no kernel-equality bench can see.
+
+**Fix.** `reset()` now snapshots the old scale buffers before any rebuild and,
+for `preservePrefixCount > 0`, restores each slot's scale prefix with the same
+old-stride/new-stride memcpy shape as the K/V restore (copy only when the
+buffers were rebuilt or the per-slot offset moved; verified skip when the
+buffers are retained in place). Also added a belt-and-braces guard at the
+reuse decision: a pin minted under one KV precision is invalidated when the
+selected precision changes before the turn starts (the preserve math sizes
+slots with the new elementBytes against the old layout).
+
+**Tests:** `testKVCacheFP8ScalePrefixSurvivesSpliceRealloc` — allocates an
+FP8 cache at maxSeqLen 1024, fills both scale buffers with a distinct nonzero
+bit pattern per element, grows to 2048 with `preservePrefixCount: 512`, and
+asserts every restored slot's scale prefix round-trips byte-exact while the
+tail of the rebuilt buffer stays zero. Pure Metal-buffer logic, no model
+snapshot needed. Verified headless on M1 Pro:
+`xcodebuild test -destination 'platform=macOS,arch=arm64' -only-testing:
+DynaMoETests/DynaMoETests/testKVCacheFP8ScalePrefixSurvivesSpliceRealloc`
+passed (0.07s), and `testKVCacheManagerPrefixPreservation` still passes
+through the reworked reset preserve path. Two headless-launch footguns hit
+while verifying, worth recording: a two-component
+`-only-testing:Target/testName` filter silences into `TEST SUCCEEDED` with
+**zero** test cases (use the three-component
+`-only-testing:Target/Class/method` form), and launching the runner fails
+with Runningboard error 5 while a debug session has the app open.
+
+**Follow-up round (second live run, 11:57–12:20Z — same session symptoms, decoded
+as the old binary + threshold):** a fresh agent run on the model still produced
+spliced-step degradation (byte-exact `<parameter=query>` triplication at step1,
+progressive confusion through steps 2–6, word salad at step7), while a forced
+fresh re-prefill mid-run (step6 retry) was clean. The per-step pattern fits the
+pre-fix scale wipe exactly at that run's agent max_tokens: step1's 3558-token
+prompt stayed under the 8192 budget → no realloc → healthy splice (its only
+fault, the triplication, is FP8 KV quantization noise — the grammar allows
+re-typing a parameter and the model retried it byte-identically); from step2 on,
+prompt growth crossed the realloc threshold → every spliced step wiped the
+pinned prefix's scales on rebuild → the observed progressive collapse; the fresh
+retry escaped it by rewriting the whole cache. The debug session running that
+test predated the fix's build, i.e. the app hadn't been rebuilt with it yet.
+Added splice-turn telemetry (`🔍 [KVCACHE] splice reset: pin=… maxSeq A->B
+kvRealloc=… scaleRebuilt=…`) to `reset()` so any future run's binary vintage and
+cache-lifecycle history are readable straight from the Xcode console instead of
+reverse-engineered from prompt dumps. A/B switches for bisecting, should it ever
+recur on a fixed build: `dynamoe_disable_prefix_reuse` (all turns full
+re-prefill) and a temporary FP16 KV setting (isolates quantization noise from
+splice mechanics).
+
+## FIX #13: STALE TOOL BLOCK AFTER tools_load (SHIPPED)
+
+Third live-run forensics round (13:03–13:14Z, post scale-fix binary — steps were
+coherent until `tools_load(["web_fetch"])`, then the model streamed 500+ tokens
+without ever committing to a call). Prompt dumps showed two prompt-side defects:
+
+**Cracked open by the dumps:** after `tools_load` executed, the next step's
+prompt REUSED the previous turn's system text verbatim
+(`nextPrompt = formattedPrompt + …`), so the authoritative "Only the following
+functions are currently loaded and callable" block never gained `web_fetch`
+(step5's `<tools>` still listed the 5 fundamentals, and `prefixReused==pin`
+proved the block bytes never changed — a block edit at the prompt head would
+have broken the common prefix). The tools_load result told the model "you may
+now call it directly using the provided schema" while the block denied it
+existed — the model burned tokens reconciling the contradiction. Same run
+revealed the sibling bug: `beginAgentSearchGuard()` (which default-loads
+`web_search`) ran AFTER `buildSystemPrompt` at send time, so the first prompt
+of a fresh process advertised no web_search at all (previous sessions showed
+it only because an earlier send in the same process had loaded it).
+
+**Fix:** `AgentHarness.buildToolsSection()` extracted so a freshly rendered
+block and a mid-run refresh are byte-identical by construction;
+`refreshingLoadedToolsSection(inPrompt:)` re-renders the "# Tools … NOTE"
+segment against the live registry at every post-tool-execution continuation
+(normal next step + both synthesis paths); when the section changed the
+continuation passes `promptTokens: nil` (full re-encode/re-prefill — the
+cost the NOTE text already tells the model to batch around). And
+`beginAgentSearchGuard()` now runs BEFORE the system prompt is built at send
+time. Telemetry: `🔄 [TOOLS] tool block changed since this prompt was built —
+rewriting system tools section (loaded=N)`.
+
+**Tests:** `testToolsLoadRewritesPromptToolSectionForNextStep` — builds a
+prompt, loads web_fetch, and asserts the refreshed stale prompt matches a
+freshly built one byte-for-byte, is idempotent, and passes non-agent prompts
+through untouched. Verified headless on M1 Pro alongside
+`testKVCacheFP8ScalePrefixSurvivesSpliceRealloc` and
+`testKVCacheManagerPrefixPreservation`. Pre-existing red tests discovered
+while verifying (fail identically on the pre-fix tree — stale prompt-section
+expectations + a suite-order-dependent isolated failure, documented in AGENTS
+notes): `testAgentHarnessBuildSystemPromptIncludesDateTime` (in isolation),
+`testAgentHarnessWebResearchPromptGuardrails`,
+`testAgentHarnessStructuredSectionsAndReleaseCyclePromptGuardrails`.
+
+## FIX #14: WEB_RESEARCH READINESS HINT (SHIPPED) + ROUND 4 LIVE FORENSICS
+
+Fourth live-run round (15:41Z Ornith / 16:19Z Spark dumps, post FIX #12/#13
+binary). The two runs failed for two DIFFERENT reasons — and neither was the
+Round 3 stale-tool-block bug (no tools_load was issued; the tool block tracked
+the registry correctly at every step, proven by Spark step6 re-encoding fresh
+at prefixReused=901 the moment web_search left the registry).
+
+**Spark run (FF5A426B, 6 steps, FP8 KV, 3.0k→8.2k):** generation stayed fully
+coherent on every spliced turn through 7.4k context — the splice + FP8 KV +
+scale-restore path demonstrably holds for Spark at these lengths. The failure
+was behavioral: the model wanted page content ("Let me fetch the detailed
+pages"), but web_fetch was never loaded and its schema was hidden, so it
+re-issued web_search query after query (six, all distinct enough to dodge the
+repeat limit) until `applyWebSearchLoopGuard`'s per-task budget (6) fired,
+unloaded web_search, and told it to answer now; with web_search gone from the
+block the grammar masks it, and the model burned tokens unable to do the
+thing it was told to do. Prompt-side trap: shell_run's description says "To
+READ A WEB PAGE, use web_fetch" unconditionally — an instruction referencing a
+tool the prompt simultaneously says is not loaded.
+
+**Fix (shipped):** `buildToolsSection()` now appends a targeted "Web research
+readiness" hint when web_search is loaded and web_fetch is not — telling the
+model to tools_load web_fetch BEFORE it needs pages and that re-searching
+cannot yield page content. Byte-shared with the refresh path by construction
+(same renderer). Test:
+`testToolsSectionCarriesWebFetchReadinessHintOnlyWhenNeeded` (hint appears in
+the search-without-fetch state, disappears when web_fetch loads or web_search
+unloads, refreshed prompt stays byte-identical to a fresh build).
+
+**Ornith run (BECE59D6, 5 steps, 35B-A3B-FP8, FP8 KV, 2.8k→6.4k):** genuine
+progressive token-level degradation, all on spliced turns, starting at turn1
+(3.5k, NO realloc — under the 8192 budget, so FIX #12's path is not involved):
+duplicated empty parameter blocks, then triplicated parameter blocks with
+garbled think text ("Zhiho", "GLK"), then duplicate command params with
+fabricated URLs. Tool-response echoes prove the garbling was in the live
+emission, not the history build. Differential analysis against the clean
+Spark run (identical splice/scale mechanics, no GDN layers): the shared
+attention-KV splice path is exonerated; GDN linear/conv state splicing is sound
+by construction (the sequence kernels are serial scans over the in-place state
+buffer, and capture/restore plus the pin backfill align state to the pinned
+token list). Remaining suspects, in priority order:
+
+1. Ornith-only, spliced-only mechanism in the 35B MoE expert path — the
+   repacked FP8 experts (ExpertRepacker + ExpertIOThreadPool staging) run with
+   a warm working set on splice turns but cold on fresh re-prefills; Spark is
+   dense and never touches it.
+2. FP8 KV dequant noise specific to Ornith's full-attn GQA layers at 3.5k+
+   (Spark tolerates the same quantization, but different model/sensitivity).
+3. Prefill-batched vs decode-simd GEMV numeric drift (rel ≤ 4e-4, T18b)
+   accumulating through the GDN state across mixed prefill/decode turns.
+
+**Not yet done (needs live console capture or A/B):** rerun the same Ornith
+conversation with (a) console capture (`🔍 [KVCACHE]`, `⚠️ [PREFIX] GDN state
+diverged`, working-set/resident-expert lines), (b) `dynamoe_disable_prefix_reuse`
+(all-turns-fresh — isolates the splice/warm-set path), (c) temporary FP16 KV
+(isolates quantization noise). (a)+(b)+(c) on the same prompt pinpoints which
+of the three suspects remains standing.
