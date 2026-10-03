@@ -2833,3 +2833,38 @@ singleton's scale buffers before setup (its assertions previously depended on
 leftover capacity from earlier tests) and adds a retained-capacity phase —
 fresh-drop to 1024 inside retained 2048 capacity, then spliced grow back to
 2048 — asserting a rebuilt buffer and byte-exact restore of every slot.
+
+**Review hardening round 2 (two more Copilot findings, both valid):**
+
+1. **Scale restore used the padded head count.** The FP8 store/attention
+   kernels address scales with the LOGICAL head count the generation path
+   resolves (`config?.effectiveNumKeyValueHeads ?? numKvHeads` — 2 for a
+   nil-config, non-Nanbeige run), packing each slot as
+   `[maxSeq x logicalHeads]` at `slot * maxSeq * logicalHeads`. reset()'s
+   `kvHeads` is only an allocation pad (>= 8 when config is nil), and using it
+   for the splice restore's offsets/sizes copied the wrong regions after a
+   stride change, giving later slots zeroed or foreign pinned scales. No live
+   model was affected (every supported model's config head count equals the
+   pad, so the numbers coincide), but the nil-config path laid the trap. The
+   restore now computes offsets/sizes with the logical count
+   (`scaleLayoutHeads`) while sizing/zeroing keep the padded count.
+   `testKVCacheFP8ScaleRestoreUsesLogicalKvHeadCount` pins it with a 2-head,
+   config-nil, whole-buffer-poison layout.
+
+2. **K/V prefix was not relaid out on spliced stride SHRINK.** neededSeqLen
+   can shrink turn-over-turn (tools_unload shortening the prompt above the
+   min-sequence floor, or a lower max-tokens setting), and the capacity check
+   alone kept the old, larger K/V buffers on such splices — pinned prefix at
+   the old slot stride while generation indexes by the new allocatedSeqLen,
+   AND while the scales were being moved to the new stride (mismatched pair).
+   `spliceStrideChanged` now also forces the K/V realloc+relayout, mirroring
+   the scale-buffer condition.
+   `testKVCachePrefixRelayoutsOnSplicedStrideShrink` reconstructs a shrink
+   splice (512 -> 384, pin 128) with retained-capacity K/V buffers and asserts
+   reallocation plus byte-exact prefix restoration and a zeroed tail.
+
+Known remaining caveat (out of scope, unreachable with current models): for a
+hypothetical nil-config model whose logical K/V row stride
+(numKvHeads x headDim) falls below the 1024-element floor, reset()'s
+`effectiveKvStride` pad and the generation-side `kvStride` would disagree; no
+supported model is in that regime (all are >= 1024 logical strides).

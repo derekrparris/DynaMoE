@@ -4286,6 +4286,140 @@ final class DynaMoETests: XCTestCase {
         )
     }
 
+    func testKVCacheFP8ScaleRestoreUsesLogicalKvHeadCount() throws {
+        // Review regression (round 2): the FP8 store/attention kernels address
+        // scales with the LOGICAL head count the generation path uses — 2 for a
+        // nil-config, non-Nanbeige run — laying each slot out as
+        // [maxSeq x logicalHeads] halves packed at slot * maxSeq * logicalHeads.
+        // reset() pads the ALLOCATION's head count to >= 8 when config is nil; using
+        // the padded count for the splice restore's offsets/sizes copies the wrong
+        // regions and leaves later slots with zeroed or foreign pinned scales.
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        let layoutHeads = 2
+        KVCacheManager.shared.kScaleBuffer = nil
+        KVCacheManager.shared.vScaleBuffer = nil
+
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: layoutHeads, headDim: 64, maxSeqLen: 1024, precision: .fp8,
+            preservePrefixCount: 0
+        )
+        guard let oldKBuf = KVCacheManager.shared.kScaleBuffer,
+              let oldVBuf = KVCacheManager.shared.vScaleBuffer else {
+            return XCTFail("FP8 KV cache did not allocate scale buffers")
+        }
+        let oldKS = oldKBuf.contents().bindMemory(to: UInt16.self, capacity: oldKBuf.length / 2)
+        let oldVS = oldVBuf.contents().bindMemory(to: UInt16.self, capacity: oldVBuf.length / 2)
+        // Poison the whole padded buffer, then write only the compact live layout
+        // the store kernels would write: slot regions advance by maxSeq * logicalHeads.
+        for i in 0..<(oldKBuf.length / 2) { oldKS[i] = 0xDEAD; oldVS[i] = 0xBEEF }
+        for slot in 0..<4 {
+            let base = slot * 1024 * layoutHeads
+            for t in 0..<(1024 * layoutHeads) {
+                oldKS[base + t] = UInt16(truncatingIfNeeded: 0x3000 &+ (base + t))
+                oldVS[base + t] = UInt16(truncatingIfNeeded: 0x3200 &+ (base + t))
+            }
+        }
+
+        let pinTokens = 512
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: layoutHeads, headDim: 64, maxSeqLen: 2048, precision: .fp8,
+            preservePrefixCount: pinTokens
+        )
+        guard let newKBuf = KVCacheManager.shared.kScaleBuffer,
+              let newVBuf = KVCacheManager.shared.vScaleBuffer else {
+            return XCTFail("FP8 KV cache did not allocate scale buffers after splice reset")
+        }
+        XCTAssertTrue(newKBuf !== oldKBuf && newVBuf !== oldVBuf,
+                      "stride-change splice must rebuild the scale buffers")
+        let newKS = newKBuf.contents().bindMemory(to: UInt16.self, capacity: newKBuf.length / 2)
+        let newVS = newVBuf.contents().bindMemory(to: UInt16.self, capacity: newVBuf.length / 2)
+        for slot in 0..<4 {
+            let newBase = slot * 2048 * layoutHeads
+            let oldBase = slot * 1024 * layoutHeads
+            for t in 0..<(pinTokens * layoutHeads) {
+                XCTAssertEqual(newKS[newBase + t], UInt16(truncatingIfNeeded: 0x3000 &+ (oldBase + t)),
+                               "kScale prefix corrupted at slot \(slot), element \(t) under the 2-head logical layout")
+                XCTAssertEqual(newVS[newBase + t], UInt16(truncatingIfNeeded: 0x3200 &+ (oldBase + t)),
+                               "vScale prefix corrupted at slot \(slot), element \(t) under the 2-head logical layout")
+            }
+            // Untouched tail of a freshly rebuilt buffer: zero, never the 0xDEAD poison.
+            XCTAssertEqual(newKS[newBase + pinTokens * layoutHeads], 0)
+        }
+
+        // Leave the shared singleton in a small, conventional state for later tests.
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: layoutHeads, headDim: 64, maxSeqLen: 256, precision: .fp16
+        )
+    }
+
+    func testKVCachePrefixRelayoutsOnSplicedStrideShrink() throws {
+        // Review regression (round 2): a tools_unload that shortens the prompt can
+        // shrink neededSeqLen turn-over-turn, so a spliced reset can arrive with a
+        // SMALLER maxSeqLen while preservePrefixCount > 0. The capacity check alone
+        // kept the old (larger) K/V buffers, leaving the pinned prefix at the old
+        // slot stride while generation indexes by the new allocatedSeqLen — while
+        // the scales WERE being moved to the smaller stride. The stride-change guard
+        // now forces the K/V relayout too, mirroring the scale-buffer handling.
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        KVCacheManager.shared.kCacheBuffer = nil
+        KVCacheManager.shared.vCacheBuffer = nil
+        KVCacheManager.shared.kScaleBuffer = nil
+        KVCacheManager.shared.vScaleBuffer = nil
+
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: 4, headDim: 128, maxSeqLen: 512, precision: .fp16,
+            preservePrefixCount: 0
+        )
+        guard let oldKBuf = KVCacheManager.shared.kCacheBuffer else {
+            return XCTFail("FP16 KV cache did not allocate K buffer")
+        }
+        let oldKH = oldKBuf.contents().bindMemory(to: UInt16.self, capacity: oldKBuf.length / 2)
+        for i in 0..<(oldKBuf.length / 2) { oldKH[i] = UInt16(truncatingIfNeeded: 0x2A00 &+ i) }
+
+        // Recompute reset's own per-slot stride: effectiveKvStride heads*dim floored
+        // at 1024 (padded heads = 8, headDim 128), fp16 = one half per element.
+        let strideElems = 1024
+        let pinTokens = 128
+
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: 4, headDim: 128, maxSeqLen: 384, precision: .fp16,
+            preservePrefixCount: pinTokens
+        )
+        guard let newKBuf = KVCacheManager.shared.kCacheBuffer else {
+            return XCTFail("FP16 KV cache did not allocate K buffer after shrink splice")
+        }
+        XCTAssertTrue(newKBuf !== oldKBuf,
+                      "a stride-changing splice must reallocate the K/V buffers even when retained capacity still fits")
+        XCTAssertEqual(KVCacheManager.shared.allocatedSeqLen, 384)
+        let newKH = newKBuf.contents().bindMemory(to: UInt16.self, capacity: newKBuf.length / 2)
+        for slot in 0..<4 {
+            let newBase = slot * 384 * strideElems
+            let oldBase = slot * 512 * strideElems
+            for e in 0..<(pinTokens * strideElems) {
+                XCTAssertEqual(newKH[newBase + e], UInt16(truncatingIfNeeded: 0x2A00 &+ (oldBase + e)),
+                               "pinned K prefix corrupted at slot \(slot), element \(e) during shrink relayout")
+            }
+            // Freshly zero-filled tail past the pinned prefix.
+            XCTAssertEqual(newKH[newBase + pinTokens * strideElems], 0,
+                           "shrink relayout must zero the tail past the pinned prefix at slot \(slot)")
+        }
+
+        // Leave the shared singleton in a small, conventional state for later tests.
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: 4, headDim: 128, maxSeqLen: 256, precision: .fp16
+        )
+    }
+
     func testToolsLoadRewritesPromptToolSectionForNextStep() {
         // Regression for the mid-run stale tool block: tools_load executes and
         // replies "you may now call it directly using the provided schema", but the next

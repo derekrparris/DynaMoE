@@ -187,7 +187,15 @@ final class KVCacheManager {
         // far cheaper than memset-ing every page, which commits them all up front and
         // invites eviction + KV-cache paging thrash at long context.
         let forceFreshAlloc = (preservePrefixCount == 0)
-        let needsRealloc = forceFreshAlloc || (kCacheBuffer == nil || vCacheBuffer == nil || allocatedKvBytes < requiredKvBytes)
+        // A preserved reset whose maxSeqLen differs from the last allocation must
+        // relayout every slot region even when the retained buffers still have spare
+        // capacity: neededSeqLen can SHRINK turn-to-turn (a tools_unload shortening the
+        // prompt above the min-sequence floor, or a lower max-tokens setting), and the
+        // generation paths index slot regions by allocatedSeqLen — leaving the pinned
+        // prefix at the old stride while scales move to the new one would misalign every
+        // later layer. Same condition as the FP8 scale-buffer rebuild below.
+        let spliceStrideChanged = (preservePrefixCount > 0 && maxSeqLen != oldMaxSeq)
+        let needsRealloc = forceFreshAlloc || (kCacheBuffer == nil || vCacheBuffer == nil || allocatedKvBytes < requiredKvBytes || spliceStrideChanged)
 
         if needsRealloc {
             self.kCacheBuffer = nil
@@ -244,6 +252,15 @@ final class KVCacheManager {
             let scaleElemBytes = MemoryLayout<UInt16>.stride
             let oldKScale = self.kScaleBuffer
             let oldVScale = self.vScaleBuffer
+            // The FP8 store/attention kernels address scales with the LOGICAL head count
+            // the generation path uses (config?.effectiveNumKeyValueHeads ?? numKvHeads —
+            // e.g. 2 when a nil-config run defaults to 2 KV heads), laying each slot out
+            // as [maxSeq x logicalHeads] halves. `kvHeads` above is only a capacity pad
+            // (>= 8 when config is nil); using it for the restore's offsets/sizes would
+            // copy the wrong regions after a stride change and leave later slots reading
+            // zero or foreign scales. Copy with the logical count; keep the padded count
+            // for sizing/zeroing so over-provisioned tails stay clean.
+            //
             // The allocation condition below is capacity-based, so an earlier, longer
             // conversation can leave scale buffers big enough for BOTH the old and new
             // strides. A spliced reset that changes the stride must then relayout
@@ -254,8 +271,8 @@ final class KVCacheManager {
             // separate slot regions, not within one copy. Rebuild both buffers on
             // every preserve-with-stride-change so the restore is always
             // buffer-to-buffer; fresh resets keep the capacity-retention fast path.
-            let scaleStrideChanged = (preservePrefixCount > 0 && maxSeqLen != oldMaxSeq)
-            if kScaleBuffer == nil || kScaleBuffer!.length < scaleBytes || scaleStrideChanged {
+            let scaleLayoutHeads = config?.effectiveNumKeyValueHeads ?? numKvHeads
+            if kScaleBuffer == nil || kScaleBuffer!.length < scaleBytes || spliceStrideChanged {
                 self.kScaleBuffer = device.makeBuffer(length: scaleBytes, options: .storageModeShared)
                 self.vScaleBuffer = device.makeBuffer(length: scaleBytes, options: .storageModeShared)
             }
@@ -268,15 +285,16 @@ final class KVCacheManager {
                 // and V read collapses to zero and decode degenerates into word salad.
                 // Rebuilding the scale buffers on a grown maxSeqLen throws the pinned
                 // prefix's scales away — restore them slot-by-slot exactly like the
-                // K/V memcpy above (old layout stride oldMaxSeq, new stride maxSeqLen).
-                // scaleStrideChanged above guarantees src and dst are distinct buffers
+                // K/V memcpy above, using the LOGICAL head-count layout the store
+                // kernels write (scaleLayoutHeads), not the padded capacity count.
+                // spliceStrideChanged above guarantees src and dst are distinct buffers
                 // whenever the layouts differ; when the stride is unchanged a retained
                 // buffer means every newOff equals oldOff and the loop is a no-op.
-                let prefixScaleBytes = min(min(preservePrefixCount, oldMaxSeq), maxSeqLen) * kvHeads * scaleElemBytes
+                let prefixScaleBytes = min(min(preservePrefixCount, oldMaxSeq), maxSeqLen) * scaleLayoutHeads * scaleElemBytes
                 let scaleWasRebuilt = (kScaleBuffer !== oldKScale)
                 for slot in 0..<totalSlots {
-                    let oldOff = slot * oldMaxSeq * kvHeads * scaleElemBytes
-                    let newOff = slot * maxSeqLen * kvHeads * scaleElemBytes
+                    let oldOff = slot * oldMaxSeq * scaleLayoutHeads * scaleElemBytes
+                    let newOff = slot * maxSeqLen * scaleLayoutHeads * scaleElemBytes
                     guard scaleWasRebuilt || newOff != oldOff else { continue }
                     if let oldKS = oldKScale, let newKS = kScaleBuffer {
                         let copy = min(prefixScaleBytes, max(0, oldKS.length - oldOff), max(0, newKS.length - newOff))
