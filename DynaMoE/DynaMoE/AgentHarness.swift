@@ -3099,9 +3099,14 @@ public final class AgentHarness {
     /// Kept minimal: every schema here costs prefill tokens on every turn, and each
     /// load/unload event invalidates the KV-cache prefix (full re-prefill). The model
     /// discovers and loads everything else on demand via tools_discover/tools_load.
+    /// `web_fetch` is a deliberate exception: live runs showed models will NOT
+    /// tools_load it on their own even when the prompt tells them to read pages
+    /// via web_fetch — they loop web_search until the budget guardrail kills it
+    /// (PERF_FINDINGS FIX #14), so page-fetch capability ships loaded by default.
     public static let coreLoadedToolNames: Set<String> = [
         "shell_run", "complete",
-        "tools_discover", "tools_load", "tools_unload"
+        "tools_discover", "tools_load", "tools_unload",
+        "web_fetch"
     ]
 
     /// Tools the model may never unload through `tools_unload`.

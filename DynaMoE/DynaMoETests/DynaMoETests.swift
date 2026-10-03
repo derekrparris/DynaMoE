@@ -4233,23 +4233,25 @@ final class DynaMoETests: XCTestCase {
     }
 
     func testToolsLoadRewritesPromptToolSectionForNextStep() {
-        // Regression for the mid-run stale tool block: tools_load/web_fetch executes and
+        // Regression for the mid-run stale tool block: tools_load executes and
         // replies "you may now call it directly using the provided schema", but the next
         // agent step spliced the previous turn's system text verbatim — the authoritative
         // "Only the following functions are currently loaded" block never gained the tool
         // (observed live: model stuck reconciling the contradiction, 500+ tokens, no call).
+        // Uses a non-core tool (git_diff) now that web_fetch ships in the core set.
         let harness = AgentHarness.shared
         harness.resetLoadedToolsToCore()
         defer { harness.resetLoadedToolsToCore() }
 
         let fixedDate = Date(timeIntervalSince1970: 1_800_000_000)
         let before = harness.buildSystemPrompt(baseSystem: "Test system.", modelName: "Ornith 1.5", currentDate: fixedDate)
-        XCTAssertFalse(before.contains("\"name\":\"web_fetch\""), "web_fetch must not be advertised before it is loaded")
+        XCTAssertFalse(before.contains("\"name\":\"git_diff\""), "git_diff must not be advertised before it is loaded")
+        XCTAssertTrue(before.contains("\"name\":\"web_fetch\""), "web_fetch is a core tool and must be advertised from the start")
         XCTAssertTrue(before.contains("# Tools"), "agent prompt must carry a tools section")
 
-        XCTAssertNoThrow(try harness.loadTool(named: "web_fetch"))
+        XCTAssertNoThrow(try harness.loadTool(named: "git_diff"))
         let after = harness.buildSystemPrompt(baseSystem: "Test system.", modelName: "Ornith 1.5", currentDate: fixedDate)
-        XCTAssertTrue(after.contains("\"name\":\"web_fetch\""), "freshly built prompt must advertise web_fetch")
+        XCTAssertTrue(after.contains("\"name\":\"git_diff\""), "freshly built prompt must advertise git_diff")
 
         let refreshed = harness.refreshingLoadedToolsSection(inPrompt: before)
         XCTAssertNotEqual(refreshed, before, "a stale tool block must change after tools_load")
@@ -4266,6 +4268,8 @@ final class DynaMoETests: XCTestCase {
         // not, the prompt told the model to read pages "via web_fetch" while showing
         // no web_fetch schema — the model re-issued web_search query after query for
         // page content until the budget guardrail force-disabled web_search mid-task.
+        // web_fetch now ships in the core set, so the hint only guards the case where
+        // the model (or a guardrail) unloaded web_fetch mid-run.
         let harness = AgentHarness.shared
         harness.resetLoadedToolsToCore()
         defer { harness.resetLoadedToolsToCore() }
@@ -4273,16 +4277,22 @@ final class DynaMoETests: XCTestCase {
         XCTAssertNoThrow(try harness.loadTool(named: "web_search"))
 
         let hint = "Web research readiness:"
+        let withFetch = harness.buildToolsSection()
+        XCTAssertTrue(withFetch.contains("\"name\":\"web_fetch\""), "web_fetch must ship in the core tool set")
+        XCTAssertTrue(withFetch.contains("\"name\":\"web_search\""), "the live registry must include web_search")
+        XCTAssertFalse(withFetch.contains(hint), "no hint while web_fetch is loaded")
+
+        XCTAssertNoThrow(try harness.unloadTool(named: "web_fetch"))
         let withSearchOnly = harness.buildToolsSection()
-        XCTAssertTrue(withSearchOnly.contains("\"name\":\"web_search\""), "core tool set must include web_search")
-        XCTAssertFalse(withSearchOnly.contains("\"name\":\"web_fetch\""), "web_fetch must not be in the core tool set")
-        XCTAssertTrue(withSearchOnly.contains(hint), "tools section must hint at loading web_fetch when web_search is loaded without it")
+        XCTAssertTrue(withSearchOnly.contains("\"name\":\"web_search\""), "web_search must stay loaded")
+        XCTAssertFalse(withSearchOnly.contains("\"name\":\"web_fetch\""), "web_fetch must be gone after tools_unload")
+        XCTAssertTrue(withSearchOnly.contains(hint), "tools section must hint at re-loading web_fetch when web_search is loaded without it")
         XCTAssertTrue(withSearchOnly.contains("tools_load"), "the hint must name tools_load as the remedy")
 
         XCTAssertNoThrow(try harness.loadTool(named: "web_fetch"))
-        let withFetch = harness.buildToolsSection()
-        XCTAssertTrue(withFetch.contains("\"name\":\"web_fetch\""))
-        XCTAssertFalse(withFetch.contains(hint), "hint must disappear once web_fetch is loaded")
+        let refetched = harness.buildToolsSection()
+        XCTAssertTrue(refetched.contains("\"name\":\"web_fetch\""))
+        XCTAssertFalse(refetched.contains(hint), "hint must disappear once web_fetch is loaded again")
 
         XCTAssertNoThrow(try harness.unloadTool(named: "web_search"))
         let withoutSearch = harness.buildToolsSection()

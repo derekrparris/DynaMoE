@@ -2809,3 +2809,11 @@ diverged`, working-set/resident-expert lines), (b) `dynamoe_disable_prefix_reuse
 (all-turns-fresh — isolates the splice/warm-set path), (c) temporary FP16 KV
 (isolates quantization noise). (a)+(b)+(c) on the same prompt pinpoints which
 of the three suspects remains standing.
+
+**Follow-up (post-FIX #14):** rather than relying on the hint alone, web_fetch
+now ships in `coreLoadedToolNames` (default-loaded from session start, still
+unloadable via tools_unload if the model wants the tokens back). Live evidence:
+models will NOT tools_load web_fetch on their own even when instructed to
+read pages via it, so leaving it opt-in just re-creates the loop.
+`testToolsLoadRewritesPromptToolSectionForNextStep` now drives the refresh
+regression with git_diff (a non-core tool) since web_fetch is core.
