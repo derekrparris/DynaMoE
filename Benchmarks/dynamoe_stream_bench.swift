@@ -202,6 +202,8 @@ final class GPU {
                      "gqa_attention_decode_headgate_f16_chunked_combine",
                      "gqa_attention_decode_headgate_fp8",
                      "gqa_attention_decode_headgate_fp8_chunked",
+                     "gqa_attention_decode_fused_fp8",
+                     "gqa_attention_decode_fused_fp8_chunked",
                      "gqa_attention_decode_fused_f16",
                      "gqa_attention_decode_fused_f16_chunked",
                      "gqa_attention_decode_fused_f16_chunked_combine",
@@ -2165,6 +2167,151 @@ func main() {
             runRef(UInt32(ctx), UInt32(win))
             let tRef = (CFAbsoluteTimeGetCurrent() - t0) * 1000
             print("   ctx=\(String(format: "%5d", ctx)) win=\(String(format: "%4d", win)): ref \(String(format: "%.2f", tRef))ms | chunked \(String(format: "%.2f", tChunk))ms (\(String(format: "%.1f", tRef / max(tChunk, 1e-9)))x) | max rel diff \(String(format: "%.2e", maxRel))")
+        }
+    }
+
+    // ============================ T17e: chunked FUSED Q+Gate FP8 attention (Ornith's path) ============================
+    // FP8 KV counterpart of T17b: the fused Q+Gate serial kernel
+    // (gqa_attention_decode_fused_fp8) vs the chunked scan plus the shared fused
+    // combine, mirroring the production dispatch at ContentView.swift (the branch
+    // Ornith-class models take, no g_proj tensor). No sliding-window cases: this
+    // path has no window parameter (full-attention layers only).
+    log("--- T17e: start")
+    print("    --- T17e: chunked FUSED Q+Gate FP8 attention vs original ---")
+    do {
+        guard let refPipe = gpu.pipe("gqa_attention_decode_fused_fp8"),
+              let chunkPipe = gpu.pipe("gqa_attention_decode_fused_fp8_chunked"),
+              let combinePipe = gpu.pipe("gqa_attention_decode_fused_f16_chunked_combine") else {
+            print("   (fused FP8 attention kernels unavailable - skipped)")
+            return
+        }
+        let nQ = 16, nKv = 2, hD = 256
+        let kvStride = nKv * hD
+        let maxCtx = 8192
+        guard let qGateBuf = gpu.device.makeBuffer(length: nQ * hD * 2 * 4, options: .storageModeShared),
+              let kCache = gpu.device.makeBuffer(length: maxCtx * kvStride, options: .storageModeShared),
+              let vCache = gpu.device.makeBuffer(length: maxCtx * kvStride, options: .storageModeShared),
+              let kScaleBuf = gpu.device.makeBuffer(length: maxCtx * nKv * 2, options: .storageModeShared),
+              let vScaleBuf = gpu.device.makeBuffer(length: maxCtx * nKv * 2, options: .storageModeShared),
+              let ctxRef = gpu.device.makeBuffer(length: nQ * hD * 4, options: .storageModeShared),
+              let ctxChunked = gpu.device.makeBuffer(length: nQ * hD * 4, options: .storageModeShared),
+              let pM = gpu.device.makeBuffer(length: nQ * 256 * 4, options: .storageModeShared),
+              let pL = gpu.device.makeBuffer(length: nQ * 256 * 4, options: .storageModeShared),
+              let pAcc = gpu.device.makeBuffer(length: nQ * 256 * hD * 4, options: .storageModeShared) else { return }
+
+        var seed: UInt32 = 0xF05E
+        func rnd() -> Float { seed = seed &* 1664525 &+ 1013904223; return Float(Int((seed >> 16) % 2000) - 1000) / 1000.0 }
+        func f16Bits(_ f: Float) -> UInt16 { Float16(f).bitPattern }
+
+        // Quantize random KV per (pos, kv-head) exactly like store_kv_cache_fp8:
+        // symmetric INT8 with a per-head scale = max(|x|, 1e-7) / 127.
+        let kp = kCache.contents().bindMemory(to: Int8.self, capacity: maxCtx * kvStride)
+        let vp = vCache.contents().bindMemory(to: Int8.self, capacity: maxCtx * kvStride)
+        let ksp = kScaleBuf.contents().bindMemory(to: UInt16.self, capacity: maxCtx * nKv)
+        let vsp = vScaleBuf.contents().bindMemory(to: UInt16.self, capacity: maxCtx * nKv)
+        for tau in 0..<maxCtx {
+            for h in 0..<nKv {
+                var kVals = [Float](repeating: 0, count: hD)
+                var vVals = [Float](repeating: 0, count: hD)
+                var kMax: Float = 0, vMax: Float = 0
+                for d in 0..<hD {
+                    kVals[d] = rnd(); vVals[d] = rnd()
+                    kMax = max(kMax, abs(kVals[d])); vMax = max(vMax, abs(vVals[d]))
+                }
+                let kScale = max(kMax, 1e-7) / 127.0
+                let vScale = max(vMax, 1e-7) / 127.0
+                ksp[tau * nKv + h] = f16Bits(kScale)
+                vsp[tau * nKv + h] = f16Bits(vScale)
+                let base = tau * kvStride + h * hD
+                for d in 0..<hD {
+                    kp[base + d] = Int8(max(-127, min(127, (kVals[d] / kScale).rounded())))
+                    vp[base + d] = Int8(max(-127, min(127, (vVals[d] / vScale).rounded())))
+                }
+            }
+        }
+        let qgp = qGateBuf.contents().bindMemory(to: Float.self, capacity: nQ * hD * 2)
+        for i in 0..<(nQ * hD * 2) { qgp[i] = rnd() }
+        log("   T17e: KV quantized")
+
+        func runRef(_ seqLen: UInt32) {
+            let cmd = gpu.queue.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var s = seqLen, nq = UInt32(nQ), nkv = UInt32(nKv), hd = UInt32(hD)
+            enc.setComputePipelineState(refPipe)
+            enc.setBuffer(qGateBuf, offset: 0, index: 0)
+            enc.setBuffer(kCache, offset: 0, index: 1)
+            enc.setBuffer(vCache, offset: 0, index: 2)
+            enc.setBuffer(kScaleBuf, offset: 0, index: 3)
+            enc.setBuffer(vScaleBuf, offset: 0, index: 4)
+            enc.setBuffer(ctxRef, offset: 0, index: 5)
+            enc.setBytes(&s, length: 4, index: 6)
+            enc.setBytes(&nq, length: 4, index: 7)
+            enc.setBytes(&nkv, length: 4, index: 8)
+            enc.setBytes(&hd, length: 4, index: 9)
+            enc.dispatchThreads(MTLSize(width: nQ, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: nQ, height: 1, depth: 1))
+            enc.endEncoding()
+            cmd.commit(); cmd.waitUntilCompleted()
+        }
+
+        func runChunked(_ seqLen: UInt32) -> Double {
+            // Mirror production dispatch (ContentView.swift): no window on this path.
+            let curLen: UInt32 = (seqLen == 0) ? 1 : seqLen
+            let numChunks = max(1, min(256, (curLen + 63) / 64))
+            let chunkSize = (curLen + numChunks - 1) / numChunks
+            let cmd = gpu.queue.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var s = seqLen, nq = UInt32(nQ), nkv = UInt32(nKv), hd = UInt32(hD)
+            var cs = chunkSize
+            enc.setComputePipelineState(chunkPipe)
+            enc.setBuffer(qGateBuf, offset: 0, index: 0)
+            enc.setBuffer(kCache, offset: 0, index: 1)
+            enc.setBuffer(vCache, offset: 0, index: 2)
+            enc.setBuffer(kScaleBuf, offset: 0, index: 3)
+            enc.setBuffer(vScaleBuf, offset: 0, index: 4)
+            enc.setBuffer(pM, offset: 0, index: 5)
+            enc.setBuffer(pL, offset: 0, index: 6)
+            enc.setBuffer(pAcc, offset: 0, index: 7)
+            enc.setBytes(&s, length: 4, index: 8)
+            enc.setBytes(&nq, length: 4, index: 9)
+            enc.setBytes(&nkv, length: 4, index: 10)
+            enc.setBytes(&hd, length: 4, index: 11)
+            enc.setBytes(&cs, length: 4, index: 12)
+            enc.dispatchThreadgroups(MTLSize(width: nQ, height: Int(numChunks), depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+
+            var nc = numChunks
+            enc.setComputePipelineState(combinePipe)
+            enc.setBuffer(pM, offset: 0, index: 0)
+            enc.setBuffer(pL, offset: 0, index: 1)
+            enc.setBuffer(pAcc, offset: 0, index: 2)
+            enc.setBuffer(ctxChunked, offset: 0, index: 3)
+            enc.setBuffer(qGateBuf, offset: 0, index: 4)
+            enc.setBytes(&nc, length: 4, index: 5)
+            enc.setBytes(&nq, length: 4, index: 6)
+            enc.setBytes(&hd, length: 4, index: 7)
+            enc.dispatchThreadgroups(MTLSize(width: nQ, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            enc.endEncoding()
+            let t0 = CFAbsoluteTimeGetCurrent()
+            cmd.commit(); cmd.waitUntilCompleted()
+            return (CFAbsoluteTimeGetCurrent() - t0) * 1000
+        }
+
+        _ = runRef(0); _ = runChunked(0)
+        for ctx in [1000, 2000, 4000, 8000] {
+            runRef(UInt32(ctx))
+            let tChunk = runChunked(UInt32(ctx))
+            let a = ctxRef.contents().bindMemory(to: Float.self, capacity: nQ * hD)
+            let b = ctxChunked.contents().bindMemory(to: Float.self, capacity: nQ * hD)
+            var maxRel = 0.0
+            for i in 0..<(nQ * hD) {
+                let x = Double(a[i]); let y = Double(b[i])
+                let rel = abs(x - y) / max(abs(x), abs(y), 1e-6)
+                if rel > maxRel { maxRel = rel }
+            }
+            let t0 = CFAbsoluteTimeGetCurrent()
+            runRef(UInt32(ctx))
+            let tRef = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+            print("   fusedQ ctx=\(String(format: "%5d", ctx)): ref \(String(format: "%.2f", tRef))ms | chunked \(String(format: "%.2f", tChunk))ms (\(String(format: "%.1f", tRef / max(tChunk, 1e-9)))x) | max rel diff \(String(format: "%.2e", maxRel))")
         }
     }
 

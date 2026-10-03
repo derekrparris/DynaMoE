@@ -2620,3 +2620,16 @@ active the chunk count is small (8/16), yet the chunked path still wins
 ~5-8× because the serial kernel's one thread per head remains
 latency-bound; full-attention layers win ~8×.) Xcode build green and
 `testJetSpecEligibilityExcludesFP8KVCache` passes on M1 Pro.
+
+**Verification (T17e, fused Q+Gate FP8 pair — the branch Ornith-class
+models take, added after Copilot review round 3 flagged it as previously
+missed; synthetic INT8 KV, 16 Q-heads / 2 KV-heads / 256 dim):** outputs
+match `gqa_attention_decode_fused_fp8` to max rel diff ~4e-3, and timing
+(no sliding window on this path — the kernels take no window parameter):
+
+| Context | Serial (1 thread/head) | Chunked + fused combine | Speedup |
+|---|---|---|---|
+| 1,000 | 21.5 ms | 2.7 ms | 7.9× |
+| 2,000 | 42.6 ms | 4.8 ms | 8.8× |
+| 4,000 | 85.5 ms | 12.6 ms | 6.8× |
+| 8,000 | 171.5 ms | 28.0 ms | 6.1× |
