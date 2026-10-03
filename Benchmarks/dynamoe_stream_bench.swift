@@ -2102,7 +2102,10 @@ func main() {
         }
 
         func runChunked(_ seqLen: UInt32, _ win: UInt32) -> Double {
-            let spanLen = (win > 0 && seqLen > win) ? seqLen - win : seqLen
+            // Mirror production dispatch (ContentView.swift): chunks tile the attended
+            // span [winStart, curLen), so spanLen = win when the window is active.
+            let winStart = (win > 0 && seqLen > win) ? (seqLen - win) : 0
+            let spanLen = seqLen - winStart
             let numChunks = max(1, min(256, (spanLen + 63) / 64))
             let chunkSize = (spanLen + numChunks - 1) / numChunks
             let cmd = gpu.queue.makeCommandBuffer()!
