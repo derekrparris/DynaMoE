@@ -86,6 +86,9 @@ build/
 DynaMoE Architectural Overview.md
 AGENTS.md
 
+# Compiled streaming benchmark binary (built from Benchmarks/dynamoe_stream_bench.swift)
+Benchmarks/dynamoe_stream_bench
+
 # ==========================================
 # Sparkle auto-update tooling
 # ==========================================
