@@ -3099,9 +3099,14 @@ public final class AgentHarness {
     /// Kept minimal: every schema here costs prefill tokens on every turn, and each
     /// load/unload event invalidates the KV-cache prefix (full re-prefill). The model
     /// discovers and loads everything else on demand via tools_discover/tools_load.
+    /// `web_fetch` is a deliberate exception: live runs showed models will NOT
+    /// tools_load it on their own even when the prompt tells them to read pages
+    /// via web_fetch — they loop web_search until the budget guardrail kills it
+    /// (PERF_FINDINGS FIX #14), so page-fetch capability ships loaded by default.
     public static let coreLoadedToolNames: Set<String> = [
         "shell_run", "complete",
-        "tools_discover", "tools_load", "tools_unload"
+        "tools_discover", "tools_load", "tools_unload",
+        "web_fetch"
     ]
 
     /// Tools the model may never unload through `tools_unload`.
@@ -3228,6 +3233,69 @@ public final class AgentHarness {
         return tools.keys.sorted().compactMap { tools[$0]?.definition }
     }
 
+    /// The "# Tools … NOTE …" segment of the agent system prompt (loaded schemas +
+    /// unloaded-tool notice). Shared by `buildSystemPrompt` and
+    /// `refreshingLoadedToolsSection(inPrompt:)` so a mid-run refresh renders
+    /// byte-identical text to a freshly built prompt.
+    public func buildToolsSection() -> String {
+        var prompt = "# Tools\n\nOnly the following functions are currently loaded and callable:\n\n<tools>\n"
+        let toolSchemaEncoder = JSONEncoder()
+        toolSchemaEncoder.outputFormatting = [.sortedKeys]
+        for tool in availableToolDefinitions {
+            if let data = try? toolSchemaEncoder.encode(tool),
+               let jsonStr = String(data: data, encoding: .utf8) {
+                prompt += jsonStr + "\n"
+            }
+        }
+        prompt += "</tools>\n\n"
+
+        let unloadedCount = tools.count - loadedTools.count
+        if unloadedCount > 0 {
+            prompt += """
+            NOTE: \(unloadedCount) additional tool(s) are installed but NOT loaded, so their schemas are not shown above and they cannot currently be called.
+
+            To discover what else you can do:
+            - Call `tools_discover` to list unloaded tools grouped by category (with estimated token cost).
+            - Call `tools_load` with a `names` array to register multiple tool schemas into context in ONE call. IMPORTANT: every load/unload rewrites the tool block and triggers a re-prefill of the conversation, so decide up front which tools a task needs and load them all in a single batched call. Avoid loading tools one per step or unloading mid-task.
+
+            """
+        }
+        // Web-research readiness hint: with web_search loaded but web_fetch NOT,
+        // the model sees instructions to "read pages via web_fetch" (shell_run's
+        // description) yet has no web_fetch schema — observed live: it re-issued
+        // web_search query after query trying to obtain page content until the
+        // search budget guardrail force-disabled web_search mid-task. Tell it
+        // exactly how to gain fetch capability instead.
+        if loadedTools["web_search"] != nil && loadedTools["web_fetch"] == nil {
+            prompt += """
+            Web research readiness: `web_fetch` (full page content) is NOT loaded yet, so you cannot read pages. Before you need page content, call `tools_load` with `{\"names\": [\"web_fetch\"]}` and then fetch the exact URLs `web_search` returned. Do NOT keep issuing `web_search` queries to obtain page content — search snippets are all web_search can give you.
+
+            """
+        }
+        return prompt
+    }
+
+    /// Re-renders the "# Tools" section of an ALREADY-BUILT agent prompt against the
+    /// current loaded-tool registry. `tools_load`/`tools_unload` mutate the registry
+    /// mid-run, but the next agent step's prompt string used to be assembled from the
+    /// previous step's system text verbatim — so the model was told "Tool 'web_fetch'
+    /// loaded. You may now call it directly using the provided schema" while the
+    /// authoritative "Only the following functions are currently loaded and callable"
+    /// block still omitted it (observed live: the model burned 500+ tokens never
+    /// committing to a call). Returns the prompt unchanged when it carries no tools
+    /// section (non-agent chat) or the rendered section already matches the registry.
+    public func refreshingLoadedToolsSection(inPrompt prompt: String) -> String {
+        let sectionMarker = "# Tools\n\nOnly the following functions are currently loaded and callable:"
+        guard let toolsStart = prompt.range(of: sectionMarker)?.lowerBound else { return prompt }
+        let heading = "# Subagent Result Delivery Policy"
+        guard let headingRange = prompt.range(of: heading, range: toolsStart..<prompt.endIndex),
+              headingRange.lowerBound > toolsStart else { return prompt }
+        let refreshed = String(prompt[..<toolsStart]) + buildToolsSection() + "\n" + heading + String(prompt[headingRange.upperBound...])
+        if refreshed == prompt { return prompt }
+        print("🔄 [TOOLS] tool block changed since this prompt was built — rewriting system tools section (loaded=\(loadedTools.count))")
+        return refreshed
+    }
+
     // MARK: - Prompt Formatting & ChatML Generation
 
     /// Formats the current date, time, and timezone context for temporal awareness in agent prompts.
@@ -3271,28 +3339,7 @@ public final class AgentHarness {
             prompt += AgentHarness.formattedDateTimeContext(date: currentDate) + "\n\n"
         }
 
-        prompt += "# Tools\n\nOnly the following functions are currently loaded and callable:\n\n<tools>\n"
-        let toolSchemaEncoder = JSONEncoder()
-        toolSchemaEncoder.outputFormatting = [.sortedKeys]
-        for tool in availableToolDefinitions {
-            if let data = try? toolSchemaEncoder.encode(tool),
-               let jsonStr = String(data: data, encoding: .utf8) {
-                prompt += jsonStr + "\n"
-            }
-        }
-        prompt += "</tools>\n\n"
-
-        let unloadedCount = tools.count - loadedTools.count
-        if unloadedCount > 0 {
-            prompt += """
-            NOTE: \(unloadedCount) additional tool(s) are installed but NOT loaded, so their schemas are not shown above and they cannot currently be called.
-
-            To discover what else you can do:
-            - Call `tools_discover` to list unloaded tools grouped by category (with estimated token cost).
-            - Call `tools_load` with a `names` array to register multiple tool schemas into context in ONE call. IMPORTANT: every load/unload rewrites the tool block and triggers a re-prefill of the conversation, so decide up front which tools a task needs and load them all in a single batched call. Avoid loading tools one per step or unloading mid-task.
-
-            """
-        }
+        prompt += buildToolsSection()
 
         prompt += """
 

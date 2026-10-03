@@ -4162,6 +4162,345 @@ final class DynaMoETests: XCTestCase {
         XCTAssertFalse(isJetSpecEligible(jetSpecEnabled: false, hasLinearRecurrence: false, isSparkModel: false, kvPrecision: .fp16))
     }
 
+    func testKVCacheFP8ScalePrefixSurvivesSpliceRealloc() throws {
+        // Regression for the FP8 + prefix-splice degradation (Spark token-burn /
+        // Ornith word salad): reset(preservePrefixCount:) memcpy'd the pinned INT8
+        // K/V prefix across the maxSeqLen-growth reallocation but rebuilt the
+        // per-(token, head) FP8 dequant scale buffers fresh, so every restored
+        // prefix slot dequantized against scale 0 and attention over the pinned
+        // region collapsed. Scales must ride along with the K/V prefix.
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        let kvHeads = 8
+        let tokenScaleFloats = kvHeads // one half per (token, kv-head)
+
+        // Review hardening: the scale-buffer allocation is capacity-based, so the
+        // singleton can enter this test with oversized buffers from an earlier,
+        // longer allocation (other tests, or this test's own prior runs) — then the
+        // 1024 setup below would NOT rebuild and the later growth assertions would
+        // depend on leftover state. Clear both buffers so this test deterministically
+        // exercises capacity growth from 1024 to 2048 on its own buffers.
+        KVCacheManager.shared.kScaleBuffer = nil
+        KVCacheManager.shared.vScaleBuffer = nil
+
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: kvHeads, headDim: 64, maxSeqLen: 1024, precision: .fp8,
+            preservePrefixCount: 0
+        )
+        guard let oldKBuf = KVCacheManager.shared.kScaleBuffer,
+              let oldVBuf = KVCacheManager.shared.vScaleBuffer else {
+            return XCTFail("FP8 KV cache did not allocate scale buffers")
+        }
+        let oldKS = oldKBuf.contents().bindMemory(to: UInt16.self, capacity: oldKBuf.length / 2)
+        let oldVS = oldVBuf.contents().bindMemory(to: UInt16.self, capacity: oldVBuf.length / 2)
+        for i in 0..<(oldKBuf.length / 2) {
+            // Distinct nonzero bit pattern per element so a misaligned or partial
+            // copy cannot pass by luck; the decode path only needs nonzero scales.
+            oldKS[i] = UInt16(truncatingIfNeeded: 0x3C00 &+ i)
+            oldVS[i] = UInt16(truncatingIfNeeded: 0x3E00 &+ i)
+        }
+
+        let pinTokens = 512
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: kvHeads, headDim: 64, maxSeqLen: 2048, precision: .fp8,
+            preservePrefixCount: pinTokens
+        )
+        guard let newKBuf = KVCacheManager.shared.kScaleBuffer,
+              let newVBuf = KVCacheManager.shared.vScaleBuffer else {
+            return XCTFail("FP8 KV cache did not allocate scale buffers after splice reset")
+        }
+        XCTAssertEqual(KVCacheManager.shared.allocatedSeqLen, 2048)
+        if newKBuf === oldKBuf && newVBuf === oldVBuf {
+            return XCTFail("grown splice reset should have reallocated the scale buffers")
+        }
+        let newKS = newKBuf.contents().bindMemory(to: UInt16.self, capacity: newKBuf.length / 2)
+        let newVS = newVBuf.contents().bindMemory(to: UInt16.self, capacity: newVBuf.length / 2)
+
+        // Per-layer slots the preserve path restores: old layout stride
+        // oldMaxSeq * kvHeads, new layout stride 2048 * kvHeads.
+        for slot in 0..<4 {
+            let newBase = slot * 2048 * tokenScaleFloats
+            let oldBase = slot * 1024 * tokenScaleFloats
+            for t in 0..<(pinTokens * tokenScaleFloats) {
+                XCTAssertEqual(newKS[newBase + t], oldKS[oldBase + t],
+                               "kScale prefix corrupted at slot \(slot), element \(t)")
+                XCTAssertEqual(newVS[newBase + t], oldVS[oldBase + t],
+                               "vScale prefix corrupted at slot \(slot), element \(t)")
+            }
+            // Just past the restored prefix the rebuilt buffer must still be zero.
+            XCTAssertEqual(newKS[newBase + pinTokens * tokenScaleFloats], 0)
+        }
+
+        // === Retained-capacity regression (Copilot review round): capacity left over
+        // from a longer earlier conversation must not turn a stride-change relayout
+        // into an in-place overwrite. The 2048-layout buffers allocated above are
+        // deliberately kept; a fresh 1024 reset fits inside that capacity and retains
+        // them, so the follow-up spliced grow back to 2048 has sufficient capacity —
+        // the restore must still go through freshly rebuilt buffers, and later slots'
+        // source data must survive slot 1's copy (the old code wrote slot 1's
+        // 2048-stride destination over slot 2's 1024-stride source mid-loop).
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: kvHeads, headDim: 64, maxSeqLen: 1024, precision: .fp8,
+            preservePrefixCount: 0
+        )
+        XCTAssertTrue(KVCacheManager.shared.kScaleBuffer === newKBuf,
+                      "a fresh 1024 reset fits inside the retained 2048 capacity and must keep the buffer")
+        for i in 0..<(newKBuf.length / 2) {
+            newKS[i] = UInt16(truncatingIfNeeded: 0x3400 &+ i)
+            newVS[i] = UInt16(truncatingIfNeeded: 0x3600 &+ i)
+        }
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: kvHeads, headDim: 64, maxSeqLen: 2048, precision: .fp8,
+            preservePrefixCount: pinTokens
+        )
+        guard let relaidKBuf = KVCacheManager.shared.kScaleBuffer,
+              let relaidVBuf = KVCacheManager.shared.vScaleBuffer else {
+            return XCTFail("FP8 KV cache did not allocate scale buffers after retained-capacity splice reset")
+        }
+        XCTAssertTrue(relaidKBuf !== newKBuf && relaidVBuf !== newVBuf,
+                      "a stride-change splice must rebuild the scale buffers even when the old capacity was sufficient")
+        let relaidKS = relaidKBuf.contents().bindMemory(to: UInt16.self, capacity: relaidKBuf.length / 2)
+        let relaidVS = relaidVBuf.contents().bindMemory(to: UInt16.self, capacity: relaidVBuf.length / 2)
+        for slot in 0..<4 {
+            let newBase = slot * 2048 * tokenScaleFloats
+            let oldBase = slot * 1024 * tokenScaleFloats
+            for t in 0..<(pinTokens * tokenScaleFloats) {
+                XCTAssertEqual(relaidKS[newBase + t], UInt16(truncatingIfNeeded: 0x3400 &+ (oldBase + t)),
+                               "retained-capacity splice corrupted kScale at slot \(slot), element \(t)")
+                XCTAssertEqual(relaidVS[newBase + t], UInt16(truncatingIfNeeded: 0x3600 &+ (oldBase + t)),
+                               "retained-capacity splice corrupted vScale at slot \(slot), element \(t)")
+            }
+            XCTAssertEqual(relaidKS[newBase + pinTokens * tokenScaleFloats], 0,
+                           "the rebuilt buffer's tail must be zero, not leftover source data")
+        }
+
+        // Leave the shared singleton in a small, conventional state for later tests.
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: kvHeads, headDim: 64, maxSeqLen: 256, precision: .fp16
+        )
+    }
+
+    func testKVCacheFP8ScaleRestoreUsesLogicalKvHeadCount() throws {
+        // Review regression (round 2): the FP8 store/attention kernels address
+        // scales with the LOGICAL head count the generation path uses — 2 for a
+        // nil-config, non-Nanbeige run — laying each slot out as
+        // [maxSeq x logicalHeads] halves packed at slot * maxSeq * logicalHeads.
+        // reset() pads the ALLOCATION's head count to >= 8 when config is nil; using
+        // the padded count for the splice restore's offsets/sizes copies the wrong
+        // regions and leaves later slots with zeroed or foreign pinned scales.
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        let layoutHeads = 2
+        KVCacheManager.shared.kScaleBuffer = nil
+        KVCacheManager.shared.vScaleBuffer = nil
+
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: layoutHeads, headDim: 64, maxSeqLen: 1024, precision: .fp8,
+            preservePrefixCount: 0
+        )
+        guard let oldKBuf = KVCacheManager.shared.kScaleBuffer,
+              let oldVBuf = KVCacheManager.shared.vScaleBuffer else {
+            return XCTFail("FP8 KV cache did not allocate scale buffers")
+        }
+        let oldKS = oldKBuf.contents().bindMemory(to: UInt16.self, capacity: oldKBuf.length / 2)
+        let oldVS = oldVBuf.contents().bindMemory(to: UInt16.self, capacity: oldVBuf.length / 2)
+        // Poison the whole padded buffer, then write only the compact live layout
+        // the store kernels would write: slot regions advance by maxSeq * logicalHeads.
+        for i in 0..<(oldKBuf.length / 2) { oldKS[i] = 0xDEAD; oldVS[i] = 0xBEEF }
+        for slot in 0..<4 {
+            let base = slot * 1024 * layoutHeads
+            for t in 0..<(1024 * layoutHeads) {
+                oldKS[base + t] = UInt16(truncatingIfNeeded: 0x3000 &+ (base + t))
+                oldVS[base + t] = UInt16(truncatingIfNeeded: 0x3200 &+ (base + t))
+            }
+        }
+
+        let pinTokens = 512
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: layoutHeads, headDim: 64, maxSeqLen: 2048, precision: .fp8,
+            preservePrefixCount: pinTokens
+        )
+        guard let newKBuf = KVCacheManager.shared.kScaleBuffer,
+              let newVBuf = KVCacheManager.shared.vScaleBuffer else {
+            return XCTFail("FP8 KV cache did not allocate scale buffers after splice reset")
+        }
+        XCTAssertTrue(newKBuf !== oldKBuf && newVBuf !== oldVBuf,
+                      "stride-change splice must rebuild the scale buffers")
+        let newKS = newKBuf.contents().bindMemory(to: UInt16.self, capacity: newKBuf.length / 2)
+        let newVS = newVBuf.contents().bindMemory(to: UInt16.self, capacity: newVBuf.length / 2)
+        for slot in 0..<4 {
+            let newBase = slot * 2048 * layoutHeads
+            let oldBase = slot * 1024 * layoutHeads
+            for t in 0..<(pinTokens * layoutHeads) {
+                XCTAssertEqual(newKS[newBase + t], UInt16(truncatingIfNeeded: 0x3000 &+ (oldBase + t)),
+                               "kScale prefix corrupted at slot \(slot), element \(t) under the 2-head logical layout")
+                XCTAssertEqual(newVS[newBase + t], UInt16(truncatingIfNeeded: 0x3200 &+ (oldBase + t)),
+                               "vScale prefix corrupted at slot \(slot), element \(t) under the 2-head logical layout")
+            }
+            // Untouched tail of a freshly rebuilt buffer: zero, never the 0xDEAD poison.
+            XCTAssertEqual(newKS[newBase + pinTokens * layoutHeads], 0)
+        }
+
+        // Leave the shared singleton in a small, conventional state for later tests.
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: layoutHeads, headDim: 64, maxSeqLen: 256, precision: .fp16
+        )
+    }
+
+    func testKVCachePrefixRelayoutsOnSplicedStrideShrink() throws {
+        // Review regression (round 2): a tools_unload that shortens the prompt can
+        // shrink neededSeqLen turn-over-turn, so a spliced reset can arrive with a
+        // SMALLER maxSeqLen while preservePrefixCount > 0. The capacity check alone
+        // kept the old (larger) K/V buffers, leaving the pinned prefix at the old
+        // slot stride while generation indexes by the new allocatedSeqLen — while
+        // the scales WERE being moved to the smaller stride. The stride-change guard
+        // now forces the K/V relayout too, mirroring the scale-buffer handling.
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        KVCacheManager.shared.kCacheBuffer = nil
+        KVCacheManager.shared.vCacheBuffer = nil
+        KVCacheManager.shared.kScaleBuffer = nil
+        KVCacheManager.shared.vScaleBuffer = nil
+
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: 4, headDim: 128, maxSeqLen: 512, precision: .fp16,
+            preservePrefixCount: 0
+        )
+        guard let oldKBuf = KVCacheManager.shared.kCacheBuffer else {
+            return XCTFail("FP16 KV cache did not allocate K buffer")
+        }
+        let oldKH = oldKBuf.contents().bindMemory(to: UInt16.self, capacity: oldKBuf.length / 2)
+        for i in 0..<(oldKBuf.length / 2) { oldKH[i] = UInt16(truncatingIfNeeded: 0x2A00 &+ i) }
+
+        // Recompute reset's own per-slot stride: effectiveKvStride heads*dim floored
+        // at 1024 (padded heads = 8, headDim 128), fp16 = one half per element.
+        let strideElems = 1024
+        let pinTokens = 128
+
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: 4, headDim: 128, maxSeqLen: 384, precision: .fp16,
+            preservePrefixCount: pinTokens
+        )
+        guard let newKBuf = KVCacheManager.shared.kCacheBuffer else {
+            return XCTFail("FP16 KV cache did not allocate K buffer after shrink splice")
+        }
+        XCTAssertTrue(newKBuf !== oldKBuf,
+                      "a stride-changing splice must reallocate the K/V buffers even when retained capacity still fits")
+        XCTAssertEqual(KVCacheManager.shared.allocatedSeqLen, 384)
+        let newKH = newKBuf.contents().bindMemory(to: UInt16.self, capacity: newKBuf.length / 2)
+        for slot in 0..<4 {
+            let newBase = slot * 384 * strideElems
+            let oldBase = slot * 512 * strideElems
+            for e in 0..<(pinTokens * strideElems) {
+                XCTAssertEqual(newKH[newBase + e], UInt16(truncatingIfNeeded: 0x2A00 &+ (oldBase + e)),
+                               "pinned K prefix corrupted at slot \(slot), element \(e) during shrink relayout")
+            }
+            // Freshly zero-filled tail past the pinned prefix.
+            XCTAssertEqual(newKH[newBase + pinTokens * strideElems], 0,
+                           "shrink relayout must zero the tail past the pinned prefix at slot \(slot)")
+        }
+
+        // Leave the shared singleton in a small, conventional state for later tests.
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: 4, headDim: 128, maxSeqLen: 256, precision: .fp16
+        )
+    }
+
+    func testToolsLoadRewritesPromptToolSectionForNextStep() {
+        // Regression for the mid-run stale tool block: tools_load executes and
+        // replies "you may now call it directly using the provided schema", but the next
+        // agent step spliced the previous turn's system text verbatim — the authoritative
+        // "Only the following functions are currently loaded" block never gained the tool
+        // (observed live: model stuck reconciling the contradiction, 500+ tokens, no call).
+        // Uses a non-core tool (git_diff) now that web_fetch ships in the core set.
+        let harness = AgentHarness.shared
+        harness.resetLoadedToolsToCore()
+        defer { harness.resetLoadedToolsToCore() }
+
+        let fixedDate = Date(timeIntervalSince1970: 1_800_000_000)
+        let before = harness.buildSystemPrompt(baseSystem: "Test system.", modelName: "Ornith 1.5", currentDate: fixedDate)
+        XCTAssertFalse(before.contains("\"name\":\"git_diff\""), "git_diff must not be advertised before it is loaded")
+        XCTAssertTrue(before.contains("\"name\":\"web_fetch\""), "web_fetch is a core tool and must be advertised from the start")
+        XCTAssertTrue(before.contains("# Tools"), "agent prompt must carry a tools section")
+
+        XCTAssertNoThrow(try harness.loadTool(named: "git_diff"))
+        let after = harness.buildSystemPrompt(baseSystem: "Test system.", modelName: "Ornith 1.5", currentDate: fixedDate)
+        XCTAssertTrue(after.contains("\"name\":\"git_diff\""), "freshly built prompt must advertise git_diff")
+
+        let refreshed = harness.refreshingLoadedToolsSection(inPrompt: before)
+        XCTAssertNotEqual(refreshed, before, "a stale tool block must change after tools_load")
+        XCTAssertEqual(refreshed, after, "the refreshed prompt must match a freshly built one byte-for-byte")
+
+        XCTAssertEqual(harness.refreshingLoadedToolsSection(inPrompt: after), after, "idempotent when the block already matches")
+
+        let plain = "<|im_start|>user\nhi<|im_end|>"
+        XCTAssertEqual(harness.refreshingLoadedToolsSection(inPrompt: plain), plain, "non-agent prompts pass through untouched")
+    }
+
+    func testToolsSectionCarriesWebFetchReadinessHintOnlyWhenNeeded() {
+        // Regression for the Spark search-loop: with web_search loaded but web_fetch
+        // not, the prompt told the model to read pages "via web_fetch" while showing
+        // no web_fetch schema — the model re-issued web_search query after query for
+        // page content until the budget guardrail force-disabled web_search mid-task.
+        // web_fetch now ships in the core set, so the hint only guards the case where
+        // the model (or a guardrail) unloaded web_fetch mid-run.
+        let harness = AgentHarness.shared
+        harness.resetLoadedToolsToCore()
+        defer { harness.resetLoadedToolsToCore() }
+        // Mirror the live agent-session registry: the core set plus web_search.
+        XCTAssertNoThrow(try harness.loadTool(named: "web_search"))
+
+        let hint = "Web research readiness:"
+        let withFetch = harness.buildToolsSection()
+        XCTAssertTrue(withFetch.contains("\"name\":\"web_fetch\""), "web_fetch must ship in the core tool set")
+        XCTAssertTrue(withFetch.contains("\"name\":\"web_search\""), "the live registry must include web_search")
+        XCTAssertFalse(withFetch.contains(hint), "no hint while web_fetch is loaded")
+
+        XCTAssertNoThrow(try harness.unloadTool(named: "web_fetch"))
+        let withSearchOnly = harness.buildToolsSection()
+        XCTAssertTrue(withSearchOnly.contains("\"name\":\"web_search\""), "web_search must stay loaded")
+        XCTAssertFalse(withSearchOnly.contains("\"name\":\"web_fetch\""), "web_fetch must be gone after tools_unload")
+        XCTAssertTrue(withSearchOnly.contains(hint), "tools section must hint at re-loading web_fetch when web_search is loaded without it")
+        XCTAssertTrue(withSearchOnly.contains("tools_load"), "the hint must name tools_load as the remedy")
+
+        XCTAssertNoThrow(try harness.loadTool(named: "web_fetch"))
+        let refetched = harness.buildToolsSection()
+        XCTAssertTrue(refetched.contains("\"name\":\"web_fetch\""))
+        XCTAssertFalse(refetched.contains(hint), "hint must disappear once web_fetch is loaded again")
+
+        XCTAssertNoThrow(try harness.unloadTool(named: "web_search"))
+        let withoutSearch = harness.buildToolsSection()
+        XCTAssertFalse(withoutSearch.contains(hint), "hint must not appear when web_search itself is not loaded")
+
+        // The refreshed-prompt path must stay byte-identical to a fresh build with the hint.
+        let fixedDate = Date(timeIntervalSince1970: 1_800_000_000)
+        XCTAssertNoThrow(try harness.unloadTool(named: "web_fetch"))
+        XCTAssertNoThrow(try harness.loadTool(named: "web_search"))
+        let corePrompt = harness.buildSystemPrompt(baseSystem: "Test system.", modelName: "Spark X2.5", currentDate: fixedDate)
+        XCTAssertTrue(corePrompt.contains(hint), "core registry prompt must carry the hint")
+
+        XCTAssertNoThrow(try harness.loadTool(named: "web_fetch"))
+        let refreshedCore = harness.refreshingLoadedToolsSection(inPrompt: corePrompt)
+        let freshWithFetch = harness.buildSystemPrompt(baseSystem: "Test system.", modelName: "Spark X2.5", currentDate: fixedDate)
+        XCTAssertEqual(refreshedCore, freshWithFetch, "refreshed prompt must match a freshly built one byte-for-byte")
+        XCTAssertFalse(refreshedCore.contains(hint), "hint must drop out of the refreshed prompt once web_fetch loads")
+        XCTAssertEqual(harness.refreshingLoadedToolsSection(inPrompt: refreshedCore), refreshedCore, "idempotent once current")
+    }
+
     func testOrnith9BCodingSettingsAutoregressive() throws {
         print("=== TEST ORNITH 1.5 9B AUTOREGRESSIVE WITH USER CODING SETTINGS ===")
         let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--mlx-community--Ornith-1.5-9B-OptiQ-4bit/snapshots/ad2e7748e8c9d36b82bb88307fd21c0d50be85b8"

@@ -187,7 +187,15 @@ final class KVCacheManager {
         // far cheaper than memset-ing every page, which commits them all up front and
         // invites eviction + KV-cache paging thrash at long context.
         let forceFreshAlloc = (preservePrefixCount == 0)
-        let needsRealloc = forceFreshAlloc || (kCacheBuffer == nil || vCacheBuffer == nil || allocatedKvBytes < requiredKvBytes)
+        // A preserved reset whose maxSeqLen differs from the last allocation must
+        // relayout every slot region even when the retained buffers still have spare
+        // capacity: neededSeqLen can SHRINK turn-to-turn (a tools_unload shortening the
+        // prompt above the min-sequence floor, or a lower max-tokens setting), and the
+        // generation paths index slot regions by allocatedSeqLen — leaving the pinned
+        // prefix at the old stride while scales move to the new one would misalign every
+        // later layer. Same condition as the FP8 scale-buffer rebuild below.
+        let spliceStrideChanged = (preservePrefixCount > 0 && maxSeqLen != oldMaxSeq)
+        let needsRealloc = forceFreshAlloc || (kCacheBuffer == nil || vCacheBuffer == nil || allocatedKvBytes < requiredKvBytes || spliceStrideChanged)
 
         if needsRealloc {
             self.kCacheBuffer = nil
@@ -241,13 +249,70 @@ final class KVCacheManager {
         if precision == .fp8 {
             let scaleCount = actualSlotCapacity * maxSeqLen * kvHeads
             let scaleBytes = scaleCount * MemoryLayout<UInt16>.stride // half precision per-head scales
-            if kScaleBuffer == nil || kScaleBuffer!.length < scaleBytes {
+            let scaleElemBytes = MemoryLayout<UInt16>.stride
+            let oldKScale = self.kScaleBuffer
+            let oldVScale = self.vScaleBuffer
+            // The FP8 store/attention kernels address scales with the LOGICAL head count
+            // the generation path uses (config?.effectiveNumKeyValueHeads ?? numKvHeads —
+            // e.g. 2 when a nil-config run defaults to 2 KV heads), laying each slot out
+            // as [maxSeq x logicalHeads] halves. `kvHeads` above is only a capacity pad
+            // (>= 8 when config is nil); using it for the restore's offsets/sizes would
+            // copy the wrong regions after a stride change and leave later slots reading
+            // zero or foreign scales. Copy with the logical count; keep the padded count
+            // for sizing/zeroing so over-provisioned tails stay clean.
+            //
+            // The allocation condition below is capacity-based, so an earlier, longer
+            // conversation can leave scale buffers big enough for BOTH the old and new
+            // strides. A spliced reset that changes the stride must then relayout
+            // slot-by-slot between the oldMaxSeq and maxSeqLen layouts inside the SAME
+            // buffer — and a forward slot loop would overwrite a later slot's source
+            // data before it is copied (slot 1's 2048-stride destination overlaps slot
+            // 2's 1024-stride source). memmove would not help: the overlap is between
+            // separate slot regions, not within one copy. Rebuild both buffers on
+            // every preserve-with-stride-change so the restore is always
+            // buffer-to-buffer; fresh resets keep the capacity-retention fast path.
+            let scaleLayoutHeads = config?.effectiveNumKeyValueHeads ?? numKvHeads
+            if kScaleBuffer == nil || kScaleBuffer!.length < scaleBytes || spliceStrideChanged {
                 self.kScaleBuffer = device.makeBuffer(length: scaleBytes, options: .storageModeShared)
                 self.vScaleBuffer = device.makeBuffer(length: scaleBytes, options: .storageModeShared)
             }
             if preservePrefixCount == 0 {
                 if let ksBuf = kScaleBuffer { memset(ksBuf.contents(), 0, min(scaleBytes, ksBuf.length)) }
                 if let vsBuf = vScaleBuffer { memset(vsBuf.contents(), 0, min(scaleBytes, vsBuf.length)) }
+            } else {
+                // The preserved INT8 K/V prefix is meaningless without its per-(token,
+                // head) dequant scales: with zeroed scales every pinned position's score
+                // and V read collapses to zero and decode degenerates into word salad.
+                // Rebuilding the scale buffers on a grown maxSeqLen throws the pinned
+                // prefix's scales away — restore them slot-by-slot exactly like the
+                // K/V memcpy above, using the LOGICAL head-count layout the store
+                // kernels write (scaleLayoutHeads), not the padded capacity count.
+                // spliceStrideChanged above guarantees src and dst are distinct buffers
+                // whenever the layouts differ; when the stride is unchanged a retained
+                // buffer means every newOff equals oldOff and the loop is a no-op.
+                let prefixScaleBytes = min(min(preservePrefixCount, oldMaxSeq), maxSeqLen) * scaleLayoutHeads * scaleElemBytes
+                let scaleWasRebuilt = (kScaleBuffer !== oldKScale)
+                for slot in 0..<totalSlots {
+                    let oldOff = slot * oldMaxSeq * scaleLayoutHeads * scaleElemBytes
+                    let newOff = slot * maxSeqLen * scaleLayoutHeads * scaleElemBytes
+                    guard scaleWasRebuilt || newOff != oldOff else { continue }
+                    if let oldKS = oldKScale, let newKS = kScaleBuffer {
+                        let copy = min(prefixScaleBytes, max(0, oldKS.length - oldOff), max(0, newKS.length - newOff))
+                        if copy > 0 {
+                            memcpy(newKS.contents().advanced(by: newOff), oldKS.contents().advanced(by: oldOff), copy)
+                        }
+                    }
+                    if let oldVS = oldVScale, let newVS = vScaleBuffer {
+                        let copy = min(prefixScaleBytes, max(0, oldVS.length - oldOff), max(0, newVS.length - newOff))
+                        if copy > 0 {
+                            memcpy(newVS.contents().advanced(by: newOff), oldVS.contents().advanced(by: oldOff), copy)
+                        }
+                    }
+                }
+                // Splice-turn telemetry: reallocation + scale-rebuild decisions decide
+                // whether the prefix survives intact. Without this line, a run's binary
+                // vintage and cache-lifecycle history are indistinguishable after the fact.
+                print("🔍 [KVCACHE] splice reset: pin=\(preservePrefixCount) maxSeq \(oldMaxSeq)->\(maxSeqLen) kvRealloc=\(needsRealloc) scaleRebuilt=\(kScaleBuffer !== oldKScale) slots=\(totalSlots)")
             }
         }
 
@@ -2278,7 +2343,14 @@ struct ContentView: View {
         let assistantMsgId = UUID()
         let assistantMsg = ChatMessage(id: assistantMsgId, role: .assistant, content: "", thinkingContent: nil, isThinking: thinkingEnabled)
         sessions[sessionIdx].messages.append(assistantMsg)
-        
+
+        // Runs BEFORE the system prompt is built: beginAgentSearchGuard (re)loads
+        // `web_search` into the registry, and buildSystemPrompt renders <tools> from
+        // the live registry. Calling it after the build left the first prompt of a
+        // fresh process advertising only the fundamental tools while the grammar
+        // accepted web_search — the model could call a tool the prompt denied having.
+        AgentHarness.shared.beginAgentSearchGuard()
+
         // Build prompt formatted with chat template
         var promptString = ""
         let conversationDate = sessions[sessionIdx].createdAt
@@ -2509,8 +2581,6 @@ struct ContentView: View {
                 promptString += "<|im_start|>assistant\n"
             }
         }
-        
-        AgentHarness.shared.beginAgentSearchGuard()
         startAutoregressiveGeneration(customPrompt: promptString, sessionId: currentSessionId, messageId: assistantMsgId)
         return true
     }
@@ -5239,6 +5309,14 @@ struct ContentView: View {
             kvPrec = .fp16
         }
         let hasRecurrence = (modelConfig?.isLingModel == true || modelConfig?.hasLinearRecurrence == true || cachedLayers.contains { $0.attentionType == .linearAttention })
+        // A pin minted under one KV precision cannot be restored under another: the
+        // preserve-path memcpy sizes slots with the *new* elementBytes against a cache
+        // laid out with the old ones (and FP8 additionally needs its scale buffers).
+        // activePrecision still holds the previous turn's value until reset() below.
+        if kvPrec != KVCacheManager.shared.activePrecision && PrefixCacheManager.shared.currentPinnedCount > 0 {
+            print("🔁 [PREFIX] KV precision changed \(KVCacheManager.shared.activePrecision) -> \(kvPrec) — pinned prefix is unusable, full re-prefill")
+            PrefixCacheManager.shared.invalidate()
+        }
         // FIX #10: hybrid (GDN) models now reuse the KV prefix too — but only when
         // the ENTIRE pinned prefix matches, because the O(1) recurrent states are
         // only valid at exactly the pinned token count (snapshot is taken at turn
@@ -5249,7 +5327,7 @@ struct ContentView: View {
         // DRP.DynaMoE dynamoe_disable_prefix_reuse -bool YES
         if UserDefaults.standard.bool(forKey: "dynamoe_disable_prefix_reuse") {
             prefixTokensReused = 0
-        } else         if hasRecurrence {
+        } else if hasRecurrence {
             if reuseCandidate > 0 && reuseCandidate == PrefixCacheManager.shared.currentPinnedCount {
                 prefixTokensReused = reuseCandidate
             } else {
@@ -12110,7 +12188,9 @@ if layer.attnGateProjTensor != nil,
                     Do not emit any tool calls. Do not search again. Just answer.
                     </system>
                     """
-                    let synthesisPrompt = formattedPrompt + assistantTurnText + synthesisDirective
+                    let staleSynthesisPrompt = formattedPrompt + assistantTurnText + synthesisDirective
+                    let synthesisPrompt = AgentHarness.shared.refreshingLoadedToolsSection(inPrompt: staleSynthesisPrompt)
+                    let synthesisToolsChanged = (synthesisPrompt != staleSynthesisPrompt)
                     let splicedTokens = self.buildSplicedContinuationTokens(
                         basePromptTokens: promptTokenIds,
                         generatedTokenIds: generatedTokenIds,
@@ -12137,7 +12217,7 @@ if layer.attnGateProjTensor != nil,
                     self.generationStatusText = "🛡️ Tool loop guard hit — forcing final answer..."
                     self.startAutoregressiveGeneration(
                         customPrompt: synthesisPrompt,
-                        promptTokens: splicedTokens,
+                        promptTokens: synthesisToolsChanged ? nil : splicedTokens,
                         sessionId: sessionId,
                         messageId: synthesisMsgId,
                         agentStep: agentStep + 1,
@@ -12433,7 +12513,13 @@ if layer.attnGateProjTensor != nil,
                         }
                         let endTag = (modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>")
                         let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
-                        let nextPrompt = formattedPrompt + assistantTurnText + "\n" + toolResponseTurn
+                        let staleNextPrompt = formattedPrompt + assistantTurnText + "\n" + toolResponseTurn
+                        // tools_load/tools_unload may have changed the registry THIS step;
+                        // the spliced ids carry the prompt's OLD tools block, so when the
+                        // section changes the continuation must re-encode (full re-prefill)
+                        // rather than splice from the stale tokens.
+                        let nextPrompt = AgentHarness.shared.refreshingLoadedToolsSection(inPrompt: staleNextPrompt)
+                        let toolsSectionChanged = (nextPrompt != staleNextPrompt)
                         let splicedTokens = self.buildSplicedContinuationTokens(
                             basePromptTokens: promptTokenIds,
                             generatedTokenIds: generatedTokenIds,
@@ -12460,7 +12546,7 @@ if layer.attnGateProjTensor != nil,
                             }
                             self.startAutoregressiveGeneration(
                                 customPrompt: nextPrompt,
-                                promptTokens: splicedTokens,
+                                promptTokens: toolsSectionChanged ? nil : splicedTokens,
                                 sessionId: sessionId,
                                 messageId: nextAssistantMsgId,
                                 agentStep: agentStep + 1
@@ -12487,7 +12573,9 @@ if layer.attnGateProjTensor != nil,
                             Do not emit any tool calls. Do not search again. Just answer.
                             </system>
                             """
-                            let synthesisPrompt = formattedPrompt + assistantTurnText + "\n" + toolResponseContext + synthesisDirective
+                            let staleSynthesisPrompt = formattedPrompt + assistantTurnText + "\n" + toolResponseContext + synthesisDirective
+                            let synthesisPrompt = AgentHarness.shared.refreshingLoadedToolsSection(inPrompt: staleSynthesisPrompt)
+                            let synthesisToolsChanged = (synthesisPrompt != staleSynthesisPrompt)
                             let splicedTokens = self.buildSplicedContinuationTokens(
                                 basePromptTokens: promptTokenIds,
                                 generatedTokenIds: generatedTokenIds,
@@ -12515,7 +12603,7 @@ if layer.attnGateProjTensor != nil,
                                 self.generationStatusText = "🛡️ Tool loop guard hit — forcing final answer..."
                                 self.startAutoregressiveGeneration(
                                     customPrompt: synthesisPrompt,
-                                    promptTokens: splicedTokens,
+                                    promptTokens: synthesisToolsChanged ? nil : splicedTokens,
                                     sessionId: sessionId,
                                     messageId: synthesisMsgId,
                                     agentStep: agentStep + 1,
