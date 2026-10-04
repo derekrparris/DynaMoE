@@ -3516,12 +3516,22 @@ public final class AgentHarness {
     }
 
     /// Spark 2.5 (DeepSeek-style) tool response turn: <｜start▁of▁sentence｜><|Tool|> <tool_response>{result}</tool_response> per result, ending with <｜end▁of▁sentence｜>
-    public func formatSparkToolResponseTurn(responses: [String]) -> String {
+    public func formatSparkToolResponseTurn(responses: [String], includeAssistantPrefix: Bool = false, thinkingEnabled: Bool = true) -> String {
         var turn = "<｜start▁of▁sentence｜><|Tool|>"
         for r in responses {
             turn += "<tool_response>\(Self.renderToolResultForModel(r))</tool_response>"
         }
         turn += "<｜end▁of▁sentence｜>"
+
+        // Chat template add_generation_prompt: after a Tool role turn the model needs
+        // its own assistant turn re-opened, or it pattern-completes the transcript
+        // instead of answering. Observed live: with the prompt ending at the bare
+        // Tool-turn close, Spark emitted an end-of-text token and then fabricated
+        // the NEXT tool-result block itself, which froze as a broken fragment and
+        // ended the run with garbage shown to the user. The suffix reuses the
+        // first-turn generation prompt verbatim so the two dialects cannot drift.
+        guard includeAssistantPrefix else { return turn }
+        turn += thinkingEnabled ? "<｜start▁of▁sentence｜><|Bot|><think>" : "<｜start▁of▁sentence｜><|Bot|></think>"
         return turn
     }
 

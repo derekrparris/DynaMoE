@@ -11820,7 +11820,7 @@ if layer.attnGateProjTensor != nil,
                         deltaText = ""
                     }
                     accumulatedDecodedText = emittable
-                    if deltaText.contains("<|im_end|>") || deltaText.contains("<|endoftext|>") || deltaText.contains("<|role_end|>") {
+                    if deltaText.contains("<｜end▁of▁text｜>") || deltaText.contains("<|im_end|>") || deltaText.contains("<|endoftext|>") || deltaText.contains("<|role_end|>") {
                         shouldBreak = true
                         breakReason = "end-tag-in-text"
                         break
@@ -12503,7 +12503,9 @@ if layer.attnGateProjTensor != nil,
                             )
                         } else if modelConfig?.isSparkModel == true {
                             toolResponseTurn = AgentHarness.shared.formatSparkToolResponseTurn(
-                                responses: allResponses
+                                responses: allResponses,
+                                includeAssistantPrefix: true,
+                                thinkingEnabled: thinkingEnabled
                             )
                         } else {
                             toolResponseTurn = AgentHarness.shared.formatToolResponseTurn(

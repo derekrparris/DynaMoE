@@ -7378,6 +7378,109 @@ final class DynaMoETests: XCTestCase {
         )
     }
 
+    /// Regression for the Spark continuation-turn hole (observed live, post FIX #15):
+    /// the agent continuation prompt ended at the bare Tool-role turn close with no
+    /// assistant re-open, so Spark pattern-completed the transcript instead of
+    /// answering - it emitted its end-of-text token and then fabricated the NEXT
+    /// tool-result block itself, which froze as a broken fragment and ended the run
+    /// with garbage shown to the user. The tool-response turn must therefore end
+    /// with the same generation prompt the first turn gets (the template's
+    /// add_generation_prompt), while the history-embedding form must stay bare.
+    func testSparkToolResponseTurnReopensAssistantTurn() {
+        let harness = AgentHarness.shared
+        let response = "{\"result\": {\"stdout\": \"hello\"}}"
+
+        let turn = harness.formatSparkToolResponseTurn(
+            responses: [response],
+            includeAssistantPrefix: true,
+            thinkingEnabled: true
+        )
+        XCTAssertTrue(turn.contains("<|Tool|>"))
+        XCTAssertTrue(turn.contains("hello"))
+        // The assistant re-open must come AFTER the Tool-turn close.
+        XCTAssertTrue(turn.contains("<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|Bot|><think>"))
+        XCTAssertTrue(turn.hasSuffix("<｜start▁of▁sentence｜><|Bot|><think>"))
+        XCTAssertFalse(turn.contains("<|im_start|>"))
+
+        // Thinking disabled: the close variant so the model answers directly.
+        let plainTurn = harness.formatSparkToolResponseTurn(
+            responses: [response],
+            includeAssistantPrefix: true,
+            thinkingEnabled: false
+        )
+        XCTAssertTrue(plainTurn.hasSuffix("<｜start▁of▁sentence｜><|Bot|></think>"))
+
+        // History-embedding form (default): ends at the Tool-turn close, no Bot opener.
+        let historyTurn = harness.formatSparkToolResponseTurn(responses: [response])
+        XCTAssertTrue(historyTurn.hasSuffix("<｜end▁of▁sentence｜>"))
+        XCTAssertFalse(historyTurn.contains("<|Bot|>"))
+    }
+
+    /// Regression for the invisible whitespace loop at the tag-choice boundary
+    /// (observed live: Spark opened a tool call, then streamed hundreds of
+    /// invisible whitespace tokens - nothing rendered (the response is
+    /// whitespace-trimmed), no closer ever arrived so the parser could not
+    /// freeze, and the degenerate-cycle guard ignores units without letters or
+    /// digits - until the user stopped the turn). Layout whitespace between
+    /// structural tags is legal, but bounded: past a small allowance the
+    /// tag-choice mask must force the next structural tag.
+    func testGrammarMaskBoundsWhitespaceAtTagChoiceBoundary() {
+        let harness = AgentHarness.shared
+        let sampler = GrammarConstrainedSampler.shared
+        try? harness.loadTool(named: "web_search")
+        defer {
+            harness.resetLoadedToolsToCore()
+            sampler.reset()
+        }
+
+        sampler.isEnabled = true
+        sampler.reset()
+
+        func masked(_ text: String, tokens: [String]) -> [Bool] {
+            sampler.updateState(emittedText: text)
+            sampler.invalidateTokenizerCaches()
+            var logits = [Float](repeating: 0, count: tokens.count)
+            logits.withUnsafeMutableBufferPointer { buf in
+                sampler.applyLogitMask(
+                    logits: buf.baseAddress!,
+                    vocabSize: tokens.count,
+                    tokenDecoder: { tokens[Int($0)] }
+                )
+            }
+            return logits.map { $0 == -.infinity }
+        }
+
+        // Fresh boundary: layout whitespace and function-tag prefixes both pass.
+        XCTAssertEqual(
+            masked("<tool_call>", tokens: ["\n", " ", "<", "<f", "<function=", "x"]),
+            [false, false, false, false, false, true],
+            "at the fresh boundary, whitespace and function-tag prefixes pass"
+        )
+
+        // One newline in: one more whitespace char still fits the allowance, and a
+        // merged whitespace+tag token always passes.
+        XCTAssertEqual(
+            masked("<tool_call>\n", tokens: ["\n", " ", "\n<function=", "<"]),
+            [false, false, false, false],
+            "within the allowance whitespace still passes; merged WS+tag tokens always pass"
+        )
+
+        // Beyond the allowance: pure-whitespace tokens are masked and the only
+        // legal continuations are the structural tag (or a merged WS+tag token).
+        XCTAssertEqual(
+            masked("<tool_call>\n\n", tokens: ["\n", " ", "\t", "<", "<f", "\n<function=", "x"]),
+            [true, true, true, false, false, false, true],
+            "the whitespace allowance is bounded; the mask forces the structural tag"
+        )
+
+        // Same bound between a parameter closer and the next structural tag.
+        XCTAssertEqual(
+            masked("<tool_call>\n<function=web_search>\n<parameter=query>abc</parameter>\n\n", tokens: ["\n", "<", "</", "x"]),
+            [true, false, false, true],
+            "the bound applies between a parameter closer and the next tag too"
+        )
+    }
+
     /// Regression for the malformed-call loop: after `<parameter=command>` the
     /// value state is otherwise unconstrained, so a model that starts echoing
     /// `<parameter` inside the value loops there (observed: `<parameter=command>`
@@ -11600,6 +11703,480 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         let fp8Text = (try? tokenizer.decode(ids: generatedTokenIds)) ?? ""
         print("FP8 GREEDY TEXT: '\(fp8Text)'")
         try? fp8Text.write(toFile: "/var/folders/mz/_wbpft9n74x5dbt3tkcdpd2m0000gn/T/opencode/spark_greedy_fp8.txt", atomically: true, encoding: .utf8)
+    }
+
+    func testSparkAgentToolCallEmissionDiagnostic() throws {
+        print("=== SPARK AGENT TOOL-CALL EMISSION DIAGNOSTIC (exact failing step0 prompt, FP8 KV) ===")
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--XHToken--Spark-X2.5-4B/snapshots/0bcb35678590218655dff3765b9e61c83b35e9c4"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            throw XCTSkip("Spark-X2.5-4B snapshot not found")
+        }
+        // Byte-exact prompt from the failing live run's step0 dump, read at runtime so
+        // the tag-bearing text never has to be retyped into source (the harness would
+        // parse a retyped fragment as a live tool call). Strips the turn-meta header
+        // line and the blank separator; everything after is the exact prompt bytes.
+        let dumpPath = "/Users/derekparris/Downloads/DynaMoePromptDumps/prompt-step0-2026-10-03T18-38-14Z.txt"
+        guard let dumpRaw = try? String(contentsOfFile: dumpPath, encoding: .utf8),
+              let firstNl = dumpRaw.firstIndex(of: "\n") else {
+            throw XCTSkip("Prompt dump not found: \(dumpPath)")
+        }
+        var promptStart = dumpRaw.index(after: firstNl)
+        while promptStart < dumpRaw.endIndex, dumpRaw[promptStart] == "\n" {
+            promptStart = dumpRaw.index(after: promptStart)
+        }
+        let appPrompt = String(dumpRaw[promptStart...])
+
+        let engine = try DynaMoeEngine(filePath: snapshotDir)
+        let summary = try engine.getSummary()
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let address = UInt(shard.baseAddress)
+            guard let ptr = UnsafeMutableRawPointer(bitPattern: address) else { continue }
+            let len = Int(shard.length)
+            if let buf = device.makeBuffer(bytesNoCopy: ptr, length: len, options: .storageModeShared, deallocator: nil) {
+                buffers[shard.index] = buf
+            }
+        }
+
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+
+        guard let cmdQueue = device.makeCommandQueue() else {
+            XCTFail("No Metal command queue")
+            return
+        }
+
+        let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir))
+        let cachedLayers = inference.buildCachedLayers(summary: summary, config: config, targetLayerCount: 36)
+
+        let hiddenDim = config?.hiddenSize ?? 2560
+        let intermediateDim = config?.intermediateSize ?? 10240
+        let vocabSize = config?.vocabSize ?? 131072
+        let numHeads: UInt32 = UInt32(config?.numAttentionHeads ?? 16)
+        let numKvHeads: UInt32 = UInt32(config?.numKeyValueHeads ?? 4)
+        let headDim: UInt32 = UInt32(config?.headDim ?? 256)
+        let kvStride = numKvHeads * headDim
+
+        // App agent-turn tool registry: the core set (web_fetch ships core) plus
+        // web_search loaded at send time by beginAgentSearchGuard — the exact set
+        // the failing run's prompt advertised and registered into the grammar mask.
+        let harness = AgentHarness.shared
+        harness.resetLoadedToolsToCore()
+        try harness.loadTool(named: "web_search")
+        defer {
+            harness.resetLoadedToolsToCore()
+            _ = try? harness.loadTool(named: "web_search")
+        }
+        let registeredNames = harness.availableToolDefinitions.map { $0.function.name }.sorted()
+        print("DIAG registered tools: \(registeredNames.joined(separator: ","))")
+
+        let hBufA = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let hBufB = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let xNorm1Buf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let xNorm2Buf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let qGateBuf = device.makeBuffer(length: Int(numHeads * headDim) * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let kVecBuf = device.makeBuffer(length: Int(kvStride) * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let vVecBuf = device.makeBuffer(length: Int(kvStride) * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let bVecBuf = device.makeBuffer(length: Int(numHeads) * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let attnCtxBuf = device.makeBuffer(length: Int(numHeads * headDim) * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let attnOutBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let hMidBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let interBuf = device.makeBuffer(length: intermediateDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let hMlpBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let xFinalBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let logitsBuf = device.makeBuffer(length: vocabSize * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let singleTokenBuf = device.makeBuffer(length: 4, options: .storageModeShared)!
+
+        func dispatchLinearLocal(
+            enc: MTLComputeCommandEncoder,
+            weight: TensorMetadata?,
+            inBuf: MTLBuffer,
+            outBuf: MTLBuffer,
+            inDim: UInt32,
+            outDim: UInt32,
+            weightOffsetAdd: UInt64 = 0
+        ) {
+            guard let w = weight, let wRaw = buffers[w.shardIndex] else { return }
+            var wOff = w.offsetStart + weightOffsetAdd
+            var inD = inDim
+            var outD = outDim
+            if let bSimdPipe = inference.bf16GemvSimdPipeline {
+                enc.setComputePipelineState(bSimdPipe)
+                enc.setBuffer(wRaw, offset: 0, index: 0)
+                enc.setBuffer(inBuf, offset: 0, index: 1)
+                enc.setBuffer(outBuf, offset: 0, index: 2)
+                enc.setBytes(&wOff, length: 8, index: 3)
+                enc.setBytes(&inD, length: 4, index: 4)
+                enc.setBytes(&outD, length: 4, index: 5)
+                enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            }
+            enc.memoryBarrier(scope: .buffers)
+        }
+
+        let embedWeight = summary.tensors.first { $0.name.contains("embedding") && $0.name.hasSuffix(".weight") }!
+        let normTensor = summary.tensors.first { $0.name == "model.norm.weight" }!
+        let lmHeadTensor = summary.tensors.first { $0.name == "lm_head.weight" } ?? embedWeight
+
+        let embedPipe = inference.embedPipeline!
+        let rmsPipe = inference.rmsnormPipeline!
+        let ropePipe = inference.ropePipeline!
+
+        func runTokenForward(tokenId: UInt32, step: UInt32, computeLogits: Bool) {
+            let kCache = KVCacheManager.shared.kCacheBuffer!
+            let vCache = KVCacheManager.shared.vCacheBuffer!
+            let kScale = KVCacheManager.shared.kScaleBuffer!
+            let vScale = KVCacheManager.shared.vScaleBuffer!
+            let maxSeq = KVCacheManager.shared.allocatedSeqLen
+
+            var curH = hBufA
+            var nxtH = hBufB
+
+            let embedCmd = cmdQueue.makeCommandBuffer()!
+            let embedEnc = embedCmd.makeComputeCommandEncoder()!
+            singleTokenBuf.contents().bindMemory(to: UInt32.self, capacity: 1)[0] = tokenId
+            var wOff = embedWeight.offsetStart
+            var hDimVal = UInt32(hiddenDim)
+            var tokCount: UInt32 = 1
+            embedEnc.setComputePipelineState(embedPipe)
+            embedEnc.setBuffer(buffers[embedWeight.shardIndex]!, offset: 0, index: 0)
+            embedEnc.setBuffer(singleTokenBuf, offset: 0, index: 1)
+            embedEnc.setBuffer(curH, offset: 0, index: 2)
+            embedEnc.setBytes(&wOff, length: 8, index: 3)
+            embedEnc.setBytes(&hDimVal, length: 4, index: 4)
+            embedEnc.setBytes(&tokCount, length: 4, index: 5)
+            embedEnc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+            embedEnc.endEncoding()
+            embedCmd.commit()
+
+            for l in 0..<36 {
+                let layer = cachedLayers[l]
+                let cmd = cmdQueue.makeCommandBuffer()!
+                let enc = cmd.makeComputeCommandEncoder()!
+
+                var norm1Off = layer.norm1Tensor!.offsetStart
+                var epsVal: Float = 1e-6
+                enc.setComputePipelineState(rmsPipe)
+                enc.setBuffer(curH, offset: 0, index: 0)
+                enc.setBuffer(buffers[layer.norm1Tensor!.shardIndex]!, offset: 0, index: 1)
+                enc.setBuffer(xNorm1Buf, offset: 0, index: 2)
+                enc.setBytes(&norm1Off, length: 8, index: 3)
+                enc.setBytes(&hDimVal, length: 4, index: 4)
+                enc.setBytes(&epsVal, length: 4, index: 5)
+                enc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                let fusedQKV = layer.fusedQKVTensor!
+                let currentQDim = numHeads * headDim
+                let currentKvDim = kvStride
+                dispatchLinearLocal(enc: enc, weight: fusedQKV, inBuf: xNorm1Buf, outBuf: qGateBuf, inDim: UInt32(hiddenDim), outDim: currentQDim)
+                dispatchLinearLocal(enc: enc, weight: fusedQKV, inBuf: xNorm1Buf, outBuf: kVecBuf, inDim: UInt32(hiddenDim), outDim: currentKvDim, weightOffsetAdd: UInt64(currentQDim) * UInt64(hiddenDim) * 2)
+                dispatchLinearLocal(enc: enc, weight: fusedQKV, inBuf: xNorm1Buf, outBuf: vVecBuf, inDim: UInt32(hiddenDim), outDim: currentKvDim, weightOffsetAdd: (UInt64(currentQDim) + UInt64(currentKvDim)) * UInt64(hiddenDim) * 2)
+
+                let gateProj = layer.attnGateProjTensor!
+                dispatchLinearLocal(enc: enc, weight: gateProj, inBuf: xNorm1Buf, outBuf: bVecBuf, inDim: UInt32(hiddenDim), outDim: numHeads)
+
+                var curStep = step
+                var nQ = numHeads
+                var nK = numKvHeads
+                var hD = headDim
+                var rD = UInt32(config?.effectiveRotaryDim(layerIndex: l, headDim: Int(headDim)) ?? 128)
+                var qStr = headDim
+                var kStr = headDim
+                var theta = config?.effectiveRopeTheta(layerIndex: l) ?? 10000000.0
+
+                enc.setComputePipelineState(ropePipe)
+                enc.setBuffer(qGateBuf, offset: 0, index: 0)
+                enc.setBytes(&curStep, length: 4, index: 1)
+                enc.setBytes(&nQ, length: 4, index: 2)
+                enc.setBytes(&hD, length: 4, index: 3)
+                enc.setBytes(&rD, length: 4, index: 4)
+                enc.setBytes(&qStr, length: 4, index: 5)
+                enc.setBytes(&theta, length: 4, index: 6)
+                enc.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), ropePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+
+                enc.setBuffer(kVecBuf, offset: 0, index: 0)
+                enc.setBytes(&curStep, length: 4, index: 1)
+                enc.setBytes(&nK, length: 4, index: 2)
+                enc.setBytes(&hD, length: 4, index: 3)
+                enc.setBytes(&rD, length: 4, index: 4)
+                enc.setBytes(&kStr, length: 4, index: 5)
+                enc.setBytes(&theta, length: 4, index: 6)
+                enc.dispatchThreads(MTLSize(width: Int(numKvHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numKvHeads), ropePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                let layerByteOffset = l * maxSeq * Int(kvStride) * 1
+                let scaleByteOffset = l * maxSeq * Int(numKvHeads) * 2
+                enc.setComputePipelineState(inference.storeKvCacheFP8Pipeline!)
+                enc.setBuffer(kVecBuf, offset: 0, index: 0)
+                enc.setBuffer(vVecBuf, offset: 0, index: 1)
+                enc.setBuffer(kCache, offset: layerByteOffset, index: 2)
+                enc.setBuffer(vCache, offset: layerByteOffset, index: 3)
+                enc.setBuffer(kScale, offset: scaleByteOffset, index: 4)
+                enc.setBuffer(vScale, offset: scaleByteOffset, index: 5)
+                enc.setBytes(&curStep, length: 4, index: 6)
+                enc.setBytes(&nK, length: 4, index: 7)
+                enc.setBytes(&hD, length: 4, index: 8)
+                enc.dispatchThreadgroups(MTLSize(width: Int(numKvHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                var seqLen = step + 1
+                var windowSize: UInt32 = layer.isSlidingAttention ? UInt32(config?.effectiveSlidingWindow ?? 0) : 0
+                enc.setComputePipelineState(inference.gqaHeadGateFP8Pipeline!)
+                enc.setBuffer(qGateBuf, offset: 0, index: 0)
+                enc.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                enc.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                enc.setBuffer(kScale, offset: scaleByteOffset, index: 3)
+                enc.setBuffer(vScale, offset: scaleByteOffset, index: 4)
+                enc.setBuffer(attnCtxBuf, offset: 0, index: 5)
+                enc.setBuffer(bVecBuf, offset: 0, index: 6)
+                enc.setBytes(&seqLen, length: 4, index: 7)
+                enc.setBytes(&nQ, length: 4, index: 8)
+                enc.setBytes(&nK, length: 4, index: 9)
+                enc.setBytes(&hD, length: 4, index: 10)
+                enc.setBytes(&windowSize, length: 4, index: 11)
+                enc.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), inference.gqaHeadGateFP8Pipeline!.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                dispatchLinearLocal(enc: enc, weight: layer.oProjTensor, inBuf: attnCtxBuf, outBuf: attnOutBuf, inDim: currentQDim, outDim: UInt32(hiddenDim))
+
+                enc.setComputePipelineState(inference.addPipeline!)
+                enc.setBuffer(curH, offset: 0, index: 0)
+                enc.setBuffer(attnOutBuf, offset: 0, index: 1)
+                enc.setBuffer(hMidBuf, offset: 0, index: 2)
+                enc.setBytes(&hDimVal, length: 4, index: 3)
+                enc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                var norm2Off = layer.norm2Tensor!.offsetStart
+                enc.setComputePipelineState(rmsPipe)
+                enc.setBuffer(hMidBuf, offset: 0, index: 0)
+                enc.setBuffer(buffers[layer.norm2Tensor!.shardIndex]!, offset: 0, index: 1)
+                enc.setBuffer(xNorm2Buf, offset: 0, index: 2)
+                enc.setBytes(&norm2Off, length: 8, index: 3)
+                enc.setBytes(&hDimVal, length: 4, index: 4)
+                enc.setBytes(&epsVal, length: 4, index: 5)
+                enc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                let gateW = layer.denseGateWeight!
+                let upW = layer.denseUpWeight!
+                var gWOff = gateW.offsetStart
+                var uWOff = upW.offsetStart
+                var interDimVal = UInt32(intermediateDim)
+                enc.setComputePipelineState(inference.bf16GeluGateUpSimdPipeline!)
+                enc.setBuffer(buffers[gateW.shardIndex]!, offset: 0, index: 0)
+                enc.setBuffer(buffers[upW.shardIndex]!, offset: 0, index: 1)
+                enc.setBuffer(xNorm2Buf, offset: 0, index: 2)
+                enc.setBuffer(interBuf, offset: 0, index: 3)
+                enc.setBytes(&gWOff, length: 8, index: 4)
+                enc.setBytes(&uWOff, length: 8, index: 5)
+                enc.setBytes(&hDimVal, length: 4, index: 6)
+                enc.setBytes(&interDimVal, length: 4, index: 7)
+                enc.dispatchThreadgroups(MTLSize(width: intermediateDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                enc.setComputePipelineState(inference.clearPipeline!)
+                enc.setBuffer(hMlpBuf, offset: 0, index: 0)
+                enc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                let downW = layer.denseDownWeight!
+                var dWOff = downW.offsetStart
+                var pkVal: Float = 1.0
+                enc.setComputePipelineState(inference.bf16DownSimdPipeline!)
+                enc.setBuffer(buffers[downW.shardIndex]!, offset: 0, index: 0)
+                enc.setBuffer(interBuf, offset: 0, index: 1)
+                enc.setBuffer(hMlpBuf, offset: 0, index: 2)
+                enc.setBytes(&dWOff, length: 8, index: 3)
+                enc.setBytes(&interDimVal, length: 4, index: 4)
+                enc.setBytes(&hDimVal, length: 4, index: 5)
+                enc.setBytes(&pkVal, length: 4, index: 6)
+                enc.dispatchThreadgroups(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                enc.setComputePipelineState(inference.addPipeline!)
+                enc.setBuffer(hMidBuf, offset: 0, index: 0)
+                enc.setBuffer(hMlpBuf, offset: 0, index: 1)
+                enc.setBuffer(nxtH, offset: 0, index: 2)
+                enc.setBytes(&hDimVal, length: 4, index: 3)
+                enc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+
+                enc.endEncoding()
+                cmd.commit()
+
+                let tmp = curH
+                curH = nxtH
+                nxtH = tmp
+            }
+
+            if computeLogits {
+                let finalCmd = cmdQueue.makeCommandBuffer()!
+                let finalEnc = finalCmd.makeComputeCommandEncoder()!
+                var normOff = normTensor.offsetStart
+                var epsVal: Float = 1e-6
+                finalEnc.setComputePipelineState(rmsPipe)
+                finalEnc.setBuffer(curH, offset: 0, index: 0)
+                finalEnc.setBuffer(buffers[normTensor.shardIndex]!, offset: 0, index: 1)
+                finalEnc.setBuffer(xFinalBuf, offset: 0, index: 2)
+                finalEnc.setBytes(&normOff, length: 8, index: 3)
+                finalEnc.setBytes(&hDimVal, length: 4, index: 4)
+                finalEnc.setBytes(&epsVal, length: 4, index: 5)
+                finalEnc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                finalEnc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                finalEnc.memoryBarrier(scope: .buffers)
+
+                dispatchLinearLocal(enc: finalEnc, weight: lmHeadTensor, inBuf: xFinalBuf, outBuf: logitsBuf, inDim: UInt32(hiddenDim), outDim: UInt32(vocabSize))
+                finalEnc.endEncoding()
+                finalCmd.commit()
+                finalCmd.waitUntilCompleted()
+            }
+        }
+
+        let tokPath = "\(snapshotDir)/tokenizer.json"
+        let tokenizer = try DynaMoeTokenizer(tokenizerPath: tokPath)
+        let promptTokens = try tokenizer.encode(text: appPrompt)
+        print("DIAG prompt token count: \(promptTokens.count) (dump meta said 3203)")
+        let liveLogPath = "/tmp/spark_agent_diag_live.log"
+        try? "spark agent tool-call emission diagnostic\n".write(toFile: liveLogPath, atomically: true, encoding: .utf8)
+        let liveHandle = FileHandle(forWritingAtPath: liveLogPath)
+        liveHandle?.seekToEndOfFile()
+        func live(_ line: String) {
+            liveHandle?.write(Data((line + "\n").utf8))
+        }
+        live("DIAG prompt token count: \(promptTokens.count) (dump meta said 3203)")
+
+        let promptCount = promptTokens.count - 1
+
+        func prefill() {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            for step in 0..<promptCount {
+                runTokenForward(tokenId: promptTokens[step], step: UInt32(step), computeLogits: false)
+                if (step + 1) % 500 == 0 {
+                    let line = String(format: "DIAG prefill progress: %d/%d tokens, %.1f s elapsed", step + 1, promptCount, CFAbsoluteTimeGetCurrent() - t0)
+                    print(line)
+                    live(line)
+                }
+            }
+            print(String(format: "DIAG prefill: %d tokens in %.1f s", promptCount, CFAbsoluteTimeGetCurrent() - t0))
+        }
+
+        func runDecodePass(label: String, temperature: Float, topPVal: Float, minPVal: Float, topKVal: Int, repPenVal: Float) {
+            KVCacheManager.shared.reset(
+                device: device,
+                config: config,
+                actualLayers: 36,
+                totalLoops: 1,
+                numKvHeads: Int(numKvHeads),
+                headDim: Int(headDim),
+                maxSeqLen: 6144,
+                precision: .fp8
+            )
+            prefill()
+            let grammarToken = GrammarConstrainedSampler.shared.beginGeneration()
+            var contextTokens = promptTokens
+            var generatedTokenIds: [UInt32] = []
+            var accumulatedDecodedText = ""
+            var lastGrammarState = GrammarConstrainedSampler.shared.currentState
+            var genToken = promptTokens.last!
+            var currentStepLocal = UInt32(promptCount)
+            let genCap = 800
+            let passStart = CFAbsoluteTimeGetCurrent()
+            for genStep in 0..<genCap {
+                runTokenForward(tokenId: genToken, step: currentStepLocal, computeLogits: true)
+                currentStepLocal += 1
+                let logitsPtr = logitsBuf.contents().bindMemory(to: Float.self, capacity: vocabSize)
+                let nextToken = InferenceEngine.sampleNextToken(
+                    logits: logitsPtr,
+                    vocabSize: Int(vocabSize),
+                    contextTokens: contextTokens,
+                    temperature: temperature,
+                    topP: topPVal,
+                    minP: minPVal,
+                    topK: topKVal,
+                    repetitionPenalty: repPenVal,
+                    presencePenalty: 0.0,
+                    eosTokenIds: [1, 2],
+                    grammarMask: { maskLogits, maskVocab in
+                        GrammarConstrainedSampler.shared.updateStateAndApplyLogitMask(
+                            emittedText: accumulatedDecodedText,
+                            logits: maskLogits,
+                            vocabSize: maskVocab,
+                            tokenDecoder: { try? tokenizer.decode(ids: [$0]) },
+                            enforceStructuralTagContinuation: true,
+                            token: grammarToken
+                        )
+                    }
+                )
+                if nextToken == 1 || nextToken == 2 {
+                    live("[\(label)] EOS at gen step \(genStep)")
+                    print("[\(label)] EOS at gen step \(genStep)")
+                    break
+                }
+                generatedTokenIds.append(nextToken)
+                contextTokens.append(nextToken)
+                let fullDecoded = (try? tokenizer.decode(ids: generatedTokenIds)) ?? ""
+                var emittable = fullDecoded
+                if emittable.hasSuffix("\u{FFFD}") {
+                    emittable = String(emittable.dropLast())
+                }
+                let deltaText: String
+                if emittable.hasPrefix(accumulatedDecodedText) {
+                    deltaText = String(emittable.dropFirst(accumulatedDecodedText.count))
+                } else {
+                    deltaText = ""
+                }
+                accumulatedDecodedText = emittable
+                let tokText = (try? tokenizer.decode(ids: [nextToken])) ?? ""
+                let esc = tokText
+                    .replacingOccurrences(of: "\\", with: "\\\\")
+                    .replacingOccurrences(of: "\n", with: "\\n")
+                    .replacingOccurrences(of: "\r", with: "\\r")
+                live("[\(label)] g\(genStep) id=\(nextToken) '\(esc)'")
+                print("[\(label)] g\(genStep) id=\(nextToken) '\(esc)'")
+                if (genStep + 1) % 200 == 0 {
+                    let line = String(format: "[%@] progress: %d tokens, %.1f s", label, genStep + 1, CFAbsoluteTimeGetCurrent() - passStart)
+                    print(line)
+                    live(line)
+                }
+                if CFAbsoluteTimeGetCurrent() - passStart > 900 {
+                    live("[\(label)] per-pass time budget (900 s) exhausted - stopping pass")
+                    print("[\(label)] per-pass time budget (900 s) exhausted — stopping pass")
+                    break
+                }
+                let gs = GrammarConstrainedSampler.shared.currentState
+                if gs != lastGrammarState {
+                    let line = "[\(label)] GRAMMAR state \(lastGrammarState) -> \(gs) at g\(genStep)"
+                    print(line)
+                    live(line)
+                    lastGrammarState = gs
+                }
+                if StreamingToolParser.shared.shouldFreezeGeneration(accumulatedText: accumulatedDecodedText, deltaText: deltaText) {
+                    live("[\(label)] FREEZE FIRED at gen step \(genStep)")
+                    print("[\(label)] FREEZE FIRED at gen step \(genStep)")
+                    break
+                }
+                genToken = nextToken
+            }
+            let doneLine = String(format: "[%@] pass done: %d tokens in %.1f s", label, generatedTokenIds.count, CFAbsoluteTimeGetCurrent() - passStart)
+            print(doneLine)
+            live(doneLine)
+            live("[\(label)] emission tail: \(accumulatedDecodedText.suffix(600))")
+            let outPath = "/tmp/spark_agent_diag_\(label).txt"
+            try? accumulatedDecodedText.write(toFile: outPath, atomically: true, encoding: .utf8)
+            print("[\(label)] full emission written to \(outPath)")
+            print("[\(label)] emission head: '\(accumulatedDecodedText.prefix(400))'")
+        }
+
+        runDecodePass(label: "greedy", temperature: 0.0, topPVal: 0.9, minPVal: 0.05, topKVal: 50, repPenVal: 1.1)
+        runDecodePass(label: "sampled", temperature: 0.70, topPVal: 0.90, minPVal: 0.05, topKVal: 50, repPenVal: 1.10)
     }
 
     func testSparkVerbatimAppForward() throws {

@@ -2868,3 +2868,111 @@ hypothetical nil-config model whose logical K/V row stride
 (numKvHeads x headDim) falls below the 1024-element floor, reset()'s
 `effectiveKvStride` pad and the generation-side `kvStride` would disagree; no
 supported model is in that regime (all are >= 1024 logical strides).
+
+
+## FIX #15: UNBOUNDED LAYOUT WHITESPACE AT THE TAG-CHOICE BOUNDARY (SHIPPED)
+
+**Symptom (live, both post-FIX-#14 Spark attempts, 18:21Z + 18:38Z sessions):**
+the model thinks, closes its think block, writes its response line, opens a
+tool call... and then nothing. Tokens keep streaming at ~2 tok/s, no visible
+output appears, no step-1 dump is ever written, and no freeze ever fires. The
+persisted transcripts pin it exactly: both turns end mid-call, the last visible
+text being the tool-call opener, with 302/555 total tokens against only
+~110/200 visible ones — hundreds of tokens emitted past the opener decode to
+nothing a user can see.
+
+**Isolation (new model-gated diagnostic,
+`testSparkAgentToolCallEmissionDiagnostic`):** replays the byte-exact failing
+step-0 prompt (read at runtime from the live dump, 3203/3203 token round-trip)
+through the app-faithful FP8 decode path with the real sampler, grammar mask
+and parser-freeze wiring. BOTH passes (greedy and the assistant-profile
+sampled settings) emit a clean, well-formed web_search call and the parser
+freeze fires (g249 greedy / g88 sampled). So prompt, model emission, grammar
+mask and parser were all healthy under decode-path numerics — the app-only
+failure had to be a marginal trajectory falling into a hole the replication
+didn't visit. The transcripts supplied the hole: the ~2 tok/s crawl is the
+per-token O(vocab) tag-choice scan, i.e. the mask WAS engaged the whole time,
+and the only tokens that pass the engaged mask while rendering as nothing are
+whitespace (the response is whitespace-trimmed every frame, and the
+degenerate-cycle guard deliberately ignores units with no letters or digits).
+
+**Root cause:** `applyTagChoiceMask` exempts whitespace tokens
+unconditionally at the whitespace boundary, and its `allowed()` drops ALL
+leading whitespace from candidates, so an empty candidate is a "prefix" of
+every option. A trajectory whose top logits at the opener boundary land on
+whitespace (the app's chunked-prefill numerics differ from the decode path by
+<= 4e-4/projection, T18b — plenty to flip a near-tie) can draw whitespace
+forever: every draw keeps the prefix whitespace-only, the exemption re-arms,
+nothing is ever visible, no closer is ever typed so the parser can never
+freeze, and the loop runs to max-tokens or the user's Stop.
+
+**Fix:** the layout-whitespace allowance at a tag-choice boundary is now
+bounded to two characters (one generous newline — the canonical format uses
+exactly one). Past the allowance, pure-whitespace tokens are masked too, so
+the mask forces the next structural tag (a merged whitespace+tag token still
+passes at any time). Healthy calls are unaffected: both diagnostic passes used
+a single newline, well inside the allowance.
+
+**Test:** `testGrammarMaskBoundsWhitespaceAtTagChoiceBoundary` (pure logic,
+runs anywhere) pins fresh-boundary legality, the allowance window, the bound
+beyond it, and the same bound between a parameter closer and the next tag;
+it fails on the pre-fix mask by construction (whitespace past the boundary
+was unmasked). All six grammar-sampler tests re-run green, plus both
+tools-section prompt regressions.
+
+**Residual note:** the diagnostic's own prefill is the decode-path forward,
+not the app's chunked prefill, so the trap trajectory itself is not directly
+reproducible headlessly — the diagnosis is transcript forensics plus
+mechanism analysis, and the fix is verified structurally. Live re-run of the
+same conversation is the confirmation step. The per-token O(vocab)
+tag-choice scan (the ~2 tok/s crawl whenever the grammar engages) is a known
+cost, out of scope here.
+
+
+## FIX #16: SPARK CONTINUATION PROMPT ENDED AT THE TOOL TURN (SHIPPED)
+
+**Context:** the first live run with the FIX #15 binary was a partial success - the
+whitespace hole is closed at the boundary that mattered. Step 0 emitted a clean,
+well-formed web_search call for the first time on this prompt, the parser froze,
+the tool executed (5 results), and the FIX #12 splice machinery carried the
+pinned prefix into step 1 perfectly (prefixReused=3328, splice-vs-reencode
+IDENTICAL).
+
+**Symptom (step 1):** 21 generated tokens, then freeze with garbage. The exact
+emission: Spark's `<｜end▁of▁text｜>` added token (id 7, NOT eos id 1/2) followed by
+a FABRICATED tool-result block - it wrote the `[web_search] success / count: 5 /
+query: Kimi K3 coding capabilities comparison` header for the SECOND search it had
+planned but not run - then the parser's structural close glyphs, which froze the
+turn as a broken fragment. No actionable call, run over, garbage shown to the user.
+
+**Root cause:** `formatSparkToolResponseTurn` (the agent-loop continuation turn for
+Spark) ended at the Tool role turn's close. The Qwen and Ling equivalents both
+re-open an assistant turn (`<|im_start|>assistant`, `<role>ASSISTANT</role>`), but
+Spark's did not - the continuation prompt's last token was the Tool-turn end tag
+with no generation prompt behind it (verified byte-exact in the step-1 dump).
+Per Spark's own chat_template.jinja, after a tool turn the generation prompt must
+be added (`add_generation_prompt`): a fresh Bot turn with the think marker. With
+nothing there, the model pattern-completed the transcript instead of answering.
+
+**Fix (three parts):**
+
+1. `formatSparkToolResponseTurn` gained `includeAssistantPrefix` +
+   `thinkingEnabled` and, when the prefix is requested, appends the exact
+   generation-prompt suffix reused verbatim from the first-turn prompt builder
+   (DeepSeek-style Bot reopen + think marker; the close variant when thinking is
+   off). History embedding keeps the bare form.
+2. The agent-loop call site passes `includeAssistantPrefix: true,
+   thinkingEnabled: thinkingEnabled` (mirroring the Qwen/Ling branches).
+3. The decode loop's end-tag-in-text break now also recognizes Spark's
+   `<｜end▁of▁text｜>` (id 7 decodes visibly; without this the model could emit it
+   mid-turn and keep generating through the marker).
+
+**Test:** `testSparkToolResponseTurnReopensAssistantTurn` pins the continuation
+form (assistant reopen AFTER the Tool-turn close, think-marker variants, no
+ChatML leakage) and the bare history form. Ling/Qwen formatting tests and the
+tools-section prompt regressions re-run green.
+
+**Note:** the fabricated-result freeze path itself behaved defensively - the
+broken fragment was parsed, found non-actionable, and the run ended cleanly
+rather than executing a phantom call. The failure mode was output quality, not
+harness integrity.
