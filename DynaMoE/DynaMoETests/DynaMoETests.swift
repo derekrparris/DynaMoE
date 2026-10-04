@@ -4382,7 +4382,18 @@ final class DynaMoETests: XCTestCase {
             return XCTFail("FP16 KV cache did not allocate K buffer")
         }
         let oldKH = oldKBuf.contents().bindMemory(to: UInt16.self, capacity: oldKBuf.length / 2)
-        for i in 0..<(oldKBuf.length / 2) { oldKH[i] = UInt16(truncatingIfNeeded: 0x2A00 &+ i) }
+        // The canary must differ per ABSOLUTE element: both slot strides here
+        // (512 * 1024 and 384 * 1024 elements) are multiples of the UInt16
+        // wraparound period (65,536), so a plain `base &+ i` fill repeats
+        // identically in every slot — a relayout that reads the WRONG source
+        // slot, or uses the new stride for source offsets, could still byte-match
+        // every prefix assertion. Mixing the wrapped high index bits into the
+        // low ones breaks that aliasing while keeping the fill copyable as a
+        // single helper shared by this fill and the expectation below.
+        func kvCanary(_ i: Int) -> UInt16 {
+            UInt16(truncatingIfNeeded: i) ^ UInt16(truncatingIfNeeded: i >> 16) ^ 0x2A00
+        }
+        for i in 0..<(oldKBuf.length / 2) { oldKH[i] = kvCanary(i) }
 
         // Recompute reset's own per-slot stride: effectiveKvStride heads*dim floored
         // at 1024 (padded heads = 8, headDim 128), fp16 = one half per element.
@@ -4405,7 +4416,7 @@ final class DynaMoETests: XCTestCase {
             let newBase = slot * 384 * strideElems
             let oldBase = slot * 512 * strideElems
             for e in 0..<(pinTokens * strideElems) {
-                XCTAssertEqual(newKH[newBase + e], UInt16(truncatingIfNeeded: 0x2A00 &+ (oldBase + e)),
+                XCTAssertEqual(newKH[newBase + e], kvCanary(oldBase + e),
                                "pinned K prefix corrupted at slot \(slot), element \(e) during shrink relayout")
             }
             // Freshly zero-filled tail past the pinned prefix.

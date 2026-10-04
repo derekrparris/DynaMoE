@@ -2976,3 +2976,20 @@ tools-section prompt regressions re-run green.
 broken fragment was parsed, found non-actionable, and the run ended cleanly
 rather than executing a phantom call. The failure mode was output quality, not
 harness integrity.
+
+
+**Review hardening (PR #29, post-4c09aeb canary finding):** Copilot caught that
+`testKVCachePrefixRelayoutsOnSplicedStrideShrink`'s UInt16 canary
+(`0x2A00 &+ i`) wraps every 65,536 elements while both of that test's slot
+strides (512 x 1024 and 384 x 1024) are multiples of that period — so every slot
+carried identical bytes and the byte-exact relayout assertions would still pass
+if the restore read the wrong source slot or used the new stride for source
+offsets. The fill and expectation now share a `kvCanary` helper that XORs the
+wrapped high index bits into the low ones
+(`UInt16(i) ^ UInt16(i >> 16) ^ 0x2A00`), making each absolute element distinct
+so the regression detects wrong-source relayouts, not just reallocation and tail
+clearing. The sibling canary tests are not affected: their slot strides
+(2048/4096/8192/16384) are not wraparound multiples, and the logical-head test
+pairs its compact-layout canary with whole-buffer foreign poison
+(0xDEAD/0xBEEF), so a wrong-source copy there surfaces as poison bytes. All
+three scale/splice regressions re-run green.
