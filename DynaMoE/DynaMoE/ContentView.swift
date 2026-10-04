@@ -11766,7 +11766,7 @@ if layer.attnGateProjTensor != nil,
                 for nextToken in acceptedBatch {
                     // 5. Check EOS
                     let isLingEos = (modelConfig?.isLingModel == true) && (nextToken == 156895 || nextToken == 156892)
-                    let isSparkEos = (modelConfig?.isSparkModel == true) && (nextToken == 1 || nextToken == 2)
+                    let isSparkEos = (modelConfig?.isSparkModel == true) && (nextToken == 1 || nextToken == 2 || nextToken == 7)
                     if nextToken == eosTokenId || nextToken == 248044 || nextToken == 248046 || nextToken == 166101 || nextToken == 166102 || isLingEos || isSparkEos {
                         shouldBreak = true
                         breakReason = "eos-token(\(nextToken))"

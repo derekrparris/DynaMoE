@@ -11864,6 +11864,7 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
             embedEnc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
             embedEnc.endEncoding()
             embedCmd.commit()
+            embedCmd.waitUntilCompleted()
 
             for l in 0..<36 {
                 let layer = cachedLayers[l]
