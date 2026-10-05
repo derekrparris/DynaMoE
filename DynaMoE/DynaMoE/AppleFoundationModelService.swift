@@ -241,9 +241,13 @@ public enum AppleFoundationModelService {
     /// Formats a conversation as a plain "User:" / "Assistant:" transcript for
     /// use as context. Empty turns, excluded messages, and thinking blocks are
     /// skipped. Speaker labels older replies may carry from the pre-fix
-    /// completion-style prompting are stripped. When the conversation exceeds
-    /// `charBudget` characters the oldest turns are dropped first, but the
-    /// newest turn is always kept.
+    /// completion-style prompting are stripped. Turns are kept newest-first
+    /// while they fit within `charBudget` characters — including the newest,
+    /// so even a small positive budget cannot smuggle an arbitrarily large
+    /// recent turn past the reservation that computed it. A turn that does not
+    /// fit whole is dropped rather than truncated: a fragment cut mid-sentence
+    /// would mislead the model more than a missing turn. When nothing fits,
+    /// the transcript is empty.
     nonisolated public static func buildConversationTranscript(
         from messages: [ChatMessage],
         excludingMessageIds: Set<UUID> = [],
@@ -259,7 +263,7 @@ public enum AppleFoundationModelService {
             guard !content.isEmpty else { continue }
             let speaker = message.role == .user ? "User" : "Assistant"
             let turn = "\(speaker): \(content)"
-            if !keptTurns.isEmpty && usedChars + turn.count + 2 > charBudget { break }
+            if usedChars + turn.count + 2 > charBudget { break }
             keptTurns.append(turn)
             usedChars += turn.count + 2
         }
@@ -305,11 +309,11 @@ public enum AppleFoundationModelService {
     /// old flat 8,000-character share ignored them and pushed longer turns
     /// past the window, which surfaced as hard context-overflow errors. So
     /// history, the only flexible part, is budgeted per request: everything
-    /// else is counted first and history gets the remainder. A too-large
-    /// prompt floors the budget at zero; callers should then send no history
-    /// at all, since the transcript builder's newest-turn guarantee would add
-    /// exactly the excess that overflows. A stopgap until the compaction
-    /// feature summarizes evicted turns instead.
+    /// else is counted first and history gets the remainder. The transcript
+    /// builder counts every turn — including its newest — against the value
+    /// returned here, so an oversized prompt squeezes history smaller and
+    /// smaller without ever letting it push the turn past the window. A
+    /// stopgap until the compaction feature summarizes evicted turns instead.
     nonisolated public static func historyCharBudget(
         systemPrompt: String?,
         prompt: String,

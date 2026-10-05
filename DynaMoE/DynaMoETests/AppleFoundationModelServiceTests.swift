@@ -99,14 +99,36 @@ final class AppleFoundationModelServiceTests: XCTestCase {
         XCTAssertEqual(transcript, "User: " + String(repeating: "c", count: 50))
     }
 
-    func testTranscriptAlwaysKeepsNewestTurnEvenOverBudget() {
+    func testTranscriptKeepsNewestTurnsFirstWithinBudget() {
+        let older = makeMessage(.user, String(repeating: "a", count: 20))
+        let middle = makeMessage(.assistant, String(repeating: "b", count: 20))
+        let newer = makeMessage(.user, String(repeating: "c", count: 20))
+        // Fits exactly the two newest turns plus separators, not the third:
+        // newest turns win over older ones when the budget forces a choice,
+        // and the boundary turn at the exact remaining budget is kept.
+        let budget = ("User: ".count + 20 + 2) + ("Assistant: ".count + 20 + 2)
+        let transcript = AppleFoundationModelService.buildConversationTranscript(
+            from: [older, middle, newer],
+            excludingMessageIds: [],
+            charBudget: budget
+        )
+        XCTAssertEqual(
+            transcript,
+            "Assistant: \(String(repeating: "b", count: 20))\n\nUser: \(String(repeating: "c", count: 20))"
+        )
+    }
+
+    func testTranscriptDropsTurnsThatAloneExceedBudget() {
+        // Even the newest turn is subject to the budget: a small remainder
+        // must not smuggle an arbitrarily large recent turn past the
+        // reservation that computed it.
         let messages = [makeMessage(.user, String(repeating: "x", count: 500))]
         let transcript = AppleFoundationModelService.buildConversationTranscript(
             from: messages,
             excludingMessageIds: [],
             charBudget: 10
         )
-        XCTAssertEqual(transcript, "User: " + String(repeating: "x", count: 500))
+        XCTAssertEqual(transcript, "")
     }
 
     func testTranscriptExcludesThinkingAndSystemTurns() {
@@ -315,10 +337,14 @@ final class AppleFoundationModelServiceTests: XCTestCase {
     }
 
     func testOSCompatibilityMatchesRuntimeOS() {
-        // The build machine runs macOS 26.x, so the framework entry is offered;
-        // on a macOS 15 machine this same check would report false.
-        let os = ProcessInfo.processInfo.operatingSystemVersion
-        let expected = os.majorVersion >= 26
+        // Both halves of the property: the framework must exist at build time
+        // and the OS must be new enough at run time. A macOS 26 Mac running a
+        // binary built without the framework correctly reports false, so the
+        // expectation mirrors the same compile-time condition.
+        var expected = false
+        #if canImport(FoundationModels)
+        if #available(macOS 26.0, *) { expected = true }
+        #endif
         XCTAssertEqual(AppleFoundationModelService.isOSCompatible, expected)
     }
 }
