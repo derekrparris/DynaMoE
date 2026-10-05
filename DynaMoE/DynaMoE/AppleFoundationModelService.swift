@@ -52,6 +52,8 @@ public enum AppleFoundationModelService {
     /// The virtual registry entry for the system model. Appears at the top of
     /// the chat model picker and Settings whenever the OS can host the
     /// framework; Apple Intelligence availability is checked live at use time.
+    /// `lastModified` is a fixed epoch: the entry has no file on disk, so a
+    /// per-call Date() would make every scan look like a newly changed model.
     public static func makeDiscoveredModel() -> DiscoveredModel {
         DiscoveredModel(
             id: modelId,
@@ -65,7 +67,7 @@ public enum AppleFoundationModelService {
             architectureName: "AppleFoundationModel",
             isMoE: false,
             hasTokenizer: false,
-            lastModified: Date(),
+            lastModified: Date(timeIntervalSince1970: 0),
             quantization: nil,
             rawModelType: "apple-afm",
             supportsThinking: false
@@ -156,15 +158,19 @@ public enum AppleFoundationModelService {
             let stream = session.streamResponse(to: prompt, options: options)
             var iterator = stream.makeAsyncIterator()
             var cumulativeText = ""
+            // Cached character count. String.count walks grapheme boundaries, so
+            // computing it inside the reveal loop would rescan the whole
+            // snapshot on every tick; count each snapshot exactly once instead.
+            var cumulativeCount = 0
             var displayedText = ""
             var displayedCount = 0
             while true {
                 if Task.isCancelled { break }
                 // Reveal what has already arrived at the paced cadence before
                 // pulling the next buffered snapshot.
-                while displayedCount < cumulativeText.count {
+                while displayedCount < cumulativeCount {
                     if Task.isCancelled { break }
-                    let backlog = cumulativeText.count - displayedCount
+                    let backlog = cumulativeCount - displayedCount
                     displayedCount += min(revealStep(forBacklog: backlog), backlog)
                     displayedText = String(cumulativeText.prefix(displayedCount))
                     onPartial?(displayedText)
@@ -188,6 +194,7 @@ public enum AppleFoundationModelService {
                         onPartial?("")
                     }
                     cumulativeText = normalized
+                    cumulativeCount = normalized.count
                 } catch {
                     // Cancellation surfaces as an error from the iterator; end
                     // the reveal quietly so the caller keeps the partial text.

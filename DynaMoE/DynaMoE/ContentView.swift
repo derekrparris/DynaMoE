@@ -4463,6 +4463,14 @@ struct ContentView: View {
         let responseCeiling = maxNewTokens
         let generationStartTime = CFAbsoluteTimeGetCurrent()
 
+        // This Task is deliberately non-detached: it inherits the enclosing
+        // @MainActor (this target defaults actor isolation to MainActor), so
+        // every state write below — including inside the onPartial callback,
+        // which runs synchronously on this same task — is statically
+        // main-actor-isolated and needs no MainActor.run hops. The weights
+        // loop uses Task.detached because its per-token Metal work must not
+        // occupy the main actor; this path only suspends on the on-device
+        // model's snapshots between paced reveals, so nothing blocks here.
         generationTask = Task(priority: .userInitiated) {
             var latestPartial = ""
             var sawFirstPartial = false
@@ -4525,6 +4533,10 @@ struct ContentView: View {
                     self.sessions[sIdx].messages[mIdx].content = partialPrefix + errText
                     self.sessions[sIdx].messages[mIdx].isThinking = false
                 }
+                // The turn failed, but queued prompts must not wait on a
+                // generation that will never complete: drain exactly like the
+                // success path does.
+                self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)
                 return
             }
 

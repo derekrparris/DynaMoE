@@ -126,7 +126,9 @@ struct ChatDetailView: View {
                     Text("• 🧠 Thinking")
                 }
                 if dm.isAppleFoundationModel {
-                    Text("• 🍎")
+                    // Decorative branding glyph; the row title already says
+                    // Apple, so keep it out of the VoiceOver reading.
+                    Text("• 🍎").accessibilityHidden(true)
                 }
             }
         }
