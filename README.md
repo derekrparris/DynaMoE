@@ -225,7 +225,7 @@ DynaMoE/
 
 - [x] Add auto-update capability (Sparkle)
 - [x] MoE streaming bottleneck resolution (speed increase of over 500% compared to previous streaming speed)
-- [ ] Support Apple Foundation Models
+- [x] Support Apple Foundation Models
 - [ ] Use Apple Foundation Model (AFM) to compact conversations
 - [ ] Configurable YaRN RoPE scaling UI toggle for long-context execution up to 1M tokens.
 - [ ] UI/UX refinement
