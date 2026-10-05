@@ -150,6 +150,7 @@ public enum AppleFoundationModelService {
             let stream = session.streamResponse(to: prompt, options: options)
             var iterator = stream.makeAsyncIterator()
             var cumulativeText = ""
+            var displayedText = ""
             var displayedCount = 0
             while true {
                 if Task.isCancelled { break }
@@ -159,14 +160,28 @@ public enum AppleFoundationModelService {
                     if Task.isCancelled { break }
                     let backlog = cumulativeText.count - displayedCount
                     displayedCount += min(revealStep(forBacklog: backlog), backlog)
-                    onPartial?(String(cumulativeText.prefix(displayedCount)))
+                    displayedText = String(cumulativeText.prefix(displayedCount))
+                    onPartial?(displayedText)
                     try? await Task.sleep(nanoseconds: revealTickNanoseconds)
                 }
                 do {
                     guard let snapshot = try await iterator.next() else { break }
                     // A model that thinks it is continuing a transcript opens
                     // with speaker labels; strip any so replies read clean.
-                    cumulativeText = stripLeadingSpeakerLabel(snapshot.content)
+                    let normalized = stripLeadingSpeakerLabel(snapshot.content)
+                    // Stripping can retract text the reveal already typed out:
+                    // "Assistant" types out, then the next snapshot completes
+                    // the label as "Assistant:" and normalizes shorter. A
+                    // cursor left past characters the reply no longer has
+                    // would swallow the real reply's opening characters whole,
+                    // so when the displayed prefix is gone, clear it and start
+                    // the reveal over from the actual text.
+                    if !normalized.hasPrefix(displayedText) {
+                        displayedText = ""
+                        displayedCount = 0
+                        onPartial?("")
+                    }
+                    cumulativeText = normalized
                 } catch {
                     // Cancellation surfaces as an error from the iterator; end
                     // the reveal quietly so the caller keeps the partial text.

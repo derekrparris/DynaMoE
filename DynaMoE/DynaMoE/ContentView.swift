@@ -1613,14 +1613,21 @@ struct ContentView: View {
     /// awaited for the same reason the weights load awaits it: direct callers
     /// reach here without `switchModel`'s stop-and-wait, and releasing the shared
     /// engine, FDs, and shard mappings would fault a generation still running.
-    /// The returned task tracks readiness, just like `loadAndBridgeToMetal`'s.
+    /// The token is also rechecked after each suspension: a newer request made
+    /// while this one waits has already recorded its own session, profile, and
+    /// last-used choices at request time, so a superseded activation must stand
+    /// down rather than flip them back to the system model. The returned task
+    /// tracks readiness, just like `loadAndBridgeToMetal`'s.
     @discardableResult
     private func coordinateAppleFoundationModelActivation(of model: DiscoveredModel, sessionId targetSessionId: UUID?) -> Task<Void, Never> {
         modelLoadToken &+= 1
+        let token = modelLoadToken
         let previousLoad = modelLoadTask
         let activationTask = Task { @MainActor in
             await previousLoad?.value
+            guard self.modelLoadToken == token else { return }
             await self.awaitGenerationTeardown()
+            guard self.modelLoadToken == token else { return }
             self.activateAppleFoundationModel(model, sessionId: targetSessionId)
         }
         modelLoadTask = activationTask

@@ -12,6 +12,10 @@ import XCTest
 /// Pure-logic coverage for the Apple Foundation Model backend's helpers.
 /// Availability-dependent behavior is hardware-gated like the model snapshot
 /// tests: it verifies consistency, not that any given Mac can serve requests.
+/// MainActor-isolated like the other app-coupled suites: the service type is
+/// actor-bound under the app target's default isolation, so identity and
+/// availability tests must call it from the main actor.
+@MainActor
 final class AppleFoundationModelServiceTests: XCTestCase {
 
     // MARK: - Virtual Model Identity
