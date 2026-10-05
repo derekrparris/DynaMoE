@@ -843,19 +843,24 @@ struct ChatDetailView: View {
                                 .help("Stop generating")
                             }
                         } else {
+                            // Slash commands are backend-independent app actions
+                            // (/compact runs on the system model), so the button
+                            // must dispatch them even with no weights model
+                            // loaded instead of dying silently like a chat send.
+                            let draftIsCommand = ChatCommand.parse(promptText) != nil
                             Button(action: {
                                 let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
-                                if !trimmed.isEmpty && isModelLoaded {
+                                if !trimmed.isEmpty && (isModelLoaded || ChatCommand.parse(trimmed) != nil) {
                                     if onSendMessage(trimmed) { promptText = "" }
                                 }
                             }) {
                                 Image(systemName: "arrow.right.circle.fill")
                                     .font(.system(size: max(20, 26 * zoomManager.zoomScale)))
-                                    .foregroundColor(promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !isModelLoaded ? .secondary.opacity(0.3) : .purple)
+                                    .foregroundColor(promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (!isModelLoaded && !draftIsCommand) ? .secondary.opacity(0.3) : .purple)
                             }
                             .buttonStyle(.plain)
-                            .disabled(promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !isModelLoaded)
-                            .help(isModelLoaded ? "Send Message" : "Load a model first")
+                            .disabled(promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (!isModelLoaded && !draftIsCommand))
+                            .help(isModelLoaded || draftIsCommand ? "Send Message" : "Load a model first")
                         }
                     }
                 }

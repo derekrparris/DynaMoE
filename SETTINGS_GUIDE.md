@@ -11,6 +11,7 @@ A comprehensive, practical guide to configuring, tuning, and operating DynaMoE o
    - [Local Model Discovery](#local-model-discovery)
    - [Default & Last Used Model](#default--last-used-model)
    - [Apple Foundation Model (On-Device System Model)](#apple-foundation-model-on-device-system-model)
+   - [Conversation Compaction (`/compact`)](#conversation-compaction-compact)
    - [MoE Contiguous Binary Repackaging (Flash-MoE)](#moe-contiguous-binary-repackaging-flash-moe)
    - [Model-Specific Profiles ("Coder" & "Assistant")](#model-specific-profiles-coder--assistant)
 4. [Generation & Sampling Hyperparameters](#4-generation--sampling-hyperparameters)
@@ -106,10 +107,19 @@ On macOS 26 or later with Apple Intelligence enabled, DynaMoE surfaces Apple's b
 - **Zero-Install**: it appears as *Apple Foundation Model (On-Device)* under **System Models** in the chat model picker and in the Models settings list. Selecting it takes effect instantly — nothing is loaded from disk, so any resident weights engine is released and the working-set memory budget is freed.
 - **Availability States**: if Apple Intelligence is turned off, still downloading its model, or the Mac is ineligible, selecting the model or sending a message surfaces the exact remediation in the chat status area.
 - **Profiles Still Apply**: the Coder/Assistant profile's system prompt and temperature drive the turn (temperature is clamped to the on-device model's 0–1 range; repetition/presence penalties and Top-P/Min-P/Top-K have no system-model equivalent and are ignored).
-- **Plain Chat Only**: reasoning/thinking blocks, agent tools, JetSpec, and KV/prefix-cache acceleration are local-weights features; the system model runs as a direct conversationalist. Each turn carries as much conversation history as the system model's small context window can spare after the profile's persona and response budget — oldest turns drop first; AFM-powered summarization of long histories is planned.
+- **Plain Chat Only**: reasoning/thinking blocks, agent tools, JetSpec, and KV/prefix-cache acceleration are local-weights features; the system model runs as a direct conversationalist. Each turn carries as much conversation history as the system model's small context window can spare after the profile's persona and response budget — oldest turns drop first.
 
 > [!NOTE]
 > Token counts and tok/s shown for Apple Foundation Model turns are character-based approximations; the system API does not report per-chunk token usage.
+
+### Conversation Compaction (`/compact`)
+
+Typing `/compact` in the composer — on **any** backend, with optional extra emphasis such as `/compact keep the pread-streaming decisions` — manually summarizes and compacts the conversation using the Apple Foundation Model:
+
+- Everything older than the most recent verbatim tail is folded into two digests that persist with the conversation and are injected into every later prompt on both chat backends: a rolling **general summary** (goals, decisions, paths, commands, blockers, open threads) that merges forward at each subsequent compaction, and a **detailed recap of the most recently compacted work** at full fidelity (files, commands, errors), replaced wholesale by each new pass.
+- The history rewrite is transactional: the conversation is only replaced once both summaries exist, so an unavailable or failed on-device model leaves everything untouched — compaction never degrades into silent truncation.
+- The compacted prefix no longer matches the pinned KV state, so the next turn on a weights model pays one full re-prefill by design.
+- Compaction is manual for now; automatic context-window-aware thresholding may come later.
 
 ### MoE Contiguous Binary Repackaging (Flash-MoE)
 Sparse MoE models with hundreds of experts (e.g., Qwen 3.8 Flash Next with 512 routed experts) distribute their tensor weights across dozens of multi-gigabyte `.safetensors` shard files. During token-by-token generation under SSD streaming:

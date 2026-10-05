@@ -211,16 +211,21 @@ public enum AppleFoundationModelService {
     }
 
     /// One-shot completion with no chat-session coupling, intended for
-    /// non-interactive callers — the long-context summarization/compaction
-    /// feature will call this to compress other models' conversation history.
+    /// non-interactive callers — the conversation-compaction feature calls this
+    /// to compress history into summaries. The optional response cap is clamped
+    /// exactly like the streaming path's.
     public static func respondOnce(
         prompt: String,
         instructions: String? = nil,
-        temperature: Double? = nil
+        temperature: Double? = nil,
+        maximumResponseTokens: Int? = nil
     ) async throws -> String {
         #if canImport(FoundationModels)
         if #available(macOS 26.0, *) {
-            let options = GenerationOptions(temperature: clampTemperature(temperature))
+            let options = GenerationOptions(
+                temperature: clampTemperature(temperature),
+                maximumResponseTokens: clampMaximumResponseTokens(maximumResponseTokens)
+            )
             let session = LanguageModelSession(instructions: instructions)
             let response = try await session.respond(to: prompt, options: options)
             return response.content
@@ -234,13 +239,97 @@ public enum AppleFoundationModelService {
     /// Warms the on-device model so the first turn does not pay spin-up
     /// latency. Fire-and-forget; safe to call on every activation.
     public static func prewarm() {
-        #if canImport(FoundationModels)
+#if canImport(FoundationModels)
         if #available(macOS 26.0, *) {
             if case .ready = checkAvailability() {
                 LanguageModelSession().prewarm()
             }
         }
         #endif
+    }
+
+    // MARK: - Conversation Compaction (manual "/compact")
+
+    /// Character budget for the evicted transcript handed to the summarizer.
+    /// A summary request is one prompt plus its own response, not a chat turn,
+    /// so this is not `historyCharBudget`; it simply keeps a very long evicted
+    /// region inside the on-device session while staying large enough to lose
+    /// nothing meaningful. The transcript builder drops oldest-first when even
+    /// this is exceeded.
+    nonisolated public static let compactionTranscriptCharBudget = 6_000
+
+    /// Response budget for the rolling general summary: it must stay concise
+    /// because it is re-fed at every later compaction for its whole life.
+    nonisolated public static let compactionSummaryResponseTokens = 768
+
+    /// Response budget for the detailed recent-work recap: completeness of the
+    /// most recent work beats brevity, so this is the larger of the two.
+    nonisolated public static let compactionRecapResponseTokens = 1_024
+
+    /// Assembles the prompt for the rolling-summary pass: the previous standing
+    /// summary and the previous recap (all of which merge forward), plus the
+    /// transcript of the messages this compact is removing.
+    nonisolated public static func compactionPrompt(
+        previousSummary: String?,
+        previousRecap: String?,
+        evictedTranscript: String
+    ) -> String {
+        var blocks: [String] = []
+        let general = (previousSummary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !general.isEmpty {
+            blocks.append("Previous standing summary of everything older:\n\(general)")
+        }
+        let detail = (previousRecap ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !detail.isEmpty {
+            blocks.append("Previous detailed recap of the recently covered work:\n\(detail)")
+        }
+        let excerpt = evictedTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        blocks.append(excerpt.isEmpty
+            ? "Conversation excerpt: (the transcript came back empty)"
+            : "Conversation excerpt to fold in, oldest first:\n\(excerpt)")
+        return blocks.joined(separator: "\n\n")
+    }
+
+    /// Instructions for the rolling general summary: merge the previous
+    /// standing summary and recap with the evicted excerpt into one updated
+    /// standing context that survives the next compaction. Ordered priorities
+    /// keep what actually moves the work forward; everything else gives way.
+    nonisolated public static func compactionSummaryInstructions(focus: String?) -> String {
+        var parts: [String] = []
+        parts.append(
+            "You maintain the standing summary of a long-running developer conversation between the user and DynaMoE, an AI coding assistant. "
+                + "Merge the previous standing summary and the previous recap (if present) with the conversation excerpt into ONE updated standing summary "
+                + "that a future assistant can continue the work from. "
+                + "Prioritize, in order: the user's overall goals and current task; decisions made and their reasons; file paths, directories, and code being worked on; "
+                + "commands and configurations that mattered; errors or blockers and their current status; open threads and concrete next steps. "
+                + "Drop small talk, restatements, and anything superseded by later turns. Write compact prose with short bullet lines where lists aid scanning, "
+                + "and be precise rather than vague. Do not invent facts that are not present. Reply with the updated summary only — no preamble, no questions."
+        )
+        let cleaned = (focus ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleaned.isEmpty {
+            parts.append("Extra emphasis from the user for this compaction: \(cleaned)")
+        }
+        return parts.joined(separator: "\n\n")
+    }
+
+    /// Instructions for the detailed recent-work recap: reconstruct everything
+    /// worth keeping from the turns this compaction removes, at full fidelity —
+    /// it is what keeps the most recent work detailed while the standing
+    /// summary stays small.
+    nonisolated public static func compactionRecapInstructions(focus: String?) -> String {
+        var parts: [String] = []
+        parts.append(
+            "Reconstruct, in detail, what the user has been working on in the conversation excerpt below: the most recent work last. "
+                + "Include actual file paths, command lines, API and function names, short code snippets where they matter, exact error messages, "
+                + "configuration values, decisions taken, and which threads are left open. "
+                + "Completeness beats brevity — this recap replaces the removed messages for the immediate future of the conversation. "
+                + "Do not editorialize or invent facts that are not present. Reply with the recap only — no preamble, no questions."
+        )
+        let cleaned = (focus ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleaned.isEmpty {
+            parts.append("Extra emphasis from the user for this recap: \(cleaned)")
+        }
+        return parts.joined(separator: "\n\n")
     }
 
     // MARK: - Pure Helpers (unit tested)
@@ -324,15 +413,17 @@ public enum AppleFoundationModelService {
     nonisolated public static func historyCharBudget(
         systemPrompt: String?,
         prompt: String,
-        maximumResponseTokens: Int?
+        maximumResponseTokens: Int?,
+        compactionContext: String? = nil
     ) -> Int {
         // An open-ended request gets the framework's own default, so reserve
         // the ceiling it can still consume.
         let responseTokens = clampMaximumResponseTokens(maximumResponseTokens) ?? maxResponseTokenCeiling
         let personaChars = (systemPrompt ?? "").trimmingCharacters(in: .whitespacesAndNewlines).count
+        let compactedChars = (compactionContext ?? "").trimmingCharacters(in: .whitespacesAndNewlines).count
         // Block separators, the history header's caption slack, and estimation
         // slop live in this pad.
-        let reserved = responseTokens * 4 + personaChars + prompt.count
+        let reserved = responseTokens * 4 + personaChars + prompt.count + compactedChars
             + chatTurnRulesText.count + historyBlockHeader.count + 64
         return max(0, sessionContextChars - reserved)
     }
@@ -357,12 +448,17 @@ public enum AppleFoundationModelService {
     /// with the newest user message as the prompt is what stops that.
     nonisolated public static func buildChatTurnInstructions(
         systemPrompt: String,
-        historyTranscript: String
+        historyTranscript: String,
+        compactionContext: String? = nil
     ) -> String {
         var blocks: [String] = []
         let persona = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         if !persona.isEmpty {
             blocks.append(persona)
+        }
+        let compacted = (compactionContext ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !compacted.isEmpty {
+            blocks.append(compacted)
         }
         let history = historyTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
         if !history.isEmpty {

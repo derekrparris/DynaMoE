@@ -136,6 +136,15 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
     public var isThinkingEnabled: Bool?
     public var isAgentToolsEnabled: Bool?
     public var queuedPrompts: [QueuedPrompt]
+    /// Rolling general summary of everything a manual /compact removed from
+    /// `messages`, written by the Apple Foundation Model and merged forward at
+    /// every later compaction. Optional and back-compatible: older files
+    /// decode without it, and conversations never compacted carry nil.
+    public var rollingSummary: String?
+    /// Detailed recap of the most recent evicted work, replaced wholesale by
+    /// each /compact so recent context survives summarization at full fidelity
+    /// until the next compaction folds it into `rollingSummary`.
+    public var recentWorkDigest: String?
 
     public init(
         id: UUID = UUID(),
@@ -148,7 +157,9 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         selectedModelPath: String? = nil,
         isThinkingEnabled: Bool? = nil,
         isAgentToolsEnabled: Bool? = nil,
-        queuedPrompts: [QueuedPrompt] = []
+        queuedPrompts: [QueuedPrompt] = [],
+        rollingSummary: String? = nil,
+        recentWorkDigest: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -161,6 +172,8 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         self.isThinkingEnabled = isThinkingEnabled
         self.isAgentToolsEnabled = isAgentToolsEnabled
         self.queuedPrompts = queuedPrompts
+        self.rollingSummary = rollingSummary
+        self.recentWorkDigest = recentWorkDigest
     }
 
     enum CodingKeys: String, CodingKey {
@@ -168,6 +181,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         case selectedModelId, selectedModelName, selectedModelPath
         case isThinkingEnabled, isAgentToolsEnabled
         case queuedPrompts
+        case rollingSummary, recentWorkDigest
     }
 
     public init(from decoder: Decoder) throws {
@@ -183,6 +197,8 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         self.isThinkingEnabled = try container.decodeIfPresent(Bool.self, forKey: .isThinkingEnabled)
         self.isAgentToolsEnabled = try container.decodeIfPresent(Bool.self, forKey: .isAgentToolsEnabled)
         self.queuedPrompts = try container.decodeIfPresent([QueuedPrompt].self, forKey: .queuedPrompts) ?? []
+        self.rollingSummary = try container.decodeIfPresent(String.self, forKey: .rollingSummary)
+        self.recentWorkDigest = try container.decodeIfPresent(String.self, forKey: .recentWorkDigest)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -198,6 +214,8 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         try container.encodeIfPresent(isThinkingEnabled, forKey: .isThinkingEnabled)
         try container.encodeIfPresent(isAgentToolsEnabled, forKey: .isAgentToolsEnabled)
         try container.encode(queuedPrompts, forKey: .queuedPrompts)
+        try container.encodeIfPresent(rollingSummary, forKey: .rollingSummary)
+        try container.encodeIfPresent(recentWorkDigest, forKey: .recentWorkDigest)
     }
 }
 
@@ -223,5 +241,40 @@ public extension ChatSession {
             latest = max(latest, prompt.timestamp)
         }
         return latest
+    }
+
+    /// Trailing messages a manual compaction always keeps verbatim, so the
+    /// freshest exchanges reach the model exactly as they happened instead of
+    /// through the summary. Small on purpose: the detailed digest carries the
+    /// recently evicted work, so the tail only needs the live exchange.
+    nonisolated static let messagesKeptRecentOnCompact = 6
+
+    /// Splits history for a manual compaction: everything before the verbatim
+    /// tail is evicted into the summary, the tail is kept. A conversation with
+    /// no surplus (nothing before the tail) evicts nothing, and a short
+    /// conversation keeps everything.
+    nonisolated func compactionSplit(
+        keepingRecent: Int = ChatSession.messagesKeptRecentOnCompact
+    ) -> (evicted: [ChatMessage], kept: [ChatMessage]) {
+        guard messages.count > keepingRecent else { return ([], messages) }
+        let pivot = messages.count - keepingRecent
+        return (Array(messages[..<pivot]), Array(messages[pivot...]))
+    }
+
+    /// The compacted-context block injected into every post-compaction prompt,
+    /// for either backend: the standing general summary first, then the
+    /// detailed recap of the most recently evicted work. Nil before the first
+    /// compaction, and trimmed to nil if both digests are empty.
+    nonisolated var compactionContextBlock: String? {
+        var blocks: [String] = []
+        let general = (rollingSummary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !general.isEmpty {
+            blocks.append("Summary of this conversation's earlier history (compacted, so reply with that knowledge in mind):\n\(general)")
+        }
+        let detail = (recentWorkDigest ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !detail.isEmpty {
+            blocks.append("The most recently compacted work, kept in detail:\n\(detail)")
+        }
+        return blocks.isEmpty ? nil : blocks.joined(separator: "\n\n")
     }
 }
