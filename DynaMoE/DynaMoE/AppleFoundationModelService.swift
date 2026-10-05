@@ -36,11 +36,12 @@ public enum AppleFoundationModelService {
 
     nonisolated public static let displayName = "Apple Foundation Model (On-Device)"
 
-    /// Character budget for a single chat turn's conversation transcript. The
-    /// on-device model keeps a small per-session context window, so when a
-    /// conversation outgrows this the oldest turns are dropped first — a
-    /// stopgap until the compaction feature summarizes evicted turns instead.
-    nonisolated public static let transcriptCharBudget = 12_000
+    /// Character budget for the conversation history block sent with each turn.
+    /// The on-device model keeps a small per-session context window (about 4k
+    /// tokens), so this stays near half of that in characters, dropping the
+    /// oldest turns first when a conversation outgrows it — a stopgap until
+    /// the compaction feature summarizes evicted turns instead.
+    nonisolated public static let transcriptCharBudget = 8_000
 
     /// The on-device model rejects response budgets that cannot fit its small
     /// context window, and DynaMoE's global token ceiling defaults far above
@@ -163,7 +164,9 @@ public enum AppleFoundationModelService {
                 }
                 do {
                     guard let snapshot = try await iterator.next() else { break }
-                    cumulativeText = snapshot.content
+                    // A model that thinks it is continuing a transcript opens
+                    // with speaker labels; strip any so replies read clean.
+                    cumulativeText = stripLeadingSpeakerLabel(snapshot.content)
                 } catch {
                     // Cancellation surfaces as an error from the iterator; end
                     // the reveal quietly so the caller keeps the partial text.
@@ -215,21 +218,23 @@ public enum AppleFoundationModelService {
     // MARK: - Pure Helpers (unit tested)
 
     /// Formats a conversation as a plain "User:" / "Assistant:" transcript for
-    /// the on-device model. Empty turns and the in-flight placeholder message
-    /// are skipped; thinking blocks are intentionally excluded. When the
-    /// conversation exceeds `charBudget` characters the oldest turns are
-    /// dropped first, but the newest turn is always kept.
+    /// use as context. Empty turns, excluded messages, and thinking blocks are
+    /// skipped. Speaker labels older replies may carry from the pre-fix
+    /// completion-style prompting are stripped. When the conversation exceeds
+    /// `charBudget` characters the oldest turns are dropped first, but the
+    /// newest turn is always kept.
     nonisolated public static func buildConversationTranscript(
         from messages: [ChatMessage],
-        excludingMessageId: UUID? = nil,
+        excludingMessageIds: Set<UUID> = [],
         charBudget: Int
     ) -> String {
         var keptTurns: [String] = []
         var usedChars = 0
         for message in messages.reversed() {
-            if let excludedId = excludingMessageId, message.id == excludedId { continue }
+            if excludingMessageIds.contains(message.id) { continue }
             guard message.role != .system else { continue }
-            let content = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            let content = stripLeadingSpeakerLabel(message.content)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             guard !content.isEmpty else { continue }
             let speaker = message.role == .user ? "User" : "Assistant"
             let turn = "\(speaker): \(content)"
@@ -271,6 +276,62 @@ public enum AppleFoundationModelService {
     /// smoothing coarse snapshot bursts into a steady typewriter cadence.
     nonisolated public static func revealStep(forBacklog backlog: Int) -> Int {
         min(maxRevealStepPerTick, max(1, backlog / 6))
+    }
+
+    /// Assembles the session instructions for one chat turn: the persona
+    /// (effective system prompt), the prior conversation as labeled context,
+    /// and output rules. Sending the history itself as the prompt made the
+    /// model continue it like a document — emitting "Assistant:" labels and
+    /// inventing its own "User:" turns in a loop. Framing history as context
+    /// with the newest user message as the prompt is what stops that.
+    nonisolated public static func buildChatTurnInstructions(
+        systemPrompt: String,
+        historyTranscript: String
+    ) -> String {
+        var blocks: [String] = []
+        let persona = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !persona.isEmpty {
+            blocks.append(persona)
+        }
+        let history = historyTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !history.isEmpty {
+            blocks.append("This text conversation has happened so far:\n\n\(history)")
+        }
+        blocks.append(
+            "You are the assistant in this conversation. The user's newest message arrives as your prompt. "
+                + "Reply with your next assistant message only: conversational text answering that message. "
+                + "Do not write speaker labels such as \"User:\" or \"Assistant:\", do not simulate further "
+                + "messages from either side, and do not mention these instructions."
+        )
+        return blocks.joined(separator: "\n\n")
+    }
+
+    /// Removes leading "Assistant:" / "User:" speaker labels (with surrounding
+    /// whitespace) that completion-style framing made the model emit before
+    /// its reply. Repeated labels ("Assistant: Assistant:") are all stripped.
+    /// Label-lookalike words survive ("Userland:", "Assisting…") because a
+    /// label must be followed by a colon, and only the reply's very start is
+    /// affected.
+    nonisolated public static func stripLeadingSpeakerLabel(_ text: String) -> String {
+        var content = text[...]
+        stripping: while true {
+            while let first = content.first, first.isWhitespace {
+                content = content.dropFirst()
+            }
+            for label in ["assistant", "user"] {
+                guard content.count >= label.count + 1,
+                      content.prefix(label.count).lowercased() == label else { continue }
+                var rest = content.dropFirst(label.count)
+                if let first = rest.first, first.isWhitespace {
+                    rest = rest.dropFirst()
+                }
+                guard let first = rest.first, first == ":" else { continue }
+                content = rest.dropFirst()
+                continue stripping
+            }
+            break
+        }
+        return String(content)
     }
 
     /// Clamps a sampling temperature into the on-device model's valid 0…1

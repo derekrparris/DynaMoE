@@ -57,7 +57,7 @@ final class AppleFoundationModelServiceTests: XCTestCase {
         ]
         let transcript = AppleFoundationModelService.buildConversationTranscript(
             from: messages,
-            excludingMessageId: nil,
+            excludingMessageIds: [],
             charBudget: 10_000
         )
         XCTAssertEqual(transcript, "User: Hello\n\nAssistant: Hi there!\n\nUser: Write a haiku")
@@ -73,7 +73,7 @@ final class AppleFoundationModelServiceTests: XCTestCase {
         ]
         let transcript = AppleFoundationModelService.buildConversationTranscript(
             from: messages,
-            excludingMessageId: placeholder.id,
+            excludingMessageIds: [placeholder.id],
             charBudget: 10_000
         )
         XCTAssertEqual(transcript, "User: Question")
@@ -89,7 +89,7 @@ final class AppleFoundationModelServiceTests: XCTestCase {
         // A budget of 100 keeps the newest turn (55) but cannot fit the next (55 + 2 + 55).
         let transcript = AppleFoundationModelService.buildConversationTranscript(
             from: messages,
-            excludingMessageId: nil,
+            excludingMessageIds: [],
             charBudget: 100
         )
         XCTAssertEqual(transcript, "User: " + String(repeating: "c", count: 50))
@@ -99,7 +99,7 @@ final class AppleFoundationModelServiceTests: XCTestCase {
         let messages = [makeMessage(.user, String(repeating: "x", count: 500))]
         let transcript = AppleFoundationModelService.buildConversationTranscript(
             from: messages,
-            excludingMessageId: nil,
+            excludingMessageIds: [],
             charBudget: 10
         )
         XCTAssertEqual(transcript, "User: " + String(repeating: "x", count: 500))
@@ -112,7 +112,7 @@ final class AppleFoundationModelServiceTests: XCTestCase {
         ]
         let transcript = AppleFoundationModelService.buildConversationTranscript(
             from: messages,
-            excludingMessageId: nil,
+            excludingMessageIds: [],
             charBudget: 10_000
         )
         XCTAssertEqual(transcript, "User: Real question")
@@ -164,6 +164,54 @@ final class AppleFoundationModelServiceTests: XCTestCase {
             AppleFoundationModelService.clampMaximumResponseTokens(8192),
             AppleFoundationModelService.maxResponseTokenCeiling
         )
+    }
+
+    func testTranscriptStripsLegacySpeakerLabelsFromHistory() {
+        // Replies saved by the pre-fix completion-style prompting carry stray
+        // speaker labels; the history block must not feed them back.
+        let messages = [
+            makeMessage(.user, "hi"),
+            makeMessage(.assistant, "Assistant: Assistant: hello there!")
+        ]
+        let transcript = AppleFoundationModelService.buildConversationTranscript(
+            from: messages,
+            excludingMessageIds: [],
+            charBudget: 10_000
+        )
+        XCTAssertEqual(transcript, "User: hi\n\nAssistant: hello there!")
+    }
+
+    func testChatTurnInstructionsFrameHistoryAsContext() {
+        let instructions = AppleFoundationModelService.buildChatTurnInstructions(
+            systemPrompt: "You are DynaMoE.",
+            historyTranscript: "User: hi"
+        )
+        XCTAssertTrue(instructions.contains("You are DynaMoE."))
+        XCTAssertTrue(instructions.contains("conversation has happened so far"))
+        XCTAssertTrue(instructions.contains("User: hi"))
+        XCTAssertTrue(instructions.contains("Reply with your next assistant message only"))
+        XCTAssertTrue(instructions.contains("do not simulate further messages from either side"))
+    }
+
+    func testChatTurnInstructionsOmitEmptyBlocks() {
+        let instructions = AppleFoundationModelService.buildChatTurnInstructions(
+            systemPrompt: "   ",
+            historyTranscript: ""
+        )
+        XCTAssertFalse(instructions.contains("conversation has happened so far"))
+        XCTAssertTrue(instructions.contains("You are the assistant"))
+    }
+
+    func testStripLeadingSpeakerLabel() {
+        XCTAssertEqual(AppleFoundationModelService.stripLeadingSpeakerLabel("Assistant: hello"), "hello")
+        XCTAssertEqual(AppleFoundationModelService.stripLeadingSpeakerLabel("assistant:hello"), "hello")
+        XCTAssertEqual(AppleFoundationModelService.stripLeadingSpeakerLabel("Assistant: Assistant: hi"), "hi")
+        XCTAssertEqual(AppleFoundationModelService.stripLeadingSpeakerLabel("User: do this"), "do this")
+        XCTAssertEqual(AppleFoundationModelService.stripLeadingSpeakerLabel("  \n Assistant: hi"), "hi")
+        XCTAssertEqual(AppleFoundationModelService.stripLeadingSpeakerLabel("Plain reply"), "Plain reply")
+        XCTAssertEqual(AppleFoundationModelService.stripLeadingSpeakerLabel("Userland is a game"), "Userland is a game")
+        XCTAssertEqual(AppleFoundationModelService.stripLeadingSpeakerLabel("Assisting you today"), "Assisting you today")
+        XCTAssertEqual(AppleFoundationModelService.stripLeadingSpeakerLabel("Assistant"), "Assistant")
     }
 
     // MARK: - Availability Consistency (hardware-gated, skips nothing but

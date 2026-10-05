@@ -2431,16 +2431,25 @@ struct ContentView: View {
                 modelPath: nil,
                 currentDate: conversationDate
             ).trimmingCharacters(in: .whitespacesAndNewlines)
-            let transcript = AppleFoundationModelService.buildConversationTranscript(
+            // History travels in the session instructions as context; only the
+            // newest user message is the prompt. Feeding the speaker-labeled
+            // transcript as the prompt made the model continue it like a
+            // document — emitting "Assistant:" labels and inventing its own
+            // "User:" turns in a loop.
+            let historyTranscript = AppleFoundationModelService.buildConversationTranscript(
                 from: sessions[sessionIdx].messages,
-                excludingMessageId: assistantMsgId,
+                excludingMessageIds: [assistantMsgId, userMsg.id],
                 charBudget: AppleFoundationModelService.transcriptCharBudget
+            )
+            let afmInstructions = AppleFoundationModelService.buildChatTurnInstructions(
+                systemPrompt: afmSystemPrompt,
+                historyTranscript: historyTranscript
             )
             startAppleFoundationModelGeneration(
                 sessionId: currentSessionId,
                 messageId: assistantMsgId,
-                transcript: transcript,
-                systemPromptText: afmSystemPrompt
+                userPrompt: text,
+                instructionsText: afmInstructions
             )
             return true
         }
@@ -4370,8 +4379,8 @@ struct ContentView: View {
     private func startAppleFoundationModelGeneration(
         sessionId: UUID,
         messageId: UUID,
-        transcript: String,
-        systemPromptText: String
+        userPrompt: String,
+        instructionsText: String
     ) -> Bool {
         let availability = AppleFoundationModelService.checkAvailability()
         guard case .ready = availability else {
@@ -4421,8 +4430,8 @@ struct ContentView: View {
 
             do {
                 latestPartial = try await AppleFoundationModelService.streamChatTurn(
-                    prompt: transcript,
-                    instructions: systemPromptText.isEmpty ? nil : systemPromptText,
+                    prompt: userPrompt,
+                    instructions: instructionsText.isEmpty ? nil : instructionsText,
                     temperature: profileTemperature,
                     maximumResponseTokens: responseCeiling
                 ) { partialText in
