@@ -36,12 +36,12 @@ public enum AppleFoundationModelService {
 
     nonisolated public static let displayName = "Apple Foundation Model (On-Device)"
 
-    /// Character budget for the conversation history block sent with each turn.
-    /// The on-device model keeps a small per-session context window (about 4k
-    /// tokens), so this stays near half of that in characters, dropping the
-    /// oldest turns first when a conversation outgrows it — a stopgap until
-    /// the compaction feature summarizes evicted turns instead.
-    nonisolated public static let transcriptCharBudget = 8_000
+    /// Approximate size of one on-device session's context window, in
+    /// characters at the service's own 4-chars-per-token estimate (about 4k
+    /// tokens) and shared by everything a turn sends: persona, output rules,
+    /// history block, the newest prompt, and the response.
+    /// `historyCharBudget` derives the share of it history may use.
+    nonisolated public static let sessionContextChars = 16_000
 
     /// The on-device model rejects response budgets that cannot fit its small
     /// context window, and DynaMoE's global token ceiling defaults far above
@@ -85,9 +85,15 @@ public enum AppleFoundationModelService {
 
     /// Whether this OS can host the framework at all. Used to decide whether
     /// the virtual model entry is offered; says nothing about Apple
-    /// Intelligence enablement (`checkAvailability()` covers that).
+    /// Intelligence enablement (`checkAvailability()` covers that). Gated on
+    /// the compile-time framework check like every generation call here: a
+    /// binary built without FoundationModels must not advertise the backend
+    /// on a Mac that later runs macOS 26, when every turn would fall through
+    /// to `frameworkUnavailable`.
     nonisolated public static var isOSCompatible: Bool {
+        #if canImport(FoundationModels)
         if #available(macOS 26.0, *) { return true }
+        #endif
         return false
     }
 
@@ -293,6 +299,45 @@ public enum AppleFoundationModelService {
         min(maxRevealStepPerTick, max(1, backlog / 6))
     }
 
+    /// Character budget the conversation history block may occupy in one chat
+    /// turn's instructions. The session's window holds persona, output rules,
+    /// history, the newest prompt, and the requested response together; the
+    /// old flat 8,000-character share ignored them and pushed longer turns
+    /// past the window, which surfaced as hard context-overflow errors. So
+    /// history, the only flexible part, is budgeted per request: everything
+    /// else is counted first and history gets the remainder. A too-large
+    /// prompt floors the budget at zero; callers should then send no history
+    /// at all, since the transcript builder's newest-turn guarantee would add
+    /// exactly the excess that overflows. A stopgap until the compaction
+    /// feature summarizes evicted turns instead.
+    nonisolated public static func historyCharBudget(
+        systemPrompt: String?,
+        prompt: String,
+        maximumResponseTokens: Int?
+    ) -> Int {
+        // An open-ended request gets the framework's own default, so reserve
+        // the ceiling it can still consume.
+        let responseTokens = clampMaximumResponseTokens(maximumResponseTokens) ?? maxResponseTokenCeiling
+        let personaChars = (systemPrompt ?? "").trimmingCharacters(in: .whitespacesAndNewlines).count
+        // Block separators, the history header's caption slack, and estimation
+        // slop live in this pad.
+        let reserved = responseTokens * 4 + personaChars + prompt.count
+            + chatTurnRulesText.count + historyBlockHeader.count + 64
+        return max(0, sessionContextChars - reserved)
+    }
+
+    /// Header caption wrapping the transcript block in the chat-turn
+    /// instructions. Shared with `historyCharBudget` so its reservation always
+    /// matches the framing actually assembled.
+    nonisolated static let historyBlockHeader = "This text conversation has happened so far:"
+
+    /// The output rules appended to every chat turn's instructions. Shared with
+    /// `historyCharBudget` so reservations never drift from the real text.
+    nonisolated static let chatTurnRulesText = "You are the assistant in this conversation. The user's newest message arrives as your prompt. "
+        + "Reply with your next assistant message only: conversational text answering that message. "
+        + "Do not write speaker labels such as \"User:\" or \"Assistant:\", do not simulate further "
+        + "messages from either side, and do not mention these instructions."
+
     /// Assembles the session instructions for one chat turn: the persona
     /// (effective system prompt), the prior conversation as labeled context,
     /// and output rules. Sending the history itself as the prompt made the
@@ -310,14 +355,9 @@ public enum AppleFoundationModelService {
         }
         let history = historyTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
         if !history.isEmpty {
-            blocks.append("This text conversation has happened so far:\n\n\(history)")
+            blocks.append("\(historyBlockHeader)\n\n\(history)")
         }
-        blocks.append(
-            "You are the assistant in this conversation. The user's newest message arrives as your prompt. "
-                + "Reply with your next assistant message only: conversational text answering that message. "
-                + "Do not write speaker labels such as \"User:\" or \"Assistant:\", do not simulate further "
-                + "messages from either side, and do not mention these instructions."
-        )
+        blocks.append(chatTurnRulesText)
         return blocks.joined(separator: "\n\n")
     }
 

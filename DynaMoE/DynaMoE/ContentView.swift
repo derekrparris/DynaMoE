@@ -2467,11 +2467,21 @@ struct ContentView: View {
             // newest user message is the prompt. Feeding the speaker-labeled
             // transcript as the prompt made the model continue it like a
             // document — emitting "Assistant:" labels and inventing its own
-            // "User:" turns in a loop.
+            // "User:" turns in a loop. The slice is whatever the session's
+            // context window can spare after the persona, rules, this prompt,
+            // and the response ceiling; a zero budget means those alone fill
+            // the window, so no history is sent rather than the transcript
+            // builder's unconditional newest turn, which would be exactly
+            // the excess that overflows.
+            let afmHistoryBudget = AppleFoundationModelService.historyCharBudget(
+                systemPrompt: afmSystemPrompt,
+                prompt: text,
+                maximumResponseTokens: maxNewTokens
+            )
             let historyTranscript = AppleFoundationModelService.buildConversationTranscript(
-                from: sessions[sessionIdx].messages,
+                from: afmHistoryBudget > 0 ? sessions[sessionIdx].messages : [],
                 excludingMessageIds: [assistantMsgId, userMsg.id],
-                charBudget: AppleFoundationModelService.transcriptCharBudget
+                charBudget: afmHistoryBudget
             )
             let afmInstructions = AppleFoundationModelService.buildChatTurnInstructions(
                 systemPrompt: afmSystemPrompt,

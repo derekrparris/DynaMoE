@@ -170,6 +170,90 @@ final class AppleFoundationModelServiceTests: XCTestCase {
         )
     }
 
+    // MARK: - History Context Budget
+
+    func testHistoryBudgetReservesRoomForPromptPersonaAndResponse() {
+        let base = AppleFoundationModelService.historyCharBudget(
+            systemPrompt: "persona", prompt: "hi", maximumResponseTokens: 64
+        )
+        XCTAssertGreaterThan(base, 4_000)
+
+        let withLongerPrompt = AppleFoundationModelService.historyCharBudget(
+            systemPrompt: "persona", prompt: String(repeating: "x", count: 4_000), maximumResponseTokens: 64
+        )
+        XCTAssertGreaterThan(base, withLongerPrompt)
+
+        let withLongerPersona = AppleFoundationModelService.historyCharBudget(
+            systemPrompt: String(repeating: "p", count: 2_000), prompt: "hi", maximumResponseTokens: 64
+        )
+        XCTAssertGreaterThan(base, withLongerPersona)
+
+        let withLargerResponse = AppleFoundationModelService.historyCharBudget(
+            systemPrompt: "persona", prompt: "hi", maximumResponseTokens: 2_048
+        )
+        XCTAssertGreaterThan(base, withLargerResponse)
+    }
+
+    func testHistoryBudgetReservesResponseLikeTheStreamCall() {
+        // A request past the ceiling reserves exactly like the stream call's
+        // own clamp, and an open-ended request conservatively assumes the
+        // full ceiling.
+        XCTAssertEqual(
+            AppleFoundationModelService.historyCharBudget(
+                systemPrompt: "p", prompt: "hi", maximumResponseTokens: 65_536
+            ),
+            AppleFoundationModelService.historyCharBudget(
+                systemPrompt: "p", prompt: "hi",
+                maximumResponseTokens: AppleFoundationModelService.maxResponseTokenCeiling
+            )
+        )
+        XCTAssertEqual(
+            AppleFoundationModelService.historyCharBudget(systemPrompt: "p", prompt: "hi", maximumResponseTokens: nil),
+            AppleFoundationModelService.historyCharBudget(
+                systemPrompt: "p", prompt: "hi",
+                maximumResponseTokens: AppleFoundationModelService.maxResponseTokenCeiling
+            )
+        )
+    }
+
+    func testHistoryBudgetFloorsAtZeroForOversizedPrompts() {
+        XCTAssertEqual(
+            AppleFoundationModelService.historyCharBudget(
+                systemPrompt: nil,
+                prompt: String(repeating: "x", count: AppleFoundationModelService.sessionContextChars),
+                maximumResponseTokens: 1
+            ),
+            0
+        )
+    }
+
+    func testAssembledTurnStaysWithinSessionContext() {
+        let persona = "You are a terse assistant."
+        let prompt = String(repeating: "note ", count: 100)
+        let responseTokens = 64
+        let budget = AppleFoundationModelService.historyCharBudget(
+            systemPrompt: persona, prompt: prompt, maximumResponseTokens: responseTokens
+        )
+        XCTAssertGreaterThan(budget, 0)
+        let transcript = AppleFoundationModelService.buildConversationTranscript(
+            from: [
+                makeMessage(.user, "Long-forgotten question " + String(repeating: "?", count: 200)),
+                makeMessage(.assistant, "An older reply."),
+                makeMessage(.user, "Recent question"),
+            ],
+            excludingMessageIds: [],
+            charBudget: budget
+        )
+        XCTAssertLessThanOrEqual(transcript.count, budget)
+        let instructions = AppleFoundationModelService.buildChatTurnInstructions(
+            systemPrompt: persona, historyTranscript: transcript
+        )
+        XCTAssertLessThanOrEqual(
+            instructions.count + prompt.count,
+            AppleFoundationModelService.sessionContextChars - responseTokens * 4
+        )
+    }
+
     func testTranscriptStripsLegacySpeakerLabelsFromHistory() {
         // Replies saved by the pre-fix completion-style prompting carry stray
         // speaker labels; the history block must not feed them back.
