@@ -14,9 +14,11 @@ import Foundation
 /// trigger a command by accident.
 nonisolated public enum ChatCommand: Equatable {
     /// Summarize and compact the conversation with the Apple Foundation Model:
-    /// everything older than the recent verbatim tail is folded into a rolling
-    /// general summary plus a detailed recap of the most recently evicted work.
-    /// `focus` carries the user's optional extra instructions for the pass.
+    /// the entire history is folded into a rolling general summary plus a
+    /// detailed recap of the most recent work, the on-screen chat becomes a
+    /// blank slate with just the compaction marker, and both digests ride in
+    /// every later prompt on either backend. `focus` carries the user's
+    /// optional extra instructions for the pass.
     case compact(focus: String?)
 
     /// Every recognized command name, lowercase — the composer can render

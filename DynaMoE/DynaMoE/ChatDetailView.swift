@@ -13,6 +13,7 @@ struct ChatDetailView: View {
     @ObservedObject var localModelManager: LocalModelManager = LocalModelManager.shared
     
     var isGenerating: Bool
+    var isCompactingConversation: Bool = false
     var isStreamingOffDisk: Bool = false
     var generationSpeed: Double
     var generationTokens: Int
@@ -77,7 +78,8 @@ struct ChatDetailView: View {
     @AppStorage("dynamoe_agent_turbo_mode") private var isTurboModeEnabled: Bool = false
     @ObservedObject private var subagentManager = SubagentManager.shared
 
-    /// Ticks while the newest message streams (content or thinking grows), so the
+    /// Ticks while the newest message streams (content or thinking grows — a
+    /// chat turn, or the /compact progress bubble typing out a summary), so the
     /// scroll handlers can follow live output without diffing full strings.
     private var streamingTick: Int {
         guard let last = session?.messages.last else { return 0 }
@@ -287,6 +289,7 @@ struct ChatDetailView: View {
                                         message: message,
                                         isGenerating: isGenerating && message.id == session.messages.last?.id,
                                         isStreamingOffDisk: isStreamingOffDisk,
+                                        isCompactingConversation: isCompactingConversation,
                                         isExpanded: Binding(
                                             get: { isReasoningExpanded[message.id] ?? reasoningExpandedByDefault },
                                             set: { isReasoningExpanded[message.id] = $0 }
@@ -328,7 +331,7 @@ struct ChatDetailView: View {
                     }
                 }
                 .onChange(of: streamingTick) { _ in
-                    guard isPinnedToBottom, isGenerating else { return }
+                    guard isPinnedToBottom, isGenerating || isCompactingConversation else { return }
                     scrollAnchorTick += 1
                     DispatchQueue.main.async {
                         proxy.scrollTo(scrollAnchorTick, anchor: .bottom)
@@ -1068,6 +1071,7 @@ struct ChatMessageView: View {
     let message: ChatMessage
     var isGenerating: Bool = false
     var isStreamingOffDisk: Bool = false
+    var isCompactingConversation: Bool = false
     @Binding var isExpanded: Bool
     @State private var isCopied = false
     @State private var feedback: String? = nil
@@ -1252,11 +1256,12 @@ struct ChatMessageView: View {
                     if !displayContent.isEmpty {
                         MarkdownMessageView(
                             content: displayContent,
-                            isStreaming: isGenerating && message.isThinking == false,
+                            isStreaming: (isGenerating || isCompactingConversation) && message.isThinking == false,
                             isStreamingOffDisk: isStreamingOffDisk
                         )
-                    } else if isGenerating && !message.isThinking && !hasThinkingContent && (message.toolCalls == nil || message.toolCalls!.isEmpty) {
-                        // Only for non-thinking models during initial prefill / generation
+                    } else if (isGenerating || isCompactingConversation) && !message.isThinking && !hasThinkingContent && (message.toolCalls == nil || message.toolCalls!.isEmpty) {
+                        // Only for non-thinking models during initial prefill / generation,
+                        // or the /compact progress bubble before its first summary text
                         if let prefill = message.prefillStatus {
                             HStack(spacing: 8) {
                                 ProgressView()
@@ -1272,7 +1277,7 @@ struct ChatMessageView: View {
                         } else {
                             HStack(spacing: 8) {
                                 StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
-                                Text(isStreamingOffDisk ? "Streaming MoE experts off SSD disk..." : "Generating response...")
+                                Text(isCompactingConversation ? "Summarizing the conversation..." : (isStreamingOffDisk ? "Streaming MoE experts off SSD disk..." : "Generating response..."))
                                     .font(.system(size: 13))
                                     .foregroundColor(.secondary)
                             }

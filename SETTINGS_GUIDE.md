@@ -116,7 +116,8 @@ On macOS 26 or later with Apple Intelligence enabled, DynaMoE surfaces Apple's b
 
 Typing `/compact` in the composer — on **any** backend, with optional extra emphasis such as `/compact keep the pread-streaming decisions` — manually summarizes and compacts the conversation using the Apple Foundation Model:
 
-- Everything older than the most recent verbatim tail is folded into two digests that persist with the conversation and are injected into every later prompt on both chat backends: a rolling **general summary** (goals, decisions, paths, commands, blockers, open threads) that merges forward at each subsequent compaction, and a **detailed recap of the most recently compacted work** at full fidelity (files, commands, errors), replaced wholesale by each new pass.
+- The entire conversation is folded into two digests that persist with the session and are injected into every later prompt on both chat backends: a rolling **general summary** (goals, decisions, paths, commands, blockers, open threads) that merges forward at each subsequent compaction, and a **detailed recap of the most recently compacted work** at full fidelity (files, commands, errors), replaced wholesale by each new pass.
+- The compacted history becomes a **blank slate**: the chat shows only the compaction marker afterwards, so earlier turns vanish from the screen and the conversation continues from the digests.
 - The history rewrite is transactional: the conversation is only replaced once both summaries exist, so an unavailable or failed on-device model leaves everything untouched — compaction never degrades into silent truncation.
 - The compacted prefix no longer matches the pinned KV state, so the next turn on a weights model pays one full re-prefill by design.
 - Compaction is manual for now; automatic context-window-aware thresholding may come later.

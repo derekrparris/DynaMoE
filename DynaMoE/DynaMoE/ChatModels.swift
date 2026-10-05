@@ -243,24 +243,6 @@ public extension ChatSession {
         return latest
     }
 
-    /// Trailing messages a manual compaction always keeps verbatim, so the
-    /// freshest exchanges reach the model exactly as they happened instead of
-    /// through the summary. Small on purpose: the detailed digest carries the
-    /// recently evicted work, so the tail only needs the live exchange.
-    nonisolated static let messagesKeptRecentOnCompact = 6
-
-    /// Splits history for a manual compaction: everything before the verbatim
-    /// tail is evicted into the summary, the tail is kept. A conversation with
-    /// no surplus (nothing before the tail) evicts nothing, and a short
-    /// conversation keeps everything.
-    nonisolated func compactionSplit(
-        keepingRecent: Int = ChatSession.messagesKeptRecentOnCompact
-    ) -> (evicted: [ChatMessage], kept: [ChatMessage]) {
-        guard messages.count > keepingRecent else { return ([], messages) }
-        let pivot = messages.count - keepingRecent
-        return (Array(messages[..<pivot]), Array(messages[pivot...]))
-    }
-
     /// The compacted-context block injected into every post-compaction prompt,
     /// for either backend: the standing general summary first, then the
     /// detailed recap of the most recently evicted work. Nil before the first

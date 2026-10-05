@@ -1063,6 +1063,10 @@ struct ContentView: View {
     /// commit rewrites the conversation's message array, so normal sends are
     /// rejected until it settles — whatever interleaved would be dropped.
     @State private var isCompactingConversation: Bool = false
+    /// The conversation /compact is currently rewriting, so the progress
+    /// bubble's spinner/typewriter treatment is shown only in the chat the
+    /// user is looking at, matching how generation state is session-scoped.
+    @State private var compactingSessionId: UUID? = nil
     @State private var generatingSessionId: UUID? = nil
     /// Sessions pinned against retention while a generation unwinds or a
     /// replacement is being sent. `stopAutoregressiveGeneration` flips
@@ -1882,6 +1886,7 @@ struct ContentView: View {
                     session: activeSessionBinding,
                     promptText: $chatPromptText,
                     isGenerating: isGeneratingText && (generatingSessionId == (selectedSessionId ?? sessions.first?.id)),
+                    isCompactingConversation: isCompactingConversation && (compactingSessionId == (selectedSessionId ?? sessions.first?.id)),
                     isStreamingOffDisk: isStreamingOffDisk,
                     generationSpeed: generationSpeedTokPerSec,
                     generationTokens: generationTotalTokens,
@@ -2399,12 +2404,13 @@ struct ContentView: View {
         }
     }
 
-    /// Manual compaction via /compact. The Apple Foundation Model folds every
-    /// message before the recent verbatim tail into two digests stored on the
-    /// session: a rolling general summary that merges forward across
-    /// compactions, and a detailed recap of the most recently evicted work,
-    /// replaced wholesale each pass. Both chat backends inject that context
-    /// into every later prompt, so the conversation keeps moving with the
+    /// Manual compaction via /compact. The Apple Foundation Model folds the
+    /// entire conversation into two digests stored on the session: a rolling
+    /// general summary that merges forward across compactions, and a detailed
+    /// recap of the most recently evicted work, replaced wholesale each pass.
+    /// The committed history becomes a blank slate — only the compaction
+    /// marker remains on screen — with both digests injected into every later
+    /// prompt on either backend, so the conversation keeps moving with the
     /// essential detail intact. The general summary streams live into a
     /// progress bubble so the command is visibly working from the first
     /// moment, and the session is rewritten only after both summaries exist —
@@ -2429,10 +2435,14 @@ struct ContentView: View {
             generationStatusText = note
             return true
         }
-        let split = sessions[sessionIdx].compactionSplit()
-        let evicted = split.evicted
+        // Blank slate: every message is eligible, notices and prior compact
+        // markers included (the transcript builder skips system roles on its
+        // own, so they contribute nothing to the summaries). If nothing has
+        // been said, the transcript comes back empty and that is what "nothing
+        // to compact" keys on.
+        let evicted = sessions[sessionIdx].messages
         guard !evicted.isEmpty else {
-            let note = "ℹ️ Nothing to compact — this conversation still fits in full."
+            let note = "ℹ️ Nothing to compact — this conversation is still empty."
             sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
             generationStatusText = note
             return true
@@ -2449,6 +2459,12 @@ struct ContentView: View {
             excludingMessageIds: [],
             charBudget: AppleFoundationModelService.compactionTranscriptCharBudget
         )
+        guard !evictedTranscript.isEmpty else {
+            let note = "ℹ️ Nothing to compact — no user or assistant content to summarize yet."
+            sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
+            generationStatusText = note
+            return true
+        }
         let summaryPrompt = AppleFoundationModelService.compactionPrompt(
             previousSummary: sessions[sessionIdx].rollingSummary,
             previousRecap: sessions[sessionIdx].recentWorkDigest,
@@ -2457,26 +2473,41 @@ struct ContentView: View {
         let recapPrompt = "Conversation excerpt, oldest messages first — the most recent work last:\n\n\(evictedTranscript)"
         let summaryInstructions = AppleFoundationModelService.compactionSummaryInstructions(focus: focus)
         let recapInstructions = AppleFoundationModelService.compactionRecapInstructions(focus: focus)
-        let keptTail = split.kept
         let evictedCount = evicted.count
         // The progress bubble makes the command visible from the instant it is
-        // accepted: the general summary streams into it at the AFM chat
-        // cadence. The commit rewrite below drops it; on failure it becomes
-        // the error notice.
+        // accepted: before any summary text flows it carries the same spinning
+        // composing pill a chat turn shows during prefill, then the general
+        // summary streams into it at the AFM chat cadence. The commit rewrite
+        // below drops it; on failure it becomes the error notice.
         let progressId = UUID()
         sessions[sessionIdx].messages.append(ChatMessage(
             id: progressId,
             role: .system,
-            content: "🗂 Compacting \(evictedCount) messages via Apple Foundation Model — writing the general summary…"
+            content: "",
+            prefillStatus: "🍎 Apple Foundation Model — summarizing \(evictedCount) messages…"
         ))
         isCompactingConversation = true
+        compactingSessionId = sessionId
         generationStatusText = "🗂 Compacting \(evictedCount) messages via Apple Foundation Model…"
         Task { @MainActor in
-            defer { self.isCompactingConversation = false }
+            defer {
+                self.isCompactingConversation = false
+                self.compactingSessionId = nil
+            }
             func postToProgress(_ text: String) {
                 guard let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
                       let msgIdx = self.sessions[liveIdx].messages.firstIndex(where: { $0.id == progressId }) else { return }
+                // First visible characters retire the composing pill, exactly
+                // like a chat turn's transition from ingestion to streaming.
+                self.sessions[liveIdx].messages[msgIdx].prefillStatus = nil
                 self.sessions[liveIdx].messages[msgIdx].content = text
+            }
+            // Appends after the streamed summary instead of replacing it, so the
+            // finished general summary stays visible through the recap pass.
+            func postToProgressLatest(_ text: String) {
+                guard let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
+                      let msgIdx = self.sessions[liveIdx].messages.firstIndex(where: { $0.id == progressId }) else { return }
+                self.sessions[liveIdx].messages[msgIdx].content += text
             }
             do {
                 var lastUIWrite = 0.0
@@ -2495,7 +2526,9 @@ struct ContentView: View {
                 guard !newSummaryText.isEmpty else {
                     throw AppleFoundationModelUnavailableError(reason: "The summary came back empty.")
                 }
-                postToProgress("🗂 General summary written — capturing the detailed recap of the recent work…")
+                // Append rather than overwrite: the streamed summary stays
+                // visible while the recap pass runs.
+                postToProgressLatest("\n\n🗂 Summary written — capturing the detailed recap of the recent work…")
                 let newRecap = try await AppleFoundationModelService.respondOnce(
                     prompt: recapPrompt,
                     instructions: recapInstructions,
@@ -2512,13 +2545,14 @@ struct ContentView: View {
                 guard let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) else { return }
                 self.sessions[liveIdx].rollingSummary = newSummaryText
                 self.sessions[liveIdx].recentWorkDigest = newRecapText
-                // The snapshot tail replaces the whole array, which also drops
-                // the progress bubble and every evicted message in one write.
+                // Blank slate: the whole conversation — evicted messages and
+                // the progress bubble — is replaced by a single marker in one
+                // write; both digests carry the context from here on.
                 let marker = ChatMessage(
                     role: .system,
-                    content: "🗂 \(evictedCount) messages compacted into a rolling summary by Apple Foundation Model, keeping the latest exchange verbatim."
+                    content: "🗂 \(evictedCount) messages compacted into a rolling summary by Apple Foundation Model. The conversation continues from that summary context."
                 )
-                self.sessions[liveIdx].messages = [marker] + keptTail
+                self.sessions[liveIdx].messages = [marker]
                 // The token prefix changed: any pinned KV state for this
                 // conversation no longer matches, and reusing it would splice
                 // summaries into stale slots. One full re-prefill is the cost

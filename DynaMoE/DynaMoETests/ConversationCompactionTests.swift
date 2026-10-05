@@ -41,32 +41,6 @@ final class ConversationCompactionTests: XCTestCase {
         XCTAssertEqual(ChatCommand.names, ["/compact"])
     }
 
-    // MARK: - Evict/Keep Split
-
-    func testCompactionSplitKeepsRecentVerbatimTail() {
-        let session = ChatSession(
-            messages: (0..<10).map { makeMessage($0 % 2 == 0 ? .user : .assistant, "m\($0)") }
-        )
-        let split = session.compactionSplit()
-        XCTAssertEqual(split.evicted.count, 4)
-        XCTAssertEqual(split.kept.count, ChatSession.messagesKeptRecentOnCompact)
-        XCTAssertEqual(split.evicted.first?.content, "m0")
-        XCTAssertEqual(split.kept.first?.content, "m4")
-        XCTAssertEqual(split.kept.last?.content, "m9")
-    }
-
-    func testCompactionSplitEvictsNothingShortOfTheTail() {
-        let short = ChatSession(messages: [makeMessage(.user, "hi"), makeMessage(.assistant, "hello")])
-        XCTAssertEqual(short.compactionSplit().evicted, [])
-        XCTAssertEqual(short.compactionSplit().kept.count, 2)
-
-        let exact = ChatSession(
-            messages: (0..<ChatSession.messagesKeptRecentOnCompact).map { makeMessage(.assistant, "t\($0)") }
-        )
-        XCTAssertEqual(exact.compactionSplit().evicted, [])
-        XCTAssertEqual(exact.compactionSplit().kept.count, ChatSession.messagesKeptRecentOnCompact)
-    }
-
     // MARK: - Compaction Context Block
 
     func testCompactionContextBlockFormatsGeneralAndDetail() {
