@@ -4398,6 +4398,13 @@ struct ContentView: View {
         generationElapsedMs = 0.0
         generationSpeedTokPerSec = 0.0
         generationStatusText = "🍎 Apple Foundation Model — generating…"
+        if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }),
+           let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }) {
+            // Same plumbing the weights path uses during prefill: keeps the
+            // header pill and the in-bubble spinner lit through the on-device
+            // model's session spin-up and prompt ingestion before content flows.
+            sessions[sIdx].messages[mIdx].prefillStatus = "🍎 Apple Foundation Model — composing…"
+        }
 
         // The active profile drives temperature (clamped to the model's 0…1
         // range) and the response ceiling (clamped to its small context);
@@ -4440,6 +4447,10 @@ struct ContentView: View {
                     self.generationStatusText = "🍎 Streaming: ~\(approxTokens) tokens | \(String(format: "%.1f", tokPerSec)) tok/s"
                     if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
                        let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }) {
+                        if self.sessions[sIdx].messages[mIdx].prefillStatus != nil {
+                            // First visible characters: retire the composing pill.
+                            self.sessions[sIdx].messages[mIdx].prefillStatus = nil
+                        }
                         self.sessions[sIdx].messages[mIdx].content = partialText
                         // Keep activity fresh so retention sees the streaming turn.
                         self.sessions[sIdx].messages[mIdx].timestamp = Date()
@@ -4460,6 +4471,7 @@ struct ContentView: View {
                 if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
                    let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }) {
                     let partialPrefix = latestPartial.isEmpty ? "" : latestPartial + "\n\n"
+                    self.sessions[sIdx].messages[mIdx].prefillStatus = nil
                     self.sessions[sIdx].messages[mIdx].content = partialPrefix + errText
                     self.sessions[sIdx].messages[mIdx].isThinking = false
                 }
@@ -4488,6 +4500,7 @@ struct ContentView: View {
 
             if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
                let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }) {
+                self.sessions[sIdx].messages[mIdx].prefillStatus = nil
                 self.sessions[sIdx].messages[mIdx].content = finalText
                 self.sessions[sIdx].messages[mIdx].timestamp = Date()
                 self.sessions[sIdx].messages[mIdx].isThinking = false

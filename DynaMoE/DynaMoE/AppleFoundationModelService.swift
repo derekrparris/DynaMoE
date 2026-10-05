@@ -122,11 +122,15 @@ public enum AppleFoundationModelService {
     // MARK: - Generation (macOS 26+, gated at runtime)
 
     /// Streams one chat turn from the on-device model. `onPartial` receives the
-    /// cumulative response text so far (Foundation Models streams snapshots,
-    /// not deltas, so the latest snapshot is the whole text). Returns the final
-    /// text. Errors (guardrails, context overflow, cancellation) propagate to
-    /// the caller, which keeps any partial text already delivered through
-    /// `onPartial`.
+    /// response text revealed so far. The system API emits snapshots in coarse
+    /// bursts — whole words or phrases at a time — which for a model this fast
+    /// lands on screen as chunky jumps, so the text is instead re-revealed at a
+    /// paced typewriter cadence: every `revealTickNanoseconds` the visible
+    /// prefix advances by `revealStep(forBacklog:)` characters. The stream
+    /// buffers new snapshots while earlier text types out, so pacing never
+    /// delays the model. Returns the final full text. Errors (guardrails,
+    /// context overflow) propagate to the caller, which keeps any partial text
+    /// already delivered through `onPartial`.
     @discardableResult
     public static func streamChatTurn(
         prompt: String,
@@ -143,11 +147,29 @@ public enum AppleFoundationModelService {
             )
             let session = LanguageModelSession(instructions: instructions)
             let stream = session.streamResponse(to: prompt, options: options)
+            var iterator = stream.makeAsyncIterator()
             var cumulativeText = ""
-            for try await snapshot in stream {
-                cumulativeText = snapshot.content
-                onPartial?(cumulativeText)
+            var displayedCount = 0
+            while true {
                 if Task.isCancelled { break }
+                // Reveal what has already arrived at the paced cadence before
+                // pulling the next buffered snapshot.
+                while displayedCount < cumulativeText.count {
+                    if Task.isCancelled { break }
+                    let backlog = cumulativeText.count - displayedCount
+                    displayedCount += min(revealStep(forBacklog: backlog), backlog)
+                    onPartial?(String(cumulativeText.prefix(displayedCount)))
+                    try? await Task.sleep(nanoseconds: revealTickNanoseconds)
+                }
+                do {
+                    guard let snapshot = try await iterator.next() else { break }
+                    cumulativeText = snapshot.content
+                } catch {
+                    // Cancellation surfaces as an error from the iterator; end
+                    // the reveal quietly so the caller keeps the partial text.
+                    if Task.isCancelled { break }
+                    throw error
+                }
             }
             return cumulativeText
         }
@@ -232,6 +254,23 @@ public enum AppleFoundationModelService {
     /// the tokenizer from system-model sessions, rejecting their sends.
     nonisolated public static func sendGateAllowsSend(hasEngine: Bool, sessionUsesSystemModel: Bool) -> Bool {
         sessionUsesSystemModel || hasEngine
+    }
+
+    /// Cadence of the paced reveal, in nanoseconds. 24 ms stays comfortably
+    /// above the composer's 16 ms UI throttle while remaining gentle on the
+    /// main actor.
+    nonisolated public static let revealTickNanoseconds: UInt64 = 24_000_000
+
+    /// Cap on characters revealed per tick, so even a huge backlog after a
+    /// generation stall lands as a fast cascade instead of a single jump.
+    nonisolated public static let maxRevealStepPerTick = 120
+
+    /// Characters revealed per tick for a given backlog: one sixth of the
+    /// remaining text (minimum one, capped at `maxRevealStepPerTick`). Pacing
+    /// the reveal against the backlog tracks the model's own output rate while
+    /// smoothing coarse snapshot bursts into a steady typewriter cadence.
+    nonisolated public static func revealStep(forBacklog backlog: Int) -> Int {
+        min(maxRevealStepPerTick, max(1, backlog / 6))
     }
 
     /// Clamps a sampling temperature into the on-device model's valid 0…1

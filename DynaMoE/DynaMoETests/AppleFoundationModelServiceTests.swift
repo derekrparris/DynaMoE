@@ -136,6 +136,19 @@ final class AppleFoundationModelServiceTests: XCTestCase {
         XCTAssertFalse(AppleFoundationModelService.sendGateAllowsSend(hasEngine: false, sessionUsesSystemModel: false))
     }
 
+    func testRevealStepPacesBacklogSmoothly() {
+        // Small backlogs trickle at >= 1 char/tick; large ones cascade quickly
+        // but never dump the full backlog in a single tick.
+        XCTAssertEqual(AppleFoundationModelService.revealStep(forBacklog: 1), 1)
+        XCTAssertEqual(AppleFoundationModelService.revealStep(forBacklog: 12), 2)
+        XCTAssertEqual(AppleFoundationModelService.revealStep(forBacklog: 600), 100)
+        XCTAssertEqual(AppleFoundationModelService.revealStep(forBacklog: 720), 120)
+        XCTAssertEqual(
+            AppleFoundationModelService.revealStep(forBacklog: 500_000),
+            AppleFoundationModelService.maxRevealStepPerTick
+        )
+    }
+
     func testTemperatureIsClampedToValidRange() {
         XCTAssertEqual(AppleFoundationModelService.clampTemperature(nil), nil)
         XCTAssertEqual(AppleFoundationModelService.clampTemperature(0.3), 0.3)
