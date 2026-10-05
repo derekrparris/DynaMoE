@@ -154,9 +154,15 @@ public class LocalModelManager: ObservableObject {
                 // Surface Apple's system on-device Foundation Model as a virtual
                 // registry entry whenever the OS can host it (macOS 26+). It has no
                 // snapshot on disk; Apple Intelligence availability is checked
-                // live when the model is selected or used.
+                // live when the model is selected or used. Appended, never
+                // prepended: `discoveredModels.first` is the no-preference
+                // fallback in `getDefaultOrFirstModel()`, so a weights model
+                // must own that slot; a fresh user without a default or
+                // last-used choice should not be handed the system model, which
+                // may be unavailable. The model picker renders system models in
+                // their own leading section regardless of array position.
                 if AppleFoundationModelService.isOSCompatible {
-                    finalModels.insert(AppleFoundationModelService.makeDiscoveredModel(), at: 0)
+                    finalModels.append(AppleFoundationModelService.makeDiscoveredModel())
                 }
                 self.discoveredModels = finalModels
                 self.isScanning = false

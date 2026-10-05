@@ -1448,8 +1448,7 @@ struct ContentView: View {
     @discardableResult
     private func completeModelSwitch(to model: DiscoveredModel, sessionId targetSessionId: UUID?) -> Task<Void, Never> {
         if model.isAppleFoundationModel {
-            activateAppleFoundationModel(model, sessionId: targetSessionId)
-            return Task { }
+            return coordinateAppleFoundationModelActivation(of: model, sessionId: targetSessionId)
         }
         PrefixCacheManager.shared.invalidate()
         let loadTask = loadAndBridgeToMetal(filePath: model.snapshotPath)
@@ -1567,8 +1566,10 @@ struct ContentView: View {
 
     /// Installs the system on-device model as the active backend. Nothing loads
     /// from disk: any resident weights engine is released so the working-set
-    /// budget is not held by a backend that no longer needs it. The load task
-    /// returned by `completeModelSwitch` for this path is already complete.
+    /// budget is not held by a backend that no longer needs it. Callers must go
+    /// through `coordinateAppleFoundationModelActivation` so an in-flight
+    /// weights load cannot install over this activation afterward, and its
+    /// unguarded side effects cannot repopulate what this releases.
     private func activateAppleFoundationModel(_ model: DiscoveredModel, sessionId targetSessionId: UUID?) {
         PrefixCacheManager.shared.invalidate()
         ExpertIOThreadPool.shared.closeAllLayerFDs()
@@ -1600,6 +1601,30 @@ struct ContentView: View {
         }
         // Warm the on-device model so the first turn does not pay spin-up latency.
         AppleFoundationModelService.prewarm()
+    }
+
+    /// Serializes AFM activation against any in-flight weights load, mirroring
+    /// the `modelLoadToken` protocol two weights loads follow. Bumping the token
+    /// makes a stale load skip its guarded installs instead of installing its
+    /// engine/path over the sentinel afterwards, and draining that load task
+    /// fully before mutating keeps its unguarded side effects (ExpertIO pool
+    /// setup, working-set initialization and pre-faulting) from repopulating
+    /// resources after this activation released them. Generation teardown is
+    /// awaited for the same reason the weights load awaits it: direct callers
+    /// reach here without `switchModel`'s stop-and-wait, and releasing the shared
+    /// engine, FDs, and shard mappings would fault a generation still running.
+    /// The returned task tracks readiness, just like `loadAndBridgeToMetal`'s.
+    @discardableResult
+    private func coordinateAppleFoundationModelActivation(of model: DiscoveredModel, sessionId targetSessionId: UUID?) -> Task<Void, Never> {
+        modelLoadToken &+= 1
+        let previousLoad = modelLoadTask
+        let activationTask = Task { @MainActor in
+            await previousLoad?.value
+            await self.awaitGenerationTeardown()
+            self.activateAppleFoundationModel(model, sessionId: targetSessionId)
+        }
+        modelLoadTask = activationTask
+        return activationTask
     }
 
     // MARK: - Chat Session Persistence & Retention
@@ -13322,8 +13347,7 @@ if layer.attnGateProjTensor != nil,
         // the registry scan, or a raw path hand-off) must not attempt to mmap a
         // fake path: activate the on-device backend directly instead.
         if filePath == AppleFoundationModelService.modelPath {
-            activateAppleFoundationModel(AppleFoundationModelService.makeDiscoveredModel(), sessionId: nil)
-            return Task { }
+            return coordinateAppleFoundationModelActivation(of: AppleFoundationModelService.makeDiscoveredModel(), sessionId: nil)
         }
         self.isLoadingModel = true
         self.metalStatus = "⏳ Loading model engine & zero-copy weights..."
