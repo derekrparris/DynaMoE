@@ -10,6 +10,7 @@ A comprehensive, practical guide to configuring, tuning, and operating DynaMoE o
 3. [Models & Binary Repackaging](#3-models--binary-repackaging)
    - [Local Model Discovery](#local-model-discovery)
    - [Default & Last Used Model](#default--last-used-model)
+   - [Apple Foundation Model (On-Device System Model)](#apple-foundation-model-on-device-system-model)
    - [MoE Contiguous Binary Repackaging (Flash-MoE)](#moe-contiguous-binary-repackaging-flash-moe)
    - [Model-Specific Profiles ("Coder" & "Assistant")](#model-specific-profiles-coder--assistant)
 4. [Generation & Sampling Hyperparameters](#4-generation--sampling-hyperparameters)
@@ -97,6 +98,18 @@ Upon startup, DynaMoE automatically scans your Hugging Face cache directory (`~/
 ### Default & Last Used Model
 - **Make Default**: Setting a model as the default ensures it is selected automatically when DynaMoE launches fresh.
 - **Automatic Fallback**: If no default model is specified, DynaMoE restores the **Last Used Model** across app restarts.
+
+### Apple Foundation Model (On-Device System Model)
+
+On macOS 26 or later with Apple Intelligence enabled, DynaMoE surfaces Apple's built-in on-device Foundation Model as a first-class chat backend alongside your local weights models:
+
+- **Zero-Install**: it appears as *Apple Foundation Model (On-Device)* under **System Models** in the chat model picker and in the Models settings list. Selecting it takes effect instantly — nothing is loaded from disk, so any resident weights engine is released and the working-set memory budget is freed.
+- **Availability States**: if Apple Intelligence is turned off, still downloading its model, or the Mac is ineligible, selecting the model or sending a message surfaces the exact remediation in the chat status area.
+- **Profiles Still Apply**: the Coder/Assistant profile's system prompt and temperature drive the turn (temperature is clamped to the on-device model's 0–1 range; repetition/presence penalties and Top-P/Min-P/Top-K have no system-model equivalent and are ignored).
+- **Plain Chat Only**: reasoning/thinking blocks, agent tools, JetSpec, and KV/prefix-cache acceleration are local-weights features; the system model runs as a direct conversationalist. Each turn is assembled from the conversation transcript (roughly the most recent ~12,000 characters, oldest turns dropped first — AFM-powered summarization of long histories is planned).
+
+> [!NOTE]
+> Token counts and tok/s shown for Apple Foundation Model turns are character-based approximations; the system API does not report per-chunk token usage.
 
 ### MoE Contiguous Binary Repackaging (Flash-MoE)
 Sparse MoE models with hundreds of experts (e.g., Qwen 3.8 Flash Next with 512 routed experts) distribute their tensor weights across dozens of multi-gigabyte `.safetensors` shard files. During token-by-token generation under SSD streaming:

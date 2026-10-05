@@ -32,6 +32,8 @@ Special thanks and acknowledgement to the open-source projects and research that
 
 DynaMoE supports sparse Mixture-of-Experts, hybrid recurrent SSM/attention architectures, and dense autoregressive transformers with automatic model topology detection.
 
+On macOS 26 or later with Apple Intelligence enabled, Apple's built-in **on-device Foundation Model** is also selectable as a zero-install chat backend (plain chat; agent tools, JetSpec, thinking blocks, and KV-cache prefixing are local-weights features that do not apply). It appears in the chat model picker under **System Models**, and its service layer also exposes one-shot completions for an upcoming long-context summarization/compaction feature.
+
 **The following models have been tested:**
 
 * **Ornith 1.5 35B A3B**

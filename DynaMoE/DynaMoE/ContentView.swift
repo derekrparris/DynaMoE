@@ -1447,6 +1447,10 @@ struct ContentView: View {
     /// load task so a caller can wait for that specific model to be ready.
     @discardableResult
     private func completeModelSwitch(to model: DiscoveredModel, sessionId targetSessionId: UUID?) -> Task<Void, Never> {
+        if model.isAppleFoundationModel {
+            activateAppleFoundationModel(model, sessionId: targetSessionId)
+            return Task { }
+        }
         PrefixCacheManager.shared.invalidate()
         let loadTask = loadAndBridgeToMetal(filePath: model.snapshotPath)
         activeLoadedModelPath = model.snapshotPath
@@ -1507,7 +1511,12 @@ struct ContentView: View {
     /// settled. `activeLoadedModelPath` is not used here because it is set before
     /// a load finishes and left in place on failure, so it cannot prove usability.
     private func isEngineUsable(forPath path: String) -> Bool {
-        installedModelPath == path
+        // The system on-device model has no engine/tokenizer/summary triple: it
+        // is installed as soon as the sentinel path is the active backend.
+        if path == AppleFoundationModelService.modelPath {
+            return installedModelPath == path && !isLoadingModel
+        }
+        return installedModelPath == path
             && engine != nil
             && summary != nil
             && tokenizer != nil
@@ -1533,6 +1542,64 @@ struct ContentView: View {
             let preferredProfile = ModelProfileManager.shared.getActiveProfile(for: targetPath)
             applyProfile(preferredProfile, for: targetPath)
         }
+    }
+
+    // MARK: - Apple Foundation Model (System On-Device) Backend
+
+    /// True when the active chat backend is Apple's system on-device Foundation
+    /// Model rather than a locally loaded weights engine. `installedModelPath`
+    /// carries the sentinel path while it is active; no Rust engine, tokenizer,
+    /// Metal buffers, or KV cache exist in that state.
+    var isAppleFoundationModelActive: Bool {
+        installedModelPath == AppleFoundationModelService.modelPath
+    }
+
+    /// Whether a conversation is (or would default to) the Apple Foundation
+    /// Model. Like the weights path, a session without explicit model fields
+    /// runs against whatever backend is currently active.
+    private func sessionUsesAppleFoundationModel(_ session: ChatSession) -> Bool {
+        if session.selectedModelId == AppleFoundationModelService.modelId { return true }
+        if let path = session.selectedModelPath, !path.isEmpty {
+            return path == AppleFoundationModelService.modelPath
+        }
+        return isAppleFoundationModelActive
+    }
+
+    /// Installs the system on-device model as the active backend. Nothing loads
+    /// from disk: any resident weights engine is released so the working-set
+    /// budget is not held by a backend that no longer needs it. The load task
+    /// returned by `completeModelSwitch` for this path is already complete.
+    private func activateAppleFoundationModel(_ model: DiscoveredModel, sessionId targetSessionId: UUID?) {
+        PrefixCacheManager.shared.invalidate()
+        ExpertIOThreadPool.shared.closeAllLayerFDs()
+        WorkingSetManager.shared.releaseShardMappings()
+        engine = nil
+        tokenizer = nil
+        summary = nil
+        modelConfig = nil
+        shardBuffers = [:]
+        isLoadingModel = false
+        installedModelPath = AppleFoundationModelService.modelPath
+        activeLoadedModelPath = AppleFoundationModelService.modelPath
+        localModelManager.setLastUsedModel(id: model.id)
+        if let sid = targetSessionId,
+           let idx = sessions.firstIndex(where: { $0.id == sid }) {
+            sessions[idx].selectedModelId = model.id
+            sessions[idx].selectedModelName = model.displayName
+            sessions[idx].selectedModelPath = model.snapshotPath
+        }
+        let preferredProfile = ModelProfileManager.shared.getActiveProfile(for: model.id)
+        applyProfile(preferredProfile, for: model.id)
+        let availability = AppleFoundationModelService.checkAvailability()
+        if availability.isReady {
+            metalStatus = "✅ Apple Foundation Model ready (on-device)."
+            generationStatusText = "🍎 Apple Foundation Model active."
+        } else {
+            metalStatus = "⚠️ Apple Foundation Model: \(availability.statusText)"
+            generationStatusText = metalStatus
+        }
+        // Warm the on-device model so the first turn does not pay spin-up latency.
+        AppleFoundationModelService.prewarm()
     }
 
     // MARK: - Chat Session Persistence & Retention
@@ -1794,7 +1861,8 @@ struct ContentView: View {
                     supportsThinking: activeModelSupportsThinking,
                     isThinkingEnabled: isThinkingEnabledForActiveSession,
                     isAgentToolsEnabled: isAgentToolsEnabledForActiveSession,
-                    isModelLoaded: tokenizer != nil && summary != nil,
+                    isModelLoaded: (tokenizer != nil && summary != nil) || isAppleFoundationModelActive,
+                    isAppleFoundationModelActive: isAppleFoundationModelActive,
                     onSendMessage: { prompt in
                         handleSendMessage(prompt)
                     },
@@ -2310,18 +2378,22 @@ struct ContentView: View {
         // so a send could run on the old engine; async callers await the specific
         // load before calling here.
         guard !isLoadingModel else { return false }
+        guard let currentSessionId = explicitSessionId ?? selectedSessionId ?? sessions.first?.id else { return false }
+        guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return false }
         // Backstop for the send button's isModelLoaded gate: sending before the
         // engine is ready must not touch chat or harness state — a pre-load
         // prompt was observed to poison later sessions (garbled output even in
-        // fresh chats) until the app relaunched.
-        guard tokenizer != nil, summary != nil else {
+        // fresh chats) until the app relaunched. The Apple Foundation Model
+        // backend has no tokenizer/summary at all, so its sessions must pass
+        // this gate on the system-model exemption alone.
+        let sendSessionUsesAFM = sessionUsesAppleFoundationModel(sessions[sessionIdx])
+        let weightsEngineReady = tokenizer != nil && summary != nil
+        guard AppleFoundationModelService.sendGateAllowsSend(hasEngine: weightsEngineReady, sessionUsesSystemModel: sendSessionUsesAFM) else {
             let err = "⚠️ No model loaded — select a model in Settings (bottom left) before sending."
             generationStatusText = err
             gpuComputeOutput = err
             return false
         }
-        guard let currentSessionId = explicitSessionId ?? selectedSessionId ?? sessions.first?.id else { return false }
-        guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return false }
         
         let userMsg = ChatMessage(role: .user, content: text)
         sessions[sessionIdx].messages.append(userMsg)
@@ -2343,6 +2415,35 @@ struct ContentView: View {
         let assistantMsgId = UUID()
         let assistantMsg = ChatMessage(id: assistantMsgId, role: .assistant, content: "", thinkingContent: nil, isThinking: thinkingEnabled)
         sessions[sessionIdx].messages.append(assistantMsg)
+
+        // === Apple Foundation Model backend branch ===
+        // The system on-device model is a complete second backend: no Rust engine,
+        // tokenizer, Metal buffers, KV/prefix cache, or tool harness. Route the
+        // turn to its own generation path before any chat-template formatting,
+        // grammar, or agent machinery engages. Plain chat only in this phase.
+        if sendSessionUsesAFM {
+            let conversationDate = sessions[sessionIdx].createdAt
+            let afmSystemPrompt = ModelConfig.buildEffectiveSystemPrompt(
+                userPrompt: systemPrompt,
+                config: nil,
+                summary: nil,
+                modelName: AppleFoundationModelService.displayName,
+                modelPath: nil,
+                currentDate: conversationDate
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            let transcript = AppleFoundationModelService.buildConversationTranscript(
+                from: sessions[sessionIdx].messages,
+                excludingMessageId: assistantMsgId,
+                charBudget: AppleFoundationModelService.transcriptCharBudget
+            )
+            startAppleFoundationModelGeneration(
+                sessionId: currentSessionId,
+                messageId: assistantMsgId,
+                transcript: transcript,
+                systemPromptText: afmSystemPrompt
+            )
+            return true
+        }
 
         // Runs BEFORE the system prompt is built: beginAgentSearchGuard (re)loads
         // `web_search` into the registry, and buildSystemPrompt renders <tools> from
@@ -4251,6 +4352,154 @@ struct ContentView: View {
     /// replacement (Stop would no longer cancel it). Call from the main actor.
     private func ownsGeneration(_ id: UInt64) -> Bool {
         id == generationId
+    }
+
+    // MARK: - Apple Foundation Model (System On-Device) Generation
+
+    /// One chat turn on Apple's system on-device Foundation Model (macOS 26+,
+    /// Apple Intelligence enabled). Mirrors the UI contract of
+    /// `startAutoregressiveGeneration` — generation identity
+    /// (`ownsGeneration`), streaming message updates, stop-button cancellation,
+    /// and queued-prompt draining — without any of the weights/Metal/KV-cache
+    /// machinery. Plain chat only: no tool parsing, grammar masking, JetSpec, or
+    /// prefix caching. Token counts are character-based approximations because
+    /// the macOS 26 streaming API does not report per-chunk token usage.
+    /// Returns true once the turn is started (or its failure was recorded into
+    /// the placeholder message), matching `handleSendMessage`'s contract.
+    @discardableResult
+    private func startAppleFoundationModelGeneration(
+        sessionId: UUID,
+        messageId: UUID,
+        transcript: String,
+        systemPromptText: String
+    ) -> Bool {
+        let availability = AppleFoundationModelService.checkAvailability()
+        guard case .ready = availability else {
+            let err = "⚠️ Apple Foundation Model unavailable — \(availability.statusText)"
+            if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }),
+               let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }) {
+                sessions[sIdx].messages[mIdx].content = err
+                sessions[sIdx].messages[mIdx].isThinking = false
+            }
+            gpuComputeOutput = err
+            generationStatusText = err
+            return true
+        }
+
+        generationId &+= 1
+        let myGenerationId = generationId
+        isGeneratingText = true
+        generatingSessionId = sessionId
+        generatedStreamText = ""
+        thinkingText = ""
+        responseText = ""
+        isThinking = false
+        generationTotalTokens = 0
+        generationElapsedMs = 0.0
+        generationSpeedTokPerSec = 0.0
+        generationStatusText = "🍎 Apple Foundation Model — generating…"
+
+        // The active profile drives temperature (clamped to the model's 0…1
+        // range) and the response ceiling (clamped to its small context);
+        // penalties, Min-P, and Top-P have no on-device equivalent and are ignored.
+        let profileTemperature = Double(temperature)
+        let responseCeiling = maxNewTokens
+        let generationStartTime = CFAbsoluteTimeGetCurrent()
+
+        generationTask = Task(priority: .userInitiated) {
+            var latestPartial = ""
+            var sawFirstPartial = false
+            var firstPartialAt = 0.0
+            var lastUIUpdateTime = 0.0
+
+            do {
+                latestPartial = try await AppleFoundationModelService.streamChatTurn(
+                    prompt: transcript,
+                    instructions: systemPromptText.isEmpty ? nil : systemPromptText,
+                    temperature: profileTemperature,
+                    maximumResponseTokens: responseCeiling
+                ) { partialText in
+                    latestPartial = partialText
+                    // 60fps-throttled streaming UI updates, mirroring the weights path.
+                    let now = CFAbsoluteTimeGetCurrent()
+                    if now - lastUIUpdateTime < 0.016 { return }
+                    lastUIUpdateTime = now
+                    if !sawFirstPartial {
+                        sawFirstPartial = true
+                        firstPartialAt = now
+                    }
+                    guard self.ownsGeneration(myGenerationId) else { return }
+                    let elapsed = max(now - generationStartTime, 0.001)
+                    let approxTokens = AppleFoundationModelService.approximateTokenCount(for: partialText)
+                    let tokPerSec = Double(approxTokens) / elapsed
+                    self.generatedStreamText = partialText
+                    self.responseText = partialText
+                    self.generationTotalTokens = approxTokens
+                    self.generationElapsedMs = elapsed * 1000.0
+                    self.generationSpeedTokPerSec = tokPerSec
+                    self.generationStatusText = "🍎 Streaming: ~\(approxTokens) tokens | \(String(format: "%.1f", tokPerSec)) tok/s"
+                    if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
+                       let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }) {
+                        self.sessions[sIdx].messages[mIdx].content = partialText
+                        // Keep activity fresh so retention sees the streaming turn.
+                        self.sessions[sIdx].messages[mIdx].timestamp = Date()
+                        self.sessions[sIdx].messages[mIdx].tokenCount = approxTokens
+                        self.sessions[sIdx].messages[mIdx].tokensPerSec = tokPerSec
+                        self.sessions[sIdx].messages[mIdx].timeToFirstTokenSeconds = max(firstPartialAt - generationStartTime, 0.0)
+                    }
+                }
+            } catch {
+                // Stop-button cancellation throws out of the stream iteration;
+                // whatever partial text already streamed stays in the message.
+                if Task.isCancelled || !self.ownsGeneration(myGenerationId) { return }
+                let errText = "⚠️ Apple Foundation Model error: \(error.localizedDescription)"
+                self.isGeneratingText = false
+                self.generationTask = nil
+                self.generationStatusText = errText
+                self.gpuComputeOutput = errText
+                if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
+                   let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }) {
+                    let partialPrefix = latestPartial.isEmpty ? "" : latestPartial + "\n\n"
+                    self.sessions[sIdx].messages[mIdx].content = partialPrefix + errText
+                    self.sessions[sIdx].messages[mIdx].isThinking = false
+                }
+                return
+            }
+
+            // A cancelled or superseded task must not finalize: the replacement
+            // generation owns the UI flags and task handle now (see
+            // `ownsGeneration`). The streamed partial text already landed in the
+            // message and is intentionally preserved.
+            if Task.isCancelled || !self.ownsGeneration(myGenerationId) { return }
+
+            let finalElapsed = max(CFAbsoluteTimeGetCurrent() - generationStartTime, 0.001)
+            let finalText = latestPartial
+            let approxTokens = AppleFoundationModelService.approximateTokenCount(for: finalText)
+            let finalTokPerSec = Double(approxTokens) / finalElapsed
+
+            self.isGeneratingText = false
+            self.generationTask = nil
+            self.generatedStreamText = finalText
+            self.responseText = finalText
+            self.generationTotalTokens = approxTokens
+            self.generationElapsedMs = finalElapsed * 1000.0
+            self.generationSpeedTokPerSec = finalTokPerSec
+            self.generationStatusText = "🍎 Generated ~\(approxTokens) tokens in \(String(format: "%.2f", finalElapsed * 1000.0)) ms (\(String(format: "%.1f", finalTokPerSec)) tok/s)"
+
+            if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
+               let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }) {
+                self.sessions[sIdx].messages[mIdx].content = finalText
+                self.sessions[sIdx].messages[mIdx].timestamp = Date()
+                self.sessions[sIdx].messages[mIdx].isThinking = false
+                self.sessions[sIdx].messages[mIdx].tokenCount = approxTokens
+                self.sessions[sIdx].messages[mIdx].tokensPerSec = finalTokPerSec
+                if sawFirstPartial {
+                    self.sessions[sIdx].messages[mIdx].timeToFirstTokenSeconds = max(firstPartialAt - generationStartTime, 0.0)
+                }
+            }
+            self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)
+        }
+        return true
     }
 
     /// Builds the raw-token prompt for an agent continuation turn: the previous
@@ -13047,6 +13296,13 @@ if layer.attnGateProjTensor != nil,
     /// specific load instead of racing it; UI callers ignore the result.
     @discardableResult
     private func loadAndBridgeToMetal(filePath: String) -> Task<Void, Never> {
+        // A load request for the system-model sentinel (a session restore racing
+        // the registry scan, or a raw path hand-off) must not attempt to mmap a
+        // fake path: activate the on-device backend directly instead.
+        if filePath == AppleFoundationModelService.modelPath {
+            activateAppleFoundationModel(AppleFoundationModelService.makeDiscoveredModel(), sessionId: nil)
+            return Task { }
+        }
         self.isLoadingModel = true
         self.metalStatus = "⏳ Loading model engine & zero-copy weights..."
 

@@ -242,6 +242,18 @@ struct HelpAndSettingsGuideView: View {
                 }
             }
 
+            infoBox(title: "Apple Foundation Model (On-Device)", icon: "apple.logo") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("On macOS 26 or later with Apple Intelligence enabled, Apple's built-in on-device system model appears under System Models in the chat model picker and in the Models settings list. Selecting it is instant: nothing loads from disk, and any resident weights engine is released, freeing the working-set memory budget.")
+                        .font(.system(size: 12))
+                        .lineSpacing(2)
+
+                    Text("The active profile's system prompt and temperature drive the turn (temperature clamped to the model's 0-1 range). Agent tools, reasoning blocks, JetSpec, and KV-cache acceleration are local-weights features; the system model runs as a plain conversationalist. Very long conversations keep only the most recent history; AFM-powered summarization compaction is planned.")
+                        .font(.system(size: 12))
+                        .lineSpacing(2)
+                }
+            }
+
             Text("Model Management Features")
                 .font(.headline).bold()
 

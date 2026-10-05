@@ -27,6 +27,7 @@ struct ChatDetailView: View {
     var isThinkingEnabled: Bool = true
     var isAgentToolsEnabled: Bool = true
     var isModelLoaded: Bool = true
+    var isAppleFoundationModelActive: Bool = false
     var onSendMessage: (String) -> Bool
     var onStopGeneration: () -> Void
     var onQueuePrompt: ((String) -> Bool)? = nil
@@ -85,7 +86,9 @@ struct ChatDetailView: View {
 
     private func modelIconName(for name: String?) -> String {
         let lower = (name ?? "").lowercased()
-        if lower.contains("ornith") || lower.contains("bird") {
+        if lower.contains("apple foundation") {
+            return "apple.logo"
+        } else if lower.contains("ornith") || lower.contains("bird") {
             return "bird.fill"
         } else if lower.contains("nanbeige") {
             return "building.columns.fill"
@@ -97,6 +100,36 @@ struct ChatDetailView: View {
             return "flame.fill"
         }
         return "cube.fill"
+    }
+
+    /// One row of the model selector menu. Shared by the system-models and
+    /// Hugging Face sections so the AFM entry renders identically to a real
+    /// snapshot model (checkmark, size, capability badges).
+    private func discoveredModelMenuButton(_ dm: DiscoveredModel) -> some View {
+        let isCurrent = (session?.selectedModelId == dm.id) ||
+                        (session?.selectedModelPath == dm.snapshotPath) ||
+                        (modelName == dm.displayName) ||
+                        (session?.selectedModelName == dm.displayName)
+        return Button(action: {
+            onSelectDiscoveredModel?(dm)
+        }) {
+            HStack {
+                if isCurrent {
+                    Image(systemName: "checkmark")
+                }
+                Text(dm.displayName)
+                Text("(\(dm.formattedSize))")
+                if dm.isMoE {
+                    Text("• MoE")
+                }
+                if dm.supportsThinking {
+                    Text("• 🧠 Thinking")
+                }
+                if dm.isAppleFoundationModel {
+                    Text("• 🍎")
+                }
+            }
+        }
     }
 
     var body: some View {
@@ -505,32 +538,22 @@ struct ChatDetailView: View {
 
                         // Antigravity-Style Model Selector Menu
                         Menu {
-                            if localModelManager.discoveredModels.isEmpty {
+                            let systemModels = localModelManager.discoveredModels.filter { $0.isAppleFoundationModel }
+                            let weightsModels = localModelManager.discoveredModels.filter { !$0.isAppleFoundationModel }
+                            if !systemModels.isEmpty {
+                                Section("System Models") {
+                                    ForEach(systemModels) { dm in
+                                        discoveredModelMenuButton(dm)
+                                    }
+                                }
+                            }
+                            if weightsModels.isEmpty && systemModels.isEmpty {
                                 Text("No models found in ~/.cache/huggingface/hub")
-                            } else {
+                            }
+                            if !weightsModels.isEmpty {
                                 Section("Discovered Hugging Face Models") {
-                                    ForEach(localModelManager.discoveredModels) { dm in
-                                        let isCurrent = (session?.selectedModelId == dm.id) ||
-                                                        (session?.selectedModelPath == dm.snapshotPath) ||
-                                                        (modelName == dm.displayName) ||
-                                                        (session?.selectedModelName == dm.displayName)
-                                        Button(action: {
-                                            onSelectDiscoveredModel?(dm)
-                                        }) {
-                                            HStack {
-                                                if isCurrent {
-                                                    Image(systemName: "checkmark")
-                                                }
-                                                Text(dm.displayName)
-                                                Text("(\(dm.formattedSize))")
-                                                if dm.isMoE {
-                                                    Text("• MoE")
-                                                }
-                                                if dm.supportsThinking {
-                                                    Text("• 🧠 Thinking")
-                                                }
-                                            }
-                                        }
+                                    ForEach(weightsModels) { dm in
+                                        discoveredModelMenuButton(dm)
                                     }
                                 }
                             }
@@ -710,11 +733,14 @@ struct ChatDetailView: View {
                         }
                         .menuStyle(.borderlessButton)
                         .fixedSize()
-                        .help(isAgentToolsEnabled ? "Agent mode is enabled: Model can run shell commands, inspect, and edit files" : "Agent mode is disabled")
+                        .disabled(isAppleFoundationModelActive)
+                        .help(isAppleFoundationModelActive
+                              ? "Agent tools require a local weights model — Apple Foundation Model runs in plain chat mode"
+                              : (isAgentToolsEnabled ? "Agent mode is enabled: Model can run shell commands, inspect, and edit files" : "Agent mode is disabled"))
                         .transition(.opacity.combined(with: .scale))
 
                         // Turbo Mode (Auto-Approve) Toggle when tools are active
-                        if isAgentToolsEnabled {
+                        if isAgentToolsEnabled && !isAppleFoundationModelActive {
                             Button(action: {
                                 isTurboModeEnabled.toggle()
                             }) {
