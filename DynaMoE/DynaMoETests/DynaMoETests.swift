@@ -4162,6 +4162,356 @@ final class DynaMoETests: XCTestCase {
         XCTAssertFalse(isJetSpecEligible(jetSpecEnabled: false, hasLinearRecurrence: false, isSparkModel: false, kvPrecision: .fp16))
     }
 
+    func testKVCacheFP8ScalePrefixSurvivesSpliceRealloc() throws {
+        // Regression for the FP8 + prefix-splice degradation (Spark token-burn /
+        // Ornith word salad): reset(preservePrefixCount:) memcpy'd the pinned INT8
+        // K/V prefix across the maxSeqLen-growth reallocation but rebuilt the
+        // per-(token, head) FP8 dequant scale buffers fresh, so every restored
+        // prefix slot dequantized against scale 0 and attention over the pinned
+        // region collapsed. Scales must ride along with the K/V prefix.
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        let kvHeads = 8
+        let tokenScaleFloats = kvHeads // one half per (token, kv-head)
+
+        // Review hardening: the scale-buffer allocation is capacity-based, so the
+        // singleton can enter this test with oversized buffers from an earlier,
+        // longer allocation (other tests, or this test's own prior runs) — then the
+        // 1024 setup below would NOT rebuild and the later growth assertions would
+        // depend on leftover state. Clear both buffers so this test deterministically
+        // exercises capacity growth from 1024 to 2048 on its own buffers.
+        KVCacheManager.shared.kScaleBuffer = nil
+        KVCacheManager.shared.vScaleBuffer = nil
+
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: kvHeads, headDim: 64, maxSeqLen: 1024, precision: .fp8,
+            preservePrefixCount: 0
+        )
+        guard let oldKBuf = KVCacheManager.shared.kScaleBuffer,
+              let oldVBuf = KVCacheManager.shared.vScaleBuffer else {
+            return XCTFail("FP8 KV cache did not allocate scale buffers")
+        }
+        let oldKS = oldKBuf.contents().bindMemory(to: UInt16.self, capacity: oldKBuf.length / 2)
+        let oldVS = oldVBuf.contents().bindMemory(to: UInt16.self, capacity: oldVBuf.length / 2)
+        for i in 0..<(oldKBuf.length / 2) {
+            // Distinct nonzero bit pattern per element so a misaligned or partial
+            // copy cannot pass by luck; the decode path only needs nonzero scales.
+            oldKS[i] = UInt16(truncatingIfNeeded: 0x3C00 &+ i)
+            oldVS[i] = UInt16(truncatingIfNeeded: 0x3E00 &+ i)
+        }
+
+        let pinTokens = 512
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: kvHeads, headDim: 64, maxSeqLen: 2048, precision: .fp8,
+            preservePrefixCount: pinTokens
+        )
+        guard let newKBuf = KVCacheManager.shared.kScaleBuffer,
+              let newVBuf = KVCacheManager.shared.vScaleBuffer else {
+            return XCTFail("FP8 KV cache did not allocate scale buffers after splice reset")
+        }
+        XCTAssertEqual(KVCacheManager.shared.allocatedSeqLen, 2048)
+        if newKBuf === oldKBuf && newVBuf === oldVBuf {
+            return XCTFail("grown splice reset should have reallocated the scale buffers")
+        }
+        let newKS = newKBuf.contents().bindMemory(to: UInt16.self, capacity: newKBuf.length / 2)
+        let newVS = newVBuf.contents().bindMemory(to: UInt16.self, capacity: newVBuf.length / 2)
+
+        // Per-layer slots the preserve path restores: old layout stride
+        // oldMaxSeq * kvHeads, new layout stride 2048 * kvHeads.
+        for slot in 0..<4 {
+            let newBase = slot * 2048 * tokenScaleFloats
+            let oldBase = slot * 1024 * tokenScaleFloats
+            for t in 0..<(pinTokens * tokenScaleFloats) {
+                XCTAssertEqual(newKS[newBase + t], oldKS[oldBase + t],
+                               "kScale prefix corrupted at slot \(slot), element \(t)")
+                XCTAssertEqual(newVS[newBase + t], oldVS[oldBase + t],
+                               "vScale prefix corrupted at slot \(slot), element \(t)")
+            }
+            // Just past the restored prefix the rebuilt buffer must still be zero.
+            XCTAssertEqual(newKS[newBase + pinTokens * tokenScaleFloats], 0)
+        }
+
+        // === Retained-capacity regression (Copilot review round): capacity left over
+        // from a longer earlier conversation must not turn a stride-change relayout
+        // into an in-place overwrite. The 2048-layout buffers allocated above are
+        // deliberately kept; a fresh 1024 reset fits inside that capacity and retains
+        // them, so the follow-up spliced grow back to 2048 has sufficient capacity —
+        // the restore must still go through freshly rebuilt buffers, and later slots'
+        // source data must survive slot 1's copy (the old code wrote slot 1's
+        // 2048-stride destination over slot 2's 1024-stride source mid-loop).
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: kvHeads, headDim: 64, maxSeqLen: 1024, precision: .fp8,
+            preservePrefixCount: 0
+        )
+        XCTAssertTrue(KVCacheManager.shared.kScaleBuffer === newKBuf,
+                      "a fresh 1024 reset fits inside the retained 2048 capacity and must keep the buffer")
+        for i in 0..<(newKBuf.length / 2) {
+            newKS[i] = UInt16(truncatingIfNeeded: 0x3400 &+ i)
+            newVS[i] = UInt16(truncatingIfNeeded: 0x3600 &+ i)
+        }
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: kvHeads, headDim: 64, maxSeqLen: 2048, precision: .fp8,
+            preservePrefixCount: pinTokens
+        )
+        guard let relaidKBuf = KVCacheManager.shared.kScaleBuffer,
+              let relaidVBuf = KVCacheManager.shared.vScaleBuffer else {
+            return XCTFail("FP8 KV cache did not allocate scale buffers after retained-capacity splice reset")
+        }
+        XCTAssertTrue(relaidKBuf !== newKBuf && relaidVBuf !== newVBuf,
+                      "a stride-change splice must rebuild the scale buffers even when the old capacity was sufficient")
+        let relaidKS = relaidKBuf.contents().bindMemory(to: UInt16.self, capacity: relaidKBuf.length / 2)
+        let relaidVS = relaidVBuf.contents().bindMemory(to: UInt16.self, capacity: relaidVBuf.length / 2)
+        for slot in 0..<4 {
+            let newBase = slot * 2048 * tokenScaleFloats
+            let oldBase = slot * 1024 * tokenScaleFloats
+            for t in 0..<(pinTokens * tokenScaleFloats) {
+                XCTAssertEqual(relaidKS[newBase + t], UInt16(truncatingIfNeeded: 0x3400 &+ (oldBase + t)),
+                               "retained-capacity splice corrupted kScale at slot \(slot), element \(t)")
+                XCTAssertEqual(relaidVS[newBase + t], UInt16(truncatingIfNeeded: 0x3600 &+ (oldBase + t)),
+                               "retained-capacity splice corrupted vScale at slot \(slot), element \(t)")
+            }
+            XCTAssertEqual(relaidKS[newBase + pinTokens * tokenScaleFloats], 0,
+                           "the rebuilt buffer's tail must be zero, not leftover source data")
+        }
+
+        // Leave the shared singleton in a small, conventional state for later tests.
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: kvHeads, headDim: 64, maxSeqLen: 256, precision: .fp16
+        )
+    }
+
+    func testKVCacheFP8ScaleRestoreUsesLogicalKvHeadCount() throws {
+        // Review regression (round 2): the FP8 store/attention kernels address
+        // scales with the LOGICAL head count the generation path uses — 2 for a
+        // nil-config, non-Nanbeige run — laying each slot out as
+        // [maxSeq x logicalHeads] halves packed at slot * maxSeq * logicalHeads.
+        // reset() pads the ALLOCATION's head count to >= 8 when config is nil; using
+        // the padded count for the splice restore's offsets/sizes copies the wrong
+        // regions and leaves later slots with zeroed or foreign pinned scales.
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        let layoutHeads = 2
+        KVCacheManager.shared.kScaleBuffer = nil
+        KVCacheManager.shared.vScaleBuffer = nil
+
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: layoutHeads, headDim: 64, maxSeqLen: 1024, precision: .fp8,
+            preservePrefixCount: 0
+        )
+        guard let oldKBuf = KVCacheManager.shared.kScaleBuffer,
+              let oldVBuf = KVCacheManager.shared.vScaleBuffer else {
+            return XCTFail("FP8 KV cache did not allocate scale buffers")
+        }
+        let oldKS = oldKBuf.contents().bindMemory(to: UInt16.self, capacity: oldKBuf.length / 2)
+        let oldVS = oldVBuf.contents().bindMemory(to: UInt16.self, capacity: oldVBuf.length / 2)
+        // Poison the whole padded buffer, then write only the compact live layout
+        // the store kernels would write: slot regions advance by maxSeq * logicalHeads.
+        for i in 0..<(oldKBuf.length / 2) { oldKS[i] = 0xDEAD; oldVS[i] = 0xBEEF }
+        for slot in 0..<4 {
+            let base = slot * 1024 * layoutHeads
+            for t in 0..<(1024 * layoutHeads) {
+                oldKS[base + t] = UInt16(truncatingIfNeeded: 0x3000 &+ (base + t))
+                oldVS[base + t] = UInt16(truncatingIfNeeded: 0x3200 &+ (base + t))
+            }
+        }
+
+        let pinTokens = 512
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: layoutHeads, headDim: 64, maxSeqLen: 2048, precision: .fp8,
+            preservePrefixCount: pinTokens
+        )
+        guard let newKBuf = KVCacheManager.shared.kScaleBuffer,
+              let newVBuf = KVCacheManager.shared.vScaleBuffer else {
+            return XCTFail("FP8 KV cache did not allocate scale buffers after splice reset")
+        }
+        XCTAssertTrue(newKBuf !== oldKBuf && newVBuf !== oldVBuf,
+                      "stride-change splice must rebuild the scale buffers")
+        let newKS = newKBuf.contents().bindMemory(to: UInt16.self, capacity: newKBuf.length / 2)
+        let newVS = newVBuf.contents().bindMemory(to: UInt16.self, capacity: newVBuf.length / 2)
+        for slot in 0..<4 {
+            let newBase = slot * 2048 * layoutHeads
+            let oldBase = slot * 1024 * layoutHeads
+            for t in 0..<(pinTokens * layoutHeads) {
+                XCTAssertEqual(newKS[newBase + t], UInt16(truncatingIfNeeded: 0x3000 &+ (oldBase + t)),
+                               "kScale prefix corrupted at slot \(slot), element \(t) under the 2-head logical layout")
+                XCTAssertEqual(newVS[newBase + t], UInt16(truncatingIfNeeded: 0x3200 &+ (oldBase + t)),
+                               "vScale prefix corrupted at slot \(slot), element \(t) under the 2-head logical layout")
+            }
+            // Untouched tail of a freshly rebuilt buffer: zero, never the 0xDEAD poison.
+            XCTAssertEqual(newKS[newBase + pinTokens * layoutHeads], 0)
+        }
+
+        // Leave the shared singleton in a small, conventional state for later tests.
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: layoutHeads, headDim: 64, maxSeqLen: 256, precision: .fp16
+        )
+    }
+
+    func testKVCachePrefixRelayoutsOnSplicedStrideShrink() throws {
+        // Review regression (round 2): a tools_unload that shortens the prompt can
+        // shrink neededSeqLen turn-over-turn, so a spliced reset can arrive with a
+        // SMALLER maxSeqLen while preservePrefixCount > 0. The capacity check alone
+        // kept the old (larger) K/V buffers, leaving the pinned prefix at the old
+        // slot stride while generation indexes by the new allocatedSeqLen — while
+        // the scales WERE being moved to the smaller stride. The stride-change guard
+        // now forces the K/V relayout too, mirroring the scale-buffer handling.
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        KVCacheManager.shared.kCacheBuffer = nil
+        KVCacheManager.shared.vCacheBuffer = nil
+        KVCacheManager.shared.kScaleBuffer = nil
+        KVCacheManager.shared.vScaleBuffer = nil
+
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: 4, headDim: 128, maxSeqLen: 512, precision: .fp16,
+            preservePrefixCount: 0
+        )
+        guard let oldKBuf = KVCacheManager.shared.kCacheBuffer else {
+            return XCTFail("FP16 KV cache did not allocate K buffer")
+        }
+        let oldKH = oldKBuf.contents().bindMemory(to: UInt16.self, capacity: oldKBuf.length / 2)
+        // The canary must differ per ABSOLUTE element: both slot strides here
+        // (512 * 1024 and 384 * 1024 elements) are multiples of the UInt16
+        // wraparound period (65,536), so a plain `base &+ i` fill repeats
+        // identically in every slot — a relayout that reads the WRONG source
+        // slot, or uses the new stride for source offsets, could still byte-match
+        // every prefix assertion. Mixing the wrapped high index bits into the
+        // low ones breaks that aliasing while keeping the fill copyable as a
+        // single helper shared by this fill and the expectation below.
+        func kvCanary(_ i: Int) -> UInt16 {
+            UInt16(truncatingIfNeeded: i) ^ UInt16(truncatingIfNeeded: i >> 16) ^ 0x2A00
+        }
+        for i in 0..<(oldKBuf.length / 2) { oldKH[i] = kvCanary(i) }
+
+        // Recompute reset's own per-slot stride: effectiveKvStride heads*dim floored
+        // at 1024 (padded heads = 8, headDim 128), fp16 = one half per element.
+        let strideElems = 1024
+        let pinTokens = 128
+
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: 4, headDim: 128, maxSeqLen: 384, precision: .fp16,
+            preservePrefixCount: pinTokens
+        )
+        guard let newKBuf = KVCacheManager.shared.kCacheBuffer else {
+            return XCTFail("FP16 KV cache did not allocate K buffer after shrink splice")
+        }
+        XCTAssertTrue(newKBuf !== oldKBuf,
+                      "a stride-changing splice must reallocate the K/V buffers even when retained capacity still fits")
+        XCTAssertEqual(KVCacheManager.shared.allocatedSeqLen, 384)
+        let newKH = newKBuf.contents().bindMemory(to: UInt16.self, capacity: newKBuf.length / 2)
+        for slot in 0..<4 {
+            let newBase = slot * 384 * strideElems
+            let oldBase = slot * 512 * strideElems
+            for e in 0..<(pinTokens * strideElems) {
+                XCTAssertEqual(newKH[newBase + e], kvCanary(oldBase + e),
+                               "pinned K prefix corrupted at slot \(slot), element \(e) during shrink relayout")
+            }
+            // Freshly zero-filled tail past the pinned prefix.
+            XCTAssertEqual(newKH[newBase + pinTokens * strideElems], 0,
+                           "shrink relayout must zero the tail past the pinned prefix at slot \(slot)")
+        }
+
+        // Leave the shared singleton in a small, conventional state for later tests.
+        KVCacheManager.shared.reset(
+            device: device, config: nil, actualLayers: 4, totalLoops: 1,
+            numKvHeads: 4, headDim: 128, maxSeqLen: 256, precision: .fp16
+        )
+    }
+
+    func testToolsLoadRewritesPromptToolSectionForNextStep() {
+        // Regression for the mid-run stale tool block: tools_load executes and
+        // replies "you may now call it directly using the provided schema", but the next
+        // agent step spliced the previous turn's system text verbatim — the authoritative
+        // "Only the following functions are currently loaded" block never gained the tool
+        // (observed live: model stuck reconciling the contradiction, 500+ tokens, no call).
+        // Uses a non-core tool (git_diff) now that web_fetch ships in the core set.
+        let harness = AgentHarness.shared
+        harness.resetLoadedToolsToCore()
+        defer { harness.resetLoadedToolsToCore() }
+
+        let fixedDate = Date(timeIntervalSince1970: 1_800_000_000)
+        let before = harness.buildSystemPrompt(baseSystem: "Test system.", modelName: "Ornith 1.5", currentDate: fixedDate)
+        XCTAssertFalse(before.contains("\"name\":\"git_diff\""), "git_diff must not be advertised before it is loaded")
+        XCTAssertTrue(before.contains("\"name\":\"web_fetch\""), "web_fetch is a core tool and must be advertised from the start")
+        XCTAssertTrue(before.contains("# Tools"), "agent prompt must carry a tools section")
+
+        XCTAssertNoThrow(try harness.loadTool(named: "git_diff"))
+        let after = harness.buildSystemPrompt(baseSystem: "Test system.", modelName: "Ornith 1.5", currentDate: fixedDate)
+        XCTAssertTrue(after.contains("\"name\":\"git_diff\""), "freshly built prompt must advertise git_diff")
+
+        let refreshed = harness.refreshingLoadedToolsSection(inPrompt: before)
+        XCTAssertNotEqual(refreshed, before, "a stale tool block must change after tools_load")
+        XCTAssertEqual(refreshed, after, "the refreshed prompt must match a freshly built one byte-for-byte")
+
+        XCTAssertEqual(harness.refreshingLoadedToolsSection(inPrompt: after), after, "idempotent when the block already matches")
+
+        let plain = "<|im_start|>user\nhi<|im_end|>"
+        XCTAssertEqual(harness.refreshingLoadedToolsSection(inPrompt: plain), plain, "non-agent prompts pass through untouched")
+    }
+
+    func testToolsSectionCarriesWebFetchReadinessHintOnlyWhenNeeded() {
+        // Regression for the Spark search-loop: with web_search loaded but web_fetch
+        // not, the prompt told the model to read pages "via web_fetch" while showing
+        // no web_fetch schema — the model re-issued web_search query after query for
+        // page content until the budget guardrail force-disabled web_search mid-task.
+        // web_fetch now ships in the core set, so the hint only guards the case where
+        // the model (or a guardrail) unloaded web_fetch mid-run.
+        let harness = AgentHarness.shared
+        harness.resetLoadedToolsToCore()
+        defer { harness.resetLoadedToolsToCore() }
+        // Mirror the live agent-session registry: the core set plus web_search.
+        XCTAssertNoThrow(try harness.loadTool(named: "web_search"))
+
+        let hint = "Web research readiness:"
+        let withFetch = harness.buildToolsSection()
+        XCTAssertTrue(withFetch.contains("\"name\":\"web_fetch\""), "web_fetch must ship in the core tool set")
+        XCTAssertTrue(withFetch.contains("\"name\":\"web_search\""), "the live registry must include web_search")
+        XCTAssertFalse(withFetch.contains(hint), "no hint while web_fetch is loaded")
+
+        XCTAssertNoThrow(try harness.unloadTool(named: "web_fetch"))
+        let withSearchOnly = harness.buildToolsSection()
+        XCTAssertTrue(withSearchOnly.contains("\"name\":\"web_search\""), "web_search must stay loaded")
+        XCTAssertFalse(withSearchOnly.contains("\"name\":\"web_fetch\""), "web_fetch must be gone after tools_unload")
+        XCTAssertTrue(withSearchOnly.contains(hint), "tools section must hint at re-loading web_fetch when web_search is loaded without it")
+        XCTAssertTrue(withSearchOnly.contains("tools_load"), "the hint must name tools_load as the remedy")
+
+        XCTAssertNoThrow(try harness.loadTool(named: "web_fetch"))
+        let refetched = harness.buildToolsSection()
+        XCTAssertTrue(refetched.contains("\"name\":\"web_fetch\""))
+        XCTAssertFalse(refetched.contains(hint), "hint must disappear once web_fetch is loaded again")
+
+        XCTAssertNoThrow(try harness.unloadTool(named: "web_search"))
+        let withoutSearch = harness.buildToolsSection()
+        XCTAssertFalse(withoutSearch.contains(hint), "hint must not appear when web_search itself is not loaded")
+
+        // The refreshed-prompt path must stay byte-identical to a fresh build with the hint.
+        let fixedDate = Date(timeIntervalSince1970: 1_800_000_000)
+        XCTAssertNoThrow(try harness.unloadTool(named: "web_fetch"))
+        XCTAssertNoThrow(try harness.loadTool(named: "web_search"))
+        let corePrompt = harness.buildSystemPrompt(baseSystem: "Test system.", modelName: "Spark X2.5", currentDate: fixedDate)
+        XCTAssertTrue(corePrompt.contains(hint), "core registry prompt must carry the hint")
+
+        XCTAssertNoThrow(try harness.loadTool(named: "web_fetch"))
+        let refreshedCore = harness.refreshingLoadedToolsSection(inPrompt: corePrompt)
+        let freshWithFetch = harness.buildSystemPrompt(baseSystem: "Test system.", modelName: "Spark X2.5", currentDate: fixedDate)
+        XCTAssertEqual(refreshedCore, freshWithFetch, "refreshed prompt must match a freshly built one byte-for-byte")
+        XCTAssertFalse(refreshedCore.contains(hint), "hint must drop out of the refreshed prompt once web_fetch loads")
+        XCTAssertEqual(harness.refreshingLoadedToolsSection(inPrompt: refreshedCore), refreshedCore, "idempotent once current")
+    }
+
     func testOrnith9BCodingSettingsAutoregressive() throws {
         print("=== TEST ORNITH 1.5 9B AUTOREGRESSIVE WITH USER CODING SETTINGS ===")
         let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--mlx-community--Ornith-1.5-9B-OptiQ-4bit/snapshots/ad2e7748e8c9d36b82bb88307fd21c0d50be85b8"
@@ -7036,6 +7386,109 @@ final class DynaMoETests: XCTestCase {
             masked("<tool_call><function=web_search", tokens: ["_fetch", ">junk"]),
             [true, false],
             "the dead-end valve must keep exactly one continuation alive"
+        )
+    }
+
+    /// Regression for the Spark continuation-turn hole (observed live, post FIX #15):
+    /// the agent continuation prompt ended at the bare Tool-role turn close with no
+    /// assistant re-open, so Spark pattern-completed the transcript instead of
+    /// answering - it emitted its end-of-text token and then fabricated the NEXT
+    /// tool-result block itself, which froze as a broken fragment and ended the run
+    /// with garbage shown to the user. The tool-response turn must therefore end
+    /// with the same generation prompt the first turn gets (the template's
+    /// add_generation_prompt), while the history-embedding form must stay bare.
+    func testSparkToolResponseTurnReopensAssistantTurn() {
+        let harness = AgentHarness.shared
+        let response = "{\"result\": {\"stdout\": \"hello\"}}"
+
+        let turn = harness.formatSparkToolResponseTurn(
+            responses: [response],
+            includeAssistantPrefix: true,
+            thinkingEnabled: true
+        )
+        XCTAssertTrue(turn.contains("<|Tool|>"))
+        XCTAssertTrue(turn.contains("hello"))
+        // The assistant re-open must come AFTER the Tool-turn close.
+        XCTAssertTrue(turn.contains("<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|Bot|><think>"))
+        XCTAssertTrue(turn.hasSuffix("<｜start▁of▁sentence｜><|Bot|><think>"))
+        XCTAssertFalse(turn.contains("<|im_start|>"))
+
+        // Thinking disabled: the close variant so the model answers directly.
+        let plainTurn = harness.formatSparkToolResponseTurn(
+            responses: [response],
+            includeAssistantPrefix: true,
+            thinkingEnabled: false
+        )
+        XCTAssertTrue(plainTurn.hasSuffix("<｜start▁of▁sentence｜><|Bot|></think>"))
+
+        // History-embedding form (default): ends at the Tool-turn close, no Bot opener.
+        let historyTurn = harness.formatSparkToolResponseTurn(responses: [response])
+        XCTAssertTrue(historyTurn.hasSuffix("<｜end▁of▁sentence｜>"))
+        XCTAssertFalse(historyTurn.contains("<|Bot|>"))
+    }
+
+    /// Regression for the invisible whitespace loop at the tag-choice boundary
+    /// (observed live: Spark opened a tool call, then streamed hundreds of
+    /// invisible whitespace tokens - nothing rendered (the response is
+    /// whitespace-trimmed), no closer ever arrived so the parser could not
+    /// freeze, and the degenerate-cycle guard ignores units without letters or
+    /// digits - until the user stopped the turn). Layout whitespace between
+    /// structural tags is legal, but bounded: past a small allowance the
+    /// tag-choice mask must force the next structural tag.
+    func testGrammarMaskBoundsWhitespaceAtTagChoiceBoundary() {
+        let harness = AgentHarness.shared
+        let sampler = GrammarConstrainedSampler.shared
+        try? harness.loadTool(named: "web_search")
+        defer {
+            harness.resetLoadedToolsToCore()
+            sampler.reset()
+        }
+
+        sampler.isEnabled = true
+        sampler.reset()
+
+        func masked(_ text: String, tokens: [String]) -> [Bool] {
+            sampler.updateState(emittedText: text)
+            sampler.invalidateTokenizerCaches()
+            var logits = [Float](repeating: 0, count: tokens.count)
+            logits.withUnsafeMutableBufferPointer { buf in
+                sampler.applyLogitMask(
+                    logits: buf.baseAddress!,
+                    vocabSize: tokens.count,
+                    tokenDecoder: { tokens[Int($0)] }
+                )
+            }
+            return logits.map { $0 == -.infinity }
+        }
+
+        // Fresh boundary: layout whitespace and function-tag prefixes both pass.
+        XCTAssertEqual(
+            masked("<tool_call>", tokens: ["\n", " ", "<", "<f", "<function=", "x"]),
+            [false, false, false, false, false, true],
+            "at the fresh boundary, whitespace and function-tag prefixes pass"
+        )
+
+        // One newline in: one more whitespace char still fits the allowance, and a
+        // merged whitespace+tag token always passes.
+        XCTAssertEqual(
+            masked("<tool_call>\n", tokens: ["\n", " ", "\n<function=", "<"]),
+            [false, false, false, false],
+            "within the allowance whitespace still passes; merged WS+tag tokens always pass"
+        )
+
+        // Beyond the allowance: pure-whitespace tokens are masked and the only
+        // legal continuations are the structural tag (or a merged WS+tag token).
+        XCTAssertEqual(
+            masked("<tool_call>\n\n", tokens: ["\n", " ", "\t", "<", "<f", "\n<function=", "x"]),
+            [true, true, true, false, false, false, true],
+            "the whitespace allowance is bounded; the mask forces the structural tag"
+        )
+
+        // Same bound between a parameter closer and the next structural tag.
+        XCTAssertEqual(
+            masked("<tool_call>\n<function=web_search>\n<parameter=query>abc</parameter>\n\n", tokens: ["\n", "<", "</", "x"]),
+            [true, false, false, true],
+            "the bound applies between a parameter closer and the next tag too"
         )
     }
 
@@ -11261,6 +11714,481 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         let fp8Text = (try? tokenizer.decode(ids: generatedTokenIds)) ?? ""
         print("FP8 GREEDY TEXT: '\(fp8Text)'")
         try? fp8Text.write(toFile: "/var/folders/mz/_wbpft9n74x5dbt3tkcdpd2m0000gn/T/opencode/spark_greedy_fp8.txt", atomically: true, encoding: .utf8)
+    }
+
+    func testSparkAgentToolCallEmissionDiagnostic() throws {
+        print("=== SPARK AGENT TOOL-CALL EMISSION DIAGNOSTIC (exact failing step0 prompt, FP8 KV) ===")
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--XHToken--Spark-X2.5-4B/snapshots/0bcb35678590218655dff3765b9e61c83b35e9c4"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            throw XCTSkip("Spark-X2.5-4B snapshot not found")
+        }
+        // Byte-exact prompt from the failing live run's step0 dump, read at runtime so
+        // the tag-bearing text never has to be retyped into source (the harness would
+        // parse a retyped fragment as a live tool call). Strips the turn-meta header
+        // line and the blank separator; everything after is the exact prompt bytes.
+        let dumpPath = "/Users/derekparris/Downloads/DynaMoePromptDumps/prompt-step0-2026-10-03T18-38-14Z.txt"
+        guard let dumpRaw = try? String(contentsOfFile: dumpPath, encoding: .utf8),
+              let firstNl = dumpRaw.firstIndex(of: "\n") else {
+            throw XCTSkip("Prompt dump not found: \(dumpPath)")
+        }
+        var promptStart = dumpRaw.index(after: firstNl)
+        while promptStart < dumpRaw.endIndex, dumpRaw[promptStart] == "\n" {
+            promptStart = dumpRaw.index(after: promptStart)
+        }
+        let appPrompt = String(dumpRaw[promptStart...])
+
+        let engine = try DynaMoeEngine(filePath: snapshotDir)
+        let summary = try engine.getSummary()
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let address = UInt(shard.baseAddress)
+            guard let ptr = UnsafeMutableRawPointer(bitPattern: address) else { continue }
+            let len = Int(shard.length)
+            if let buf = device.makeBuffer(bytesNoCopy: ptr, length: len, options: .storageModeShared, deallocator: nil) {
+                buffers[shard.index] = buf
+            }
+        }
+
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+
+        guard let cmdQueue = device.makeCommandQueue() else {
+            XCTFail("No Metal command queue")
+            return
+        }
+
+        let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir))
+        let cachedLayers = inference.buildCachedLayers(summary: summary, config: config, targetLayerCount: 36)
+
+        let hiddenDim = config?.hiddenSize ?? 2560
+        let intermediateDim = config?.intermediateSize ?? 10240
+        let vocabSize = config?.vocabSize ?? 131072
+        let numHeads: UInt32 = UInt32(config?.numAttentionHeads ?? 16)
+        let numKvHeads: UInt32 = UInt32(config?.numKeyValueHeads ?? 4)
+        let headDim: UInt32 = UInt32(config?.headDim ?? 256)
+        let kvStride = numKvHeads * headDim
+
+        // App agent-turn tool registry: the core set (web_fetch ships core) plus
+        // web_search loaded at send time by beginAgentSearchGuard — the exact set
+        // the failing run's prompt advertised and registered into the grammar mask.
+        let harness = AgentHarness.shared
+        harness.resetLoadedToolsToCore()
+        try harness.loadTool(named: "web_search")
+        defer {
+            harness.resetLoadedToolsToCore()
+            _ = try? harness.loadTool(named: "web_search")
+        }
+        let registeredNames = harness.availableToolDefinitions.map { $0.function.name }.sorted()
+        print("DIAG registered tools: \(registeredNames.joined(separator: ","))")
+
+        let hBufA = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let hBufB = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let xNorm1Buf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let xNorm2Buf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let qGateBuf = device.makeBuffer(length: Int(numHeads * headDim) * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let kVecBuf = device.makeBuffer(length: Int(kvStride) * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let vVecBuf = device.makeBuffer(length: Int(kvStride) * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let bVecBuf = device.makeBuffer(length: Int(numHeads) * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let attnCtxBuf = device.makeBuffer(length: Int(numHeads * headDim) * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let attnOutBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let hMidBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let interBuf = device.makeBuffer(length: intermediateDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let hMlpBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let xFinalBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let logitsBuf = device.makeBuffer(length: vocabSize * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let singleTokenBuf = device.makeBuffer(length: 4, options: .storageModeShared)!
+
+        func dispatchLinearLocal(
+            enc: MTLComputeCommandEncoder,
+            weight: TensorMetadata?,
+            inBuf: MTLBuffer,
+            outBuf: MTLBuffer,
+            inDim: UInt32,
+            outDim: UInt32,
+            weightOffsetAdd: UInt64 = 0
+        ) {
+            guard let w = weight, let wRaw = buffers[w.shardIndex] else { return }
+            var wOff = w.offsetStart + weightOffsetAdd
+            var inD = inDim
+            var outD = outDim
+            if let bSimdPipe = inference.bf16GemvSimdPipeline {
+                enc.setComputePipelineState(bSimdPipe)
+                enc.setBuffer(wRaw, offset: 0, index: 0)
+                enc.setBuffer(inBuf, offset: 0, index: 1)
+                enc.setBuffer(outBuf, offset: 0, index: 2)
+                enc.setBytes(&wOff, length: 8, index: 3)
+                enc.setBytes(&inD, length: 4, index: 4)
+                enc.setBytes(&outD, length: 4, index: 5)
+                enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            }
+            enc.memoryBarrier(scope: .buffers)
+        }
+
+        let embedWeight = summary.tensors.first { $0.name.contains("embedding") && $0.name.hasSuffix(".weight") }!
+        let normTensor = summary.tensors.first { $0.name == "model.norm.weight" }!
+        let lmHeadTensor = summary.tensors.first { $0.name == "lm_head.weight" } ?? embedWeight
+
+        let embedPipe = inference.embedPipeline!
+        let rmsPipe = inference.rmsnormPipeline!
+        let ropePipe = inference.ropePipeline!
+
+        func runTokenForward(tokenId: UInt32, step: UInt32, computeLogits: Bool) {
+            let kCache = KVCacheManager.shared.kCacheBuffer!
+            let vCache = KVCacheManager.shared.vCacheBuffer!
+            let kScale = KVCacheManager.shared.kScaleBuffer!
+            let vScale = KVCacheManager.shared.vScaleBuffer!
+            let maxSeq = KVCacheManager.shared.allocatedSeqLen
+
+            var curH = hBufA
+            var nxtH = hBufB
+
+            let embedCmd = cmdQueue.makeCommandBuffer()!
+            let embedEnc = embedCmd.makeComputeCommandEncoder()!
+            singleTokenBuf.contents().bindMemory(to: UInt32.self, capacity: 1)[0] = tokenId
+            var wOff = embedWeight.offsetStart
+            var hDimVal = UInt32(hiddenDim)
+            var tokCount: UInt32 = 1
+            embedEnc.setComputePipelineState(embedPipe)
+            embedEnc.setBuffer(buffers[embedWeight.shardIndex]!, offset: 0, index: 0)
+            embedEnc.setBuffer(singleTokenBuf, offset: 0, index: 1)
+            embedEnc.setBuffer(curH, offset: 0, index: 2)
+            embedEnc.setBytes(&wOff, length: 8, index: 3)
+            embedEnc.setBytes(&hDimVal, length: 4, index: 4)
+            embedEnc.setBytes(&tokCount, length: 4, index: 5)
+            embedEnc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+            embedEnc.endEncoding()
+            embedCmd.commit()
+            embedCmd.waitUntilCompleted()
+
+            for l in 0..<36 {
+                let layer = cachedLayers[l]
+                let cmd = cmdQueue.makeCommandBuffer()!
+                let enc = cmd.makeComputeCommandEncoder()!
+
+                var norm1Off = layer.norm1Tensor!.offsetStart
+                var epsVal: Float = 1e-6
+                enc.setComputePipelineState(rmsPipe)
+                enc.setBuffer(curH, offset: 0, index: 0)
+                enc.setBuffer(buffers[layer.norm1Tensor!.shardIndex]!, offset: 0, index: 1)
+                enc.setBuffer(xNorm1Buf, offset: 0, index: 2)
+                enc.setBytes(&norm1Off, length: 8, index: 3)
+                enc.setBytes(&hDimVal, length: 4, index: 4)
+                enc.setBytes(&epsVal, length: 4, index: 5)
+                enc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                let fusedQKV = layer.fusedQKVTensor!
+                let currentQDim = numHeads * headDim
+                let currentKvDim = kvStride
+                dispatchLinearLocal(enc: enc, weight: fusedQKV, inBuf: xNorm1Buf, outBuf: qGateBuf, inDim: UInt32(hiddenDim), outDim: currentQDim)
+                dispatchLinearLocal(enc: enc, weight: fusedQKV, inBuf: xNorm1Buf, outBuf: kVecBuf, inDim: UInt32(hiddenDim), outDim: currentKvDim, weightOffsetAdd: UInt64(currentQDim) * UInt64(hiddenDim) * 2)
+                dispatchLinearLocal(enc: enc, weight: fusedQKV, inBuf: xNorm1Buf, outBuf: vVecBuf, inDim: UInt32(hiddenDim), outDim: currentKvDim, weightOffsetAdd: (UInt64(currentQDim) + UInt64(currentKvDim)) * UInt64(hiddenDim) * 2)
+
+                let gateProj = layer.attnGateProjTensor!
+                dispatchLinearLocal(enc: enc, weight: gateProj, inBuf: xNorm1Buf, outBuf: bVecBuf, inDim: UInt32(hiddenDim), outDim: numHeads)
+
+                var curStep = step
+                var nQ = numHeads
+                var nK = numKvHeads
+                var hD = headDim
+                var rD = UInt32(config?.effectiveRotaryDim(layerIndex: l, headDim: Int(headDim)) ?? 128)
+                var qStr = headDim
+                var kStr = headDim
+                var theta = config?.effectiveRopeTheta(layerIndex: l) ?? 10000000.0
+
+                enc.setComputePipelineState(ropePipe)
+                enc.setBuffer(qGateBuf, offset: 0, index: 0)
+                enc.setBytes(&curStep, length: 4, index: 1)
+                enc.setBytes(&nQ, length: 4, index: 2)
+                enc.setBytes(&hD, length: 4, index: 3)
+                enc.setBytes(&rD, length: 4, index: 4)
+                enc.setBytes(&qStr, length: 4, index: 5)
+                enc.setBytes(&theta, length: 4, index: 6)
+                enc.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), ropePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+
+                enc.setBuffer(kVecBuf, offset: 0, index: 0)
+                enc.setBytes(&curStep, length: 4, index: 1)
+                enc.setBytes(&nK, length: 4, index: 2)
+                enc.setBytes(&hD, length: 4, index: 3)
+                enc.setBytes(&rD, length: 4, index: 4)
+                enc.setBytes(&kStr, length: 4, index: 5)
+                enc.setBytes(&theta, length: 4, index: 6)
+                enc.dispatchThreads(MTLSize(width: Int(numKvHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numKvHeads), ropePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                let layerByteOffset = l * maxSeq * Int(kvStride) * 1
+                let scaleByteOffset = l * maxSeq * Int(numKvHeads) * 2
+                enc.setComputePipelineState(inference.storeKvCacheFP8Pipeline!)
+                enc.setBuffer(kVecBuf, offset: 0, index: 0)
+                enc.setBuffer(vVecBuf, offset: 0, index: 1)
+                enc.setBuffer(kCache, offset: layerByteOffset, index: 2)
+                enc.setBuffer(vCache, offset: layerByteOffset, index: 3)
+                enc.setBuffer(kScale, offset: scaleByteOffset, index: 4)
+                enc.setBuffer(vScale, offset: scaleByteOffset, index: 5)
+                enc.setBytes(&curStep, length: 4, index: 6)
+                enc.setBytes(&nK, length: 4, index: 7)
+                enc.setBytes(&hD, length: 4, index: 8)
+                enc.dispatchThreadgroups(MTLSize(width: Int(numKvHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                var seqLen = step + 1
+                var windowSize: UInt32 = layer.isSlidingAttention ? UInt32(config?.effectiveSlidingWindow ?? 0) : 0
+                enc.setComputePipelineState(inference.gqaHeadGateFP8Pipeline!)
+                enc.setBuffer(qGateBuf, offset: 0, index: 0)
+                enc.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                enc.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                enc.setBuffer(kScale, offset: scaleByteOffset, index: 3)
+                enc.setBuffer(vScale, offset: scaleByteOffset, index: 4)
+                enc.setBuffer(attnCtxBuf, offset: 0, index: 5)
+                enc.setBuffer(bVecBuf, offset: 0, index: 6)
+                enc.setBytes(&seqLen, length: 4, index: 7)
+                enc.setBytes(&nQ, length: 4, index: 8)
+                enc.setBytes(&nK, length: 4, index: 9)
+                enc.setBytes(&hD, length: 4, index: 10)
+                enc.setBytes(&windowSize, length: 4, index: 11)
+                enc.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), inference.gqaHeadGateFP8Pipeline!.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                dispatchLinearLocal(enc: enc, weight: layer.oProjTensor, inBuf: attnCtxBuf, outBuf: attnOutBuf, inDim: currentQDim, outDim: UInt32(hiddenDim))
+
+                enc.setComputePipelineState(inference.addPipeline!)
+                enc.setBuffer(curH, offset: 0, index: 0)
+                enc.setBuffer(attnOutBuf, offset: 0, index: 1)
+                enc.setBuffer(hMidBuf, offset: 0, index: 2)
+                enc.setBytes(&hDimVal, length: 4, index: 3)
+                enc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                var norm2Off = layer.norm2Tensor!.offsetStart
+                enc.setComputePipelineState(rmsPipe)
+                enc.setBuffer(hMidBuf, offset: 0, index: 0)
+                enc.setBuffer(buffers[layer.norm2Tensor!.shardIndex]!, offset: 0, index: 1)
+                enc.setBuffer(xNorm2Buf, offset: 0, index: 2)
+                enc.setBytes(&norm2Off, length: 8, index: 3)
+                enc.setBytes(&hDimVal, length: 4, index: 4)
+                enc.setBytes(&epsVal, length: 4, index: 5)
+                enc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                let gateW = layer.denseGateWeight!
+                let upW = layer.denseUpWeight!
+                var gWOff = gateW.offsetStart
+                var uWOff = upW.offsetStart
+                var interDimVal = UInt32(intermediateDim)
+                enc.setComputePipelineState(inference.bf16GeluGateUpSimdPipeline!)
+                enc.setBuffer(buffers[gateW.shardIndex]!, offset: 0, index: 0)
+                enc.setBuffer(buffers[upW.shardIndex]!, offset: 0, index: 1)
+                enc.setBuffer(xNorm2Buf, offset: 0, index: 2)
+                enc.setBuffer(interBuf, offset: 0, index: 3)
+                enc.setBytes(&gWOff, length: 8, index: 4)
+                enc.setBytes(&uWOff, length: 8, index: 5)
+                enc.setBytes(&hDimVal, length: 4, index: 6)
+                enc.setBytes(&interDimVal, length: 4, index: 7)
+                enc.dispatchThreadgroups(MTLSize(width: intermediateDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                enc.setComputePipelineState(inference.clearPipeline!)
+                enc.setBuffer(hMlpBuf, offset: 0, index: 0)
+                enc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                let downW = layer.denseDownWeight!
+                var dWOff = downW.offsetStart
+                var pkVal: Float = 1.0
+                enc.setComputePipelineState(inference.bf16DownSimdPipeline!)
+                enc.setBuffer(buffers[downW.shardIndex]!, offset: 0, index: 0)
+                enc.setBuffer(interBuf, offset: 0, index: 1)
+                enc.setBuffer(hMlpBuf, offset: 0, index: 2)
+                enc.setBytes(&dWOff, length: 8, index: 3)
+                enc.setBytes(&interDimVal, length: 4, index: 4)
+                enc.setBytes(&hDimVal, length: 4, index: 5)
+                enc.setBytes(&pkVal, length: 4, index: 6)
+                enc.dispatchThreadgroups(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                enc.setComputePipelineState(inference.addPipeline!)
+                enc.setBuffer(hMidBuf, offset: 0, index: 0)
+                enc.setBuffer(hMlpBuf, offset: 0, index: 1)
+                enc.setBuffer(nxtH, offset: 0, index: 2)
+                enc.setBytes(&hDimVal, length: 4, index: 3)
+                enc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+
+                enc.endEncoding()
+                cmd.commit()
+
+                let tmp = curH
+                curH = nxtH
+                nxtH = tmp
+            }
+
+            if computeLogits {
+                let finalCmd = cmdQueue.makeCommandBuffer()!
+                let finalEnc = finalCmd.makeComputeCommandEncoder()!
+                var normOff = normTensor.offsetStart
+                var epsVal: Float = 1e-6
+                finalEnc.setComputePipelineState(rmsPipe)
+                finalEnc.setBuffer(curH, offset: 0, index: 0)
+                finalEnc.setBuffer(buffers[normTensor.shardIndex]!, offset: 0, index: 1)
+                finalEnc.setBuffer(xFinalBuf, offset: 0, index: 2)
+                finalEnc.setBytes(&normOff, length: 8, index: 3)
+                finalEnc.setBytes(&hDimVal, length: 4, index: 4)
+                finalEnc.setBytes(&epsVal, length: 4, index: 5)
+                finalEnc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                finalEnc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                finalEnc.memoryBarrier(scope: .buffers)
+
+                dispatchLinearLocal(enc: finalEnc, weight: lmHeadTensor, inBuf: xFinalBuf, outBuf: logitsBuf, inDim: UInt32(hiddenDim), outDim: UInt32(vocabSize))
+                finalEnc.endEncoding()
+                finalCmd.commit()
+                finalCmd.waitUntilCompleted()
+            }
+        }
+
+        let tokPath = "\(snapshotDir)/tokenizer.json"
+        let tokenizer = try DynaMoeTokenizer(tokenizerPath: tokPath)
+        let promptTokens = try tokenizer.encode(text: appPrompt)
+        print("DIAG prompt token count: \(promptTokens.count) (dump meta said 3203)")
+        let liveLogPath = "/tmp/spark_agent_diag_live.log"
+        try? "spark agent tool-call emission diagnostic\n".write(toFile: liveLogPath, atomically: true, encoding: .utf8)
+        let liveHandle = FileHandle(forWritingAtPath: liveLogPath)
+        liveHandle?.seekToEndOfFile()
+        func live(_ line: String) {
+            liveHandle?.write(Data((line + "\n").utf8))
+        }
+        live("DIAG prompt token count: \(promptTokens.count) (dump meta said 3203)")
+
+        let promptCount = promptTokens.count - 1
+
+        func prefill() {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            for step in 0..<promptCount {
+                runTokenForward(tokenId: promptTokens[step], step: UInt32(step), computeLogits: false)
+                if (step + 1) % 500 == 0 {
+                    let line = String(format: "DIAG prefill progress: %d/%d tokens, %.1f s elapsed", step + 1, promptCount, CFAbsoluteTimeGetCurrent() - t0)
+                    print(line)
+                    live(line)
+                }
+            }
+            print(String(format: "DIAG prefill: %d tokens in %.1f s", promptCount, CFAbsoluteTimeGetCurrent() - t0))
+        }
+
+        func runDecodePass(label: String, temperature: Float, topPVal: Float, minPVal: Float, topKVal: Int, repPenVal: Float) {
+            KVCacheManager.shared.reset(
+                device: device,
+                config: config,
+                actualLayers: 36,
+                totalLoops: 1,
+                numKvHeads: Int(numKvHeads),
+                headDim: Int(headDim),
+                maxSeqLen: 6144,
+                precision: .fp8
+            )
+            prefill()
+            let grammarToken = GrammarConstrainedSampler.shared.beginGeneration()
+            var contextTokens = promptTokens
+            var generatedTokenIds: [UInt32] = []
+            var accumulatedDecodedText = ""
+            var lastGrammarState = GrammarConstrainedSampler.shared.currentState
+            var genToken = promptTokens.last!
+            var currentStepLocal = UInt32(promptCount)
+            let genCap = 800
+            let passStart = CFAbsoluteTimeGetCurrent()
+            for genStep in 0..<genCap {
+                runTokenForward(tokenId: genToken, step: currentStepLocal, computeLogits: true)
+                currentStepLocal += 1
+                let logitsPtr = logitsBuf.contents().bindMemory(to: Float.self, capacity: vocabSize)
+                let nextToken = InferenceEngine.sampleNextToken(
+                    logits: logitsPtr,
+                    vocabSize: Int(vocabSize),
+                    contextTokens: contextTokens,
+                    temperature: temperature,
+                    topP: topPVal,
+                    minP: minPVal,
+                    topK: topKVal,
+                    repetitionPenalty: repPenVal,
+                    presencePenalty: 0.0,
+                    eosTokenIds: [1, 2],
+                    grammarMask: { maskLogits, maskVocab in
+                        GrammarConstrainedSampler.shared.updateStateAndApplyLogitMask(
+                            emittedText: accumulatedDecodedText,
+                            logits: maskLogits,
+                            vocabSize: maskVocab,
+                            tokenDecoder: { try? tokenizer.decode(ids: [$0]) },
+                            enforceStructuralTagContinuation: true,
+                            token: grammarToken
+                        )
+                    }
+                )
+                if nextToken == 1 || nextToken == 2 {
+                    live("[\(label)] EOS at gen step \(genStep)")
+                    print("[\(label)] EOS at gen step \(genStep)")
+                    break
+                }
+                generatedTokenIds.append(nextToken)
+                contextTokens.append(nextToken)
+                let fullDecoded = (try? tokenizer.decode(ids: generatedTokenIds)) ?? ""
+                var emittable = fullDecoded
+                if emittable.hasSuffix("\u{FFFD}") {
+                    emittable = String(emittable.dropLast())
+                }
+                let deltaText: String
+                if emittable.hasPrefix(accumulatedDecodedText) {
+                    deltaText = String(emittable.dropFirst(accumulatedDecodedText.count))
+                } else {
+                    deltaText = ""
+                }
+                accumulatedDecodedText = emittable
+                let tokText = (try? tokenizer.decode(ids: [nextToken])) ?? ""
+                let esc = tokText
+                    .replacingOccurrences(of: "\\", with: "\\\\")
+                    .replacingOccurrences(of: "\n", with: "\\n")
+                    .replacingOccurrences(of: "\r", with: "\\r")
+                live("[\(label)] g\(genStep) id=\(nextToken) '\(esc)'")
+                print("[\(label)] g\(genStep) id=\(nextToken) '\(esc)'")
+                if (genStep + 1) % 200 == 0 {
+                    let line = String(format: "[%@] progress: %d tokens, %.1f s", label, genStep + 1, CFAbsoluteTimeGetCurrent() - passStart)
+                    print(line)
+                    live(line)
+                }
+                if CFAbsoluteTimeGetCurrent() - passStart > 900 {
+                    live("[\(label)] per-pass time budget (900 s) exhausted - stopping pass")
+                    print("[\(label)] per-pass time budget (900 s) exhausted — stopping pass")
+                    break
+                }
+                let gs = GrammarConstrainedSampler.shared.currentState
+                if gs != lastGrammarState {
+                    let line = "[\(label)] GRAMMAR state \(lastGrammarState) -> \(gs) at g\(genStep)"
+                    print(line)
+                    live(line)
+                    lastGrammarState = gs
+                }
+                if StreamingToolParser.shared.shouldFreezeGeneration(accumulatedText: accumulatedDecodedText, deltaText: deltaText) {
+                    live("[\(label)] FREEZE FIRED at gen step \(genStep)")
+                    print("[\(label)] FREEZE FIRED at gen step \(genStep)")
+                    break
+                }
+                genToken = nextToken
+            }
+            let doneLine = String(format: "[%@] pass done: %d tokens in %.1f s", label, generatedTokenIds.count, CFAbsoluteTimeGetCurrent() - passStart)
+            print(doneLine)
+            live(doneLine)
+            live("[\(label)] emission tail: \(accumulatedDecodedText.suffix(600))")
+            let outPath = "/tmp/spark_agent_diag_\(label).txt"
+            try? accumulatedDecodedText.write(toFile: outPath, atomically: true, encoding: .utf8)
+            print("[\(label)] full emission written to \(outPath)")
+            print("[\(label)] emission head: '\(accumulatedDecodedText.prefix(400))'")
+        }
+
+        runDecodePass(label: "greedy", temperature: 0.0, topPVal: 0.9, minPVal: 0.05, topKVal: 50, repPenVal: 1.1)
+        runDecodePass(label: "sampled", temperature: 0.70, topPVal: 0.90, minPVal: 0.05, topKVal: 50, repPenVal: 1.10)
     }
 
     func testSparkVerbatimAppForward() throws {

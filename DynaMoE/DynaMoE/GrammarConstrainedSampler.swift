@@ -720,8 +720,26 @@ nonisolated public final class GrammarConstrainedSampler {
         // instead and let the next state transition recover.
         if !options.contains(where: { $0.hasPrefix(trimmed) || trimmed.hasPrefix($0) }) { return }
 
+        // Layout whitespace between structural tags is legal (the canonical
+        // format puts a single newline between the opener and the function tag,
+        // and between a closer and the next tag), but it must be BOUNDED.
+        // Unbounded, a model whose top logits at the boundary are whitespace can
+        // draw whitespace forever: every draw keeps the prefix whitespace-only,
+        // the whitespace exemption keeps re-arming, the whitespace is trimmed out
+        // of the rendered response so nothing is ever visible, no closer is ever
+        // typed so the parser can never freeze, and the degenerate-cycle guard
+        // ignores cycles whose unit carries no letter or digit (observed: Spark
+        // streamed 300-550 invisible tokens past an open tool-call tag, ~2 tok/s
+        // under the per-token tag-choice scan, until the user stopped the turn).
+        // Two characters is one generous newline worth of layout slack.
+        let whitespaceStillLegal = atWhitespaceBoundary && currentPrefix.count < 2
+
         func allowed(_ candidate: String) -> Bool {
             let t = candidate.drop(while: isWSChar)
+            // A pure-whitespace candidate (t empty after dropping) never advances
+            // toward a tag; an empty t is a "prefix" of every option, so without
+            // this guard whitespace would always pass here too.
+            guard !t.isEmpty else { return false }
             for option in options {
                 if option.hasPrefix(t) { return true }
                 if t.hasPrefix(option) {
@@ -735,7 +753,7 @@ nonisolated public final class GrammarConstrainedSampler {
 
         for v in 0..<vocabSize {
             guard let str = tokenDecoder(UInt32(v)) else { continue }
-            if atWhitespaceBoundary && isWS(str) { continue }
+            if whitespaceStillLegal && isWS(str) { continue }
             if allowed(currentPrefix + str) { continue }
             logits[v] = -Float.infinity
         }
