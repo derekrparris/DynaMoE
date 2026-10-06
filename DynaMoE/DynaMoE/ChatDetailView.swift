@@ -534,7 +534,7 @@ struct ChatDetailView: View {
                             submitImmediateDraft()
                         }
                     )
-                    .frame(minHeight: max(21, 25 * zoomManager.zoomScale), maxHeight: max(100, 140 * zoomManager.zoomScale))
+                    .frame(minHeight: max(14, 17 * zoomManager.zoomScale), maxHeight: max(100, 140 * zoomManager.zoomScale))
                     .padding(.horizontal, 4)
                     .padding(.top, 2)
                     
