@@ -97,6 +97,17 @@ struct ChatDetailView: View {
         compactionProgressMessageId != nil
     }
 
+    /// Minimum height of the composer's text view that still fits exactly one
+    /// line: the editor font's line height plus its top and bottom insets.
+    /// Deriving this from the real font metrics keeps the first line and the
+    /// placeholder from being clipped when the composer is collapsed, while the
+    /// surrounding spacing is trimmed instead to keep the box compact.
+    private var composerMinHeight: CGFloat {
+        let font = NSFont.systemFont(ofSize: max(10, 13.5 * zoomManager.zoomScale))
+        let lineHeight = ceil(font.ascender - font.descender + font.leading)
+        return lineHeight + MacTextEditor.textContainerInsetHeight * 2
+    }
+
     private func modelIconName(for name: String?) -> String {
         let lower = (name ?? "").lowercased()
         if lower.contains("apple foundation") {
@@ -499,7 +510,8 @@ struct ChatDetailView: View {
                             )
                         }
                     }
-                    .padding(10)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
                     .background(Color(NSColor.controlBackgroundColor))
                     .cornerRadius(14)
                     .overlay(
@@ -513,7 +525,7 @@ struct ChatDetailView: View {
                     .transition(.asymmetric(insertion: .opacity.combined(with: .move(edge: .bottom)), removal: .opacity.combined(with: .scale(scale: 0.95))))
                 }
 
-                VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 6) {
                     // Multi-line Expanding Input
                     MacTextEditor(
                         text: $promptText,
@@ -534,9 +546,9 @@ struct ChatDetailView: View {
                             submitImmediateDraft()
                         }
                     )
-                    .frame(minHeight: max(21, 25 * zoomManager.zoomScale), maxHeight: max(100, 140 * zoomManager.zoomScale))
+                    .frame(minHeight: composerMinHeight, maxHeight: max(100, 140 * zoomManager.zoomScale))
                     .padding(.horizontal, 4)
-                    .padding(.top, 2)
+                    .padding(.top, 1)
                     
                     // Bottom Controls Bar inside the floating card
                     HStack(spacing: 8) {
@@ -1004,6 +1016,11 @@ final class ComposerTextView: NSTextView {
 
 // MARK: - Custom Mac NSTextView Wrapper
 struct MacTextEditor: NSViewRepresentable {
+    /// Vertical padding above and below the text inside the editor. Shared with
+    /// the composer's minimum-height math so a single line of text plus these
+    /// insets always fits without vertical clipping.
+    static let textContainerInsetHeight: CGFloat = 2
+
     @Binding var text: String
     var placeholder: String
     var zoomScale: CGFloat = 1.0
@@ -1041,7 +1058,7 @@ struct MacTextEditor: NSViewRepresentable {
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
-        textView.textContainerInset = NSSize(width: 0, height: 4)
+        textView.textContainerInset = NSSize(width: 0, height: Self.textContainerInsetHeight)
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
 
