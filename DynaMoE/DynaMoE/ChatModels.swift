@@ -71,6 +71,12 @@ nonisolated public struct ChatMessage: Identifiable, Codable, Equatable, Sendabl
     public var timeToFirstTokenSeconds: Double?
     public var thinkingTimeSeconds: Double?
     public var prefillStatus: String?
+    /// Runtime-only marker for messages that must never survive a relaunch:
+    /// the compaction progress bubble streams an uncommitted summary into the
+    /// persisted `messages` array, and a save that caught it mid-pass would
+    /// otherwise restore a partial summary as an ordinary settled system
+    /// message. `ChatSessionStore.normalizedForRestore` drops these on load.
+    public var isTransient: Bool?
     public var toolCalls: [ToolCallRecord]?
     public var jetSpecTau: Double?
     public var jetSpecDraftAccepted: Int?
@@ -87,6 +93,7 @@ nonisolated public struct ChatMessage: Identifiable, Codable, Equatable, Sendabl
         timeToFirstTokenSeconds: Double? = nil,
         thinkingTimeSeconds: Double? = nil,
         prefillStatus: String? = nil,
+        isTransient: Bool? = nil,
         toolCalls: [ToolCallRecord]? = nil,
         jetSpecTau: Double? = nil,
         jetSpecDraftAccepted: Int? = nil
@@ -102,6 +109,7 @@ nonisolated public struct ChatMessage: Identifiable, Codable, Equatable, Sendabl
         self.timeToFirstTokenSeconds = timeToFirstTokenSeconds
         self.thinkingTimeSeconds = thinkingTimeSeconds
         self.prefillStatus = prefillStatus
+        self.isTransient = isTransient
         self.toolCalls = toolCalls
         self.jetSpecTau = jetSpecTau
         self.jetSpecDraftAccepted = jetSpecDraftAccepted
@@ -136,6 +144,15 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
     public var isThinkingEnabled: Bool?
     public var isAgentToolsEnabled: Bool?
     public var queuedPrompts: [QueuedPrompt]
+    /// Rolling general summary of everything a manual /compact removed from
+    /// `messages`, written by the Apple Foundation Model and merged forward at
+    /// every later compaction. Optional and back-compatible: older files
+    /// decode without it, and conversations never compacted carry nil.
+    public var rollingSummary: String?
+    /// Detailed recap of the most recent evicted work, replaced wholesale by
+    /// each /compact so recent context survives summarization at full fidelity
+    /// until the next compaction folds it into `rollingSummary`.
+    public var recentWorkDigest: String?
 
     public init(
         id: UUID = UUID(),
@@ -148,7 +165,9 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         selectedModelPath: String? = nil,
         isThinkingEnabled: Bool? = nil,
         isAgentToolsEnabled: Bool? = nil,
-        queuedPrompts: [QueuedPrompt] = []
+        queuedPrompts: [QueuedPrompt] = [],
+        rollingSummary: String? = nil,
+        recentWorkDigest: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -161,6 +180,8 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         self.isThinkingEnabled = isThinkingEnabled
         self.isAgentToolsEnabled = isAgentToolsEnabled
         self.queuedPrompts = queuedPrompts
+        self.rollingSummary = rollingSummary
+        self.recentWorkDigest = recentWorkDigest
     }
 
     enum CodingKeys: String, CodingKey {
@@ -168,6 +189,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         case selectedModelId, selectedModelName, selectedModelPath
         case isThinkingEnabled, isAgentToolsEnabled
         case queuedPrompts
+        case rollingSummary, recentWorkDigest
     }
 
     public init(from decoder: Decoder) throws {
@@ -183,6 +205,8 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         self.isThinkingEnabled = try container.decodeIfPresent(Bool.self, forKey: .isThinkingEnabled)
         self.isAgentToolsEnabled = try container.decodeIfPresent(Bool.self, forKey: .isAgentToolsEnabled)
         self.queuedPrompts = try container.decodeIfPresent([QueuedPrompt].self, forKey: .queuedPrompts) ?? []
+        self.rollingSummary = try container.decodeIfPresent(String.self, forKey: .rollingSummary)
+        self.recentWorkDigest = try container.decodeIfPresent(String.self, forKey: .recentWorkDigest)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -198,6 +222,8 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         try container.encodeIfPresent(isThinkingEnabled, forKey: .isThinkingEnabled)
         try container.encodeIfPresent(isAgentToolsEnabled, forKey: .isAgentToolsEnabled)
         try container.encode(queuedPrompts, forKey: .queuedPrompts)
+        try container.encodeIfPresent(rollingSummary, forKey: .rollingSummary)
+        try container.encodeIfPresent(recentWorkDigest, forKey: .recentWorkDigest)
     }
 }
 
@@ -224,4 +250,50 @@ public extension ChatSession {
         }
         return latest
     }
+
+    /// The compacted-context block injected into every post-compaction prompt,
+    /// for either backend: the standing general summary first, then the
+    /// detailed recap of the most recently evicted work. Nil before the first
+    /// compaction, and trimmed to nil if both digests are empty.
+    nonisolated var compactionContextBlock: String? {
+        var blocks: [String] = []
+        let general = ChatSession.sanitizeCompactionDigest(rollingSummary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !general.isEmpty {
+            blocks.append("Summary of this conversation's earlier history (compacted, so reply with that knowledge in mind):\n\(general)")
+        }
+        let detail = ChatSession.sanitizeCompactionDigest(recentWorkDigest ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if !detail.isEmpty {
+            blocks.append("The most recently compacted work, kept in detail:\n\(detail)")
+        }
+        return blocks.isEmpty ? nil : blocks.joined(separator: "\n\n")
+    }
+
+    /// Neutralizes chat-template control tokens in a compaction digest before it
+    /// rides inside the system block. The digests are derived from arbitrary
+    /// user messages and tool output, and every weights dialect wraps the system
+    /// block verbatim, so a digest carrying a delimiter such as `</s>`,
+    /// `<|im_end|>`, the DeepSeek sentence marker, or `<|role_end|>` could close
+    /// the system span and inject or malform the roles that follow. Matching the
+    /// general token shapes covers every supported dialect without enumerating
+    /// them by hand.
+    nonisolated static func sanitizeCompactionDigest(_ text: String) -> String {
+        var s = text
+        for rule in compactionDigestScrubRules {
+            guard let regex = try? NSRegularExpression(pattern: rule.pattern) else { continue }
+            let range = NSRange(s.startIndex..<s.endIndex, in: s)
+            s = regex.stringByReplacingMatches(in: s, range: range, withTemplate: rule.replacement)
+        }
+        return s
+    }
+
+    private static let compactionDigestScrubRules: [(pattern: String, replacement: String)] = [
+        // <|im_start|>, <|im_end|>, <|endoftext|>, <|role_end|>, <|System|>, <|User|>, <|Bot|>, <|Tool|>
+        (#"<\|[^|<>]{1,40}\|>"#, "[template-token]"),
+        // DeepSeek/Spark fullwidth-bar markers: <｜start▁of▁sentence｜> and its peers.
+        ("<\u{FF5C}[^|<>]{1,60}\u{FF5C}>", "[template-token]"),
+        // Ling/Hermes role spans.
+        (#"</?role>"#, "[role-token]"),
+        // Llama end/start markers.
+        (#"</?s>"#, "[end-token]")
+    ]
 }

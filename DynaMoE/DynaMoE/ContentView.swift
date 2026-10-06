@@ -1059,6 +1059,19 @@ struct ContentView: View {
     @AppStorage("dynamoe_max_tokens") private var maxNewTokens: Int = 8192
     @State private var activeProfile: ModelProfileType = .coder
     @State private var isGeneratingText: Bool = false
+    /// True while a manual /compact is summarizing history. The summarizer's
+    /// commit rewrites the conversation's message array, so normal sends are
+    /// rejected until it settles — whatever interleaved would be dropped.
+    @State private var isCompactingConversation: Bool = false
+    /// The conversation /compact is currently rewriting, so its progress is
+    /// shown only in the chat the user is looking at, matching how generation
+    /// state is session-scoped.
+    @State private var compactingSessionId: UUID? = nil
+    /// The progress bubble /compact streams its summary into. Only this
+    /// message renders with the spinner/typewriter treatment; passing a bare
+    /// "compacting" flag to the list would mark every historical bubble as
+    /// live-streaming for the duration of the pass.
+    @State private var compactingProgressMessageId: UUID? = nil
     @State private var generatingSessionId: UUID? = nil
     /// Sessions pinned against retention while a generation unwinds or a
     /// replacement is being sent. `stopAutoregressiveGeneration` flips
@@ -1878,6 +1891,7 @@ struct ContentView: View {
                     session: activeSessionBinding,
                     promptText: $chatPromptText,
                     isGenerating: isGeneratingText && (generatingSessionId == (selectedSessionId ?? sessions.first?.id)),
+                    compactionProgressMessageId: (isCompactingConversation && compactingSessionId == (selectedSessionId ?? sessions.first?.id)) ? compactingProgressMessageId : nil,
                     isStreamingOffDisk: isStreamingOffDisk,
                     generationSpeed: generationSpeedTokPerSec,
                     generationTokens: generationTotalTokens,
@@ -2197,6 +2211,11 @@ struct ContentView: View {
         // behind an earlier interrupt still lands in the chat that was active
         // when the user pressed send, not whatever is selected once it runs.
         let targetSessionId = selectedSessionId ?? sessions.first?.id
+        // Slash commands are app actions with their own backend, so they dispatch
+        // before the interrupt/model-load lifecycle: Cmd-Return and a queued
+        // item's "Send Now" reach /compact without loading weights or being
+        // refused when an unrelated load fails.
+        if let handled = dispatchChatCommand(trimmed, sessionId: targetSessionId) { return handled }
 
         let prior = interruptSendTask
         let token = UUID()
@@ -2382,6 +2401,292 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Slash Commands (manual "/compact")
+
+    /// Dispatches a parsed slash command. Commands are app actions rather than
+    /// chat turns: nothing is appended as a user message, and true consumes the
+    /// composer's text the moment the command is accepted for processing;
+    /// outcomes land in the conversation as system notices and the status line.
+    private func handleChatCommand(_ command: ChatCommand, sessionIndex sessionIdx: Int, sessionId: UUID) -> Bool {
+        switch command {
+        case .compact(let focus):
+            return runManualCompact(sessionIndex: sessionIdx, sessionId: sessionId, focus: focus)
+        }
+    }
+
+    /// Manual compaction via /compact. The Apple Foundation Model folds the
+    /// entire conversation into two digests stored on the session: a rolling
+    /// general summary that merges forward across compactions, and a detailed
+    /// recap of the most recently evicted work, replaced wholesale each pass.
+    /// The committed history becomes a blank slate — only the compaction
+    /// marker remains on screen — with both digests injected into every later
+    /// prompt on either backend, so the conversation keeps moving with the
+    /// essential detail intact. Because the pass deletes what it summarizes,
+    /// the transcript accounts for every evicted turn including tool calls:
+    /// a history longer than one summarizer request is split into chunks,
+    /// each older chunk folded into the rolling summary by its own pass, and
+    /// the newest chunk additionally producing the recap. The general summary
+    /// streams live into a progress bubble so the command is visibly working
+    /// from the first moment, and the session is rewritten only after all
+    /// passes succeed — an unavailable or failed summarizer leaves the
+    /// history untouched. The conversation is pinned against chat retention
+    /// for the pass's whole lifetime, so a retention sweep cannot delete it
+    /// while the summarizer is suspended and the commit silently no-ops
+    /// afterwards.
+    private func runManualCompact(sessionIndex sessionIdx: Int, sessionId: UUID, focus: String?) -> Bool {
+        // Compaction rewrites the message array mid-history: a turn still
+        // generating into it, or one still unwinding from a stop, would write
+        // into entries the pass is about to drop. Both states are refused
+        // loudly — commands report themselves, unlike normal sends, which
+        // silently keep the draft. A weights model being loaded does not
+        // block: the summarizer is the system model, and a load touches
+        // engine state, not the conversation.
+        if isGeneratingText {
+            let note = "⚠️ Stop the running turn before compacting — /compact rewrites the conversation while it works."
+            sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
+            generationStatusText = note
+            return true
+        }
+        if generationTeardownTask != nil {
+            let note = "⚠️ The previous turn is still winding down — run /compact again in a moment."
+            sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
+            generationStatusText = note
+            return true
+        }
+        // Blank slate: every message is eligible, notices and prior compact
+        // markers included (the transcript builder skips system roles on its
+        // own, so they contribute nothing to the summaries). If nothing has
+        // been said, the transcript comes back empty and that is what "nothing
+        // to compact" keys on.
+        let evicted = sessions[sessionIdx].messages
+        guard !evicted.isEmpty else {
+            let note = "ℹ️ Nothing to compact — this conversation is still empty."
+            sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
+            generationStatusText = note
+            return true
+        }
+        let availability = AppleFoundationModelService.checkAvailability()
+        guard case .ready = availability else {
+            let note = "⚠️ Cannot compact — Apple Foundation Model unavailable (\(availability.statusText))."
+            sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
+            generationStatusText = note
+            return true
+        }
+        // Read before any async work: both digests describe pre-pass state,
+        // and the live session is re-resolved by identity at commit.
+        let previousSummary = sessions[sessionIdx].rollingSummary
+        let previousRecap = sessions[sessionIdx].recentWorkDigest
+        let summaryInstructions = AppleFoundationModelService.compactionSummaryInstructions(focus: focus)
+        let recapInstructions = AppleFoundationModelService.compactionRecapInstructions(focus: focus)
+        // Compaction deletes what it summarizes, so the transcript must
+        // account for every evicted turn: the chunker includes tool calls
+        // with their results and splits long histories into budget-sized
+        // pieces instead of silently dropping the oldest past a flat cap.
+        // The chunk budget is derived per request — prior digests, pass
+        // instructions, and the response reservation are counted first — so
+        // a repeat compaction cannot overflow the system model's window the
+        // way a fixed chunk size could. Each chunk gets its own summarizer
+        // pass below; the newest chunk additionally feeds the detailed
+        // recap.
+        let chunkBudget = AppleFoundationModelService.compactionChunkCharBudget(
+            previousSummary: previousSummary,
+            previousRecap: previousRecap,
+            instructions: summaryInstructions,
+            // Reserve for the larger of the two passes: the recap's response is
+            // bigger than the summary's, and the same chunk feeds both.
+            maximumResponseTokens: max(
+                AppleFoundationModelService.compactionSummaryResponseTokens,
+                AppleFoundationModelService.compactionRecapResponseTokens
+            )
+        )
+        // A non-positive budget means the prior digests and the pass
+        // instructions already fill the summarizer's window; no chunk can fit,
+        // and adding one would only push every pass further past the limit.
+        // Refuse with a clear message instead of letting each pass overflow.
+        guard chunkBudget > 0 else {
+            let note = "⚠️ Cannot compact — the existing summary plus your /compact focus already fill the on-device model's window. Shorten the focus and try again."
+            sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
+            generationStatusText = note
+            return true
+        }
+        let transcriptChunks = AppleFoundationModelService.buildCompactionTranscriptChunks(
+            from: evicted,
+            excludingMessageIds: [],
+            charBudget: chunkBudget
+        )
+        guard !transcriptChunks.isEmpty else {
+            let note = "ℹ️ Nothing to compact — no user or assistant content to summarize yet."
+            sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
+            generationStatusText = note
+            return true
+        }
+        let evictedCount = evicted.count
+        // The progress bubble makes the command visible from the instant it is
+        // accepted: before any summary text flows it carries the same spinning
+        // composing pill a chat turn shows during prefill, then the general
+        // summary streams into it at the AFM chat cadence. The commit rewrite
+        // below drops it; on failure it becomes the error notice.
+        let progressId = UUID()
+        sessions[sessionIdx].messages.append(ChatMessage(
+            id: progressId,
+            role: .system,
+            content: "",
+            prefillStatus: "🍎 Apple Foundation Model — summarizing \(evictedCount) messages…",
+            isTransient: true
+        ))
+        isCompactingConversation = true
+        compactingSessionId = sessionId
+        compactingProgressMessageId = progressId
+        // The summarizer suspends for seconds at a time while the user stays
+        // free to create or switch chats; an unpinned conversation sitting at
+        // the retention limit could be deleted mid-pass, and the commit guard
+        // would return silently after the store destroyed the original. Same
+        // pin the other long-running session operations hold.
+        retainRetentionProtection(sessionId)
+        generationStatusText = "🗂 Compacting \(evictedCount) messages via Apple Foundation Model…"
+        Task { @MainActor in
+            defer {
+                self.isCompactingConversation = false
+                self.compactingSessionId = nil
+                self.compactingProgressMessageId = nil
+                self.releaseRetentionProtection(sessionId)
+            }
+            func postToProgress(_ text: String) {
+                guard let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
+                      let msgIdx = self.sessions[liveIdx].messages.firstIndex(where: { $0.id == progressId }) else { return }
+                // First visible characters retire the composing pill, exactly
+                // like a chat turn's transition from ingestion to streaming.
+                self.sessions[liveIdx].messages[msgIdx].prefillStatus = nil
+                self.sessions[liveIdx].messages[msgIdx].content = text
+            }
+            // Keeps the composing pill but retitles it: the intermediate
+            // passes of a long conversation stay visible as progress without
+            // streaming their intermediate digests into the bubble.
+            func updateProgressStatus(_ text: String) {
+                guard let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
+                      let msgIdx = self.sessions[liveIdx].messages.firstIndex(where: { $0.id == progressId }) else { return }
+                self.sessions[liveIdx].messages[msgIdx].prefillStatus = text
+            }
+            // Appends after the streamed summary instead of replacing it, so the
+            // finished general summary stays visible through the recap pass.
+            func postToProgressLatest(_ text: String) {
+                guard let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
+                      let msgIdx = self.sessions[liveIdx].messages.firstIndex(where: { $0.id == progressId }) else { return }
+                self.sessions[liveIdx].messages[msgIdx].content += text
+            }
+            do {
+                // Older chunks merge into the rolling summary one pass each.
+                // The previous recap rides along on the first pass only: it
+                // describes work older than this transcript, after the first
+                // pass it is already folded in, and the recap written at the
+                // end replaces it wholesale.
+                var mergedSummary = previousSummary
+                var mergedRecap = previousRecap
+                let olderChunks = transcriptChunks.dropLast()
+                for (offset, chunk) in olderChunks.enumerated() {
+                    updateProgressStatus(
+                        "🍎 Apple Foundation Model — folding older history into the summary (part \(offset + 1) of \(olderChunks.count))…"
+                    )
+                    let merged = try await AppleFoundationModelService.respondOnce(
+                        prompt: AppleFoundationModelService.compactionPrompt(
+                            previousSummary: mergedSummary,
+                            previousRecap: mergedRecap,
+                            evictedTranscript: chunk
+                        ),
+                        instructions: summaryInstructions,
+                        temperature: 0.0,
+                        maximumResponseTokens: AppleFoundationModelService.compactionSummaryResponseTokens
+                    )
+                    let mergedText = merged.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !mergedText.isEmpty else {
+                        throw AppleFoundationModelUnavailableError(reason: "An older-history digest came back empty.")
+                    }
+                    mergedSummary = mergedText
+                    mergedRecap = nil
+                }
+                let recentTranscript = transcriptChunks.last!
+                let summaryPrompt = AppleFoundationModelService.compactionPrompt(
+                    previousSummary: mergedSummary,
+                    previousRecap: mergedRecap,
+                    evictedTranscript: recentTranscript
+                )
+                let recapPrompt = "Conversation excerpt, oldest messages first — the most recent work last:\n\n\(recentTranscript)"
+                var lastUIWrite = 0.0
+                let newSummary = try await AppleFoundationModelService.streamChatTurn(
+                    prompt: summaryPrompt,
+                    instructions: summaryInstructions,
+                    temperature: 0.0,
+                    maximumResponseTokens: AppleFoundationModelService.compactionSummaryResponseTokens
+                ) { partial in
+                    let now = CFAbsoluteTimeGetCurrent()
+                    guard now - lastUIWrite >= 0.016 else { return }
+                    lastUIWrite = now
+                    postToProgress("🗂 Compacting \(evictedCount) messages — general summary so far:\n\n\(partial)")
+                }
+                let newSummaryText = newSummary.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !newSummaryText.isEmpty else {
+                    throw AppleFoundationModelUnavailableError(reason: "The summary came back empty.")
+                }
+                // Append rather than overwrite: the streamed summary stays
+                // visible while the recap pass runs.
+                postToProgressLatest("\n\n🗂 Summary written — capturing the detailed recap of the recent work…")
+                let newRecap = try await AppleFoundationModelService.respondOnce(
+                    prompt: recapPrompt,
+                    instructions: recapInstructions,
+                    temperature: 0.0,
+                    maximumResponseTokens: AppleFoundationModelService.compactionRecapResponseTokens
+                )
+                let newRecapText = newRecap.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !newRecapText.isEmpty else {
+                    throw AppleFoundationModelUnavailableError(reason: "The recap came back empty.")
+                }
+                // Re-resolve by identity: the user may have switched chats while
+                // the on-device model worked, and a pruning retention pass may
+                // have removed this conversation in the meantime.
+                guard let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) else { return }
+                self.sessions[liveIdx].rollingSummary = newSummaryText
+                self.sessions[liveIdx].recentWorkDigest = newRecapText
+                // Blank slate: the whole conversation — evicted messages and
+                // the progress bubble — is replaced by a single marker in one
+                // write; both digests carry the context from here on.
+                let marker = ChatMessage(
+                    role: .system,
+                    content: "🗂 \(evictedCount) messages compacted into a rolling summary by Apple Foundation Model. The conversation continues from that summary context."
+                )
+                self.sessions[liveIdx].messages = [marker]
+                // The token prefix changed: any pinned KV state for this
+                // conversation no longer matches, and reusing it would splice
+                // summaries into stale slots. One full re-prefill is the cost
+                // of compaction; it is paid here, deliberately.
+                PrefixCacheManager.shared.invalidate(sessionId: sessionId)
+                self.generationStatusText = "🗂 Compacted \(evictedCount) messages — details live in the rolling summary."
+            } catch {
+                self.generationStatusText = "⚠️ Compaction failed: \(error.localizedDescription)"
+                postToProgress("⚠️ Compaction failed: \(error.localizedDescription) — the conversation was left unchanged.")
+            }
+        }
+        return true
+    }
+
+    /// Dispatches a composer slash command as an app action, independent of any
+    /// model-load or generation gate. Returns nil when `text` is not a
+    /// recognized command, so the caller falls through to an ordinary chat
+    /// turn. Shared by the plain send path and the immediate-send path so
+    /// Cmd-Return and queued "Send Now" reach `/compact` without loading weights
+    /// or being refused by an unrelated load.
+    private func dispatchChatCommand(_ text: String, sessionId explicitSessionId: UUID?) -> Bool? {
+        guard let command = ChatCommand.parse(text) else { return nil }
+        guard let cmdSessionId = explicitSessionId ?? selectedSessionId ?? sessions.first?.id,
+              let cmdSessionIdx = sessions.firstIndex(where: { $0.id == cmdSessionId }) else { return false }
+        if isCompactingConversation {
+            let note = "⚠️ A compaction is already running — try /compact again once it finishes."
+            sessions[cmdSessionIdx].messages.append(ChatMessage(role: .system, content: note))
+            generationStatusText = note
+            return true
+        }
+        return handleChatCommand(command, sessionIndex: cmdSessionIdx, sessionId: cmdSessionId)
+    }
+
     /// Returns whether the prompt was accepted. A `false` result means nothing
     /// was sent, so the composer must keep the text instead of clearing it.
     ///
@@ -2394,6 +2699,12 @@ struct ContentView: View {
         // need not have succeeded: with persistence down the user can still chat,
         // and the merge preserves any in-memory conversation with real messages.
         guard hasAttemptedInitialLoad else { return false }
+        // Slash commands are app actions, not chat turns, so they dispatch
+        // before every send lifecycle gate: /compact needs no loaded weights
+        // model — the system on-device model doing the summarizing is its own
+        // backend — and states that would reject it tell the user why instead
+        // of silently keeping the draft.
+        if let handled = dispatchChatCommand(text, sessionId: explicitSessionId) { return handled }
         // A stopped generation may still be unwinding. Starting now would reset the
         // shared KV buffers the cancelled task can still be using, so reject the
         // send (leaving the draft intact) until its teardown finishes. Async callers
@@ -2412,6 +2723,12 @@ struct ContentView: View {
         guard !isLoadingModel else { return false }
         guard let currentSessionId = explicitSessionId ?? selectedSessionId ?? sessions.first?.id else { return false }
         guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return false }
+        // A running compaction rewrites this session's messages when its
+        // summaries land; an interleaved send would be part of the rewrite.
+        if isCompactingConversation {
+            generationStatusText = "⚠️ Conversation is being compacted — try again in a moment."
+            return false
+        }
         // Backstop for the send button's isModelLoaded gate: sending before the
         // engine is ready must not touch chat or harness state — a pre-load
         // prompt was observed to poison later sessions (garbled output even in
@@ -2463,6 +2780,20 @@ struct ContentView: View {
                 modelPath: nil,
                 currentDate: conversationDate
             ).trimmingCharacters(in: .whitespacesAndNewlines)
+            // The persona and newest prompt are not summarizable, so when even
+            // they plus the framework's minimum response cannot fit the window
+            // the turn is refused with a clear size error instead of being
+            // allowed to overflow. Roll back the user/assistant pair appended
+            // above so the composer keeps the text and the chat is unchanged.
+            guard AppleFoundationModelService.chatTurnFitsWindow(
+                systemPrompt: afmSystemPrompt,
+                prompt: text
+            ) else {
+                sessions[sessionIdx].messages.removeLast(2)
+                let err = "⚠️ This message is too long for the on-device model's context window. Shorten it and try again."
+                generationStatusText = err
+                return false
+            }
             // History travels in the session instructions as context; only the
             // newest user message is the prompt. Feeding the speaker-labeled
             // transcript as the prompt made the model continue it like a
@@ -2472,10 +2803,33 @@ struct ContentView: View {
             // and the response ceiling; the transcript builder counts every
             // turn against that budget — including the newest — so history
             // can never be what pushes the turn past the window.
+            // The digest is trimmed to whatever the window can spare once the
+            // persona, this prompt, and the framework's minimum response are
+            // reserved, so the assembled turn can never overflow through the
+            // compacted context. The same trimmed value feeds the response
+            // ceiling and the instruction builder below.
+            let afmCompactionContext = AppleFoundationModelService.chatTurnCompactionContext(
+                sessions[sessionIdx].compactionContextBlock,
+                systemPrompt: afmSystemPrompt,
+                prompt: text
+            )
+            // The response ceiling is derived from the same window accounting
+            // as the history budget: with a large persona, prompt, or compacted
+            // digest context riding along, the requested cap could overflow
+            // the system model's window with history already floored at zero,
+            // so the turn generates a little shorter instead of failing
+            // mid-generation.
+            let afmResponseTokens = AppleFoundationModelService.chatTurnResponseTokenCeiling(
+                requested: maxNewTokens,
+                systemPrompt: afmSystemPrompt,
+                prompt: text,
+                compactionContext: afmCompactionContext
+            )
             let afmHistoryBudget = AppleFoundationModelService.historyCharBudget(
                 systemPrompt: afmSystemPrompt,
                 prompt: text,
-                maximumResponseTokens: maxNewTokens
+                maximumResponseTokens: afmResponseTokens,
+                compactionContext: afmCompactionContext
             )
             let historyTranscript = AppleFoundationModelService.buildConversationTranscript(
                 from: sessions[sessionIdx].messages,
@@ -2484,13 +2838,15 @@ struct ContentView: View {
             )
             let afmInstructions = AppleFoundationModelService.buildChatTurnInstructions(
                 systemPrompt: afmSystemPrompt,
-                historyTranscript: historyTranscript
+                historyTranscript: historyTranscript,
+                compactionContext: afmCompactionContext
             )
             startAppleFoundationModelGeneration(
                 sessionId: currentSessionId,
                 messageId: assistantMsgId,
                 userPrompt: text,
-                instructionsText: afmInstructions
+                instructionsText: afmInstructions,
+                responseTokenCeiling: afmResponseTokens
             )
             return true
         }
@@ -2513,6 +2869,13 @@ struct ContentView: View {
             modelPath: activeLoadedModelPath,
             currentDate: conversationDate
         ).trimmingCharacters(in: .whitespacesAndNewlines)
+        // The post-compaction digest travels inside the system block for every
+        // chat-template dialect at once: the templates below each wrap
+        // `effectiveSystem` verbatim, so appending here is the single injection
+        // point for weights sessions.
+        if let compactedContext = sessions[sessionIdx].compactionContextBlock {
+            effectiveSystem += "\n\n" + compactedContext
+        }
 
         let agentToolsEnabled = (sessions[sessionIdx].isAgentToolsEnabled ?? defaultAgentToolsEnabled)
         if agentToolsEnabled {
@@ -4421,7 +4784,8 @@ struct ContentView: View {
         sessionId: UUID,
         messageId: UUID,
         userPrompt: String,
-        instructionsText: String
+        instructionsText: String,
+        responseTokenCeiling: Int? = nil
     ) -> Bool {
         let availability = AppleFoundationModelService.checkAvailability()
         guard case .ready = availability else {
@@ -4459,8 +4823,10 @@ struct ContentView: View {
         // The active profile drives temperature (clamped to the model's 0…1
         // range) and the response ceiling (clamped to its small context);
         // penalties, Min-P, and Top-P have no on-device equivalent and are ignored.
+        // A caller that derived a window-fitting ceiling passes it; nil keeps
+        // the user's setting.
         let profileTemperature = Double(temperature)
-        let responseCeiling = maxNewTokens
+        let responseCeiling = responseTokenCeiling ?? maxNewTokens
         let generationStartTime = CFAbsoluteTimeGetCurrent()
 
         // This Task is deliberately non-detached: it inherits the enclosing

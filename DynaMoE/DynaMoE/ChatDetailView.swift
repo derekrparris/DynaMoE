@@ -13,6 +13,11 @@ struct ChatDetailView: View {
     @ObservedObject var localModelManager: LocalModelManager = LocalModelManager.shared
     
     var isGenerating: Bool
+    /// The progress bubble /compact is streaming its summary into, or nil.
+    /// Rendering flags are scoped to this message id, never a bare
+    /// "compacting" boolean, so historical bubbles keep their settled
+    /// Markdown treatment while the pass runs.
+    var compactionProgressMessageId: UUID? = nil
     var isStreamingOffDisk: Bool = false
     var generationSpeed: Double
     var generationTokens: Int
@@ -77,11 +82,19 @@ struct ChatDetailView: View {
     @AppStorage("dynamoe_agent_turbo_mode") private var isTurboModeEnabled: Bool = false
     @ObservedObject private var subagentManager = SubagentManager.shared
 
-    /// Ticks while the newest message streams (content or thinking grows), so the
+    /// Ticks while the newest message streams (content or thinking grows — a
+    /// chat turn, or the /compact progress bubble typing out a summary), so the
     /// scroll handlers can follow live output without diffing full strings.
     private var streamingTick: Int {
         guard let last = session?.messages.last else { return 0 }
         return last.content.count &* 31 &+ (last.thinkingContent?.count ?? 0)
+    }
+
+    /// True while a /compact pass is streaming into its progress bubble.
+    /// Only the scroll handlers need the conversation-level bit; everything
+    /// rendered is keyed to `compactionProgressMessageId` instead.
+    private var isCompactingConversation: Bool {
+        compactionProgressMessageId != nil
     }
 
     private func modelIconName(for name: String?) -> String {
@@ -287,6 +300,7 @@ struct ChatDetailView: View {
                                         message: message,
                                         isGenerating: isGenerating && message.id == session.messages.last?.id,
                                         isStreamingOffDisk: isStreamingOffDisk,
+                                        isCompactingConversation: message.id == compactionProgressMessageId,
                                         isExpanded: Binding(
                                             get: { isReasoningExpanded[message.id] ?? reasoningExpandedByDefault },
                                             set: { isReasoningExpanded[message.id] = $0 }
@@ -328,7 +342,7 @@ struct ChatDetailView: View {
                     }
                 }
                 .onChange(of: streamingTick) { _ in
-                    guard isPinnedToBottom, isGenerating else { return }
+                    guard isPinnedToBottom, isGenerating || isCompactingConversation else { return }
                     scrollAnchorTick += 1
                     DispatchQueue.main.async {
                         proxy.scrollTo(scrollAnchorTick, anchor: .bottom)
@@ -843,19 +857,24 @@ struct ChatDetailView: View {
                                 .help("Stop generating")
                             }
                         } else {
+                            // Slash commands are backend-independent app actions
+                            // (/compact runs on the system model), so the button
+                            // must dispatch them even with no weights model
+                            // loaded instead of dying silently like a chat send.
+                            let draftIsCommand = ChatCommand.parse(promptText) != nil
                             Button(action: {
                                 let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
-                                if !trimmed.isEmpty && isModelLoaded {
+                                if !trimmed.isEmpty && (isModelLoaded || ChatCommand.parse(trimmed) != nil) {
                                     if onSendMessage(trimmed) { promptText = "" }
                                 }
                             }) {
                                 Image(systemName: "arrow.right.circle.fill")
                                     .font(.system(size: max(20, 26 * zoomManager.zoomScale)))
-                                    .foregroundColor(promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !isModelLoaded ? .secondary.opacity(0.3) : .purple)
+                                    .foregroundColor(promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (!isModelLoaded && !draftIsCommand) ? .secondary.opacity(0.3) : .purple)
                             }
                             .buttonStyle(.plain)
-                            .disabled(promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !isModelLoaded)
-                            .help(isModelLoaded ? "Send Message" : "Load a model first")
+                            .disabled(promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (!isModelLoaded && !draftIsCommand))
+                            .help(isModelLoaded || draftIsCommand ? "Send Message" : "Load a model first")
                         }
                     }
                 }
@@ -1063,6 +1082,7 @@ struct ChatMessageView: View {
     let message: ChatMessage
     var isGenerating: Bool = false
     var isStreamingOffDisk: Bool = false
+    var isCompactingConversation: Bool = false
     @Binding var isExpanded: Bool
     @State private var isCopied = false
     @State private var feedback: String? = nil
@@ -1247,11 +1267,12 @@ struct ChatMessageView: View {
                     if !displayContent.isEmpty {
                         MarkdownMessageView(
                             content: displayContent,
-                            isStreaming: isGenerating && message.isThinking == false,
+                            isStreaming: (isGenerating || isCompactingConversation) && message.isThinking == false,
                             isStreamingOffDisk: isStreamingOffDisk
                         )
-                    } else if isGenerating && !message.isThinking && !hasThinkingContent && (message.toolCalls == nil || message.toolCalls!.isEmpty) {
-                        // Only for non-thinking models during initial prefill / generation
+                    } else if (isGenerating || isCompactingConversation) && !message.isThinking && !hasThinkingContent && (message.toolCalls == nil || message.toolCalls!.isEmpty) {
+                        // Only for non-thinking models during initial prefill / generation,
+                        // or the /compact progress bubble before its first summary text
                         if let prefill = message.prefillStatus {
                             HStack(spacing: 8) {
                                 ProgressView()
@@ -1267,7 +1288,7 @@ struct ChatMessageView: View {
                         } else {
                             HStack(spacing: 8) {
                                 StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
-                                Text(isStreamingOffDisk ? "Streaming MoE experts off SSD disk..." : "Generating response...")
+                                Text(isCompactingConversation ? "Summarizing the conversation..." : (isStreamingOffDisk ? "Streaming MoE experts off SSD disk..." : "Generating response..."))
                                     .font(.system(size: 13))
                                     .foregroundColor(.secondary)
                             }

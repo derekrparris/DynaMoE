@@ -248,7 +248,11 @@ struct HelpAndSettingsGuideView: View {
                         .font(.system(size: 12))
                         .lineSpacing(2)
 
-                    Text("The active profile's system prompt and temperature drive the turn (temperature clamped to the model's 0-1 range). Agent tools, reasoning blocks, JetSpec, and KV-cache acceleration are local-weights features; the system model runs as a plain conversationalist. Very long conversations keep only the most recent history; AFM-powered summarization compaction is planned.")
+                    Text("The active profile's system prompt and temperature drive the turn (temperature clamped to the model's 0-1 range). Agent tools, reasoning blocks, JetSpec, and KV-cache acceleration are local-weights features; the system model runs as a plain conversationalist.")
+                        .font(.system(size: 12))
+                        .lineSpacing(2)
+
+                    Text("The system model also powers /compact, a manual command usable on any backend: it summarizes the whole conversation into a rolling general summary plus a detailed recap of the latest work, then leaves a blank slate — only the compaction marker stays on screen — with both digests riding along in every later prompt on either backend. When the on-device model is unavailable, history stays untouched rather than being cut down.")
                         .font(.system(size: 12))
                         .lineSpacing(2)
                 }
