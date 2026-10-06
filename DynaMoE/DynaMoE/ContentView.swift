@@ -2211,6 +2211,11 @@ struct ContentView: View {
         // behind an earlier interrupt still lands in the chat that was active
         // when the user pressed send, not whatever is selected once it runs.
         let targetSessionId = selectedSessionId ?? sessions.first?.id
+        // Slash commands are app actions with their own backend, so they dispatch
+        // before the interrupt/model-load lifecycle: Cmd-Return and a queued
+        // item's "Send Now" reach /compact without loading weights or being
+        // refused when an unrelated load fails.
+        if let handled = dispatchChatCommand(trimmed, sessionId: targetSessionId) { return handled }
 
         let prior = interruptSendTask
         let token = UUID()
@@ -2647,6 +2652,25 @@ struct ContentView: View {
         return true
     }
 
+    /// Dispatches a composer slash command as an app action, independent of any
+    /// model-load or generation gate. Returns nil when `text` is not a
+    /// recognized command, so the caller falls through to an ordinary chat
+    /// turn. Shared by the plain send path and the immediate-send path so
+    /// Cmd-Return and queued "Send Now" reach `/compact` without loading weights
+    /// or being refused by an unrelated load.
+    private func dispatchChatCommand(_ text: String, sessionId explicitSessionId: UUID?) -> Bool? {
+        guard let command = ChatCommand.parse(text) else { return nil }
+        guard let cmdSessionId = explicitSessionId ?? selectedSessionId ?? sessions.first?.id,
+              let cmdSessionIdx = sessions.firstIndex(where: { $0.id == cmdSessionId }) else { return false }
+        if isCompactingConversation {
+            let note = "⚠️ A compaction is already running — try /compact again once it finishes."
+            sessions[cmdSessionIdx].messages.append(ChatMessage(role: .system, content: note))
+            generationStatusText = note
+            return true
+        }
+        return handleChatCommand(command, sessionIndex: cmdSessionIdx, sessionId: cmdSessionId)
+    }
+
     /// Returns whether the prompt was accepted. A `false` result means nothing
     /// was sent, so the composer must keep the text instead of clearing it.
     ///
@@ -2664,17 +2688,7 @@ struct ContentView: View {
         // model — the system on-device model doing the summarizing is its own
         // backend — and states that would reject it tell the user why instead
         // of silently keeping the draft.
-        if let command = ChatCommand.parse(text) {
-            guard let cmdSessionId = explicitSessionId ?? selectedSessionId ?? sessions.first?.id,
-                  let cmdSessionIdx = sessions.firstIndex(where: { $0.id == cmdSessionId }) else { return false }
-            if isCompactingConversation {
-                let note = "⚠️ A compaction is already running — try /compact again once it finishes."
-                sessions[cmdSessionIdx].messages.append(ChatMessage(role: .system, content: note))
-                generationStatusText = note
-                return true
-            }
-            return handleChatCommand(command, sessionIndex: cmdSessionIdx, sessionId: cmdSessionId)
-        }
+        if let handled = dispatchChatCommand(text, sessionId: explicitSessionId) { return handled }
         // A stopped generation may still be unwinding. Starting now would reset the
         // shared KV buffers the cancelled task can still be using, so reject the
         // send (leaving the draft intact) until its teardown finishes. Async callers
@@ -2750,6 +2764,20 @@ struct ContentView: View {
                 modelPath: nil,
                 currentDate: conversationDate
             ).trimmingCharacters(in: .whitespacesAndNewlines)
+            // The persona and newest prompt are not summarizable, so when even
+            // they plus the framework's minimum response cannot fit the window
+            // the turn is refused with a clear size error instead of being
+            // allowed to overflow. Roll back the user/assistant pair appended
+            // above so the composer keeps the text and the chat is unchanged.
+            guard AppleFoundationModelService.chatTurnFitsWindow(
+                systemPrompt: afmSystemPrompt,
+                prompt: text
+            ) else {
+                sessions[sessionIdx].messages.removeLast(2)
+                let err = "⚠️ This message is too long for the on-device model's context window. Shorten it and try again."
+                generationStatusText = err
+                return false
+            }
             // History travels in the session instructions as context; only the
             // newest user message is the prompt. Feeding the speaker-labeled
             // transcript as the prompt made the model continue it like a
@@ -2759,7 +2787,16 @@ struct ContentView: View {
             // and the response ceiling; the transcript builder counts every
             // turn against that budget — including the newest — so history
             // can never be what pushes the turn past the window.
-            let afmCompactionContext = sessions[sessionIdx].compactionContextBlock
+            // The digest is trimmed to whatever the window can spare once the
+            // persona, this prompt, and the framework's minimum response are
+            // reserved, so the assembled turn can never overflow through the
+            // compacted context. The same trimmed value feeds the response
+            // ceiling and the instruction builder below.
+            let afmCompactionContext = AppleFoundationModelService.chatTurnCompactionContext(
+                sessions[sessionIdx].compactionContextBlock,
+                systemPrompt: afmSystemPrompt,
+                prompt: text
+            )
             // The response ceiling is derived from the same window accounting
             // as the history budget: with a large persona, prompt, or compacted
             // digest context riding along, the requested cap could overflow

@@ -291,6 +291,87 @@ final class ConversationCompactionTests: XCTestCase {
         XCTAssertEqual(absurd, 64)
     }
 
+    func testChatTurnCompactionContextFitsWindowAroundMinimumResponse() {
+        let persona = String(repeating: "p", count: 600)
+        let prompt = String(repeating: "u", count: 500)
+        // The oversized digest is trimmed to leave room for the framework's
+        // minimum response, and the assembled fixed parts plus that response fit
+        // inside the session window.
+        let oversized = String(repeating: "d", count: 15_000)
+        let fitted = AppleFoundationModelService.chatTurnCompactionContext(
+            oversized,
+            systemPrompt: persona,
+            prompt: prompt
+        )
+        XCTAssertNotNil(fitted)
+        XCTAssertLessThan(fitted!.count, oversized.count)
+        let fixed = persona.count + prompt.count + fitted!.count
+            + AppleFoundationModelService.chatTurnRulesText.count
+            + AppleFoundationModelService.historyBlockHeader.count + 64
+        XCTAssertLessThanOrEqual(
+            fixed + AppleFoundationModelService.minimumResponseTokens * 4,
+            AppleFoundationModelService.sessionContextChars
+        )
+        // The ceiling derived from the same oversized context trims it
+        // internally, so it is at least the framework minimum and the turn can
+        // actually be generated instead of overflowing.
+        let ceiling = AppleFoundationModelService.chatTurnResponseTokenCeiling(
+            requested: 8_192,
+            systemPrompt: persona,
+            prompt: prompt,
+            compactionContext: oversized
+        )
+        XCTAssertGreaterThanOrEqual(ceiling, AppleFoundationModelService.minimumResponseTokens)
+        // No digest is passed through untouched, and nil stays nil.
+        XCTAssertEqual(
+            AppleFoundationModelService.chatTurnCompactionContext(nil, systemPrompt: persona, prompt: prompt),
+            nil
+        )
+        XCTAssertEqual(
+            AppleFoundationModelService.chatTurnCompactionContext("short", systemPrompt: persona, prompt: prompt),
+            "short"
+        )
+
+        // A persona large enough that even the persona and prompt cannot carry
+        // the minimum response is reported as unfittable, so the caller refuses
+        // the turn instead of letting the fixed parts overflow.
+        let hugePersona = String(repeating: "p", count: AppleFoundationModelService.sessionContextChars)
+        XCTAssertFalse(AppleFoundationModelService.chatTurnFitsWindow(systemPrompt: hugePersona, prompt: prompt))
+        XCTAssertTrue(AppleFoundationModelService.chatTurnFitsWindow(systemPrompt: "You are DynaMoE.", prompt: "hi"))
+    }
+
+    // MARK: - Digest Sanitization
+
+    func testCompactionDigestSanitizesTemplateDelimiters() {
+        // A digest derived from tool output or user text can carry a dialect's
+        // control tokens; the system block is wrapped verbatim by every template,
+        // so they must be neutralized before injection or they close the system
+        // span and inject roles.
+        let fullwidth = UnicodeScalar(0xFF5C)! // ｜
+        let blockSep = UnicodeScalar(0x2581)!  // ▁
+        let sparkMarker = "<\(fullwidth)end\(blockSep)of\(blockSep)text\(fullwidth)>"
+        let raw = "before <|im_end|> <|role_end|> </s> <role>ASSISTANT</role> \(sparkMarker) after"
+        let clean = ChatSession.sanitizeCompactionDigest(raw)
+        for token in ["<|im_end|>", "<|role_end|>", "</s>", "<role>", "</role>", sparkMarker] {
+            XCTAssertFalse(clean.contains(token), "\(token) must be neutralized")
+        }
+        XCTAssertTrue(clean.contains("before"))
+        XCTAssertTrue(clean.contains("after"))
+    }
+
+    func testCompactionContextBlockSanitizesDigestsForSystemInjection() {
+        var session = ChatSession()
+        session.rollingSummary = "old context with <|im_end|> leak"
+        session.recentWorkDigest = "recent <role>USER</role> work"
+        let block = session.compactionContextBlock
+        XCTAssertNotNil(block)
+        XCTAssertFalse(block!.contains("<|im_end|>"))
+        XCTAssertFalse(block!.contains("<role>"))
+        XCTAssertFalse(block!.contains("</role>"))
+        XCTAssertTrue(block!.contains("old context"))
+        XCTAssertTrue(block!.contains("recent"))
+    }
+
     // MARK: - Persistence
 
     func testCompactedSessionFieldsRoundTripThroughPersistence() throws {

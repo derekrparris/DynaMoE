@@ -519,17 +519,60 @@ public enum AppleFoundationModelService {
         min(maxRevealStepPerTick, max(1, backlog / 6))
     }
 
+    /// The framework's own floor on a response budget: the on-device model
+    /// refuses fewer than this many response tokens, and `clampMaximumResponse
+    /// Tokens` raises anything smaller back up to it. A turn whose fixed parts
+    /// leave less room than this cannot be assembled without overflowing the
+    /// session window, so the flexible parts must fit around it.
+    nonisolated public static let minimumResponseTokens = 64
+
+    /// Character count the non-digest fixed parts of a chat-turn request always
+    /// occupy: persona, output rules, the history header, a small pad, and the
+    /// reserved minimum response. `historyCharBudget` and the compaction digest
+    /// are the flexible occupants measured against it.
+    nonisolated public static func chatTurnFixedCharFloor(systemPrompt: String?, prompt: String) -> Int {
+        let personaChars = (systemPrompt ?? "").trimmingCharacters(in: .whitespacesAndNewlines).count
+        return personaChars + prompt.count + chatTurnRulesText.count + historyBlockHeader.count + 64
+            + minimumResponseTokens * 4
+    }
+
+    /// Whether the persona and newest prompt alone leave room for the framework's
+    /// minimum response inside the session window. When false, no digest size can
+    /// save the turn and the caller must reject it with a clear size error rather
+    /// than let the fixed parts overflow.
+    nonisolated public static func chatTurnFitsWindow(systemPrompt: String?, prompt: String) -> Bool {
+        chatTurnFixedCharFloor(systemPrompt: systemPrompt, prompt: prompt) <= sessionContextChars
+    }
+
+    /// Truncates a compaction digest so the turn's fixed parts plus at least
+    /// `minimumResponseTokens` of response fit the session window. The digest is
+    /// the one flexible fixed part between the persona and the newest prompt, so
+    /// it gives way first; `nil` is preserved as no digest, and a digest too
+    /// large for the remaining budget is trimmed to it (possibly to empty when
+    /// the window is exactly full).
+    nonisolated public static func chatTurnCompactionContext(
+        _ compactionContext: String?,
+        systemPrompt: String?,
+        prompt: String
+    ) -> String? {
+        guard let context = compactionContext, !context.isEmpty else { return compactionContext }
+        let budget = sessionContextChars - chatTurnFixedCharFloor(systemPrompt: systemPrompt, prompt: prompt)
+        guard budget > 0 else { return "" }
+        return context.count <= budget ? context : String(context.prefix(budget))
+    }
+
     /// Clamps a chat turn's response-token reservation so the assembled
     /// request cannot outgrow the system model's window through its fixed
     /// parts alone. `historyCharBudget` can only shrink the history block;
     /// with a large persona, prompt, or compacted digest context riding
     /// along, persona + digests + prompt + the requested response could exceed
-    /// the window with history already floored at zero. The response, the one
-    /// flexible reserved occupant, gives way instead: the turn's ceiling is
-    /// the lesser of the requested (framework-clamped) ceiling and what the
-    /// window has left, floored at the framework's own minimum. Normal turns
-    /// keep their full ceiling; only genuinely overflowing configurations
-    /// generate a little shorter rather than failing mid-generation.
+    /// the window with history already floored at zero. The digest is first
+    /// trimmed to whatever the window can spare (see
+    /// `chatTurnCompactionContext`), which leaves room for the framework's
+    /// minimum response, so the returned ceiling always assembles with that
+    /// trimmed context. A caller that assembles the request must pass that
+    /// trimmed context through to the instruction builder; `chatTurnFitsWindow`
+    /// guards the impossible case where even the persona and prompt do not fit.
     nonisolated public static func chatTurnResponseTokenCeiling(
         requested: Int?,
         systemPrompt: String?,
@@ -537,14 +580,19 @@ public enum AppleFoundationModelService {
         compactionContext: String? = nil
     ) -> Int {
         let ceiling = clampMaximumResponseTokens(requested) ?? maxResponseTokenCeiling
+        let fittedContext = chatTurnCompactionContext(
+            compactionContext,
+            systemPrompt: systemPrompt,
+            prompt: prompt
+        )
         let personaChars = (systemPrompt ?? "").trimmingCharacters(in: .whitespacesAndNewlines).count
-        let compactedChars = (compactionContext ?? "").trimmingCharacters(in: .whitespacesAndNewlines).count
+        let compactedChars = (fittedContext ?? "").count
         // Block separators, the history header's caption slack, and estimation
         // slop live in this pad, mirroring `historyCharBudget`.
         let fixed = personaChars + prompt.count + compactedChars
             + chatTurnRulesText.count + historyBlockHeader.count + 64
         let remainingTokens = (sessionContextChars - fixed) / 4
-        return min(ceiling, max(64, remainingTokens))
+        return min(ceiling, max(minimumResponseTokens, remainingTokens))
     }
 
     /// Character budget the conversation history block may occupy in one chat

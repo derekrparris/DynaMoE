@@ -249,14 +249,43 @@ public extension ChatSession {
     /// compaction, and trimmed to nil if both digests are empty.
     nonisolated var compactionContextBlock: String? {
         var blocks: [String] = []
-        let general = (rollingSummary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let general = ChatSession.sanitizeCompactionDigest(rollingSummary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if !general.isEmpty {
             blocks.append("Summary of this conversation's earlier history (compacted, so reply with that knowledge in mind):\n\(general)")
         }
-        let detail = (recentWorkDigest ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let detail = ChatSession.sanitizeCompactionDigest(recentWorkDigest ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if !detail.isEmpty {
             blocks.append("The most recently compacted work, kept in detail:\n\(detail)")
         }
         return blocks.isEmpty ? nil : blocks.joined(separator: "\n\n")
     }
+
+    /// Neutralizes chat-template control tokens in a compaction digest before it
+    /// rides inside the system block. The digests are derived from arbitrary
+    /// user messages and tool output, and every weights dialect wraps the system
+    /// block verbatim, so a digest carrying a delimiter such as `</s>`,
+    /// `<|im_end|>`, the DeepSeek sentence marker, or `<|role_end|>` could close
+    /// the system span and inject or malform the roles that follow. Matching the
+    /// general token shapes covers every supported dialect without enumerating
+    /// them by hand.
+    nonisolated static func sanitizeCompactionDigest(_ text: String) -> String {
+        var s = text
+        for rule in compactionDigestScrubRules {
+            guard let regex = try? NSRegularExpression(pattern: rule.pattern) else { continue }
+            let range = NSRange(s.startIndex..<s.endIndex, in: s)
+            s = regex.stringByReplacingMatches(in: s, range: range, withTemplate: rule.replacement)
+        }
+        return s
+    }
+
+    private static let compactionDigestScrubRules: [(pattern: String, replacement: String)] = [
+        // <|im_start|>, <|im_end|>, <|endoftext|>, <|role_end|>, <|System|>, <|User|>, <|Bot|>, <|Tool|>
+        (#"<\|[^|<>]{1,40}\|>"#, "[template-token]"),
+        // DeepSeek/Spark fullwidth-bar markers: <｜start▁of▁sentence｜> and its peers.
+        ("<\u{FF5C}[^|<>]{1,60}\u{FF5C}>", "[template-token]"),
+        // Ling/Hermes role spans.
+        (#"</?role>"#, "[role-token]"),
+        // Llama end/start markers.
+        (#"</?s>"#, "[end-token]")
+    ]
 }
