@@ -247,6 +247,11 @@ final class ChatSessionStore: ObservableObject {
     /// error and transient flags clear.
     nonisolated static func normalizedForRestore(_ session: ChatSession) -> ChatSession {
         var restored = session
+        // Transient runtime-only messages (the compaction progress bubble, which
+        // streams an uncommitted summary into the array) are dropped entirely:
+        // clearing their flags would still leave a partial summary on screen as
+        // an ordinary settled system message, and compaction cannot resume.
+        restored.messages.removeAll { $0.isTransient == true }
         for idx in restored.messages.indices {
             restored.messages[idx].isThinking = false
             restored.messages[idx].prefillStatus = nil

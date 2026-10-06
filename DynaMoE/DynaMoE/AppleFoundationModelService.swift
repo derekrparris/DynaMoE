@@ -272,13 +272,11 @@ public enum AppleFoundationModelService {
     /// most recent work beats brevity, so this is the larger of the two.
     nonisolated public static let compactionRecapResponseTokens = 1_024
 
-    /// Floor for the derived per-chunk budget. Each digest request carries the
-    /// prior digests, the pass instructions, its own bounded response, and one
-    /// chunk inside the system model's small window; with legitimately sized
-    /// digests the remainder stays well above this floor, and it only binds on
-    /// degenerate (hand-edited) digest content, where trading a possible
-    /// overflow error for progress beats refusing to compact at all.
-    nonisolated public static let minimumCompactionChunkCharBudget = 1_000
+    /// Cap on the user's optional `/compact` focus text. The focus rides in
+    /// both pass instructions, which are fixed occupants of the summarizer's
+    /// window; an unbounded focus could fill the window by itself and force
+    /// every digest pass to overflow.
+    nonisolated public static let maxCompactionFocusChars = 1_000
 
     /// Derives the character budget one chunk of the evicted transcript may
     /// occupy in a digest pass, the same accounting `historyCharBudget` does
@@ -288,8 +286,11 @@ public enum AppleFoundationModelService {
     /// chunk gets the remainder. A fixed chunk size could push a repeat
     /// compaction past the window exactly the way the old flat history share
     /// did. The result is capped by `compactionTranscriptCharBudget` so a
-    /// fresh session does not stuff the whole window into one enormous
-    /// prompt, and floored by `minimumCompactionChunkCharBudget`.
+    /// fresh session does not stuff the whole window into one enormous prompt,
+    /// and never exceeds the window's remainder. A non-positive remainder
+    /// means the fixed digest and instruction content already fills the
+    /// window: that is reported as `0` so the caller refuses with a clear
+    /// message, instead of flooring to a chunk that guarantees an overflow.
     nonisolated public static func compactionChunkCharBudget(
         previousSummary: String?,
         previousRecap: String?,
@@ -305,7 +306,8 @@ public enum AppleFoundationModelService {
         // first:") live in this pad.
         let reserved = responseTokens * 4 + summaryChars + recapChars + instructions.count + 192
         let remaining = sessionContextChars - reserved
-        return min(compactionTranscriptCharBudget, max(minimumCompactionChunkCharBudget, remaining))
+        guard remaining > 0 else { return 0 }
+        return min(compactionTranscriptCharBudget, remaining)
     }
 
     /// Assembles the prompt for the rolling-summary pass: the previous standing
@@ -347,7 +349,7 @@ public enum AppleFoundationModelService {
                 + "Drop small talk, restatements, and anything superseded by later turns. Write compact prose with short bullet lines where lists aid scanning, "
                 + "and be precise rather than vague. Do not invent facts that are not present. Reply with the updated summary only — no preamble, no questions."
         )
-        let cleaned = (focus ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleaned = clampCompactionFocus(focus)
         if !cleaned.isEmpty {
             parts.append("Extra emphasis from the user for this compaction: \(cleaned)")
         }
@@ -367,11 +369,19 @@ public enum AppleFoundationModelService {
                 + "Completeness beats brevity — this recap replaces the removed messages for the immediate future of the conversation. "
                 + "Do not editorialize or invent facts that are not present. Reply with the recap only — no preamble, no questions."
         )
-        let cleaned = (focus ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleaned = clampCompactionFocus(focus)
         if !cleaned.isEmpty {
             parts.append("Extra emphasis from the user for this recap: \(cleaned)")
         }
         return parts.joined(separator: "\n\n")
+    }
+
+    /// Trims and bounds the user's optional `/compact` focus so it cannot fill
+    /// the summarizer's window through the pass instructions alone.
+    nonisolated static func clampCompactionFocus(_ focus: String?) -> String {
+        let trimmed = (focus ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > maxCompactionFocusChars else { return trimmed }
+        return String(trimmed.prefix(maxCompactionFocusChars))
     }
 
     /// Serializes one message as a transcript turn for compaction. Unlike the

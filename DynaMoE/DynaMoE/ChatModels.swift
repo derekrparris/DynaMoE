@@ -71,6 +71,12 @@ nonisolated public struct ChatMessage: Identifiable, Codable, Equatable, Sendabl
     public var timeToFirstTokenSeconds: Double?
     public var thinkingTimeSeconds: Double?
     public var prefillStatus: String?
+    /// Runtime-only marker for messages that must never survive a relaunch:
+    /// the compaction progress bubble streams an uncommitted summary into the
+    /// persisted `messages` array, and a save that caught it mid-pass would
+    /// otherwise restore a partial summary as an ordinary settled system
+    /// message. `ChatSessionStore.normalizedForRestore` drops these on load.
+    public var isTransient: Bool?
     public var toolCalls: [ToolCallRecord]?
     public var jetSpecTau: Double?
     public var jetSpecDraftAccepted: Int?
@@ -87,6 +93,7 @@ nonisolated public struct ChatMessage: Identifiable, Codable, Equatable, Sendabl
         timeToFirstTokenSeconds: Double? = nil,
         thinkingTimeSeconds: Double? = nil,
         prefillStatus: String? = nil,
+        isTransient: Bool? = nil,
         toolCalls: [ToolCallRecord]? = nil,
         jetSpecTau: Double? = nil,
         jetSpecDraftAccepted: Int? = nil
@@ -102,6 +109,7 @@ nonisolated public struct ChatMessage: Identifiable, Codable, Equatable, Sendabl
         self.timeToFirstTokenSeconds = timeToFirstTokenSeconds
         self.thinkingTimeSeconds = thinkingTimeSeconds
         self.prefillStatus = prefillStatus
+        self.isTransient = isTransient
         self.toolCalls = toolCalls
         self.jetSpecTau = jetSpecTau
         self.jetSpecDraftAccepted = jetSpecDraftAccepted

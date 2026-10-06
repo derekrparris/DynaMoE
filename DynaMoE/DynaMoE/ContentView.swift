@@ -2492,8 +2492,23 @@ struct ContentView: View {
             previousSummary: previousSummary,
             previousRecap: previousRecap,
             instructions: summaryInstructions,
-            maximumResponseTokens: AppleFoundationModelService.compactionSummaryResponseTokens
+            // Reserve for the larger of the two passes: the recap's response is
+            // bigger than the summary's, and the same chunk feeds both.
+            maximumResponseTokens: max(
+                AppleFoundationModelService.compactionSummaryResponseTokens,
+                AppleFoundationModelService.compactionRecapResponseTokens
+            )
         )
+        // A non-positive budget means the prior digests and the pass
+        // instructions already fill the summarizer's window; no chunk can fit,
+        // and adding one would only push every pass further past the limit.
+        // Refuse with a clear message instead of letting each pass overflow.
+        guard chunkBudget > 0 else {
+            let note = "⚠️ Cannot compact — the existing summary plus your /compact focus already fill the on-device model's window. Shorten the focus and try again."
+            sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
+            generationStatusText = note
+            return true
+        }
         let transcriptChunks = AppleFoundationModelService.buildCompactionTranscriptChunks(
             from: evicted,
             excludingMessageIds: [],
@@ -2516,7 +2531,8 @@ struct ContentView: View {
             id: progressId,
             role: .system,
             content: "",
-            prefillStatus: "🍎 Apple Foundation Model — summarizing \(evictedCount) messages…"
+            prefillStatus: "🍎 Apple Foundation Model — summarizing \(evictedCount) messages…",
+            isTransient: true
         ))
         isCompactingConversation = true
         compactingSessionId = sessionId

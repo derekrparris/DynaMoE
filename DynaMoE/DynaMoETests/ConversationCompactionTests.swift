@@ -245,15 +245,48 @@ final class ConversationCompactionTests: XCTestCase {
             + summary.count + recap.count + instructions.count + 192
         XCTAssertLessThanOrEqual(fixed + repeatPass, AppleFoundationModelService.sessionContextChars)
 
-        // Degenerate digest content degrades pass size to the floor instead
-        // of refusing to compact.
+        // Fixed digest/instruction content that alone fills the window reports
+        // infeasibility (0) so the caller refuses with a clear message, instead
+        // of flooring to a chunk that would guarantee an overflow.
         let degenerate = AppleFoundationModelService.compactionChunkCharBudget(
             previousSummary: String(repeating: "s", count: 9_000),
             previousRecap: String(repeating: "r", count: 9_000),
             instructions: instructions,
             maximumResponseTokens: AppleFoundationModelService.compactionSummaryResponseTokens
         )
-        XCTAssertEqual(degenerate, AppleFoundationModelService.minimumCompactionChunkCharBudget)
+        XCTAssertEqual(degenerate, 0)
+    }
+
+    func testCompactionChunkBudgetStaysInsideWindowForAnyRemainder() {
+        // A large focus pushes the instructions up; the derived budget must
+        // still never let fixed parts plus the chunk exceed the window.
+        let instructions = String(repeating: "i", count: 12_000)
+        let budget = AppleFoundationModelService.compactionChunkCharBudget(
+            previousSummary: nil,
+            previousRecap: nil,
+            instructions: instructions,
+            maximumResponseTokens: AppleFoundationModelService.compactionSummaryResponseTokens
+        )
+        XCTAssertGreaterThanOrEqual(budget, 0)
+        let reserved = AppleFoundationModelService.compactionSummaryResponseTokens * 4
+            + instructions.count + 192
+        XCTAssertLessThanOrEqual(reserved + budget, AppleFoundationModelService.sessionContextChars)
+    }
+
+    func testCompactionFocusIsCappedSoInstructionsCannotFillTheWindow() {
+        let hugeFocus = String(repeating: "f", count: 20_000)
+        let instructions = AppleFoundationModelService.compactionSummaryInstructions(focus: hugeFocus)
+        // The focus rides in the instructions once, bounded by the cap.
+        XCTAssertGreaterThan(instructions.count, AppleFoundationModelService.maxCompactionFocusChars)
+        XCTAssertLessThan(instructions.count, 3_000)
+        // With normal digests the capped focus cannot drive the budget to zero.
+        let budget = AppleFoundationModelService.compactionChunkCharBudget(
+            previousSummary: String(repeating: "s", count: 3_072),
+            previousRecap: String(repeating: "r", count: 4_096),
+            instructions: instructions,
+            maximumResponseTokens: AppleFoundationModelService.compactionRecapResponseTokens
+        )
+        XCTAssertGreaterThan(budget, 0)
     }
 
     func testChatTurnResponseCeilingClampsWhenDigestsCrowdTheWindow() {
@@ -383,6 +416,23 @@ final class ConversationCompactionTests: XCTestCase {
         XCTAssertEqual(restored.rollingSummary, "Standing summary survived.")
         XCTAssertEqual(restored.recentWorkDigest, "Recent digest survived.")
         XCTAssertEqual(restored.messages.count, 2)
+    }
+
+    func testTransientProgressMessagesAreDroppedOnRestore() throws {
+        let session = ChatSession(messages: [
+            makeMessage(.user, "hello"),
+            ChatMessage(role: .system, content: "partial summary so far…", isTransient: true),
+            makeMessage(.assistant, "hi")
+        ])
+        // Round-trip through persistence the way the store does, then normalize.
+        let data = try JSONEncoder().encode(session)
+        let decoded = try JSONDecoder().decode(ChatSession.self, from: data)
+        let restored = ChatSessionStore.normalizedForRestore(decoded)
+        // The transient progress bubble is gone; the real turns survive.
+        XCTAssertEqual(restored.messages.count, 2)
+        XCTAssertFalse(restored.messages.contains { $0.isTransient == true })
+        XCTAssertTrue(restored.messages.contains { $0.content == "hello" })
+        XCTAssertTrue(restored.messages.contains { $0.content == "hi" })
     }
 
     func testPreCompactionSessionFilesDecodeWithoutTheNewFields() throws {
