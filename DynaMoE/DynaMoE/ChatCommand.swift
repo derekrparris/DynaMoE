@@ -31,10 +31,13 @@ nonisolated public enum ChatCommand: Equatable {
     nonisolated public static func parse(_ text: String) -> ChatCommand? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.hasPrefix("/") else { return nil }
+        // Every whitespace kind (spaces, tabs, newlines) delimits the command
+        // word, not just the literal space: a newline- or tab-separated
+        // composer draft must dispatch the same as a space-separated one.
         let parts = trimmed.split(
-            separator: " ",
             maxSplits: 1,
-            omittingEmptySubsequences: true
+            omittingEmptySubsequences: true,
+            whereSeparator: { $0.isWhitespace }
         )
         guard let first = parts.first else { return nil }
         let argument = parts.count > 1 ? parts[1] : ""

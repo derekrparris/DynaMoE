@@ -1063,10 +1063,15 @@ struct ContentView: View {
     /// commit rewrites the conversation's message array, so normal sends are
     /// rejected until it settles — whatever interleaved would be dropped.
     @State private var isCompactingConversation: Bool = false
-    /// The conversation /compact is currently rewriting, so the progress
-    /// bubble's spinner/typewriter treatment is shown only in the chat the
-    /// user is looking at, matching how generation state is session-scoped.
+    /// The conversation /compact is currently rewriting, so its progress is
+    /// shown only in the chat the user is looking at, matching how generation
+    /// state is session-scoped.
     @State private var compactingSessionId: UUID? = nil
+    /// The progress bubble /compact streams its summary into. Only this
+    /// message renders with the spinner/typewriter treatment; passing a bare
+    /// "compacting" flag to the list would mark every historical bubble as
+    /// live-streaming for the duration of the pass.
+    @State private var compactingProgressMessageId: UUID? = nil
     @State private var generatingSessionId: UUID? = nil
     /// Sessions pinned against retention while a generation unwinds or a
     /// replacement is being sent. `stopAutoregressiveGeneration` flips
@@ -1886,7 +1891,7 @@ struct ContentView: View {
                     session: activeSessionBinding,
                     promptText: $chatPromptText,
                     isGenerating: isGeneratingText && (generatingSessionId == (selectedSessionId ?? sessions.first?.id)),
-                    isCompactingConversation: isCompactingConversation && (compactingSessionId == (selectedSessionId ?? sessions.first?.id)),
+                    compactionProgressMessageId: (isCompactingConversation && compactingSessionId == (selectedSessionId ?? sessions.first?.id)) ? compactingProgressMessageId : nil,
                     isStreamingOffDisk: isStreamingOffDisk,
                     generationSpeed: generationSpeedTokPerSec,
                     generationTokens: generationTotalTokens,
@@ -2411,10 +2416,15 @@ struct ContentView: View {
     /// The committed history becomes a blank slate — only the compaction
     /// marker remains on screen — with both digests injected into every later
     /// prompt on either backend, so the conversation keeps moving with the
-    /// essential detail intact. The general summary streams live into a
-    /// progress bubble so the command is visibly working from the first
-    /// moment, and the session is rewritten only after both summaries exist —
-    /// an unavailable or failed summarizer leaves the history untouched.
+    /// essential detail intact. Because the pass deletes what it summarizes,
+    /// the transcript accounts for every evicted turn including tool calls:
+    /// a history longer than one summarizer request is split into chunks,
+    /// each older chunk folded into the rolling summary by its own pass, and
+    /// the newest chunk additionally producing the recap. The general summary
+    /// streams live into a progress bubble so the command is visibly working
+    /// from the first moment, and the session is rewritten only after all
+    /// passes succeed — an unavailable or failed summarizer leaves the
+    /// history untouched.
     private func runManualCompact(sessionIndex sessionIdx: Int, sessionId: UUID, focus: String?) -> Bool {
         // Compaction rewrites the message array mid-history: a turn still
         // generating into it, or one still unwinding from a stop, would write
@@ -2454,23 +2464,27 @@ struct ContentView: View {
             generationStatusText = note
             return true
         }
-        let evictedTranscript = AppleFoundationModelService.buildConversationTranscript(
+        // Compaction deletes what it summarizes, so the transcript must
+        // account for every evicted turn: the chunker includes tool calls
+        // with their results and splits long histories into budget-sized
+        // pieces instead of silently dropping the oldest past a flat cap.
+        // Each chunk gets its own summarizer pass below; the newest chunk
+        // additionally feeds the detailed recap.
+        let transcriptChunks = AppleFoundationModelService.buildCompactionTranscriptChunks(
             from: evicted,
             excludingMessageIds: [],
             charBudget: AppleFoundationModelService.compactionTranscriptCharBudget
         )
-        guard !evictedTranscript.isEmpty else {
+        guard !transcriptChunks.isEmpty else {
             let note = "ℹ️ Nothing to compact — no user or assistant content to summarize yet."
             sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
             generationStatusText = note
             return true
         }
-        let summaryPrompt = AppleFoundationModelService.compactionPrompt(
-            previousSummary: sessions[sessionIdx].rollingSummary,
-            previousRecap: sessions[sessionIdx].recentWorkDigest,
-            evictedTranscript: evictedTranscript
-        )
-        let recapPrompt = "Conversation excerpt, oldest messages first — the most recent work last:\n\n\(evictedTranscript)"
+        // Read before the async work starts: both digests describe pre-pass
+        // state, and the live session is re-resolved by identity at commit.
+        let previousSummary = sessions[sessionIdx].rollingSummary
+        let previousRecap = sessions[sessionIdx].recentWorkDigest
         let summaryInstructions = AppleFoundationModelService.compactionSummaryInstructions(focus: focus)
         let recapInstructions = AppleFoundationModelService.compactionRecapInstructions(focus: focus)
         let evictedCount = evicted.count
@@ -2488,11 +2502,13 @@ struct ContentView: View {
         ))
         isCompactingConversation = true
         compactingSessionId = sessionId
+        compactingProgressMessageId = progressId
         generationStatusText = "🗂 Compacting \(evictedCount) messages via Apple Foundation Model…"
         Task { @MainActor in
             defer {
                 self.isCompactingConversation = false
                 self.compactingSessionId = nil
+                self.compactingProgressMessageId = nil
             }
             func postToProgress(_ text: String) {
                 guard let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
@@ -2502,6 +2518,14 @@ struct ContentView: View {
                 self.sessions[liveIdx].messages[msgIdx].prefillStatus = nil
                 self.sessions[liveIdx].messages[msgIdx].content = text
             }
+            // Keeps the composing pill but retitles it: the intermediate
+            // passes of a long conversation stay visible as progress without
+            // streaming their intermediate digests into the bubble.
+            func updateProgressStatus(_ text: String) {
+                guard let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
+                      let msgIdx = self.sessions[liveIdx].messages.firstIndex(where: { $0.id == progressId }) else { return }
+                self.sessions[liveIdx].messages[msgIdx].prefillStatus = text
+            }
             // Appends after the streamed summary instead of replacing it, so the
             // finished general summary stays visible through the recap pass.
             func postToProgressLatest(_ text: String) {
@@ -2510,6 +2534,42 @@ struct ContentView: View {
                 self.sessions[liveIdx].messages[msgIdx].content += text
             }
             do {
+                // Older chunks merge into the rolling summary one pass each.
+                // The previous recap rides along on the first pass only: it
+                // describes work older than this transcript, after the first
+                // pass it is already folded in, and the recap written at the
+                // end replaces it wholesale.
+                var mergedSummary = previousSummary
+                var mergedRecap = previousRecap
+                let olderChunks = transcriptChunks.dropLast()
+                for (offset, chunk) in olderChunks.enumerated() {
+                    updateProgressStatus(
+                        "🍎 Apple Foundation Model — folding older history into the summary (part \(offset + 1) of \(olderChunks.count))…"
+                    )
+                    let merged = try await AppleFoundationModelService.respondOnce(
+                        prompt: AppleFoundationModelService.compactionPrompt(
+                            previousSummary: mergedSummary,
+                            previousRecap: mergedRecap,
+                            evictedTranscript: chunk
+                        ),
+                        instructions: summaryInstructions,
+                        temperature: 0.0,
+                        maximumResponseTokens: AppleFoundationModelService.compactionSummaryResponseTokens
+                    )
+                    let mergedText = merged.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !mergedText.isEmpty else {
+                        throw AppleFoundationModelUnavailableError(reason: "An older-history digest came back empty.")
+                    }
+                    mergedSummary = mergedText
+                    mergedRecap = nil
+                }
+                let recentTranscript = transcriptChunks.last!
+                let summaryPrompt = AppleFoundationModelService.compactionPrompt(
+                    previousSummary: mergedSummary,
+                    previousRecap: mergedRecap,
+                    evictedTranscript: recentTranscript
+                )
+                let recapPrompt = "Conversation excerpt, oldest messages first — the most recent work last:\n\n\(recentTranscript)"
                 var lastUIWrite = 0.0
                 let newSummary = try await AppleFoundationModelService.streamChatTurn(
                     prompt: summaryPrompt,

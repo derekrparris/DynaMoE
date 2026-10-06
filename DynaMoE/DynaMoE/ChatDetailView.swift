@@ -13,7 +13,11 @@ struct ChatDetailView: View {
     @ObservedObject var localModelManager: LocalModelManager = LocalModelManager.shared
     
     var isGenerating: Bool
-    var isCompactingConversation: Bool = false
+    /// The progress bubble /compact is streaming its summary into, or nil.
+    /// Rendering flags are scoped to this message id, never a bare
+    /// "compacting" boolean, so historical bubbles keep their settled
+    /// Markdown treatment while the pass runs.
+    var compactionProgressMessageId: UUID? = nil
     var isStreamingOffDisk: Bool = false
     var generationSpeed: Double
     var generationTokens: Int
@@ -84,6 +88,13 @@ struct ChatDetailView: View {
     private var streamingTick: Int {
         guard let last = session?.messages.last else { return 0 }
         return last.content.count &* 31 &+ (last.thinkingContent?.count ?? 0)
+    }
+
+    /// True while a /compact pass is streaming into its progress bubble.
+    /// Only the scroll handlers need the conversation-level bit; everything
+    /// rendered is keyed to `compactionProgressMessageId` instead.
+    private var isCompactingConversation: Bool {
+        compactionProgressMessageId != nil
     }
 
     private func modelIconName(for name: String?) -> String {
@@ -289,7 +300,7 @@ struct ChatDetailView: View {
                                         message: message,
                                         isGenerating: isGenerating && message.id == session.messages.last?.id,
                                         isStreamingOffDisk: isStreamingOffDisk,
-                                        isCompactingConversation: isCompactingConversation,
+                                        isCompactingConversation: message.id == compactionProgressMessageId,
                                         isExpanded: Binding(
                                             get: { isReasoningExpanded[message.id] ?? reasoningExpandedByDefault },
                                             set: { isReasoningExpanded[message.id] = $0 }

@@ -250,13 +250,21 @@ public enum AppleFoundationModelService {
 
     // MARK: - Conversation Compaction (manual "/compact")
 
-    /// Character budget for the evicted transcript handed to the summarizer.
-    /// A summary request is one prompt plus its own response, not a chat turn,
-    /// so this is not `historyCharBudget`; it simply keeps a very long evicted
-    /// region inside the on-device session while staying large enough to lose
-    /// nothing meaningful. The transcript builder drops oldest-first when even
-    /// this is exceeded.
+    /// Character budget for one chunk of the evicted transcript handed to the
+    /// summarizer. A summary request is one prompt plus its own response, not
+    /// a chat turn, so this is not `historyCharBudget`: it keeps each digest
+    /// request inside the on-device session's window. Compaction is
+    /// destructive, so the chunker never drops a turn to meet this budget;
+    /// a longer history is split across several merge passes instead, and
+    /// only a single turn too large for any chunk is truncated (with a
+    /// marker saying so).
     nonisolated public static let compactionTranscriptCharBudget = 6_000
+
+    /// Cap on any single serialized tool result inside a compaction transcript
+    /// turn. Tool outputs can run to tens of thousands of characters; the
+    /// digest passes need the outcome, not the full dump, and an uncapped
+    /// result would crowd every other turn out of the chunk budget.
+    nonisolated public static let compactionToolResultCharBudget = 1_000
 
     /// Response budget for the rolling general summary: it must stay concise
     /// because it is re-fed at every later compaction for its whole life.
@@ -330,6 +338,84 @@ public enum AppleFoundationModelService {
             parts.append("Extra emphasis from the user for this recap: \(cleaned)")
         }
         return parts.joined(separator: "\n\n")
+    }
+
+    /// Serializes one message as a transcript turn for compaction. Unlike the
+    /// chat-history builder, compaction is destructive: whatever this skips
+    /// is gone for good once the history is replaced, so structured tool calls
+    /// ride along with their arguments and results, the same records the
+    /// weights history reconstruction replays, with each result capped at
+    /// `compactionToolResultCharBudget` characters. System messages are UI
+    /// notices rather than conversation, and skipped gesture calls carry no
+    /// information, so both stay out. Returns nil when a message holds
+    /// nothing worth keeping, which is what "nothing to compact" keys on.
+    nonisolated public static func compactionTranscriptTurn(for message: ChatMessage) -> String? {
+        guard message.role != .system else { return nil }
+        var parts: [String] = []
+        let speaker = message.role == .user ? "User" : "Assistant"
+        let content = stripLeadingSpeakerLabel(message.content)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !content.isEmpty {
+            parts.append("\(speaker): \(content)")
+        }
+        if let calls = message.toolCalls, !calls.isEmpty {
+            for call in calls where !call.isGesture {
+                let arguments = call.arguments
+                    .sorted(by: { $0.key < $1.key })
+                    .map { "\($0.key)=\"\($0.value)\"" }
+                    .joined(separator: ", ")
+                var line = "Tool call \(call.name)(\(arguments))"
+                if let result = call.output ?? call.error {
+                    let label = call.output != nil ? "result" : "error"
+                    if result.count > compactionToolResultCharBudget {
+                        let omitted = result.count - compactionToolResultCharBudget
+                        line += " \(label): \(result.prefix(compactionToolResultCharBudget)) […\(label) truncated, \(omitted) characters omitted]"
+                    } else {
+                        line += " \(label): \(result)"
+                    }
+                }
+                parts.append(line)
+            }
+        }
+        guard !parts.isEmpty else { return nil }
+        return parts.joined(separator: "\n")
+    }
+
+    /// Groups serialized compaction turns into chunks the summarizer can
+    /// digest one request at a time, oldest first, whole turns per chunk.
+    /// Every chunk stays within `charBudget` characters; a turn too large
+    /// for any chunk is truncated into a chunk of its own rather than
+    /// dropped, because the compact that follows deletes the messages it
+    /// never summarized. Empty when the conversation holds nothing worth
+    /// keeping.
+    nonisolated public static func buildCompactionTranscriptChunks(
+        from messages: [ChatMessage],
+        excludingMessageIds: Set<UUID> = [],
+        charBudget: Int
+    ) -> [String] {
+        guard charBudget > 0 else { return [] }
+        var chunks: [String] = []
+        var current: [String] = []
+        var usedChars = 0
+        for message in messages {
+            if excludingMessageIds.contains(message.id) { continue }
+            guard var turn = compactionTranscriptTurn(for: message) else { continue }
+            if turn.count > charBudget {
+                let marker = " […turn truncated to fit the digest window]"
+                turn = String(turn.prefix(max(0, charBudget - marker.count))) + marker
+            }
+            if usedChars + turn.count + 2 > charBudget, !current.isEmpty {
+                chunks.append(current.joined(separator: "\n\n"))
+                current = []
+                usedChars = 0
+            }
+            current.append(turn)
+            usedChars += turn.count + 2
+        }
+        if !current.isEmpty {
+            chunks.append(current.joined(separator: "\n\n"))
+        }
+        return chunks
     }
 
     // MARK: - Pure Helpers (unit tested)

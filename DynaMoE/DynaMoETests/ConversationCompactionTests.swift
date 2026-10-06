@@ -28,6 +28,12 @@ final class ConversationCompactionTests: XCTestCase {
         XCTAssertEqual(ChatCommand.parse("  /COMPACT  "), .compact(focus: nil))
         XCTAssertEqual(ChatCommand.parse("/Compact focus on the buffer bug"), .compact(focus: "focus on the buffer bug"))
         XCTAssertEqual(ChatCommand.parse("/compact   keep the pread commands "), .compact(focus: "keep the pread commands"))
+        // Every whitespace kind delimits the command word, not just the
+        // literal space: newline- or tab-separated composer drafts dispatch
+        // exactly like space-separated ones.
+        XCTAssertEqual(ChatCommand.parse("/compact\nkeep the errors"), .compact(focus: "keep the errors"))
+        XCTAssertEqual(ChatCommand.parse("/compact\n\n  keep the errors"), .compact(focus: "keep the errors"))
+        XCTAssertEqual(ChatCommand.parse("/compact\tkeep the errors"), .compact(focus: "keep the errors"))
     }
 
     func testUnknownOrOrdinaryTextIsNotACommand() {
@@ -134,6 +140,79 @@ final class ConversationCompactionTests: XCTestCase {
             compactionContext: String(repeating: "x", count: 2_000)
         )
         XCTAssertEqual(base - withContext, 2_000)
+    }
+
+    // MARK: - Compaction Transcript (destructive-safe)
+
+    func testCompactionTranscriptIncludesToolCallsAndResults() {
+        let calls = [
+            ToolCallRecord(name: "shell_run", arguments: ["command": "cargo test"], output: "test result: ok. 16 passed"),
+            ToolCallRecord(name: "file_read", arguments: ["path": "ContentView.swift"], error: "file not found"),
+            ToolCallRecord(name: "no_op", isGesture: true),
+            ToolCallRecord(name: "web_fetch", arguments: ["url": "example.invalid"], output: String(repeating: "x", count: 1_500))
+        ]
+        let turn = AppleFoundationModelService.compactionTranscriptTurn(
+            for: ChatMessage(role: .assistant, content: "checking the build", toolCalls: calls)
+        ) ?? ""
+        XCTAssertTrue(turn.contains("Assistant: checking the build"))
+        XCTAssertTrue(turn.contains("Tool call shell_run(command=\"cargo test\") result: test result: ok. 16 passed"))
+        XCTAssertTrue(turn.contains("Tool call file_read(path=\"ContentView.swift\") error: file not found"))
+        XCTAssertFalse(turn.contains("no_op"), "skipped gesture calls are noise, not context")
+        XCTAssertTrue(turn.contains("[…result truncated, 500 characters omitted]"), "huge tool results must be capped, not copied whole")
+        XCTAssertFalse(turn.contains(String(repeating: "x", count: 1_100)), "the cap must actually cut the result off")
+    }
+
+    func testCompactionTranscriptSkipsSystemNoticesAndEmptyTurns() {
+        XCTAssertNil(AppleFoundationModelService.compactionTranscriptTurn(for: makeMessage(.system, "⚠️ gate notice")))
+        XCTAssertNil(AppleFoundationModelService.compactionTranscriptTurn(for: makeMessage(.assistant, "   ")))
+        XCTAssertEqual(
+            AppleFoundationModelService.compactionTranscriptTurn(for: makeMessage(.user, "run the tests")),
+            "User: run the tests"
+        )
+    }
+
+    func testCompactionChunksCoverEveryTurnOldestFirst() {
+        // Six ~430-character turns with a 1,200-character budget: two turns
+        // per chunk, three chunks, and no turn silently dropped the way the
+        // old single-pass builder dropped everything past its cap.
+        let messages = (0..<6).map { index in
+            makeMessage(.user, "turn \(index): " + String(repeating: "detail ", count: 60))
+        }
+        let chunks = AppleFoundationModelService.buildCompactionTranscriptChunks(
+            from: messages,
+            charBudget: 1_200
+        )
+        XCTAssertEqual(chunks.count, 3)
+        for (index, chunk) in chunks.enumerated() {
+            XCTAssertLessThanOrEqual(chunk.count, 1_200, "chunk \(index) exceeds the budget")
+        }
+        for index in 0..<6 {
+            XCTAssertTrue(chunks.contains { $0.contains("turn \(index):") }, "turn \(index) landed in no chunk")
+        }
+        XCTAssertTrue(chunks[0].contains("turn 0:"), "chunks must run oldest first")
+        XCTAssertTrue(chunks[0].contains("turn 1:"))
+        XCTAssertTrue(chunks[2].contains("turn 5:"), "the newest work must land in the recap chunk")
+    }
+
+    func testCompactionChunksTruncateOversizedTurnInsteadOfDroppingIt() {
+        let huge = makeMessage(.user, String(repeating: "a", count: 5_000))
+        let small = makeMessage(.user, "final note")
+        let chunks = AppleFoundationModelService.buildCompactionTranscriptChunks(
+            from: [huge, small],
+            charBudget: 1_200
+        )
+        // A turn too large for any chunk becomes its own truncated chunk with
+        // a marker instead of vanishing, and the turn after it still gets
+        // summarized.
+        XCTAssertEqual(chunks.count, 2)
+        XCTAssertTrue(chunks[0].contains("turn truncated"))
+        XCTAssertLessThanOrEqual(chunks[0].count, 1_200)
+        XCTAssertTrue(chunks[1].contains("final note"))
+        // A system-only history has nothing worth keeping.
+        XCTAssertTrue(AppleFoundationModelService.buildCompactionTranscriptChunks(
+            from: [makeMessage(.system, "notice")],
+            charBudget: 1_200
+        ).isEmpty)
     }
 
     // MARK: - Persistence
