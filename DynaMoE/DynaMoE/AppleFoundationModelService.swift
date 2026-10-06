@@ -251,13 +251,11 @@ public enum AppleFoundationModelService {
     // MARK: - Conversation Compaction (manual "/compact")
 
     /// Character budget for one chunk of the evicted transcript handed to the
-    /// summarizer. A summary request is one prompt plus its own response, not
-    /// a chat turn, so this is not `historyCharBudget`: it keeps each digest
-    /// request inside the on-device session's window. Compaction is
-    /// destructive, so the chunker never drops a turn to meet this budget;
-    /// a longer history is split across several merge passes instead, and
-    /// only a single turn too large for any chunk is truncated (with a
-    /// marker saying so).
+    /// summarizer. This is the ceiling: the working budget is derived per
+    /// request by `compactionChunkCharBudget`, because compaction is
+    /// destructive and a digest pass must never drop a turn to fit. A longer
+    /// history is split across several merge passes instead, and only a single
+    /// turn too large for any chunk is truncated (with a marker saying so).
     nonisolated public static let compactionTranscriptCharBudget = 6_000
 
     /// Cap on any single serialized tool result inside a compaction transcript
@@ -273,6 +271,42 @@ public enum AppleFoundationModelService {
     /// Response budget for the detailed recent-work recap: completeness of the
     /// most recent work beats brevity, so this is the larger of the two.
     nonisolated public static let compactionRecapResponseTokens = 1_024
+
+    /// Floor for the derived per-chunk budget. Each digest request carries the
+    /// prior digests, the pass instructions, its own bounded response, and one
+    /// chunk inside the system model's small window; with legitimately sized
+    /// digests the remainder stays well above this floor, and it only binds on
+    /// degenerate (hand-edited) digest content, where trading a possible
+    /// overflow error for progress beats refusing to compact at all.
+    nonisolated public static let minimumCompactionChunkCharBudget = 1_000
+
+    /// Derives the character budget one chunk of the evicted transcript may
+    /// occupy in a digest pass, the same accounting `historyCharBudget` does
+    /// for chat turns: every fixed occupant of the request window (the prior
+    /// standing summary, the prior recap, the pass instructions including any
+    /// user focus, and the response reservation) is counted first and the
+    /// chunk gets the remainder. A fixed chunk size could push a repeat
+    /// compaction past the window exactly the way the old flat history share
+    /// did. The result is capped by `compactionTranscriptCharBudget` so a
+    /// fresh session does not stuff the whole window into one enormous
+    /// prompt, and floored by `minimumCompactionChunkCharBudget`.
+    nonisolated public static func compactionChunkCharBudget(
+        previousSummary: String?,
+        previousRecap: String?,
+        instructions: String,
+        maximumResponseTokens: Int?
+    ) -> Int {
+        let responseTokens = clampMaximumResponseTokens(maximumResponseTokens) ?? maxResponseTokenCeiling
+        let summaryChars = (previousSummary ?? "").trimmingCharacters(in: .whitespacesAndNewlines).count
+        let recapChars = (previousRecap ?? "").trimmingCharacters(in: .whitespacesAndNewlines).count
+        // Block separators and the prompt's fixed labels ("Previous standing
+        // summary of everything older:", "Previous detailed recap of the
+        // recently covered work:", "Conversation excerpt to fold in, oldest
+        // first:") live in this pad.
+        let reserved = responseTokens * 4 + summaryChars + recapChars + instructions.count + 192
+        let remaining = sessionContextChars - reserved
+        return min(compactionTranscriptCharBudget, max(minimumCompactionChunkCharBudget, remaining))
+    }
 
     /// Assembles the prompt for the rolling-summary pass: the previous standing
     /// summary and the previous recap (all of which merge forward), plus the
@@ -483,6 +517,34 @@ public enum AppleFoundationModelService {
     /// smoothing coarse snapshot bursts into a steady typewriter cadence.
     nonisolated public static func revealStep(forBacklog backlog: Int) -> Int {
         min(maxRevealStepPerTick, max(1, backlog / 6))
+    }
+
+    /// Clamps a chat turn's response-token reservation so the assembled
+    /// request cannot outgrow the system model's window through its fixed
+    /// parts alone. `historyCharBudget` can only shrink the history block;
+    /// with a large persona, prompt, or compacted digest context riding
+    /// along, persona + digests + prompt + the requested response could exceed
+    /// the window with history already floored at zero. The response, the one
+    /// flexible reserved occupant, gives way instead: the turn's ceiling is
+    /// the lesser of the requested (framework-clamped) ceiling and what the
+    /// window has left, floored at the framework's own minimum. Normal turns
+    /// keep their full ceiling; only genuinely overflowing configurations
+    /// generate a little shorter rather than failing mid-generation.
+    nonisolated public static func chatTurnResponseTokenCeiling(
+        requested: Int?,
+        systemPrompt: String?,
+        prompt: String,
+        compactionContext: String? = nil
+    ) -> Int {
+        let ceiling = clampMaximumResponseTokens(requested) ?? maxResponseTokenCeiling
+        let personaChars = (systemPrompt ?? "").trimmingCharacters(in: .whitespacesAndNewlines).count
+        let compactedChars = (compactionContext ?? "").trimmingCharacters(in: .whitespacesAndNewlines).count
+        // Block separators, the history header's caption slack, and estimation
+        // slop live in this pad, mirroring `historyCharBudget`.
+        let fixed = personaChars + prompt.count + compactedChars
+            + chatTurnRulesText.count + historyBlockHeader.count + 64
+        let remainingTokens = (sessionContextChars - fixed) / 4
+        return min(ceiling, max(64, remainingTokens))
     }
 
     /// Character budget the conversation history block may occupy in one chat

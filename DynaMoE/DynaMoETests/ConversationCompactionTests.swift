@@ -215,6 +215,82 @@ final class ConversationCompactionTests: XCTestCase {
         ).isEmpty)
     }
 
+    func testCompactionChunkBudgetShrinksForStoredDigests() {
+        // Fresh session: the derived budget is just the ceiling.
+        let fresh = AppleFoundationModelService.compactionChunkCharBudget(
+            previousSummary: nil,
+            previousRecap: nil,
+            instructions: "short instructions",
+            maximumResponseTokens: AppleFoundationModelService.compactionSummaryResponseTokens
+        )
+        XCTAssertEqual(fresh, AppleFoundationModelService.compactionTranscriptCharBudget)
+
+        // Repeat compaction with full-size digests: the chunk shrinks below the
+        // ceiling so digests + instructions + response + chunk stay inside the
+        // session window instead of overflowing it.
+        let summary = String(repeating: "s", count: 3_072)
+        let recap = String(repeating: "r", count: 4_096)
+        let instructions = String(repeating: "i", count: 1_300)
+        let repeatPass = AppleFoundationModelService.compactionChunkCharBudget(
+            previousSummary: summary,
+            previousRecap: recap,
+            instructions: instructions,
+            maximumResponseTokens: AppleFoundationModelService.compactionSummaryResponseTokens
+        )
+        XCTAssertLessThan(repeatPass, AppleFoundationModelService.compactionTranscriptCharBudget)
+        XCTAssertGreaterThan(repeatPass, 0)
+        // The request it sizes must actually fit: fixed parts plus the chunk
+        // cannot exceed the session window.
+        let fixed = AppleFoundationModelService.compactionSummaryResponseTokens * 4
+            + summary.count + recap.count + instructions.count + 192
+        XCTAssertLessThanOrEqual(fixed + repeatPass, AppleFoundationModelService.sessionContextChars)
+
+        // Degenerate digest content degrades pass size to the floor instead
+        // of refusing to compact.
+        let degenerate = AppleFoundationModelService.compactionChunkCharBudget(
+            previousSummary: String(repeating: "s", count: 9_000),
+            previousRecap: String(repeating: "r", count: 9_000),
+            instructions: instructions,
+            maximumResponseTokens: AppleFoundationModelService.compactionSummaryResponseTokens
+        )
+        XCTAssertEqual(degenerate, AppleFoundationModelService.minimumCompactionChunkCharBudget)
+    }
+
+    func testChatTurnResponseCeilingClampsWhenDigestsCrowdTheWindow() {
+        // Roomy turn: the user's requested ceiling survives untouched.
+        let roomy = AppleFoundationModelService.chatTurnResponseTokenCeiling(
+            requested: 8_192,
+            systemPrompt: "You are DynaMoE.",
+            prompt: "hello",
+            compactionContext: nil
+        )
+        XCTAssertEqual(roomy, AppleFoundationModelService.maxResponseTokenCeiling)
+
+        // A digest context crowding the window shrinks the response ceiling
+        // rather than letting the assembled turn overflow with history
+        // already floored at zero.
+        let persona = String(repeating: "p", count: 600)
+        let prompt = String(repeating: "u", count: 500)
+        let crowded = AppleFoundationModelService.chatTurnResponseTokenCeiling(
+            requested: 8_192,
+            systemPrompt: persona,
+            prompt: prompt,
+            compactionContext: String(repeating: "d", count: 7_270)
+        )
+        XCTAssertLessThan(crowded, AppleFoundationModelService.maxResponseTokenCeiling)
+        XCTAssertGreaterThan(crowded, 64)
+
+        // Absurd fixed parts degrade to the framework's minimum instead of a
+        // zero or negative ceiling.
+        let absurd = AppleFoundationModelService.chatTurnResponseTokenCeiling(
+            requested: 8_192,
+            systemPrompt: persona,
+            prompt: prompt,
+            compactionContext: String(repeating: "d", count: 15_000)
+        )
+        XCTAssertEqual(absurd, 64)
+    }
+
     // MARK: - Persistence
 
     func testCompactedSessionFieldsRoundTripThroughPersistence() throws {

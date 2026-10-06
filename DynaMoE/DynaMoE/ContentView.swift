@@ -2424,7 +2424,10 @@ struct ContentView: View {
     /// streams live into a progress bubble so the command is visibly working
     /// from the first moment, and the session is rewritten only after all
     /// passes succeed — an unavailable or failed summarizer leaves the
-    /// history untouched.
+    /// history untouched. The conversation is pinned against chat retention
+    /// for the pass's whole lifetime, so a retention sweep cannot delete it
+    /// while the summarizer is suspended and the commit silently no-ops
+    /// afterwards.
     private func runManualCompact(sessionIndex sessionIdx: Int, sessionId: UUID, focus: String?) -> Bool {
         // Compaction rewrites the message array mid-history: a turn still
         // generating into it, or one still unwinding from a stop, would write
@@ -2464,16 +2467,32 @@ struct ContentView: View {
             generationStatusText = note
             return true
         }
+        // Read before any async work: both digests describe pre-pass state,
+        // and the live session is re-resolved by identity at commit.
+        let previousSummary = sessions[sessionIdx].rollingSummary
+        let previousRecap = sessions[sessionIdx].recentWorkDigest
+        let summaryInstructions = AppleFoundationModelService.compactionSummaryInstructions(focus: focus)
+        let recapInstructions = AppleFoundationModelService.compactionRecapInstructions(focus: focus)
         // Compaction deletes what it summarizes, so the transcript must
         // account for every evicted turn: the chunker includes tool calls
         // with their results and splits long histories into budget-sized
         // pieces instead of silently dropping the oldest past a flat cap.
-        // Each chunk gets its own summarizer pass below; the newest chunk
-        // additionally feeds the detailed recap.
+        // The chunk budget is derived per request — prior digests, pass
+        // instructions, and the response reservation are counted first — so
+        // a repeat compaction cannot overflow the system model's window the
+        // way a fixed chunk size could. Each chunk gets its own summarizer
+        // pass below; the newest chunk additionally feeds the detailed
+        // recap.
+        let chunkBudget = AppleFoundationModelService.compactionChunkCharBudget(
+            previousSummary: previousSummary,
+            previousRecap: previousRecap,
+            instructions: summaryInstructions,
+            maximumResponseTokens: AppleFoundationModelService.compactionSummaryResponseTokens
+        )
         let transcriptChunks = AppleFoundationModelService.buildCompactionTranscriptChunks(
             from: evicted,
             excludingMessageIds: [],
-            charBudget: AppleFoundationModelService.compactionTranscriptCharBudget
+            charBudget: chunkBudget
         )
         guard !transcriptChunks.isEmpty else {
             let note = "ℹ️ Nothing to compact — no user or assistant content to summarize yet."
@@ -2481,12 +2500,6 @@ struct ContentView: View {
             generationStatusText = note
             return true
         }
-        // Read before the async work starts: both digests describe pre-pass
-        // state, and the live session is re-resolved by identity at commit.
-        let previousSummary = sessions[sessionIdx].rollingSummary
-        let previousRecap = sessions[sessionIdx].recentWorkDigest
-        let summaryInstructions = AppleFoundationModelService.compactionSummaryInstructions(focus: focus)
-        let recapInstructions = AppleFoundationModelService.compactionRecapInstructions(focus: focus)
         let evictedCount = evicted.count
         // The progress bubble makes the command visible from the instant it is
         // accepted: before any summary text flows it carries the same spinning
@@ -2503,12 +2516,19 @@ struct ContentView: View {
         isCompactingConversation = true
         compactingSessionId = sessionId
         compactingProgressMessageId = progressId
+        // The summarizer suspends for seconds at a time while the user stays
+        // free to create or switch chats; an unpinned conversation sitting at
+        // the retention limit could be deleted mid-pass, and the commit guard
+        // would return silently after the store destroyed the original. Same
+        // pin the other long-running session operations hold.
+        retainRetentionProtection(sessionId)
         generationStatusText = "🗂 Compacting \(evictedCount) messages via Apple Foundation Model…"
         Task { @MainActor in
             defer {
                 self.isCompactingConversation = false
                 self.compactingSessionId = nil
                 self.compactingProgressMessageId = nil
+                self.releaseRetentionProtection(sessionId)
             }
             func postToProgress(_ text: String) {
                 guard let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
@@ -2740,10 +2760,22 @@ struct ContentView: View {
             // turn against that budget — including the newest — so history
             // can never be what pushes the turn past the window.
             let afmCompactionContext = sessions[sessionIdx].compactionContextBlock
+            // The response ceiling is derived from the same window accounting
+            // as the history budget: with a large persona, prompt, or compacted
+            // digest context riding along, the requested cap could overflow
+            // the system model's window with history already floored at zero,
+            // so the turn generates a little shorter instead of failing
+            // mid-generation.
+            let afmResponseTokens = AppleFoundationModelService.chatTurnResponseTokenCeiling(
+                requested: maxNewTokens,
+                systemPrompt: afmSystemPrompt,
+                prompt: text,
+                compactionContext: afmCompactionContext
+            )
             let afmHistoryBudget = AppleFoundationModelService.historyCharBudget(
                 systemPrompt: afmSystemPrompt,
                 prompt: text,
-                maximumResponseTokens: maxNewTokens,
+                maximumResponseTokens: afmResponseTokens,
                 compactionContext: afmCompactionContext
             )
             let historyTranscript = AppleFoundationModelService.buildConversationTranscript(
@@ -2760,7 +2792,8 @@ struct ContentView: View {
                 sessionId: currentSessionId,
                 messageId: assistantMsgId,
                 userPrompt: text,
-                instructionsText: afmInstructions
+                instructionsText: afmInstructions,
+                responseTokenCeiling: afmResponseTokens
             )
             return true
         }
@@ -4698,7 +4731,8 @@ struct ContentView: View {
         sessionId: UUID,
         messageId: UUID,
         userPrompt: String,
-        instructionsText: String
+        instructionsText: String,
+        responseTokenCeiling: Int? = nil
     ) -> Bool {
         let availability = AppleFoundationModelService.checkAvailability()
         guard case .ready = availability else {
@@ -4736,8 +4770,10 @@ struct ContentView: View {
         // The active profile drives temperature (clamped to the model's 0…1
         // range) and the response ceiling (clamped to its small context);
         // penalties, Min-P, and Top-P have no on-device equivalent and are ignored.
+        // A caller that derived a window-fitting ceiling passes it; nil keeps
+        // the user's setting.
         let profileTemperature = Double(temperature)
-        let responseCeiling = maxNewTokens
+        let responseCeiling = responseTokenCeiling ?? maxNewTokens
         let generationStartTime = CFAbsoluteTimeGetCurrent()
 
         // This Task is deliberately non-detached: it inherits the enclosing
