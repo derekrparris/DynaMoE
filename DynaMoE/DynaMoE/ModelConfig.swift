@@ -122,6 +122,7 @@ public struct TokenIdOrArray: Codable {
 }
 
 public struct NestedTextConfig: Codable {
+    public var modelType: String?
     public var hiddenSize: Int?
     public var numHiddenLayers: Int?
     public var numAttentionHeads: Int?
@@ -143,6 +144,20 @@ public struct NestedTextConfig: Codable {
     public var bosTokenId: TokenIdOrArray?
     public var tieWordEmbeddings: Bool?
     public var skipLoopFinalNorm: Bool?
+
+    // Gemma 4 text config
+    public var attentionKEqV: Bool?
+    public var globalHeadDim: Int?
+    public var numGlobalKeyValueHeads: Int?
+    public var numKvSharedLayers: Int?
+    public var hiddenActivation: String?
+    public var enableMoeBlock: Bool?
+    public var topKExperts: Int?
+    public var finalLogitSoftcapping: Float?
+    public var slidingWindow: Int?
+    public var hiddenSizePerLayerInput: Int?
+    public var useDoubleWideMlp: Bool?
+    public var vocabSizePerLayerInput: Int?
 
     public var linearNumValueHeads: Int?
     public var linearNumKeyHeads: Int?
@@ -171,6 +186,7 @@ public struct NestedTextConfig: Codable {
     public var ropeInterleave: Bool?
 
     enum CodingKeys: String, CodingKey {
+        case modelType = "model_type"
         case hiddenSize = "hidden_size"
         case numHiddenLayers = "num_hidden_layers"
         case numAttentionHeads = "num_attention_heads"
@@ -192,6 +208,18 @@ public struct NestedTextConfig: Codable {
         case bosTokenId = "bos_token_id"
         case tieWordEmbeddings = "tie_word_embeddings"
         case skipLoopFinalNorm = "skip_loop_final_norm"
+        case attentionKEqV = "attention_k_eq_v"
+        case globalHeadDim = "global_head_dim"
+        case numGlobalKeyValueHeads = "num_global_key_value_heads"
+        case numKvSharedLayers = "num_kv_shared_layers"
+        case hiddenActivation = "hidden_activation"
+        case enableMoeBlock = "enable_moe_block"
+        case topKExperts = "top_k_experts"
+        case finalLogitSoftcapping = "final_logit_softcapping"
+        case slidingWindow = "sliding_window"
+        case hiddenSizePerLayerInput = "hidden_size_per_layer_input"
+        case useDoubleWideMlp = "use_double_wide_mlp"
+        case vocabSizePerLayerInput = "vocab_size_per_layer_input"
         case linearNumValueHeads = "linear_num_value_heads"
         case linearNumKeyHeads = "linear_num_key_heads"
         case linearValueHeadDim = "linear_value_head_dim"
@@ -232,6 +260,7 @@ public struct ModelConfig: Codable {
     public var vocabSize: Int?
     public var numExperts: Int?
     public var numExpertsPerTok: Int?
+    public var topKExperts: Int?
     public var layerTypes: [String]?
     public var maxPositionEmbeddings: Int?
     public var rmsNormEps: Float?
@@ -272,6 +301,12 @@ public struct ModelConfig: Codable {
     public var slidingWindow: Int?
     public var headwiseAttnOutputGate: Bool?
     public var gateAttnActMode: String?
+    public var attentionKEqV: Bool?
+    public var globalHeadDim: Int?
+    public var numGlobalKeyValueHeads: Int?
+    public var hiddenActivation: String?
+    public var enableMoeBlock: Bool?
+    public var finalLogitSoftcapping: Float?
     public var textConfig: NestedTextConfig?
 
     /// Per-layer-type RoPE parameters for hybrid sliding/full attention models (e.g. Spark 2.5).
@@ -291,6 +326,7 @@ public struct ModelConfig: Codable {
         case vocabSize = "vocab_size"
         case numExperts = "num_experts"
         case numExpertsPerTok = "num_experts_per_tok"
+        case topKExperts = "top_k_experts"
         case layerTypes = "layer_types"
         case maxPositionEmbeddings = "max_position_embeddings"
         case rmsNormEps = "rms_norm_eps"
@@ -331,6 +367,12 @@ public struct ModelConfig: Codable {
         case slidingWindow = "sliding_window"
         case headwiseAttnOutputGate = "headwise_attn_output_gate"
         case gateAttnActMode = "gate_attn_act_mode"
+        case attentionKEqV = "attention_k_eq_v"
+        case globalHeadDim = "global_head_dim"
+        case numGlobalKeyValueHeads = "num_global_key_value_heads"
+        case hiddenActivation = "hidden_activation"
+        case enableMoeBlock = "enable_moe_block"
+        case finalLogitSoftcapping = "final_logit_softcapping"
         case textConfig = "text_config"
     }
 
@@ -377,6 +419,9 @@ public struct ModelConfig: Codable {
 
     public var effectiveNumExpertsPerTok: Int {
         if let topK = textConfig?.numExpertsPerTok ?? numExpertsPerTok {
+            return topK
+        }
+        if let topK = textConfig?.topKExperts ?? topKExperts {
             return topK
         }
         if effectiveNumExperts >= 512 {
@@ -445,6 +490,11 @@ public struct ModelConfig: Codable {
 
     public var effectiveMoeIntermediateSize: Int {
         return textConfig?.moeIntermediateSize ?? moeIntermediateSize ?? 640
+    }
+
+    /// Dense MLP intermediate width (Gemma 4 keeps it in the nested text_config).
+    public var effectiveIntermediateSize: Int {
+        return textConfig?.intermediateSize ?? intermediateSize ?? 0
     }
 
     public var effectiveHcCount: Int {
@@ -530,6 +580,49 @@ public struct ModelConfig: Codable {
         return rawType.contains("spark") || archs.contains(where: { $0.contains("spark") })
     }
 
+    /// Gemma 4 (multimodal wrapper with a nested `gemma4_text` decoder). The text
+    /// decoder is a hybrid sliding/global attention MoE whose tensor names live
+    /// under `model.language_model.*`.
+    public var isGemma4Model: Bool {
+        let rawType = (modelType ?? "").lowercased()
+        let textType = (textConfig?.modelType ?? "").lowercased()
+        let archs = architectures?.map { $0.lowercased() } ?? []
+        return rawType.contains("gemma4") || textType.contains("gemma4") ||
+               archs.contains(where: { $0.contains("gemma4") })
+    }
+
+    /// Global-attention layers reuse the key projection as the value projection
+    /// (`attention_k_eq_v`), and use `global_head_dim` with a reduced KV head count.
+    public var effectiveAttentionKEqV: Bool {
+        return textConfig?.attentionKEqV ?? attentionKEqV ?? false
+    }
+
+    public var effectiveGlobalHeadDim: Int {
+        return textConfig?.globalHeadDim ?? globalHeadDim ?? 0
+    }
+
+    public var effectiveNumGlobalKeyValueHeads: Int {
+        return textConfig?.numGlobalKeyValueHeads ?? numGlobalKeyValueHeads ?? 0
+    }
+
+    /// Hidden activation function name (e.g. "gelu_pytorch_tanh", "silu").
+    public var effectiveHiddenActivation: String {
+        return textConfig?.hiddenActivation ?? hiddenActivation ?? "silu"
+    }
+
+    public var isGeluActivation: Bool {
+        return effectiveHiddenActivation.lowercased().contains("gelu")
+    }
+
+    public var effectiveEnableMoeBlock: Bool {
+        return textConfig?.enableMoeBlock ?? enableMoeBlock ?? false
+    }
+
+    /// Final logit soft-capping value (Gemma 2/3/4). Nil = disabled.
+    public var effectiveFinalLogitSoftcapping: Float? {
+        return textConfig?.finalLogitSoftcapping ?? finalLogitSoftcapping
+    }
+
     /// Raw layer-type string for a layer index (e.g. "sliding_attention" / "full_attention")
     public func layerTypeString(at layerIndex: Int) -> String? {
         guard let types = effectiveLayerTypesStrings, layerIndex >= 0, layerIndex < types.count else { return nil }
@@ -543,7 +636,7 @@ public struct ModelConfig: Codable {
 
     /// Sliding window size (nil = full attention everywhere)
     public var effectiveSlidingWindow: Int? {
-        return slidingWindow
+        return textConfig?.slidingWindow ?? slidingWindow
     }
 
     /// Resolves the RoPE theta for a specific layer, honoring per-layer-type
@@ -565,6 +658,14 @@ public struct ModelConfig: Codable {
     public func effectiveRotaryDim(layerIndex: Int, headDim: Int) -> Int {
         let hd = headDim > 0 ? headDim : 128
         let lt = layerTypeString(at: layerIndex)
+        // Gemma 4: sliding layers use full rotary over head_dim (theta 1e4);
+        // global layers use proportional RoPE (p-RoPE) rotating only the first
+        // partial_rotary_factor * global_head_dim dims (0.25 * 512 = 128).
+        if isGemma4Model {
+            if lt?.contains("sliding") ?? false { return hd }
+            let f = textConfig?.ropeParameters?.partialRotaryFactor ?? partialRotaryFactor ?? 0.25
+            return max(32, Int(Float(hd) * f))
+        }
         var factor: Float? = nil
         if let params = ropeParametersByLayerType {
             if (lt?.contains("sliding") ?? false) {
@@ -663,10 +764,15 @@ public struct ModelConfig: Codable {
 
         // Manually decode the per-layer-type rope_parameters dictionary (Spark 2.5 hybrid):
         // the top-level "rope_parameters" key can be a nested {full_attention, sliding_attention}
-        // object which the flat RopeParametersConfig decode silently drops.
-        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let ropeParams = json["rope_parameters"] as? [String: Any] {
-            if let nested = try? JSONSerialization.data(withJSONObject: ropeParams),
+        // object which the flat RopeParametersConfig decode silently drops. Gemma 4 nests it
+        // one level deeper under "text_config".
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            var ropeParams = json["rope_parameters"] as? [String: Any]
+            if ropeParams == nil, let textCfg = json["text_config"] as? [String: Any] {
+                ropeParams = textCfg["rope_parameters"] as? [String: Any]
+            }
+            if let ropeParams,
+               let nested = try? JSONSerialization.data(withJSONObject: ropeParams),
                let byType = try? decoder.decode(SlidingAttentionRopeParameters.self, from: nested) {
                 if byType.fullAttention != nil || byType.slidingAttention != nil {
                     config?.ropeParametersByLayerType = byType
@@ -684,7 +790,7 @@ public struct ModelConfig: Codable {
     public var isRMSNormUnitOffset: Bool {
         let archs = architectures?.map { $0.lowercased() } ?? []
         let modelTypeName = (modelType ?? (textConfig != nil ? "qwen3_5_moe" : "")).lowercased()
-        let isGemma = modelTypeName.contains("gemma") || archs.contains(where: { $0.contains("gemma") })
+        let isGemma = !isGemma4Model && (modelTypeName.contains("gemma") || archs.contains(where: { $0.contains("gemma") }))
         let isQwen4OrNext = modelTypeName.contains("qwen4") || modelTypeName.contains("next") ||
                             archs.contains(where: { $0.contains("qwen4") || $0.contains("next") || $0.contains("qwen4exp") })
         let isQwen35Moe = modelTypeName.contains("qwen3_5_moe") || archs.contains(where: { $0.contains("qwen3_5moe") || $0.contains("qwen3_5_moe") })
@@ -846,6 +952,10 @@ public struct ModelConfig: Codable {
             return true
         }
         if nameLower.contains("nemotron") || typeStr.contains("nemotron") || archStr.contains("nemotron") || pathLower.contains("nemotron") {
+            return true
+        }
+        // Gemma 4 reasons inside a `<|channel>thought … <channel|>` block.
+        if config?.isGemma4Model == true || typeStr.contains("gemma4") || archStr.contains("gemma4") {
             return true
         }
         if nameLower.contains("think") || pathLower.contains("think") {

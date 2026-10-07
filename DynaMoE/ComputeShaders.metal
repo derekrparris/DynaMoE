@@ -35,6 +35,14 @@ inline float bf16_to_fp32(ushort u) {
     return as_type<float>(bits);
 }
 
+/// Reads four consecutive bf16 values as a `ushort4` without assuming 8-byte
+/// alignment. Safetensors/FlashMoE tensor offsets are only guaranteed 2-byte
+/// aligned, so a direct `ushort4*` load from a weight base can be misaligned
+/// and read garbage on Apple GPUs. Scalar 2-byte loads are always safe.
+inline ushort4 load_ushort4_unaligned(device const ushort* p) {
+    return ushort4(p[0], p[1], p[2], p[3]);
+}
+
 inline ushort read_u16_unaligned(device const uchar* p) {
     return (ushort)p[0] | ((ushort)p[1] << 8);
 }
@@ -1527,7 +1535,7 @@ kernel void bf16_gemv(
     uint32_t num4 = inDim / 4;
     for (uint32_t i = 0; i < num4; i++) {
         uint32_t base = i * 4;
-        ushort4 w4 = *(device const ushort4*)(wRow + base);
+        ushort4 w4 = load_ushort4_unaligned(wRow + base);
         float4 in4 = *(device const float4*)(inPtr + base);
         dot0 += (bf16_to_fp32(w4.x) * in4.x) + (bf16_to_fp32(w4.y) * in4.y);
         dot1 += (bf16_to_fp32(w4.z) * in4.z) + (bf16_to_fp32(w4.w) * in4.w);
@@ -1760,6 +1768,47 @@ kernel void apply_rope_qwen(
 
         uint64_t idx0 = headBase + i;
         uint64_t idx1 = headBase + i + halfRotary;
+
+        float v0 = qkVector[idx0];
+        float v1 = qkVector[idx1];
+
+        qkVector[idx0] = v0 * cosVal - v1 * sinVal;
+        qkVector[idx1] = v0 * sinVal + v1 * cosVal;
+    }
+}
+
+/// MSL Kernel: Proportional RoPE (Gemma 4 global layers). Unlike the standard
+/// kernel, the rotation pairs element `i` with `i + headDim/2` and the frequency
+/// denominator is the full `headDim` (not the reduced rotary dimension); only the
+/// first `rotaryDim/2` angle pairs rotate, the rest are left untouched (p-RoPE).
+kernel void apply_rope_proportional(
+    device float* qkVector [[buffer(0)]],
+    constant uint32_t& tokenPos [[buffer(1)]],
+    constant uint32_t& numHeads [[buffer(2)]],
+    constant uint32_t& headDim [[buffer(3)]],
+    constant uint32_t& rotaryDim [[buffer(4)]],
+    constant uint32_t& headStride [[buffer(5)]],
+    constant float& ropeTheta [[buffer(6)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint headIdx = pos.x;
+    uint tokenIdx = pos.y;
+    if (headIdx >= numHeads) return;
+
+    uint32_t effectivePos = tokenPos + tokenIdx;
+    uint64_t headBase = (uint64_t)tokenIdx * ((uint64_t)numHeads * headStride) + ((uint64_t)headIdx * headStride);
+    uint32_t halfHead = headDim / 2;
+    uint32_t active = rotaryDim / 2;
+
+    for (uint32_t i = 0; i < active; i++) {
+        float exponent = (2.0f * (float)i) / (float)headDim;
+        float freq = 1.0f / pow(ropeTheta, exponent);
+        float angle = (float)effectivePos * freq;
+        float cosVal = cos(angle);
+        float sinVal = sin(angle);
+
+        uint64_t idx0 = headBase + i;
+        uint64_t idx1 = headBase + i + halfHead;
 
         float v0 = qkVector[idx0];
         float v1 = qkVector[idx1];
@@ -3445,8 +3494,8 @@ kernel void bf16_swiglu_gate_up_simd(
     uint64_t gateRowStart = (gateWeightOffset / 2) + ((uint64_t)r * hiddenDim);
     uint64_t upRowStart   = (upWeightOffset / 2) + ((uint64_t)r * hiddenDim);
 
-    device const ushort4* g4 = (device const ushort4*)(rawGateBuffer + gateRowStart);
-    device const ushort4* u4 = (device const ushort4*)(rawUpBuffer + upRowStart);
+    device const ushort* g4 = rawGateBuffer + gateRowStart;
+    device const ushort* u4 = rawUpBuffer + upRowStart;
     device const float4* in4 = (device const float4*)inputVector;
 
     float gate_dot = 0.0f;
@@ -3454,10 +3503,10 @@ kernel void bf16_swiglu_gate_up_simd(
 
     uint32_t numChunks = hiddenDim / 8;
     for (uint32_t c = laneId; c < numChunks; c += 32) {
-        ushort4 g_lo = g4[c * 2 + 0];
-        ushort4 g_hi = g4[c * 2 + 1];
-        ushort4 u_lo = u4[c * 2 + 0];
-        ushort4 u_hi = u4[c * 2 + 1];
+        ushort4 g_lo = load_ushort4_unaligned(g4 + c * 8 + 0);
+        ushort4 g_hi = load_ushort4_unaligned(g4 + c * 8 + 4);
+        ushort4 u_lo = load_ushort4_unaligned(u4 + c * 8 + 0);
+        ushort4 u_hi = load_ushort4_unaligned(u4 + c * 8 + 4);
 
         float4 in_lo = in4[c * 2 + 0];
         float4 in_hi = in4[c * 2 + 1];
@@ -3509,8 +3558,8 @@ kernel void bf16_gelu_gate_up_simd(
     uint64_t gateRowStart = (gateWeightOffset / 2) + ((uint64_t)r * hiddenDim);
     uint64_t upRowStart   = (upWeightOffset / 2) + ((uint64_t)r * hiddenDim);
 
-    device const ushort4* g4 = (device const ushort4*)(rawGateBuffer + gateRowStart);
-    device const ushort4* u4 = (device const ushort4*)(rawUpBuffer + upRowStart);
+    device const ushort* g4 = rawGateBuffer + gateRowStart;
+    device const ushort* u4 = rawUpBuffer + upRowStart;
     device const float4* in4 = (device const float4*)inputVector;
 
     float gate_dot = 0.0f;
@@ -3518,10 +3567,10 @@ kernel void bf16_gelu_gate_up_simd(
 
     uint32_t numChunks = hiddenDim / 8;
     for (uint32_t c = laneId; c < numChunks; c += 32) {
-        ushort4 g_lo = g4[c * 2 + 0];
-        ushort4 g_hi = g4[c * 2 + 1];
-        ushort4 u_lo = u4[c * 2 + 0];
-        ushort4 u_hi = u4[c * 2 + 1];
+        ushort4 g_lo = load_ushort4_unaligned(g4 + c * 8 + 0);
+        ushort4 g_hi = load_ushort4_unaligned(g4 + c * 8 + 4);
+        ushort4 u_lo = load_ushort4_unaligned(u4 + c * 8 + 0);
+        ushort4 u_hi = load_ushort4_unaligned(u4 + c * 8 + 4);
 
         float4 in_lo = in4[c * 2 + 0];
         float4 in_hi = in4[c * 2 + 1];
@@ -3577,8 +3626,8 @@ kernel void bf16_swiglu_gate_up_batched(
     uint64_t gateRowStart = (gateWeightOffset / 2) + ((uint64_t)r * hiddenDim);
     uint64_t upRowStart   = (upWeightOffset / 2) + ((uint64_t)r * hiddenDim);
 
-    device const ushort4* g4 = (device const ushort4*)(rawGateBuffer + gateRowStart);
-    device const ushort4* u4 = (device const ushort4*)(rawUpBuffer + upRowStart);
+    device const ushort* g4 = rawGateBuffer + gateRowStart;
+    device const ushort* u4 = rawUpBuffer + upRowStart;
     device const float4* in4 = (device const float4*)(inputVector + ((uint64_t)tokenIdx * hiddenDim));
 
     float gate_dot = 0.0f;
@@ -3586,10 +3635,10 @@ kernel void bf16_swiglu_gate_up_batched(
 
     uint32_t numChunks = hiddenDim / 8;
     for (uint32_t c = laneId; c < numChunks; c += 32) {
-        ushort4 g_lo = g4[c * 2 + 0];
-        ushort4 g_hi = g4[c * 2 + 1];
-        ushort4 u_lo = u4[c * 2 + 0];
-        ushort4 u_hi = u4[c * 2 + 1];
+        ushort4 g_lo = load_ushort4_unaligned(g4 + c * 8 + 0);
+        ushort4 g_hi = load_ushort4_unaligned(g4 + c * 8 + 4);
+        ushort4 u_lo = load_ushort4_unaligned(u4 + c * 8 + 0);
+        ushort4 u_hi = load_ushort4_unaligned(u4 + c * 8 + 4);
 
         float4 in_lo = in4[c * 2 + 0];
         float4 in_hi = in4[c * 2 + 1];
@@ -3645,8 +3694,8 @@ kernel void bf16_gelu_gate_up_batched(
     uint64_t gateRowStart = (gateWeightOffset / 2) + ((uint64_t)r * hiddenDim);
     uint64_t upRowStart   = (upWeightOffset / 2) + ((uint64_t)r * hiddenDim);
 
-    device const ushort4* g4 = (device const ushort4*)(rawGateBuffer + gateRowStart);
-    device const ushort4* u4 = (device const ushort4*)(rawUpBuffer + upRowStart);
+    device const ushort* g4 = rawGateBuffer + gateRowStart;
+    device const ushort* u4 = rawUpBuffer + upRowStart;
     device const float4* in4 = (device const float4*)(inputVector + ((uint64_t)tokenIdx * hiddenDim));
 
     float gate_dot = 0.0f;
@@ -3654,10 +3703,10 @@ kernel void bf16_gelu_gate_up_batched(
 
     uint32_t numChunks = hiddenDim / 8;
     for (uint32_t c = laneId; c < numChunks; c += 32) {
-        ushort4 g_lo = g4[c * 2 + 0];
-        ushort4 g_hi = g4[c * 2 + 1];
-        ushort4 u_lo = u4[c * 2 + 0];
-        ushort4 u_hi = u4[c * 2 + 1];
+        ushort4 g_lo = load_ushort4_unaligned(g4 + c * 8 + 0);
+        ushort4 g_hi = load_ushort4_unaligned(g4 + c * 8 + 4);
+        ushort4 u_lo = load_ushort4_unaligned(u4 + c * 8 + 0);
+        ushort4 u_hi = load_ushort4_unaligned(u4 + c * 8 + 4);
 
         float4 in_lo = in4[c * 2 + 0];
         float4 in_hi = in4[c * 2 + 1];
@@ -3706,15 +3755,15 @@ kernel void bf16_down_proj_accumulate_simd(
     if (d >= hiddenDim) return;
 
     uint64_t downRowStart = (downWeightOffset / 2) + ((uint64_t)d * intermediateDim);
-    device const ushort4* d4 = (device const ushort4*)(rawDownBuffer + downRowStart);
+    device const ushort* d4 = rawDownBuffer + downRowStart;
     device const float4* in4 = (device const float4*)intermediateVector;
 
     float down_dot = 0.0f;
     uint32_t numChunks = intermediateDim / 8;
 
     for (uint32_t c = laneId; c < numChunks; c += 32) {
-        ushort4 d_lo = d4[c * 2 + 0];
-        ushort4 d_hi = d4[c * 2 + 1];
+        ushort4 d_lo = load_ushort4_unaligned(d4 + c * 8 + 0);
+        ushort4 d_hi = load_ushort4_unaligned(d4 + c * 8 + 4);
         float4 in_lo = in4[c * 2 + 0];
         float4 in_hi = in4[c * 2 + 1];
 
@@ -3757,15 +3806,15 @@ kernel void bf16_down_proj_accumulate_batched(
     float routingWeight = activeWeights[batchIdx];
 
     uint64_t downRowStart = (downWeightOffset / 2) + ((uint64_t)d * intermediateDim);
-    device const ushort4* d4 = (device const ushort4*)(rawDownBuffer + downRowStart);
+    device const ushort* d4 = rawDownBuffer + downRowStart;
     device const float4* in4 = (device const float4*)(intermediateVector + ((uint64_t)tokenIdx * intermediateDim));
 
     float down_dot = 0.0f;
     uint32_t numChunks = intermediateDim / 8;
 
     for (uint32_t c = laneId; c < numChunks; c += 32) {
-        ushort4 d_lo = d4[c * 2 + 0];
-        ushort4 d_hi = d4[c * 2 + 1];
+        ushort4 d_lo = load_ushort4_unaligned(d4 + c * 8 + 0);
+        ushort4 d_hi = load_ushort4_unaligned(d4 + c * 8 + 4);
         float4 in_lo = in4[c * 2 + 0];
         float4 in_hi = in4[c * 2 + 1];
 
@@ -3803,26 +3852,25 @@ kernel void bf16_gemv_simd(
     if (row >= outDim) return;
 
     uint64_t rowWeightStart = (weightOffset / 2) + ((uint64_t)row * inDim);
-    device const ushort4* w4 = (device const ushort4*)(rawWeightBuffer + rowWeightStart);
+    device const ushort* wRow = rawWeightBuffer + rowWeightStart;
     device const float4* in4 = (device const float4*)(inputVector + ((uint64_t)tokenIdx * inDim));
 
     float dot = 0.0f;
     uint32_t numChunks = inDim / 8;
 
     for (uint32_t c = laneId; c < numChunks; c += 32) {
-        ushort4 w_lo = w4[c * 2 + 0];
-        ushort4 w_hi = w4[c * 2 + 1];
         float4 in_lo = in4[c * 2 + 0];
         float4 in_hi = in4[c * 2 + 1];
+        uint32_t wb = c * 8;
 
-        dot += (bf16_to_fp32(w_lo.x) * in_lo.x) +
-               (bf16_to_fp32(w_lo.y) * in_lo.y) +
-               (bf16_to_fp32(w_lo.z) * in_lo.z) +
-               (bf16_to_fp32(w_lo.w) * in_lo.w) +
-               (bf16_to_fp32(w_hi.x) * in_hi.x) +
-               (bf16_to_fp32(w_hi.y) * in_hi.y) +
-               (bf16_to_fp32(w_hi.z) * in_hi.z) +
-               (bf16_to_fp32(w_hi.w) * in_hi.w);
+        dot += (bf16_to_fp32(wRow[wb + 0]) * in_lo.x) +
+               (bf16_to_fp32(wRow[wb + 1]) * in_lo.y) +
+               (bf16_to_fp32(wRow[wb + 2]) * in_lo.z) +
+               (bf16_to_fp32(wRow[wb + 3]) * in_lo.w) +
+               (bf16_to_fp32(wRow[wb + 4]) * in_hi.x) +
+               (bf16_to_fp32(wRow[wb + 5]) * in_hi.y) +
+               (bf16_to_fp32(wRow[wb + 6]) * in_hi.z) +
+               (bf16_to_fp32(wRow[wb + 7]) * in_hi.w);
     }
 
     dot = simd_sum(dot);
@@ -7521,13 +7569,13 @@ kernel void bf16_gemv_batched(
     uint o = tgPos.x;
     uint t0 = tgPos.y * 16;
     if (o >= outDim) return;
-    device const ushort4* w4 = (device const ushort4*)(rawWeightBuffer + (weightOffset / 2) + ((uint64_t)o * inDim));
+    device const ushort* w4 = rawWeightBuffer + (weightOffset / 2) + ((uint64_t)o * inDim);
     float acc[16];
     for (uint t = 0; t < 16; t++) acc[t] = 0.0f;
     uint32_t numChunks = inDim / 8;
     for (uint32_t c = laneId; c < numChunks; c += 32) {
-        ushort4 wLoRaw = w4[c * 2 + 0];
-        ushort4 wHiRaw = w4[c * 2 + 1];
+        ushort4 wLoRaw = load_ushort4_unaligned(w4 + c * 8 + 0);
+        ushort4 wHiRaw = load_ushort4_unaligned(w4 + c * 8 + 4);
         float4 wLo = float4(bf16_to_fp32(wLoRaw.x), bf16_to_fp32(wLoRaw.y), bf16_to_fp32(wLoRaw.z), bf16_to_fp32(wLoRaw.w));
         float4 wHi = float4(bf16_to_fp32(wHiRaw.x), bf16_to_fp32(wHiRaw.y), bf16_to_fp32(wHiRaw.z), bf16_to_fp32(wHiRaw.w));
         for (uint t = 0; t < 16; t++) {
@@ -7649,5 +7697,259 @@ kernel void fp8_gemv_batched(
         if (t0 + 13 < batch) outputBatched[(uint64_t)(t0 + 13) * outDim + o] = s13 * rowScale;
         if (t0 + 14 < batch) outputBatched[(uint64_t)(t0 + 14) * outDim + o] = s14 * rowScale;
         if (t0 + 15 < batch) outputBatched[(uint64_t)(t0 + 15) * outDim + o] = s15 * rowScale;
+    }
+}
+
+// =============================================================================
+// MARK: - Gemma 4 Hybrid-Attention MoE Support Kernels
+// =============================================================================
+
+/// RMSNorm without a learned scale (Gemma 4 v_norm / router.norm). Batched grid (P,1,1).
+kernel void rmsnorm_no_scale_bf16(
+    device const float* inVector [[buffer(0)]],
+    device float* outVector [[buffer(1)]],
+    constant uint32_t& dim [[buffer(2)]],
+    constant float& eps [[buffer(3)]],
+    threadgroup float* sharedWarpSums [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]],
+    uint tgIdx [[threadgroup_position_in_grid]]
+) {
+    uint dimVec4 = dim / 4;
+    device const float4* inVec4 = (device const float4*)(inVector + ((uint64_t)tgIdx * dim));
+    device const float* inVec = inVector + ((uint64_t)tgIdx * dim);
+    float localSum = 0.0f;
+    for (uint i = tid; i < dimVec4; i += tgSize) {
+        float4 v = inVec4[i];
+        localSum += dot(v, v);
+    }
+    for (uint i = dimVec4 * 4 + tid; i < dim; i += tgSize) {
+        float v = inVec[i];
+        localSum += v * v;
+    }
+    float totalSum = threadgroup_reduce_sum(localSum, sharedWarpSums, tid, tgSize);
+    float invRms = rsqrt(totalSum / (float)dim + eps);
+    device float4* outVec4 = (device float4*)(outVector + ((uint64_t)tgIdx * dim));
+    device float* outVec = outVector + ((uint64_t)tgIdx * dim);
+    for (uint i = tid; i < dimVec4; i += tgSize) {
+        outVec4[i] = inVec4[i] * invRms;
+    }
+    for (uint i = dimVec4 * 4 + tid; i < dim; i += tgSize) {
+        outVec[i] = inVec[i] * invRms;
+    }
+}
+
+/// Elementwise out = in * bf16Vector * scalar (Gemma 4 router input transform:
+/// rmsnorm(x) * router.scale * hidden_size^-0.5).
+kernel void mul_by_bf16_vector(
+    device const float* inVector [[buffer(0)]],
+    device const uchar* vecBuffer [[buffer(1)]],
+    device float* outVector [[buffer(2)]],
+    constant uint64_t& vecOffset [[buffer(3)]],
+    constant uint32_t& dim [[buffer(4)]],
+    constant float& scalar [[buffer(5)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= dim) return;
+    float s = read_bf16_unaligned(vecBuffer + vecOffset + ((uint64_t)i * 2));
+    outVector[i] = inVector[i] * s * scalar;
+}
+
+/// In-place multiply of a float vector by a scalar (embedding scale, layer_scalar).
+kernel void scale_vector_inplace(
+    device float* vecBuffer [[buffer(0)]],
+    constant uint32_t& dim [[buffer(1)]],
+    constant float& scalar [[buffer(2)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= dim) return;
+    vecBuffer[i] *= scalar;
+}
+
+/// Applies Gemma 4's per-expert routing scale to the selected top-k weights.
+kernel void apply_topk_per_expert_scale(
+    device float* routingWeights [[buffer(0)]],
+    device const uint32_t* expertIndices [[buffer(1)]],
+    device const uchar* scaleBuffer [[buffer(2)]],
+    constant uint64_t& scaleOffset [[buffer(3)]],
+    constant uint32_t& topK [[buffer(4)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= topK) return;
+    float s = read_bf16_unaligned(scaleBuffer + scaleOffset + ((uint64_t)expertIndices[i] * 2));
+    routingWeights[i] *= s;
+}
+
+/// Stores K/V into the layer's KV cache with an explicit cache stride. Gemma 4
+/// mixes head counts and head dims across layer types (8x256 sliding, 2x512
+/// global) while the cache is allocated with a single uniform stride.
+kernel void store_kv_cache_gemma_f16(
+    device const float* kVector [[buffer(0)]],
+    device const float* vVector [[buffer(1)]],
+    device half* kCacheBuffer [[buffer(2)]],
+    device half* vCacheBuffer [[buffer(3)]],
+    constant uint32_t& tokenPos [[buffer(4)]],
+    constant uint32_t& numKvHeads [[buffer(5)]],
+    constant uint32_t& headDim [[buffer(6)]],
+    constant uint32_t& cacheStride [[buffer(7)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint elemIdx = pos.x;
+    uint tokenIdx = pos.y;
+    uint32_t kvStride = numKvHeads * headDim;
+    if (elemIdx >= kvStride) return;
+    uint32_t effectivePos = tokenPos + tokenIdx;
+    uint32_t inOffset = (tokenIdx * kvStride) + elemIdx;
+    uint32_t cacheOffset = (effectivePos * cacheStride) + elemIdx;
+    kCacheBuffer[cacheOffset] = half(kVector[inOffset]);
+    vCacheBuffer[cacheOffset] = half(vVector[inOffset]);
+}
+
+kernel void store_kv_cache_gemma(
+    device const float* kVector [[buffer(0)]],
+    device const float* vVector [[buffer(1)]],
+    device float* kCacheBuffer [[buffer(2)]],
+    device float* vCacheBuffer [[buffer(3)]],
+    constant uint32_t& tokenPos [[buffer(4)]],
+    constant uint32_t& numKvHeads [[buffer(5)]],
+    constant uint32_t& headDim [[buffer(6)]],
+    constant uint32_t& cacheStride [[buffer(7)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint elemIdx = pos.x;
+    uint tokenIdx = pos.y;
+    uint32_t kvStride = numKvHeads * headDim;
+    if (elemIdx >= kvStride) return;
+    uint32_t effectivePos = tokenPos + tokenIdx;
+    uint32_t inOffset = (tokenIdx * kvStride) + elemIdx;
+    uint32_t cacheOffset = (effectivePos * cacheStride) + elemIdx;
+    kCacheBuffer[cacheOffset] = kVector[inOffset];
+    vCacheBuffer[cacheOffset] = vVector[inOffset];
+}
+
+/// Gemma 4 grouped-query attention decode. One threadgroup (32 lanes) per query
+/// head. Unlike the standard kernel this takes an explicit `scaling` (Gemma 4
+/// uses 1.0), a sliding `windowSize`, and an explicit cache stride.
+kernel void gqa_attention_decode_gemma_f16(
+    device const float* qVector [[buffer(0)]],
+    device const half* kCacheBuffer [[buffer(1)]],
+    device const half* vCacheBuffer [[buffer(2)]],
+    device float* attnOutBuffer [[buffer(3)]],
+    constant uint32_t& seqLen [[buffer(4)]],
+    constant uint32_t& numQHeads [[buffer(5)]],
+    constant uint32_t& numKvHeads [[buffer(6)]],
+    constant uint32_t& headDim [[buffer(7)]],
+    constant uint32_t& windowSize [[buffer(8)]],
+    constant float& scaling [[buffer(9)]],
+    constant uint32_t& cacheStride [[buffer(10)]],
+    uint tgIdx [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint qHeadIdx = tgIdx;
+    if (qHeadIdx >= numQHeads) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+    uint32_t qHeadBase = qHeadIdx * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+
+    uint32_t currentSeqLen = (seqLen == 0) ? 1 : ((seqLen & 0x80000000) ? ((seqLen & 0x7FFFFFFF) + 1) : seqLen);
+    uint32_t winStart = (windowSize > 0 && currentSeqLen > windowSize) ? (currentSeqLen - windowSize) : 0;
+
+    uint32_t headDimVec = headDim / 4;
+    device const float4* qVec = (device const float4*)(qVector + qHeadBase);
+
+    float4 acc[32];
+    for (uint32_t i = 0; i < 32; i++) acc[i] = float4(0.0f);
+    float m = -1e20f;
+    float l = 0.0f;
+
+    for (uint32_t tau = winStart; tau < currentSeqLen; tau++) {
+        device const half* kVec = kCacheBuffer + (uint64_t)tau * cacheStride + kvHeadBase;
+        float partial = 0.0f;
+        for (uint32_t i = laneId; i < headDimVec; i += 32) {
+            uint32_t e = i * 4;
+            float4 kk = float4(float(kVec[e + 0]), float(kVec[e + 1]), float(kVec[e + 2]), float(kVec[e + 3]));
+            partial += dot(qVec[i], kk);
+        }
+        float score = simd_sum(partial) * scaling;
+        float m_prev = m;
+        m = max(m, score);
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+        l = l * alpha + beta;
+
+        device const half* vVec = vCacheBuffer + (uint64_t)tau * cacheStride + kvHeadBase;
+        for (uint32_t i = laneId, slot = 0; i < headDimVec; i += 32, slot++) {
+            uint32_t e = i * 4;
+            float4 vv = float4(float(vVec[e + 0]), float(vVec[e + 1]), float(vVec[e + 2]), float(vVec[e + 3]));
+            acc[slot] = acc[slot] * alpha + vv * beta;
+        }
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    device float4* outVec = (device float4*)(attnOutBuffer + qHeadBase);
+    for (uint32_t i = laneId, slot = 0; i < headDimVec; i += 32, slot++) {
+        outVec[i] = acc[slot] * invL;
+    }
+}
+
+kernel void gqa_attention_decode_gemma(
+    device const float* qVector [[buffer(0)]],
+    device const float* kCacheBuffer [[buffer(1)]],
+    device const float* vCacheBuffer [[buffer(2)]],
+    device float* attnOutBuffer [[buffer(3)]],
+    constant uint32_t& seqLen [[buffer(4)]],
+    constant uint32_t& numQHeads [[buffer(5)]],
+    constant uint32_t& numKvHeads [[buffer(6)]],
+    constant uint32_t& headDim [[buffer(7)]],
+    constant uint32_t& windowSize [[buffer(8)]],
+    constant float& scaling [[buffer(9)]],
+    constant uint32_t& cacheStride [[buffer(10)]],
+    uint tgIdx [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint qHeadIdx = tgIdx;
+    if (qHeadIdx >= numQHeads) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+    uint32_t qHeadBase = qHeadIdx * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+
+    uint32_t currentSeqLen = (seqLen == 0) ? 1 : ((seqLen & 0x80000000) ? ((seqLen & 0x7FFFFFFF) + 1) : seqLen);
+    uint32_t winStart = (windowSize > 0 && currentSeqLen > windowSize) ? (currentSeqLen - windowSize) : 0;
+
+    uint32_t headDimVec = headDim / 4;
+    device const float4* qVec = (device const float4*)(qVector + qHeadBase);
+
+    float4 acc[32];
+    for (uint32_t i = 0; i < 32; i++) acc[i] = float4(0.0f);
+    float m = -1e20f;
+    float l = 0.0f;
+
+    for (uint32_t tau = winStart; tau < currentSeqLen; tau++) {
+        device const float4* kVec = (device const float4*)(kCacheBuffer + (uint64_t)tau * cacheStride + kvHeadBase);
+        float partial = 0.0f;
+        for (uint32_t i = laneId; i < headDimVec; i += 32) {
+            partial += dot(qVec[i], kVec[i]);
+        }
+        float score = simd_sum(partial) * scaling;
+        float m_prev = m;
+        m = max(m, score);
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+        l = l * alpha + beta;
+
+        device const float4* vVec = (device const float4*)(vCacheBuffer + (uint64_t)tau * cacheStride + kvHeadBase);
+        for (uint32_t i = laneId, slot = 0; i < headDimVec; i += 32, slot++) {
+            acc[slot] = acc[slot] * alpha + vVec[i] * beta;
+        }
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    device float4* outVec = (device float4*)(attnOutBuffer + qHeadBase);
+    for (uint32_t i = laneId, slot = 0; i < headDimVec; i += 32, slot++) {
+        outVec[i] = acc[slot] * invL;
     }
 }
