@@ -7953,3 +7953,126 @@ kernel void gqa_attention_decode_gemma(
         outVec[i] = acc[slot] * invL;
     }
 }
+
+/// Stores K/V into the layer's FP8 KV cache with an explicit cache stride and per-head
+/// INT8 scales (Gemma 4). Mirrors store_kv_cache_gemma_f16 but quantizes to int8 and
+/// writes a per-(token, kv-head) dequant scale, matching store_kv_cache_fp8's scheme.
+kernel void store_kv_cache_gemma_fp8(
+    device const float* kVector [[buffer(0)]],
+    device const float* vVector [[buffer(1)]],
+    device char* kCacheBuffer [[buffer(2)]],
+    device char* vCacheBuffer [[buffer(3)]],
+    device half* kScaleBuffer [[buffer(4)]],
+    device half* vScaleBuffer [[buffer(5)]],
+    constant uint32_t& tokenPos [[buffer(6)]],
+    constant uint32_t& numKvHeads [[buffer(7)]],
+    constant uint32_t& headDim [[buffer(8)]],
+    constant uint32_t& cacheStride [[buffer(9)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]]
+) {
+    uint kvHeadIdx = tgPos.x;
+    uint tokenIdx = tgPos.y;
+    uint laneId = tid.x;
+    if (kvHeadIdx >= numKvHeads) return;
+
+    uint32_t effectivePos = tokenPos + tokenIdx;
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t inBase = tokenIdx * kvStride + kvHeadIdx * headDim;
+    uint32_t cacheHeadBase = effectivePos * cacheStride + kvHeadIdx * headDim;
+    uint32_t scaleIdx = effectivePos * numKvHeads + kvHeadIdx;
+
+    float local_max_k = 0.0f;
+    float local_max_v = 0.0f;
+    for (uint32_t d = laneId; d < headDim; d += 32) {
+        local_max_k = max(local_max_k, abs(kVector[inBase + d]));
+        local_max_v = max(local_max_v, abs(vVector[inBase + d]));
+    }
+    float scale_k = max(simd_max(local_max_k), 1e-7f) / 127.0f;
+    float scale_v = max(simd_max(local_max_v), 1e-7f) / 127.0f;
+    float inv_scale_k = 1.0f / scale_k;
+    float inv_scale_v = 1.0f / scale_v;
+
+    if (laneId == 0) {
+        kScaleBuffer[scaleIdx] = half(scale_k);
+        vScaleBuffer[scaleIdx] = half(scale_v);
+    }
+
+    for (uint32_t d = laneId; d < headDim; d += 32) {
+        float qk = clamp(round(kVector[inBase + d] * inv_scale_k), -127.0f, 127.0f);
+        float qv = clamp(round(vVector[inBase + d] * inv_scale_v), -127.0f, 127.0f);
+        kCacheBuffer[cacheHeadBase + d] = char(qk);
+        vCacheBuffer[cacheHeadBase + d] = char(qv);
+    }
+}
+
+/// Gemma 4 grouped-query attention decode over an INT8 KV cache with per-head dequant
+/// scales. Same explicit scaling/window/cacheStride contract as gqa_attention_decode_gemma.
+kernel void gqa_attention_decode_gemma_fp8(
+    device const float* qVector [[buffer(0)]],
+    device const char* kCacheBuffer [[buffer(1)]],
+    device const char* vCacheBuffer [[buffer(2)]],
+    device const half* kScaleBuffer [[buffer(3)]],
+    device const half* vScaleBuffer [[buffer(4)]],
+    device float* attnOutBuffer [[buffer(5)]],
+    constant uint32_t& seqLen [[buffer(6)]],
+    constant uint32_t& numQHeads [[buffer(7)]],
+    constant uint32_t& numKvHeads [[buffer(8)]],
+    constant uint32_t& headDim [[buffer(9)]],
+    constant uint32_t& windowSize [[buffer(10)]],
+    constant float& scaling [[buffer(11)]],
+    constant uint32_t& cacheStride [[buffer(12)]],
+    uint tgIdx [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint qHeadIdx = tgIdx;
+    if (qHeadIdx >= numQHeads) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+    uint32_t qHeadBase = qHeadIdx * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+
+    uint32_t currentSeqLen = (seqLen == 0) ? 1 : ((seqLen & 0x80000000) ? ((seqLen & 0x7FFFFFFF) + 1) : seqLen);
+    uint32_t winStart = (windowSize > 0 && currentSeqLen > windowSize) ? (currentSeqLen - windowSize) : 0;
+
+    uint32_t headDimVec = headDim / 4;
+    device const float4* qVec = (device const float4*)(qVector + qHeadBase);
+
+    float4 acc[32];
+    for (uint32_t i = 0; i < 32; i++) acc[i] = float4(0.0f);
+    float m = -1e20f;
+    float l = 0.0f;
+
+    for (uint32_t tau = winStart; tau < currentSeqLen; tau++) {
+        float kScale = float(kScaleBuffer[tau * numKvHeads + kvHeadIdx]);
+        device const char* kBase = kCacheBuffer + (uint64_t)tau * cacheStride + kvHeadBase;
+        float partial = 0.0f;
+        for (uint32_t i = laneId; i < headDimVec; i += 32) {
+            uint32_t e = i * 4;
+            float4 kk = float4(float(kBase[e + 0]), float(kBase[e + 1]), float(kBase[e + 2]), float(kBase[e + 3]));
+            partial += dot(qVec[i], kk);
+        }
+        float score = simd_sum(partial) * kScale * scaling;
+        float m_prev = m;
+        m = max(m, score);
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+        l = l * alpha + beta;
+
+        float vScale = float(vScaleBuffer[tau * numKvHeads + kvHeadIdx]);
+        device const char* vBase = vCacheBuffer + (uint64_t)tau * cacheStride + kvHeadBase;
+        float beta_vScale = beta * vScale;
+        for (uint32_t i = laneId, slot = 0; i < headDimVec; i += 32, slot++) {
+            uint32_t e = i * 4;
+            float4 vv = float4(float(vBase[e + 0]), float(vBase[e + 1]), float(vBase[e + 2]), float(vBase[e + 3]));
+            acc[slot] = acc[slot] * alpha + vv * beta_vScale;
+        }
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    device float4* outVec = (device float4*)(attnOutBuffer + qHeadBase);
+    for (uint32_t i = laneId, slot = 0; i < headDimVec; i += 32, slot++) {
+        outVec[i] = acc[slot] * invL;
+    }
+}
