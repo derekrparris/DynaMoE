@@ -12909,6 +12909,30 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         XCTAssertFalse(splitGemmaOpen.thinkClose)
         XCTAssertEqual(splitGemmaOpen.think, "The user said \"hello!\".")
         XCTAssertEqual(splitGemmaOpen.resp, "")
+        // Scenario 9: Gemma 4 agent continuation. formatGemmaToolResponseTurn ends the
+        // continuation prompt with <|channel>thought\n, so the model does NOT re-emit the opener:
+        // its reasoning streams with no open tag, closed only by <channel|>. The prompt must be
+        // recognized as requesting thinking, or the reasoning renders as the response body
+        // until the close arrives, then jumps into the thinking accordion. Regression for
+        // the post-web_search render leak.
+        let gemmaContinuationPrompt = "<bos><|turn>system\n<|think|>\nSYS<turn|>\n<|turn>model\n<|channel>thought\n"
+        XCTAssertTrue(ContentView.promptRequestsThinking(gemmaContinuationPrompt),
+                      "Gemma continuation prompt ends on the channel opener and must request thinking")
+
+        let contStream = "I should search for the latest version."
+        let contOpen = ContentView.splitThinkingAndResponse(raw: contStream, promptRequestsThinking: ContentView.promptRequestsThinking(gemmaContinuationPrompt))
+        XCTAssertTrue(contOpen.thinkOpen, "untagged continuation reasoning must stay in the thinking block")
+        XCTAssertEqual(contOpen.resp, "")
+
+        let contClosed = ContentView.splitThinkingAndResponse(raw: contStream + "<channel|>Here is the answer.", promptRequestsThinking: ContentView.promptRequestsThinking(gemmaContinuationPrompt))
+        XCTAssertTrue(contClosed.thinkClose)
+        XCTAssertEqual(contClosed.think, "I should search for the latest version.")
+        XCTAssertEqual(contClosed.resp, "Here is the answer.")
+
+        // Thinking-disabled first turn ends on the closed empty channel: no thinking requested.
+        XCTAssertFalse(ContentView.promptRequestsThinking("<|turn>model\n<|channel>thought\n<channel|>"))
+        // A plain Gemma first turn (model emits its own opener) is unaffected.
+        XCTAssertFalse(ContentView.promptRequestsThinking("<|turn>model\n"))
     }
 
     func testSparkForwardDiagnostics() throws {

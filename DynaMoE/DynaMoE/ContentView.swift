@@ -15058,7 +15058,7 @@ if layer.attnGateProjTensor != nil,
                 var activeThink = false
 
                 let promptTrimmed = formattedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-                let promptRequestsThinking = (promptTrimmed.hasSuffix("<think>") || promptTrimmed.hasSuffix("<thought>") || promptTrimmed.hasSuffix("<|thought|>")) && !promptTrimmed.hasSuffix("</think>") && !promptTrimmed.hasSuffix("</thought>") && !promptTrimmed.hasSuffix("</|thought|>")
+                let promptRequestsThinking = Self.promptRequestsThinking(promptTrimmed)
 
                 let thinkSplit = Self.splitThinkingAndResponse(raw: updatedRaw, promptRequestsThinking: promptRequestsThinking)
 
@@ -15164,7 +15164,7 @@ if layer.attnGateProjTensor != nil,
             var finalThink = ""
             var finalResp = ""
             let promptTrimmedFinal = formattedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-            let promptRequestsThinkingFinal = (promptTrimmedFinal.hasSuffix("<think>") || promptTrimmedFinal.hasSuffix("<thought>") || promptTrimmedFinal.hasSuffix("<|thought|>")) && !promptTrimmedFinal.hasSuffix("</think>") && !promptTrimmedFinal.hasSuffix("</thought>") && !promptTrimmedFinal.hasSuffix("</|thought|>")
+            let promptRequestsThinkingFinal = Self.promptRequestsThinking(promptTrimmedFinal)
 
             let finalSplit = Self.splitThinkingAndResponse(raw: finalDecoded, promptRequestsThinking: promptRequestsThinkingFinal)
             if finalSplit.thinkClose {
@@ -16133,6 +16133,25 @@ if layer.attnGateProjTensor != nil,
             if let last { return last }
         }
         return nil
+    }
+
+    /// True when the prompt ends on an open reasoning marker, so untagged streamed
+    /// output is the model's reasoning until a closing marker arrives. Covers the
+    /// XML/`<thought>` dialects and Gemma 4's channel opener.
+    ///
+    /// The Gemma 4 agent continuation prompt (`formatGemmaToolResponseTurn`) already
+    /// appends `<|channel>thought\n`, so the model does not re-emit the opener and its
+    /// reasoning streams with NO open tag, only the closing <channel|> at the end.
+    /// Without recognizing the opener as a thinking request, that reasoning was
+    /// classified as the response body until the close arrived, then jumped into the
+    /// thinking accordion (observed live right after a web_search). The first turn is
+    /// unaffected: it ends at `<|turn>model\n` and the model emits its own opener.
+    static func promptRequestsThinking(_ prompt: String) -> Bool {
+        let p = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        let openSuffixes = ["<think>", "<thought>", "<|thought|>", "<|channel>thought", "<|channel>"]
+        let closeSuffixes = ["</think>", "</thought>", "</|thought|>", "<channel|>"]
+        guard openSuffixes.contains(where: { p.hasSuffix($0) }) else { return false }
+        return !closeSuffixes.contains(where: { p.hasSuffix($0) })
     }
 
     /// Splits accumulated output into thinking and response halves using a whitespace-tolerant
