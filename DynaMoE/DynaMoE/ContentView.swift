@@ -97,6 +97,43 @@ nonisolated func isJetSpecEligible(jetSpecEnabled: Bool, hasLinearRecurrence: Bo
     jetSpecEnabled && !hasLinearRecurrence && !isSparkModel && kvPrecision != .fp8
 }
 
+/// Batched-prefill chunk cap for Gemma 4: tokens per `runLayerWisePrefill` call.
+/// Bounds the sliding-window ring's slack (window + chunk, so an in-flight
+/// batch never overwrites a row attention still needs) and the transient
+/// per-call prefill buffers (~250 KB/token) that previously scaled with the
+/// entire delta prompt.
+let gemmaPrefillChunkCap = 512
+
+/// Reusable transient buffers for the batched prefill (`runLayerWisePrefill`).
+/// The chunked Gemma prefill re-enters that function once per 512-token chunk;
+/// re-allocating the ~3 GB of double-buffered expert staging (plus the per-chunk
+/// scratch) on every chunk — while the weight residency grows toward the memory
+/// budget — can exhaust the allocator mid-prefill: `makeBuffer` returns nil and
+/// the chunk silently fails (observed deterministically at the third chunk of a
+/// fresh 3k-token prompt at FP8 on a 16 GB machine). The pool allocates each
+/// named buffer once per prefill (on the first chunk, while residency is still
+/// low) and reuses it across chunks; the generation loop drains it when prefill
+/// ends so the decode phase never holds the staging.
+final class PrefillTransientPool: @unchecked Sendable {
+    static let shared = PrefillTransientPool()
+    private var buffers: [String: MTLBuffer] = [:]
+    private init() {}
+
+    /// Returns a pooled buffer for `name` with at least `byteCount` bytes,
+    /// re-allocating (growing) only when the pooled one is too small.
+    func buffer(device: MTLDevice, name: String, byteCount: Int) -> MTLBuffer? {
+        if let existing = buffers[name], existing.length >= byteCount { return existing }
+        guard let made = device.makeBuffer(length: byteCount, options: .storageModeShared) else { return nil }
+        buffers[name] = made
+        return made
+    }
+
+    /// Releases every pooled buffer (call when prefill completes or fails).
+    func drain() { buffers.removeAll() }
+
+    var heldBytes: Int { buffers.values.reduce(0) { $0 + $1.length } }
+}
+
 final class KVCacheManager {
     static let shared = KVCacheManager()
 
@@ -110,6 +147,88 @@ final class KVCacheManager {
     var allocatedKvBytes: Int = 0
     var activePrecision: KVCachePrecision = .fp16
     private var device: MTLDevice?
+
+    // Gemma 4 sliding-window ring KV cache. The 25 sliding layers only ever
+    // attend within effectiveSlidingWindow of the current position, so their KV
+    // slots hold window + slack ring positions instead of maxSeqLen linear
+    // positions: physical row = logical position % slidingRingLen. The slack
+    // covers the largest batched prefill chunk and the JetSpec tree scratch
+    // (node slots step..step+N-1), so in-flight batches never overwrite a row
+    // an attention pass still needs. Empty arrays = uniform maxSeqLen layout
+    // (every non-Gemma model, and Gemma's global layers).
+    var slidingRingLen: Int = 0
+    var slotIsRing: [Bool] = []
+    /// Per-slot position base (prefix sum over slots) into the K/V buffers.
+    var slotPosBase: [Int] = []
+    /// Per-slot position capacity (ringLen for ring slots, maxSeqLen otherwise).
+    var slotPosCount: [Int] = []
+    /// Per ring slot, the logical position whose K/V the row currently holds
+    /// (-1 = never written). Exact bookkeeping for prefix-splice validation:
+    /// a pinned prefix is only spliced when every reused row still holds its
+    /// own position, so a turn that ran past the pin boundary (overwriting the
+    /// window) forces a full re-prefill instead of attending stale rows.
+    private var ringSlotLastPos: [Int] = []
+
+    /// Position base of a slot's region (uniform layout falls back to slot * allocatedSeqLen).
+    func kvSlotPositionBase(_ slot: Int) -> Int {
+        guard slotPosBase.indices.contains(slot) else { return slot * allocatedSeqLen }
+        return slotPosBase[slot]
+    }
+
+    /// Position capacity of a slot's region.
+    func kvSlotPositionCount(_ slot: Int) -> Int {
+        guard slotPosCount.indices.contains(slot) else { return allocatedSeqLen }
+        return slotPosCount[slot]
+    }
+
+    /// Byte offset of a slot's region within the shared K/V cache buffers.
+    func kvSlotByteOffset(slot: Int, stride: Int, elementBytes: Int) -> Int {
+        kvSlotPositionBase(slot) * stride * elementBytes
+    }
+
+    /// Byte offset of a slot's region within the FP8 per-head scale buffers
+    /// (layout: [positions, logicalHeads] halves per slot).
+    func kvSlotScaleByteOffset(slot: Int, layoutHeads: Int) -> Int {
+        kvSlotPositionBase(slot) * layoutHeads * MemoryLayout<UInt16>.stride
+    }
+
+    /// Whether the slot is a sliding-window ring slot (Gemma 4 sliding layers).
+    func isRingSlot(_ slot: Int) -> Bool {
+        slidingRingLen > 0 && slotIsRing.indices.contains(slot) && slotIsRing[slot]
+    }
+
+    /// Physical row for a logical position in a slot (linear slots pass through).
+    func ringSlotForRow(_ pos: Int, slot: Int) -> Int {
+        isRingSlot(slot) ? pos % slidingRingLen : pos
+    }
+
+    /// Records that [range.lowerBound, range.upperBound) were dispatched into
+    /// the ring. No-op unless the ring layout is active.
+    func noteRingStores(range: Range<Int>) {
+        guard slidingRingLen > 0, ringSlotLastPos.count == slidingRingLen, !range.isEmpty else { return }
+        for pos in range where pos >= 0 {
+            ringSlotLastPos[pos % slidingRingLen] = pos
+        }
+    }
+
+    /// True when every ring row the pinned prefix still needs holds exactly
+    /// its own position (nothing stored past the pin overwrote the window).
+    func ringPrefixRowsIntact(prefixCount: Int, window: Int) -> Bool {
+        guard slidingRingLen > 0, window > 0 else { return true }
+        return KVCacheManager.ringRowsIntact(
+            lastPos: ringSlotLastPos, ringLen: slidingRingLen,
+            prefixCount: prefixCount, window: window
+        )
+    }
+
+    private static func ringRowsIntact(lastPos: [Int], ringLen: Int, prefixCount: Int, window: Int) -> Bool {
+        guard ringLen > 0, window > 0, lastPos.count == ringLen, prefixCount > 0 else { return false }
+        let lo = max(0, prefixCount - window)
+        for pos in lo..<prefixCount {
+            if pos < 0 || lastPos[pos % ringLen] != pos { return false }
+        }
+        return true
+    }
 
     // FIX #10: snapshots of the GDN recurrent + conv states taken at the moment
     // the pinned prefix token list is recorded (turn end). When the next turn's
@@ -155,10 +274,17 @@ final class KVCacheManager {
         headDim: Int = 128,
         maxSeqLen: Int = 2048,
         precision: KVCachePrecision = .fp16,
-        preservePrefixCount: Int = 0
+        preservePrefixCount: Int = 0,
+        slidingSlotFlags: [Bool]? = nil,
+        slidingRingLen ringLenParam: Int = 0
     ) {
         let oldMaxSeq = self.allocatedSeqLen
         let wasAllocated = (kCacheBuffer != nil)
+        let oldSlotIsRing = self.slotIsRing
+        let oldSlotPosBase = self.slotPosBase
+        let oldSlotPosCount = self.slotPosCount
+        let oldSlidingRingLen = self.slidingRingLen
+        let oldRingSlotLastPos = self.ringSlotLastPos
         self.allocatedSeqLen = maxSeqLen
         self.activePrecision = precision
         self.device = device
@@ -171,17 +297,54 @@ final class KVCacheManager {
         // One KV slot per full-attention layer (indexed by fullAttnIndex, which is
         // < actualLayers). No fixed floor: padding a 30-layer hybrid model (Gemma 4)
         // to 44 slots wasted ~32% of the KV cache for nothing.
-        let actualSlotCapacity = totalSlots
         let kvStride = kvHeads * hDim
         let isMla = (isLing || config?.kvLoraRank != nil)
         let effectiveKvStride = isMla ? 4096 : max(kvStride, 1024)
         let elementBytes = precision.bytesPerElement
 
+        // Sliding-window ring layout (Gemma 4): per-slot position capacity is
+        // ringLen for flagged (sliding) slots and maxSeqLen for the rest. The
+        // arrays are only populated when at least one slot rings; otherwise the
+        // helpers below fall back to the uniform slot * maxSeqLen layout.
+        let ringLen = max(0, ringLenParam)
+        let ringFlags = slidingSlotFlags ?? []
+        var newSlotIsRing = [Bool](repeating: false, count: totalSlots)
+        var newSlotPosBase = [Int](repeating: 0, count: totalSlots)
+        var newSlotPosCount = [Int](repeating: maxSeqLen, count: totalSlots)
+        var totalPositions = 0
+        for slot in 0..<totalSlots {
+            let rings = (ringLen > 0 && slot < ringFlags.count && ringFlags[slot])
+            newSlotIsRing[slot] = rings
+            newSlotPosBase[slot] = totalPositions
+            newSlotPosCount[slot] = rings ? ringLen : maxSeqLen
+            totalPositions += newSlotPosCount[slot]
+        }
+        let ringLayoutActive = newSlotIsRing.contains(true)
+        self.slotIsRing = ringLayoutActive ? newSlotIsRing : []
+        self.slotPosBase = ringLayoutActive ? newSlotPosBase : []
+        self.slotPosCount = ringLayoutActive ? newSlotPosCount : []
+        self.slidingRingLen = ringLayoutActive ? ringLen : 0
+        // Ring bookkeeping: keep the per-slot last-position table only when the
+        // layout and ring length are unchanged AND the preserved rows validated
+        // (the caller validates before reset and drops the pin otherwise); any
+        // other transition restarts from "never written" so the next turn's
+        // splice check conservatively fails until rows are re-stored.
+        if ringLayoutActive {
+            if preservePrefixCount > 0, oldSlidingRingLen == ringLen, oldRingSlotLastPos.count == ringLen,
+               KVCacheManager.ringRowsIntact(lastPos: oldRingSlotLastPos, ringLen: ringLen, prefixCount: preservePrefixCount, window: config?.effectiveSlidingWindow ?? 0) {
+                self.ringSlotLastPos = oldRingSlotLastPos
+            } else {
+                self.ringSlotLastPos = [Int](repeating: -1, count: ringLen)
+            }
+        } else {
+            self.ringSlotLastPos = []
+        }
+
         // For Ling MLA, K stride is 16 heads * 192 = 3072 halfs, V stride is 16 heads * 128 = 2048 halfs
         let kStride = isLing ? 3072 : effectiveKvStride
         let vStride = isLing ? 2048 : effectiveKvStride
-        let kBytes = actualSlotCapacity * maxSeqLen * kStride * elementBytes
-        let vBytes = actualSlotCapacity * maxSeqLen * vStride * elementBytes
+        let kBytes = totalPositions * kStride * elementBytes
+        let vBytes = totalPositions * vStride * elementBytes
         let requiredKvBytes = max(kBytes, vBytes)
 
         let oldK = self.kCacheBuffer
@@ -199,7 +362,10 @@ final class KVCacheManager {
         // prefix at the old stride while scales move to the new one would misalign every
         // later layer. Same condition as the FP8 scale-buffer rebuild below.
         let spliceStrideChanged = (preservePrefixCount > 0 && maxSeqLen != oldMaxSeq)
-        let needsRealloc = forceFreshAlloc || (kCacheBuffer == nil || vCacheBuffer == nil || allocatedKvBytes < requiredKvBytes || spliceStrideChanged)
+        // A ring-layout change (first ring allocation, or a different ring length)
+        // moves every slot region; a retained buffer would keep the old layout.
+        let spliceLayoutChanged = (preservePrefixCount > 0 && (oldSlotIsRing != self.slotIsRing || oldSlotPosCount != self.slotPosCount || oldSlidingRingLen != self.slidingRingLen))
+        let needsRealloc = forceFreshAlloc || (kCacheBuffer == nil || vCacheBuffer == nil || allocatedKvBytes < requiredKvBytes || spliceStrideChanged || spliceLayoutChanged)
 
         if needsRealloc {
             self.kCacheBuffer = nil
@@ -210,15 +376,51 @@ final class KVCacheManager {
         }
 
         if preservePrefixCount > 0 && wasAllocated {
+            // Per-slot region bases: the ring layout when active, uniform otherwise.
+            // Ring slots preserve only the last `window` rows (all a future turn
+            // can ever read, and exactly the rows the caller validated); linear
+            // slots preserve the whole [0, pin) prefix as before.
+            let ringWindow = max(0, config?.effectiveSlidingWindow ?? 0)
+            let rowBytesK = kStride * elementBytes
+            let rowBytesV = vStride * elementBytes
             for slot in 0..<totalSlots {
-                let newKLayerByteOffset = slot * maxSeqLen * kStride * elementBytes
-                let newVLayerByteOffset = slot * maxSeqLen * vStride * elementBytes
+                if ringLayoutActive && newSlotIsRing[slot] {
+                    let live = min(preservePrefixCount, ringWindow)
+                    if needsRealloc, let oldKBuf = oldK, let oldVBuf = oldV, let newKBuf = kCacheBuffer, let newVBuf = vCacheBuffer {
+                        // Slot region bases are position counts; scale them to bytes
+                        // before adding row offsets.
+                        let slotBaseOldBytes = ((slot < oldSlotPosBase.count) ? oldSlotPosBase[slot] : slot * oldMaxSeq) * kStride * elementBytes
+                        let slotBaseNewBytes = newSlotPosBase[slot] * kStride * elementBytes
+                        let oldRings = (oldSlidingRingLen > 0 && slot < oldSlotIsRing.count && oldSlotIsRing[slot])
+                        for pos in (preservePrefixCount - live)..<preservePrefixCount {
+                            let oldRow = oldRings ? (pos % oldSlidingRingLen) : pos
+                            let newRow = pos % ringLen
+                            let kSrc = slotBaseOldBytes + oldRow * rowBytesK
+                            let kDst = slotBaseNewBytes + newRow * rowBytesK
+                            let vSrc = slotBaseOldBytes + oldRow * rowBytesV
+                            let vDst = slotBaseNewBytes + newRow * rowBytesV
+                            if kSrc + rowBytesK <= oldKBuf.length && kDst + rowBytesK <= newKBuf.length {
+                                memcpy(newKBuf.contents().advanced(by: kDst), oldKBuf.contents().advanced(by: kSrc), rowBytesK)
+                            }
+                            if vSrc + rowBytesV <= oldVBuf.length && vDst + rowBytesV <= newVBuf.length {
+                                memcpy(newVBuf.contents().advanced(by: vDst), oldVBuf.contents().advanced(by: vSrc), rowBytesV)
+                            }
+                        }
+                    }
+                    // Retained buffer (no realloc): the ring mapping is unchanged,
+                    // so the live rows are already exactly where the next turn
+                    // reads them — nothing to copy.
+                    continue
+                }
+                let newKLayerByteOffset = (ringLayoutActive ? newSlotPosBase[slot] : slot * maxSeqLen) * kStride * elementBytes
+                let newVLayerByteOffset = (ringLayoutActive ? newSlotPosBase[slot] : slot * maxSeqLen) * vStride * elementBytes
                 let prefixKBytes = min(preservePrefixCount, maxSeqLen) * kStride * elementBytes
                 let prefixVBytes = min(preservePrefixCount, maxSeqLen) * vStride * elementBytes
 
                 if needsRealloc, let oldKBuf = oldK, let oldVBuf = oldV, let newKBuf = kCacheBuffer, let newVBuf = vCacheBuffer {
-                    let oldKLayerByteOffset = slot * oldMaxSeq * kStride * elementBytes
-                    let oldVLayerByteOffset = slot * oldMaxSeq * vStride * elementBytes
+                    let oldSlotBase = (slot < oldSlotPosBase.count) ? oldSlotPosBase[slot] : slot * oldMaxSeq
+                    let oldKLayerByteOffset = oldSlotBase * kStride * elementBytes
+                    let oldVLayerByteOffset = oldSlotBase * vStride * elementBytes
                     let copyKBytes = min(prefixKBytes, max(0, oldKBuf.length - oldKLayerByteOffset), max(0, newKBuf.length - newKLayerByteOffset))
                     let copyVBytes = min(prefixVBytes, max(0, oldVBuf.length - oldVLayerByteOffset), max(0, newVBuf.length - newVLayerByteOffset))
                     if copyKBytes > 0 {
@@ -246,7 +448,7 @@ final class KVCacheManager {
         }
 
         if precision == .fp8 {
-            let scaleCount = actualSlotCapacity * maxSeqLen * kvHeads
+            let scaleCount = totalPositions * kvHeads
             let scaleBytes = scaleCount * MemoryLayout<UInt16>.stride // half precision per-head scales
             let scaleElemBytes = MemoryLayout<UInt16>.stride
             let oldKScale = self.kScaleBuffer
@@ -271,7 +473,7 @@ final class KVCacheManager {
             // every preserve-with-stride-change so the restore is always
             // buffer-to-buffer; fresh resets keep the capacity-retention fast path.
             let scaleLayoutHeads = config?.effectiveNumKeyValueHeads ?? numKvHeads
-            if kScaleBuffer == nil || kScaleBuffer!.length < scaleBytes || spliceStrideChanged {
+            if kScaleBuffer == nil || kScaleBuffer!.length < scaleBytes || spliceStrideChanged || spliceLayoutChanged {
                 self.kScaleBuffer = device.makeBuffer(length: scaleBytes, options: .storageModeShared)
                 self.vScaleBuffer = device.makeBuffer(length: scaleBytes, options: .storageModeShared)
             }
@@ -289,11 +491,38 @@ final class KVCacheManager {
                 // spliceStrideChanged above guarantees src and dst are distinct buffers
                 // whenever the layouts differ; when the stride is unchanged a retained
                 // buffer means every newOff equals oldOff and the loop is a no-op.
+                // Ring slots (Gemma 4 sliding layers) restore only the last `window`
+                // rows, mirroring the K/V ring preserve.
                 let prefixScaleBytes = min(min(preservePrefixCount, oldMaxSeq), maxSeqLen) * scaleLayoutHeads * scaleElemBytes
                 let scaleWasRebuilt = (kScaleBuffer !== oldKScale)
+                let scaleRowBytes = scaleLayoutHeads * scaleElemBytes
                 for slot in 0..<totalSlots {
-                    let oldOff = slot * oldMaxSeq * scaleLayoutHeads * scaleElemBytes
-                    let newOff = slot * maxSeqLen * scaleLayoutHeads * scaleElemBytes
+                    let slotBaseOld = (slot < oldSlotPosBase.count) ? oldSlotPosBase[slot] : slot * oldMaxSeq
+                    let slotBaseNew = ringLayoutActive ? newSlotPosBase[slot] : slot * maxSeqLen
+                    let oldOff = slotBaseOld * scaleLayoutHeads * scaleElemBytes
+                    let newOff = slotBaseNew * scaleLayoutHeads * scaleElemBytes
+                    if ringLayoutActive && newSlotIsRing[slot] {
+                        guard scaleWasRebuilt else { continue }
+                        if let oldKS = oldKScale, let newKS = kScaleBuffer, let oldVS = oldVScale, let newVS = vScaleBuffer {
+                            let live = min(preservePrefixCount, max(0, config?.effectiveSlidingWindow ?? 0))
+                            let oldRings = (oldSlidingRingLen > 0 && slot < oldSlotIsRing.count && oldSlotIsRing[slot])
+                            for pos in (preservePrefixCount - live)..<preservePrefixCount {
+                                let oldRow = oldRings ? (pos % oldSlidingRingLen) : pos
+                                let newRow = pos % ringLen
+                                let srcK = oldOff + oldRow * scaleRowBytes
+                                let dstK = newOff + newRow * scaleRowBytes
+                                if srcK + scaleRowBytes <= oldKS.length && dstK + scaleRowBytes <= newKS.length {
+                                    memcpy(newKS.contents().advanced(by: dstK), oldKS.contents().advanced(by: srcK), scaleRowBytes)
+                                }
+                                let srcV = oldOff + oldRow * scaleRowBytes
+                                let dstV = newOff + newRow * scaleRowBytes
+                                if srcV + scaleRowBytes <= oldVS.length && dstV + scaleRowBytes <= newVS.length {
+                                    memcpy(newVS.contents().advanced(by: dstV), oldVS.contents().advanced(by: srcV), scaleRowBytes)
+                                }
+                            }
+                        }
+                        continue
+                    }
                     guard scaleWasRebuilt || newOff != oldOff else { continue }
                     if let oldKS = oldKScale, let newKS = kScaleBuffer {
                         let copy = min(prefixScaleBytes, max(0, oldKS.length - oldOff), max(0, newKS.length - newOff))
@@ -6159,7 +6388,7 @@ struct ContentView: View {
         // only valid at exactly the pinned token count (snapshot is taken at turn
         // end next to recordTurn).
         let reuseCandidate = PrefixCacheManager.shared.findCommonPrefix(promptTokenIds: promptTokenIds, sessionId: sessionId)
-        let prefixTokensReused: Int
+        var prefixTokensReused: Int
         // A/B toggle for bisecting the tool-call truncation: defaults write
         // DRP.DynaMoE dynamoe_disable_prefix_reuse -bool YES
         if UserDefaults.standard.bool(forKey: "dynamoe_disable_prefix_reuse") {
@@ -6177,6 +6406,48 @@ struct ContentView: View {
             }
         } else {
             prefixTokensReused = reuseCandidate
+            // Gemma 4's sliding attention is not `linearAttention`, so it takes this
+            // non-recurrence branch and a failed reuse is otherwise silent (none of the
+            // recurrence-branch prints fire). Name it so a "full re-prefill every turn"
+            // report is attributable instead of showing up only as an unexplained loop.
+            if isGemma4, prefixTokensReused == 0, PrefixCacheManager.shared.currentPinnedCount > 0 {
+                print("🔁 [PREFIX] Gemma pin of \(PrefixCacheManager.shared.currentPinnedCount) not reusable (reuseCandidate=\(reuseCandidate)) — full re-prefill of \(promptTokenIds.count) tokens")
+            }
+        }
+
+        // Gemma 4 sliding-window ring KV: the sliding layers' ring rows only
+        // survive a turn boundary while nothing stored past the pin boundary
+        // wrapped onto the reused window's rows. The ring bookkeeping knows
+        // exactly, so validate before splicing; a clobbered window falls back
+        // to a full re-prefill (same policy as the GDN "cannot rewind" path).
+        let gemmaSlidingWindow = Int(modelConfig?.effectiveSlidingWindow ?? 0)
+        // Ring slack: must cover the largest batched prefill chunk (the chunk
+        // cap below) and the JetSpec tree scratch (maxNodes=8 node slots plus
+        // the root re-store) so in-flight batches never overwrite a live row.
+        let gemmaRingSlack = max(gemmaPrefillChunkCap, 16)
+        let isGemma4Ring = isGemma4 && gemmaSlidingWindow > 0
+        let gemmaSlidingRingLen = isGemma4Ring ? (gemmaSlidingWindow + gemmaRingSlack) : 0
+        if isGemma4Ring && prefixTokensReused > 0,
+           !KVCacheManager.shared.ringPrefixRowsIntact(prefixCount: prefixTokensReused, window: gemmaSlidingWindow) {
+            print("🔁 [PREFIX] Gemma sliding-ring window rows were overwritten past the pin (\(PrefixCacheManager.shared.currentPinnedCount) pinned, reusing \(prefixTokensReused)) — full re-prefill")
+            prefixTokensReused = 0
+        }
+        // Per-slot ring flags in KVCacheManager slot order (loopIdx * actualLayers
+        // + fullAttnIndex; for Gemma every layer is full-attention, so this is
+        // just the layer order).
+        var gemmaSlidingSlotFlags: [Bool]? = nil
+        if isGemma4Ring {
+            var flags = [Bool](repeating: false, count: max(1, totalLoops) * actualLayers)
+            for loopIdx in 0..<max(1, totalLoops) {
+                for l in 0..<actualLayers {
+                    let layer = cachedLayers[l]
+                    if layer.attentionType == .fullAttention {
+                        let slot = (loopIdx * actualLayers) + layer.fullAttnIndex
+                        if slot < flags.count { flags[slot] = layer.isSlidingAttention }
+                    }
+                }
+            }
+            gemmaSlidingSlotFlags = flags
         }
 
         // Prompt-dump diagnostic for the tool-call spiral bisection
@@ -6241,7 +6512,9 @@ struct ContentView: View {
             headDim: Int(headDim),
             maxSeqLen: neededSeqLen,
             precision: kvPrec,
-            preservePrefixCount: prefixTokensReused
+            preservePrefixCount: prefixTokensReused,
+            slidingSlotFlags: gemmaSlidingSlotFlags,
+            slidingRingLen: gemmaSlidingRingLen
         )
         let grammarGenerationToken = GrammarConstrainedSampler.shared.beginGeneration()
         generationId &+= 1
@@ -7382,20 +7655,22 @@ struct ContentView: View {
                             if let kCache = KVCacheManager.shared.kCacheBuffer,
                                let vCache = KVCacheManager.shared.vCacheBuffer {
                                 let slot = (loopIdx * actualLayers) + layer.fullAttnIndex
-                                let maxSeq = KVCacheManager.shared.allocatedSeqLen
-                                let prec = KVCacheManager.shared.activePrecision
-                                let layerByteOffset = slot * maxSeq * Int(gemmaKvStride) * prec.bytesPerElement
+                                let kvMgr = KVCacheManager.shared
+                                let prec = kvMgr.activePrecision
+                                let layerByteOffset = kvMgr.kvSlotByteOffset(slot: slot, stride: Int(gemmaKvStride), elementBytes: prec.bytesPerElement)
                                 var pos = step
                                 var nKv = gNumKv
                                 var hD = gHeadDim
                                 var cacheStride = gemmaKvStride
+                                // Sliding layers address a ring-sized slot region.
+                                var ringLen: UInt32 = kvMgr.isRingSlot(slot) ? UInt32(kvMgr.slidingRingLen) : 0
 
                                 if prec == .fp8,
                                    let kScale = KVCacheManager.shared.kScaleBuffer,
                                    let vScale = KVCacheManager.shared.vScaleBuffer,
                                    let storePipe = storeKvGemmaFP8Pipeline,
                                    let attnPipe = gqaGemmaFP8Pipeline {
-                                    let scaleByteOffset = slot * maxSeq * Int(numKvHeads) * MemoryLayout<UInt16>.stride
+                                    let scaleByteOffset = kvMgr.kvSlotScaleByteOffset(slot: slot, layoutHeads: Int(numKvHeads))
                                     layerEnc1.setComputePipelineState(storePipe)
                                     layerEnc1.setBuffer(kVectorBuffer, offset: 0, index: 0)
                                     layerEnc1.setBuffer(vVectorBuffer, offset: 0, index: 1)
@@ -7407,8 +7682,11 @@ struct ContentView: View {
                                     layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 7)
                                     layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 8)
                                     layerEnc1.setBytes(&cacheStride, length: MemoryLayout<UInt32>.stride, index: 9)
+                                    layerEnc1.setBytes(&ringLen, length: MemoryLayout<UInt32>.stride, index: 10)
                                     layerEnc1.dispatchThreadgroups(MTLSize(width: Int(gNumKv), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                                     layerEnc1.memoryBarrier(scope: .buffers)
+                                    // Ring bookkeeping: this layer just stored position `step`.
+                                    kvMgr.noteRingStores(range: Int(step)..<Int(step) + 1)
 
                                     var seqLen = step + 1
                                     var nQ = numHeads
@@ -7428,6 +7706,7 @@ struct ContentView: View {
                                     layerEnc1.setBytes(&windowSize, length: MemoryLayout<UInt32>.stride, index: 10)
                                     layerEnc1.setBytes(&scaling, length: MemoryLayout<Float>.stride, index: 11)
                                     layerEnc1.setBytes(&cacheStride, length: MemoryLayout<UInt32>.stride, index: 12)
+                                    layerEnc1.setBytes(&ringLen, length: MemoryLayout<UInt32>.stride, index: 13)
                                     layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                                     layerEnc1.memoryBarrier(scope: .buffers)
                                 } else {
@@ -7442,8 +7721,11 @@ struct ContentView: View {
                                     layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 5)
                                     layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 6)
                                     layerEnc1.setBytes(&cacheStride, length: MemoryLayout<UInt32>.stride, index: 7)
+                                    layerEnc1.setBytes(&ringLen, length: MemoryLayout<UInt32>.stride, index: 8)
                                     layerEnc1.dispatchThreads(MTLSize(width: Int(gKvDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(gKvDim), storePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                                     layerEnc1.memoryBarrier(scope: .buffers)
+                                    // Ring bookkeeping: this layer just stored position `step`.
+                                    kvMgr.noteRingStores(range: Int(step)..<Int(step) + 1)
                                 }
 
                                 var seqLen = step + 1
@@ -7466,6 +7748,7 @@ struct ContentView: View {
                                     layerEnc1.setBytes(&windowSize, length: MemoryLayout<UInt32>.stride, index: 8)
                                     layerEnc1.setBytes(&scaling, length: MemoryLayout<Float>.stride, index: 9)
                                     layerEnc1.setBytes(&cacheStride, length: MemoryLayout<UInt32>.stride, index: 10)
+                                    layerEnc1.setBytes(&ringLen, length: MemoryLayout<UInt32>.stride, index: 11)
                                     layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                                     layerEnc1.memoryBarrier(scope: .buffers)
                                 }
@@ -9793,7 +10076,7 @@ if layer.attnGateProjTensor != nil,
             }
 
             // Helper for Layer-Wise Streaming Prompt Prefill (O(Layers) SSD reads instead of O(Tokens * Layers))
-            func runLayerWisePrefill(promptTokens: [UInt32], startPos: UInt32 = 0) -> Bool {
+            func runLayerWisePrefill(promptTokens: [UInt32], startPos: UInt32 = 0, chunkIndex: Int = 0, chunkCount: Int = 1) -> Bool {
                 let P = promptTokens.count
                 guard P > 0 else { return true }
 
@@ -9828,34 +10111,47 @@ if layer.attnGateProjTensor != nil,
                 // double-buffered staging holds exactly one layer's set per buffer.
                 let prefillStagingSlotCap = min(max(P * topKCount, 64), numExperts > 0 ? Int(numExperts) : 512)
 
-                guard let hBufA = device.makeBuffer(length: totalHBytes, options: .storageModeShared),
-                      let hBufB = device.makeBuffer(length: totalHBytes, options: .storageModeShared),
-                      let hMidBuffer_all = device.makeBuffer(length: totalHBytes, options: .storageModeShared),
-                      let xNorm1Buffer_all = device.makeBuffer(length: totalHBytes, options: .storageModeShared),
-                      let xNorm2Buffer_all = device.makeBuffer(length: totalHBytes, options: .storageModeShared),
-                      let attnOutBuffer_all = device.makeBuffer(length: totalHBytes, options: .storageModeShared),
-                      let hMlpBuffer_all = device.makeBuffer(length: totalHBytes, options: .storageModeShared),
-                      let qGateBuffer_all = device.makeBuffer(length: max(P * Int(maxQkvDim), 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let zGateBuffer_all = device.makeBuffer(length: max(P * Int(maxZDim), 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let attnCtxBuffer_all = device.makeBuffer(length: max(P * Int(maxZDim), 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let kVectorBuffer_all = device.makeBuffer(length: max(P * max(Int(kvStride), 128), 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let vVectorBuffer_all = device.makeBuffer(length: max(P * max(Int(kvStride), 128), 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let aVectorBuffer_all = device.makeBuffer(length: max(P * 128, 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let bVectorBuffer_all = device.makeBuffer(length: max(P * (isGemma4Prefill ? Int(hiddenDim) : 128), 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let interBuffer_all = device.makeBuffer(length: max(P * Int(maxInterDim), 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let routerIndicesBuffer_all = device.makeBuffer(length: max(P * topKCount, 16) * MemoryLayout<UInt32>.stride, options: .storageModeShared),
-                      let routerWeightsBuffer_all = device.makeBuffer(length: max(P * topKCount, 16) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let sharedScoreBuffer_all = device.makeBuffer(length: max(P, 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let hcStreamsBuffer_all = device.makeBuffer(length: max(totalHcBytes, 64), options: .storageModeShared),
-                      let hcNormedBuffer_all = device.makeBuffer(length: max(totalHcBytes, 64), options: .storageModeShared),
-                      let hcBottleneckBuffer_all = device.makeBuffer(length: max(P * 512, 64) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let hcInjectScaleBuffer_all = device.makeBuffer(length: max(P * 4, 64) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let denseActiveTokensBuffer = device.makeBuffer(length: max(P, 1) * MemoryLayout<UInt32>.stride, options: .storageModeShared),
-                      let denseActiveWeightsBuffer = device.makeBuffer(length: max(P, 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let expertActiveTokensBuffer = device.makeBuffer(length: max(P * topKCount, 64) * MemoryLayout<UInt32>.stride, options: .storageModeShared),
-                      let expertActiveWeightsBuffer = device.makeBuffer(length: max(P * topKCount, 64) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let prefillStagingBufferA = device.makeBuffer(length: max(prefillStagingSlotCap * Int(loadedLayout?.expert_size ?? 3151872), 64), options: .storageModeShared),
-                      let prefillStagingBufferB = device.makeBuffer(length: max(prefillStagingSlotCap * Int(loadedLayout?.expert_size ?? 3151872), 64), options: .storageModeShared) else {
+                // Per-call transients come from the prefill pool: the chunked Gemma
+                // prefill re-enters this function per chunk, so per-call allocation
+                // would re-allocate the multi-GB expert staging on every chunk while
+                // the weight residency grows toward the budget. A nil allocation is
+                // reported by name — it is the silent killer of chunked prefill runs.
+                func pooled(_ name: String, _ byteCount: Int) -> MTLBuffer? {
+                    let bytes = max(byteCount, 64)
+                    guard let buf = PrefillTransientPool.shared.buffer(device: device, name: name, byteCount: bytes) else {
+                        print("❌ [PREFILL] transient buffer '\(name)' (\(bytes / 1_048_576) MB) failed to allocate — pool already held \(PrefillTransientPool.shared.heldBytes / 1_048_576) MB; memory pressure (budget-capped weight residency + staging)")
+                        return nil
+                    }
+                    return buf
+                }
+                guard let hBufA = pooled("prefill.hBufA", totalHBytes),
+                      let hBufB = pooled("prefill.hBufB", totalHBytes),
+                      let hMidBuffer_all = pooled("prefill.hMid", totalHBytes),
+                      let xNorm1Buffer_all = pooled("prefill.xNorm1", totalHBytes),
+                      let xNorm2Buffer_all = pooled("prefill.xNorm2", totalHBytes),
+                      let attnOutBuffer_all = pooled("prefill.attnOut", totalHBytes),
+                      let hMlpBuffer_all = pooled("prefill.hMlp", totalHBytes),
+                      let qGateBuffer_all = pooled("prefill.qGate", max(P * Int(maxQkvDim), 1) * MemoryLayout<Float>.stride),
+                      let zGateBuffer_all = pooled("prefill.zGate", max(P * Int(maxZDim), 1) * MemoryLayout<Float>.stride),
+                      let attnCtxBuffer_all = pooled("prefill.attnCtx", max(P * Int(maxZDim), 1) * MemoryLayout<Float>.stride),
+                      let kVectorBuffer_all = pooled("prefill.kVec", max(P * max(Int(kvStride), 128), 1) * MemoryLayout<Float>.stride),
+                      let vVectorBuffer_all = pooled("prefill.vVec", max(P * max(Int(kvStride), 128), 1) * MemoryLayout<Float>.stride),
+                      let aVectorBuffer_all = pooled("prefill.aVec", max(P * 128, 1) * MemoryLayout<Float>.stride),
+                      let bVectorBuffer_all = pooled("prefill.bVec", max(P * (isGemma4Prefill ? Int(hiddenDim) : 128), 1) * MemoryLayout<Float>.stride),
+                      let interBuffer_all = pooled("prefill.inter", max(P * Int(maxInterDim), 1) * MemoryLayout<Float>.stride),
+                      let routerIndicesBuffer_all = pooled("prefill.routerIdx", max(P * topKCount, 16) * MemoryLayout<UInt32>.stride),
+                      let routerWeightsBuffer_all = pooled("prefill.routerW", max(P * topKCount, 16) * MemoryLayout<Float>.stride),
+                      let sharedScoreBuffer_all = pooled("prefill.sharedScore", max(P, 1) * MemoryLayout<Float>.stride),
+                      let hcStreamsBuffer_all = pooled("prefill.hcStreams", max(totalHcBytes, 64)),
+                      let hcNormedBuffer_all = pooled("prefill.hcNormed", max(totalHcBytes, 64)),
+                      let hcBottleneckBuffer_all = pooled("prefill.hcBottleneck", max(P * 512, 64) * MemoryLayout<Float>.stride),
+                      let hcInjectScaleBuffer_all = pooled("prefill.hcInjectScale", max(P * 4, 64) * MemoryLayout<Float>.stride),
+                      let denseActiveTokensBuffer = pooled("prefill.denseTok", max(P, 1) * MemoryLayout<UInt32>.stride),
+                      let denseActiveWeightsBuffer = pooled("prefill.denseW", max(P, 1) * MemoryLayout<Float>.stride),
+                      let expertActiveTokensBuffer = pooled("prefill.expertTok", max(P * topKCount, 64) * MemoryLayout<UInt32>.stride),
+                      let expertActiveWeightsBuffer = pooled("prefill.expertW", max(P * topKCount, 64) * MemoryLayout<Float>.stride),
+                      let prefillStagingBufferA = pooled("prefill.stagingA", max(prefillStagingSlotCap * Int(loadedLayout?.expert_size ?? 3151872), 64)),
+                      let prefillStagingBufferB = pooled("prefill.stagingB", max(prefillStagingSlotCap * Int(loadedLayout?.expert_size ?? 3151872), 64)) else {
                     return false
                 }
                 // Packs a layer's active experts into one staging buffer: reused predicted
@@ -9922,7 +10218,10 @@ if layer.attnGateProjTensor != nil,
 
                 // Step 0: Initial Token Embeddings for all P prompt tokens into hBufA
                 guard let embedCmd = commandQueue.makeCommandBuffer(),
-                      let embedEnc = embedCmd.makeComputeCommandEncoder() else { return false }
+                      let embedEnc = embedCmd.makeComputeCommandEncoder() else {
+                    print("❌ [PREFILL] embed command buffer allocation failed (chunk startPos=\(startPos), P=\(P))")
+                    return false
+                }
 
                 let hasEmbedScale = (embedScale != nil)
                 let hasEmbedBias = (embedBias != nil)
@@ -10038,6 +10337,11 @@ if layer.attnGateProjTensor != nil,
                 // Step 1: Layer-Wise Forward Pass: Outer Loop Layers, Inner Loop Tokens
                 let totalPasses = totalLoops * actualLayers
                 var passIdx = 0
+                // Chunked Gemma prefill re-enters this function once per token chunk. Report
+                // progress against the whole turn's layer count so the UI advances monotonically
+                // instead of restarting at layer 1 for every chunk (which reads as a re-prefill).
+                let prefillLayerBase = max(0, chunkIndex) * totalPasses
+                let prefillLayerTotal = max(1, chunkCount) * totalPasses
 
                 for loopIdx in 0..<totalLoops {
                     for l in 0..<actualLayers {
@@ -10065,7 +10369,10 @@ if layer.attnGateProjTensor != nil,
                             let gKvDim: UInt32 = gNumKv * gHeadDim
 
                             guard let gCmd = commandQueue.makeCommandBuffer(),
-                                  let gEnc = gCmd.makeComputeCommandEncoder() else { return false }
+                                  let gEnc = gCmd.makeComputeCommandEncoder() else {
+                                print("❌ [PREFILL] Gemma layer \(l) Phase A command buffer allocation failed (chunk startPos=\(startPos), P=\(P))")
+                                return false
+                            }
 
                             // 1. RMSNorm1(currH) -> xNorm1Buffer_all
                             if let norm1 = layer.norm1Tensor, let norm1Raw = buffers[norm1.shardIndex] {
@@ -10178,19 +10485,23 @@ if layer.attnGateProjTensor != nil,
                             if let kCache = KVCacheManager.shared.kCacheBuffer,
                                let vCache = KVCacheManager.shared.vCacheBuffer {
                                 let slot = (loopIdx * actualLayers) + layer.fullAttnIndex
-                                let maxSeq = KVCacheManager.shared.allocatedSeqLen
-                                let prec = KVCacheManager.shared.activePrecision
-                                let layerByteOffset = slot * maxSeq * Int(gemmaKvStride) * prec.bytesPerElement
+                                let kvMgr = KVCacheManager.shared
+                                let prec = kvMgr.activePrecision
+                                let layerByteOffset = kvMgr.kvSlotByteOffset(slot: slot, stride: Int(gemmaKvStride), elementBytes: prec.bytesPerElement)
                                 var cacheStride = gemmaKvStride
                                 var pos = startPos
                                 var nKv = gNumKv
                                 var hD = gHeadDim
+                                // Sliding layers address a ring-sized slot region; the
+                                // chunk cap bounds P so the batch never overwrites a
+                                // row a later row in this pass still reads.
+                                var ringLen: UInt32 = kvMgr.isRingSlot(slot) ? UInt32(kvMgr.slidingRingLen) : 0
                                 if prec == .fp8,
                                    let kScale = KVCacheManager.shared.kScaleBuffer,
                                    let vScale = KVCacheManager.shared.vScaleBuffer,
                                    let storePipe = storeKvGemmaFP8Pipeline,
                                    let attnPipe = gqaGemmaFP8Pipeline {
-                                    let scaleByteOffset = slot * maxSeq * Int(numKvHeads) * MemoryLayout<UInt16>.stride
+                                    let scaleByteOffset = kvMgr.kvSlotScaleByteOffset(slot: slot, layoutHeads: Int(numKvHeads))
                                     gEnc.setComputePipelineState(storePipe)
                                     gEnc.setBuffer(kVectorBuffer_all, offset: 0, index: 0)
                                     gEnc.setBuffer(vVectorBuffer_all, offset: 0, index: 1)
@@ -10202,8 +10513,11 @@ if layer.attnGateProjTensor != nil,
                                     gEnc.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 7)
                                     gEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 8)
                                     gEnc.setBytes(&cacheStride, length: MemoryLayout<UInt32>.stride, index: 9)
+                                    gEnc.setBytes(&ringLen, length: MemoryLayout<UInt32>.stride, index: 10)
                                     gEnc.dispatchThreadgroups(MTLSize(width: Int(gNumKv), height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                                     gEnc.memoryBarrier(scope: .buffers)
+                                    // Ring bookkeeping: this layer just stored [startPos, startPos+P).
+                                    kvMgr.noteRingStores(range: Int(startPos)..<Int(startPos) + P)
 
                                     var nQ = numHeads
                                     var windowSize: UInt32 = gSliding ? UInt32(modelConfig?.effectiveSlidingWindow ?? 0) : 0
@@ -10225,6 +10539,7 @@ if layer.attnGateProjTensor != nil,
                                         gEnc.setBytes(&windowSize, length: MemoryLayout<UInt32>.stride, index: 10)
                                         gEnc.setBytes(&scaling, length: MemoryLayout<Float>.stride, index: 11)
                                         gEnc.setBytes(&cacheStride, length: MemoryLayout<UInt32>.stride, index: 12)
+                                        gEnc.setBytes(&ringLen, length: MemoryLayout<UInt32>.stride, index: 13)
                                         gEnc.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                                     }
                                     gEnc.memoryBarrier(scope: .buffers)
@@ -10240,8 +10555,11 @@ if layer.attnGateProjTensor != nil,
                                     gEnc.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 5)
                                     gEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 6)
                                     gEnc.setBytes(&cacheStride, length: MemoryLayout<UInt32>.stride, index: 7)
+                                    gEnc.setBytes(&ringLen, length: MemoryLayout<UInt32>.stride, index: 8)
                                     gEnc.dispatchThreads(MTLSize(width: Int(gKvDim), height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(gKvDim), storePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                                     gEnc.memoryBarrier(scope: .buffers)
+                                    // Ring bookkeeping: this layer just stored [startPos, startPos+P).
+                                    kvMgr.noteRingStores(range: Int(startPos)..<Int(startPos) + P)
                                 }
 
                                 var nQ = numHeads
@@ -10264,6 +10582,7 @@ if layer.attnGateProjTensor != nil,
                                         gEnc.setBytes(&windowSize, length: MemoryLayout<UInt32>.stride, index: 8)
                                         gEnc.setBytes(&scaling, length: MemoryLayout<Float>.stride, index: 9)
                                         gEnc.setBytes(&cacheStride, length: MemoryLayout<UInt32>.stride, index: 10)
+                                        gEnc.setBytes(&ringLen, length: MemoryLayout<UInt32>.stride, index: 11)
                                         gEnc.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                                     }
                                     gEnc.memoryBarrier(scope: .buffers)
@@ -10435,7 +10754,10 @@ if layer.attnGateProjTensor != nil,
 
                             gEnc.endEncoding()
                             gCmd.commit()
+                            let tGemmaPhaseAStart = CFAbsoluteTimeGetCurrent()
                             gCmd.waitUntilCompleted()
+                            prefillDiagPhaseAMs += (CFAbsoluteTimeGetCurrent() - tGemmaPhaseAStart) * 1000.0
+                            prefillDiagLayers += 1
                             if let gErr = gCmd.error {
                                 print("❌ [METAL ERROR] gemma4 prefill Phase A layer \(l): \(gErr)")
                                 return false
@@ -10459,7 +10781,10 @@ if layer.attnGateProjTensor != nil,
                             }
 
                             guard let gemmaMoeCmd = commandQueue.makeCommandBuffer(),
-                                  let gemmaMoeEnc = gemmaMoeCmd.makeComputeCommandEncoder() else { return false }
+                                  let gemmaMoeEnc = gemmaMoeCmd.makeComputeCommandEncoder() else {
+                                print("❌ [PREFILL] Gemma layer \(l) Phase B command buffer allocation failed (chunk startPos=\(startPos), P=\(P))")
+                                return false
+                            }
 
                             // pre_feedforward_layernorm_2(hMid) -> xNorm2Buffer_all
                             if let pf2 = layer.preFfnNorm2Tensor, let pf2Raw = buffers[pf2.shardIndex] {
@@ -10677,7 +11002,9 @@ if layer.attnGateProjTensor != nil,
                                 ExpertIOThreadPool.shared.dispatchAsync(tasks: kickTasks, done: kickSem)
                             }
 
+                            let tGemmaMoeGpuStart = CFAbsoluteTimeGetCurrent()
                             gemmaMoeCmd.waitUntilCompleted()
+                            prefillDiagGpuMs += (CFAbsoluteTimeGetCurrent() - tGemmaMoeGpuStart) * 1000.0
                             if let gErr = gemmaMoeCmd.error {
                                 print("❌ [METAL ERROR] gemma4 prefill Phase B layer \(l): \(gErr)")
                                 return false
@@ -10694,9 +11021,10 @@ if layer.attnGateProjTensor != nil,
                                 let elapsedG = max(0.001, nowG - prefillStartTime)
                                 let effG = Double(P) * (Double(passIdx) / Double(totalPasses))
                                 let spdG = effG / elapsedG
-                                let pctG = Int((Double(passIdx) / Double(totalPasses)) * 100)
+                                let dispLayerIdxG = prefillLayerBase + passIdx
+                                let pctG = Int((Double(dispLayerIdxG) / Double(max(1, prefillLayerTotal))) * 100)
                                 let sStrG = spdG >= 10 ? String(format: "%.0f", spdG) : String(format: "%.1f", spdG)
-                                let pStrG = "Ingesting prompt: Layer \(passIdx)/\(totalPasses) (\(pctG)%) • \(sStrG) tok/s"
+                                let pStrG = "Ingesting prompt: Layer \(dispLayerIdxG)/\(prefillLayerTotal) (\(pctG)%) • \(sStrG) tok/s"
                                 let rssG = WorkingSetManager.shared.effectiveResidentMemoryGB
                                 Task { @MainActor in
                                     self.generationSpeedTokPerSec = spdG
@@ -12378,9 +12706,10 @@ if layer.attnGateProjTensor != nil,
                             let elapsed = max(0.001, now - prefillStartTime)
                             let effectiveTokensProcessed = Double(P) * (Double(passIdx) / Double(totalPasses))
                             let promptSpeed = effectiveTokensProcessed / elapsed
-                            let pct = Int((Double(passIdx) / Double(totalPasses)) * 100)
+                            let dispLayerIdx = prefillLayerBase + passIdx
+                            let pct = Int((Double(dispLayerIdx) / Double(max(1, prefillLayerTotal))) * 100)
                             let speedStr = promptSpeed >= 10 ? String(format: "%.0f", promptSpeed) : String(format: "%.1f", promptSpeed)
-                            let prefillStr = "Ingesting prompt: Layer \(passIdx)/\(totalPasses) (\(pct)%) • \(speedStr) tok/s"
+                            let prefillStr = "Ingesting prompt: Layer \(dispLayerIdx)/\(prefillLayerTotal) (\(pct)%) • \(speedStr) tok/s"
                             let currentRss = WorkingSetManager.shared.effectiveResidentMemoryGB
 
                             Task { @MainActor in
@@ -12761,13 +13090,17 @@ if layer.attnGateProjTensor != nil,
                             if let kCache = KVCacheManager.shared.kCacheBuffer,
                                let vCache = KVCacheManager.shared.vCacheBuffer {
                                 let slotIndex = (loopIdx * actualLayers) + layer.fullAttnIndex
-                                let maxSeq = KVCacheManager.shared.allocatedSeqLen
-                                let prec = KVCacheManager.shared.activePrecision
-                                let layerByteOffset = slotIndex * maxSeq * Int(gemmaKvStride) * prec.bytesPerElement
+                                let kvMgr = KVCacheManager.shared
+                                let prec = kvMgr.activePrecision
+                                let layerByteOffset = kvMgr.kvSlotByteOffset(slot: slotIndex, stride: Int(gemmaKvStride), elementBytes: prec.bytesPerElement)
                                 var basePos = step
                                 var nKv = gNumKv
                                 var hD = gHeadDim
                                 var cacheStride = gemmaKvStride
+                                // Sliding layers address a ring-sized slot region; tree
+                                // node k's ring slot is (step + k) % ringLen (N <= ring
+                                // slack, so the scratch never lands on a live window row).
+                                var ringLen: UInt32 = kvMgr.isRingSlot(slotIndex) ? UInt32(kvMgr.slidingRingLen) : 0
 
                                 if prec == .fp16, let storePipe = storeKvGemmaF16Pipeline {
                                     gEnc.setComputePipelineState(storePipe)
@@ -12779,8 +13112,10 @@ if layer.attnGateProjTensor != nil,
                                     gEnc.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 5)
                                     gEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 6)
                                     gEnc.setBytes(&cacheStride, length: MemoryLayout<UInt32>.stride, index: 7)
+                                    gEnc.setBytes(&ringLen, length: MemoryLayout<UInt32>.stride, index: 8)
                                     gEnc.dispatchThreads(MTLSize(width: Int(gKvDim), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(gKvDim), storePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                                     gEnc.memoryBarrier(scope: .buffers)
+                                    kvMgr.noteRingStores(range: Int(step)..<Int(step) + N)
                                 } else if let storePipe = storeKvGemmaPipeline {
                                     gEnc.setComputePipelineState(storePipe)
                                     gEnc.setBuffer(jb.treeKVectorBuffer, offset: 0, index: 0)
@@ -12791,8 +13126,10 @@ if layer.attnGateProjTensor != nil,
                                     gEnc.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 5)
                                     gEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 6)
                                     gEnc.setBytes(&cacheStride, length: MemoryLayout<UInt32>.stride, index: 7)
+                                    gEnc.setBytes(&ringLen, length: MemoryLayout<UInt32>.stride, index: 8)
                                     gEnc.dispatchThreads(MTLSize(width: Int(gKvDim), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(gKvDim), storePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                                     gEnc.memoryBarrier(scope: .buffers)
+                                    kvMgr.noteRingStores(range: Int(step)..<Int(step) + N)
                                 }
 
                                 var pLen = step
@@ -12817,6 +13154,7 @@ if layer.attnGateProjTensor != nil,
                                     gEnc.setBytes(&windowSize, length: MemoryLayout<UInt32>.stride, index: 11)
                                     gEnc.setBytes(&scaling, length: MemoryLayout<Float>.stride, index: 12)
                                     gEnc.setBytes(&cacheStride, length: MemoryLayout<UInt32>.stride, index: 13)
+                                    gEnc.setBytes(&ringLen, length: MemoryLayout<UInt32>.stride, index: 14)
                                     gEnc.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                                     gEnc.memoryBarrier(scope: .buffers)
                                 }
@@ -14264,8 +14602,8 @@ if layer.attnGateProjTensor != nil,
                 if acceptedResult.acceptedCount > 0,
                    let kCache = KVCacheManager.shared.kCacheBuffer,
                    let vCache = KVCacheManager.shared.vCacheBuffer {
-                    let maxSeq = KVCacheManager.shared.allocatedSeqLen
-                    let prec = KVCacheManager.shared.activePrecision
+                    let kvMgr = KVCacheManager.shared
+                    let prec = kvMgr.activePrecision
                     let slotByteSize = Int(kvStride) * prec.bytesPerElement
 
                     var needsCompaction = false
@@ -14285,12 +14623,16 @@ if layer.attnGateProjTensor != nil,
                                 let layer = cachedLayers[l]
                                 if layer.attentionType == .fullAttention {
                                     let slot = (loopIdx * actualLayers) + layer.fullAttnIndex
-                                    let layerByteOffset = slot * maxSeq * Int(kvStride) * prec.bytesPerElement
+                                    let layerByteOffset = kvMgr.kvSlotByteOffset(slot: slot, stride: Int(kvStride), elementBytes: prec.bytesPerElement)
                                     for (i, nodeIdx) in acceptedResult.acceptedNodeIndices.enumerated() {
                                         let destSlot = UInt32(i + 1)
                                         if nodeIdx != destSlot {
-                                            let srcOffset = layerByteOffset + Int(step + nodeIdx) * slotByteSize
-                                            let dstOffset = layerByteOffset + Int(step + destSlot) * slotByteSize
+                                            // Ring slots (Gemma 4 sliding layers) compact inside
+                                            // the ring: node k's slot is (step + k) % ringLen.
+                                            let srcRow = kvMgr.ringSlotForRow(Int(step) + Int(nodeIdx), slot: slot)
+                                            let dstRow = kvMgr.ringSlotForRow(Int(step) + Int(destSlot), slot: slot)
+                                            let srcOffset = layerByteOffset + srcRow * slotByteSize
+                                            let dstOffset = layerByteOffset + dstRow * slotByteSize
                                             blit.copy(from: kCache, sourceOffset: srcOffset, to: kCache, destinationOffset: dstOffset, size: slotByteSize)
                                             blit.copy(from: vCache, sourceOffset: srcOffset, to: vCache, destinationOffset: dstOffset, size: slotByteSize)
                                         }
@@ -14306,6 +14648,9 @@ if layer.attnGateProjTensor != nil,
                             return nil
                         }
                     }
+                    // Accepted positions step+1..step+m now live at their committed
+                    // rows (linear or ring); mirror that in the ring bookkeeping.
+                    kvMgr.noteRingStores(range: Int(step) + 1 ..< Int(step) + 1 + Int(acceptedResult.acceptedCount))
                 }
 
                 // 6.5 Commit winning node linear attention recurrent states to linearStateBuffer
@@ -14470,10 +14815,34 @@ if layer.attnGateProjTensor != nil,
                             }
                         }
                         ok = prefillSuccess
+                    } else if modelConfig?.isGemma4Model == true {
+                        // Chunked batched prefill: each call's batch must fit the
+                        // sliding ring's slack (window + chunk) so a store never
+                        // overwrites a row a later row in the same pass still
+                        // reads, and the transient per-call buffers stay bounded
+                        // instead of scaling with the whole delta prompt.
+                        var chunkedOk = true
+                        var chunkStart = 0
+                        var chunkIndex = 0
+                        let totalPrefillChunks = max(1, (prefillTokens.count + gemmaPrefillChunkCap - 1) / gemmaPrefillChunkCap)
+                        while chunkStart < prefillTokens.count {
+                            if Task.isCancelled { chunkedOk = false; break }
+                            let chunkEnd = min(chunkStart + gemmaPrefillChunkCap, prefillTokens.count)
+                            let chunk = Array(prefillTokens[chunkStart..<chunkEnd])
+                            if !runLayerWisePrefill(promptTokens: chunk, startPos: UInt32(startPos) + UInt32(chunkStart), chunkIndex: chunkIndex, chunkCount: totalPrefillChunks) {
+                                print("❌ [PREFILL] Gemma chunked prefill failed at tokens \(chunkStart)..<\(chunkEnd) — see prior diagnostics for the failing layer/buffer.")
+                                chunkedOk = false
+                                break
+                            }
+                            chunkStart = chunkEnd
+                            chunkIndex += 1
+                        }
+                        ok = chunkedOk
                     } else {
                         ok = runLayerWisePrefill(promptTokens: prefillTokens, startPos: UInt32(startPos))
                     }
                     if !ok {
+                        PrefillTransientPool.shared.drain()
                         await MainActor.run {
                             guard self.ownsGeneration(myGenerationId) else { return }
                             self.isGeneratingText = false
@@ -14491,6 +14860,9 @@ if layer.attnGateProjTensor != nil,
                 }
                 currentStep = UInt32(promptCount)
                 WorkingSetManager.shared.trimAfterPrefill(shardBuffers: buffers, mode: budgetMode)
+                // The prefill transients (multi-GB expert staging) are no longer
+                // needed once ingestion completes — release them before decode.
+                PrefillTransientPool.shared.drain()
 
                 // Clear prefill status once prefill completes
                 await MainActor.run {

@@ -7792,6 +7792,7 @@ kernel void store_kv_cache_gemma_f16(
     constant uint32_t& numKvHeads [[buffer(5)]],
     constant uint32_t& headDim [[buffer(6)]],
     constant uint32_t& cacheStride [[buffer(7)]],
+    constant uint32_t& ringLen [[buffer(8)]],
     uint2 pos [[thread_position_in_grid]]
 ) {
     uint elemIdx = pos.x;
@@ -7799,6 +7800,9 @@ kernel void store_kv_cache_gemma_f16(
     uint32_t kvStride = numKvHeads * headDim;
     if (elemIdx >= kvStride) return;
     uint32_t effectivePos = tokenPos + tokenIdx;
+    // Sliding-window ring layout (Gemma 4): the slot region holds only ringLen
+    // positions; physical row = logical position % ringLen. ringLen == 0 = linear.
+    if (ringLen > 0) { effectivePos = effectivePos % ringLen; }
     uint32_t inOffset = (tokenIdx * kvStride) + elemIdx;
     uint32_t cacheOffset = (effectivePos * cacheStride) + elemIdx;
     kCacheBuffer[cacheOffset] = half(kVector[inOffset]);
@@ -7814,6 +7818,7 @@ kernel void store_kv_cache_gemma(
     constant uint32_t& numKvHeads [[buffer(5)]],
     constant uint32_t& headDim [[buffer(6)]],
     constant uint32_t& cacheStride [[buffer(7)]],
+    constant uint32_t& ringLen [[buffer(8)]],
     uint2 pos [[thread_position_in_grid]]
 ) {
     uint elemIdx = pos.x;
@@ -7821,6 +7826,8 @@ kernel void store_kv_cache_gemma(
     uint32_t kvStride = numKvHeads * headDim;
     if (elemIdx >= kvStride) return;
     uint32_t effectivePos = tokenPos + tokenIdx;
+    // Sliding-window ring layout (Gemma 4): physical row = position % ringLen.
+    if (ringLen > 0) { effectivePos = effectivePos % ringLen; }
     uint32_t inOffset = (tokenIdx * kvStride) + elemIdx;
     uint32_t cacheOffset = (effectivePos * cacheStride) + elemIdx;
     kCacheBuffer[cacheOffset] = kVector[inOffset];
@@ -7842,6 +7849,7 @@ kernel void gqa_attention_decode_gemma_f16(
     constant uint32_t& windowSize [[buffer(8)]],
     constant float& scaling [[buffer(9)]],
     constant uint32_t& cacheStride [[buffer(10)]],
+    constant uint32_t& ringLen [[buffer(11)]],
     uint tgIdx [[threadgroup_position_in_grid]],
     uint laneId [[thread_index_in_simdgroup]]
 ) {
@@ -7864,8 +7872,13 @@ kernel void gqa_attention_decode_gemma_f16(
     float m = -1e20f;
     float l = 0.0f;
 
-    for (uint32_t tau = winStart; tau < currentSeqLen; tau++) {
-        device const half* kVec = kCacheBuffer + (uint64_t)tau * cacheStride + kvHeadBase;
+    // Sliding-window ring layout (Gemma 4): physical row = position % ringLen;
+    // ringLen == 0 = linear cache. The read window spans < ringLen consecutive
+    // positions, so a running slot with a wrap check replaces per-position modulo.
+    uint32_t tauSlot = (ringLen > 0) ? (winStart % ringLen) : winStart;
+    for (uint32_t tau = winStart; tau < currentSeqLen; tau++, tauSlot++) {
+        if (ringLen > 0 && tauSlot >= ringLen) { tauSlot = 0; }
+        device const half* kVec = kCacheBuffer + (uint64_t)tauSlot * cacheStride + kvHeadBase;
         float partial = 0.0f;
         for (uint32_t i = laneId; i < headDimVec; i += 32) {
             uint32_t e = i * 4;
@@ -7879,7 +7892,7 @@ kernel void gqa_attention_decode_gemma_f16(
         float beta = exp(score - m);
         l = l * alpha + beta;
 
-        device const half* vVec = vCacheBuffer + (uint64_t)tau * cacheStride + kvHeadBase;
+        device const half* vVec = vCacheBuffer + (uint64_t)tauSlot * cacheStride + kvHeadBase;
         for (uint32_t i = laneId, slot = 0; i < headDimVec; i += 32, slot++) {
             uint32_t e = i * 4;
             float4 vv = float4(float(vVec[e + 0]), float(vVec[e + 1]), float(vVec[e + 2]), float(vVec[e + 3]));
@@ -7906,6 +7919,7 @@ kernel void gqa_attention_decode_gemma(
     constant uint32_t& windowSize [[buffer(8)]],
     constant float& scaling [[buffer(9)]],
     constant uint32_t& cacheStride [[buffer(10)]],
+    constant uint32_t& ringLen [[buffer(11)]],
     uint tgIdx [[threadgroup_position_in_grid]],
     uint laneId [[thread_index_in_simdgroup]]
 ) {
@@ -7928,8 +7942,11 @@ kernel void gqa_attention_decode_gemma(
     float m = -1e20f;
     float l = 0.0f;
 
-    for (uint32_t tau = winStart; tau < currentSeqLen; tau++) {
-        device const float4* kVec = (device const float4*)(kCacheBuffer + (uint64_t)tau * cacheStride + kvHeadBase);
+    // Sliding-window ring layout (Gemma 4): physical row = position % ringLen.
+    uint32_t tauSlot = (ringLen > 0) ? (winStart % ringLen) : winStart;
+    for (uint32_t tau = winStart; tau < currentSeqLen; tau++, tauSlot++) {
+        if (ringLen > 0 && tauSlot >= ringLen) { tauSlot = 0; }
+        device const float4* kVec = (device const float4*)(kCacheBuffer + (uint64_t)tauSlot * cacheStride + kvHeadBase);
         float partial = 0.0f;
         for (uint32_t i = laneId; i < headDimVec; i += 32) {
             partial += dot(qVec[i], kVec[i]);
@@ -7941,7 +7958,7 @@ kernel void gqa_attention_decode_gemma(
         float beta = exp(score - m);
         l = l * alpha + beta;
 
-        device const float4* vVec = (device const float4*)(vCacheBuffer + (uint64_t)tau * cacheStride + kvHeadBase);
+        device const float4* vVec = (device const float4*)(vCacheBuffer + (uint64_t)tauSlot * cacheStride + kvHeadBase);
         for (uint32_t i = laneId, slot = 0; i < headDimVec; i += 32, slot++) {
             acc[slot] = acc[slot] * alpha + vVec[i] * beta;
         }
@@ -7968,6 +7985,7 @@ kernel void store_kv_cache_gemma_fp8(
     constant uint32_t& numKvHeads [[buffer(7)]],
     constant uint32_t& headDim [[buffer(8)]],
     constant uint32_t& cacheStride [[buffer(9)]],
+    constant uint32_t& ringLen [[buffer(10)]],
     uint2 tgPos [[threadgroup_position_in_grid]],
     uint2 tid [[thread_position_in_threadgroup]]
 ) {
@@ -7977,6 +7995,9 @@ kernel void store_kv_cache_gemma_fp8(
     if (kvHeadIdx >= numKvHeads) return;
 
     uint32_t effectivePos = tokenPos + tokenIdx;
+    // Sliding-window ring layout (Gemma 4): physical row = position % ringLen;
+    // the per-(token, head) scale lives at the same ring row.
+    if (ringLen > 0) { effectivePos = effectivePos % ringLen; }
     uint32_t kvStride = numKvHeads * headDim;
     uint32_t inBase = tokenIdx * kvStride + kvHeadIdx * headDim;
     uint32_t cacheHeadBase = effectivePos * cacheStride + kvHeadIdx * headDim;
@@ -8022,6 +8043,7 @@ kernel void gqa_attention_decode_gemma_fp8(
     constant uint32_t& windowSize [[buffer(10)]],
     constant float& scaling [[buffer(11)]],
     constant uint32_t& cacheStride [[buffer(12)]],
+    constant uint32_t& ringLen [[buffer(13)]],
     uint tgIdx [[threadgroup_position_in_grid]],
     uint laneId [[thread_index_in_simdgroup]]
 ) {
@@ -8044,9 +8066,13 @@ kernel void gqa_attention_decode_gemma_fp8(
     float m = -1e20f;
     float l = 0.0f;
 
-    for (uint32_t tau = winStart; tau < currentSeqLen; tau++) {
-        float kScale = float(kScaleBuffer[tau * numKvHeads + kvHeadIdx]);
-        device const char* kBase = kCacheBuffer + (uint64_t)tau * cacheStride + kvHeadBase;
+    // Sliding-window ring layout (Gemma 4): K/V rows AND per-(token, head)
+    // scales live at position % ringLen.
+    uint32_t tauSlot = (ringLen > 0) ? (winStart % ringLen) : winStart;
+    for (uint32_t tau = winStart; tau < currentSeqLen; tau++, tauSlot++) {
+        if (ringLen > 0 && tauSlot >= ringLen) { tauSlot = 0; }
+        float kScale = float(kScaleBuffer[tauSlot * numKvHeads + kvHeadIdx]);
+        device const char* kBase = kCacheBuffer + (uint64_t)tauSlot * cacheStride + kvHeadBase;
         float partial = 0.0f;
         for (uint32_t i = laneId; i < headDimVec; i += 32) {
             uint32_t e = i * 4;
@@ -8060,8 +8086,8 @@ kernel void gqa_attention_decode_gemma_fp8(
         float beta = exp(score - m);
         l = l * alpha + beta;
 
-        float vScale = float(vScaleBuffer[tau * numKvHeads + kvHeadIdx]);
-        device const char* vBase = vCacheBuffer + (uint64_t)tau * cacheStride + kvHeadBase;
+        float vScale = float(vScaleBuffer[tauSlot * numKvHeads + kvHeadIdx]);
+        device const char* vBase = vCacheBuffer + (uint64_t)tauSlot * cacheStride + kvHeadBase;
         float beta_vScale = beta * vScale;
         for (uint32_t i = laneId, slot = 0; i < headDimVec; i += 32, slot++) {
             uint32_t e = i * 4;
@@ -8102,6 +8128,7 @@ kernel void gqa_attention_tree_verify_gemma(
     constant uint32_t& windowSize [[buffer(11)]],
     constant float& scaling [[buffer(12)]],
     constant uint32_t& cacheStride [[buffer(13)]],
+    constant uint32_t& ringLen [[buffer(14)]],
     uint2 tgPos [[threadgroup_position_in_grid]],
     uint laneId [[thread_index_in_simdgroup]]
 ) {
@@ -8126,8 +8153,11 @@ kernel void gqa_attention_tree_verify_gemma(
     float m = -1e20f;
     float l = 0.0f;
 
-    for (uint32_t tau = winStart; tau < prefixLen; tau++) {
-        device const float4* kVec = (device const float4*)(kCacheBuffer + (uint64_t)tau * cacheStride + kvHeadBase);
+    // Sliding-window ring layout (Gemma 4): prefix rows live at position % ringLen.
+    uint32_t tauSlot = (ringLen > 0) ? (winStart % ringLen) : winStart;
+    for (uint32_t tau = winStart; tau < prefixLen; tau++, tauSlot++) {
+        if (ringLen > 0 && tauSlot >= ringLen) { tauSlot = 0; }
+        device const float4* kVec = (device const float4*)(kCacheBuffer + (uint64_t)tauSlot * cacheStride + kvHeadBase);
         float partial = 0.0f;
         for (uint32_t i = laneId; i < headDimVec; i += 32) partial += dot(qVec[i], kVec[i]);
         float score = simd_sum(partial) * scaling;
@@ -8136,7 +8166,7 @@ kernel void gqa_attention_tree_verify_gemma(
         float alpha = exp(m_prev - m);
         float beta = exp(score - m);
         l = l * alpha + beta;
-        device const float4* vVec = (device const float4*)(vCacheBuffer + (uint64_t)tau * cacheStride + kvHeadBase);
+        device const float4* vVec = (device const float4*)(vCacheBuffer + (uint64_t)tauSlot * cacheStride + kvHeadBase);
         for (uint32_t i = laneId, slot = 0; i < headDimVec; i += 32, slot++) {
             acc[slot] = acc[slot] * alpha + vVec[i] * beta;
         }
@@ -8147,7 +8177,10 @@ kernel void gqa_attention_tree_verify_gemma(
         if (maskVal < -1e4f) continue;
         uint32_t treePos = prefixLen + depthsBuffer[k];
         if (treePos < winStart) continue;
+        // Tree node k occupies ring slot (prefixLen + k) % ringLen; only its RoPE
+        // position uses prefixLen + depth[k].
         uint32_t slotIdx = prefixLen + k;
+        if (ringLen > 0) { slotIdx = slotIdx % ringLen; }
         device const float4* kVec = (device const float4*)(kCacheBuffer + (uint64_t)slotIdx * cacheStride + kvHeadBase);
         float partial = 0.0f;
         for (uint32_t i = laneId; i < headDimVec; i += 32) partial += dot(qVec[i], kVec[i]);
@@ -8186,6 +8219,7 @@ kernel void gqa_attention_tree_verify_gemma_f16(
     constant uint32_t& windowSize [[buffer(11)]],
     constant float& scaling [[buffer(12)]],
     constant uint32_t& cacheStride [[buffer(13)]],
+    constant uint32_t& ringLen [[buffer(14)]],
     uint2 tgPos [[threadgroup_position_in_grid]],
     uint laneId [[thread_index_in_simdgroup]]
 ) {
@@ -8210,8 +8244,11 @@ kernel void gqa_attention_tree_verify_gemma_f16(
     float m = -1e20f;
     float l = 0.0f;
 
-    for (uint32_t tau = winStart; tau < prefixLen; tau++) {
-        device const half* kBase = kCacheBuffer + (uint64_t)tau * cacheStride + kvHeadBase;
+    // Sliding-window ring layout (Gemma 4): prefix rows live at position % ringLen.
+    uint32_t tauSlot = (ringLen > 0) ? (winStart % ringLen) : winStart;
+    for (uint32_t tau = winStart; tau < prefixLen; tau++, tauSlot++) {
+        if (ringLen > 0 && tauSlot >= ringLen) { tauSlot = 0; }
+        device const half* kBase = kCacheBuffer + (uint64_t)tauSlot * cacheStride + kvHeadBase;
         float partial = 0.0f;
         for (uint32_t i = laneId; i < headDimVec; i += 32) {
             uint32_t e = i * 4;
@@ -8224,7 +8261,7 @@ kernel void gqa_attention_tree_verify_gemma_f16(
         float alpha = exp(m_prev - m);
         float beta = exp(score - m);
         l = l * alpha + beta;
-        device const half* vBase = vCacheBuffer + (uint64_t)tau * cacheStride + kvHeadBase;
+        device const half* vBase = vCacheBuffer + (uint64_t)tauSlot * cacheStride + kvHeadBase;
         for (uint32_t i = laneId, slot = 0; i < headDimVec; i += 32, slot++) {
             uint32_t e = i * 4;
             float4 vv = float4(float(vBase[e + 0]), float(vBase[e + 1]), float(vBase[e + 2]), float(vBase[e + 3]));
@@ -8237,7 +8274,10 @@ kernel void gqa_attention_tree_verify_gemma_f16(
         if (maskVal < -1e4f) continue;
         uint32_t treePos = prefixLen + depthsBuffer[k];
         if (treePos < winStart) continue;
+        // Tree node k occupies ring slot (prefixLen + k) % ringLen; only its RoPE
+        // position uses prefixLen + depth[k].
         uint32_t slotIdx = prefixLen + k;
+        if (ringLen > 0) { slotIdx = slotIdx % ringLen; }
         device const half* kBase = kCacheBuffer + (uint64_t)slotIdx * cacheStride + kvHeadBase;
         float partial = 0.0f;
         for (uint32_t i = laneId; i < headDimVec; i += 32) {

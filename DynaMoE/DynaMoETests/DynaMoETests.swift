@@ -6072,7 +6072,8 @@ final class DynaMoETests: XCTestCase {
                 layerEnc1.memoryBarrier(scope: .buffers)
             }
 
-            // KV Cache Store + GQA Attention
+            // KV Cache Store + GQA Attention (linear cache layout: ringLen 0)
+            var linearRingLen: UInt32 = 0
             let slot = layer.fullAttnIndex
             let layerByteOffset = slot * maxSeqLen * Int(gemmaKvStride) * 2
             var cacheStride = gemmaKvStride
@@ -6087,6 +6088,7 @@ final class DynaMoETests: XCTestCase {
             layerEnc1.setBytes(&nK, length: 4, index: 5)
             layerEnc1.setBytes(&hD, length: 4, index: 6)
             layerEnc1.setBytes(&cacheStride, length: 4, index: 7)
+            layerEnc1.setBytes(&linearRingLen, length: 4, index: 8)
             layerEnc1.dispatchThreads(MTLSize(width: Int(gKvDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(gKvDim), storeKvGemmaF16Pipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
             layerEnc1.memoryBarrier(scope: .buffers)
 
@@ -6105,6 +6107,7 @@ final class DynaMoETests: XCTestCase {
             layerEnc1.setBytes(&windowSize, length: 4, index: 8)
             layerEnc1.setBytes(&scaling, length: 4, index: 9)
             layerEnc1.setBytes(&cacheStride, length: 4, index: 10)
+            layerEnc1.setBytes(&linearRingLen, length: 4, index: 11)
             layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
             layerEnc1.memoryBarrier(scope: .buffers)
 
@@ -6781,10 +6784,11 @@ final class DynaMoETests: XCTestCase {
                     enc.memoryBarrier(scope: .buffers)
                 }
 
-                // KV Store + Attention
+                // KV Store + Attention (linear cache layout: ringLen 0)
                 let slot = layer.fullAttnIndex
                 let layerByteOffset = slot * maxSeqLen * Int(gemmaKvStride) * 2
                 var cacheStride = gemmaKvStride
+                var linearRingLen: UInt32 = 0
 
                 enc.setComputePipelineState(storeKvGemmaF16Pipe)
                 enc.setBuffer(kVecBuf, offset: 0, index: 0)
@@ -6795,6 +6799,7 @@ final class DynaMoETests: XCTestCase {
                 enc.setBytes(&nK, length: 4, index: 5)
                 enc.setBytes(&hD, length: 4, index: 6)
                 enc.setBytes(&cacheStride, length: 4, index: 7)
+                enc.setBytes(&linearRingLen, length: 4, index: 8)
                 enc.dispatchThreads(MTLSize(width: Int(gKvDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(gKvDim), storeKvGemmaF16Pipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                 enc.memoryBarrier(scope: .buffers)
 
@@ -6813,6 +6818,7 @@ final class DynaMoETests: XCTestCase {
                 enc.setBytes(&winSize, length: 4, index: 8)
                 enc.setBytes(&scaling, length: 4, index: 9)
                 enc.setBytes(&cacheStride, length: 4, index: 10)
+                enc.setBytes(&linearRingLen, length: 4, index: 11)
                 enc.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                 enc.memoryBarrier(scope: .buffers)
 
@@ -7412,6 +7418,7 @@ final class DynaMoETests: XCTestCase {
             var cacheStride = gemmaKvStride
             var windowSize: UInt32 = gSliding ? UInt32(config?.effectiveSlidingWindow ?? 0) : 0
             var scaling: Float = 1.0
+            var linearRingLen: UInt32 = 0
             if prec == .fp8 {
                 let kScale = KVCacheManager.shared.kScaleBuffer!
                 let vScale = KVCacheManager.shared.vScaleBuffer!
@@ -7427,6 +7434,7 @@ final class DynaMoETests: XCTestCase {
                 enc.setBytes(&nK, length: 4, index: 7)
                 enc.setBytes(&hD, length: 4, index: 8)
                 enc.setBytes(&cacheStride, length: 4, index: 9)
+                enc.setBytes(&linearRingLen, length: 4, index: 10)
                 enc.dispatchThreadgroups(MTLSize(width: Int(gNumKv), height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                 enc.memoryBarrier(scope: .buffers)
                 enc.setComputePipelineState(gqaPipe)
@@ -7446,6 +7454,7 @@ final class DynaMoETests: XCTestCase {
                     enc.setBytes(&windowSize, length: 4, index: 10)
                     enc.setBytes(&scaling, length: 4, index: 11)
                     enc.setBytes(&cacheStride, length: 4, index: 12)
+                    enc.setBytes(&linearRingLen, length: 4, index: 13)
                     enc.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                 }
                 enc.memoryBarrier(scope: .buffers)
@@ -7459,6 +7468,7 @@ final class DynaMoETests: XCTestCase {
             enc.setBytes(&nK, length: 4, index: 5)
             enc.setBytes(&hD, length: 4, index: 6)
             enc.setBytes(&cacheStride, length: 4, index: 7)
+            enc.setBytes(&linearRingLen, length: 4, index: 8)
             enc.dispatchThreads(MTLSize(width: Int(gKvDim), height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(gKvDim), storeKvPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
             enc.memoryBarrier(scope: .buffers)
             enc.setComputePipelineState(gqaPipe)
@@ -7476,6 +7486,7 @@ final class DynaMoETests: XCTestCase {
                 enc.setBytes(&windowSize, length: 4, index: 8)
                 enc.setBytes(&scaling, length: 4, index: 9)
                 enc.setBytes(&cacheStride, length: 4, index: 10)
+                enc.setBytes(&linearRingLen, length: 4, index: 11)
                 enc.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
             }
             enc.memoryBarrier(scope: .buffers)
@@ -7852,6 +7863,7 @@ final class DynaMoETests: XCTestCase {
             let enc = cmd.makeComputeCommandEncoder()!
             var seqLen = UInt32(totalSeq); var nQ = UInt32(numQHeads); var nK = UInt32(numKvHeads)
             var hD = UInt32(headDim); var win = window; var sc = scaling; var cs = UInt32(cacheStride)
+            var ringLen: UInt32 = 0
             enc.setComputePipelineState(decodePipe)
             enc.setBuffer(qBuf, offset: 0, index: 0)
             enc.setBuffer(kCache, offset: 0, index: 1)
@@ -7864,6 +7876,7 @@ final class DynaMoETests: XCTestCase {
             enc.setBytes(&win, length: 4, index: 8)
             enc.setBytes(&sc, length: 4, index: 9)
             enc.setBytes(&cs, length: 4, index: 10)
+            enc.setBytes(&ringLen, length: 4, index: 11)
             enc.dispatchThreadgroups(MTLSize(width: numQHeads, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
             enc.endEncoding(); cmd.commit(); cmd.waitUntilCompleted()
             return Array(UnsafeBufferPointer(start: decodeOut.contents().bindMemory(to: Float.self, capacity: qData.count), count: qData.count))
@@ -7874,6 +7887,7 @@ final class DynaMoETests: XCTestCase {
             let enc = cmd.makeComputeCommandEncoder()!
             var pLen = UInt32(prefixLen); var nNodes = UInt32(1); var nQ = UInt32(numQHeads); var nK = UInt32(numKvHeads)
             var hD = UInt32(headDim); var win = window; var sc = scaling; var cs = UInt32(cacheStride)
+            var ringLen: UInt32 = 0
             enc.setComputePipelineState(treePipe)
             enc.setBuffer(qBuf, offset: 0, index: 0)
             enc.setBuffer(kCache, offset: 0, index: 1)
@@ -7889,6 +7903,7 @@ final class DynaMoETests: XCTestCase {
             enc.setBytes(&win, length: 4, index: 11)
             enc.setBytes(&sc, length: 4, index: 12)
             enc.setBytes(&cs, length: 4, index: 13)
+            enc.setBytes(&ringLen, length: 4, index: 14)
             enc.dispatchThreadgroups(MTLSize(width: numQHeads, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
             enc.endEncoding(); cmd.commit(); cmd.waitUntilCompleted()
             return Array(UnsafeBufferPointer(start: treeOut.contents().bindMemory(to: Float.self, capacity: qData.count), count: qData.count))
@@ -7918,6 +7933,7 @@ final class DynaMoETests: XCTestCase {
         let storeCmd = cmdQueue.makeCommandBuffer()!
         let storeEnc = storeCmd.makeComputeCommandEncoder()!
         var basePos = UInt32(prefixLen); var nKv = UInt32(numKvHeads); var hDs = UInt32(headDim); var cs2 = UInt32(cacheStride)
+        var ringLenS: UInt32 = 0
         storeEnc.setComputePipelineState(storePipe)
         storeEnc.setBuffer(kNodeBuf, offset: 0, index: 0)
         storeEnc.setBuffer(vNodeBuf, offset: 0, index: 1)
@@ -7927,6 +7943,7 @@ final class DynaMoETests: XCTestCase {
         storeEnc.setBytes(&nKv, length: 4, index: 5)
         storeEnc.setBytes(&hDs, length: 4, index: 6)
         storeEnc.setBytes(&cs2, length: 4, index: 7)
+        storeEnc.setBytes(&ringLenS, length: 4, index: 8)
         storeEnc.dispatchThreads(MTLSize(width: kvDim, height: 2, depth: 1), threadsPerThreadgroup: MTLSize(width: min(kvDim, storePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
         storeEnc.endEncoding(); storeCmd.commit(); storeCmd.waitUntilCompleted()
 
@@ -7938,6 +7955,363 @@ final class DynaMoETests: XCTestCase {
         }
         print("Gemma 4 tree KV store maxErr=\(storeErr)")
         XCTAssertLessThan(storeErr, 1e-6, "Tree KV store must place node K/V at basePos + nodeIndex")
+    }
+
+    /// Gemma 4 sliding-window ring KV layout: ring slots hold window + slack
+    /// positions addressed position % ringLen, linear slots keep maxSeqLen; a
+    /// prefix splice is only valid while every reused ring row still holds its
+    /// own position (a turn that ran past the pin and wrapped onto the window
+    /// rejects the splice), and a preserved reset relocates exactly the live
+    /// rows into the new buffer.
+    func testGemma4SlidingRingKVLayoutAndPrefixValidation() throws {
+        print("=== TEST GEMMA 4 SLIDING RING KV LAYOUT + PREFIX VALIDATION ===")
+        guard let device = MTLCreateSystemDefaultDevice() else { XCTFail("No Metal GPU device"); return }
+
+        let json = """
+        {
+          "architectures": ["Gemma4ForConditionalGeneration"],
+          "model_type": "gemma4",
+          "text_config": {
+            "model_type": "gemma4_text",
+            "hidden_size": 64,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 32,
+            "head_dim": 32,
+            "sliding_window": 8,
+            "layer_types": ["sliding_attention", "sliding_attention", "full_attention", "sliding_attention", "full_attention", "sliding_attention"]
+          }
+        }
+        """.data(using: .utf8)!
+        let config = try JSONDecoder().decode(ModelConfig.self, from: json)
+        XCTAssertEqual(config.effectiveSlidingWindow, 8)
+
+        let mgr = KVCacheManager.shared
+        // 6 slots: sliding (ring R = 8 + 4) at 0,1,3,5; linear (maxSeq 32) at 2,4.
+        let flags: [Bool] = [true, true, false, true, false, true]
+        let ringLen = 12
+        let kvStride = 32 * 32
+
+        mgr.reset(device: device, config: config, actualLayers: 6, totalLoops: 1,
+                  numKvHeads: 32, headDim: 32, maxSeqLen: 32, precision: .fp16,
+                  slidingSlotFlags: flags, slidingRingLen: ringLen)
+        XCTAssertEqual(mgr.slidingRingLen, ringLen)
+        XCTAssertEqual(mgr.slotPosCount, [12, 12, 32, 12, 32, 12])
+        XCTAssertEqual(mgr.slotPosBase, [0, 12, 24, 56, 68, 100])
+        XCTAssertTrue(mgr.isRingSlot(0))
+        XCTAssertFalse(mgr.isRingSlot(2))
+        XCTAssertEqual(mgr.kvSlotPositionCount(0), 12)
+        XCTAssertEqual(mgr.kvSlotPositionCount(2), 32)
+        XCTAssertEqual(mgr.kvSlotByteOffset(slot: 3, stride: kvStride, elementBytes: 2), 56 * kvStride * 2)
+        XCTAssertEqual(mgr.ringSlotForRow(15, slot: 0), 3, "position 15 maps to ring row 15 % 12")
+        XCTAssertEqual(mgr.ringSlotForRow(15, slot: 2), 15, "linear slots pass positions through")
+        // Ring layout shrinks the cache: 112 positions instead of 6 * 32 = 192.
+        XCTAssertEqual(mgr.kCacheBuffer!.length, 112 * kvStride * 2)
+        XCTAssertEqual(mgr.vCacheBuffer!.length, 112 * kvStride * 2)
+
+        // Inactive ring (all-false flags): uniform slot * maxSeq fallback.
+        mgr.reset(device: device, config: config, actualLayers: 6, totalLoops: 1,
+                  numKvHeads: 32, headDim: 32, maxSeqLen: 32, precision: .fp16,
+                  slidingSlotFlags: [false, false, false, false, false, false], slidingRingLen: ringLen)
+        XCTAssertEqual(mgr.slidingRingLen, 0)
+        XCTAssertTrue(mgr.slotPosBase.isEmpty, "inactive ring layout falls back to the uniform layout")
+        XCTAssertEqual(mgr.kvSlotByteOffset(slot: 3, stride: kvStride, elementBytes: 2), 3 * 32 * kvStride * 2)
+
+        // Bookkeeping: stores validate the rows they claim; a later store that
+        // wraps onto a row the pinned window still needs must reject the splice.
+        mgr.reset(device: device, config: config, actualLayers: 6, totalLoops: 1,
+                  numKvHeads: 32, headDim: 32, maxSeqLen: 32, precision: .fp16,
+                  slidingSlotFlags: flags, slidingRingLen: ringLen)
+        mgr.noteRingStores(range: 0..<10)
+        XCTAssertTrue(mgr.ringPrefixRowsIntact(prefixCount: 10, window: 8),
+                      "rows [2, 10) hold exactly their positions after storing 0..<10")
+        // Positions 10..13 wrap onto rows 10, 11, 0, 1 — none of them are rows
+        // [2, 10), so a pin at 10 stays valid.
+        mgr.noteRingStores(range: 10..<14)
+        XCTAssertTrue(mgr.ringPrefixRowsIntact(prefixCount: 10, window: 8))
+        // Position 14 wraps onto row 2 — exactly a row the pin at 10 needs.
+        mgr.noteRingStores(range: 14..<15)
+        XCTAssertFalse(mgr.ringPrefixRowsIntact(prefixCount: 10, window: 8),
+                       "a store that wraps onto the pinned window's rows must reject the splice")
+        XCTAssertTrue(mgr.ringPrefixRowsIntact(prefixCount: 15, window: 8),
+                      "a pin at the new high-water mark is valid again")
+
+        // Preserved reset across a maxSeqLen change (forced realloc): only the
+        // live window rows move, landing at their ring rows in the new buffer.
+        mgr.reset(device: device, config: config, actualLayers: 6, totalLoops: 1,
+                  numKvHeads: 32, headDim: 32, maxSeqLen: 32, precision: .fp16,
+                  slidingSlotFlags: flags, slidingRingLen: ringLen)
+        // FP16 cache: rows are kvStride UInt16 elements (kvStride * 2 bytes).
+        let rowElems = kvStride
+        guard let oldK = mgr.kCacheBuffer else { XCTFail("no K cache"); return }
+        for pos in 0..<10 {
+            let rowPtr = oldK.contents().advanced(by: (pos % ringLen) * rowElems * 2).bindMemory(to: UInt16.self, capacity: rowElems)
+            for e in 0..<rowElems { rowPtr[e] = UInt16(pos) }
+        }
+        mgr.noteRingStores(range: 0..<10)
+        mgr.reset(device: device, config: config, actualLayers: 6, totalLoops: 1,
+                  numKvHeads: 32, headDim: 32, maxSeqLen: 40, precision: .fp16,
+                  preservePrefixCount: 10, slidingSlotFlags: flags, slidingRingLen: ringLen)
+        guard let newK = mgr.kCacheBuffer else { XCTFail("no preserved K cache"); return }
+        for row in 0..<ringLen {
+            let rowPtr = newK.contents().advanced(by: row * rowElems * 2).bindMemory(to: UInt16.self, capacity: rowElems)
+            let expected = (row >= 2 && row < 10) ? row : 0
+            var rowErr = 0
+            for e in 0..<rowElems { rowErr = max(rowErr, abs(Int(rowPtr[e]) - expected)) }
+            XCTAssertEqual(rowErr, 0, "preserved ring row \(row) must hold position \(row) data (expected \(expected))")
+        }
+        XCTAssertTrue(mgr.ringPrefixRowsIntact(prefixCount: 10, window: 8),
+                      "bookkeeping survives the preserved reset")
+
+        // Restore the shared singleton to a plain uniform layout for other tests.
+        mgr.reset(device: device, actualLayers: 6, totalLoops: 1,
+                  numKvHeads: 32, headDim: 32, maxSeqLen: 32, precision: .fp16)
+    }
+
+    /// The ring Gemma kernels must be numerically equivalent to the linear ones:
+    /// storing a sequence that wraps the ring and decoding/verifying through the
+    /// wrapped window (and through tree node slots that land on dead ring rows)
+    /// must reproduce the linear cache's outputs exactly.
+    func testGemma4SlidingRingKernelEquivalence() throws {
+        print("=== TEST GEMMA 4 SLIDING RING KERNEL EQUIVALENCE ===")
+        guard let device = MTLCreateSystemDefaultDevice() else { XCTFail("No Metal GPU device"); return }
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+        guard let lib = inference.defaultLibrary else { XCTFail("No Metal library"); return }
+        guard let cmdQueue = device.makeCommandQueue() else { XCTFail("No command queue"); return }
+
+        let storePipe = try device.makeComputePipelineState(function: try XCTUnwrap(lib.makeFunction(name: "store_kv_cache_gemma")))
+        let decodePipe = try device.makeComputePipelineState(function: try XCTUnwrap(lib.makeFunction(name: "gqa_attention_decode_gemma")))
+        let treePipe = try device.makeComputePipelineState(function: try XCTUnwrap(lib.makeFunction(name: "gqa_attention_tree_verify_gemma")))
+
+        let numQHeads = 4
+        let numKvHeads = 2
+        let headDim = 64
+        let cacheStride = numKvHeads * headDim
+        let window: UInt32 = 4
+        let ringLen: UInt32 = 6
+        let storedPositions = 8
+        let linearRows = 16
+        let scaling: Float = 1.0
+        let prefixLen: UInt32 = 5
+
+        var seed: UInt32 = 4242
+        func nextRand() -> Float {
+            seed = seed &* 1664525 &+ 1013904223
+            return (Float(seed >> 8) / Float(1 << 24)) - 0.5
+        }
+
+        // K/V for the 8 stored positions (identical data into both caches).
+        var kvData = [Float](repeating: 0, count: storedPositions * cacheStride * 2)
+        for i in 0..<kvData.count { kvData[i] = nextRand() }
+        // 3 tree nodes: node 0 (depth 0) with children 1, 2 (both depth 1).
+        let numNodes = 3
+        var nodeData = [Float](repeating: 0, count: numNodes * cacheStride * 2)
+        for i in 0..<nodeData.count { nodeData[i] = nextRand() }
+        // Queries: one decode query + numNodes tree queries.
+        var qData = [Float](repeating: 0, count: (1 + numNodes) * numQHeads * headDim)
+        for i in 0..<qData.count { qData[i] = nextRand() }
+
+        guard let ringK = device.makeBuffer(length: Int(ringLen) * cacheStride * 4, options: .storageModeShared),
+              let ringV = device.makeBuffer(length: Int(ringLen) * cacheStride * 4, options: .storageModeShared),
+              let linK = device.makeBuffer(length: linearRows * Int(cacheStride) * 4, options: .storageModeShared),
+              let linV = device.makeBuffer(length: linearRows * Int(cacheStride) * 4, options: .storageModeShared),
+              let kvBuf = device.makeBuffer(bytes: kvData, length: kvData.count * 4, options: .storageModeShared),
+              let nodeBuf = device.makeBuffer(bytes: nodeData, length: nodeData.count * 4, options: .storageModeShared),
+              let qBuf = device.makeBuffer(bytes: qData, length: qData.count * 4, options: .storageModeShared),
+              let ringDecodeOut = device.makeBuffer(length: numQHeads * headDim * 4, options: .storageModeShared),
+              let linDecodeOut = device.makeBuffer(length: numQHeads * headDim * 4, options: .storageModeShared),
+              let ringTreeOut = device.makeBuffer(length: numNodes * numQHeads * headDim * 4, options: .storageModeShared),
+              let linTreeOut = device.makeBuffer(length: numNodes * numQHeads * headDim * 4, options: .storageModeShared) else {
+            XCTFail("buffer alloc failed"); return
+        }
+
+        func storeBatch(kCache: MTLBuffer, vCache: MTLBuffer, source: MTLBuffer, kSrcOffset: Int, vSrcOffset: Int, tokenPos: UInt32, rows: Int, ring: UInt32) {
+            let cmd = cmdQueue.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var pos = tokenPos; var nKv = UInt32(numKvHeads); var hD = UInt32(headDim)
+            var stride = UInt32(cacheStride); var rl = ring
+            enc.setComputePipelineState(storePipe)
+            enc.setBuffer(source, offset: kSrcOffset, index: 0)
+            enc.setBuffer(source, offset: vSrcOffset, index: 1)
+            enc.setBuffer(kCache, offset: 0, index: 2)
+            enc.setBuffer(vCache, offset: 0, index: 3)
+            enc.setBytes(&pos, length: 4, index: 4)
+            enc.setBytes(&nKv, length: 4, index: 5)
+            enc.setBytes(&hD, length: 4, index: 6)
+            enc.setBytes(&stride, length: 4, index: 7)
+            enc.setBytes(&rl, length: 4, index: 8)
+            enc.dispatchThreads(MTLSize(width: Int(cacheStride), height: rows, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(cacheStride), storePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            enc.endEncoding(); cmd.commit(); cmd.waitUntilCompleted()
+            if let err = cmd.error { XCTFail("store batch failed: \(err)") }
+        }
+
+        // Fill both caches with positions 0..<8 one position per command buffer
+        // (decode-order stores: a single batch larger than the ring would race
+        // with itself on the wrapped rows; the app's chunks are always < ringLen).
+        for pos in 0..<storedPositions {
+            let kOff = pos * cacheStride * 4
+            let vOff = (storedPositions + pos) * cacheStride * 4
+            storeBatch(kCache: ringK, vCache: ringV, source: kvBuf, kSrcOffset: kOff, vSrcOffset: vOff, tokenPos: UInt32(pos), rows: 1, ring: ringLen)
+            storeBatch(kCache: linK, vCache: linV, source: kvBuf, kSrcOffset: kOff, vSrcOffset: vOff, tokenPos: UInt32(pos), rows: 1, ring: 0)
+        }
+        // Ring store placement: row 4 holds position 4; row 0 holds position 6
+        // (positions 6, 7 wrapped onto rows 0, 1, overwriting the dead rows).
+        let ringKPtr = ringK.contents().bindMemory(to: Float.self, capacity: Int(ringLen) * cacheStride)
+        var placeErr: Float = 0
+        for e in 0..<cacheStride {
+            placeErr = max(placeErr, abs(ringKPtr[4 * cacheStride + e] - kvData[4 * cacheStride + e]))
+            placeErr = max(placeErr, abs(ringKPtr[0 * cacheStride + e] - kvData[6 * cacheStride + e]))
+        }
+        print("Gemma 4 ring store placement maxErr=\(placeErr)")
+        XCTAssertLessThan(placeErr, 1e-6, "ring rows must hold their wrapped positions (row 4 <- pos 4, row 0 <- pos 6)")
+
+        // Decode at position 7 (seqLen 8, window 4): attends [4, 8) -> ring rows
+        // 4, 5, 0, 1 — a wrapped read window.
+        func runDecode(kCache: MTLBuffer, vCache: MTLBuffer, out: MTLBuffer, ring: UInt32, seqLen: UInt32, qOff: Int) {
+            let cmd = cmdQueue.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var seqLenV = seqLen; var nQ: UInt32 = UInt32(numQHeads); var nK: UInt32 = UInt32(numKvHeads)
+            var hD: UInt32 = UInt32(headDim); var win = window; var sc = scaling
+            var cs: UInt32 = UInt32(cacheStride); var rl = ring
+            enc.setComputePipelineState(decodePipe)
+            enc.setBuffer(qBuf, offset: qOff, index: 0)
+            enc.setBuffer(kCache, offset: 0, index: 1)
+            enc.setBuffer(vCache, offset: 0, index: 2)
+            enc.setBuffer(out, offset: 0, index: 3)
+            enc.setBytes(&seqLenV, length: 4, index: 4)
+            enc.setBytes(&nQ, length: 4, index: 5)
+            enc.setBytes(&nK, length: 4, index: 6)
+            enc.setBytes(&hD, length: 4, index: 7)
+            enc.setBytes(&win, length: 4, index: 8)
+            enc.setBytes(&sc, length: 4, index: 9)
+            enc.setBytes(&cs, length: 4, index: 10)
+            enc.setBytes(&rl, length: 4, index: 11)
+            enc.dispatchThreadgroups(MTLSize(width: numQHeads, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.endEncoding(); cmd.commit(); cmd.waitUntilCompleted()
+            if let err = cmd.error { XCTFail("decode failed: \(err)") }
+        }
+        runDecode(kCache: ringK, vCache: ringV, out: ringDecodeOut, ring: ringLen, seqLen: 8, qOff: 0)
+        runDecode(kCache: linK, vCache: linV, out: linDecodeOut, ring: 0, seqLen: 8, qOff: 0)
+        let rd = ringDecodeOut.contents().bindMemory(to: Float.self, capacity: numQHeads * headDim)
+        let ld = linDecodeOut.contents().bindMemory(to: Float.self, capacity: numQHeads * headDim)
+        var decodeErr: Float = 0
+        for i in 0..<(numQHeads * headDim) { decodeErr = max(decodeErr, abs(rd[i] - ld[i])) }
+        print("Gemma 4 ring vs linear decode maxErr=\(decodeErr)")
+        XCTAssertLessThan(decodeErr, 1e-5, "ring decode through a wrapped window must match the linear cache")
+
+        // Tree node scratch: nodes 0..2 at tokenPos 5 -> ring rows 5, 0, 1 (0 and
+        // 1 reuse dead prefix rows by design); linear rows 5, 6, 7. All three node
+        // slots are distinct, so the single batch cannot race with itself.
+        storeBatch(kCache: ringK, vCache: ringV, source: nodeBuf, kSrcOffset: 0, vSrcOffset: numNodes * cacheStride * 4, tokenPos: prefixLen, rows: numNodes, ring: ringLen)
+        storeBatch(kCache: linK, vCache: linV, source: nodeBuf, kSrcOffset: 0, vSrcOffset: numNodes * cacheStride * 4, tokenPos: prefixLen, rows: numNodes, ring: 0)
+
+        // Tree verification: mask node 0 -> self, node 1 -> {0, self}, node 2 -> {0, self}.
+        var mask = [Float](repeating: -1e9, count: numNodes * numNodes)
+        let allowed = [(0, 0), (1, 0), (1, 1), (2, 0), (2, 2)]
+        for (i, k) in allowed { mask[i * numNodes + k] = 0 }
+        let depths: [UInt32] = [0, 1, 1]
+        guard let maskBuf = device.makeBuffer(bytes: mask, length: mask.count * 4, options: .storageModeShared),
+              let depthsBuf = device.makeBuffer(bytes: depths, length: depths.count * 4, options: .storageModeShared) else {
+            XCTFail("mask buffer alloc failed"); return
+        }
+
+        func runTree(kCache: MTLBuffer, vCache: MTLBuffer, out: MTLBuffer, ring: UInt32) {
+            let cmd = cmdQueue.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var pLen = prefixLen; var nNodes: UInt32 = UInt32(numNodes); var nQ: UInt32 = UInt32(numQHeads)
+            var nK: UInt32 = UInt32(numKvHeads); var hD: UInt32 = UInt32(headDim); var win = window
+            var sc = scaling; var cs: UInt32 = UInt32(cacheStride); var rl = ring
+            enc.setComputePipelineState(treePipe)
+            enc.setBuffer(qBuf, offset: Int(numQHeads * headDim) * 4, index: 0)
+            enc.setBuffer(kCache, offset: 0, index: 1)
+            enc.setBuffer(vCache, offset: 0, index: 2)
+            enc.setBuffer(maskBuf, offset: 0, index: 3)
+            enc.setBuffer(depthsBuf, offset: 0, index: 4)
+            enc.setBuffer(out, offset: 0, index: 5)
+            enc.setBytes(&pLen, length: 4, index: 6)
+            enc.setBytes(&nNodes, length: 4, index: 7)
+            enc.setBytes(&nQ, length: 4, index: 8)
+            enc.setBytes(&nK, length: 4, index: 9)
+            enc.setBytes(&hD, length: 4, index: 10)
+            enc.setBytes(&win, length: 4, index: 11)
+            enc.setBytes(&sc, length: 4, index: 12)
+            enc.setBytes(&cs, length: 4, index: 13)
+            enc.setBytes(&rl, length: 4, index: 14)
+            enc.dispatchThreadgroups(MTLSize(width: numQHeads, height: numNodes, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.endEncoding(); cmd.commit(); cmd.waitUntilCompleted()
+            if let err = cmd.error { XCTFail("tree verify failed: \(err)") }
+        }
+        runTree(kCache: ringK, vCache: ringV, out: ringTreeOut, ring: ringLen)
+        runTree(kCache: linK, vCache: linV, out: linTreeOut, ring: 0)
+        let rt = ringTreeOut.contents().bindMemory(to: Float.self, capacity: numNodes * numQHeads * headDim)
+        let lt = linTreeOut.contents().bindMemory(to: Float.self, capacity: numNodes * numQHeads * headDim)
+        var treeErr: Float = 0
+        for i in 0..<(numNodes * numQHeads * headDim) { treeErr = max(treeErr, abs(rt[i] - lt[i])) }
+        print("Gemma 4 ring vs linear tree verify maxErr=\(treeErr)")
+        XCTAssertLessThan(treeErr, 1e-5, "ring tree verify (prefix wrap + node slots on dead rows) must match the linear cache")
+
+        // Batched prefill pattern: one store dispatch for a chunk of B < ringLen
+        // positions that wraps the ring (rows 0, 1, 2 re-used for positions 6, 7,
+        // 8), then per-row attention whose window crosses the wrap boundary.
+        // The chunk re-stores positions 6, 7 with fresh data and adds position 8;
+        // both caches also still carry the tree's node scratch at rows 5, 0, 1 /
+        // 5, 6, 7, which the equivalence comparison reads identically.
+        var chunkData = [Float](repeating: 0, count: 3 * cacheStride * 2)
+        for i in 0..<chunkData.count { chunkData[i] = nextRand() }
+        guard let chunkBuf = device.makeBuffer(bytes: chunkData, length: chunkData.count * 4, options: .storageModeShared) else {
+            XCTFail("chunk buffer alloc failed"); return
+        }
+        storeBatch(kCache: ringK, vCache: ringV, source: chunkBuf, kSrcOffset: 0, vSrcOffset: 3 * cacheStride * 4, tokenPos: 6, rows: 3, ring: ringLen)
+        storeBatch(kCache: linK, vCache: linV, source: chunkBuf, kSrcOffset: 0, vSrcOffset: 3 * cacheStride * 4, tokenPos: 6, rows: 3, ring: 0)
+        // Ring rows 0, 1, 2 now hold chunk positions 6, 7, 8; rows 3, 4 keep the
+        // original fill and row 5 keeps the tree's node-0 scratch.
+        for e in 0..<cacheStride {
+            placeErr = max(placeErr, abs(ringKPtr[2 * cacheStride + e] - chunkData[2 * cacheStride + e]))
+            placeErr = max(placeErr, abs(ringKPtr[4 * cacheStride + e] - kvData[4 * cacheStride + e]))
+        }
+        print("Gemma 4 ring chunked store placement maxErr=\(placeErr)")
+        XCTAssertLessThan(placeErr, 1e-6, "the chunked store must wrap onto rows 0-2 while keeping rows 3-5")
+        for r in 0..<3 {
+            let qOff = (1 + r) * numQHeads * headDim * 4
+            let seqLen = UInt32(6 + r + 1)
+            runDecode(kCache: ringK, vCache: ringV, out: ringDecodeOut, ring: ringLen, seqLen: seqLen, qOff: qOff)
+            runDecode(kCache: linK, vCache: linV, out: linDecodeOut, ring: 0, seqLen: seqLen, qOff: qOff)
+            var prefillErr: Float = 0
+            for i in 0..<(numQHeads * headDim) { prefillErr = max(prefillErr, abs(rd[i] - ld[i])) }
+            print("Gemma 4 ring vs linear chunked prefill row \(r) (seqLen \(seqLen)) maxErr=\(prefillErr)")
+            XCTAssertLessThan(prefillErr, 1e-5, "chunked prefill row \(r) must attend identical rows through the wrap")
+        }
+    }
+
+    /// The prefill transient pool reuses buffers across chunked-prefill calls
+    /// (same size => same instance; a larger request grows; drain releases all)
+    /// so the chunked prefill never re-allocates the multi-GB expert staging on
+    /// every chunk while the weight residency grows toward the memory budget.
+    func testPrefillTransientPoolReuseAndDrain() throws {
+        print("=== TEST PREFILL TRANSIENT POOL REUSE + DRAIN ===")
+        guard let device = MTLCreateSystemDefaultDevice() else { XCTFail("No Metal GPU device"); return }
+        let pool = PrefillTransientPool.shared
+        pool.drain()
+        let a = pool.buffer(device: device, name: "test.buf", byteCount: 1 << 20)
+        XCTAssertNotNil(a)
+        let b = pool.buffer(device: device, name: "test.buf", byteCount: 1 << 20)
+        XCTAssertTrue(a === b, "same-name same-size requests must reuse the pooled buffer")
+        let c = pool.buffer(device: device, name: "test.buf", byteCount: 1 << 19)
+        XCTAssertTrue(a === c, "smaller requests reuse the larger pooled buffer")
+        let d = pool.buffer(device: device, name: "test.buf", byteCount: 4 << 20)
+        XCTAssertNotNil(d)
+        XCTAssertFalse(a === d, "a larger request must reallocate")
+        XCTAssertEqual(pool.heldBytes, 4 << 20)
+        let e = pool.buffer(device: device, name: "test.other", byteCount: 1 << 20)
+        XCTAssertNotNil(e)
+        XCTAssertEqual(pool.heldBytes, 5 << 20, "each name holds exactly one buffer")
+        pool.drain()
+        XCTAssertEqual(pool.heldBytes, 0, "drain releases every pooled buffer")
+        let f = pool.buffer(device: device, name: "test.buf", byteCount: 1 << 20)
+        XCTAssertNotNil(f)
+        XCTAssertFalse(a === f, "a request after drain allocates anew")
+        pool.drain()
     }
 
     func testOrnithSystemPromptDetection() throws {
@@ -11616,11 +11990,13 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         XCTAssertEqual(preservedVPtr[0], Float16(84.0), "V-cache Token 0 should be preserved")
         XCTAssertEqual(preservedVPtr[prefixToPreserve * stride - 1], Float16(84.0), "V-cache token at end of prefix should be preserved")
 
-        // Verify tail beyond prefix was zeroed
+        // Verify the tail beyond the prefix is deliberately NOT cleared: since the
+        // lazy-commit fix every KV position is written before it is ever read, so a
+        // retained (non-reallocating) preserve keeps the stale tail bytes untouched.
         let tailOffset = (prefixToPreserve + 2) * stride
         if tailOffset < seqLen * stride {
-            XCTAssertEqual(preservedKPtr[tailOffset], Float16(0.0), "Tail beyond preserved prefix should be zeroed")
-            XCTAssertEqual(preservedVPtr[tailOffset], Float16(0.0), "V-cache tail should be zeroed")
+            XCTAssertEqual(preservedKPtr[tailOffset], Float16(42.0), "Tail beyond preserved prefix is not zeroed (lazy commit)")
+            XCTAssertEqual(preservedVPtr[tailOffset], Float16(84.0), "V-cache tail is not zeroed (lazy commit)")
         }
     }
 
