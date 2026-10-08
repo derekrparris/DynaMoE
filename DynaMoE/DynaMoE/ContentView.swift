@@ -168,7 +168,10 @@ final class KVCacheManager {
         let kvHeads = max(numKvHeads, config?.effectiveNumKeyValueHeads ?? 8)
         let hDim = max(headDim, config?.effectiveHeadDim ?? 128)
         let totalSlots = isLing ? (6 * loops) : (actualLayers * loops)
-        let actualSlotCapacity = isLing ? totalSlots : max(totalSlots, 44)
+        // One KV slot per full-attention layer (indexed by fullAttnIndex, which is
+        // < actualLayers). No fixed floor: padding a 30-layer hybrid model (Gemma 4)
+        // to 44 slots wasted ~32% of the KV cache for nothing.
+        let actualSlotCapacity = totalSlots
         let kvStride = kvHeads * hDim
         let isMla = (isLing || config?.kvLoraRank != nil)
         let effectiveKvStride = isMla ? 4096 : max(kvStride, 1024)
@@ -226,17 +229,12 @@ final class KVCacheManager {
                     }
                 }
 
-                let tailKByteOffset = newKLayerByteOffset + prefixKBytes
-                let tailKBytes = max(0, (maxSeqLen - preservePrefixCount) * kStride * elementBytes)
-                if let kBuf = kCacheBuffer, tailKByteOffset + tailKBytes <= kBuf.length {
-                    memset(kBuf.contents().advanced(by: tailKByteOffset), 0, tailKBytes)
-                }
-
-                let tailVByteOffset = newVLayerByteOffset + prefixVBytes
-                let tailVBytes = max(0, (maxSeqLen - preservePrefixCount) * vStride * elementBytes)
-                if let vBuf = vCacheBuffer, tailVByteOffset + tailVBytes <= vBuf.length {
-                    memset(vBuf.contents().advanced(by: tailVByteOffset), 0, tailVBytes)
-                }
+                // The tail [preservePrefixCount, maxSeqLen) is NOT cleared. Every KV
+                // position is written before it is ever read (prefill writes the delta
+                // above the pinned prefix, decode writes each step before attending),
+                // so stale bytes are never observed. Zeroing the tail here touched every
+                // page of the whole cache — on a 30-layer hybrid model that committed
+                // multi-GB of anonymous memory the VM would otherwise keep lazy.
             }
         } else {
             // Freshly allocated shared MTLBuffers are zero-filled by the VM on demand;
@@ -5464,6 +5462,8 @@ struct ContentView: View {
         let storeKvGemmaPipeline: MTLComputePipelineState?
         let storeKvGemmaF16Pipeline: MTLComputePipelineState?
         let storeKvGemmaFP8Pipeline: MTLComputePipelineState?
+        let gqaGemmaTreeVerifyPipeline: MTLComputePipelineState?
+        let gqaGemmaTreeVerifyF16Pipeline: MTLComputePipelineState?
         let mulByBf16VectorPipeline: MTLComputePipelineState?
         let scaleVectorInplacePipeline: MTLComputePipelineState?
         let perExpertScalePipeline: MTLComputePipelineState?
@@ -5954,6 +5954,14 @@ struct ContentView: View {
             if let f = defaultLibrary.makeFunction(name: "store_kv_cache_gemma_fp8") {
                 storeKvGemmaFP8Pipeline = try device.makeComputePipelineState(function: f)
             } else { storeKvGemmaFP8Pipeline = nil }
+
+            if let f = defaultLibrary.makeFunction(name: "gqa_attention_tree_verify_gemma") {
+                gqaGemmaTreeVerifyPipeline = try device.makeComputePipelineState(function: f)
+            } else { gqaGemmaTreeVerifyPipeline = nil }
+
+            if let f = defaultLibrary.makeFunction(name: "gqa_attention_tree_verify_gemma_f16") {
+                gqaGemmaTreeVerifyF16Pipeline = try device.makeComputePipelineState(function: f)
+            } else { gqaGemmaTreeVerifyF16Pipeline = nil }
 
             if let f = defaultLibrary.makeFunction(name: "mul_by_bf16_vector") {
                 mulByBf16VectorPipeline = try device.makeComputePipelineState(function: f)
@@ -9816,6 +9824,9 @@ if layer.attnGateProjTensor != nil,
                 let gemmaQDimAll = numHeads * max(headDim, globalHeadDim)
                 let maxQkvDim = max(gdnQkvDim, gqaQDim, hiddenDim, 2560, isGemma4Prefill ? gemmaQDimAll : 0)
                 let maxZDim = max(linValHeads * 128, attnCtxDim, 128, isGemma4Prefill ? gemmaQDimAll : 0)
+                // Max unique experts a single layer can activate for this prompt; the
+                // double-buffered staging holds exactly one layer's set per buffer.
+                let prefillStagingSlotCap = min(max(P * topKCount, 64), numExperts > 0 ? Int(numExperts) : 512)
 
                 guard let hBufA = device.makeBuffer(length: totalHBytes, options: .storageModeShared),
                       let hBufB = device.makeBuffer(length: totalHBytes, options: .storageModeShared),
@@ -9843,9 +9854,36 @@ if layer.attnGateProjTensor != nil,
                       let denseActiveWeightsBuffer = device.makeBuffer(length: max(P, 1) * MemoryLayout<Float>.stride, options: .storageModeShared),
                       let expertActiveTokensBuffer = device.makeBuffer(length: max(P * topKCount, 64) * MemoryLayout<UInt32>.stride, options: .storageModeShared),
                       let expertActiveWeightsBuffer = device.makeBuffer(length: max(P * topKCount, 64) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                      let prefillStagingBufferA = device.makeBuffer(length: max(2 * min(max(P * topKCount, 64), numExperts > 0 ? Int(numExperts) : 512) * Int(loadedLayout?.expert_size ?? 3151872), 64), options: .storageModeShared),
-                      let prefillStagingBufferB = device.makeBuffer(length: max(2 * min(max(P * topKCount, 64), numExperts > 0 ? Int(numExperts) : 512) * Int(loadedLayout?.expert_size ?? 3151872), 64), options: .storageModeShared) else {
+                      let prefillStagingBufferA = device.makeBuffer(length: max(prefillStagingSlotCap * Int(loadedLayout?.expert_size ?? 3151872), 64), options: .storageModeShared),
+                      let prefillStagingBufferB = device.makeBuffer(length: max(prefillStagingSlotCap * Int(loadedLayout?.expert_size ?? 3151872), 64), options: .storageModeShared) else {
                     return false
+                }
+                // Packs a layer's active experts into one staging buffer: reused predicted
+                // slots first, then the lowest free slots. Bounded by the buffer capacity,
+                // so a mispredicted prefetch can never write past the end (the predicted
+                // set and this layer's set can be disjoint, which previously needed a 2x
+                // buffer; packing instead keeps a single-layer buffer sufficient).
+                func packPrefillExpertSlots(predicted: [Int: Int]?, activeIds: [Int]) -> (map: [Int: Int], misses: [Int]) {
+                    var map: [Int: Int] = [:]
+                    var used = [Bool](repeating: false, count: prefillStagingSlotCap)
+                    if let predicted {
+                        for expId in activeIds {
+                            if let slot = predicted[expId], slot >= 0, slot < prefillStagingSlotCap, !used[slot] {
+                                map[expId] = slot
+                                used[slot] = true
+                            }
+                        }
+                    }
+                    var misses: [Int] = []
+                    var cursor = 0
+                    for expId in activeIds where map[expId] == nil {
+                        while cursor < prefillStagingSlotCap && used[cursor] { cursor += 1 }
+                        if cursor >= prefillStagingSlotCap { break }
+                        map[expId] = cursor
+                        used[cursor] = true
+                        misses.append(expId)
+                    }
+                    return (map, misses)
                 }
                 // FIX #6a: flash-decoding partials for multi-row prefill attention.
                 let prefillAttnChunkRows = 64
@@ -10453,33 +10491,31 @@ if layer.attnGateProjTensor != nil,
                                     // layer's predicted experts during the previous layer's MoE
                                     // GPU window; synchronously pread only the misses.
                                     let tIoStart = CFAbsoluteTimeGetCurrent()
-                                    var slotMap: [Int: Int] = [:]
-                                    var nextSlot = 0
                                     var predHits = 0
                                     for (idx, stale) in prefetchedFor where idx < l {
                                         stale.sem.wait()
                                         prefetchedFor[idx] = nil
                                     }
                                     let staging: MTLBuffer
+                                    var predictedSlots: [Int: Int]? = nil
                                     if prefillPipelineEnabled, let pf = prefetchedFor[l] {
                                         pf.sem.wait()
                                         prefetchedFor[l] = nil
-                                        for expId in uniqueActiveExpIds {
-                                            if let slot = pf.slotMap[expId] { slotMap[expId] = slot; predHits += 1 }
-                                        }
-                                        nextSlot = pf.slotBase
+                                        predictedSlots = pf.slotMap
                                         staging = pf.buf
                                         lastMoeStageIsA = (pf.buf === prefillStagingBufferA)
                                     } else {
                                         staging = lastMoeStageIsA ? prefillStagingBufferB : prefillStagingBufferA
                                         lastMoeStageIsA = !lastMoeStageIsA
                                     }
+                                    let packed = packPrefillExpertSlots(predicted: predictedSlots, activeIds: uniqueActiveExpIds)
+                                    let slotMap = packed.map
+                                    predHits = uniqueActiveExpIds.count - packed.misses.count
                                     let stagingPtr = staging.contents()
                                     var tasks: [ExpertPreadTask] = []
-                                    for expId in uniqueActiveExpIds where slotMap[expId] == nil {
-                                        slotMap[expId] = nextSlot
-                                        tasks.append(ExpertPreadTask(fd: fd, dst: stagingPtr.advanced(by: nextSlot * expertSize), offset: off_t(expId * expertSize), size: expertSize))
-                                        nextSlot += 1
+                                    for expId in packed.misses {
+                                        let slot = slotMap[expId]!
+                                        tasks.append(ExpertPreadTask(fd: fd, dst: stagingPtr.advanced(by: slot * expertSize), offset: off_t(expId * expertSize), size: expertSize))
                                     }
                                     if !tasks.isEmpty {
                                         ExpertIOThreadPool.shared.dispatchSync(tasks: &tasks)
@@ -11743,8 +11779,6 @@ if layer.attnGateProjTensor != nil,
                                     // layer's predicted experts during the previous layer's
                                     // GPU window, then synchronously read only the misses.
                                     let tIoStart = CFAbsoluteTimeGetCurrent()
-                                    var expSlotMap: [Int: Int] = [:]
-                                    var nextSlot = 0
                                     var predHits = 0
                                     // FIX #5: drain any stale kicks aimed at earlier layers
                                     // (e.g. skipped dense layers) so their staging buffers
@@ -11753,16 +11787,11 @@ if layer.attnGateProjTensor != nil,
                                         stale.sem.wait()
                                         prefetchedFor[idx] = nil
                                     }
+                                    var predictedSlots: [Int: Int]? = nil
                                     if prefillPipelineEnabled, let pf = prefetchedFor[l] {
                                         pf.sem.wait()
                                         prefetchedFor[l] = nil
-                                        for expId in uniqueActiveExpIds {
-                                            if let slot = pf.slotMap[expId] {
-                                                expSlotMap[expId] = slot
-                                                predHits += 1
-                                            }
-                                        }
-                                        nextSlot = pf.slotBase
+                                        predictedSlots = pf.slotMap
                                         prefillStagingBuffer = pf.buf
                                         lastMoeStageIsA = (pf.buf === prefillStagingBufferA)
                                     } else {
@@ -11771,14 +11800,16 @@ if layer.attnGateProjTensor != nil,
                                         prefillStagingBuffer = lastMoeStageIsA ? prefillStagingBufferB : prefillStagingBufferA
                                         lastMoeStageIsA = !lastMoeStageIsA
                                     }
+                                    let packed = packPrefillExpertSlots(predicted: predictedSlots, activeIds: uniqueActiveExpIds)
+                                    let expSlotMap = packed.map
+                                    predHits = uniqueActiveExpIds.count - packed.misses.count
                                     var tasks: [ExpertPreadTask] = []
                                     let rawStagingPtr = prefillStagingBuffer.contents()
-                                    for expId in uniqueActiveExpIds where expSlotMap[expId] == nil {
-                                        expSlotMap[expId] = nextSlot
+                                    for expId in packed.misses {
+                                        let slot = expSlotMap[expId]!
                                         let offset = off_t(expId * expertSize)
-                                        let dst = rawStagingPtr.advanced(by: nextSlot * expertSize)
+                                        let dst = rawStagingPtr.advanced(by: slot * expertSize)
                                         tasks.append(ExpertPreadTask(fd: fd, dst: dst, offset: offset, size: expertSize))
-                                        nextSlot += 1
                                     }
                                     if !tasks.isEmpty {
                                         ExpertIOThreadPool.shared.dispatchSync(tasks: &tasks)
@@ -12444,15 +12475,16 @@ if layer.attnGateProjTensor != nil,
             }
 
             // Allocate JetSpec Staging Buffers for Tree Drafting & Verification
-            // Speculative tree forward pass is enabled for resident in-memory standard attention models.
-            // Disk-streamed MoE models (packedExpertsDir != nil) and Linear Recurrence / Gated DeltaNet
-            // hybrid models (maintaining continuous causal convolution and O(1) recurrent states)
-            // execute via the direct single-token path for maximum throughput and state integrity.
+            // Speculative tree forward pass is enabled for resident in-memory standard attention
+            // models and for Gemma 4 (hybrid sliding/global attention MoE, verified by the
+            // dedicated Gemma tree kernels). Linear Recurrence / Gated DeltaNet hybrid models
+            // (maintaining continuous causal convolution and O(1) recurrent states) execute via
+            // the direct single-token path for maximum throughput and state integrity.
             let hasLinearRecurrence = cachedLayers.contains { $0.attentionType == .linearAttention }
             let effectiveJetSpec = isJetSpecEligible(
                 jetSpecEnabled: jetSpecEnabled,
                 hasLinearRecurrence: hasLinearRecurrence,
-                isSparkModel: modelConfig?.isSparkModel == true || modelConfig?.isGemma4Model == true,
+                isSparkModel: modelConfig?.isSparkModel == true,
                 kvPrecision: KVCacheManager.shared.activePrecision
             )
             let effectiveInterDim = modelConfig?.intermediateSize ?? Int(cachedLayers.first?.intermediateDim ?? 14336)
@@ -12598,6 +12630,596 @@ if layer.attnGateProjTensor != nil,
                     for l in 0..<actualLayers {
                         if Task.isCancelled { return false }
                         let layer = cachedLayers[l]
+                        // ================= Gemma 4 hybrid-attention MoE decoder layer =================
+                        // Verifies all N tree nodes in one pass. Gemma differs from the generic tree
+                        // path in every op: per-layer head dims (sliding 256 / global 512), per-head
+                        // q/k norms, value norm, proportional RoPE, a sliding window, a dual
+                        // dense+MoE FFN (GeGLU), and the per-layer output scalar.
+                        if isGemma4 {
+                            let gSliding = layer.isSlidingAttention
+                            let gHeadDim: UInt32 = gSliding ? headDim : max(headDim, globalHeadDim)
+                            let gNumKv: UInt32 = gSliding ? numKvHeads : max(1, numGlobalKvHeads)
+                            let gQDim: UInt32 = numHeads * gHeadDim
+                            let gKvDim: UInt32 = gNumKv * gHeadDim
+                            let gRmsScale: Float = 1.0 / Float(Double(hiddenDim).squareRoot())
+                            let gTopK = Int(modelConfig?.effectiveNumExpertsPerTok ?? 8)
+
+                            guard let gCmd = commandQueue.makeCommandBuffer(),
+                                  let gEnc = gCmd.makeComputeCommandEncoder() else { return false }
+
+                            // 1. pre-attention RMSNorm -> xNorm1
+                            if let norm1 = layer.norm1Tensor, let norm1Raw = buffers[norm1.shardIndex] {
+                                var nOff = norm1.offsetStart
+                                var hD = hiddenDim
+                                var epsVal = eps
+                                gEnc.setComputePipelineState(rmsnormPipeline)
+                                gEnc.setBuffer(jb.treeHiddenBuffer, offset: 0, index: 0)
+                                gEnc.setBuffer(norm1Raw, offset: 0, index: 1)
+                                gEnc.setBuffer(jb.treeXNorm1Buffer, offset: 0, index: 2)
+                                gEnc.setBytes(&nOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                                gEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 4)
+                                gEnc.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 5)
+                                gEnc.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
+                                gEnc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
+                                gEnc.memoryBarrier(scope: .buffers)
+                            }
+
+                            // 2. Q/K/V projections (batched over N nodes). Global layers reuse the key
+                            // projection as the value (attention_k_eq_v).
+                            dispatchLinear(enc: gEnc, weight: layer.qProjTensor, scale: layer.qScaleTensor, bias: layer.qBiasTensor, inBuf: jb.treeXNorm1Buffer, outBuf: jb.treeQGateBuffer, inDim: hiddenDim, outDim: gQDim, batchSize: N)
+                            dispatchLinear(enc: gEnc, weight: layer.kProjTensor, scale: layer.kScaleTensor, bias: layer.kBiasTensor, inBuf: jb.treeXNorm1Buffer, outBuf: jb.treeKVectorBuffer, inDim: hiddenDim, outDim: gKvDim, batchSize: N)
+                            if gSliding {
+                                dispatchLinear(enc: gEnc, weight: layer.vProjTensor, scale: layer.vScaleTensor, bias: layer.vBiasTensor, inBuf: jb.treeXNorm1Buffer, outBuf: jb.treeVVectorBuffer, inDim: hiddenDim, outDim: gKvDim, batchSize: N)
+                            }
+                            gEnc.memoryBarrier(scope: .buffers)
+
+                            // 3. Value norm (sliding: v_proj output; global: raw key output), no scale.
+                            if let vNormPipe = rmsnormNoScalePipeline {
+                                var vDim = gHeadDim
+                                var vEps = eps
+                                gEnc.setComputePipelineState(vNormPipe)
+                                let vInBuf = gSliding ? jb.treeVVectorBuffer : jb.treeKVectorBuffer
+                                for r in 0..<N {
+                                    let base = r * Int(gKvDim) * MemoryLayout<Float>.stride
+                                    gEnc.setBuffer(vInBuf, offset: base, index: 0)
+                                    gEnc.setBuffer(jb.treeVVectorBuffer, offset: base, index: 1)
+                                    gEnc.setBytes(&vDim, length: MemoryLayout<UInt32>.stride, index: 2)
+                                    gEnc.setBytes(&vEps, length: MemoryLayout<Float>.stride, index: 3)
+                                    gEnc.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
+                                    gEnc.dispatchThreadgroups(MTLSize(width: Int(gNumKv), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(gHeadDim)), height: 1, depth: 1))
+                                }
+                                gEnc.memoryBarrier(scope: .buffers)
+                            }
+
+                            // 4. Per-head Q/K RMSNorm (with scale), batched over N nodes.
+                            if let qNorm = layer.qNormTensor, let qNormRaw = buffers[qNorm.shardIndex], let headNormPipe = headRmsnormPipeline {
+                                var qNormOff = qNorm.offsetStart
+                                var nQ = numHeads
+                                var hD = gHeadDim
+                                var hStride = gHeadDim
+                                var epsVal = eps
+                                gEnc.setComputePipelineState(headNormPipe)
+                                gEnc.setBuffer(jb.treeQGateBuffer, offset: 0, index: 0)
+                                gEnc.setBuffer(qNormRaw, offset: 0, index: 1)
+                                gEnc.setBytes(&qNormOff, length: MemoryLayout<UInt64>.stride, index: 2)
+                                gEnc.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 3)
+                                gEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 4)
+                                gEnc.setBytes(&hStride, length: MemoryLayout<UInt32>.stride, index: 5)
+                                gEnc.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 6)
+                                gEnc.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                gEnc.memoryBarrier(scope: .buffers)
+                            }
+                            if let kNorm = layer.kNormTensor, let kNormRaw = buffers[kNorm.shardIndex], let headNormPipe = headRmsnormPipeline {
+                                var kNormOff = kNorm.offsetStart
+                                var nK = gNumKv
+                                var hD = gHeadDim
+                                var hStride = gHeadDim
+                                var epsVal = eps
+                                gEnc.setComputePipelineState(headNormPipe)
+                                gEnc.setBuffer(jb.treeKVectorBuffer, offset: 0, index: 0)
+                                gEnc.setBuffer(kNormRaw, offset: 0, index: 1)
+                                gEnc.setBytes(&kNormOff, length: MemoryLayout<UInt64>.stride, index: 2)
+                                gEnc.setBytes(&nK, length: MemoryLayout<UInt32>.stride, index: 3)
+                                gEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 4)
+                                gEnc.setBytes(&hStride, length: MemoryLayout<UInt32>.stride, index: 5)
+                                gEnc.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 6)
+                                gEnc.dispatchThreadgroups(MTLSize(width: Int(gNumKv), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                gEnc.memoryBarrier(scope: .buffers)
+                            }
+
+                            // 5. Tree RoPE: position = step + depth[node]. Sliding layers use standard
+                            // RoPE over the full head dim; global layers use proportional RoPE.
+                            let gRopePipe = gSliding ? InferenceEngine.shared.applyRopeTreePipeline : InferenceEngine.shared.applyRopeTreeProportionalPipeline
+                            if let ropePipe = gRopePipe {
+                                var tPos = step
+                                var nQ = numHeads
+                                var nK = gNumKv
+                                var hD = gHeadDim
+                                var rD = UInt32(modelConfig?.effectiveRotaryDim(layerIndex: l, headDim: Int(gHeadDim)) ?? Int(rotaryDim))
+                                var qStr = gHeadDim
+                                var kStr = gHeadDim
+                                var theta = modelConfig?.effectiveRopeTheta(layerIndex: l) ?? thetaVal
+                                gEnc.setComputePipelineState(ropePipe)
+                                gEnc.setBuffer(jb.treeQGateBuffer, offset: 0, index: 0)
+                                gEnc.setBuffer(jb.depthsBuffer, offset: 0, index: 1)
+                                gEnc.setBytes(&tPos, length: MemoryLayout<UInt32>.stride, index: 2)
+                                gEnc.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 3)
+                                gEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 4)
+                                gEnc.setBytes(&rD, length: MemoryLayout<UInt32>.stride, index: 5)
+                                gEnc.setBytes(&qStr, length: MemoryLayout<UInt32>.stride, index: 6)
+                                gEnc.setBytes(&theta, length: MemoryLayout<Float>.stride, index: 7)
+                                gEnc.dispatchThreads(MTLSize(width: Int(numHeads), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), ropePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                gEnc.setBuffer(jb.treeKVectorBuffer, offset: 0, index: 0)
+                                gEnc.setBytes(&nK, length: MemoryLayout<UInt32>.stride, index: 3)
+                                gEnc.setBytes(&kStr, length: MemoryLayout<UInt32>.stride, index: 6)
+                                gEnc.dispatchThreads(MTLSize(width: Int(gNumKv), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(gNumKv), ropePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                gEnc.memoryBarrier(scope: .buffers)
+                            }
+
+                            // 6. KV store + tree-causal attention. Tree node k occupies KV slot
+                            // (step + k); only its RoPE position uses step + depth[k].
+                            if let kCache = KVCacheManager.shared.kCacheBuffer,
+                               let vCache = KVCacheManager.shared.vCacheBuffer {
+                                let slotIndex = (loopIdx * actualLayers) + layer.fullAttnIndex
+                                let maxSeq = KVCacheManager.shared.allocatedSeqLen
+                                let prec = KVCacheManager.shared.activePrecision
+                                let layerByteOffset = slotIndex * maxSeq * Int(gemmaKvStride) * prec.bytesPerElement
+                                var basePos = step
+                                var nKv = gNumKv
+                                var hD = gHeadDim
+                                var cacheStride = gemmaKvStride
+
+                                if prec == .fp16, let storePipe = storeKvGemmaF16Pipeline {
+                                    gEnc.setComputePipelineState(storePipe)
+                                    gEnc.setBuffer(jb.treeKVectorBuffer, offset: 0, index: 0)
+                                    gEnc.setBuffer(jb.treeVVectorBuffer, offset: 0, index: 1)
+                                    gEnc.setBuffer(kCache, offset: layerByteOffset, index: 2)
+                                    gEnc.setBuffer(vCache, offset: layerByteOffset, index: 3)
+                                    gEnc.setBytes(&basePos, length: MemoryLayout<UInt32>.stride, index: 4)
+                                    gEnc.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 5)
+                                    gEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 6)
+                                    gEnc.setBytes(&cacheStride, length: MemoryLayout<UInt32>.stride, index: 7)
+                                    gEnc.dispatchThreads(MTLSize(width: Int(gKvDim), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(gKvDim), storePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    gEnc.memoryBarrier(scope: .buffers)
+                                } else if let storePipe = storeKvGemmaPipeline {
+                                    gEnc.setComputePipelineState(storePipe)
+                                    gEnc.setBuffer(jb.treeKVectorBuffer, offset: 0, index: 0)
+                                    gEnc.setBuffer(jb.treeVVectorBuffer, offset: 0, index: 1)
+                                    gEnc.setBuffer(kCache, offset: layerByteOffset, index: 2)
+                                    gEnc.setBuffer(vCache, offset: layerByteOffset, index: 3)
+                                    gEnc.setBytes(&basePos, length: MemoryLayout<UInt32>.stride, index: 4)
+                                    gEnc.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 5)
+                                    gEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 6)
+                                    gEnc.setBytes(&cacheStride, length: MemoryLayout<UInt32>.stride, index: 7)
+                                    gEnc.dispatchThreads(MTLSize(width: Int(gKvDim), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(gKvDim), storePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    gEnc.memoryBarrier(scope: .buffers)
+                                }
+
+                                var pLen = step
+                                var numNodesVal = UInt32(N)
+                                var nQ = numHeads
+                                var windowSize: UInt32 = gSliding ? UInt32(modelConfig?.effectiveSlidingWindow ?? 0) : 0
+                                var scaling = gemmaScaling
+                                let attnPipe: MTLComputePipelineState? = (prec == .fp16) ? gqaGemmaTreeVerifyF16Pipeline : gqaGemmaTreeVerifyPipeline
+                                if let attnPipe {
+                                    gEnc.setComputePipelineState(attnPipe)
+                                    gEnc.setBuffer(jb.treeQGateBuffer, offset: 0, index: 0)
+                                    gEnc.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                    gEnc.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                    gEnc.setBuffer(jb.treeMaskBuffer, offset: 0, index: 3)
+                                    gEnc.setBuffer(jb.depthsBuffer, offset: 0, index: 4)
+                                    gEnc.setBuffer(jb.treeAttnCtxBuffer, offset: 0, index: 5)
+                                    gEnc.setBytes(&pLen, length: MemoryLayout<UInt32>.stride, index: 6)
+                                    gEnc.setBytes(&numNodesVal, length: MemoryLayout<UInt32>.stride, index: 7)
+                                    gEnc.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 8)
+                                    gEnc.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 9)
+                                    gEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 10)
+                                    gEnc.setBytes(&windowSize, length: MemoryLayout<UInt32>.stride, index: 11)
+                                    gEnc.setBytes(&scaling, length: MemoryLayout<Float>.stride, index: 12)
+                                    gEnc.setBytes(&cacheStride, length: MemoryLayout<UInt32>.stride, index: 13)
+                                    gEnc.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                    gEnc.memoryBarrier(scope: .buffers)
+                                }
+                            }
+
+                            // 7. o_proj
+                            dispatchLinear(enc: gEnc, weight: layer.oProjTensor, scale: layer.oScaleTensor, bias: layer.oBiasTensor, inBuf: jb.treeAttnCtxBuffer, outBuf: jb.treeAttnOutBuffer, inDim: gQDim, outDim: hiddenDim, batchSize: N)
+                            gEnc.memoryBarrier(scope: .buffers)
+
+                            // 8. hMid = hidden + post_attention_layernorm(attn)
+                            if let norm2 = layer.norm2Tensor, let norm2Raw = buffers[norm2.shardIndex] {
+                                var nOff = norm2.offsetStart
+                                var hD = hiddenDim
+                                var epsVal = eps
+                                gEnc.setComputePipelineState(rmsnormPipeline)
+                                gEnc.setBuffer(jb.treeAttnOutBuffer, offset: 0, index: 0)
+                                gEnc.setBuffer(norm2Raw, offset: 0, index: 1)
+                                gEnc.setBuffer(jb.treeXNorm2Buffer, offset: 0, index: 2)
+                                gEnc.setBytes(&nOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                                gEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 4)
+                                gEnc.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 5)
+                                gEnc.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
+                                gEnc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
+                                gEnc.memoryBarrier(scope: .buffers)
+                            }
+                            gEnc.setComputePipelineState(addPipeline)
+                            gEnc.setBuffer(jb.treeHiddenBuffer, offset: 0, index: 0)
+                            gEnc.setBuffer(jb.treeXNorm2Buffer, offset: 0, index: 1)
+                            gEnc.setBuffer(jb.treeHMidBuffer, offset: 0, index: 2)
+                            var hDimAdd = hiddenDim
+                            gEnc.setBytes(&hDimAdd, length: MemoryLayout<UInt32>.stride, index: 3)
+                            gEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), addPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                            gEnc.memoryBarrier(scope: .buffers)
+
+                            // 9. pre_feedforward_layernorm(hMid) -> xNorm2
+                            if let preFfn = layer.preFfnNormTensor, let preFfnRaw = buffers[preFfn.shardIndex] {
+                                var nOff = preFfn.offsetStart
+                                var hD = hiddenDim
+                                var epsVal = eps
+                                gEnc.setComputePipelineState(rmsnormPipeline)
+                                gEnc.setBuffer(jb.treeHMidBuffer, offset: 0, index: 0)
+                                gEnc.setBuffer(preFfnRaw, offset: 0, index: 1)
+                                gEnc.setBuffer(jb.treeXNorm2Buffer, offset: 0, index: 2)
+                                gEnc.setBytes(&nOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                                gEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 4)
+                                gEnc.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 5)
+                                gEnc.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
+                                gEnc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
+                                gEnc.memoryBarrier(scope: .buffers)
+                            }
+
+                            // 10. Dense shared MLP (GeGLU) -> hMlp; postFfnNorm1 in place
+                            gEnc.setComputePipelineState(clearPipeline)
+                            gEnc.setBuffer(jb.treeHMlpBuffer, offset: 0, index: 0)
+                            gEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                            gEnc.memoryBarrier(scope: .buffers)
+                            if let dG = layer.denseGateWeight, let dU = layer.denseUpWeight, let dD = layer.denseDownWeight,
+                               let dGRaw = buffers[dG.shardIndex], let dURaw = buffers[dU.shardIndex], let dDRaw = buffers[dD.shardIndex],
+                               let geluPipe = bf16GeluGateUpSimdPipeline, let downPipe = bf16DownSimdPipeline {
+                                var gOff = dG.offsetStart
+                                var uOff = dU.offsetStart
+                                var dOff = dD.offsetStart
+                                var hDimVal = hiddenDim
+                                var interDimVal = layer.intermediateDim
+                                var oneVal: Float = 1.0
+                                for r in 0..<N {
+                                    let inOff = r * Int(hiddenDim) * MemoryLayout<Float>.stride
+                                    let interOff = r * Int(layer.intermediateDim) * MemoryLayout<Float>.stride
+                                    let accumOff = r * Int(hiddenDim) * MemoryLayout<Float>.stride
+                                    gEnc.setComputePipelineState(geluPipe)
+                                    gEnc.setBuffer(dGRaw, offset: 0, index: 0)
+                                    gEnc.setBuffer(dURaw, offset: 0, index: 1)
+                                    gEnc.setBuffer(jb.treeXNorm2Buffer, offset: inOff, index: 2)
+                                    gEnc.setBuffer(jb.treeInterBuffer, offset: interOff, index: 3)
+                                    gEnc.setBytes(&gOff, length: MemoryLayout<UInt64>.stride, index: 4)
+                                    gEnc.setBytes(&uOff, length: MemoryLayout<UInt64>.stride, index: 5)
+                                    gEnc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 6)
+                                    gEnc.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 7)
+                                    gEnc.dispatchThreadgroups(MTLSize(width: Int(layer.intermediateDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                    gEnc.memoryBarrier(scope: .buffers)
+                                    gEnc.setComputePipelineState(downPipe)
+                                    gEnc.setBuffer(dDRaw, offset: 0, index: 0)
+                                    gEnc.setBuffer(jb.treeInterBuffer, offset: interOff, index: 1)
+                                    gEnc.setBuffer(jb.treeHMlpBuffer, offset: accumOff, index: 2)
+                                    gEnc.setBytes(&dOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                                    gEnc.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 4)
+                                    gEnc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 5)
+                                    gEnc.setBytes(&oneVal, length: MemoryLayout<Float>.stride, index: 6)
+                                    gEnc.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                    gEnc.memoryBarrier(scope: .buffers)
+                                }
+                            }
+                            if let pf1 = layer.postFfnNorm1Tensor, let pf1Raw = buffers[pf1.shardIndex] {
+                                var nOff = pf1.offsetStart
+                                var hD = hiddenDim
+                                var epsVal = eps
+                                gEnc.setComputePipelineState(rmsnormPipeline)
+                                gEnc.setBuffer(jb.treeHMlpBuffer, offset: 0, index: 0)
+                                gEnc.setBuffer(pf1Raw, offset: 0, index: 1)
+                                gEnc.setBuffer(jb.treeHMlpBuffer, offset: 0, index: 2)
+                                gEnc.setBytes(&nOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                                gEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 4)
+                                gEnc.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 5)
+                                gEnc.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
+                                gEnc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
+                                gEnc.memoryBarrier(scope: .buffers)
+                            }
+
+                            // 11. Router: rmsnorm_no_scale(hMid) * router.scale * hidden^-0.5 -> top-k
+                            if let vNormPipe = rmsnormNoScalePipeline {
+                                var dimV = hiddenDim
+                                var eV = eps
+                                gEnc.setComputePipelineState(vNormPipe)
+                                gEnc.setBuffer(jb.treeHMidBuffer, offset: 0, index: 0)
+                                gEnc.setBuffer(jb.treeAttnOutBuffer, offset: 0, index: 1)
+                                gEnc.setBytes(&dimV, length: MemoryLayout<UInt32>.stride, index: 2)
+                                gEnc.setBytes(&eV, length: MemoryLayout<Float>.stride, index: 3)
+                                gEnc.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
+                                gEnc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
+                                gEnc.memoryBarrier(scope: .buffers)
+                            }
+                            if let rsv = layer.routerScaleVec, let rsvRaw = buffers[rsv.shardIndex], let mulPipe = mulByBf16VectorPipeline {
+                                var rsvOff = rsv.offsetStart
+                                var dimV = hiddenDim
+                                var sc = gRmsScale
+                                gEnc.setComputePipelineState(mulPipe)
+                                for r in 0..<N {
+                                    let off = r * Int(hiddenDim) * MemoryLayout<Float>.stride
+                                    gEnc.setBuffer(jb.treeAttnOutBuffer, offset: off, index: 0)
+                                    gEnc.setBuffer(rsvRaw, offset: 0, index: 1)
+                                    gEnc.setBuffer(jb.treeZGateBuffer, offset: off, index: 2)
+                                    gEnc.setBytes(&rsvOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                                    gEnc.setBytes(&dimV, length: MemoryLayout<UInt32>.stride, index: 4)
+                                    gEnc.setBytes(&sc, length: MemoryLayout<Float>.stride, index: 5)
+                                    gEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), mulPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                }
+                                gEnc.memoryBarrier(scope: .buffers)
+                            }
+                            if let routerTensor = layer.routerTensor, let routerRaw = buffers[routerTensor.shardIndex] {
+                                var rOffset = routerTensor.offsetStart
+                                var nExp = numExperts
+                                var kVal: UInt32 = UInt32(gTopK)
+                                var hDimR = hiddenDim
+                                gEnc.setComputePipelineState(routerPipeline)
+                                for r in 0..<N {
+                                    let tOff = r * Int(hiddenDim) * MemoryLayout<Float>.stride
+                                    let rIndexOffset = r * gTopK * MemoryLayout<UInt32>.stride
+                                    let rWeightOffset = r * gTopK * MemoryLayout<Float>.stride
+                                    gEnc.setBuffer(routerRaw, offset: 0, index: 0)
+                                    gEnc.setBuffer(jb.treeZGateBuffer, offset: tOff, index: 1)
+                                    gEnc.setBuffer(jb.treeRouterIndicesBuffer, offset: rIndexOffset, index: 2)
+                                    gEnc.setBuffer(jb.treeRouterWeightsBuffer, offset: rWeightOffset, index: 3)
+                                    gEnc.setBytes(&rOffset, length: MemoryLayout<UInt64>.stride, index: 4)
+                                    gEnc.setBytes(&hDimR, length: MemoryLayout<UInt32>.stride, index: 5)
+                                    gEnc.setBytes(&nExp, length: MemoryLayout<UInt32>.stride, index: 6)
+                                    gEnc.setBytes(&kVal, length: MemoryLayout<UInt32>.stride, index: 7)
+                                    gEnc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: Int(numExperts), height: 1, depth: 1))
+                                }
+                                gEnc.memoryBarrier(scope: .buffers)
+                                if let pes = layer.routerPerExpertScale, let pesRaw = buffers[pes.shardIndex], let pesPipe = perExpertScalePipeline {
+                                    var pesOff = pes.offsetStart
+                                    var kTop = kVal
+                                    gEnc.setComputePipelineState(pesPipe)
+                                    for r in 0..<N {
+                                        let rIndexOffset = r * gTopK * MemoryLayout<UInt32>.stride
+                                        let rWeightOffset = r * gTopK * MemoryLayout<Float>.stride
+                                        gEnc.setBuffer(jb.treeRouterWeightsBuffer, offset: rWeightOffset, index: 0)
+                                        gEnc.setBuffer(jb.treeRouterIndicesBuffer, offset: rIndexOffset, index: 1)
+                                        gEnc.setBuffer(pesRaw, offset: 0, index: 2)
+                                        gEnc.setBytes(&pesOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                                        gEnc.setBytes(&kTop, length: MemoryLayout<UInt32>.stride, index: 4)
+                                        gEnc.dispatchThreads(MTLSize(width: Int(kVal), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(kVal), pesPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    }
+                                    gEnc.memoryBarrier(scope: .buffers)
+                                }
+                            }
+
+                            gEnc.endEncoding()
+                            gCmd.commit()
+                            gCmd.waitUntilCompleted()
+                            if let gErr = gCmd.error {
+                                print("❌ [METAL ERROR] gemma4 tree Phase A layer \(l): \(gErr)")
+                                return false
+                            }
+
+                            // ---- Phase B: expert-major MoE over all tree nodes ----
+                            let indAllPtr = jb.treeRouterIndicesBuffer.contents().bindMemory(to: UInt32.self, capacity: N * gTopK)
+                            let wAllPtr = jb.treeRouterWeightsBuffer.contents().bindMemory(to: Float.self, capacity: N * gTopK)
+                            var candidateExpertsPerNode: [[(id: Int, weight: Float)]] = []
+                            var flatCandidateExperts: [UInt32] = []
+                            var uniqueActiveExperts = Set<UInt32>()
+                            for n in 0..<N {
+                                var nodeExp: [(id: Int, weight: Float)] = []
+                                for i in 0..<gTopK {
+                                    let expId = indAllPtr[n * gTopK + i]
+                                    let pk = wAllPtr[n * gTopK + i]
+                                    flatCandidateExperts.append(expId)
+                                    if pk > 0.00001 {
+                                        nodeExp.append((id: Int(expId), weight: pk))
+                                        uniqueActiveExperts.insert(expId)
+                                    }
+                                }
+                                candidateExpertsPerNode.append(nodeExp)
+                            }
+
+                            // Prune the tree to fit the expert budget (and the staging buffer).
+                            let expertStagingCap = max(1, expertStagingSize / max(1, Int(loadedLayout?.expert_size ?? 1)))
+                            let moeExpertCap = max(1, min(jetSpecMaxExpertCap, expertStagingCap))
+                            var activeNodeIndices = Array(0..<N)
+                            if uniqueActiveExperts.count > moeExpertCap && N > 1 {
+                                let prunedMask = pruneJetspecTreeMoe(
+                                    treeTokens: treeMask.tokenIds,
+                                    parentIndices: treeMask.parentIndices,
+                                    draftScores: nodeScores,
+                                    candidateExpertsFlat: flatCandidateExperts,
+                                    expertsPerNode: UInt32(gTopK),
+                                    maxUniqueExperts: UInt32(moeExpertCap)
+                                )
+                                var keptIndices: [Int] = []
+                                var searchStart = 0
+                                for tok in prunedMask.tokenIds {
+                                    for origIdx in searchStart..<N {
+                                        if treeMask.tokenIds[origIdx] == tok {
+                                            keptIndices.append(origIdx)
+                                            searchStart = origIdx + 1
+                                            break
+                                        }
+                                    }
+                                }
+                                if !keptIndices.isEmpty { activeNodeIndices = keptIndices }
+                            }
+
+                            var expertTokenMap: [Int: [(nodeIdx: UInt32, weight: Float)]] = [:]
+                            for n in activeNodeIndices {
+                                for item in candidateExpertsPerNode[n] {
+                                    expertTokenMap[item.id, default: []].append((nodeIdx: UInt32(n), weight: item.weight))
+                                }
+                            }
+                            let uniqueActiveExpIds = Array(expertTokenMap.keys).sorted()
+
+                            guard let gemmaMoeCmd = commandQueue.makeCommandBuffer(),
+                                  let gemmaMoeEnc = gemmaMoeCmd.makeComputeCommandEncoder() else { return false }
+
+                            // pre_feedforward_layernorm_2(hMid) -> xNorm2
+                            if let pf2 = layer.preFfnNorm2Tensor, let pf2Raw = buffers[pf2.shardIndex] {
+                                var nOff = pf2.offsetStart
+                                var hD = hiddenDim
+                                var epsVal = eps
+                                gemmaMoeEnc.setComputePipelineState(rmsnormPipeline)
+                                gemmaMoeEnc.setBuffer(jb.treeHMidBuffer, offset: 0, index: 0)
+                                gemmaMoeEnc.setBuffer(pf2Raw, offset: 0, index: 1)
+                                gemmaMoeEnc.setBuffer(jb.treeXNorm2Buffer, offset: 0, index: 2)
+                                gemmaMoeEnc.setBytes(&nOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                                gemmaMoeEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 4)
+                                gemmaMoeEnc.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 5)
+                                gemmaMoeEnc.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
+                                gemmaMoeEnc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
+                                gemmaMoeEnc.memoryBarrier(scope: .buffers)
+                            }
+                            // clear MoE accumulator (treeAttnOutBuffer, free after router)
+                            gemmaMoeEnc.setComputePipelineState(clearPipeline)
+                            gemmaMoeEnc.setBuffer(jb.treeAttnOutBuffer, offset: 0, index: 0)
+                            gemmaMoeEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                            gemmaMoeEnc.memoryBarrier(scope: .buffers)
+
+                            if let packedDir = packedExpertsDir,
+                               let fd = ExpertIOThreadPool.shared.getOrOpenLayerFD(layerIndex: l, packedExpertsDir: packedDir) {
+                                let expertSize = Int(loadedLayout?.expert_size ?? 0)
+                                if !uniqueActiveExpIds.isEmpty && expertSize > 0 && uniqueActiveExpIds.count <= expertStagingCap {
+                                    let rawStagingPtr = expertStagingBuffer.contents()
+                                    var tasks: [ExpertPreadTask] = []
+                                    for (slot, expId) in uniqueActiveExpIds.enumerated() {
+                                        tasks.append(ExpertPreadTask(fd: fd, dst: rawStagingPtr.advanced(by: slot * expertSize), offset: off_t(expId * expertSize), size: expertSize))
+                                    }
+                                    ExpertIOThreadPool.shared.dispatchSync(tasks: &tasks)
+
+                                    let compUpW = loadedLayout?.components.first(where: { $0.name.contains("up_proj") && !$0.name.contains("scale") && !$0.name.contains("bias") })
+                                    let compDownW = loadedLayout?.components.first(where: { $0.name.contains("down_proj") && !$0.name.contains("scale") && !$0.name.contains("bias") })
+                                    let moeInterDim = Int(gemmaExpertInterDim)
+                                    let upByteOffset = UInt64(moeInterDim) * UInt64(hiddenDim) * 2
+
+                                    if let geluPipe = bf16GeluGateUpSimdPipeline, let downPipe = bf16DownSimdPipeline {
+                                        var hDimVal = hiddenDim
+                                        var interDimVal = UInt32(moeInterDim)
+                                        var slotLookup: [Int: Int] = [:]
+                                        for (slot, expId) in uniqueActiveExpIds.enumerated() { slotLookup[expId] = slot }
+                                        for expId in uniqueActiveExpIds {
+                                            guard let assignments = expertTokenMap[expId], let slot = slotLookup[expId], !assignments.isEmpty else { continue }
+                                            let slotOffset = UInt64(slot * expertSize)
+                                            var gOff = slotOffset + (compUpW?.offset ?? 0)
+                                            var uOff = gOff + upByteOffset
+                                            var dOff = slotOffset + (compDownW?.offset ?? 0)
+                                            for item in assignments {
+                                                let n = Int(item.nodeIdx)
+                                                let inOff = n * Int(hiddenDim) * MemoryLayout<Float>.stride
+                                                let interOff = n * moeInterDim * MemoryLayout<Float>.stride
+                                                let accumOff = n * Int(hiddenDim) * MemoryLayout<Float>.stride
+                                                var pkVal = item.weight
+                                                gemmaMoeEnc.setComputePipelineState(geluPipe)
+                                                gemmaMoeEnc.setBuffer(expertStagingBuffer, offset: 0, index: 0)
+                                                gemmaMoeEnc.setBuffer(expertStagingBuffer, offset: 0, index: 1)
+                                                gemmaMoeEnc.setBuffer(jb.treeXNorm2Buffer, offset: inOff, index: 2)
+                                                gemmaMoeEnc.setBuffer(jb.treeInterBuffer, offset: interOff, index: 3)
+                                                gemmaMoeEnc.setBytes(&gOff, length: MemoryLayout<UInt64>.stride, index: 4)
+                                                gemmaMoeEnc.setBytes(&uOff, length: MemoryLayout<UInt64>.stride, index: 5)
+                                                gemmaMoeEnc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 6)
+                                                gemmaMoeEnc.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 7)
+                                                gemmaMoeEnc.dispatchThreadgroups(MTLSize(width: moeInterDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                                gemmaMoeEnc.memoryBarrier(scope: .buffers)
+                                                gemmaMoeEnc.setComputePipelineState(downPipe)
+                                                gemmaMoeEnc.setBuffer(expertStagingBuffer, offset: 0, index: 0)
+                                                gemmaMoeEnc.setBuffer(jb.treeInterBuffer, offset: interOff, index: 1)
+                                                gemmaMoeEnc.setBuffer(jb.treeAttnOutBuffer, offset: accumOff, index: 2)
+                                                gemmaMoeEnc.setBytes(&dOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                                                gemmaMoeEnc.setBytes(&interDimVal, length: MemoryLayout<UInt32>.stride, index: 4)
+                                                gemmaMoeEnc.setBytes(&hDimVal, length: MemoryLayout<UInt32>.stride, index: 5)
+                                                gemmaMoeEnc.setBytes(&pkVal, length: MemoryLayout<Float>.stride, index: 6)
+                                                gemmaMoeEnc.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                                gemmaMoeEnc.memoryBarrier(scope: .buffers)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // post_feedforward_layernorm_2(moe) -> treeZGateBuffer
+                            if let pf2 = layer.postFfnNorm2Tensor, let pf2Raw = buffers[pf2.shardIndex] {
+                                var nOff = pf2.offsetStart
+                                var hD = hiddenDim
+                                var epsVal = eps
+                                gemmaMoeEnc.setComputePipelineState(rmsnormPipeline)
+                                gemmaMoeEnc.setBuffer(jb.treeAttnOutBuffer, offset: 0, index: 0)
+                                gemmaMoeEnc.setBuffer(pf2Raw, offset: 0, index: 1)
+                                gemmaMoeEnc.setBuffer(jb.treeZGateBuffer, offset: 0, index: 2)
+                                gemmaMoeEnc.setBytes(&nOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                                gemmaMoeEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 4)
+                                gemmaMoeEnc.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 5)
+                                gemmaMoeEnc.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
+                                gemmaMoeEnc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
+                                gemmaMoeEnc.memoryBarrier(scope: .buffers)
+                            }
+                            // hMlp = postFfnNorm1(dense) + postFfnNorm2(moe)
+                            gemmaMoeEnc.setComputePipelineState(addPipeline)
+                            gemmaMoeEnc.setBuffer(jb.treeHMlpBuffer, offset: 0, index: 0)
+                            gemmaMoeEnc.setBuffer(jb.treeZGateBuffer, offset: 0, index: 1)
+                            gemmaMoeEnc.setBuffer(jb.treeHMlpBuffer, offset: 0, index: 2)
+                            var hDimA2 = hiddenDim
+                            gemmaMoeEnc.setBytes(&hDimA2, length: MemoryLayout<UInt32>.stride, index: 3)
+                            gemmaMoeEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), addPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                            gemmaMoeEnc.memoryBarrier(scope: .buffers)
+
+                            // post_feedforward_layernorm(combined) -> xNorm2
+                            if let pf = layer.postFfnNormTensor, let pfRaw = buffers[pf.shardIndex] {
+                                var nOff = pf.offsetStart
+                                var hD = hiddenDim
+                                var epsVal = eps
+                                gemmaMoeEnc.setComputePipelineState(rmsnormPipeline)
+                                gemmaMoeEnc.setBuffer(jb.treeHMlpBuffer, offset: 0, index: 0)
+                                gemmaMoeEnc.setBuffer(pfRaw, offset: 0, index: 1)
+                                gemmaMoeEnc.setBuffer(jb.treeXNorm2Buffer, offset: 0, index: 2)
+                                gemmaMoeEnc.setBytes(&nOff, length: MemoryLayout<UInt64>.stride, index: 3)
+                                gemmaMoeEnc.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 4)
+                                gemmaMoeEnc.setBytes(&epsVal, length: MemoryLayout<Float>.stride, index: 5)
+                                gemmaMoeEnc.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
+                                gemmaMoeEnc.dispatchThreadgroups(MTLSize(width: N, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
+                                gemmaMoeEnc.memoryBarrier(scope: .buffers)
+                            }
+                            // hidden = hMid + xNorm2
+                            gemmaMoeEnc.setComputePipelineState(addPipeline)
+                            gemmaMoeEnc.setBuffer(jb.treeHMidBuffer, offset: 0, index: 0)
+                            gemmaMoeEnc.setBuffer(jb.treeXNorm2Buffer, offset: 0, index: 1)
+                            gemmaMoeEnc.setBuffer(jb.treeHiddenBuffer, offset: 0, index: 2)
+                            var hDimF = hiddenDim
+                            gemmaMoeEnc.setBytes(&hDimF, length: MemoryLayout<UInt32>.stride, index: 3)
+                            gemmaMoeEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: N, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), addPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                            gemmaMoeEnc.memoryBarrier(scope: .buffers)
+
+                            // hidden *= layer_scalar
+                            if let ls = layer.layerScalarTensor, let lsRaw = buffers[ls.shardIndex], let scalePipe = scaleVectorInplacePipeline {
+                                var dimV = hiddenDim
+                                let lsBits = lsRaw.contents().load(fromByteOffset: Int(ls.offsetStart), as: UInt16.self)
+                                var scalarVal = Float(bitPattern: UInt32(lsBits) << 16)
+                                gemmaMoeEnc.setComputePipelineState(scalePipe)
+                                for r in 0..<N {
+                                    let off = r * Int(hiddenDim) * MemoryLayout<Float>.stride
+                                    gemmaMoeEnc.setBuffer(jb.treeHiddenBuffer, offset: off, index: 0)
+                                    gemmaMoeEnc.setBytes(&dimV, length: MemoryLayout<UInt32>.stride, index: 1)
+                                    gemmaMoeEnc.setBytes(&scalarVal, length: MemoryLayout<Float>.stride, index: 2)
+                                    gemmaMoeEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), scalePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                }
+                                gemmaMoeEnc.memoryBarrier(scope: .buffers)
+                            }
+
+                            gemmaMoeEnc.endEncoding()
+                            gemmaMoeCmd.commit()
+                            gemmaMoeCmd.waitUntilCompleted()
+                            if let gErr = gemmaMoeCmd.error {
+                                print("❌ [METAL ERROR] gemma4 tree Phase B layer \(l): \(gErr)")
+                                return false
+                            }
+                            continue
+                        }
+
                         guard let layerEnc = activeCmd.makeComputeCommandEncoder() else { return false }
 
                         // Step A: Pre-Attention RMSNorm 1

@@ -8076,3 +8076,233 @@ kernel void gqa_attention_decode_gemma_fp8(
         outVec[i] = acc[slot] * invL;
     }
 }
+
+// ============================================================================
+// Gemma 4 JetSpec tree verification kernels
+// ============================================================================
+// Gemma 4's hybrid sliding/global attention needs per-layer head dims (256 / 512),
+// a sliding window, explicit cache stride, and attention scaling 1.0. Tree node
+// positions are non-contiguous (basePos + depth), so these mirror the decode/store
+// Gemma kernels but read a depths buffer and a tree-causal mask.
+
+/// Gemma 4 tree-causal GQA verification (FP32 KV cache). One threadgroup (32 lanes)
+/// per (node, query head). Attends to the sliding-window prefix plus masked ancestors.
+kernel void gqa_attention_tree_verify_gemma(
+    device const float* qVector [[buffer(0)]],          // [numNodes, numQHeads, headDim]
+    device const float* kCacheBuffer [[buffer(1)]],     // [(prefixLen + maxDepth), cacheStride]
+    device const float* vCacheBuffer [[buffer(2)]],
+    device const float* treeMaskBuffer [[buffer(3)]],   // [numNodes, numNodes]
+    device const uint32_t* depthsBuffer [[buffer(4)]],  // [numNodes]
+    device float* attnOutBuffer [[buffer(5)]],          // [numNodes, numQHeads, headDim]
+    constant uint32_t& prefixLen [[buffer(6)]],
+    constant uint32_t& numNodes [[buffer(7)]],
+    constant uint32_t& numQHeads [[buffer(8)]],
+    constant uint32_t& numKvHeads [[buffer(9)]],
+    constant uint32_t& headDim [[buffer(10)]],
+    constant uint32_t& windowSize [[buffer(11)]],
+    constant float& scaling [[buffer(12)]],
+    constant uint32_t& cacheStride [[buffer(13)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint qHeadIdx = tgPos.x;
+    uint nodeIdx = tgPos.y;
+    if (qHeadIdx >= numQHeads || nodeIdx >= numNodes) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+    uint32_t qHeadBase = nodeIdx * numQHeads * headDim + qHeadIdx * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+
+    uint32_t nodePos = prefixLen + depthsBuffer[nodeIdx];
+    uint32_t curLen = nodePos + 1;
+    uint32_t winStart = (windowSize > 0 && curLen > windowSize) ? (curLen - windowSize) : 0;
+
+    uint32_t headDimVec = headDim / 4;
+    device const float4* qVec = (device const float4*)(qVector + qHeadBase);
+
+    float4 acc[32];
+    for (uint32_t i = 0; i < 32; i++) acc[i] = float4(0.0f);
+    float m = -1e20f;
+    float l = 0.0f;
+
+    for (uint32_t tau = winStart; tau < prefixLen; tau++) {
+        device const float4* kVec = (device const float4*)(kCacheBuffer + (uint64_t)tau * cacheStride + kvHeadBase);
+        float partial = 0.0f;
+        for (uint32_t i = laneId; i < headDimVec; i += 32) partial += dot(qVec[i], kVec[i]);
+        float score = simd_sum(partial) * scaling;
+        float m_prev = m;
+        m = max(m, score);
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+        l = l * alpha + beta;
+        device const float4* vVec = (device const float4*)(vCacheBuffer + (uint64_t)tau * cacheStride + kvHeadBase);
+        for (uint32_t i = laneId, slot = 0; i < headDimVec; i += 32, slot++) {
+            acc[slot] = acc[slot] * alpha + vVec[i] * beta;
+        }
+    }
+
+    for (uint32_t k = 0; k < numNodes; k++) {
+        float maskVal = treeMaskBuffer[nodeIdx * numNodes + k];
+        if (maskVal < -1e4f) continue;
+        uint32_t treePos = prefixLen + depthsBuffer[k];
+        if (treePos < winStart) continue;
+        uint32_t slotIdx = prefixLen + k;
+        device const float4* kVec = (device const float4*)(kCacheBuffer + (uint64_t)slotIdx * cacheStride + kvHeadBase);
+        float partial = 0.0f;
+        for (uint32_t i = laneId; i < headDimVec; i += 32) partial += dot(qVec[i], kVec[i]);
+        float score = (simd_sum(partial) * scaling) + maskVal;
+        float m_prev = m;
+        m = max(m, score);
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+        l = l * alpha + beta;
+        device const float4* vVec = (device const float4*)(vCacheBuffer + (uint64_t)slotIdx * cacheStride + kvHeadBase);
+        for (uint32_t i = laneId, slot = 0; i < headDimVec; i += 32, slot++) {
+            acc[slot] = acc[slot] * alpha + vVec[i] * beta;
+        }
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    device float4* outVec = (device float4*)(attnOutBuffer + qHeadBase);
+    for (uint32_t i = laneId, slot = 0; i < headDimVec; i += 32, slot++) {
+        outVec[i] = acc[slot] * invL;
+    }
+}
+
+/// Gemma 4 tree-causal GQA verification (FP16 KV cache).
+kernel void gqa_attention_tree_verify_gemma_f16(
+    device const float* qVector [[buffer(0)]],
+    device const half* kCacheBuffer [[buffer(1)]],
+    device const half* vCacheBuffer [[buffer(2)]],
+    device const float* treeMaskBuffer [[buffer(3)]],
+    device const uint32_t* depthsBuffer [[buffer(4)]],
+    device float* attnOutBuffer [[buffer(5)]],
+    constant uint32_t& prefixLen [[buffer(6)]],
+    constant uint32_t& numNodes [[buffer(7)]],
+    constant uint32_t& numQHeads [[buffer(8)]],
+    constant uint32_t& numKvHeads [[buffer(9)]],
+    constant uint32_t& headDim [[buffer(10)]],
+    constant uint32_t& windowSize [[buffer(11)]],
+    constant float& scaling [[buffer(12)]],
+    constant uint32_t& cacheStride [[buffer(13)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint qHeadIdx = tgPos.x;
+    uint nodeIdx = tgPos.y;
+    if (qHeadIdx >= numQHeads || nodeIdx >= numNodes) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+    uint32_t qHeadBase = nodeIdx * numQHeads * headDim + qHeadIdx * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+
+    uint32_t nodePos = prefixLen + depthsBuffer[nodeIdx];
+    uint32_t curLen = nodePos + 1;
+    uint32_t winStart = (windowSize > 0 && curLen > windowSize) ? (curLen - windowSize) : 0;
+
+    uint32_t headDimVec = headDim / 4;
+    device const float4* qVec = (device const float4*)(qVector + qHeadBase);
+
+    float4 acc[32];
+    for (uint32_t i = 0; i < 32; i++) acc[i] = float4(0.0f);
+    float m = -1e20f;
+    float l = 0.0f;
+
+    for (uint32_t tau = winStart; tau < prefixLen; tau++) {
+        device const half* kBase = kCacheBuffer + (uint64_t)tau * cacheStride + kvHeadBase;
+        float partial = 0.0f;
+        for (uint32_t i = laneId; i < headDimVec; i += 32) {
+            uint32_t e = i * 4;
+            float4 kk = float4(float(kBase[e + 0]), float(kBase[e + 1]), float(kBase[e + 2]), float(kBase[e + 3]));
+            partial += dot(qVec[i], kk);
+        }
+        float score = simd_sum(partial) * scaling;
+        float m_prev = m;
+        m = max(m, score);
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+        l = l * alpha + beta;
+        device const half* vBase = vCacheBuffer + (uint64_t)tau * cacheStride + kvHeadBase;
+        for (uint32_t i = laneId, slot = 0; i < headDimVec; i += 32, slot++) {
+            uint32_t e = i * 4;
+            float4 vv = float4(float(vBase[e + 0]), float(vBase[e + 1]), float(vBase[e + 2]), float(vBase[e + 3]));
+            acc[slot] = acc[slot] * alpha + vv * beta;
+        }
+    }
+
+    for (uint32_t k = 0; k < numNodes; k++) {
+        float maskVal = treeMaskBuffer[nodeIdx * numNodes + k];
+        if (maskVal < -1e4f) continue;
+        uint32_t treePos = prefixLen + depthsBuffer[k];
+        if (treePos < winStart) continue;
+        uint32_t slotIdx = prefixLen + k;
+        device const half* kBase = kCacheBuffer + (uint64_t)slotIdx * cacheStride + kvHeadBase;
+        float partial = 0.0f;
+        for (uint32_t i = laneId; i < headDimVec; i += 32) {
+            uint32_t e = i * 4;
+            float4 kk = float4(float(kBase[e + 0]), float(kBase[e + 1]), float(kBase[e + 2]), float(kBase[e + 3]));
+            partial += dot(qVec[i], kk);
+        }
+        float score = (simd_sum(partial) * scaling) + maskVal;
+        float m_prev = m;
+        m = max(m, score);
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+        l = l * alpha + beta;
+        device const half* vBase = vCacheBuffer + (uint64_t)slotIdx * cacheStride + kvHeadBase;
+        for (uint32_t i = laneId, slot = 0; i < headDimVec; i += 32, slot++) {
+            uint32_t e = i * 4;
+            float4 vv = float4(float(vBase[e + 0]), float(vBase[e + 1]), float(vBase[e + 2]), float(vBase[e + 3]));
+            acc[slot] = acc[slot] * alpha + vv * beta;
+        }
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    device float4* outVec = (device float4*)(attnOutBuffer + qHeadBase);
+    for (uint32_t i = laneId, slot = 0; i < headDimVec; i += 32, slot++) {
+        outVec[i] = acc[slot] * invL;
+    }
+}
+
+/// Tree-aware proportional RoPE (Gemma 4 global layers). Pairs element `i` with
+/// `i + headDim/2` and uses the full `headDim` as the frequency denominator, rotating
+/// only the first `rotaryDim/2` angle pairs; position = tokenPos + nodeDepth.
+kernel void apply_rope_tree_proportional(
+    device float* qkVector [[buffer(0)]],
+    device const uint32_t* nodeDepths [[buffer(1)]],
+    constant uint32_t& tokenPos [[buffer(2)]],
+    constant uint32_t& numHeads [[buffer(3)]],
+    constant uint32_t& headDim [[buffer(4)]],
+    constant uint32_t& rotaryDim [[buffer(5)]],
+    constant uint32_t& headStride [[buffer(6)]],
+    constant float& ropeTheta [[buffer(7)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint headIdx = pos.x;
+    uint nodeIdx = pos.y;
+    if (headIdx >= numHeads) return;
+
+    uint32_t effectivePos = tokenPos + nodeDepths[nodeIdx];
+    uint64_t headBase = (uint64_t)nodeIdx * ((uint64_t)numHeads * headStride) + ((uint64_t)headIdx * headStride);
+    uint32_t halfHead = headDim / 2;
+    uint32_t active = rotaryDim / 2;
+
+    for (uint32_t i = 0; i < active; i++) {
+        float exponent = (2.0f * (float)i) / (float)headDim;
+        float freq = 1.0f / pow(ropeTheta, exponent);
+        float angle = (float)effectivePos * freq;
+        float cosVal = cos(angle);
+        float sinVal = sin(angle);
+
+        uint64_t idx0 = headBase + i;
+        uint64_t idx1 = headBase + i + halfHead;
+
+        float v0 = qkVector[idx0];
+        float v1 = qkVector[idx1];
+
+        qkVector[idx0] = v0 * cosVal - v1 * sinVal;
+        qkVector[idx1] = v0 * sinVal + v1 * cosVal;
+    }
+}

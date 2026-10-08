@@ -7799,6 +7799,147 @@ final class DynaMoETests: XCTestCase {
         }
     }
 
+    /// Validates the Gemma 4 JetSpec tree kernels against the proven single-token
+    /// decode path. For a single tree node (N=1, depth 0) the tree attention must
+    /// reproduce `gqa_attention_decode_gemma` exactly, including the sliding window.
+    /// Also checks `store_kv_cache_gemma_tree` places node K/V at basePos + depth.
+    func testGemma4TreeVerifyKernelsMatchDecode() throws {
+        print("=== TEST GEMMA 4 TREE VERIFY KERNELS ===")
+        guard let device = MTLCreateSystemDefaultDevice() else { XCTFail("No Metal GPU device"); return }
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+        guard let lib = inference.defaultLibrary else { XCTFail("No Metal library"); return }
+        guard let cmdQueue = device.makeCommandQueue() else { XCTFail("No command queue"); return }
+
+        let numQHeads = 4
+        let numKvHeads = 2
+        let headDim = 64
+        let cacheStride = numKvHeads * headDim
+        let prefixLen = 5
+        let totalSeq = prefixLen + 1
+        let maxSeq = 16
+        let scaling: Float = 1.0
+
+        var seed: UInt32 = 12345
+        func nextRand() -> Float {
+            seed = seed &* 1664525 &+ 1013904223
+            return (Float(seed >> 8) / Float(1 << 24)) - 0.5
+        }
+
+        var kData = [Float](repeating: 0, count: maxSeq * cacheStride)
+        var vData = [Float](repeating: 0, count: maxSeq * cacheStride)
+        for i in 0..<(totalSeq * cacheStride) { kData[i] = nextRand(); vData[i] = nextRand() }
+        var qData = [Float](repeating: 0, count: numQHeads * headDim)
+        for i in 0..<qData.count { qData[i] = nextRand() }
+
+        guard let kCache = device.makeBuffer(bytes: kData, length: kData.count * 4, options: .storageModeShared),
+              let vCache = device.makeBuffer(bytes: vData, length: vData.count * 4, options: .storageModeShared),
+              let qBuf = device.makeBuffer(bytes: qData, length: qData.count * 4, options: .storageModeShared),
+              let decodeOut = device.makeBuffer(length: qData.count * 4, options: .storageModeShared),
+              let treeOut = device.makeBuffer(length: qData.count * 4, options: .storageModeShared),
+              let maskBuf = device.makeBuffer(length: 4, options: .storageModeShared),
+              let depthsBuf = device.makeBuffer(length: 4, options: .storageModeShared) else {
+            XCTFail("buffer alloc failed"); return
+        }
+        maskBuf.contents().bindMemory(to: Float.self, capacity: 1)[0] = 0.0
+        depthsBuf.contents().bindMemory(to: UInt32.self, capacity: 1)[0] = 0
+
+        let decodePipe = try device.makeComputePipelineState(function: try XCTUnwrap(lib.makeFunction(name: "gqa_attention_decode_gemma")))
+        let treePipe = try device.makeComputePipelineState(function: try XCTUnwrap(lib.makeFunction(name: "gqa_attention_tree_verify_gemma")))
+
+        func runDecode(window: UInt32) -> [Float] {
+            let cmd = cmdQueue.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var seqLen = UInt32(totalSeq); var nQ = UInt32(numQHeads); var nK = UInt32(numKvHeads)
+            var hD = UInt32(headDim); var win = window; var sc = scaling; var cs = UInt32(cacheStride)
+            enc.setComputePipelineState(decodePipe)
+            enc.setBuffer(qBuf, offset: 0, index: 0)
+            enc.setBuffer(kCache, offset: 0, index: 1)
+            enc.setBuffer(vCache, offset: 0, index: 2)
+            enc.setBuffer(decodeOut, offset: 0, index: 3)
+            enc.setBytes(&seqLen, length: 4, index: 4)
+            enc.setBytes(&nQ, length: 4, index: 5)
+            enc.setBytes(&nK, length: 4, index: 6)
+            enc.setBytes(&hD, length: 4, index: 7)
+            enc.setBytes(&win, length: 4, index: 8)
+            enc.setBytes(&sc, length: 4, index: 9)
+            enc.setBytes(&cs, length: 4, index: 10)
+            enc.dispatchThreadgroups(MTLSize(width: numQHeads, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.endEncoding(); cmd.commit(); cmd.waitUntilCompleted()
+            return Array(UnsafeBufferPointer(start: decodeOut.contents().bindMemory(to: Float.self, capacity: qData.count), count: qData.count))
+        }
+
+        func runTree(window: UInt32) -> [Float] {
+            let cmd = cmdQueue.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var pLen = UInt32(prefixLen); var nNodes = UInt32(1); var nQ = UInt32(numQHeads); var nK = UInt32(numKvHeads)
+            var hD = UInt32(headDim); var win = window; var sc = scaling; var cs = UInt32(cacheStride)
+            enc.setComputePipelineState(treePipe)
+            enc.setBuffer(qBuf, offset: 0, index: 0)
+            enc.setBuffer(kCache, offset: 0, index: 1)
+            enc.setBuffer(vCache, offset: 0, index: 2)
+            enc.setBuffer(maskBuf, offset: 0, index: 3)
+            enc.setBuffer(depthsBuf, offset: 0, index: 4)
+            enc.setBuffer(treeOut, offset: 0, index: 5)
+            enc.setBytes(&pLen, length: 4, index: 6)
+            enc.setBytes(&nNodes, length: 4, index: 7)
+            enc.setBytes(&nQ, length: 4, index: 8)
+            enc.setBytes(&nK, length: 4, index: 9)
+            enc.setBytes(&hD, length: 4, index: 10)
+            enc.setBytes(&win, length: 4, index: 11)
+            enc.setBytes(&sc, length: 4, index: 12)
+            enc.setBytes(&cs, length: 4, index: 13)
+            enc.dispatchThreadgroups(MTLSize(width: numQHeads, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.endEncoding(); cmd.commit(); cmd.waitUntilCompleted()
+            return Array(UnsafeBufferPointer(start: treeOut.contents().bindMemory(to: Float.self, capacity: qData.count), count: qData.count))
+        }
+
+        for window: UInt32 in [0, 3] {
+            let d = runDecode(window: window)
+            let t = runTree(window: window)
+            var maxErr: Float = 0
+            for i in 0..<d.count { maxErr = max(maxErr, abs(d[i] - t[i])) }
+            print("Gemma 4 tree vs decode (window=\(window)) maxErr=\(maxErr)")
+            XCTAssertLessThan(maxErr, 1e-4, "Tree attention must match single-token decode (window=\(window))")
+        }
+
+        // store_kv_cache_gemma writes node k at slot basePos + k (tree slots are
+        // contiguous by node index; only RoPE positions use depth).
+        let storePipe = try device.makeComputePipelineState(function: try XCTUnwrap(lib.makeFunction(name: "store_kv_cache_gemma")))
+        let kvDim = numKvHeads * headDim
+        var kNode = [Float](repeating: 0, count: 2 * kvDim)
+        var vNode = [Float](repeating: 0, count: 2 * kvDim)
+        for i in 0..<kvDim { kNode[i] = 1.0 + Float(i); vNode[i] = -1.0 - Float(i) }
+        for i in 0..<kvDim { kNode[kvDim + i] = 100.0 + Float(i); vNode[kvDim + i] = 200.0 + Float(i) }
+        let kCache2 = device.makeBuffer(length: maxSeq * cacheStride * 4, options: .storageModeShared)!
+        let vCache2 = device.makeBuffer(length: maxSeq * cacheStride * 4, options: .storageModeShared)!
+        let kNodeBuf = device.makeBuffer(bytes: kNode, length: kNode.count * 4, options: .storageModeShared)!
+        let vNodeBuf = device.makeBuffer(bytes: vNode, length: vNode.count * 4, options: .storageModeShared)!
+        let storeCmd = cmdQueue.makeCommandBuffer()!
+        let storeEnc = storeCmd.makeComputeCommandEncoder()!
+        var basePos = UInt32(prefixLen); var nKv = UInt32(numKvHeads); var hDs = UInt32(headDim); var cs2 = UInt32(cacheStride)
+        storeEnc.setComputePipelineState(storePipe)
+        storeEnc.setBuffer(kNodeBuf, offset: 0, index: 0)
+        storeEnc.setBuffer(vNodeBuf, offset: 0, index: 1)
+        storeEnc.setBuffer(kCache2, offset: 0, index: 2)
+        storeEnc.setBuffer(vCache2, offset: 0, index: 3)
+        storeEnc.setBytes(&basePos, length: 4, index: 4)
+        storeEnc.setBytes(&nKv, length: 4, index: 5)
+        storeEnc.setBytes(&hDs, length: 4, index: 6)
+        storeEnc.setBytes(&cs2, length: 4, index: 7)
+        storeEnc.dispatchThreads(MTLSize(width: kvDim, height: 2, depth: 1), threadsPerThreadgroup: MTLSize(width: min(kvDim, storePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+        storeEnc.endEncoding(); storeCmd.commit(); storeCmd.waitUntilCompleted()
+
+        let kPtr = kCache2.contents().bindMemory(to: Float.self, capacity: maxSeq * cacheStride)
+        var storeErr: Float = 0
+        for e in 0..<kvDim {
+            storeErr = max(storeErr, abs(kPtr[(prefixLen + 0) * cacheStride + e] - kNode[e]))
+            storeErr = max(storeErr, abs(kPtr[(prefixLen + 1) * cacheStride + e] - kNode[kvDim + e]))
+        }
+        print("Gemma 4 tree KV store maxErr=\(storeErr)")
+        XCTAssertLessThan(storeErr, 1e-6, "Tree KV store must place node K/V at basePos + nodeIndex")
+    }
+
     func testOrnithSystemPromptDetection() throws {
         print("=== TEST ORNITH SYSTEM PROMPT RESOLUTION ===")
         let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--mlx-community--Ornith-1.5-9B-OptiQ-4bit/snapshots/ad2e7748e8c9d36b82bb88307fd21c0d50be85b8"

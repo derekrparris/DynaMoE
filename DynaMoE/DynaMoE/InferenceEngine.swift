@@ -306,6 +306,7 @@ public final class InferenceEngine {
     public var gatherGdnTreeParentStatesPipeline: MTLComputePipelineState?
     public var commitGdnTreeWinningStatePipeline: MTLComputePipelineState?
     public var applyRopeTreePipeline: MTLComputePipelineState?
+    public var applyRopeTreeProportionalPipeline: MTLComputePipelineState?
     public var compactKvCacheSlotsF32Pipeline: MTLComputePipelineState?
     public var compactKvCacheSlotsF16Pipeline: MTLComputePipelineState?
 
@@ -622,6 +623,9 @@ public final class InferenceEngine {
         }
         if let ropeTreeFunc = defaultLib.makeFunction(name: "apply_rope_tree") {
             applyRopeTreePipeline = try device.makeComputePipelineState(function: ropeTreeFunc)
+        }
+        if let ropeTreePropFunc = defaultLib.makeFunction(name: "apply_rope_tree_proportional") {
+            applyRopeTreeProportionalPipeline = try device.makeComputePipelineState(function: ropeTreePropFunc)
         }
         if let compactF32Func = defaultLib.makeFunction(name: "compact_kv_cache_slots_f32") {
             compactKvCacheSlotsF32Pipeline = try device.makeComputePipelineState(function: compactF32Func)
