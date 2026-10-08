@@ -2884,7 +2884,8 @@ struct ContentView: View {
                 baseSystem: effectiveSystem,
                 modelName: sessionModelName,
                 currentDate: conversationDate,
-                isLingModel: modelConfig?.isLingModel == true
+                isLingModel: modelConfig?.isLingModel == true,
+                isGemma4Model: modelConfig?.isGemma4Model == true
             )
         }
 
@@ -14699,8 +14700,14 @@ if layer.attnGateProjTensor != nil,
                         }
                         let allResponses = toolResponses + relayResponses
 
+                        let isGemma4Continuation = (modelConfig?.isGemma4Model == true)
                         let toolResponseTurn: String
-                        if modelConfig?.isLingModel == true {
+                        if isGemma4Continuation {
+                            toolResponseTurn = AgentHarness.shared.formatGemmaToolResponseTurn(
+                                responses: allResponses,
+                                thinkingEnabled: thinkingEnabled
+                            )
+                        } else if modelConfig?.isLingModel == true {
                             toolResponseTurn = AgentHarness.shared.formatLingToolResponseTurn(
                                 responses: allResponses,
                                 thinkingEnabled: thinkingEnabled
@@ -14718,8 +14725,13 @@ if layer.attnGateProjTensor != nil,
                             )
                         }
                         let endTag = (modelConfig?.isGemma4Model == true) ? "<turn|>" : ((modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>") )
-                        let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
-                        let staleNextPrompt = formattedPrompt + assistantTurnText + "\n" + toolResponseTurn
+                        // Gemma keeps the tool call and its response in one model turn (no
+                        // <turn|> between them), so the assistant text is not closed here and
+                        // the response turn is appended with no separator.
+                        let assistantEndTag = isGemma4Continuation ? "" : endTag
+                        let continuationSeparator = isGemma4Continuation ? "" : "\n"
+                        let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: assistantEndTag)
+                        let staleNextPrompt = formattedPrompt + assistantTurnText + continuationSeparator + toolResponseTurn
                         // tools_load/tools_unload may have changed the registry THIS step;
                         // the spliced ids carry the prompt's OLD tools block, so when the
                         // section changes the continuation must re-encode (full re-prefill)
@@ -14730,8 +14742,8 @@ if layer.attnGateProjTensor != nil,
                             basePromptTokens: promptTokenIds,
                             generatedTokenIds: generatedTokenIds,
                             turnText: finalDecoded,
-                            endTag: endTag,
-                            suffix: "\n" + toolResponseTurn,
+                            endTag: assistantEndTag,
+                            suffix: continuationSeparator + toolResponseTurn,
                             encode: { try tokenizer.encode(text: $0) }
                         )
                         await MainActor.run {

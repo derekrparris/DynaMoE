@@ -5690,6 +5690,47 @@ final class DynaMoETests: XCTestCase {
         print("✅ [TEST] Gemma 4 layer tensor resolution dumped to /tmp/gemma4_dump.txt.")
     }
 
+    func testGemma4ToolCallParsing() throws {
+        let parser = StreamingToolParser.shared
+
+        // Basic call, plain-quoted string argument (as the model actually emitted).
+        let t1 = "<|tool_call>call:web_search{query: \"weather forecast Burlington NC October 8 2026\"}<tool_call|>"
+        let r1 = parser.parseStreamingToolCalls(from: t1)
+        XCTAssertEqual(r1.calls.count, 1)
+        XCTAssertEqual(r1.calls.first?.name, "web_search")
+        XCTAssertEqual(r1.calls.first?.arguments["query"] as? String, "weather forecast Burlington NC October 8 2026")
+
+        // Gemma's native <|"|> string delimiter, multiple args, numeric value.
+        let t2 = "<|tool_call>call:file_read{path:<|\"|>/tmp/x.txt<|\"|>,line:42}<tool_call|>"
+        let r2 = parser.parseStreamingToolCalls(from: t2)
+        XCTAssertEqual(r2.calls.first?.name, "file_read")
+        XCTAssertEqual(r2.calls.first?.arguments["path"] as? String, "/tmp/x.txt")
+        XCTAssertEqual(r2.calls.first?.arguments["line"] as? Int, 42)
+
+        // Truncated call (generation froze mid-stream, no closing tag).
+        let t3 = "<|tool_call>call:shell_run{command: \"ls -la\""
+        let r3 = parser.parseStreamingToolCalls(from: t3)
+        XCTAssertEqual(r3.calls.first?.name, "shell_run")
+        XCTAssertEqual(r3.calls.first?.arguments["command"] as? String, "ls -la")
+
+        // Freeze fires the moment the Gemma closer lands.
+        XCTAssertTrue(parser.shouldFreezeGeneration(accumulatedText: t1, deltaText: ""))
+    }
+
+    func testGemma4ToolResponseTurnFormat() throws {
+        let json = #"{"tool":"web_search","status":"success","result":{"content":"85F high"}}"#
+        let turn = AgentHarness.shared.formatGemmaToolResponseTurn(responses: [json], thinkingEnabled: true)
+        XCTAssertTrue(turn.hasPrefix(#"<|tool_response>response:web_search{value:<|"|>"#), turn)
+        XCTAssertTrue(turn.hasSuffix("<tool_response|><|channel>thought\n"), turn)
+        _ = turn.count
+        // Never emit ChatML control tokens into a Gemma transcript.
+        XCTAssertFalse(turn.contains("<|im_start|>"), turn)
+        XCTAssertFalse(turn.contains("<|im_end|>"), turn)
+        let nonThink = AgentHarness.shared.formatGemmaToolResponseTurn(responses: [json], thinkingEnabled: false)
+        XCTAssertFalse(nonThink.contains("<|channel>thought"), nonThink)
+        XCTAssertTrue(nonThink.hasSuffix("<tool_response|>"), nonThink)
+    }
+
     func testGemma4VerbatimAppForward() throws {
         let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--google--gemma-4-26B-A4B-it/snapshots/4d7ae4984b7db7de8f8457170b3f1a419ee76d52"
         guard FileManager.default.fileExists(atPath: snapshotDir) else {

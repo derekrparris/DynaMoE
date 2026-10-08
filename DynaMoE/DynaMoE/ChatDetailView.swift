@@ -1107,9 +1107,13 @@ struct ChatMessageView: View {
     private var displayMarkdownContent: String {
         var clean = message.content
             .replacingOccurrences(of: "<tool_call>[\\s\\S]*?</tool_call>", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "<\\|tool_call>[\\s\\S]*?<tool_call\\|>", with: "", options: .regularExpression)
             .replacingOccurrences(of: "<tool_response>[\\s\\S]*?</tool_response>", with: "", options: .regularExpression)
         if let toolCallRange = clean.range(of: "<tool_call>") {
             clean = String(clean[..<toolCallRange.lowerBound])
+        }
+        if let gemmaCallRange = clean.range(of: "<|tool_call>") {
+            clean = String(clean[..<gemmaCallRange.lowerBound])
         }
         return clean.trimmingCharacters(in: .whitespacesAndNewlines)
     }

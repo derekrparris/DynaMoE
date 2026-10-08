@@ -26,6 +26,11 @@ public final class StreamingToolParser {
     public static let qwenFunctionClose = "</function>"
     public static let llamaTagOpen = "<|python_tag|>"
     public static let llamaTagClose = "</|python_tag|>"
+    // Gemma 4 native tool call: <|tool_call>call:name{key:value,...}<tool_call|>
+    public static let gemmaToolCallOpen = "<|tool_call>"
+    public static let gemmaToolCallClose = "<tool_call|>"
+    // Gemma 4 string-quote delimiter used inside tool-call arguments.
+    fileprivate static let gemmaQuote = "<|\"|>"
 
     // Parameter/argument value spans: tag-like text inside them is data, not structure.
     private static let parameterOpen = "<parameter="
@@ -244,6 +249,11 @@ public final class StreamingToolParser {
         deltaText: String,
         format: ToolCallFormat = .qwenXML
     ) -> Bool {
+        // Gemma 4 native tool calls close with <tool_call|>; freeze the instant it lands so
+        // the call is parsed and executed instead of running the turn to EOS.
+        if accumulatedText.contains(Self.gemmaToolCallClose) || deltaText.contains(Self.gemmaToolCallClose) {
+            return true
+        }
         switch format {
         case .qwenXML:
             // Check if </tool_call> has been closed
@@ -893,7 +903,58 @@ public final class StreamingToolParser {
             }
         }
 
+        // 5. Gemma 4 native format: <|tool_call>call:name{key:value,...}<tool_call|>
+        if text.contains(Self.gemmaToolCallOpen) {
+            var gemmaCalls: [ParsedToolCall] = []
+            let blockPattern = "<\\|tool_call>([\\s\\S]*?)(<tool_call\\|>|$)"
+            if let blockRegex = try? NSRegularExpression(pattern: blockPattern, options: []) {
+                let ns = text as NSString
+                let matches = blockRegex.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length))
+                for m in matches {
+                    let block = ns.substring(with: m.range(at: 0))
+                    if let call = Self.parseGemmaToolCall(block) {
+                        gemmaCalls.append(call)
+                    }
+                }
+            }
+            if !gemmaCalls.isEmpty {
+                return (calls: gemmaCalls, brokenFragments: [])
+            }
+        }
+
         return agentCalls
+    }
+
+    /// Parses a Gemma 4 native tool call of the form
+    /// `<|tool_call>call:name{key:value,...}<tool_call|>`. Argument values use Gemma's
+    /// `<|"|>` string delimiter (also tolerates plain quotes), nested `{}`/`[]`, and bare
+    /// literals. The block may be truncated (no closing tag) when generation froze mid-stream.
+    static func parseGemmaToolCall(_ block: String) -> ParsedToolCall? {
+        var body = block.trimmingCharacters(in: .whitespacesAndNewlines)
+        if body.hasPrefix(gemmaToolCallOpen) {
+            body = String(body.dropFirst(gemmaToolCallOpen.count))
+        }
+        if let closeRange = body.range(of: gemmaToolCallClose) {
+            body = String(body[..<closeRange.lowerBound])
+        }
+        body = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        if body.hasPrefix("call:") {
+            body = String(body.dropFirst("call:".count))
+        }
+
+        guard let braceIdx = body.firstIndex(of: "{") else {
+            // Name-only call (no arguments).
+            let name = body.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty, name.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "." || $0 == "-" }) else { return nil }
+            return ParsedToolCall(name: name, arguments: [:], rawArguments: "", rawText: block)
+        }
+
+        let name = String(body[..<braceIdx]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return nil }
+        let argsStr = String(body[braceIdx...])
+        var parser = GemmaArgumentParser(argsStr)
+        let args = (parser.parseValue() as? [String: Any]) ?? [:]
+        return ParsedToolCall(name: name, arguments: args, rawArguments: argsStr, rawText: block)
     }
 
     private func parseLlamaFunctionCall(_ raw: String) -> ParsedToolCall? {
@@ -926,5 +987,136 @@ public final class StreamingToolParser {
         }
 
         return ParsedToolCall(name: fnName, arguments: parsedArgs, rawArguments: argsStr, rawText: trimmed)
+    }
+}
+
+/// Recursive-descent parser for Gemma 4 tool-call argument bodies: a `{key:value,...}`
+/// object using `<|"|>` string delimiters (plain quotes also tolerated), nested
+/// `{}`/`[]`, and bare numbers/booleans/null. Values are returned as JSON-compatible
+/// Foundation types so downstream argument coercion behaves like the other formats.
+private struct GemmaArgumentParser {
+    private let chars: [Character]
+    private var idx = 0
+
+    init(_ text: String) { chars = Array(text) }
+
+    private mutating func skipWhitespace() {
+        while idx < chars.count, chars[idx].isWhitespace { idx += 1 }
+    }
+    private func peek() -> Character? { idx < chars.count ? chars[idx] : nil }
+
+    private func matches(_ token: String) -> Bool {
+        let t = Array(token)
+        guard idx + t.count <= chars.count else { return false }
+        for k in 0..<t.count where chars[idx + k] != t[k] { return false }
+        return true
+    }
+
+    mutating func parseValue() -> Any? {
+        skipWhitespace()
+        guard let c = peek() else { return nil }
+        if c == "{" { return parseObject() }
+        if c == "[" { return parseArray() }
+        if matches(StreamingToolParser.gemmaQuote) { return parseGemmaQuoted() }
+        if c == "\"" || c == "'" { return parseQuoted(quote: c) }
+        return parseBare()
+    }
+
+    private mutating func parseGemmaQuoted() -> String {
+        idx += StreamingToolParser.gemmaQuote.count
+        var out = ""
+        while idx < chars.count {
+            if matches(StreamingToolParser.gemmaQuote) {
+                idx += StreamingToolParser.gemmaQuote.count
+                break
+            }
+            out.append(chars[idx]); idx += 1
+        }
+        return out
+    }
+
+    private mutating func parseQuoted(quote: Character) -> String {
+        idx += 1
+        var out = ""
+        while idx < chars.count {
+            let ch = chars[idx]
+            if ch == "\\", idx + 1 < chars.count {
+                let next = chars[idx + 1]
+                switch next {
+                case "n": out.append("\n")
+                case "t": out.append("\t")
+                case "r": out.append("\r")
+                default: out.append(next)
+                }
+                idx += 2
+                continue
+            }
+            if ch == quote { idx += 1; break }
+            out.append(ch); idx += 1
+        }
+        return out
+    }
+
+    private mutating func parseObject() -> [String: Any] {
+        var obj: [String: Any] = [:]
+        idx += 1 // consume '{'
+        while idx < chars.count {
+            skipWhitespace()
+            guard let c = peek(), c != "}" else { idx += 1; break }
+            let key: String
+            if c == "\"" || c == "'" { key = parseQuoted(quote: c) }
+            else if matches(StreamingToolParser.gemmaQuote) { key = parseGemmaQuoted() }
+            else { key = parseBareKey() }
+            skipWhitespace()
+            if peek() == ":" { idx += 1 }
+            let value = parseValue() ?? ""
+            if !key.isEmpty { obj[key] = value }
+            skipWhitespace()
+            if peek() == "," { idx += 1; continue }
+            if peek() == "}" { idx += 1; break }
+            if idx < chars.count { idx += 1 }
+        }
+        return obj
+    }
+
+    private mutating func parseArray() -> [Any] {
+        var arr: [Any] = []
+        idx += 1 // consume '['
+        while idx < chars.count {
+            skipWhitespace()
+            guard let c = peek(), c != "]" else { idx += 1; break }
+            if let value = parseValue() { arr.append(value) }
+            skipWhitespace()
+            if peek() == "," { idx += 1; continue }
+            if peek() == "]" { idx += 1; break }
+            if idx < chars.count { idx += 1 }
+        }
+        return arr
+    }
+
+    private mutating func parseBareKey() -> String {
+        var out = ""
+        while idx < chars.count {
+            let c = chars[idx]
+            if c == ":" || c == "," || c == "}" || c == "{" || c.isWhitespace { break }
+            out.append(c); idx += 1
+        }
+        return out
+    }
+
+    private mutating func parseBare() -> Any {
+        var out = ""
+        while idx < chars.count {
+            let c = chars[idx]
+            if c == "," || c == "}" || c == "]" { break }
+            out.append(c); idx += 1
+        }
+        let token = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        if token == "true" { return true }
+        if token == "false" { return false }
+        if token == "null" { return NSNull() }
+        if let intValue = Int(token) { return intValue }
+        if let doubleValue = Double(token) { return doubleValue }
+        return token
     }
 }
