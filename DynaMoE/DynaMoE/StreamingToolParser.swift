@@ -774,6 +774,17 @@ public final class StreamingToolParser {
         from text: String,
         format: ToolCallFormat = .qwenXML
     ) -> (calls: [ParsedToolCall], brokenFragments: [String]) {
+        // Gemma 4 native blocks are parsed FIRST: a Gemma string argument can contain
+        // text that resembles another protocol, which the dialect normalization and the
+        // earlier parsers below would otherwise claim. Parsing the outer Gemma block first
+        // keeps argument data from being reinterpreted as a different tool protocol.
+        if text.contains(Self.gemmaToolCallOpen) {
+            let gemmaFirst = Self.parseGemmaBlocks(in: text)
+            if !gemmaFirst.isEmpty {
+                return (calls: gemmaFirst, brokenFragments: [])
+            }
+        }
+
         // 0. Dialect normalization: some models emit native Qwen argument XML inside the
         //    function body using <arg_key>k</arg_key> / <arg_value>v</arg_value> pairs instead
         //    of the internal <parameter=k>v</parameter> form. Rewrite those into canonical
@@ -906,20 +917,10 @@ public final class StreamingToolParser {
             }
         }
 
-        // 5. Gemma 4 native format: <|tool_call>call:name{key:value,...}<tool_call|>
+        // 5. Gemma 4 native format (already tried first on the raw text; retry on the
+        //    normalized text in case normalization revealed a complete block).
         if text.contains(Self.gemmaToolCallOpen) {
-            var gemmaCalls: [ParsedToolCall] = []
-            let blockPattern = "<\\|tool_call>([\\s\\S]*?)(<tool_call\\|>)"
-            if let blockRegex = try? NSRegularExpression(pattern: blockPattern, options: []) {
-                let ns = text as NSString
-                let matches = blockRegex.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length))
-                for m in matches {
-                    let block = ns.substring(with: m.range(at: 0))
-                    if let call = Self.parseGemmaToolCall(block) {
-                        gemmaCalls.append(call)
-                    }
-                }
-            }
+            let gemmaCalls = Self.parseGemmaBlocks(in: text)
             if !gemmaCalls.isEmpty {
                 return (calls: gemmaCalls, brokenFragments: [])
             }
@@ -966,6 +967,21 @@ public final class StreamingToolParser {
             return nil
         }
         return ParsedToolCall(name: name, arguments: parsed, rawArguments: argsStr, rawText: block)
+    }
+
+    /// Extracts and parses every complete Gemma 4 native call block in `text`.
+    private static func parseGemmaBlocks(in text: String) -> [ParsedToolCall] {
+        let blockPattern = "<\\|tool_call>([\\s\\S]*?)(<tool_call\\|>)"
+        guard let blockRegex = try? NSRegularExpression(pattern: blockPattern, options: []) else { return [] }
+        let ns = text as NSString
+        var calls: [ParsedToolCall] = []
+        for m in blockRegex.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length)) {
+            let block = ns.substring(with: m.range(at: 0))
+            if let call = Self.parseGemmaToolCall(block) {
+                calls.append(call)
+            }
+        }
+        return calls
     }
 
     private func parseLlamaFunctionCall(_ raw: String) -> ParsedToolCall? {
@@ -1101,8 +1117,14 @@ private struct GemmaArgumentParser {
             else if matches(StreamingToolParser.gemmaQuote) { key = parseGemmaQuoted() }
             else { key = parseBareKey() }
             skipWhitespace()
-            if peek() == ":" { idx += 1 }
-            let value = parseValue() ?? ""
+            // Require the colon separator and a value that advances the cursor: an
+            // object such as `{command "x"}` or `{command:}` is malformed and must not
+            // count as a clean parse, or malformed output could execute.
+            guard peek() == ":" else { complete = false; break }
+            idx += 1
+            skipWhitespace()
+            let valueStart = idx
+            guard let value = parseValue(), idx > valueStart else { complete = false; break }
             if !key.isEmpty { obj[key] = value }
             skipWhitespace()
             if peek() == "," { idx += 1; continue }

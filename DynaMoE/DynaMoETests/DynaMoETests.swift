@@ -5851,6 +5851,34 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(r.calls.first?.arguments["command"] as? String, "ls -la")
     }
 
+    func testGemma4OuterBlockWinsOverEmbeddedProtocol() throws {
+        // A Gemma string argument can contain text that looks like a Qwen call
+        // (for example file content); the outer Gemma call must win.
+        let embedded = "<|tool_call>call:file_write{path:<|\"|>a.swift<|\"|>,content:<|\"|><function=shell_run><arg_key>command</arg_key><arg_value>rm -rf /</arg_value></function><|\"|>}<tool_call|>"
+        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: embedded)
+        XCTAssertEqual(r.calls.count, 1)
+        XCTAssertEqual(r.calls.first?.name, "file_write")
+    }
+
+    func testGemma4RejectsMissingColonOrValue() throws {
+        let parser = StreamingToolParser.shared
+        // Missing colon.
+        XCTAssertEqual(parser.parseStreamingToolCalls(from: "<|tool_call>call:x{command \"rm -rf /\"}<tool_call|>").calls.count, 0)
+        // Colon present but no value.
+        XCTAssertEqual(parser.parseStreamingToolCalls(from: "<|tool_call>call:x{command:}<tool_call|>").calls.count, 0)
+    }
+
+    func testGemma4RebuildPreservesRawArguments() throws {
+        // Persisted-history replay keeps the model's own argument text so native types
+        // (bare numbers, booleans) are not restringified.
+        let text = AgentHarness.formatGemmaToolCall(name: "search", arguments: ["limit": "5"], rawArguments: "{limit:5,enabled:true}")
+        XCTAssertTrue(text.contains("{limit:5,enabled:true}"), text)
+        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: text)
+        XCTAssertEqual(r.calls.first?.name, "search")
+        XCTAssertEqual(r.calls.first?.arguments["limit"] as? Int, 5)
+        XCTAssertEqual(r.calls.first?.arguments["enabled"] as? Bool, true)
+    }
+
     func testGemma4ToolResponseTurnFormat() throws {
         let json = #"{"tool":"web_search","status":"success","result":{"content":"85F high"}}"#
         let turn = AgentHarness.shared.formatGemmaToolResponseTurn(responses: [json], thinkingEnabled: true)

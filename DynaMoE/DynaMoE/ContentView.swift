@@ -3230,7 +3230,7 @@ struct ContentView: View {
                     if let calls = msg.toolCalls, !calls.isEmpty {
                         if !cleanMsg.contains("<|tool_call>") {
                             for call in calls {
-                                assistantBody += AgentHarness.formatGemmaToolCall(name: call.name, arguments: call.arguments)
+                                assistantBody += AgentHarness.formatGemmaToolCall(name: call.name, arguments: call.arguments, rawArguments: call.rawArguments)
                             }
                         }
                         // The stored outputs are already-rendered text, not the original JSON,

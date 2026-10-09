@@ -3645,12 +3645,22 @@ public final class AgentHarness {
     /// Rebuilds a Gemma 4 native tool call from its structured record so persisted
     /// history re-teaches the exact dialect the model emitted (the stored content does
     /// not always retain the raw call text). Keys and values are delimiter-sanitized.
-    public static func formatGemmaToolCall(name: String, arguments: [String: String]) -> String {
-        let args = arguments.keys.sorted().map { key -> String in
-            let value = Self.sanitizeGemmaToolResponseText(arguments[key] ?? "")
-            return "\(Self.sanitizeGemmaToolName(key)):<|\"|>\(value)<|\"|>"
+    public static func formatGemmaToolCall(name: String, arguments: [String: String], rawArguments: String = "") -> String {
+        let raw = rawArguments.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body: String
+        if raw.hasPrefix("{") {
+            // Preserve the model's original native argument text (bare numbers,
+            // booleans, nested objects, <|"|> quoting) instead of restringifying every
+            // value, which would teach the model schema-invalid argument types.
+            body = raw
+        } else {
+            let args = arguments.keys.sorted().map { key -> String in
+                let value = Self.sanitizeGemmaToolResponseText(arguments[key] ?? "")
+                return "\(Self.sanitizeGemmaToolName(key)):<|\"|>\(value)<|\"|>"
+            }
+            body = "{\(args.joined(separator: ","))}"
         }
-        return "<|tool_call>call:\(Self.sanitizeGemmaToolName(name)){\(args.joined(separator: ","))}<tool_call|>"
+        return "<|tool_call>call:\(Self.sanitizeGemmaToolName(name))\(body)<tool_call|>"
     }
 
     /// Turns a `tools_load` / `tools_unload` result into an explicit context registration notice
