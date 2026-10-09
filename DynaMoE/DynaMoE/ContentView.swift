@@ -3230,12 +3230,22 @@ struct ContentView: View {
                     if let calls = msg.toolCalls, !calls.isEmpty {
                         if !cleanMsg.contains("<|tool_call>") {
                             for call in calls {
-                                assistantBody += AgentHarness.shared.formatGemmaToolCall(name: call.name, arguments: call.arguments)
+                                assistantBody += AgentHarness.formatGemmaToolCall(name: call.name, arguments: call.arguments)
                             }
                         }
-                        let outputs = calls.compactMap { $0.output ?? $0.error }
-                        if !outputs.isEmpty {
-                            assistantBody += AgentHarness.shared.formatGemmaToolResponseTurn(responses: outputs, thinkingEnabled: false)
+                        // The stored outputs are already-rendered text, not the original JSON,
+                        // so the formatter cannot recover the tool name from them; pass the
+                        // recorded names alongside so call/response pairs stay valid after a reload.
+                        let pairs = calls.compactMap { call -> (name: String, response: String)? in
+                            guard let response = call.output ?? call.error else { return nil }
+                            return (call.name, response)
+                        }
+                        if !pairs.isEmpty {
+                            assistantBody += AgentHarness.shared.formatGemmaToolResponseTurn(
+                                responses: pairs.map { $0.response },
+                                toolNames: pairs.map { $0.name },
+                                thinkingEnabled: false
+                            )
                         }
                     }
                     promptString += "<|turn>model\n\(assistantBody)<turn|>\n"
@@ -14589,6 +14599,18 @@ if layer.attnGateProjTensor != nil,
                 if !ok { return nil }
 
                 // 5. Verify acceptance using Rust acceptance oracle (Greedy fast-path or Stochastic Sampling)
+                // Gemma final logit soft-capping must reach EVERY logit row the tree
+                // produces, exactly as the ordinary sampler does, or JetSpec samples from
+                // softmax(logits) instead of the model's softmax(tanh(logits/cap)*cap).
+                // Applied in place so verification, the winning-row copy, and the root
+                // fallback all see the capped distribution.
+                if let cap = modelConfig?.effectiveFinalLogitSoftcapping, cap > 0 {
+                    let treeLogitsCount = Int(treeMask.nodeCount) * Int(vocabSize)
+                    let treeSoftcapPtr = jb.targetLogitsBuffer.contents().bindMemory(to: Float.self, capacity: treeLogitsCount)
+                    for i in 0..<treeLogitsCount {
+                        treeSoftcapPtr[i] = tanhf(treeSoftcapPtr[i] / cap) * cap
+                    }
+                }
                 let targetLogitsPtr = jb.targetLogitsBuffer.contents().bindMemory(to: Float.self, capacity: Int(treeMask.nodeCount) * Int(vocabSize))
                 let treeTargetLogits = Array(UnsafeBufferPointer(start: targetLogitsPtr, count: Int(treeMask.nodeCount) * Int(vocabSize)))
 

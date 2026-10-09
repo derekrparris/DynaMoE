@@ -3567,9 +3567,9 @@ public final class AgentHarness {
     /// as `<|tool_response>response:name{value:<|"|>…<|"|>}<tool_response|>`, then re-opens the
     /// thinking channel for the next model turn. Mixing ChatML `<|im_start|>` tags into a Gemma
     /// transcript feeds the model literal control-token text it was never trained on.
-    public func formatGemmaToolResponseTurn(responses: [String], thinkingEnabled: Bool = true) -> String {
+    public func formatGemmaToolResponseTurn(responses: [String], toolNames: [String]? = nil, thinkingEnabled: Bool = true) -> String {
         var turn = ""
-        for r in responses {
+        for (index, r) in responses.enumerated() {
             if let data = r.data(using: .utf8),
                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let result = json["result"] as? [String: Any],
@@ -3581,6 +3581,11 @@ public final class AgentHarness {
                 turn += registration + "\n"
             }
             let rawName: String = {
+                // Persisted-history replay passes already-rendered text, not the
+                // original JSON, so the name must be supplied explicitly.
+                if let toolNames, index < toolNames.count, !toolNames[index].isEmpty {
+                    return toolNames[index]
+                }
                 if let data = r.data(using: .utf8),
                    let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let n = obj["tool"] as? String, !n.isEmpty { return n }
@@ -3611,9 +3616,20 @@ public final class AgentHarness {
     ]
 
     static func sanitizeGemmaToolResponseText(_ text: String) -> String {
+        // Replace, never delete: deleting a delimiter can splice its neighbours into a
+        // new one, so a single ordered pass is bypassable. A nonempty separator makes
+        // splicing impossible, and repeating to a fixed point guarantees a stable
+        // result regardless of token ordering.
         var out = text
-        for token in Self.gemmaReservedDelimiters {
-            out = out.replacingOccurrences(of: token, with: "")
+        var changed = true
+        var passes = 0
+        while changed, passes < 8 {
+            changed = false
+            passes += 1
+            for token in Self.gemmaReservedDelimiters where out.contains(token) {
+                out = out.replacingOccurrences(of: token, with: " ")
+                changed = true
+            }
         }
         return out
     }

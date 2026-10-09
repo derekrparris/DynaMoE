@@ -1049,7 +1049,12 @@ private struct GemmaArgumentParser {
                 case "n": out.append("\n")
                 case "t": out.append("\t")
                 case "r": out.append("\r")
-                default: out.append(next)
+                case "\\": out.append("\\")
+                case "\"": out.append("\"")
+                case "'": out.append("'")
+                // Unknown escape: keep the backslash so a literal path or command
+                // (e.g. a regex \d) is not silently altered when executed.
+                default: out.append("\\"); out.append(next)
                 }
                 idx += 2
                 continue

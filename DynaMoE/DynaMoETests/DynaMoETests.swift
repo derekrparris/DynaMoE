@@ -5742,6 +5742,12 @@ final class DynaMoETests: XCTestCase {
         // model that merely mentions the tag in prose or code would be stopped as a call.
         XCTAssertFalse(parser.shouldFreezeGeneration(accumulatedText: "see the token <tool_call|> in the docs", deltaText: ""))
         XCTAssertFalse(parser.shouldFreezeGeneration(accumulatedText: "", deltaText: "<tool_call|>"))
+
+        // Plain-quoted args keep the backslash before an unrecognized escape (a regex \d),
+        // so a generated command is not silently rewritten when it is executed.
+        let tEsc = "<|tool_call>call:shell_run{command: \"grep -P \\d+ file\"}<tool_call|>"
+        let rEsc = parser.parseStreamingToolCalls(from: tEsc)
+        XCTAssertEqual(rEsc.calls.first?.arguments["command"] as? String, "grep -P \\d+ file")
     }
 
     func testGemma4ToolResponseTurnFormat() throws {
@@ -5773,6 +5779,16 @@ final class DynaMoETests: XCTestCase {
         let nameJSON = String(data: try JSONSerialization.data(withJSONObject: nameDict), encoding: .utf8)!
         let nameTurn = AgentHarness.shared.formatGemmaToolResponseTurn(responses: [nameJSON], thinkingEnabled: false)
         XCTAssertTrue(nameTurn.contains("response:badtool_responsename{value:"), nameTurn)
+
+        // A delimiter split across the input must not reconstruct a reserved token once
+        // the inner delimiter is replaced: removing it would splice the halves together.
+        let spliced = AgentHarness.sanitizeGemmaToolResponseText("A <|tool_<|\"|>response> B")
+        XCTAssertFalse(spliced.contains("<|tool_response>"), spliced)
+
+        // Persisted-history replay passes rendered text, so the tool name is supplied
+        // explicitly and must be preserved in the reconstructed response header.
+        let namedTurn = AgentHarness.shared.formatGemmaToolResponseTurn(responses: ["[web_search] success"], toolNames: ["web_search"], thinkingEnabled: false)
+        XCTAssertTrue(namedTurn.contains("response:web_search{value:"), namedTurn)
     }
 
     func testGemma4ToolCallRebuildRoundTrips() throws {
@@ -5783,9 +5799,9 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(r.calls.count, 1)
         XCTAssertEqual(r.calls.first?.name, "web_search")
         XCTAssertEqual(r.calls.first?.arguments["limit"] as? String, "5")
-        XCTAssertEqual(r.calls.first?.arguments["query"] as? String, "sunny  today")
+        XCTAssertEqual(r.calls.first?.arguments["query"] as? String, "sunny   today")
         // Keys are emitted in sorted order, so the transcript is deterministic.
-        XCTAssertTrue(text.hasPrefix(#"<|tool_call>call:web_search{limit:<|\"|>5<|\"|>,query:"#), text)
+        XCTAssertTrue(text.hasPrefix(#"<|tool_call>call:web_search{limit:<|"|>5<|"|>,query:"#), text)
     }
 
     func testGemma4VerbatimAppForward() throws {
