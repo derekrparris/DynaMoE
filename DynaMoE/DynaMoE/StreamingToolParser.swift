@@ -958,8 +958,14 @@ public final class StreamingToolParser {
         guard !name.isEmpty else { return nil }
         let argsStr = String(body[braceIdx...])
         var parser = GemmaArgumentParser(argsStr)
-        let args = (parser.parseValue() as? [String: Any]) ?? [:]
-        return ParsedToolCall(name: name, arguments: args, rawArguments: argsStr, rawText: block)
+        // The closing tag does not prove the argument object is complete: an unclosed
+        // quote, brace, or bracket still yields accumulated values. Require the parser
+        // to have closed every quote/container and consumed the whole argument string,
+        // so a truncated command (a half-written shell line) cannot be executed.
+        guard let parsed = parser.parseValue() as? [String: Any], parser.complete, parser.consumedAll else {
+            return nil
+        }
+        return ParsedToolCall(name: name, arguments: parsed, rawArguments: argsStr, rawText: block)
     }
 
     private func parseLlamaFunctionCall(_ raw: String) -> ParsedToolCall? {
@@ -1002,6 +1008,9 @@ public final class StreamingToolParser {
 private struct GemmaArgumentParser {
     private let chars: [Character]
     private var idx = 0
+    /// False once any quote or container reached the end of input without closing.
+    /// A tool call is only executable when the whole argument body parsed cleanly.
+    var complete = true
 
     init(_ text: String) { chars = Array(text) }
 
@@ -1009,6 +1018,13 @@ private struct GemmaArgumentParser {
         while idx < chars.count, chars[idx].isWhitespace { idx += 1 }
     }
     private func peek() -> Character? { idx < chars.count ? chars[idx] : nil }
+
+    /// True when the parser consumed the entire argument string (trailing whitespace aside).
+    var consumedAll: Bool {
+        var i = idx
+        while i < chars.count, chars[i].isWhitespace { i += 1 }
+        return i >= chars.count
+    }
 
     private func matches(_ token: String) -> Bool {
         let t = Array(token)
@@ -1030,19 +1046,23 @@ private struct GemmaArgumentParser {
     private mutating func parseGemmaQuoted() -> String {
         idx += StreamingToolParser.gemmaQuote.count
         var out = ""
+        var closed = false
         while idx < chars.count {
             if matches(StreamingToolParser.gemmaQuote) {
                 idx += StreamingToolParser.gemmaQuote.count
+                closed = true
                 break
             }
             out.append(chars[idx]); idx += 1
         }
+        if !closed { complete = false }
         return out
     }
 
     private mutating func parseQuoted(quote: Character) -> String {
         idx += 1
         var out = ""
+        var closed = false
         while idx < chars.count {
             let ch = chars[idx]
             if ch == "\\", idx + 1 < chars.count {
@@ -1061,20 +1081,23 @@ private struct GemmaArgumentParser {
                 idx += 2
                 continue
             }
-            if ch == quote { idx += 1; break }
+            if ch == quote { idx += 1; closed = true; break }
             out.append(ch); idx += 1
         }
+        if !closed { complete = false }
         return out
     }
 
     private mutating func parseObject() -> [String: Any] {
         var obj: [String: Any] = [:]
         idx += 1 // consume '{'
+        var closed = false
         while idx < chars.count {
             skipWhitespace()
-            guard let c = peek(), c != "}" else { idx += 1; break }
+            if idx >= chars.count { break }
+            if chars[idx] == "}" { idx += 1; closed = true; break }
             let key: String
-            if c == "\"" || c == "'" { key = parseQuoted(quote: c) }
+            if chars[idx] == "\"" || chars[idx] == "'" { key = parseQuoted(quote: chars[idx]) }
             else if matches(StreamingToolParser.gemmaQuote) { key = parseGemmaQuoted() }
             else { key = parseBareKey() }
             skipWhitespace()
@@ -1083,24 +1106,28 @@ private struct GemmaArgumentParser {
             if !key.isEmpty { obj[key] = value }
             skipWhitespace()
             if peek() == "," { idx += 1; continue }
-            if peek() == "}" { idx += 1; break }
+            if peek() == "}" { idx += 1; closed = true; break }
             if idx < chars.count { idx += 1 }
         }
+        if !closed { complete = false }
         return obj
     }
 
     private mutating func parseArray() -> [Any] {
         var arr: [Any] = []
         idx += 1 // consume '['
+        var closed = false
         while idx < chars.count {
             skipWhitespace()
-            guard let c = peek(), c != "]" else { idx += 1; break }
+            if idx >= chars.count { break }
+            if chars[idx] == "]" { idx += 1; closed = true; break }
             if let value = parseValue() { arr.append(value) }
             skipWhitespace()
             if peek() == "," { idx += 1; continue }
-            if peek() == "]" { idx += 1; break }
+            if peek() == "]" { idx += 1; closed = true; break }
             if idx < chars.count { idx += 1 }
         }
+        if !closed { complete = false }
         return arr
     }
 

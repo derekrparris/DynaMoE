@@ -5738,6 +5738,26 @@ final class DynaMoETests: XCTestCase {
         }
     }
 
+    func testShardSegmentationRejectsUnknownShard() throws {
+        // A tensor whose shardIndex is not in the summary must fail the load, not pass
+        // through unmapped (no buffer exists for that index).
+        let maxBufferLength: UInt64 = 2 << 30
+        let shards = [ShardMetadata(index: 0, filename: "big.safetensors", baseAddress: 0x1_0000_0000, length: 3 << 30)]
+        let tensors = [TensorMetadata(
+            name: "ghost.weight",
+            shapeDisplay: "[]", dtype: "BF16", sizeMb: 1,
+            shardIndex: 7, offsetStart: 0, offsetEnd: 1024,
+            category: "Other", layerIndex: 0, expertId: nil
+        )]
+        let summary = ModelSummary(sizeGb: 3, tensorCount: 1, layerCount: 1, maxExpertId: 0, shards: shards, tensors: tensors, layers: [])
+
+        XCTAssertThrowsError(try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: maxBufferLength)) { error in
+            guard case MetalSegmentationError.unknownShardIndex = error else {
+                return XCTFail("Expected unknownShardIndex, got \(error)")
+            }
+        }
+    }
+
     func testGemma4LayerTensorResolution() throws {
         let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--google--gemma-4-26B-A4B-it/snapshots/4d7ae4984b7db7de8f8457170b3f1a419ee76d52"
         guard FileManager.default.fileExists(atPath: snapshotDir) else {
@@ -5813,6 +5833,22 @@ final class DynaMoETests: XCTestCase {
         let tEsc = "<|tool_call>call:shell_run{command: \"grep -P \\d+ file\"}<tool_call|>"
         let rEsc = parser.parseStreamingToolCalls(from: tEsc)
         XCTAssertEqual(rEsc.calls.first?.arguments["command"] as? String, "grep -P \\d+ file")
+    }
+
+    func testGemma4RejectsIncompleteArgumentBodies() throws {
+        let parser = StreamingToolParser.shared
+        // Missing closing brace: the call's closing tag arrived, but the argument
+        // object did not close, so it must not execute.
+        let missingBrace = "<|tool_call>call:shell_run{command:\"rm -rf /\"<tool_call|>"
+        XCTAssertEqual(parser.parseStreamingToolCalls(from: missingBrace).calls.count, 0)
+        // Missing closing quote.
+        let missingQuote = "<|tool_call>call:shell_run{command:\"rm -rf /}<tool_call|>"
+        XCTAssertEqual(parser.parseStreamingToolCalls(from: missingQuote).calls.count, 0)
+        // A well-formed call still parses.
+        let ok = "<|tool_call>call:shell_run{command:\"ls -la\"}<tool_call|>"
+        let r = parser.parseStreamingToolCalls(from: ok)
+        XCTAssertEqual(r.calls.first?.name, "shell_run")
+        XCTAssertEqual(r.calls.first?.arguments["command"] as? String, "ls -la")
     }
 
     func testGemma4ToolResponseTurnFormat() throws {
