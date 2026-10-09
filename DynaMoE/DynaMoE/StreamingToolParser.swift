@@ -250,8 +250,11 @@ public final class StreamingToolParser {
         format: ToolCallFormat = .qwenXML
     ) -> Bool {
         // Gemma 4 native tool calls close with <tool_call|>; freeze the instant it lands so
-        // the call is parsed and executed instead of running the turn to EOS.
-        if accumulatedText.contains(Self.gemmaToolCallClose) || deltaText.contains(Self.gemmaToolCallClose) {
+        // the call is parsed and executed instead of running the turn to EOS. Require the
+        // matching Gemma opener too: otherwise any agent-enabled model that merely emits the
+        // literal <tool_call|> in prose or code is frozen as if it had made a Gemma call.
+        if (accumulatedText.contains(Self.gemmaToolCallOpen) || deltaText.contains(Self.gemmaToolCallOpen)),
+           (accumulatedText.contains(Self.gemmaToolCallClose) || deltaText.contains(Self.gemmaToolCallClose)) {
             return true
         }
         switch format {

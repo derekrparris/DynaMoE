@@ -3580,18 +3580,50 @@ public final class AgentHarness {
             if let registration = Self.toolRegistrationNotice(for: r) {
                 turn += registration + "\n"
             }
-            let name: String = {
+            let rawName: String = {
                 if let data = r.data(using: .utf8),
                    let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let n = obj["tool"] as? String, !n.isEmpty { return n }
                 return "tool"
             }()
-            turn += "<|tool_response>response:\(name){value:<|\"|>\(Self.renderToolResultForModel(r))<|\"|>}<tool_response|>"
+            let name = Self.sanitizeGemmaToolName(rawName)
+            let body = Self.sanitizeGemmaToolResponseText(Self.renderToolResultForModel(r))
+            turn += "<|tool_response>response:\(name){value:<|\"|>\(body)<|\"|>}<tool_response|>"
         }
         if thinkingEnabled {
             turn += "<|channel>thought\n"
         }
         return turn
+    }
+
+    /// Gemma's tool-response turn wraps each result in control-token delimiters
+    /// (<|tool_response>…<tool_response|>, the value inside <|\"|>…<|\"|>). A tool result is
+    /// arbitrary file or web text, so it can contain those exact sequences and close the
+    /// value or the whole response early, corrupting the transcript the model reads back.
+    /// Strip every reserved Gemma delimiter before interpolation.
+    private static let gemmaReservedDelimiters = [
+        "<|tool_response>", "<tool_response|>",
+        "<|tool_call>", "<tool_call|>",
+        "<|channel>", "<channel|>",
+        "<|turn>", "<turn|>",
+        "<|think|>", "<|\"|>",
+        "<bos>", "<eos>"
+    ]
+
+    static func sanitizeGemmaToolResponseText(_ text: String) -> String {
+        var out = text
+        for token in Self.gemmaReservedDelimiters {
+            out = out.replacingOccurrences(of: token, with: "")
+        }
+        return out
+    }
+
+    /// The Gemma response turn interpolates the tool name into its structured header;
+    /// keep it to the charset tool names use so a name can never smuggle structure.
+    static func sanitizeGemmaToolName(_ name: String) -> String {
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-/")
+        let safe = name.components(separatedBy: allowed.inverted).joined()
+        return safe.isEmpty ? "tool" : safe
     }
 
     /// Turns a `tools_load` / `tools_unload` result into an explicit context registration notice
