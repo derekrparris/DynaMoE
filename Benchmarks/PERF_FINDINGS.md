@@ -3014,10 +3014,11 @@ lazy-commit fix flagged this as the remaining principled cut.
   and prefix-sum region bases (empty arrays = the old uniform layout, so
   every other model's math is byte-identical), plus helpers every dispatch
   site uses for region/scale byte offsets.
-- All 8 Gemma kernels (store/decode/tree-verify x fp32/fp16/fp8) take a
-  `ringLen` arg (0 = linear); the decode/tree read loops carry a running
-  ring slot with a wrap check, and the fp8 scale index uses the same ring
-  row.
+- All 8 Gemma kernels take a `ringLen` arg (0 = linear): the store and
+  decode families cover fp32/fp16/fp8, and tree verification covers
+  fp32/fp16 only (JetSpec excludes fp8 KV caches). The decode/tree read
+  loops carry a running ring slot with a wrap check, and the fp8 scale
+  index uses the same ring row.
 - JetSpec tree scratch: node k lives at ring slot `(step + k) % R` — it may
   land on dead prefix rows (positions below the read window) but never on a
   live window row; the acceptance compaction blit copies ring-mapped rows.

@@ -9,6 +9,22 @@ import Foundation
 import Metal
 import Accelerate
 
+/// Raised when a single tensor's page-aligned span cannot fit in one Metal buffer,
+/// so no amount of shard segmentation can address it. Surfaced to the model loader as a
+/// hard failure rather than a summary whose tensors silently map to nothing.
+public enum MetalSegmentationError: Error, LocalizedError {
+    case tensorExceedsBufferLimit(name: String, alignedSpanBytes: UInt64, maxBufferLength: UInt64)
+
+    public var errorDescription: String? {
+        switch self {
+        case let .tensorExceedsBufferLimit(name, alignedSpanBytes, maxBufferLength):
+            let spanGB = Double(alignedSpanBytes) / 1_073_741_824.0
+            let capGB = Double(maxBufferLength) / 1_073_741_824.0
+            return "Tensor \(name) needs a \(String(format: "%.2f", spanGB)) GB page-aligned buffer, above the \(String(format: "%.2f", capGB)) GB Metal buffer limit; it cannot be split across buffers."
+        }
+    }
+}
+
 public enum MemoryExecutionMode: String, CaseIterable, Identifiable, Codable {
     case autoDetect = "Auto (Smart)"
     case residentRAM = "Full RAM"
@@ -991,7 +1007,7 @@ public final class InferenceEngine {
     /// and the segment is sized to cover its tensors end-to-end; adjacent segments may
     /// share at most one page, which Metal permits. Returns the summary unchanged when
     /// every shard already fits.
-    public static func segmentShardsForMetal(_ summary: ModelSummary, maxBufferLength: UInt64) -> ModelSummary {
+    public static func segmentShardsForMetal(_ summary: ModelSummary, maxBufferLength: UInt64) throws -> ModelSummary {
         guard maxBufferLength > 0, summary.shards.contains(where: { $0.length > maxBufferLength }) else {
             return summary
         }
@@ -1033,6 +1049,16 @@ public final class InferenceEngine {
             }
 
             for t in tensors {
+                // A single tensor whose page-aligned span exceeds the buffer limit cannot
+                // be contained by any segment. Without this check it is emitted in an
+                // oversized segment, the loader silently skips that buffer, and the tensor
+                // is left unavailable while loading continues. Fail the load with a named
+                // error instead of returning a summary with unmappable tensors.
+                let singleSpan = alignUp(t.offsetEnd) - alignDown(t.offsetStart)
+                guard singleSpan <= maxBufferLength else {
+                    throw MetalSegmentationError.tensorExceedsBufferLimit(
+                        name: t.name, alignedSpanBytes: singleSpan, maxBufferLength: maxBufferLength)
+                }
                 if let first = curFirst {
                     let projected = alignUp(t.offsetEnd) - alignDown(first)
                     if projected > maxBufferLength {

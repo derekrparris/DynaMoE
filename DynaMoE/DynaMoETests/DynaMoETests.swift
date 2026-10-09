@@ -5629,7 +5629,7 @@ final class DynaMoETests: XCTestCase {
         }
         let summary = ModelSummary(sizeGb: 20, tensorCount: UInt32(tensors.count), layerCount: 10, maxExpertId: 0, shards: shards, tensors: tensors, layers: [])
 
-        let segmented = InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: maxBufferLength)
+        let segmented = try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: maxBufferLength)
 
         XCTAssertGreaterThan(segmented.shards.count, 1, "Oversized shard must be split into multiple buffers")
         XCTAssertEqual(segmented.tensors.count, tensors.count, "Every tensor must survive segmentation")
@@ -5650,6 +5650,28 @@ final class DynaMoETests: XCTestCase {
         }
 
         print("✅ [TEST] Shard segmentation verified.")
+    }
+
+    func testShardSegmentationRejectsOversizedTensor() throws {
+        // A single tensor whose page-aligned span exceeds maxBufferLength cannot be
+        // contained by any segment. Segmentation must fail the load rather than emit an
+        // oversized segment that the loader would silently skip.
+        let maxBufferLength: UInt64 = 1 << 30
+        let shards = [ShardMetadata(index: 0, filename: "big.safetensors", baseAddress: 0x1_0000_0000, length: 4 << 30)]
+        let tensors = [TensorMetadata(
+            name: "model.embed_tokens.weight",
+            shapeDisplay: "[]", dtype: "BF16", sizeMb: 2048,
+            shardIndex: 0, offsetStart: 0, offsetEnd: (2 << 30),
+            category: "Other", layerIndex: 0, expertId: nil
+        )]
+        let summary = ModelSummary(sizeGb: 4, tensorCount: 1, layerCount: 1, maxExpertId: 0, shards: shards, tensors: tensors, layers: [])
+
+        XCTAssertThrowsError(try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: maxBufferLength)) { error in
+            guard case MetalSegmentationError.tensorExceedsBufferLimit(let name, _, _) = error else {
+                return XCTFail("Expected tensorExceedsBufferLimit, got \(error)")
+            }
+            XCTAssertEqual(name, "model.embed_tokens.weight")
+        }
     }
 
     func testGemma4LayerTensorResolution() throws {
@@ -5753,6 +5775,19 @@ final class DynaMoETests: XCTestCase {
         XCTAssertTrue(nameTurn.contains("response:badtool_responsename{value:"), nameTurn)
     }
 
+    func testGemma4ToolCallRebuildRoundTrips() throws {
+        // The persisted-history rebuilder must emit a call the parser reads back, with
+        // argument values delimiter-sanitized the same way the response path is.
+        let text = AgentHarness.formatGemmaToolCall(name: "web_search", arguments: ["query": "sunny <|\"|> today", "limit": "5"])
+        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: text)
+        XCTAssertEqual(r.calls.count, 1)
+        XCTAssertEqual(r.calls.first?.name, "web_search")
+        XCTAssertEqual(r.calls.first?.arguments["limit"] as? String, "5")
+        XCTAssertEqual(r.calls.first?.arguments["query"] as? String, "sunny  today")
+        // Keys are emitted in sorted order, so the transcript is deterministic.
+        XCTAssertTrue(text.hasPrefix(#"<|tool_call>call:web_search{limit:<|\"|>5<|\"|>,query:"#), text)
+    }
+
     func testGemma4VerbatimAppForward() throws {
         let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--google--gemma-4-26B-A4B-it/snapshots/4d7ae4984b7db7de8f8457170b3f1a419ee76d52"
         guard FileManager.default.fileExists(atPath: snapshotDir) else {
@@ -5770,7 +5805,7 @@ final class DynaMoETests: XCTestCase {
 
         let engine = try DynaMoeEngine(filePath: snapshotDir)
         var summary = try engine.getSummary()
-        summary = InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: UInt64(device.maxBufferLength))
+        summary = try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: UInt64(device.maxBufferLength))
         guard let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir)) else {
             XCTFail("No ModelConfig")
             return
@@ -6528,7 +6563,7 @@ final class DynaMoETests: XCTestCase {
             return
         }
 
-        summary = InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: UInt64(device.maxBufferLength))
+        summary = try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: UInt64(device.maxBufferLength))
         var buffers: [UInt32: MTLBuffer] = [:]
         for shard in summary.shards {
             let address = UInt(shard.baseAddress)
@@ -7184,7 +7219,7 @@ final class DynaMoETests: XCTestCase {
         var summary = try engine.getSummary()
         guard let device = MTLCreateSystemDefaultDevice() else { XCTFail("No Metal GPU device"); return }
 
-        summary = InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: UInt64(device.maxBufferLength))
+        summary = try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: UInt64(device.maxBufferLength))
         var buffers: [UInt32: MTLBuffer] = [:]
         for shard in summary.shards {
             let address = UInt(shard.baseAddress)

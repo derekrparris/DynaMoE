@@ -3626,6 +3626,17 @@ public final class AgentHarness {
         return safe.isEmpty ? "tool" : safe
     }
 
+    /// Rebuilds a Gemma 4 native tool call from its structured record so persisted
+    /// history re-teaches the exact dialect the model emitted (the stored content does
+    /// not always retain the raw call text). Keys and values are delimiter-sanitized.
+    public static func formatGemmaToolCall(name: String, arguments: [String: String]) -> String {
+        let args = arguments.keys.sorted().map { key -> String in
+            let value = Self.sanitizeGemmaToolResponseText(arguments[key] ?? "")
+            return "\(Self.sanitizeGemmaToolName(key)):<|\"|>\(value)<|\"|>"
+        }
+        return "<|tool_call>call:\(Self.sanitizeGemmaToolName(name)){\(args.joined(separator: ","))}<tool_call|>"
+    }
+
     /// Turns a `tools_load` / `tools_unload` result into an explicit context registration notice
     /// so the newly enabled (or disabled) schema is visible to the model before its next response.
     private static func toolRegistrationNotice(for responseJSON: String) -> String? {

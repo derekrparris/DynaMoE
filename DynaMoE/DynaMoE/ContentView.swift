@@ -3223,6 +3223,21 @@ struct ContentView: View {
                     if !cleanMsg.isEmpty {
                         assistantBody += cleanMsg
                     }
+                    // History reconstruction: rebuild the native call when the stored
+                    // content no longer carries the raw text, and always replay the tool
+                    // results, since Gemma keeps the call and its response in one model
+                    // turn (no <turn|> between them).
+                    if let calls = msg.toolCalls, !calls.isEmpty {
+                        if !cleanMsg.contains("<|tool_call>") {
+                            for call in calls {
+                                assistantBody += AgentHarness.shared.formatGemmaToolCall(name: call.name, arguments: call.arguments)
+                            }
+                        }
+                        let outputs = calls.compactMap { $0.output ?? $0.error }
+                        if !outputs.isEmpty {
+                            assistantBody += AgentHarness.shared.formatGemmaToolResponseTurn(responses: outputs, thinkingEnabled: false)
+                        }
+                    }
                     promptString += "<|turn>model\n\(assistantBody)<turn|>\n"
                 }
             }
@@ -16364,7 +16379,7 @@ if layer.attnGateProjTensor != nil,
                 // maxBufferLength, which is far below the shard size. Split any such
                 // shard into per-buffer segments, remapping tensor offsets so the
                 // rest of the engine keeps addressing tensors by (shardIndex, offset).
-                loadedSummary = InferenceEngine.segmentShardsForMetal(loadedSummary, maxBufferLength: UInt64(device.maxBufferLength))
+                loadedSummary = try InferenceEngine.segmentShardsForMetal(loadedSummary, maxBufferLength: UInt64(device.maxBufferLength))
                 var buffers: [UInt32: MTLBuffer] = [:]
                 var mappedGB: Double = 0.0
                 
