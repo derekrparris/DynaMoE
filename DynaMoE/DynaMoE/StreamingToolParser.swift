@@ -249,12 +249,10 @@ public final class StreamingToolParser {
         deltaText: String,
         format: ToolCallFormat = .qwenXML
     ) -> Bool {
-        // Gemma 4 native tool calls close with <tool_call|>; freeze the instant it lands so
-        // the call is parsed and executed instead of running the turn to EOS. Require the
-        // matching Gemma opener too: otherwise any agent-enabled model that merely emits the
-        // literal <tool_call|> in prose or code is frozen as if it had made a Gemma call.
-        if (accumulatedText.contains(Self.gemmaToolCallOpen) || deltaText.contains(Self.gemmaToolCallOpen)),
-           (accumulatedText.contains(Self.gemmaToolCallClose) || deltaText.contains(Self.gemmaToolCallClose)) {
+        // Gemma 4 native tool calls freeze only once a complete, parseable block has
+        // arrived. Checking the opener and closer independently could freeze on a stray
+        // closer in prose followed by a later, incomplete opener that never parses.
+        if !Self.parseGemmaBlocks(in: accumulatedText).isEmpty {
             return true
         }
         switch format {

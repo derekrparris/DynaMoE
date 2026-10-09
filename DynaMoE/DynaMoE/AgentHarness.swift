@@ -3634,6 +3634,27 @@ public final class AgentHarness {
         return out
     }
 
+    /// Gemma tool-call value delimiter. Preserved when replaying native argument text.
+    private static let gemmaValueQuote = "<|\"|>"
+
+    /// Sanitizes replayed native argument text: keeps the value quote delimiter so types
+    /// and quoting survive, but neutralizes every other reserved delimiter so a persisted
+    /// string argument cannot restructure the transcript.
+    static func sanitizeGemmaArguments(_ text: String) -> String {
+        var out = text
+        var changed = true
+        var passes = 0
+        while changed, passes < 8 {
+            changed = false
+            passes += 1
+            for token in Self.gemmaReservedDelimiters where token != Self.gemmaValueQuote && out.contains(token) {
+                out = out.replacingOccurrences(of: token, with: " ")
+                changed = true
+            }
+        }
+        return out
+    }
+
     /// The Gemma response turn interpolates the tool name into its structured header;
     /// keep it to the charset tool names use so a name can never smuggle structure.
     static func sanitizeGemmaToolName(_ name: String) -> String {
@@ -3650,9 +3671,10 @@ public final class AgentHarness {
         let body: String
         if raw.hasPrefix("{") {
             // Preserve the model's original native argument text (bare numbers,
-            // booleans, nested objects, <|"|> quoting) instead of restringifying every
-            // value, which would teach the model schema-invalid argument types.
-            body = raw
+            // booleans, nested objects, quote delimiters) instead of restringifying every
+            // value, but neutralize other reserved delimiters so persisted argument data
+            // cannot restructure the transcript.
+            body = Self.sanitizeGemmaArguments(raw)
         } else {
             let args = arguments.keys.sorted().map { key -> String in
                 let value = Self.sanitizeGemmaToolResponseText(arguments[key] ?? "")

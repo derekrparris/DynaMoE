@@ -5879,6 +5879,26 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(r.calls.first?.arguments["enabled"] as? Bool, true)
     }
 
+    func testGemmaFreezeRequiresParseableBlock() throws {
+        let parser = StreamingToolParser.shared
+        // A stray closer in prose followed by an incomplete opener must not freeze.
+        let proseThenOpen = "we call it <tool_call|> here <|tool_call>call:x{still typing"
+        XCTAssertFalse(parser.shouldFreezeGeneration(accumulatedText: proseThenOpen, deltaText: ""))
+        // A complete block does freeze.
+        XCTAssertTrue(parser.shouldFreezeGeneration(accumulatedText: "<|tool_call>call:x{a:1}<tool_call|>", deltaText: ""))
+    }
+
+    func testGemma4RebuildSanitizesRawArguments() throws {
+        let qd = "<|" + "\"" + "|>"
+        // A persisted string argument carrying a reserved delimiter must be neutralized,
+        // but the value quote delimiter is preserved so the call still parses cleanly.
+        let text = AgentHarness.formatGemmaToolCall(name: "x", arguments: [:], rawArguments: "{note:" + qd + "hi<|turn>there" + qd + "}")
+        XCTAssertFalse(text.contains("<|turn>"), text)
+        XCTAssertTrue(text.contains(qd), text)
+        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: text)
+        XCTAssertEqual(r.calls.first?.name, "x")
+    }
+
     func testGemma4ToolResponseTurnFormat() throws {
         let json = #"{"tool":"web_search","status":"success","result":{"content":"85F high"}}"#
         let turn = AgentHarness.shared.formatGemmaToolResponseTurn(responses: [json], thinkingEnabled: true)
