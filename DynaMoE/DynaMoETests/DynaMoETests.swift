@@ -5881,6 +5881,17 @@ final class DynaMoETests: XCTestCase {
         XCTAssertTrue(text.hasPrefix(#"<|tool_call>call:web_search{limit:<|"|>5<|"|>,query:"#), text)
     }
 
+    func testNormalizeBareNameToolCallsLing() throws {
+        // Ling emits the function name directly after <tool_call> with no <function=...>
+        // wrapper; the bare-name rewrap must still recognize the block and parse it.
+        let raw = "<tool_call>shell_run<arg_key>command</arg_key><arg_value>ls -la</arg_value></tool_call>"
+        let normalized = StreamingToolParser.normalizeBareNameToolCalls(raw)
+        XCTAssertTrue(normalized.contains("<function=shell_run>"), normalized)
+        let calls = StreamingToolParser.shared.parseStreamingToolCalls(from: raw)
+        XCTAssertEqual(calls.calls.first?.name, "shell_run")
+        XCTAssertEqual(calls.calls.first?.arguments["command"] as? String, "ls -la")
+    }
+
     func testGemma4VerbatimAppForward() throws {
         let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--google--gemma-4-26B-A4B-it/snapshots/4d7ae4984b7db7de8f8457170b3f1a419ee76d52"
         guard FileManager.default.fileExists(atPath: snapshotDir) else {

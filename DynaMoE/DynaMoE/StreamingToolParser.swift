@@ -312,7 +312,7 @@ public final class StreamingToolParser {
     /// Truncated blocks (no closing tag) are handled too, since generation may freeze mid-stream.
     public static func normalizeBareNameToolCalls(_ raw: String) -> String {
         guard raw.contains(qwenToolCallOpen) else { return raw }
-            let blockPattern = "<\\|tool_call>([\\s\\S]*?)(<tool_call\\|>)"
+        let blockPattern = "<tool_call>([\\s\\S]*?)(</tool_call>|$)"
         guard let blockRegex = try? NSRegularExpression(pattern: blockPattern, options: []),
               let nameRegex = try? NSRegularExpression(pattern: "^\\s*([A-Za-z_][A-Za-z0-9_.\\-]*)", options: []) else {
             return raw
@@ -909,7 +909,7 @@ public final class StreamingToolParser {
         // 5. Gemma 4 native format: <|tool_call>call:name{key:value,...}<tool_call|>
         if text.contains(Self.gemmaToolCallOpen) {
             var gemmaCalls: [ParsedToolCall] = []
-            let blockPattern = "<\\|tool_call>([\\s\\S]*?)(<tool_call\\|>|$)"
+            let blockPattern = "<\\|tool_call>([\\s\\S]*?)(<tool_call\\|>)"
             if let blockRegex = try? NSRegularExpression(pattern: blockPattern, options: []) {
                 let ns = text as NSString
                 let matches = blockRegex.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length))
