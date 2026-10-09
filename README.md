@@ -15,9 +15,11 @@ This project was undertaken purely for the joy of exploration by someone who is 
 The following AI models have been used to code DynaMoE:
 * Gemini 3.6 Thinking, 3.7 Flash and 3.8 Flash
 * Ling 3.0 Flash Fin Free (Opencode)
+* GLM 5.3
 * GLM 5.3 Flash
 * Big Pickle (Opencode)
 * Deepseek V4.1 Flash
+* Kimi K3
 
 Special thanks and acknowledgement to the open-source projects and research that inspired and influenced this architecture:
 * **JetSpec** (Hao AI Lab / UC San Diego — [arXiv:2606.18394](https://arxiv.org/html/2606.18394v2)): Causal parallel tree drafting and tree-causal attention verification for breakthrough speculative decoding throughput.
@@ -34,8 +36,9 @@ DynaMoE supports sparse Mixture-of-Experts, hybrid recurrent SSM/attention archi
 
 On macOS 26 or later with Apple Intelligence enabled, Apple's built-in **on-device Foundation Model** is also selectable as a zero-install chat backend (plain chat; agent tools, JetSpec, thinking blocks, and KV-cache prefixing are local-weights features that do not apply). It appears in the chat model picker under **System Models**, and it powers `/compact` manual conversation compaction on any backend: a rolling general summary plus a detailed recap of the most recent work replace the evicted history — leaving a blank slate with just the compaction marker — in every later prompt.
 
-**The following models have been tested:**
+**The following models have been tested and should run well in DynaMoE:**
 
+* **Gemma 4 26B A4B**
 * **Ornith 1.5 35B A3B**
 * **Ling 3.0 Tiny**
 * **Qwen 3.8 Flash Next FP8 MoE**
@@ -226,7 +229,7 @@ DynaMoE/
 - [x] Add auto-update capability (Sparkle)
 - [x] MoE streaming bottleneck resolution (speed increase of over 500% compared to previous streaming speed)
 - [x] Support Apple Foundation Models
-- [ ] Use Apple Foundation Model (AFM) to compact conversations
+- [x] Use Apple Foundation Model (AFM) to compact conversations
 - [ ] Configurable YaRN RoPE scaling UI toggle for long-context execution up to 1M tokens.
 - [ ] UI/UX refinement
 

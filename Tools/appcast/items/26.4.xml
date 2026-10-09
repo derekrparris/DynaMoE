@@ -1,29 +1,9 @@
-<!doctype html>
-<!--
-  DynaMoE Sparkle release-notes template
-  ─────────────────────────────────────────
-  Sparkle renders the CDATA description block of each
-  Tools/appcast/items/<version>.xml in a WebView with JavaScript disabled.
-  This template is fully self-contained (inline CSS + inline SVG, no JS, no
-  external requests) and honors the system theme via prefers-color-scheme,
-  so it adapts to Light / Dark / Auto with no extra work.
-
-  Workflow for a new release:
-    1. Copy this file's <style> + <body> content (NOT this comment — it
-       contains CDATA delimiters that would break the appcast XML).
-    2. Edit the tokens marked with "EDIT" below (version, build, notes).
-    3. Paste into the item's CDATA description, replacing the old HTML.
-    4. Run Tools/generate-appcast.sh, then Tools/publish-appcast.sh.
-
-  Preview standalone: open this file in Safari and toggle
-  System Settings > Appearance to see Light / Dark / Auto behavior.
--->
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DynaMoE Release Notes</title>
-<style>
+        <item>
+            <title>Version 26.4</title>
+            <sparkle:version>26.4</sparkle:version>
+            <sparkle:shortVersionString>26.4</sparkle:shortVersionString>
+            <link>https://github.com/derekrparris/DynaMoE/releases/tag/v26.4</link>
+            <description><![CDATA[<style>
   :root {
     color-scheme: light dark;
     --bg: #f2f2f4;
@@ -339,5 +319,12 @@
 
 <p class="fineprint">DynaMoE is an independent open-source inference engine. macOS, Metal, and Apple Silicon are trademarks of Apple Inc. Apache 2.0 licensed.</p>
 
-</body>
-</html>
+</body>]></description>
+            <pubDate>Fri, 09 Oct 2026 19:12:08 +0000</pubDate>
+            <enclosure
+                url="https://github.com/derekrparris/DynaMoE/releases/download/v26.4/DynaMoE-26.4.app.tar.xz"
+                sparkle:edSignature="KJsF1CYTWzWloGJvMvHDJwuv0fwb/Cw/HVpiSomMNn5R+fqBwmSDjOgHUJov0Z/nFtrTQ6UKcf2xs1IoSwC6Aw=="
+                length="5533828"
+                type="application/octet-stream"
+            />
+        </item>
