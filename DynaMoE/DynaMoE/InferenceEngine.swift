@@ -1086,7 +1086,11 @@ public final class InferenceEngine {
                     throw MetalSegmentationError.tensorOutsideSegments(
                         name: t.name, offsetStart: t.offsetStart, offsetEnd: t.offsetEnd)
                 }
-                let singleSpan = alignUp(t.offsetEnd) - alignDown(t.offsetStart)
+                // Mirror flush(): page-round the end but clip it to the shard EOF. A
+                // tensor ending at a non-page-aligned EOF would otherwise compute a span
+                // past the mapped shard and be falsely rejected even though its clipped
+                // segment fits.
+                let singleSpan = min(alignUp(t.offsetEnd), total) - alignDown(t.offsetStart)
                 guard singleSpan <= maxBufferLength else {
                     throw MetalSegmentationError.tensorExceedsBufferLimit(
                         name: t.name, alignedSpanBytes: singleSpan, maxBufferLength: maxBufferLength)

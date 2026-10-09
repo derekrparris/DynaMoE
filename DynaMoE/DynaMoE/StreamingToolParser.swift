@@ -781,6 +781,10 @@ public final class StreamingToolParser {
             if !gemmaFirst.isEmpty {
                 return (calls: gemmaFirst, brokenFragments: [])
             }
+            // An opener is present but no complete block parsed. Do NOT fall through to the
+            // Qwen/Llama parsers, which could reinterpret content inside the incomplete
+            // block as a different protocol and execute it; report the block as broken.
+            return (calls: [], brokenFragments: Self.gemmaBrokenBlocks(in: text))
         }
 
         // 0. Dialect normalization: some models emit native Qwen argument XML inside the
@@ -927,59 +931,85 @@ public final class StreamingToolParser {
         return agentCalls
     }
 
-    /// Parses a Gemma 4 native tool call of the form
-    /// `<|tool_call>call:name{key:value,...}<tool_call|>`. Argument values use Gemma's
-    /// `<|"|>` string delimiter (also tolerates plain quotes), nested `{}`/`[]`, and bare
-    /// literals. A call is only returned once its closing tag has arrived.
-    static func parseGemmaToolCall(_ block: String) -> ParsedToolCall? {
-        var body = block.trimmingCharacters(in: .whitespacesAndNewlines)
-        if body.hasPrefix(gemmaToolCallOpen) {
-            body = String(body.dropFirst(gemmaToolCallOpen.count))
+    /// Parses a Gemma 4 native call that begins at the start of `text` (which must begin
+    /// with the Gemma opener). Consumes the argument object with a quote/container-aware
+    /// scan, then requires the closing tag, so a `<tool_call|>` occurring inside a
+    /// quoted value (for example file content being written) does not truncate the block.
+    /// Returns the call and the number of characters consumed, or nil when no complete
+    /// block starts here.
+    private static func parseGemmaCallPrefix(_ text: String) -> (call: ParsedToolCall, consumed: Int)? {
+        let chars = Array(text)
+        let open = Array(gemmaToolCallOpen)
+        guard chars.count >= open.count, Array(chars[0..<open.count]) == open else { return nil }
+        var i = open.count
+        let callPrefix = Array("call:")
+        if i + callPrefix.count <= chars.count, Array(chars[i..<i + callPrefix.count]) == callPrefix {
+            i += callPrefix.count
         }
-        // A truncated call (no closing tag) only occurs on EOS or the token cap, where
-        // executing partial arguments (a cut-off shell command) is unsafe. Require the
-        // closer before returning a call.
-        guard let closeRange = body.range(of: gemmaToolCallClose) else { return nil }
-        body = String(body[..<closeRange.lowerBound])
-        body = body.trimmingCharacters(in: .whitespacesAndNewlines)
-        if body.hasPrefix("call:") {
-            body = String(body.dropFirst("call:".count))
-        }
-
-        guard let braceIdx = body.firstIndex(of: "{") else {
-            // Name-only call (no arguments).
-            let name = body.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !name.isEmpty, name.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "." || $0 == "-" }) else { return nil }
-            return ParsedToolCall(name: name, arguments: [:], rawArguments: "", rawText: block)
-        }
-
-        let name = String(body[..<braceIdx]).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else { return nil }
-        let argsStr = String(body[braceIdx...])
-        var parser = GemmaArgumentParser(argsStr)
-        // The closing tag does not prove the argument object is complete: an unclosed
-        // quote, brace, or bracket still yields accumulated values. Require the parser
-        // to have closed every quote/container and consumed the whole argument string,
-        // so a truncated command (a half-written shell line) cannot be executed.
-        guard let parsed = parser.parseValue() as? [String: Any], parser.complete, parser.consumedAll else {
-            return nil
-        }
-        return ParsedToolCall(name: name, arguments: parsed, rawArguments: argsStr, rawText: block)
+        let nameStart = i
+        while i < chars.count, chars[i] != "{" { i += 1 }
+        // Require an argument object; a bare name with no object is not executable.
+        guard i < chars.count, chars[i] == "{" else { return nil }
+        let braceIdx = i
+        let name = String(chars[nameStart..<braceIdx]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty,
+              name.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "." || $0 == "-" }) else { return nil }
+        let argsText = String(chars[braceIdx...])
+        var parser = GemmaArgumentParser(argsText)
+        guard let parsed = parser.parseValue() as? [String: Any], parser.complete else { return nil }
+        let argsConsumed = parser.consumedIndex
+        i = braceIdx + argsConsumed
+        while i < chars.count, chars[i].isWhitespace { i += 1 }
+        let close = Array(gemmaToolCallClose)
+        guard i + close.count <= chars.count, Array(chars[i..<i + close.count]) == close else { return nil }
+        i += close.count
+        let call = ParsedToolCall(
+            name: name,
+            arguments: parsed,
+            rawArguments: String(chars[braceIdx..<braceIdx + argsConsumed]),
+            rawText: String(chars[0..<i])
+        )
+        return (call, i)
     }
 
     /// Extracts and parses every complete Gemma 4 native call block in `text`.
     private static func parseGemmaBlocks(in text: String) -> [ParsedToolCall] {
-        let blockPattern = "<\\|tool_call>([\\s\\S]*?)(<tool_call\\|>)"
-        guard let blockRegex = try? NSRegularExpression(pattern: blockPattern, options: []) else { return [] }
-        let ns = text as NSString
         var calls: [ParsedToolCall] = []
-        for m in blockRegex.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length)) {
-            let block = ns.substring(with: m.range(at: 0))
-            if let call = Self.parseGemmaToolCall(block) {
+        var remaining = Substring(text)
+        while let openRange = remaining.range(of: gemmaToolCallOpen) {
+            let candidate = remaining[openRange.lowerBound...]
+            if let (call, consumed) = Self.parseGemmaCallPrefix(String(candidate)) {
                 calls.append(call)
+                remaining = candidate.dropFirst(consumed)
+            } else {
+                remaining = candidate.dropFirst(gemmaToolCallOpen.count)
             }
         }
         return calls
+    }
+
+    /// Raw fragments of Gemma blocks that never parsed (an opener with no complete block),
+    /// reported so an incomplete outer block is surfaced instead of reinterpreted as
+    /// another protocol by the fallback parsers.
+    private static func gemmaBrokenBlocks(in text: String) -> [String] {
+        var fragments: [String] = []
+        var remaining = Substring(text)
+        while let openRange = remaining.range(of: gemmaToolCallOpen) {
+            let candidate = remaining[openRange.lowerBound...]
+            if let (_, consumed) = Self.parseGemmaCallPrefix(String(candidate)) {
+                remaining = candidate.dropFirst(consumed)
+            } else {
+                let after = candidate.dropFirst(gemmaToolCallOpen.count)
+                if let nextOpen = after.range(of: gemmaToolCallOpen) {
+                    fragments.append(String(candidate[..<nextOpen.lowerBound]))
+                    remaining = after[nextOpen.lowerBound...]
+                } else {
+                    fragments.append(String(candidate))
+                    remaining = Substring()
+                }
+            }
+        }
+        return fragments
     }
 
     private func parseLlamaFunctionCall(_ raw: String) -> ParsedToolCall? {
@@ -1032,6 +1062,9 @@ private struct GemmaArgumentParser {
         while idx < chars.count, chars[idx].isWhitespace { idx += 1 }
     }
     private func peek() -> Character? { idx < chars.count ? chars[idx] : nil }
+
+    /// Characters consumed so far; lets a caller resume scanning after a parsed value.
+    var consumedIndex: Int { idx }
 
     /// True when the parser consumed the entire argument string (trailing whitespace aside).
     var consumedAll: Bool {
