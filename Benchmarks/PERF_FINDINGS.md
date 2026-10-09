@@ -2993,3 +2993,108 @@ clearing. The sibling canary tests are not affected: their slot strides
 pairs its compact-layout canary with whole-buffer foreign poison
 (0xDEAD/0xBEEF), so a wrong-source copy there surfaces as poison bytes. All
 three scale/splice regressions re-run green.
+
+---
+
+## FIX #17: GEMMA 4 SLIDING-WINDOW RING KV CACHE (SHIPPED)
+
+**Problem identified.** Gemma 4 26B A4B is 30 layers of which 25 are
+`sliding_attention` (window 1024): those layers only ever attend within
+`window` of the current position, yet the uniform KV layout gave every slot
+`maxSeqLen` positions — 30 x maxSeq x 2048 elements x 2 (K+V) x elemBytes:
+~2.0 GB at an 8k agent sequence, ~8.1 GB at 32k (fp16). The 5 global layers
+are the only ones that ever read deep history. The follow-up note to the
+lazy-commit fix flagged this as the remaining principled cut.
+
+**Design.**
+
+- Ring slots: the 25 sliding slots hold `window + slack` positions (R = 1024
+  + 512 = 1536) addressed `position % R`; the 5 global slots keep the linear
+  `maxSeqLen` layout. `KVCacheManager` now carries per-slot position counts
+  and prefix-sum region bases (empty arrays = the old uniform layout, so
+  every other model's math is byte-identical), plus helpers every dispatch
+  site uses for region/scale byte offsets.
+- All 8 Gemma kernels take a `ringLen` arg (0 = linear): the store and
+  decode families cover fp32/fp16/fp8, and tree verification covers
+  fp32/fp16 only (JetSpec excludes fp8 KV caches). The decode/tree read
+  loops carry a running ring slot with a wrap check, and the fp8 scale
+  index uses the same ring row.
+- JetSpec tree scratch: node k lives at ring slot `(step + k) % R` — it may
+  land on dead prefix rows (positions below the read window) but never on a
+  live window row; the acceptance compaction blit copies ring-mapped rows.
+
+**Invariants (all three are load-bearing; breaking any produces silent
+garbage or races):**
+
+1. **A single store batch must be strictly smaller than ringLen.** An
+   in-batch wrap makes two rows of the same dispatch race on one ring row
+   (measured maxErr 0.73 in a standalone repro; the win is a nondeterministic
+   interleave). Hence the Gemma batched-prefill chunk cap (`gemmaPrefillChunkCap`
+   = 512) and the JetSpec node count (8) both sit well under R - window.
+2. **Ring slack (R - window) must cover the largest prefill chunk and the
+   tree scratch** so in-flight batches never overwrite a row a later row in
+   the same pass still reads.
+3. **Prefix splices validate exactly, not by length.** Every store site
+   records its positions in per-ring-slot last-position bookkeeping
+   (`noteRingStores`); a splice is only taken when every reused row still
+   holds its own position. A turn that ran past the pin boundary and wrapped
+   onto a needed row rejects the splice and takes a full re-prefill (the
+   same policy as the GDN "cannot rewind" rule) — this also covers failed
+   turns and precision/layout changes, where a length check would happily
+   splice clobbered rows. The preserve itself relocates only the last
+   `window` rows, ring-mapped, for K/V and FP8 scales alike.
+
+**Memory (fp16, gemmaKvStride 2048, 25+5 slots).** 8k agent sequence:
+25x1536 + 5x8192 positions = ~650 MB vs ~2.0 GB uniform (~1.36 GB cut);
+32k: ~1.66 GB vs ~8.06 GB (~6.4 GB cut); fp8 halves both. The transient
+per-call prefill buffers also stop scaling with the whole delta prompt
+(~250 KB/token): the chunked prefill caps them at ~128 MB.
+
+**Bugs caught by the new tests before shipping:** the ring preserve
+relocation initially added position-count bases to byte offsets (only
+slot 0's zero base masked it; the layout test's canary rows caught the
+shifted copies), and the first kernel-equivalence draft fed an 8-token
+batch into a 6-row ring, racing the batch with itself.
+
+**Tests.** `testGemma4SlidingRingKVLayoutAndPrefixValidation` (layout sums,
+uniform fallback, bookkeeping accept/reject around a wrap, preserved-reset
+relocation of exactly the live rows, bookkeeping surviving the splice);
+`testGemma4SlidingRingKernelEquivalence` (ring vs linear caches: wrapped
+store placement, decode through a wrapped window, tree verify whose node
+slots reuse dead rows, chunked-prefill batch store + per-row attention —
+all maxErr 0.0); the FIX #12 splice-canary trio re-run green byte-exact;
+the real-model Gemma suite (`testGemma4VerbatimAppForward`,
+`testGemma4BatchedPrefillMatchesReference` incl. fp8, `testGemma4PromptAndGeneration`)
+re-run green. `testKVCacheManagerPrefixPreservation`'s stale tail-zeroing
+assertions (obsolete since the lazy-commit fix removed the tail fill) were
+updated to pin the retained-tail behavior.
+
+**Follow-up (shipped same day): chunked FP8 prefill died at chunk 3 + retried
+forever.** Live run on the 16 GB machine, fresh 3071-token prompt at FP8:
+chunks 1-2 (positions 0..<1024) passed, chunk 3 (1024..<1536) failed with no
+`❌ [METAL ERROR]` line, and the agent loop kept restarting the generation
+(full re-prefill each time) — "prefill looping over again." Root cause: every
+chunk re-allocated the full per-call transient set — dominated by the
+double-buffered expert staging (2 x 128 slots x 11.9 MB = 3.05 GB) — while the
+budget-capped weight residency grew toward its cap; by the third cycle
+`device.makeBuffer` returned nil and the big per-call `guard` failed silently.
+(The ring kernels themselves are exact through chunk 3: a standalone repro at
+real dims — W=1024, R=1536, kvStride=2048, sliding ring + global linear, FP8
+store/decode — matched the linear cache with maxDiff 0.0 and no Metal errors.)
+
+Fix: `PrefillTransientPool` — every per-call transient in
+`runLayerWisePrefill` now comes from a named pool that allocates once per
+prefill (first chunk, while residency is still low) and is reused across
+chunks; the generation loop drains it the moment prefill completes or fails,
+so the decode phase never holds the staging. The allocation-per-chunk profile
+is now one allocation per prefill (the pre-chunking profile) while the P-sized
+buffers stay bounded by the chunk cap. Every previously-silent guard on the
+path (the pooled buffer guard, the embed/Phase A/Phase B command-buffer
+guards) now prints a named diagnostic, so any recurrence is identifiable from
+the console. Test: `testPrefillTransientPoolReuseAndDrain` pins the
+reuse/grow/drain contract.
+
+Note for future runs: a `❌ [PREFILL] transient buffer '...' failed to
+allocate` line means the budget-capped residency plus staging genuinely
+exceeds the machine — lower the memory budget mode (8 GB => 5.5 GB cap) or
+the model's resident set, not the chunking.

@@ -14,6 +14,17 @@ public enum ToolCallFormat: String, CaseIterable, Codable {
     case qwenXML = "qwen_xml"
     case hermeticJSON = "hermetic_json"
     case llama3 = "llama_3"
+    case gemma = "gemma_native"
+
+    /// The tool-call dialect the active model emits. Gemma 4 uses its own native
+    /// `<|tool_call>call:name{...}<tool_call|>` protocol; every other supported family
+    /// (Qwen, Ling/Bailing, Spark, Llama 3) is handled by the canonical XML/JSON path.
+    /// Detection must be explicit: scanning every stream for Gemma markers lets a
+    /// Qwen/Llama argument that merely contains a literal Gemma block be reinterpreted
+    /// and executed as a different tool.
+    public static func forModel(isGemma4: Bool) -> ToolCallFormat {
+        isGemma4 ? .gemma : .qwenXML
+    }
 }
 
 public final class StreamingToolParser {
@@ -26,6 +37,11 @@ public final class StreamingToolParser {
     public static let qwenFunctionClose = "</function>"
     public static let llamaTagOpen = "<|python_tag|>"
     public static let llamaTagClose = "</|python_tag|>"
+    // Gemma 4 native tool call: <|tool_call>call:name{key:value,...}<tool_call|>
+    public static let gemmaToolCallOpen = "<|tool_call>"
+    public static let gemmaToolCallClose = "<tool_call|>"
+    // Gemma 4 string-quote delimiter used inside tool-call arguments.
+    fileprivate static let gemmaQuote = "<|\"|>"
 
     // Parameter/argument value spans: tag-like text inside them is data, not structure.
     private static let parameterOpen = "<parameter="
@@ -245,6 +261,14 @@ public final class StreamingToolParser {
         format: ToolCallFormat = .qwenXML
     ) -> Bool {
         switch format {
+        case .gemma:
+            // Gemma 4 native tool calls freeze only once a complete, parseable block has
+            // arrived. Checking the opener and closer independently could freeze on a stray
+            // closer in prose followed by a later, incomplete opener that never parses.
+            // Gated on the active dialect so a Qwen/Llama argument carrying a literal Gemma
+            // block cannot freeze generation before its own outer call closes.
+            return !Self.parseGemmaBlocks(in: accumulatedText).isEmpty
+
         case .qwenXML:
             // Check if </tool_call> has been closed
             if accumulatedText.contains(Self.qwenToolCallClose) || deltaText.contains(Self.qwenToolCallClose) {
@@ -761,6 +785,23 @@ public final class StreamingToolParser {
         from text: String,
         format: ToolCallFormat = .qwenXML
     ) -> (calls: [ParsedToolCall], brokenFragments: [String]) {
+        // Gemma 4 native blocks are parsed FIRST when the active model uses that dialect:
+        // a Gemma string argument can contain text that resembles another protocol, which
+        // the dialect normalization and the earlier parsers below would otherwise claim.
+        // Parsing the outer Gemma block first keeps argument data from being reinterpreted
+        // as a different tool protocol. Gated on the active dialect so a Qwen/Llama
+        // argument that merely contains a literal Gemma block is not claimed here.
+        if format == .gemma, text.contains(Self.gemmaToolCallOpen) {
+            let gemmaFirst = Self.parseGemmaBlocks(in: text)
+            if !gemmaFirst.isEmpty {
+                return (calls: gemmaFirst, brokenFragments: [])
+            }
+            // An opener is present but no complete block parsed. Do NOT fall through to the
+            // Qwen/Llama parsers, which could reinterpret content inside the incomplete
+            // block as a different protocol and execute it; report the block as broken.
+            return (calls: [], brokenFragments: Self.gemmaBrokenBlocks(in: text))
+        }
+
         // 0. Dialect normalization: some models emit native Qwen argument XML inside the
         //    function body using <arg_key>k</arg_key> / <arg_value>v</arg_value> pairs instead
         //    of the internal <parameter=k>v</parameter> form. Rewrite those into canonical
@@ -893,7 +934,100 @@ public final class StreamingToolParser {
             }
         }
 
+        // 5. Gemma 4 native format (already tried first on the raw text when the active
+        //    dialect is Gemma; retry on the normalized text in case normalization revealed
+        //    a complete block). Gated on the active dialect for the same reason as above.
+        if format == .gemma, text.contains(Self.gemmaToolCallOpen) {
+            let gemmaCalls = Self.parseGemmaBlocks(in: text)
+            if !gemmaCalls.isEmpty {
+                return (calls: gemmaCalls, brokenFragments: [])
+            }
+        }
+
         return agentCalls
+    }
+
+    /// Parses a Gemma 4 native call that begins at the start of `text` (which must begin
+    /// with the Gemma opener). Consumes the argument object with a quote/container-aware
+    /// scan, then requires the closing tag, so a `<tool_call|>` occurring inside a
+    /// quoted value (for example file content being written) does not truncate the block.
+    /// Returns the call and the number of characters consumed, or nil when no complete
+    /// block starts here.
+    private static func parseGemmaCallPrefix(_ text: String) -> (call: ParsedToolCall, consumed: Int)? {
+        let chars = Array(text)
+        let open = Array(gemmaToolCallOpen)
+        guard chars.count >= open.count, Array(chars[0..<open.count]) == open else { return nil }
+        var i = open.count
+        let callPrefix = Array("call:")
+        if i + callPrefix.count <= chars.count, Array(chars[i..<i + callPrefix.count]) == callPrefix {
+            i += callPrefix.count
+        }
+        let nameStart = i
+        while i < chars.count, chars[i] != "{" { i += 1 }
+        // Require an argument object; a bare name with no object is not executable.
+        guard i < chars.count, chars[i] == "{" else { return nil }
+        let braceIdx = i
+        let name = String(chars[nameStart..<braceIdx]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty,
+              name.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "." || $0 == "-" }) else { return nil }
+        let argsText = String(chars[braceIdx...])
+        var parser = GemmaArgumentParser(argsText)
+        guard let parsed = parser.parseValue() as? [String: Any], parser.complete else { return nil }
+        let argsConsumed = parser.consumedIndex
+        i = braceIdx + argsConsumed
+        while i < chars.count, chars[i].isWhitespace { i += 1 }
+        let close = Array(gemmaToolCallClose)
+        guard i + close.count <= chars.count, Array(chars[i..<i + close.count]) == close else { return nil }
+        i += close.count
+        let call = ParsedToolCall(
+            name: name,
+            arguments: parsed,
+            rawArguments: String(chars[braceIdx..<braceIdx + argsConsumed]),
+            rawText: String(chars[0..<i])
+        )
+        return (call, i)
+    }
+
+    /// Extracts and parses every complete Gemma 4 native call block in `text`.
+    private static func parseGemmaBlocks(in text: String) -> [ParsedToolCall] {
+        var calls: [ParsedToolCall] = []
+        var remaining = Substring(text)
+        while let openRange = remaining.range(of: gemmaToolCallOpen) {
+            let candidate = remaining[openRange.lowerBound...]
+            if let (call, consumed) = Self.parseGemmaCallPrefix(String(candidate)) {
+                calls.append(call)
+                remaining = candidate.dropFirst(consumed)
+            } else {
+                // A malformed opener stops the scan: advancing past it would let a nested
+                // opener inside the incomplete block be parsed as a top-level call.
+                break
+            }
+        }
+        return calls
+    }
+
+    /// Raw fragments of Gemma blocks that never parsed (an opener with no complete block),
+    /// reported so an incomplete outer block is surfaced instead of reinterpreted as
+    /// another protocol by the fallback parsers.
+    private static func gemmaBrokenBlocks(in text: String) -> [String] {
+        var fragments: [String] = []
+        var remaining = Substring(text)
+        while let openRange = remaining.range(of: gemmaToolCallOpen) {
+            let candidate = remaining[openRange.lowerBound...]
+            if let (_, consumed) = Self.parseGemmaCallPrefix(String(candidate)) {
+                remaining = candidate.dropFirst(consumed)
+            } else {
+                let after = candidate.dropFirst(gemmaToolCallOpen.count)
+                if let nextOpen = after.range(of: gemmaToolCallOpen) {
+                    fragments.append(String(candidate[..<nextOpen.lowerBound]))
+                    remaining = after[nextOpen.lowerBound...]
+                } else {
+                    fragments.append(String(candidate))
+                    remaining = Substring()
+                }
+            }
+        }
+        return fragments
     }
 
     private func parseLlamaFunctionCall(_ raw: String) -> ParsedToolCall? {
@@ -926,5 +1060,178 @@ public final class StreamingToolParser {
         }
 
         return ParsedToolCall(name: fnName, arguments: parsedArgs, rawArguments: argsStr, rawText: trimmed)
+    }
+}
+
+/// Recursive-descent parser for Gemma 4 tool-call argument bodies: a `{key:value,...}`
+/// object using `<|"|>` string delimiters (plain quotes also tolerated), nested
+/// `{}`/`[]`, and bare numbers/booleans/null. Values are returned as JSON-compatible
+/// Foundation types so downstream argument coercion behaves like the other formats.
+private struct GemmaArgumentParser {
+    private let chars: [Character]
+    private var idx = 0
+    /// False once any quote or container reached the end of input without closing.
+    /// A tool call is only executable when the whole argument body parsed cleanly.
+    var complete = true
+
+    init(_ text: String) { chars = Array(text) }
+
+    private mutating func skipWhitespace() {
+        while idx < chars.count, chars[idx].isWhitespace { idx += 1 }
+    }
+    private func peek() -> Character? { idx < chars.count ? chars[idx] : nil }
+
+    /// Characters consumed so far; lets a caller resume scanning after a parsed value.
+    var consumedIndex: Int { idx }
+
+    /// True when the parser consumed the entire argument string (trailing whitespace aside).
+    var consumedAll: Bool {
+        var i = idx
+        while i < chars.count, chars[i].isWhitespace { i += 1 }
+        return i >= chars.count
+    }
+
+    private func matches(_ token: String) -> Bool {
+        let t = Array(token)
+        guard idx + t.count <= chars.count else { return false }
+        for k in 0..<t.count where chars[idx + k] != t[k] { return false }
+        return true
+    }
+
+    mutating func parseValue() -> Any? {
+        skipWhitespace()
+        guard let c = peek() else { return nil }
+        if c == "{" { return parseObject() }
+        if c == "[" { return parseArray() }
+        if matches(StreamingToolParser.gemmaQuote) { return parseGemmaQuoted() }
+        if c == "\"" || c == "'" { return parseQuoted(quote: c) }
+        return parseBare()
+    }
+
+    private mutating func parseGemmaQuoted() -> String {
+        idx += StreamingToolParser.gemmaQuote.count
+        var out = ""
+        var closed = false
+        while idx < chars.count {
+            if matches(StreamingToolParser.gemmaQuote) {
+                idx += StreamingToolParser.gemmaQuote.count
+                closed = true
+                break
+            }
+            out.append(chars[idx]); idx += 1
+        }
+        if !closed { complete = false }
+        return out
+    }
+
+    private mutating func parseQuoted(quote: Character) -> String {
+        idx += 1
+        var out = ""
+        var closed = false
+        while idx < chars.count {
+            let ch = chars[idx]
+            if ch == "\\", idx + 1 < chars.count {
+                let next = chars[idx + 1]
+                switch next {
+                case "n": out.append("\n")
+                case "t": out.append("\t")
+                case "r": out.append("\r")
+                case "\\": out.append("\\")
+                case "\"": out.append("\"")
+                case "'": out.append("'")
+                // Unknown escape: keep the backslash so a literal path or command
+                // (e.g. a regex \d) is not silently altered when executed.
+                default: out.append("\\"); out.append(next)
+                }
+                idx += 2
+                continue
+            }
+            if ch == quote { idx += 1; closed = true; break }
+            out.append(ch); idx += 1
+        }
+        if !closed { complete = false }
+        return out
+    }
+
+    private mutating func parseObject() -> [String: Any] {
+        var obj: [String: Any] = [:]
+        idx += 1 // consume '{'
+        var closed = false
+        while idx < chars.count {
+            skipWhitespace()
+            if idx >= chars.count { break }
+            if chars[idx] == "}" { idx += 1; closed = true; break }
+            let key: String
+            if chars[idx] == "\"" || chars[idx] == "'" { key = parseQuoted(quote: chars[idx]) }
+            else if matches(StreamingToolParser.gemmaQuote) { key = parseGemmaQuoted() }
+            else { key = parseBareKey() }
+            skipWhitespace()
+            // Require the colon separator and a value that advances the cursor: an
+            // object such as `{command "x"}` or `{command:}` is malformed and must not
+            // count as a clean parse, or malformed output could execute.
+            guard peek() == ":" else { complete = false; break }
+            idx += 1
+            skipWhitespace()
+            let valueStart = idx
+            guard let value = parseValue(), idx > valueStart else { complete = false; break }
+            if !key.isEmpty { obj[key] = value }
+            skipWhitespace()
+            if peek() == "," { idx += 1; continue }
+            if peek() == "}" { idx += 1; closed = true; break }
+            // Any other separator (a stray token, `;`, etc.) means the object is
+            // malformed: mark it incomplete so it cannot execute.
+            complete = false
+            break
+        }
+        if !closed { complete = false }
+        return obj
+    }
+
+    private mutating func parseArray() -> [Any] {
+        var arr: [Any] = []
+        idx += 1 // consume '['
+        var closed = false
+        while idx < chars.count {
+            skipWhitespace()
+            if idx >= chars.count { break }
+            if chars[idx] == "]" { idx += 1; closed = true; break }
+            let valueStart = idx
+            guard let value = parseValue(), idx > valueStart else { complete = false; break }
+            arr.append(value)
+            skipWhitespace()
+            if peek() == "," { idx += 1; continue }
+            if peek() == "]" { idx += 1; closed = true; break }
+            // Any other separator means the array is malformed.
+            complete = false
+            break
+        }
+        if !closed { complete = false }
+        return arr
+    }
+
+    private mutating func parseBareKey() -> String {
+        var out = ""
+        while idx < chars.count {
+            let c = chars[idx]
+            if c == ":" || c == "," || c == "}" || c == "{" || c.isWhitespace { break }
+            out.append(c); idx += 1
+        }
+        return out
+    }
+
+    private mutating func parseBare() -> Any {
+        var out = ""
+        while idx < chars.count {
+            let c = chars[idx]
+            if c == "," || c == "}" || c == "]" { break }
+            out.append(c); idx += 1
+        }
+        let token = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        if token == "true" { return true }
+        if token == "false" { return false }
+        if token == "null" { return NSNull() }
+        if let intValue = Int(token) { return intValue }
+        if let doubleValue = Double(token) { return doubleValue }
+        return token
     }
 }

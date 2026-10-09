@@ -289,8 +289,12 @@ public class LocalModelManager: ObservableObject {
             rawModelType = json["model_type"] as? String
             let archs = json["architectures"] as? [String] ?? []
             let archString = archs.first ?? rawModelType ?? ""
+            // Gemma 4 nests the decoder config (experts, layers, model_type) under "text_config".
+            let textConfig = json["text_config"] as? [String: Any]
+            let textType = (textConfig?["model_type"] as? String) ?? ""
+            let archLower = archString.lowercased()
 
-            if let numExperts = json["num_experts"] as? Int ?? json["n_routed_experts"] as? Int ?? json["num_local_experts"] as? Int {
+            if let numExperts = json["num_experts"] as? Int ?? json["n_routed_experts"] as? Int ?? json["num_local_experts"] as? Int ?? textConfig?["num_experts"] as? Int {
                 isMoE = true
                 expertCount = numExperts
             }
@@ -299,7 +303,10 @@ public class LocalModelManager: ObservableObject {
                 isMoE = true
             }
 
-            if archString.localizedCaseInsensitiveContains("qwen3_5") || archString.localizedCaseInsensitiveContains("ornith") || (rawModelType?.localizedCaseInsensitiveContains("qwen3_5") ?? false) || (rawModelType?.localizedCaseInsensitiveContains("ornith") ?? false) {
+            let isGemma4 = archLower.contains("gemma4") || (rawModelType?.localizedCaseInsensitiveContains("gemma4") ?? false) || textType.localizedCaseInsensitiveContains("gemma4")
+            if isGemma4 {
+                architectureName = isMoE ? "Gemma 4 Hybrid Attention MoE" : "Gemma 4 Hybrid Attention"
+            } else if archString.localizedCaseInsensitiveContains("qwen3_5") || archString.localizedCaseInsensitiveContains("ornith") || (rawModelType?.localizedCaseInsensitiveContains("qwen3_5") ?? false) || (rawModelType?.localizedCaseInsensitiveContains("ornith") ?? false) {
                 architectureName = isMoE ? "Hybrid SSM-MoE" : "Hybrid SSM-Dense"
             } else if archString.localizedCaseInsensitiveContains("nanbeige") {
                 architectureName = isMoE ? "Dense/MoE Transformer" : "Nanbeige Transformer"

@@ -5532,6 +5532,3158 @@ final class DynaMoETests: XCTestCase {
         print("✅ [TEST] RMSNorm unit offset and output gate rules verified cleanly.")
     }
 
+    func testGemma4ConfigParsing() throws {
+        // Gemma 4 nests the decoder config under "text_config" and uses standard
+        // RMSNorm (x * weight), unlike Gemma 2/3 which use unit-offset weights.
+        let json = """
+        {
+          "architectures": ["Gemma4ForConditionalGeneration"],
+          "model_type": "gemma4",
+          "text_config": {
+            "model_type": "gemma4_text",
+            "hidden_size": 2816,
+            "num_hidden_layers": 30,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "head_dim": 256,
+            "global_head_dim": 512,
+            "num_global_key_value_heads": 2,
+            "attention_k_eq_v": true,
+            "intermediate_size": 2112,
+            "moe_intermediate_size": 704,
+            "num_experts": 128,
+            "top_k_experts": 8,
+            "enable_moe_block": true,
+            "hidden_activation": "gelu_pytorch_tanh",
+            "final_logit_softcapping": 30.0,
+            "sliding_window": 1024,
+            "rms_norm_eps": 1e-06,
+            "vocab_size": 262144,
+            "layer_types": ["sliding_attention", "sliding_attention", "full_attention"],
+            "rope_parameters": {
+              "full_attention": {"rope_type": "proportional", "rope_theta": 1000000.0, "partial_rotary_factor": 0.25},
+              "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0}
+            }
+          }
+        }
+        """.data(using: .utf8)!
+
+        let config = try JSONDecoder().decode(ModelConfig.self, from: json)
+        XCTAssertTrue(config.isGemma4Model, "gemma4 must be detected from the nested text_config")
+        XCTAssertFalse(config.isRMSNormUnitOffset, "Gemma 4 uses standard RMSNorm (x * weight), not unit-offset")
+        XCTAssertEqual(config.effectiveHiddenSize, 2816)
+        XCTAssertEqual(config.effectiveNumExperts, 128)
+        XCTAssertEqual(config.effectiveNumExpertsPerTok, 8)
+        XCTAssertTrue(config.isMoE)
+        XCTAssertEqual(config.effectiveGlobalHeadDim, 512)
+        XCTAssertEqual(config.effectiveNumGlobalKeyValueHeads, 2)
+        XCTAssertTrue(config.effectiveAttentionKEqV)
+        XCTAssertEqual(config.effectiveMoeIntermediateSize, 704)
+        XCTAssertEqual(config.effectiveSlidingWindow, 1024)
+        XCTAssertEqual(config.effectiveFinalLogitSoftcapping, 30.0)
+        XCTAssertTrue(config.isGeluActivation)
+
+        // Per-layer attention type: sliding layers are real full attention with a window.
+        let attnTypes = config.resolveLayerAttentionTypes(totalLayers: 3)
+        XCTAssertTrue(attnTypes.allSatisfy { $0 == .fullAttention }, "Gemma 4 sliding/full layers are all full-attention (windowed)")
+
+        // RoPE: sliding layers use full rotary over head_dim; global layers use p-RoPE (0.25).
+        XCTAssertEqual(config.effectiveRotaryDim(layerIndex: 0, headDim: 256), 256, "Sliding layers use full rotary over head_dim")
+        XCTAssertEqual(config.effectiveRotaryDim(layerIndex: 2, headDim: 512), 128, "Global layers rotate 0.25 * global_head_dim")
+
+        // The per-layer-type rope_parameters (nested one level deeper under text_config)
+        // are populated by the file loader, so exercise that path for the theta check.
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("gemma4_test_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let configUrl = tmpDir.appendingPathComponent("config.json")
+        try json.write(to: configUrl)
+        let loaded = ModelConfig.load(fromFilePath: configUrl.path)
+        XCTAssertNotNil(loaded?.ropeParametersByLayerType, "Nested text_config rope_parameters must be decoded")
+        XCTAssertEqual(loaded?.effectiveRopeTheta(layerIndex: 0), 10000.0)
+        XCTAssertEqual(loaded?.effectiveRopeTheta(layerIndex: 2), 1000000.0)
+
+        print("✅ [TEST] Gemma 4 config parsing verified.")
+    }
+
+    func testGemma4RotaryDimHonorsConfigFactor() throws {
+        // A Gemma config whose global partial_rotary_factor differs from the 0.25 default
+        // must drive the proportional RoPE dimension instead of the hard-coded fallback.
+        let json = """
+        {
+          "architectures": ["Gemma4ForConditionalGeneration"],
+          "model_type": "gemma4",
+          "text_config": {
+            "model_type": "gemma4_text",
+            "head_dim": 256,
+            "global_head_dim": 512,
+            "partial_rotary_factor": 0.5,
+            "layer_types": ["full_attention"]
+          }
+        }
+        """.data(using: .utf8)!
+        let config = try JSONDecoder().decode(ModelConfig.self, from: json)
+        XCTAssertTrue(config.isGemma4Model)
+        XCTAssertEqual(config.effectiveRotaryDim(layerIndex: 0, headDim: 512), 256,
+                       "Global layers must honor the configured partial rotary factor, not 0.25")
+    }
+
+    func testShardSegmentationForMetal() throws {
+        // A shard larger than the device's maxBufferLength (e.g. Gemma 4's 46 GB shard on
+        // an 8.88 GB-limit GPU) must be split into page-aligned segments, with every
+        // tensor remapped into the segment that fully contains it.
+        let maxBufferLength: UInt64 = 8 << 30
+        let shardLength: UInt64 = 20 << 30
+        let shardBase: UInt64 = 0x1_0000_0000
+        let shards = [ShardMetadata(index: 0, filename: "big.safetensors", baseAddress: shardBase, length: shardLength)]
+
+        var tensors: [TensorMetadata] = []
+        var offset: UInt64 = 0
+        for i in 0..<10 {
+            let size: UInt64 = 1 << 30
+            tensors.append(TensorMetadata(
+                name: "model.layers.\(i).weight",
+                shapeDisplay: "[]", dtype: "BF16", sizeMb: 1024,
+                shardIndex: 0, offsetStart: offset, offsetEnd: offset + size,
+                category: "Other", layerIndex: UInt32(i), expertId: nil
+            ))
+            offset += size + 12345  // small gaps keep offsets non-page-aligned
+        }
+        let summary = ModelSummary(sizeGb: 20, tensorCount: UInt32(tensors.count), layerCount: 10, maxExpertId: 0, shards: shards, tensors: tensors, layers: [])
+
+        let segmented = try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: maxBufferLength)
+
+        XCTAssertGreaterThan(segmented.shards.count, 1, "Oversized shard must be split into multiple buffers")
+        XCTAssertEqual(segmented.tensors.count, tensors.count, "Every tensor must survive segmentation")
+
+        for shard in segmented.shards {
+            XCTAssertLessThanOrEqual(shard.length, maxBufferLength, "Segment must fit in one Metal buffer")
+            XCTAssertEqual(shard.baseAddress % UInt64(vm_page_size), 0, "Zero-copy buffer base must be page-aligned")
+        }
+
+        for (i, t) in segmented.tensors.enumerated() {
+            guard let shard = segmented.shards.first(where: { $0.index == t.shardIndex }) else {
+                XCTFail("Tensor \(i) points at a missing segment")
+                continue
+            }
+            XCTAssertLessThanOrEqual(t.offsetEnd, shard.length, "Tensor \(i) must not straddle two segments")
+            // The remapped (base + offset) must reproduce the original absolute address.
+            XCTAssertEqual(shard.baseAddress + t.offsetStart, shardBase + tensors[i].offsetStart, "Tensor \(i) address must be preserved")
+        }
+
+        print("✅ [TEST] Shard segmentation verified.")
+    }
+
+    func testShardSegmentationClipsSpanAtShardEOF() throws {
+        // A tensor ending at a non-page-aligned shard EOF: its unclipped span exceeds the
+        // limit but its EOF-clipped segment fits, so it must not be falsely rejected.
+        let page = UInt64(vm_page_size)
+        let shardLength: UInt64 = 2 * page - 100
+        let maxBufferLength: UInt64 = shardLength - page
+        let shards = [ShardMetadata(index: 0, filename: "edge.safetensors", baseAddress: 0x1_0000_0000, length: shardLength)]
+        let tensors = [TensorMetadata(
+            name: "tail.weight",
+            shapeDisplay: "[]", dtype: "BF16", sizeMb: 1,
+            shardIndex: 0, offsetStart: page, offsetEnd: shardLength,
+            category: "Other", layerIndex: 0, expertId: nil
+        )]
+        let summary = ModelSummary(sizeGb: 1, tensorCount: 1, layerCount: 1, maxExpertId: 0, shards: shards, tensors: tensors, layers: [])
+
+        let segmented = try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: maxBufferLength)
+        for shard in segmented.shards {
+            XCTAssertLessThanOrEqual(shard.length, maxBufferLength, "EOF-clipped segment must fit")
+        }
+    }
+
+    func testShardSegmentationRejectsOversizedTensor() throws {
+        // A single tensor whose page-aligned span exceeds maxBufferLength cannot be
+        // contained by any segment. Segmentation must fail the load rather than emit an
+        // oversized segment that the loader would silently skip.
+        let maxBufferLength: UInt64 = 1 << 30
+        let shards = [ShardMetadata(index: 0, filename: "big.safetensors", baseAddress: 0x1_0000_0000, length: 4 << 30)]
+        let tensors = [TensorMetadata(
+            name: "model.embed_tokens.weight",
+            shapeDisplay: "[]", dtype: "BF16", sizeMb: 2048,
+            shardIndex: 0, offsetStart: 0, offsetEnd: (2 << 30),
+            category: "Other", layerIndex: 0, expertId: nil
+        )]
+        let summary = ModelSummary(sizeGb: 4, tensorCount: 1, layerCount: 1, maxExpertId: 0, shards: shards, tensors: tensors, layers: [])
+
+        XCTAssertThrowsError(try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: maxBufferLength)) { error in
+            guard case MetalSegmentationError.tensorExceedsBufferLimit(let name, _, _) = error else {
+                return XCTFail("Expected tensorExceedsBufferLimit, got \(error)")
+            }
+            XCTAssertEqual(name, "model.embed_tokens.weight")
+        }
+    }
+
+    func testShardSegmentationRejectsTensorOutsideSegments() throws {
+        // A corrupt manifest can place tensor offsets beyond the shard; segmentation
+        // must reject it rather than fall back to the last segment (which underflows or
+        // addresses bytes outside the mapped buffer).
+        let maxBufferLength: UInt64 = 2 << 30
+        let shardLength: UInt64 = 3 << 30
+        let shards = [ShardMetadata(index: 0, filename: "big.safetensors", baseAddress: 0x1_0000_0000, length: shardLength)]
+        let tensors = [TensorMetadata(
+            name: "model.tie.weight",
+            shapeDisplay: "[]", dtype: "BF16", sizeMb: 1,
+            shardIndex: 0, offsetStart: shardLength - 1024, offsetEnd: shardLength + 1024,
+            category: "Other", layerIndex: 0, expertId: nil
+        )]
+        let summary = ModelSummary(sizeGb: 3, tensorCount: 1, layerCount: 1, maxExpertId: 0, shards: shards, tensors: tensors, layers: [])
+
+        XCTAssertThrowsError(try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: maxBufferLength)) { error in
+            guard case MetalSegmentationError.tensorOutsideSegments = error else {
+                return XCTFail("Expected tensorOutsideSegments, got \(error)")
+            }
+        }
+    }
+
+    func testShardSegmentationRejectsInvertedRange() throws {
+        // A malformed manifest with offsetEnd < offsetStart must fail with the named load
+        // error, not trap on the unsigned alignment subtraction.
+        let maxBufferLength: UInt64 = 2 << 30
+        let shards = [ShardMetadata(index: 0, filename: "big.safetensors", baseAddress: 0x1_0000_0000, length: 3 << 30)]
+        let tensors = [TensorMetadata(
+            name: "bad.inverted",
+            shapeDisplay: "[]", dtype: "BF16", sizeMb: 1,
+            shardIndex: 0, offsetStart: 1 << 20, offsetEnd: (1 << 20) - 1,
+            category: "Other", layerIndex: 0, expertId: nil
+        )]
+        let summary = ModelSummary(sizeGb: 3, tensorCount: 1, layerCount: 1, maxExpertId: 0, shards: shards, tensors: tensors, layers: [])
+
+        XCTAssertThrowsError(try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: maxBufferLength)) { error in
+            guard case MetalSegmentationError.tensorOutsideSegments = error else {
+                return XCTFail("Expected tensorOutsideSegments, got \(error)")
+            }
+        }
+    }
+
+    func testShardSegmentationRejectsUnknownShard() throws {
+        // A tensor whose shardIndex is not in the summary must fail the load, not pass
+        // through unmapped (no buffer exists for that index).
+        let maxBufferLength: UInt64 = 2 << 30
+        let shards = [ShardMetadata(index: 0, filename: "big.safetensors", baseAddress: 0x1_0000_0000, length: 3 << 30)]
+        let tensors = [TensorMetadata(
+            name: "ghost.weight",
+            shapeDisplay: "[]", dtype: "BF16", sizeMb: 1,
+            shardIndex: 7, offsetStart: 0, offsetEnd: 1024,
+            category: "Other", layerIndex: 0, expertId: nil
+        )]
+        let summary = ModelSummary(sizeGb: 3, tensorCount: 1, layerCount: 1, maxExpertId: 0, shards: shards, tensors: tensors, layers: [])
+
+        XCTAssertThrowsError(try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: maxBufferLength)) { error in
+            guard case MetalSegmentationError.unknownShardIndex = error else {
+                return XCTFail("Expected unknownShardIndex, got \(error)")
+            }
+        }
+    }
+
+    func testRejectsInvalidTensorWhenNoShardNeedsSegmentation() throws {
+        // No shard exceeds the buffer limit, so segmentation is skipped; the manifest
+        // must still be validated (here an unknown shard).
+        let maxBufferLength: UInt64 = 8 << 30
+        let shards = [ShardMetadata(index: 0, filename: "small.safetensors", baseAddress: 0x1_0000_0000, length: 1 << 30)]
+        let tensors = [TensorMetadata(
+            name: "ghost.weight",
+            shapeDisplay: "[]", dtype: "BF16", sizeMb: 1,
+            shardIndex: 9, offsetStart: 0, offsetEnd: 1024,
+            category: "Other", layerIndex: 0, expertId: nil
+        )]
+        let summary = ModelSummary(sizeGb: 1, tensorCount: 1, layerCount: 1, maxExpertId: 0, shards: shards, tensors: tensors, layers: [])
+
+        XCTAssertThrowsError(try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: maxBufferLength)) { error in
+            guard case MetalSegmentationError.unknownShardIndex = error else {
+                return XCTFail("Expected unknownShardIndex, got \(error)")
+            }
+        }
+    }
+
+    func testGemma4LayerTensorResolution() throws {
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--google--gemma-4-26B-A4B-it/snapshots/4d7ae4984b7db7de8f8457170b3f1a419ee76d52"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            print("Gemma 4 snapshot not found, skipping.")
+            return
+        }
+        var out = ""
+        func log(_ s: String) { out += s + "\n" }
+        let engine = try DynaMoeEngine(filePath: snapshotDir)
+        let summary = try engine.getSummary()
+        let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir))
+        XCTAssertEqual(config?.isGemma4Model, true)
+        log("gemma4 summary: layers=\(summary.layerCount) maxExpertId=\(summary.maxExpertId) tensors=\(summary.tensors.count) shards=\(summary.shards.count)")
+
+        let layers = InferenceEngine.shared.buildCachedLayers(summary: summary, config: config)
+        XCTAssertEqual(layers.count, 30)
+
+        func dump(_ idx: Int) {
+            let l = layers[idx]
+            log("layer \(idx) sliding=\(l.isSlidingAttention) mlpType=\(l.mlpType) interDim=\(l.intermediateDim)")
+            func p(_ label: String, _ t: TensorMetadata?) { log("  \(label): \(t.map { "\($0.name) \($0.shapeDisplay) off=\($0.offsetStart)" } ?? "nil")") }
+            p("norm1", l.norm1Tensor); p("norm2", l.norm2Tensor)
+            p("preFfn", l.preFfnNormTensor); p("preFfn2", l.preFfnNorm2Tensor)
+            p("postFfn", l.postFfnNormTensor); p("postFfn1", l.postFfnNorm1Tensor); p("postFfn2", l.postFfnNorm2Tensor)
+            p("layerScalar", l.layerScalarTensor)
+            p("qProj", l.qProjTensor); p("kProj", l.kProjTensor); p("vProj", l.vProjTensor); p("oProj", l.oProjTensor)
+            p("qNorm", l.qNormTensor); p("kNorm", l.kNormTensor)
+            p("dGate", l.denseGateWeight); p("dUp", l.denseUpWeight); p("dDown", l.denseDownWeight)
+            p("router", l.routerTensor); p("routerScaleVec", l.routerScaleVec); p("routerPerExpert", l.routerPerExpertScale)
+            p("expFused[0]", l.expertFusedGateUpWeights[0]); p("expDown[0]", l.expertDownWeights[0])
+            log("  expFused count=\(l.expertFusedGateUpWeights.count) expDown count=\(l.expertDownWeights.count)")
+        }
+        dump(0)   // sliding
+        dump(5)   // global
+        try out.write(toFile: "/tmp/gemma4_dump.txt", atomically: true, encoding: .utf8)
+        print("✅ [TEST] Gemma 4 layer tensor resolution dumped to /tmp/gemma4_dump.txt.")
+    }
+
+    func testGemma4ToolCallParsing() throws {
+        let parser = StreamingToolParser.shared
+
+        // Basic call, plain-quoted string argument (as the model actually emitted).
+        let t1 = "<|tool_call>call:web_search{query: \"weather forecast Burlington NC October 8 2026\"}<tool_call|>"
+        let r1 = parser.parseStreamingToolCalls(from: t1, format: .gemma)
+        XCTAssertEqual(r1.calls.count, 1)
+        XCTAssertEqual(r1.calls.first?.name, "web_search")
+        XCTAssertEqual(r1.calls.first?.arguments["query"] as? String, "weather forecast Burlington NC October 8 2026")
+
+        // Gemma's native <|"|> string delimiter, multiple args, numeric value.
+        let t2 = "<|tool_call>call:file_read{path:<|\"|>/tmp/x.txt<|\"|>,line:42}<tool_call|>"
+        let r2 = parser.parseStreamingToolCalls(from: t2, format: .gemma)
+        XCTAssertEqual(r2.calls.first?.name, "file_read")
+        XCTAssertEqual(r2.calls.first?.arguments["path"] as? String, "/tmp/x.txt")
+        XCTAssertEqual(r2.calls.first?.arguments["line"] as? Int, 42)
+
+        // A truncated call (no closing tag) only occurs on EOS or the token cap, where
+        // executing partial arguments (a cut-off shell command) would be unsafe, so it
+        // must not be returned as an executable call.
+        let t3 = "<|tool_call>call:shell_run{command: \"ls -la\""
+        let r3 = parser.parseStreamingToolCalls(from: t3, format: .gemma)
+        XCTAssertEqual(r3.calls.count, 0)
+
+        // Freeze fires the moment the Gemma closer lands.
+        XCTAssertTrue(parser.shouldFreezeGeneration(accumulatedText: t1, deltaText: "", format: .gemma))
+
+        // The Gemma closer must not freeze unless the matching opener is present, or any
+        // model that merely mentions the tag in prose or code would be stopped as a call.
+        XCTAssertFalse(parser.shouldFreezeGeneration(accumulatedText: "see the token <tool_call|> in the docs", deltaText: "", format: .gemma))
+        XCTAssertFalse(parser.shouldFreezeGeneration(accumulatedText: "", deltaText: "<tool_call|>", format: .gemma))
+
+        // Plain-quoted args keep the backslash before an unrecognized escape (a regex \d),
+        // so a generated command is not silently rewritten when it is executed.
+        let tEsc = "<|tool_call>call:shell_run{command: \"grep -P \\d+ file\"}<tool_call|>"
+        let rEsc = parser.parseStreamingToolCalls(from: tEsc, format: .gemma)
+        XCTAssertEqual(rEsc.calls.first?.arguments["command"] as? String, "grep -P \\d+ file")
+    }
+
+    func testGemma4RejectsIncompleteArgumentBodies() throws {
+        let parser = StreamingToolParser.shared
+        // Missing closing brace: the call's closing tag arrived, but the argument
+        // object did not close, so it must not execute.
+        let missingBrace = "<|tool_call>call:shell_run{command:\"rm -rf /\"<tool_call|>"
+        XCTAssertEqual(parser.parseStreamingToolCalls(from: missingBrace, format: .gemma).calls.count, 0)
+        // Missing closing quote.
+        let missingQuote = "<|tool_call>call:shell_run{command:\"rm -rf /}<tool_call|>"
+        XCTAssertEqual(parser.parseStreamingToolCalls(from: missingQuote, format: .gemma).calls.count, 0)
+        // A well-formed call still parses.
+        let ok = "<|tool_call>call:shell_run{command:\"ls -la\"}<tool_call|>"
+        let r = parser.parseStreamingToolCalls(from: ok, format: .gemma)
+        XCTAssertEqual(r.calls.first?.name, "shell_run")
+        XCTAssertEqual(r.calls.first?.arguments["command"] as? String, "ls -la")
+    }
+
+    func testGemma4OuterBlockWinsOverEmbeddedProtocol() throws {
+        // A Gemma string argument can contain text that looks like a Qwen call
+        // (for example file content); the outer Gemma call must win.
+        let embedded = "<|tool_call>call:file_write{path:<|\"|>a.swift<|\"|>,content:<|\"|><function=shell_run><arg_key>command</arg_key><arg_value>rm -rf /</arg_value></function><|\"|>}<tool_call|>"
+        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: embedded, format: .gemma)
+        XCTAssertEqual(r.calls.count, 1)
+        XCTAssertEqual(r.calls.first?.name, "file_write")
+    }
+
+    func testGemma4RejectsMissingColonOrValue() throws {
+        let parser = StreamingToolParser.shared
+        // Missing colon.
+        XCTAssertEqual(parser.parseStreamingToolCalls(from: "<|tool_call>call:x{command \"rm -rf /\"}<tool_call|>", format: .gemma).calls.count, 0)
+        // Colon present but no value.
+        XCTAssertEqual(parser.parseStreamingToolCalls(from: "<|tool_call>call:x{command:}<tool_call|>", format: .gemma).calls.count, 0)
+    }
+
+    func testGemma4RejectsUnexpectedObjectSeparator() throws {
+        // Two fields separated by a stray ";" must not be accepted (which would let a
+        // later field overwrite an earlier one).
+        let semi = "<|tool_call>call:x{command:\"safe\";command:\"danger\"}<tool_call|>"
+        XCTAssertEqual(StreamingToolParser.shared.parseStreamingToolCalls(from: semi, format: .gemma).calls.count, 0)
+    }
+
+    func testGemma4TerminatorInsideQuotedArgument() throws {
+        // A <tool_call|> inside a quoted value (file content) must not truncate the block.
+        let raw = "<|tool_call>call:file_write{path:<|\"|>a.txt<|\"|>,content:<|\"|>text <tool_call|> more<|\"|>}<tool_call|>"
+        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: raw, format: .gemma)
+        XCTAssertEqual(r.calls.count, 1)
+        XCTAssertEqual(r.calls.first?.name, "file_write")
+        XCTAssertEqual(r.calls.first?.arguments["content"] as? String, "text <tool_call|> more")
+    }
+
+    func testGemmaNestedCallInsideMalformedOpenerNotExecuted() throws {
+        // An incomplete outer call whose quoted value never closes must not let a nested
+        // complete call be parsed and executed.
+        let raw = "<|tool_call>call:file_write{path:<|\"|>/tmp/<tool_call|><|tool_call>call:shell_run{command:\"ls\"}<tool_call|>"
+        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: raw, format: .gemma)
+        XCTAssertEqual(r.calls.count, 0)
+    }
+
+    func testResponseTextWithoutToolCallsStripsWholeGemmaCall() throws {
+        let raw = "Here you go. <|tool_call>call:file_write{content:<|\"|>text <tool_call|> more<|\"|>}<tool_call|> trailing"
+        let stripped = AgentHarness.shared.responseTextWithoutToolCalls(raw)
+        XCTAssertTrue(stripped.contains("Here you go."), stripped)
+        XCTAssertFalse(stripped.contains("<|tool_call>"), stripped)
+        XCTAssertFalse(stripped.contains("<tool_call|>"), stripped)
+    }
+
+    func testGemma4RejectsMalformedArrayElement() throws {
+        // [1,,2] must not be accepted as [1, "", 2].
+        let raw = "<|tool_call>call:x{items:[1,,2]}<tool_call|>"
+        XCTAssertEqual(StreamingToolParser.shared.parseStreamingToolCalls(from: raw, format: .gemma).calls.count, 0)
+    }
+
+    func testGemmaIncompleteBlockDoesNotFallThrough() throws {
+        // An incomplete Gemma block embedding a complete Qwen function must not let the
+        // fallback parsers execute the embedded call.
+        let raw = "<|tool_call>call:file_write{path:<|\"|>a<|\"|>,content:<|\"|><function=shell_run><arg_key>command</arg_key><arg_value>rm -rf /</arg_value></function>"
+        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: raw, format: .gemma)
+        XCTAssertEqual(r.calls.count, 0)
+    }
+
+    func testGemmaDialectGatedByActiveModel() throws {
+        let parser = StreamingToolParser.shared
+        // A Qwen argument that literally contains a complete Gemma block, before the outer
+        // Qwen call closes. While the active dialect is Qwen the embedded text is data: it
+        // must not freeze generation early, and it must not be parsed as the active call.
+        let partialQwen = "<tool_call><function=file_write><parameter=path>a.txt</parameter><parameter=content><|tool_call>call:shell_run{command:\"ls\"}<tool_call|></parameter>"
+        XCTAssertFalse(
+            parser.shouldFreezeGeneration(accumulatedText: partialQwen, deltaText: "", format: .qwenXML),
+            "a literal Gemma block inside a Qwen argument must not freeze a Qwen turn"
+        )
+        // The same text DOES freeze under the Gemma dialect, which is why detection must be
+        // explicit rather than scanning every stream.
+        XCTAssertTrue(
+            parser.shouldFreezeGeneration(accumulatedText: partialQwen, deltaText: "", format: .gemma)
+        )
+
+        // When the outer Qwen call closes, the Qwen parser owns it and the embedded Gemma
+        // block is kept as argument data instead of being reinterpreted as shell_run.
+        let fullQwen = partialQwen + "</function></tool_call>"
+        let qwen = parser.parseStreamingToolCalls(from: fullQwen, format: .qwenXML)
+        XCTAssertEqual(qwen.calls.count, 1)
+        XCTAssertEqual(qwen.calls.first?.name, "file_write")
+        XCTAssertFalse(qwen.calls.contains(where: { $0.name == "shell_run" }))
+    }
+
+    func testGemmaDisplayCleanupGatedByDialect() throws {
+        // A non-Gemma answer that merely documents the Gemma opener must keep its text:
+        // truncating globally stripped everything from the token onward.
+        let docAnswer = "Gemma emits <|tool_call>call:name{...}<tool_call|> for a call."
+        let nonGemma = ChatMessageView.cleanedMarkdown(docAnswer, isGemmaDialect: false)
+        XCTAssertTrue(nonGemma.contains("for a call."), nonGemma)
+
+        // Under the Gemma dialect nothing after the opener is shown, since a real call
+        // permits no suffix.
+        let gemma = ChatMessageView.cleanedMarkdown(docAnswer, isGemmaDialect: true)
+        XCTAssertEqual(gemma, "Gemma emits")
+    }
+
+    func testGemma4RebuildPreservesRawArguments() throws {
+        // Persisted-history replay keeps the model's own argument text so native types
+        // (bare numbers, booleans) are not restringified.
+        let text = AgentHarness.formatGemmaToolCall(name: "search", arguments: ["limit": "5"], rawArguments: "{limit:5,enabled:true}")
+        XCTAssertTrue(text.contains("{limit:5,enabled:true}"), text)
+        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: text, format: .gemma)
+        XCTAssertEqual(r.calls.first?.name, "search")
+        XCTAssertEqual(r.calls.first?.arguments["limit"] as? Int, 5)
+        XCTAssertEqual(r.calls.first?.arguments["enabled"] as? Bool, true)
+    }
+
+    func testGemmaFreezeRequiresParseableBlock() throws {
+        let parser = StreamingToolParser.shared
+        // A stray closer in prose followed by an incomplete opener must not freeze.
+        let proseThenOpen = "we call it <tool_call|> here <|tool_call>call:x{still typing"
+        XCTAssertFalse(parser.shouldFreezeGeneration(accumulatedText: proseThenOpen, deltaText: "", format: .gemma))
+        // A complete block does freeze.
+        XCTAssertTrue(parser.shouldFreezeGeneration(accumulatedText: "<|tool_call>call:x{a:1}<tool_call|>", deltaText: "", format: .gemma))
+    }
+
+    func testGemma4RebuildSanitizesRawArguments() throws {
+        let qd = "<|" + "\"" + "|>"
+        // A persisted string argument carrying a reserved delimiter must be neutralized,
+        // but the value quote delimiter is preserved so the call still parses cleanly.
+        let text = AgentHarness.formatGemmaToolCall(name: "x", arguments: [:], rawArguments: "{note:" + qd + "hi<|turn>there" + qd + "}")
+        XCTAssertFalse(text.contains("<|turn>"), text)
+        XCTAssertTrue(text.contains(qd), text)
+        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: text, format: .gemma)
+        XCTAssertEqual(r.calls.first?.name, "x")
+    }
+
+    func testGemma4ToolResponseTurnFormat() throws {
+        let json = #"{"tool":"web_search","status":"success","result":{"content":"85F high"}}"#
+        let turn = AgentHarness.shared.formatGemmaToolResponseTurn(responses: [json], thinkingEnabled: true)
+        XCTAssertTrue(turn.hasPrefix(#"<|tool_response>response:web_search{value:<|"|>"#), turn)
+        XCTAssertTrue(turn.hasSuffix("<tool_response|><|channel>thought\n"), turn)
+        _ = turn.count
+        // Never emit ChatML control tokens into a Gemma transcript.
+        XCTAssertFalse(turn.contains("<|im_start|>"), turn)
+        XCTAssertFalse(turn.contains("<|im_end|>"), turn)
+        let nonThink = AgentHarness.shared.formatGemmaToolResponseTurn(responses: [json], thinkingEnabled: false)
+        XCTAssertFalse(nonThink.contains("<|channel>thought"), nonThink)
+        XCTAssertTrue(nonThink.hasSuffix("<tool_response|>"), nonThink)
+        // A tool result is arbitrary file/web text and can contain Gemma own control tokens;
+        // they must be neutralized so the value/response cannot be closed early.
+        let gq = #"<|"|>"#
+        let hostileContent = "x " + gq + " y <tool_response|> z <|channel>q"
+        let hostileDict: [String: Any] = ["tool": "file_read", "status": "success", "result": ["content": hostileContent]]
+        let hostileJSON = String(data: try JSONSerialization.data(withJSONObject: hostileDict), encoding: .utf8)!
+        let hostileTurn = AgentHarness.shared.formatGemmaToolResponseTurn(responses: [hostileJSON], thinkingEnabled: false)
+        XCTAssertEqual(hostileTurn.components(separatedBy: gq).count, 3, hostileTurn)
+        XCTAssertFalse(hostileTurn.contains("<tool_response|> z"), hostileTurn)
+        XCTAssertFalse(hostileTurn.contains("<|channel>"), hostileTurn)
+
+        // The interpolated tool name is filtered to the safe charset.
+        let dirtyName = "bad" + "<|tool_response>" + "name"
+        let nameDict: [String: Any] = ["tool": dirtyName, "status": "success", "result": [String: Any]()]
+        let nameJSON = String(data: try JSONSerialization.data(withJSONObject: nameDict), encoding: .utf8)!
+        let nameTurn = AgentHarness.shared.formatGemmaToolResponseTurn(responses: [nameJSON], thinkingEnabled: false)
+        XCTAssertTrue(nameTurn.contains("response:badtool_responsename{value:"), nameTurn)
+
+        // A delimiter split across the input must not reconstruct a reserved token once
+        // the inner delimiter is replaced: removing it would splice the halves together.
+        let spliced = AgentHarness.sanitizeGemmaToolResponseText("A <|tool_<|\"|>response> B")
+        XCTAssertFalse(spliced.contains("<|tool_response>"), spliced)
+
+        // Persisted-history replay passes rendered text, so the tool name is supplied
+        // explicitly and must be preserved in the reconstructed response header.
+        let namedTurn = AgentHarness.shared.formatGemmaToolResponseTurn(responses: ["[web_search] success"], toolNames: ["web_search"], thinkingEnabled: false)
+        XCTAssertTrue(namedTurn.contains("response:web_search{value:"), namedTurn)
+
+        // A registration notice carries response-controlled schema text and is appended
+        // outside the response value, so it must be delimiter-sanitized too, or a schema
+        // can restructure the model turn.
+        let schema = "prefix <turn|> <|channel> suffix"
+        let regDict: [String: Any] = ["tool": "tools_load", "status": "success",
+                                      "result": ["registration": true, "tool_name": "web_search", "schema": schema]]
+        let regJSON = String(data: try JSONSerialization.data(withJSONObject: regDict), encoding: .utf8)!
+        let regTurn = AgentHarness.shared.formatGemmaToolResponseTurn(responses: [regJSON], thinkingEnabled: false)
+        XCTAssertTrue(regTurn.contains("[TOOL_REGISTRATION]"), regTurn)
+        XCTAssertFalse(regTurn.contains("<turn|>"), regTurn)
+        XCTAssertFalse(regTurn.contains("<|channel>"), regTurn)
+    }
+
+    func testGemma4ToolCallRebuildRoundTrips() throws {
+        // The persisted-history rebuilder must emit a call the parser reads back, with
+        // argument values delimiter-sanitized the same way the response path is.
+        let text = AgentHarness.formatGemmaToolCall(name: "web_search", arguments: ["query": "sunny <|\"|> today", "limit": "5"])
+        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: text, format: .gemma)
+        XCTAssertEqual(r.calls.count, 1)
+        XCTAssertEqual(r.calls.first?.name, "web_search")
+        XCTAssertEqual(r.calls.first?.arguments["limit"] as? String, "5")
+        XCTAssertEqual(r.calls.first?.arguments["query"] as? String, "sunny   today")
+        // Keys are emitted in sorted order, so the transcript is deterministic.
+        XCTAssertTrue(text.hasPrefix(#"<|tool_call>call:web_search{limit:<|"|>5<|"|>,query:"#), text)
+    }
+
+    func testNormalizeBareNameToolCallsLing() throws {
+        // Ling emits the function name directly after <tool_call> with no <function=...>
+        // wrapper; the bare-name rewrap must still recognize the block and parse it.
+        let raw = "<tool_call>shell_run<arg_key>command</arg_key><arg_value>ls -la</arg_value></tool_call>"
+        let normalized = StreamingToolParser.normalizeBareNameToolCalls(raw)
+        XCTAssertTrue(normalized.contains("<function=shell_run>"), normalized)
+        let calls = StreamingToolParser.shared.parseStreamingToolCalls(from: raw)
+        XCTAssertEqual(calls.calls.first?.name, "shell_run")
+        XCTAssertEqual(calls.calls.first?.arguments["command"] as? String, "ls -la")
+    }
+
+    func testGemma4VerbatimAppForward() throws {
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--google--gemma-4-26B-A4B-it/snapshots/4d7ae4984b7db7de8f8457170b3f1a419ee76d52"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            print("Gemma 4 snapshot not found, skipping.")
+            return
+        }
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal device")
+            return
+        }
+        guard let cmdQueue = device.makeCommandQueue() else {
+            XCTFail("No command queue")
+            return
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshotDir)
+        var summary = try engine.getSummary()
+        summary = try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: UInt64(device.maxBufferLength))
+        guard let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir)) else {
+            XCTFail("No ModelConfig")
+            return
+        }
+
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let address = UInt(shard.baseAddress)
+            guard let ptr = UnsafeMutableRawPointer(bitPattern: address) else { continue }
+            let len = Int(shard.length)
+            if len > 0, len <= Int(device.maxBufferLength) {
+                if let buf = device.makeBuffer(bytesNoCopy: ptr, length: len, options: .storageModeShared, deallocator: nil) {
+                    buffers[shard.index] = buf
+                }
+            }
+        }
+
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+        guard let defaultLib = inference.defaultLibrary else {
+            XCTFail("No default Metal library")
+            return
+        }
+
+        let layers = inference.buildCachedLayers(summary: summary, config: config)
+        XCTAssertEqual(layers.count, 30)
+
+        // Compile Gemma 4 pipelines
+        let rmsnormNoScalePipeline = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: "rmsnorm_no_scale_bf16")!)
+        let gqaGemmaF16Pipeline = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: "gqa_attention_decode_gemma_f16")!)
+        let storeKvGemmaF16Pipeline = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: "store_kv_cache_gemma_f16")!)
+        let scaleVectorInplacePipeline = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: "scale_vector_inplace")!)
+        let perExpertScalePipeline = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: "apply_topk_per_expert_scale")!)
+        let mulByBf16VectorPipeline = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: "mul_by_bf16_vector")!)
+        let ropeProportionalPipeline = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: "apply_rope_proportional")!)
+        let headRmsnormPipeline = inference.headRmsnormPipeline!
+        let embedPipeline = inference.embedPipeline!
+        let rmsnormPipeline = inference.rmsnormPipeline!
+        let ropePipeline = inference.ropePipeline!
+        let routerPipeline = inference.routerPipeline!
+        let bf16GeluGateUpSimdPipeline = inference.bf16GeluGateUpSimdPipeline ?? inference.bf16GeluGateUpPipeline!
+        let bf16DownSimdPipeline = inference.bf16DownSimdPipeline ?? inference.bf16DownPipeline!
+        let gemvSimd = inference.bf16GemvSimdPipeline!
+        let addPipeline = inference.addPipeline!
+        let clearPipeline = inference.clearPipeline!
+
+        let hiddenDim: UInt32 = 2816
+        let numHeads: UInt32 = 16
+        let numKvHeads: UInt32 = 8
+        let headDim: UInt32 = 256
+        let globalHeadDim: UInt32 = 512
+        let numGlobalKvHeads: UInt32 = 2
+        let gemmaExpertInterDim: UInt32 = 704
+        let gemmaKvStride: UInt32 = numKvHeads * headDim // 2048
+        let gemmaScaling: Float = 1.0
+        let eps: Float = config.effectiveRmsNormEps
+
+        let embedWeight = summary.tensors.first { $0.name.hasSuffix("embed_tokens.weight") }!
+        let normTensor = summary.tensors.first { $0.name == "model.language_model.norm.weight" }!
+        let lmHeadTensor = summary.tensors.first { $0.name == "lm_head.weight" || $0.name == "model.lm_head.weight" } ?? embedWeight
+        var vocabSize: UInt32 = 262144
+        let cleanShape = lmHeadTensor.shapeDisplay.replacingOccurrences(of: "[", with: "").replacingOccurrences(of: "]", with: "").replacingOccurrences(of: " ", with: "")
+        if let first = cleanShape.split(separator: ",").first, let parsed = UInt32(first), parsed > 0 {
+            vocabSize = parsed
+        }
+
+        // Scratch buffers
+        let singleTokenBuffer = device.makeBuffer(length: 4, options: .storageModeShared)!
+        let hCurrBuffer = device.makeBuffer(length: Int(hiddenDim) * 4, options: .storageModeShared)!
+        let hNextBuffer = device.makeBuffer(length: Int(hiddenDim) * 4, options: .storageModeShared)!
+        let xNorm1Buffer = device.makeBuffer(length: Int(hiddenDim) * 4, options: .storageModeShared)!
+        let qGateBuffer = device.makeBuffer(length: max(Int(numHeads * globalHeadDim), 10240) * 4, options: .storageModeShared)!
+        let kVectorBuffer = device.makeBuffer(length: max(Int(numKvHeads * headDim), 4096) * 4, options: .storageModeShared)!
+        let vVectorBuffer = device.makeBuffer(length: max(Int(numKvHeads * headDim), 6144) * 4, options: .storageModeShared)!
+        let attnCtxBuffer = device.makeBuffer(length: max(Int(numHeads * globalHeadDim), 8192) * 4, options: .storageModeShared)!
+        let attnOutBuffer = device.makeBuffer(length: Int(hiddenDim) * 4, options: .storageModeShared)!
+        let hMidBuffer = device.makeBuffer(length: Int(hiddenDim) * 4, options: .storageModeShared)!
+        let xNorm2Buffer = device.makeBuffer(length: Int(hiddenDim) * 4, options: .storageModeShared)!
+        let hMlpBuffer = device.makeBuffer(length: Int(hiddenDim) * 4, options: .storageModeShared)!
+        let bVectorBuffer = device.makeBuffer(length: Int(hiddenDim) * 4, options: .storageModeShared)!
+        let interBuffer = device.makeBuffer(length: max(2112, 704) * 4, options: .storageModeShared)!
+        let routerIndicesBuffer = device.makeBuffer(length: 128 * 4, options: .storageModeShared)!
+        let routerWeightsBuffer = device.makeBuffer(length: 128 * 4, options: .storageModeShared)!
+        let xFinalBuffer = device.makeBuffer(length: Int(hiddenDim) * 4, options: .storageModeShared)!
+        let logitsBuffer = device.makeBuffer(length: Int(vocabSize) * 4, options: .storageModeShared)!
+
+        // KV Cache
+        let maxSeqLen = 128
+        KVCacheManager.shared.reset(
+            device: device,
+            config: config,
+            actualLayers: 30,
+            totalLoops: 1,
+            numKvHeads: Int(numKvHeads),
+            headDim: Int(headDim),
+            maxSeqLen: maxSeqLen,
+            precision: .fp16,
+            preservePrefixCount: 0
+        )
+        guard let kCache = KVCacheManager.shared.kCacheBuffer,
+              let vCache = KVCacheManager.shared.vCacheBuffer else {
+            XCTFail("No KV Cache buffers")
+            return
+        }
+
+        // FlashMoE packed layout
+        var packedExpertsDir: URL? = nil
+        var loadedLayout: FlashMoELayout? = nil
+        let pDir = URL(fileURLWithPath: snapshotDir).appendingPathComponent("packed_experts")
+        let layoutFile = pDir.appendingPathComponent("layout.json")
+        if FileManager.default.fileExists(atPath: layoutFile.path),
+           let lData = try? Data(contentsOf: layoutFile),
+           let lay = try? JSONDecoder().decode(FlashMoELayout.self, from: lData) {
+            packedExpertsDir = pDir
+            loadedLayout = lay
+            ExpertIOThreadPool.shared.initialize(numThreads: 8)
+        }
+        let expertSize = Int(loadedLayout?.expert_size ?? 11894784)
+        let expertStagingBuffer = device.makeBuffer(length: 32 * expertSize, options: .storageModeShared)!
+
+        func l2Norm(_ buf: MTLBuffer, count: Int) -> Float {
+            let p = buf.contents().bindMemory(to: Float.self, capacity: count)
+            var ss: Double = 0
+            for i in 0..<count { let v = Double(p[i]); ss += v * v }
+            return Float(ss.squareRoot())
+        }
+
+        func dispatchLinearTest(
+            _ enc: MTLComputeCommandEncoder,
+            weight: TensorMetadata?,
+            inBuf: MTLBuffer, outBuf: MTLBuffer,
+            inDim: UInt32, outDim: UInt32,
+            weightOffsetAdd: UInt64 = 0, outOffset: Int = 0
+        ) {
+            guard let w = weight, let wRaw = buffers[w.shardIndex] else { return }
+            var wOff = w.offsetStart + weightOffsetAdd
+            var inD = inDim
+            var outD = outDim
+            enc.setComputePipelineState(gemvSimd)
+            enc.setBuffer(wRaw, offset: 0, index: 0)
+            enc.setBuffer(inBuf, offset: 0, index: 1)
+            enc.setBuffer(outBuf, offset: outOffset, index: 2)
+            enc.setBytes(&wOff, length: 8, index: 3)
+            enc.setBytes(&inD, length: 4, index: 4)
+            enc.setBytes(&outD, length: 4, index: 5)
+            enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+        }
+
+        // Run Token 2 forward
+        let tokenId: UInt32 = 2
+        let step: UInt32 = 0
+        var currentH = hCurrBuffer
+        var nextH = hNextBuffer
+        var hDimV = hiddenDim
+        var epsV = eps
+        var testLogs: [String] = []
+        func logT(_ s: String) {
+            testLogs.append(s)
+            print(s)
+        }
+
+        guard var activeCmd = cmdQueue.makeCommandBuffer() else { fatalError("no cmd") }
+
+        for l in 0..<30 {
+            let layer = layers[l]
+            guard let layerEnc1 = activeCmd.makeComputeCommandEncoder() else { fatalError("enc1") }
+
+            // Embed at layer 0
+            if l == 0 {
+                singleTokenBuffer.contents().bindMemory(to: UInt32.self, capacity: 1)[0] = tokenId
+                var wOffset = embedWeight.offsetStart
+                var tokCount: UInt32 = 1
+                layerEnc1.setComputePipelineState(embedPipeline)
+                layerEnc1.setBuffer(buffers[embedWeight.shardIndex]!, offset: 0, index: 0)
+                layerEnc1.setBuffer(singleTokenBuffer, offset: 0, index: 1)
+                layerEnc1.setBuffer(currentH, offset: 0, index: 2)
+                layerEnc1.setBytes(&wOffset, length: 8, index: 3)
+                layerEnc1.setBytes(&hDimV, length: 4, index: 4)
+                layerEnc1.setBytes(&tokCount, length: 4, index: 5)
+                layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), embedPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                layerEnc1.memoryBarrier(scope: .buffers)
+
+                var embedScale: Float = Float(Double(hiddenDim).squareRoot())
+                layerEnc1.setComputePipelineState(scaleVectorInplacePipeline)
+                layerEnc1.setBuffer(currentH, offset: 0, index: 0)
+                layerEnc1.setBytes(&hDimV, length: 4, index: 1)
+                layerEnc1.setBytes(&embedScale, length: 4, index: 2)
+                layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), scaleVectorInplacePipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                layerEnc1.memoryBarrier(scope: .buffers)
+            }
+
+            // Norm 1
+            let norm1 = layer.norm1Tensor!
+            var gammaOff = norm1.offsetStart
+            layerEnc1.setComputePipelineState(rmsnormPipeline)
+            layerEnc1.setBuffer(currentH, offset: 0, index: 0)
+            layerEnc1.setBuffer(buffers[norm1.shardIndex]!, offset: 0, index: 1)
+            layerEnc1.setBuffer(xNorm1Buffer, offset: 0, index: 2)
+            layerEnc1.setBytes(&gammaOff, length: 8, index: 3)
+            layerEnc1.setBytes(&hDimV, length: 4, index: 4)
+            layerEnc1.setBytes(&epsV, length: 4, index: 5)
+            layerEnc1.setThreadgroupMemoryLength(1024 * 4, index: 0)
+            layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
+            layerEnc1.memoryBarrier(scope: .buffers)
+
+            // Attention projections
+            let isGlobal = !layer.isSlidingAttention
+            let gHeadDim: UInt32 = isGlobal ? globalHeadDim : headDim
+            let gNumKv: UInt32 = isGlobal ? numGlobalKvHeads : numKvHeads
+            let gQDim: UInt32 = numHeads * gHeadDim
+            let gKvDim: UInt32 = gNumKv * gHeadDim
+
+            layerEnc1.setComputePipelineState(clearPipeline)
+            layerEnc1.setBuffer(attnOutBuffer, offset: 0, index: 0)
+            layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            layerEnc1.memoryBarrier(scope: .buffers)
+
+            dispatchLinearTest(layerEnc1, weight: layer.qProjTensor, inBuf: xNorm1Buffer, outBuf: qGateBuffer, inDim: hiddenDim, outDim: gQDim)
+            dispatchLinearTest(layerEnc1, weight: layer.kProjTensor, inBuf: xNorm1Buffer, outBuf: kVectorBuffer, inDim: hiddenDim, outDim: gKvDim)
+            if let vProj = layer.vProjTensor {
+                dispatchLinearTest(layerEnc1, weight: vProj, inBuf: xNorm1Buffer, outBuf: vVectorBuffer, inDim: hiddenDim, outDim: gKvDim)
+            }
+
+            // Per-head norms
+            if let qNorm = layer.qNormTensor, let qNormRaw = buffers[qNorm.shardIndex] {
+                var qNormOff = qNorm.offsetStart
+                var nQ = numHeads
+                var hD = gHeadDim
+                var hStride = gHeadDim
+                var epsVal = epsV
+                layerEnc1.setComputePipelineState(headRmsnormPipeline)
+                layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                layerEnc1.setBuffer(qNormRaw, offset: 0, index: 1)
+                layerEnc1.setBytes(&qNormOff, length: 8, index: 2)
+                layerEnc1.setBytes(&nQ, length: 4, index: 3)
+                layerEnc1.setBytes(&hD, length: 4, index: 4)
+                layerEnc1.setBytes(&hStride, length: 4, index: 5)
+                layerEnc1.setBytes(&epsVal, length: 4, index: 6)
+                layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                layerEnc1.memoryBarrier(scope: .buffers)
+            }
+            var vDim = gHeadDim
+            var vEps = epsV
+            layerEnc1.setComputePipelineState(rmsnormNoScalePipeline)
+            layerEnc1.setBuffer(layer.isSlidingAttention ? vVectorBuffer : kVectorBuffer, offset: 0, index: 0)
+            layerEnc1.setBuffer(vVectorBuffer, offset: 0, index: 1)
+            layerEnc1.setBytes(&vDim, length: MemoryLayout<UInt32>.stride, index: 2)
+            layerEnc1.setBytes(&vEps, length: MemoryLayout<Float>.stride, index: 3)
+            layerEnc1.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
+            layerEnc1.dispatchThreadgroups(MTLSize(width: Int(gNumKv), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(gHeadDim)), height: 1, depth: 1))
+            layerEnc1.memoryBarrier(scope: .buffers)
+
+            if let kNorm = layer.kNormTensor, let kNormRaw = buffers[kNorm.shardIndex] {
+                var kNormOff = kNorm.offsetStart
+                var nK = gNumKv
+                var hD = gHeadDim
+                var hStride = gHeadDim
+                var epsVal = epsV
+                layerEnc1.setComputePipelineState(headRmsnormPipeline)
+                layerEnc1.setBuffer(kVectorBuffer, offset: 0, index: 0)
+                layerEnc1.setBuffer(kNormRaw, offset: 0, index: 1)
+                layerEnc1.setBytes(&kNormOff, length: 8, index: 2)
+                layerEnc1.setBytes(&nK, length: 4, index: 3)
+                layerEnc1.setBytes(&hD, length: 4, index: 4)
+                layerEnc1.setBytes(&hStride, length: 4, index: 5)
+                layerEnc1.setBytes(&epsVal, length: 4, index: 6)
+                layerEnc1.dispatchThreadgroups(MTLSize(width: Int(gNumKv), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                layerEnc1.memoryBarrier(scope: .buffers)
+            }
+
+            // RoPE
+            var pos = step
+            var nQ = numHeads
+            var nK = gNumKv
+            var hD = gHeadDim
+            var qStr = gHeadDim
+            var kStr = gHeadDim
+            var theta: Float = isGlobal ? 1000000.0 : 10000.0
+            if isGlobal {
+                var partialRotaryDim: UInt32 = 128
+                layerEnc1.setComputePipelineState(ropeProportionalPipeline)
+                layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                layerEnc1.setBytes(&pos, length: 4, index: 1)
+                layerEnc1.setBytes(&nQ, length: 4, index: 2)
+                layerEnc1.setBytes(&hD, length: 4, index: 3)
+                layerEnc1.setBytes(&partialRotaryDim, length: 4, index: 4)
+                layerEnc1.setBytes(&qStr, length: 4, index: 5)
+                layerEnc1.setBytes(&theta, length: 4, index: 6)
+                layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), ropeProportionalPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+
+                layerEnc1.setBuffer(kVectorBuffer, offset: 0, index: 0)
+                layerEnc1.setBytes(&pos, length: 4, index: 1)
+                layerEnc1.setBytes(&nK, length: 4, index: 2)
+                layerEnc1.setBytes(&hD, length: 4, index: 3)
+                layerEnc1.setBytes(&partialRotaryDim, length: 4, index: 4)
+                layerEnc1.setBytes(&kStr, length: 4, index: 5)
+                layerEnc1.setBytes(&theta, length: 4, index: 6)
+                layerEnc1.dispatchThreads(MTLSize(width: Int(gNumKv), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(gNumKv), ropeProportionalPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                layerEnc1.memoryBarrier(scope: .buffers)
+            } else {
+                var rD = gHeadDim
+                layerEnc1.setComputePipelineState(ropePipeline)
+                layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                layerEnc1.setBytes(&pos, length: 4, index: 1)
+                layerEnc1.setBytes(&nQ, length: 4, index: 2)
+                layerEnc1.setBytes(&hD, length: 4, index: 3)
+                layerEnc1.setBytes(&rD, length: 4, index: 4)
+                layerEnc1.setBytes(&qStr, length: 4, index: 5)
+                layerEnc1.setBytes(&theta, length: 4, index: 6)
+                layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), ropePipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+
+                layerEnc1.setBuffer(kVectorBuffer, offset: 0, index: 0)
+                layerEnc1.setBytes(&pos, length: 4, index: 1)
+                layerEnc1.setBytes(&nK, length: 4, index: 2)
+                layerEnc1.setBytes(&hD, length: 4, index: 3)
+                layerEnc1.setBytes(&rD, length: 4, index: 4)
+                layerEnc1.setBytes(&kStr, length: 4, index: 5)
+                layerEnc1.setBytes(&theta, length: 4, index: 6)
+                layerEnc1.dispatchThreads(MTLSize(width: Int(gNumKv), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(gNumKv), ropePipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                layerEnc1.memoryBarrier(scope: .buffers)
+            }
+
+            // KV Cache Store + GQA Attention (linear cache layout: ringLen 0)
+            var linearRingLen: UInt32 = 0
+            let slot = layer.fullAttnIndex
+            let layerByteOffset = slot * maxSeqLen * Int(gemmaKvStride) * 2
+            var cacheStride = gemmaKvStride
+            let vSourceBuffer = vVectorBuffer
+
+            layerEnc1.setComputePipelineState(storeKvGemmaF16Pipeline)
+            layerEnc1.setBuffer(kVectorBuffer, offset: 0, index: 0)
+            layerEnc1.setBuffer(vSourceBuffer, offset: 0, index: 1)
+            layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 2)
+            layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 3)
+            layerEnc1.setBytes(&pos, length: 4, index: 4)
+            layerEnc1.setBytes(&nK, length: 4, index: 5)
+            layerEnc1.setBytes(&hD, length: 4, index: 6)
+            layerEnc1.setBytes(&cacheStride, length: 4, index: 7)
+            layerEnc1.setBytes(&linearRingLen, length: 4, index: 8)
+            layerEnc1.dispatchThreads(MTLSize(width: Int(gKvDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(gKvDim), storeKvGemmaF16Pipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            layerEnc1.memoryBarrier(scope: .buffers)
+
+            var seqLen = step + 1
+            var windowSize: UInt32 = layer.isSlidingAttention ? 1024 : 0
+            var scaling: Float = gemmaScaling
+            layerEnc1.setComputePipelineState(gqaGemmaF16Pipeline)
+            layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+            layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+            layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+            layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 3)
+            layerEnc1.setBytes(&seqLen, length: 4, index: 4)
+            layerEnc1.setBytes(&nQ, length: 4, index: 5)
+            layerEnc1.setBytes(&nK, length: 4, index: 6)
+            layerEnc1.setBytes(&hD, length: 4, index: 7)
+            layerEnc1.setBytes(&windowSize, length: 4, index: 8)
+            layerEnc1.setBytes(&scaling, length: 4, index: 9)
+            layerEnc1.setBytes(&cacheStride, length: 4, index: 10)
+            layerEnc1.setBytes(&linearRingLen, length: 4, index: 11)
+            layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            layerEnc1.memoryBarrier(scope: .buffers)
+
+            // o_proj
+            dispatchLinearTest(layerEnc1, weight: layer.oProjTensor, inBuf: attnCtxBuffer, outBuf: attnOutBuffer, inDim: gQDim, outDim: hiddenDim)
+
+            // post_attention_layernorm(attnOut) -> xNorm2Buffer
+            let norm2 = layer.norm2Tensor!
+            var norm2Off = norm2.offsetStart
+            layerEnc1.setComputePipelineState(rmsnormPipeline)
+            layerEnc1.setBuffer(attnOutBuffer, offset: 0, index: 0)
+            layerEnc1.setBuffer(buffers[norm2.shardIndex]!, offset: 0, index: 1)
+            layerEnc1.setBuffer(xNorm2Buffer, offset: 0, index: 2)
+            layerEnc1.setBytes(&norm2Off, length: 8, index: 3)
+            layerEnc1.setBytes(&hDimV, length: 4, index: 4)
+            layerEnc1.setBytes(&epsV, length: 4, index: 5)
+            layerEnc1.setThreadgroupMemoryLength(1024 * 4, index: 0)
+            layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
+            layerEnc1.memoryBarrier(scope: .buffers)
+
+            // hMid = currentH + xNorm2
+            layerEnc1.setComputePipelineState(addPipeline)
+            layerEnc1.setBuffer(currentH, offset: 0, index: 0)
+            layerEnc1.setBuffer(xNorm2Buffer, offset: 0, index: 1)
+            layerEnc1.setBuffer(hMidBuffer, offset: 0, index: 2)
+            layerEnc1.setBytes(&hDimV, length: 4, index: 3)
+            layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), addPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            layerEnc1.memoryBarrier(scope: .buffers)
+
+            // pre_feedforward_layernorm(hMid) -> xNorm2Buffer
+            let preFfn = layer.preFfnNormTensor!
+            var preFfnOff = preFfn.offsetStart
+            layerEnc1.setComputePipelineState(rmsnormPipeline)
+            layerEnc1.setBuffer(hMidBuffer, offset: 0, index: 0)
+            layerEnc1.setBuffer(buffers[preFfn.shardIndex]!, offset: 0, index: 1)
+            layerEnc1.setBuffer(xNorm2Buffer, offset: 0, index: 2)
+            layerEnc1.setBytes(&preFfnOff, length: 8, index: 3)
+            layerEnc1.setBytes(&hDimV, length: 4, index: 4)
+            layerEnc1.setBytes(&epsV, length: 4, index: 5)
+            layerEnc1.setThreadgroupMemoryLength(1024 * 4, index: 0)
+            layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
+            layerEnc1.memoryBarrier(scope: .buffers)
+
+            // Dense MLP
+            layerEnc1.setComputePipelineState(clearPipeline)
+            layerEnc1.setBuffer(hMlpBuffer, offset: 0, index: 0)
+            layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            layerEnc1.memoryBarrier(scope: .buffers)
+
+            let dG = layer.denseGateWeight!
+            let dU = layer.denseUpWeight!
+            let dD = layer.denseDownWeight!
+            var gOff = dG.offsetStart
+            var uOff = dU.offsetStart
+            var dOff = dD.offsetStart
+            var interDimV = layer.intermediateDim
+            var pk: Float = 1.0
+
+            layerEnc1.setComputePipelineState(bf16GeluGateUpSimdPipeline)
+            layerEnc1.setBuffer(buffers[dG.shardIndex]!, offset: 0, index: 0)
+            layerEnc1.setBuffer(buffers[dU.shardIndex]!, offset: 0, index: 1)
+            layerEnc1.setBuffer(xNorm2Buffer, offset: 0, index: 2)
+            layerEnc1.setBuffer(interBuffer, offset: 0, index: 3)
+            layerEnc1.setBytes(&gOff, length: 8, index: 4)
+            layerEnc1.setBytes(&uOff, length: 8, index: 5)
+            layerEnc1.setBytes(&hDimV, length: 4, index: 6)
+            layerEnc1.setBytes(&interDimV, length: 4, index: 7)
+            layerEnc1.dispatchThreadgroups(MTLSize(width: Int(interDimV), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            layerEnc1.memoryBarrier(scope: .buffers)
+
+            layerEnc1.setComputePipelineState(bf16DownSimdPipeline)
+            layerEnc1.setBuffer(buffers[dD.shardIndex]!, offset: 0, index: 0)
+            layerEnc1.setBuffer(interBuffer, offset: 0, index: 1)
+            layerEnc1.setBuffer(hMlpBuffer, offset: 0, index: 2)
+            layerEnc1.setBytes(&dOff, length: 8, index: 3)
+            layerEnc1.setBytes(&interDimV, length: 4, index: 4)
+            layerEnc1.setBytes(&hDimV, length: 4, index: 5)
+            layerEnc1.setBytes(&pk, length: 4, index: 6)
+            layerEnc1.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            layerEnc1.memoryBarrier(scope: .buffers)
+
+            // post_feedforward_layernorm_1(dense)
+            let pf1 = layer.postFfnNorm1Tensor!
+            var pf1Off = pf1.offsetStart
+            layerEnc1.setComputePipelineState(rmsnormPipeline)
+            layerEnc1.setBuffer(hMlpBuffer, offset: 0, index: 0)
+            layerEnc1.setBuffer(buffers[pf1.shardIndex]!, offset: 0, index: 1)
+            layerEnc1.setBuffer(hMlpBuffer, offset: 0, index: 2)
+            layerEnc1.setBytes(&pf1Off, length: 8, index: 3)
+            layerEnc1.setBytes(&hDimV, length: 4, index: 4)
+            layerEnc1.setBytes(&epsV, length: 4, index: 5)
+            layerEnc1.setThreadgroupMemoryLength(1024 * 4, index: 0)
+            layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
+            layerEnc1.memoryBarrier(scope: .buffers)
+
+            // Router: rmsnorm_no_scale(hMid) * router.scale * hidden^-0.5 -> bVectorBuffer
+            var gemmaScale = 1.0 / Float(Double(hiddenDim).squareRoot())
+            layerEnc1.setComputePipelineState(rmsnormNoScalePipeline)
+            layerEnc1.setBuffer(hMidBuffer, offset: 0, index: 0)
+            layerEnc1.setBuffer(attnOutBuffer, offset: 0, index: 1)
+            layerEnc1.setBytes(&hDimV, length: 4, index: 2)
+            layerEnc1.setBytes(&epsV, length: 4, index: 3)
+            layerEnc1.setThreadgroupMemoryLength(1024 * 4, index: 0)
+            layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
+            layerEnc1.memoryBarrier(scope: .buffers)
+
+            let rsv = layer.routerScaleVec!
+            var rsvOff = rsv.offsetStart
+            layerEnc1.setComputePipelineState(mulByBf16VectorPipeline)
+            layerEnc1.setBuffer(attnOutBuffer, offset: 0, index: 0)
+            layerEnc1.setBuffer(buffers[rsv.shardIndex]!, offset: 0, index: 1)
+            layerEnc1.setBuffer(bVectorBuffer, offset: 0, index: 2)
+            layerEnc1.setBytes(&rsvOff, length: 8, index: 3)
+            layerEnc1.setBytes(&hDimV, length: 4, index: 4)
+            layerEnc1.setBytes(&gemmaScale, length: 4, index: 5)
+            layerEnc1.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), mulByBf16VectorPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            layerEnc1.memoryBarrier(scope: .buffers)
+
+            let routerTensor = layer.routerTensor!
+            var rOffset = routerTensor.offsetStart
+            var nExp: UInt32 = 128
+            var kVal: UInt32 = 8
+            layerEnc1.setComputePipelineState(routerPipeline)
+            layerEnc1.setBuffer(buffers[routerTensor.shardIndex]!, offset: 0, index: 0)
+            layerEnc1.setBuffer(bVectorBuffer, offset: 0, index: 1)
+            layerEnc1.setBuffer(routerIndicesBuffer, offset: 0, index: 2)
+            layerEnc1.setBuffer(routerWeightsBuffer, offset: 0, index: 3)
+            layerEnc1.setBytes(&rOffset, length: 8, index: 4)
+            layerEnc1.setBytes(&hDimV, length: 4, index: 5)
+            layerEnc1.setBytes(&nExp, length: 4, index: 6)
+            layerEnc1.setBytes(&kVal, length: 4, index: 7)
+            layerEnc1.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+            layerEnc1.memoryBarrier(scope: .buffers)
+
+            let pes = layer.routerPerExpertScale!
+            var pesOff = pes.offsetStart
+            var kTop = kVal
+            layerEnc1.setComputePipelineState(perExpertScalePipeline)
+            layerEnc1.setBuffer(routerWeightsBuffer, offset: 0, index: 0)
+            layerEnc1.setBuffer(routerIndicesBuffer, offset: 0, index: 1)
+            layerEnc1.setBuffer(buffers[pes.shardIndex]!, offset: 0, index: 2)
+            layerEnc1.setBytes(&pesOff, length: 8, index: 3)
+            layerEnc1.setBytes(&kTop, length: 4, index: 4)
+            layerEnc1.dispatchThreads(MTLSize(width: Int(kVal), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(kVal), perExpertScalePipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            layerEnc1.memoryBarrier(scope: .buffers)
+
+            layerEnc1.endEncoding()
+            activeCmd.commit()
+            activeCmd.waitUntilCompleted()
+            if let err = activeCmd.error {
+                XCTFail("Router cmd error at layer \(l): \(err)")
+                return
+            }
+
+            // Pread active experts
+            var gemmaActiveExperts: [(id: Int, weight: Float)] = []
+            let gIndPtr = routerIndicesBuffer.contents().bindMemory(to: UInt32.self, capacity: 8)
+            let gWPtr = routerWeightsBuffer.contents().bindMemory(to: Float.self, capacity: 8)
+            for i in 0..<8 {
+                let w = gWPtr[i]
+                if w > 0.00001 { gemmaActiveExperts.append((id: Int(gIndPtr[i]), weight: w)) }
+            }
+
+            guard let gemmaMoeCmd = cmdQueue.makeCommandBuffer(),
+                  let gemmaEnc = gemmaMoeCmd.makeComputeCommandEncoder() else {
+                XCTFail("Failed to create MoE encoder")
+                return
+            }
+
+            // pre_feedforward_layernorm_2(hMid) -> xNorm2Buffer
+            let pf2 = layer.preFfnNorm2Tensor!
+            var pf2Off = pf2.offsetStart
+            gemmaEnc.setComputePipelineState(rmsnormPipeline)
+            gemmaEnc.setBuffer(hMidBuffer, offset: 0, index: 0)
+            gemmaEnc.setBuffer(buffers[pf2.shardIndex]!, offset: 0, index: 1)
+            gemmaEnc.setBuffer(xNorm2Buffer, offset: 0, index: 2)
+            gemmaEnc.setBytes(&pf2Off, length: 8, index: 3)
+            gemmaEnc.setBytes(&hDimV, length: 4, index: 4)
+            gemmaEnc.setBytes(&epsV, length: 4, index: 5)
+            gemmaEnc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+            gemmaEnc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
+            gemmaEnc.memoryBarrier(scope: .buffers)
+
+            // Clear xNorm1Buffer for expert accumulation
+            gemmaEnc.setComputePipelineState(clearPipeline)
+            gemmaEnc.setBuffer(xNorm1Buffer, offset: 0, index: 0)
+            gemmaEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            gemmaEnc.memoryBarrier(scope: .buffers)
+
+            var gemmaSlotOf: [Int: Int] = [:]
+            if let packedDir = packedExpertsDir,
+               let gemmaFd = ExpertIOThreadPool.shared.getOrOpenLayerFD(layerIndex: l, packedExpertsDir: packedDir) {
+                var tasks: [ExpertPreadTask] = []
+                for (slot, exp) in gemmaActiveExperts.enumerated() {
+                    gemmaSlotOf[exp.id] = slot
+                    tasks.append(ExpertPreadTask(fd: gemmaFd,
+                                                 dst: expertStagingBuffer.contents().advanced(by: slot * expertSize),
+                                                 offset: off_t(exp.id * expertSize),
+                                                 size: expertSize))
+                }
+                if !tasks.isEmpty {
+                    ExpertIOThreadPool.shared.dispatchSync(tasks: &tasks)
+                }
+            }
+
+            let gemmaCompUpOff = UInt64(loadedLayout?.components.first(where: { $0.name.contains("up_proj") && !$0.name.contains("scale") && !$0.name.contains("bias") })?.offset ?? 0)
+            let gemmaCompDownOff = UInt64(loadedLayout?.components.first(where: { $0.name.contains("down_proj") && !$0.name.contains("scale") && !$0.name.contains("bias") })?.offset ?? 0)
+            var expertInterDimV = gemmaExpertInterDim
+            let upByteOffset = UInt64(gemmaExpertInterDim) * UInt64(hiddenDim) * 2
+
+            for (expId, weight) in gemmaActiveExperts {
+                let fusedRaw: MTLBuffer
+                let downRaw: MTLBuffer
+                let gOff: UInt64
+                let uOff: UInt64
+                let dOff: UInt64
+                if let slot = gemmaSlotOf[expId] {
+                    let slotOffset = UInt64(slot * expertSize)
+                    fusedRaw = expertStagingBuffer
+                    downRaw = expertStagingBuffer
+                    gOff = slotOffset + gemmaCompUpOff
+                    uOff = slotOffset + gemmaCompUpOff + upByteOffset
+                    dOff = slotOffset + gemmaCompDownOff
+                } else if let fused = layer.expertFusedGateUpWeights[expId], let down = layer.expertDownWeights[expId],
+                          let fusedBuf = buffers[fused.shardIndex], let downBuf = buffers[down.shardIndex] {
+                    fusedRaw = fusedBuf
+                    downRaw = downBuf
+                    gOff = fused.offsetStart
+                    uOff = fused.offsetStart + upByteOffset
+                    dOff = down.offsetStart
+                } else { continue }
+
+                var gOffV = gOff
+                var uOffV = uOff
+                var dOffV = dOff
+                var expW = weight
+
+                gemmaEnc.setComputePipelineState(bf16GeluGateUpSimdPipeline)
+                gemmaEnc.setBuffer(fusedRaw, offset: 0, index: 0)
+                gemmaEnc.setBuffer(fusedRaw, offset: 0, index: 1)
+                gemmaEnc.setBuffer(xNorm2Buffer, offset: 0, index: 2)
+                gemmaEnc.setBuffer(interBuffer, offset: 0, index: 3)
+                gemmaEnc.setBytes(&gOffV, length: 8, index: 4)
+                gemmaEnc.setBytes(&uOffV, length: 8, index: 5)
+                gemmaEnc.setBytes(&hDimV, length: 4, index: 6)
+                gemmaEnc.setBytes(&expertInterDimV, length: 4, index: 7)
+                gemmaEnc.dispatchThreadgroups(MTLSize(width: Int(expertInterDimV), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                gemmaEnc.memoryBarrier(scope: .buffers)
+
+                gemmaEnc.setComputePipelineState(bf16DownSimdPipeline)
+                gemmaEnc.setBuffer(downRaw, offset: 0, index: 0)
+                gemmaEnc.setBuffer(interBuffer, offset: 0, index: 1)
+                gemmaEnc.setBuffer(xNorm1Buffer, offset: 0, index: 2)
+                gemmaEnc.setBytes(&dOffV, length: 8, index: 3)
+                gemmaEnc.setBytes(&expertInterDimV, length: 4, index: 4)
+                gemmaEnc.setBytes(&hDimV, length: 4, index: 5)
+                gemmaEnc.setBytes(&expW, length: 4, index: 6)
+                gemmaEnc.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                gemmaEnc.memoryBarrier(scope: .buffers)
+            }
+
+            // post_feedforward_layernorm_2(moe) -> bVectorBuffer
+            let pf2Post = layer.postFfnNorm2Tensor!
+            var pf2PostOff = pf2Post.offsetStart
+            gemmaEnc.setComputePipelineState(rmsnormPipeline)
+            gemmaEnc.setBuffer(xNorm1Buffer, offset: 0, index: 0)
+            gemmaEnc.setBuffer(buffers[pf2Post.shardIndex]!, offset: 0, index: 1)
+            gemmaEnc.setBuffer(bVectorBuffer, offset: 0, index: 2)
+            gemmaEnc.setBytes(&pf2PostOff, length: 8, index: 3)
+            gemmaEnc.setBytes(&hDimV, length: 4, index: 4)
+            gemmaEnc.setBytes(&epsV, length: 4, index: 5)
+            gemmaEnc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+            gemmaEnc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
+            gemmaEnc.memoryBarrier(scope: .buffers)
+
+            // hMlp = postFfnNorm1(dense) + postFfnNorm2(moe)
+            gemmaEnc.setComputePipelineState(addPipeline)
+            gemmaEnc.setBuffer(hMlpBuffer, offset: 0, index: 0)
+            gemmaEnc.setBuffer(bVectorBuffer, offset: 0, index: 1)
+            gemmaEnc.setBuffer(hMlpBuffer, offset: 0, index: 2)
+            gemmaEnc.setBytes(&hDimV, length: 4, index: 3)
+            gemmaEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), addPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            gemmaEnc.memoryBarrier(scope: .buffers)
+
+            // post_feedforward_layernorm(combined) -> xNorm2Buffer
+            let pfCombined = layer.postFfnNormTensor!
+            var pfCombOff = pfCombined.offsetStart
+            gemmaEnc.setComputePipelineState(rmsnormPipeline)
+            gemmaEnc.setBuffer(hMlpBuffer, offset: 0, index: 0)
+            gemmaEnc.setBuffer(buffers[pfCombined.shardIndex]!, offset: 0, index: 1)
+            gemmaEnc.setBuffer(xNorm2Buffer, offset: 0, index: 2)
+            gemmaEnc.setBytes(&pfCombOff, length: 8, index: 3)
+            gemmaEnc.setBytes(&hDimV, length: 4, index: 4)
+            gemmaEnc.setBytes(&epsV, length: 4, index: 5)
+            gemmaEnc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+            gemmaEnc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
+            gemmaEnc.memoryBarrier(scope: .buffers)
+
+            // nextH = hMid + xNorm2
+            gemmaEnc.setComputePipelineState(addPipeline)
+            gemmaEnc.setBuffer(hMidBuffer, offset: 0, index: 0)
+            gemmaEnc.setBuffer(xNorm2Buffer, offset: 0, index: 1)
+            gemmaEnc.setBuffer(nextH, offset: 0, index: 2)
+            gemmaEnc.setBytes(&hDimV, length: 4, index: 3)
+            gemmaEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), addPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            gemmaEnc.memoryBarrier(scope: .buffers)
+
+            // nextH *= layer_scalar
+            let ls = layer.layerScalarTensor!
+            let lsRaw = buffers[ls.shardIndex]!
+            let lsBits = lsRaw.contents().load(fromByteOffset: Int(ls.offsetStart), as: UInt16.self)
+            var scalarVal = Float(bitPattern: UInt32(lsBits) << 16)
+            gemmaEnc.setComputePipelineState(scaleVectorInplacePipeline)
+            gemmaEnc.setBuffer(nextH, offset: 0, index: 0)
+            gemmaEnc.setBytes(&hDimV, length: 4, index: 1)
+            gemmaEnc.setBytes(&scalarVal, length: 4, index: 2)
+            gemmaEnc.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), scaleVectorInplacePipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            gemmaEnc.memoryBarrier(scope: .buffers)
+
+            gemmaEnc.endEncoding()
+            gemmaMoeCmd.commit()
+            gemmaMoeCmd.waitUntilCompleted()
+            if let err = gemmaMoeCmd.error {
+                XCTFail("MoE cmd error at layer \(l): \(err)")
+                return
+            }
+
+            let l2Out = l2Norm(nextH, count: Int(hiddenDim))
+            logT("Layer \(l) output L2: \(String(format: "%.4f", l2Out)) (scalar=\(scalarVal))")
+
+            let temp = currentH
+            currentH = nextH
+            nextH = temp
+
+            guard let nextCmd = cmdQueue.makeCommandBuffer() else { fatalError("no next cmd") }
+            activeCmd = nextCmd
+        }
+
+        // Final norm + LM head
+        guard let finalEnc = activeCmd.makeComputeCommandEncoder() else { fatalError("no final enc") }
+        var normOffset = normTensor.offsetStart
+        finalEnc.setComputePipelineState(rmsnormPipeline)
+        finalEnc.setBuffer(currentH, offset: 0, index: 0)
+        finalEnc.setBuffer(buffers[normTensor.shardIndex]!, offset: 0, index: 1)
+        finalEnc.setBuffer(xFinalBuffer, offset: 0, index: 2)
+        finalEnc.setBytes(&normOffset, length: 8, index: 3)
+        finalEnc.setBytes(&hDimV, length: 4, index: 4)
+        finalEnc.setBytes(&epsV, length: 4, index: 5)
+        finalEnc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+        finalEnc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
+        finalEnc.memoryBarrier(scope: .buffers)
+
+        dispatchLinearTest(finalEnc, weight: lmHeadTensor, inBuf: xFinalBuffer, outBuf: logitsBuffer, inDim: hiddenDim, outDim: vocabSize)
+        finalEnc.endEncoding()
+        activeCmd.commit()
+        activeCmd.waitUntilCompleted()
+
+        let xFinalL2 = l2Norm(xFinalBuffer, count: Int(hiddenDim))
+        let xFinalRms = xFinalL2 / sqrt(Float(hiddenDim))
+        logT("✅ Final x_final L2: \(xFinalL2), RMS: \(xFinalRms)")
+
+        // Extract top 10 logits
+        let logitsPtr = logitsBuffer.contents().bindMemory(to: Float.self, capacity: Int(vocabSize))
+        var top10: [(id: Int, val: Float)] = []
+        for i in 0..<Int(vocabSize) {
+            let val = logitsPtr[i]
+            if top10.count < 10 {
+                top10.append((id: i, val: val))
+                top10.sort { $0.val > $1.val }
+            } else if val > top10.last!.val {
+                top10[9] = (id: i, val: val)
+                top10.sort { $0.val > $1.val }
+            }
+        }
+        logT("✅ Top 10 logits:")
+        for t in top10 {
+            logT("  id=\(t.id): \(String(format: "%.3f", t.val))")
+        }
+
+        try? testLogs.joined(separator: "\n").write(toFile: "/tmp/gemma4_test_log.txt", atomically: true, encoding: .utf8)
+        XCTAssertEqual(top10.first?.id, 237323)
+    }
+
+    func testGemma4PromptAndGeneration() throws {
+        print("=== TEST GEMMA 4 PROMPT & AUTOREGRESSIVE GENERATION ===")
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--google--gemma-4-26B-A4B-it/snapshots/4d7ae4984b7db7de8f8457170b3f1a419ee76d52"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            throw XCTSkip("Gemma 4 snapshot not found")
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshotDir)
+        var summary = try engine.getSummary()
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+
+        summary = try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: UInt64(device.maxBufferLength))
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let address = UInt(shard.baseAddress)
+            guard let ptr = UnsafeMutableRawPointer(bitPattern: address) else { continue }
+            let len = Int(shard.length)
+            if len > 0, len <= Int(device.maxBufferLength) {
+                if let buf = device.makeBuffer(bytesNoCopy: ptr, length: len, options: .storageModeShared, deallocator: nil) {
+                    buffers[shard.index] = buf
+                }
+            }
+        }
+
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+        guard let defaultLib = inference.defaultLibrary else {
+            XCTFail("No default Metal library")
+            return
+        }
+
+        guard let cmdQueue = device.makeCommandQueue() else {
+            XCTFail("No Metal command queue")
+            return
+        }
+
+        let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir))
+        let cachedLayers = inference.buildCachedLayers(summary: summary, config: config, targetLayerCount: 30)
+
+        let hiddenDim = config?.hiddenSize ?? 2816
+        let vocabSize = config?.vocabSize ?? 262144
+        let numHeads: UInt32 = UInt32(config?.numAttentionHeads ?? 16)
+        let numKvHeads: UInt32 = UInt32(config?.numKeyValueHeads ?? 8)
+        let headDim: UInt32 = UInt32(config?.headDim ?? 256)
+        let globalHeadDim: UInt32 = UInt32(config?.effectiveGlobalHeadDim ?? 512)
+        let numGlobalKvHeads: UInt32 = UInt32(config?.effectiveNumGlobalKeyValueHeads ?? 2)
+        let gemmaKvStride: UInt32 = numKvHeads * headDim
+        let numExperts: UInt32 = UInt32(config?.effectiveNumExperts ?? 128)
+        let gemmaExpertInterDim: UInt32 = UInt32(config?.effectiveMoeIntermediateSize ?? 704)
+        let eps: Float = config?.rmsNormEps ?? 1e-6
+        let maxSeqLen = 64
+
+        KVCacheManager.shared.reset(
+            device: device,
+            config: config,
+            actualLayers: 30,
+            totalLoops: 1,
+            numKvHeads: Int(numKvHeads),
+            headDim: Int(headDim),
+            maxSeqLen: maxSeqLen,
+            precision: .fp16
+        )
+
+        let hBufA = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let hBufB = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let xNorm1Buf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let xNorm2Buf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let qGateBuf = device.makeBuffer(length: 16 * 512 * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let kVecBuf = device.makeBuffer(length: Int(gemmaKvStride) * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let vVecBuf = device.makeBuffer(length: Int(gemmaKvStride) * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let bVecBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let attnCtxBuf = device.makeBuffer(length: 16 * 512 * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let attnOutBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let hMidBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let interBuf = device.makeBuffer(length: 16384 * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let hMlpBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let xFinalBuf = device.makeBuffer(length: hiddenDim * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let logitsBuf = device.makeBuffer(length: vocabSize * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let routerIndicesBuf = device.makeBuffer(length: 8 * MemoryLayout<UInt32>.stride, options: .storageModeShared)!
+        let routerWeightsBuf = device.makeBuffer(length: 8 * MemoryLayout<Float>.stride, options: .storageModeShared)!
+        let singleTokenBuf = device.makeBuffer(length: 4, options: .storageModeShared)!
+
+        let embedWeight = summary.tensors.first { $0.name.hasSuffix("embed_tokens.weight") }!
+        let normTensor = summary.tensors.first { $0.name == "model.language_model.norm.weight" || $0.name == "model.norm.weight" }!
+        let lmHeadTensor = summary.tensors.first { $0.name == "lm_head.weight" || $0.name == "model.lm_head.weight" } ?? embedWeight
+
+        let embedPipe = inference.embedPipeline!
+        let scaleVectorPipe = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: "scale_vector_inplace")!)
+        let rmsnormPipe = inference.rmsnormPipeline!
+        let rmsnormNoScalePipe = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: "rmsnorm_no_scale_bf16")!)
+        let headRmsnormPipe = inference.headRmsnormPipeline!
+        let ropePipe = inference.ropePipeline!
+        let ropeProportionalPipe = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: "apply_rope_proportional")!)
+        let storeKvGemmaF16Pipe = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: "store_kv_cache_gemma_f16")!)
+        let gqaGemmaF16Pipe = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: "gqa_attention_decode_gemma_f16")!)
+        let geluPipe = inference.bf16GeluGateUpSimdPipeline ?? inference.bf16GeluGateUpPipeline!
+        let downPipe = inference.bf16DownSimdPipeline ?? inference.bf16DownPipeline!
+        let addPipe = inference.addPipeline!
+        let clearPipe = inference.clearPipeline!
+        let mulByBf16Pipe = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: "mul_by_bf16_vector")!)
+        let routerPipe = inference.routerPipeline!
+        let perExpertScalePipe = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: "apply_topk_per_expert_scale")!)
+        let gemvPipe = inference.bf16GemvSimdPipeline!
+
+        func dispatchLinearLocal(
+            enc: MTLComputeCommandEncoder,
+            weight: TensorMetadata?,
+            inBuf: MTLBuffer,
+            outBuf: MTLBuffer,
+            inDim: UInt32,
+            outDim: UInt32
+        ) {
+            guard let w = weight, let wRaw = buffers[w.shardIndex] else { return }
+            var wOff = w.offsetStart
+            var inD = inDim
+            var outD = outDim
+            enc.setComputePipelineState(gemvPipe)
+            enc.setBuffer(wRaw, offset: 0, index: 0)
+            enc.setBuffer(inBuf, offset: 0, index: 1)
+            enc.setBuffer(outBuf, offset: 0, index: 2)
+            enc.setBytes(&wOff, length: 8, index: 3)
+            enc.setBytes(&inD, length: 4, index: 4)
+            enc.setBytes(&outD, length: 4, index: 5)
+            enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+        }
+
+        func runTokenForward(tokenId: UInt32, step: UInt32, computeLogits: Bool) {
+            let kCache = KVCacheManager.shared.kCacheBuffer!
+            let vCache = KVCacheManager.shared.vCacheBuffer!
+
+            var curH = hBufA
+            var nxtH = hBufB
+
+            let embedCmd = cmdQueue.makeCommandBuffer()!
+            let embedEnc = embedCmd.makeComputeCommandEncoder()!
+            singleTokenBuf.contents().bindMemory(to: UInt32.self, capacity: 1)[0] = tokenId
+            var wOff = embedWeight.offsetStart
+            var hDimVal = UInt32(hiddenDim)
+            var tokCount: UInt32 = 1
+            embedEnc.setComputePipelineState(embedPipe)
+            embedEnc.setBuffer(buffers[embedWeight.shardIndex]!, offset: 0, index: 0)
+            embedEnc.setBuffer(singleTokenBuf, offset: 0, index: 1)
+            embedEnc.setBuffer(curH, offset: 0, index: 2)
+            embedEnc.setBytes(&wOff, length: 8, index: 3)
+            embedEnc.setBytes(&hDimVal, length: 4, index: 4)
+            embedEnc.setBytes(&tokCount, length: 4, index: 5)
+            embedEnc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+            embedEnc.memoryBarrier(scope: .buffers)
+
+            var embedScaleVal = Float(Double(hiddenDim).squareRoot())
+            embedEnc.setComputePipelineState(scaleVectorPipe)
+            embedEnc.setBuffer(curH, offset: 0, index: 0)
+            embedEnc.setBytes(&hDimVal, length: 4, index: 1)
+            embedEnc.setBytes(&embedScaleVal, length: 4, index: 2)
+            embedEnc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+            embedEnc.endEncoding()
+            embedCmd.commit()
+            embedCmd.waitUntilCompleted()
+
+            for layer in cachedLayers {
+                let cmd = cmdQueue.makeCommandBuffer()!
+                let enc = cmd.makeComputeCommandEncoder()!
+                var epsV = eps
+
+                // 1. RMSNorm 1
+                var norm1Off = layer.norm1Tensor!.offsetStart
+                enc.setComputePipelineState(rmsnormPipe)
+                enc.setBuffer(curH, offset: 0, index: 0)
+                enc.setBuffer(buffers[layer.norm1Tensor!.shardIndex]!, offset: 0, index: 1)
+                enc.setBuffer(xNorm1Buf, offset: 0, index: 2)
+                enc.setBytes(&norm1Off, length: 8, index: 3)
+                enc.setBytes(&hDimVal, length: 4, index: 4)
+                enc.setBytes(&epsV, length: 4, index: 5)
+                enc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                // 2. QKV Projections
+                let isGlobal = !layer.isSlidingAttention
+                let gHeadDim: UInt32 = isGlobal ? globalHeadDim : headDim
+                let gNumKv: UInt32 = isGlobal ? numGlobalKvHeads : numKvHeads
+                let gQDim: UInt32 = numHeads * gHeadDim
+                let gKvDim: UInt32 = gNumKv * gHeadDim
+
+                dispatchLinearLocal(enc: enc, weight: layer.qProjTensor, inBuf: xNorm1Buf, outBuf: qGateBuf, inDim: UInt32(hiddenDim), outDim: gQDim)
+                dispatchLinearLocal(enc: enc, weight: layer.kProjTensor, inBuf: xNorm1Buf, outBuf: kVecBuf, inDim: UInt32(hiddenDim), outDim: gKvDim)
+                if !isGlobal {
+                    dispatchLinearLocal(enc: enc, weight: layer.vProjTensor, inBuf: xNorm1Buf, outBuf: vVecBuf, inDim: UInt32(hiddenDim), outDim: gKvDim)
+                }
+
+                // Value Norm (No Scale)
+                var vDim = gHeadDim
+                var vEps = epsV
+                enc.setComputePipelineState(rmsnormNoScalePipe)
+                enc.setBuffer(layer.isSlidingAttention ? vVecBuf : kVecBuf, offset: 0, index: 0)
+                enc.setBuffer(vVecBuf, offset: 0, index: 1)
+                enc.setBytes(&vDim, length: 4, index: 2)
+                enc.setBytes(&vEps, length: 4, index: 3)
+                enc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                enc.dispatchThreadgroups(MTLSize(width: Int(gNumKv), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(gHeadDim)), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                // Q / K Per-Head RMSNorm
+                if let qNorm = layer.qNormTensor, let qNormRaw = buffers[qNorm.shardIndex] {
+                    var qNormOff = qNorm.offsetStart
+                    var nQ = numHeads
+                    var hD = gHeadDim
+                    var hStride = gHeadDim
+                    enc.setComputePipelineState(headRmsnormPipe)
+                    enc.setBuffer(qGateBuf, offset: 0, index: 0)
+                    enc.setBuffer(qNormRaw, offset: 0, index: 1)
+                    enc.setBytes(&qNormOff, length: 8, index: 2)
+                    enc.setBytes(&nQ, length: 4, index: 3)
+                    enc.setBytes(&hD, length: 4, index: 4)
+                    enc.setBytes(&hStride, length: 4, index: 5)
+                    enc.setBytes(&epsV, length: 4, index: 6)
+                    enc.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                    enc.memoryBarrier(scope: .buffers)
+                }
+                if let kNorm = layer.kNormTensor, let kNormRaw = buffers[kNorm.shardIndex] {
+                    var kNormOff = kNorm.offsetStart
+                    var nK = gNumKv
+                    var hD = gHeadDim
+                    var hStride = gHeadDim
+                    enc.setComputePipelineState(headRmsnormPipe)
+                    enc.setBuffer(kVecBuf, offset: 0, index: 0)
+                    enc.setBuffer(kNormRaw, offset: 0, index: 1)
+                    enc.setBytes(&kNormOff, length: 8, index: 2)
+                    enc.setBytes(&nK, length: 4, index: 3)
+                    enc.setBytes(&hD, length: 4, index: 4)
+                    enc.setBytes(&hStride, length: 4, index: 5)
+                    enc.setBytes(&epsV, length: 4, index: 6)
+                    enc.dispatchThreadgroups(MTLSize(width: Int(gNumKv), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                    enc.memoryBarrier(scope: .buffers)
+                }
+
+                // RoPE
+                var pos = step
+                var nQ = numHeads
+                var nK = gNumKv
+                var hD = gHeadDim
+                var qStr = gHeadDim
+                var kStr = gHeadDim
+                var theta: Float = isGlobal ? 1000000.0 : 10000.0
+                if isGlobal {
+                    var partialRotaryDim: UInt32 = 128
+                    enc.setComputePipelineState(ropeProportionalPipe)
+                    enc.setBuffer(qGateBuf, offset: 0, index: 0)
+                    enc.setBytes(&pos, length: 4, index: 1)
+                    enc.setBytes(&nQ, length: 4, index: 2)
+                    enc.setBytes(&hD, length: 4, index: 3)
+                    enc.setBytes(&partialRotaryDim, length: 4, index: 4)
+                    enc.setBytes(&qStr, length: 4, index: 5)
+                    enc.setBytes(&theta, length: 4, index: 6)
+                    enc.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), ropeProportionalPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+
+                    enc.setBuffer(kVecBuf, offset: 0, index: 0)
+                    enc.setBytes(&pos, length: 4, index: 1)
+                    enc.setBytes(&nK, length: 4, index: 2)
+                    enc.setBytes(&hD, length: 4, index: 3)
+                    enc.setBytes(&partialRotaryDim, length: 4, index: 4)
+                    enc.setBytes(&kStr, length: 4, index: 5)
+                    enc.setBytes(&theta, length: 4, index: 6)
+                    enc.dispatchThreads(MTLSize(width: Int(gNumKv), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(gNumKv), ropeProportionalPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                    enc.memoryBarrier(scope: .buffers)
+                } else {
+                    var rD = gHeadDim
+                    enc.setComputePipelineState(ropePipe)
+                    enc.setBuffer(qGateBuf, offset: 0, index: 0)
+                    enc.setBytes(&pos, length: 4, index: 1)
+                    enc.setBytes(&nQ, length: 4, index: 2)
+                    enc.setBytes(&hD, length: 4, index: 3)
+                    enc.setBytes(&rD, length: 4, index: 4)
+                    enc.setBytes(&qStr, length: 4, index: 5)
+                    enc.setBytes(&theta, length: 4, index: 6)
+                    enc.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), ropePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+
+                    enc.setBuffer(kVecBuf, offset: 0, index: 0)
+                    enc.setBytes(&pos, length: 4, index: 1)
+                    enc.setBytes(&nK, length: 4, index: 2)
+                    enc.setBytes(&hD, length: 4, index: 3)
+                    enc.setBytes(&rD, length: 4, index: 4)
+                    enc.setBytes(&kStr, length: 4, index: 5)
+                    enc.setBytes(&theta, length: 4, index: 6)
+                    enc.dispatchThreads(MTLSize(width: Int(gNumKv), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(gNumKv), ropePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                    enc.memoryBarrier(scope: .buffers)
+                }
+
+                // KV Store + Attention (linear cache layout: ringLen 0)
+                let slot = layer.fullAttnIndex
+                let layerByteOffset = slot * maxSeqLen * Int(gemmaKvStride) * 2
+                var cacheStride = gemmaKvStride
+                var linearRingLen: UInt32 = 0
+
+                enc.setComputePipelineState(storeKvGemmaF16Pipe)
+                enc.setBuffer(kVecBuf, offset: 0, index: 0)
+                enc.setBuffer(vVecBuf, offset: 0, index: 1)
+                enc.setBuffer(kCache, offset: layerByteOffset, index: 2)
+                enc.setBuffer(vCache, offset: layerByteOffset, index: 3)
+                enc.setBytes(&pos, length: 4, index: 4)
+                enc.setBytes(&nK, length: 4, index: 5)
+                enc.setBytes(&hD, length: 4, index: 6)
+                enc.setBytes(&cacheStride, length: 4, index: 7)
+                enc.setBytes(&linearRingLen, length: 4, index: 8)
+                enc.dispatchThreads(MTLSize(width: Int(gKvDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(gKvDim), storeKvGemmaF16Pipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                var seqLen = step + 1
+                var winSize: UInt32 = isGlobal ? 0 : 512
+                var scaling: Float = 1.0
+                enc.setComputePipelineState(gqaGemmaF16Pipe)
+                enc.setBuffer(qGateBuf, offset: 0, index: 0)
+                enc.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                enc.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                enc.setBuffer(attnCtxBuf, offset: 0, index: 3)
+                enc.setBytes(&seqLen, length: 4, index: 4)
+                enc.setBytes(&nQ, length: 4, index: 5)
+                enc.setBytes(&nK, length: 4, index: 6)
+                enc.setBytes(&hD, length: 4, index: 7)
+                enc.setBytes(&winSize, length: 4, index: 8)
+                enc.setBytes(&scaling, length: 4, index: 9)
+                enc.setBytes(&cacheStride, length: 4, index: 10)
+                enc.setBytes(&linearRingLen, length: 4, index: 11)
+                enc.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                dispatchLinearLocal(enc: enc, weight: layer.oProjTensor, inBuf: attnCtxBuf, outBuf: attnOutBuf, inDim: gQDim, outDim: UInt32(hiddenDim))
+
+                // Post-attention norm -> xNorm2Buf
+                var norm2Off = layer.norm2Tensor!.offsetStart
+                enc.setComputePipelineState(rmsnormPipe)
+                enc.setBuffer(attnOutBuf, offset: 0, index: 0)
+                enc.setBuffer(buffers[layer.norm2Tensor!.shardIndex]!, offset: 0, index: 1)
+                enc.setBuffer(xNorm2Buf, offset: 0, index: 2)
+                enc.setBytes(&norm2Off, length: 8, index: 3)
+                enc.setBytes(&hDimVal, length: 4, index: 4)
+                enc.setBytes(&epsV, length: 4, index: 5)
+                enc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                // hMid = curH + xNorm2Buf
+                enc.setComputePipelineState(addPipe)
+                enc.setBuffer(curH, offset: 0, index: 0)
+                enc.setBuffer(xNorm2Buf, offset: 0, index: 1)
+                enc.setBuffer(hMidBuf, offset: 0, index: 2)
+                enc.setBytes(&hDimVal, length: 4, index: 3)
+                enc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                // Dense branch
+                var preFfnOff = layer.preFfnNormTensor!.offsetStart
+                enc.setComputePipelineState(rmsnormPipe)
+                enc.setBuffer(hMidBuf, offset: 0, index: 0)
+                enc.setBuffer(buffers[layer.preFfnNormTensor!.shardIndex]!, offset: 0, index: 1)
+                enc.setBuffer(xNorm2Buf, offset: 0, index: 2)
+                enc.setBytes(&preFfnOff, length: 8, index: 3)
+                enc.setBytes(&hDimVal, length: 4, index: 4)
+                enc.setBytes(&epsV, length: 4, index: 5)
+                enc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                let dG = layer.denseGateWeight!
+                let dU = layer.denseUpWeight!
+                let dD = layer.denseDownWeight!
+                var gOff = dG.offsetStart
+                var uOff = dU.offsetStart
+                var dOff = dD.offsetStart
+                var interDimV = layer.intermediateDim
+                enc.setComputePipelineState(clearPipe)
+                enc.setBuffer(hMlpBuf, offset: 0, index: 0)
+                enc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+                enc.setComputePipelineState(geluPipe)
+                enc.setBuffer(buffers[dG.shardIndex]!, offset: 0, index: 0)
+                enc.setBuffer(buffers[dU.shardIndex]!, offset: 0, index: 1)
+                enc.setBuffer(xNorm2Buf, offset: 0, index: 2)
+                enc.setBuffer(interBuf, offset: 0, index: 3)
+                enc.setBytes(&gOff, length: 8, index: 4)
+                enc.setBytes(&uOff, length: 8, index: 5)
+                enc.setBytes(&hDimVal, length: 4, index: 6)
+                enc.setBytes(&interDimV, length: 4, index: 7)
+                enc.dispatchThreadgroups(MTLSize(width: Int(interDimV), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                var pkVal: Float = 1.0
+                enc.setComputePipelineState(downPipe)
+                enc.setBuffer(buffers[dD.shardIndex]!, offset: 0, index: 0)
+                enc.setBuffer(interBuf, offset: 0, index: 1)
+                enc.setBuffer(hMlpBuf, offset: 0, index: 2)
+                enc.setBytes(&dOff, length: 8, index: 3)
+                enc.setBytes(&interDimV, length: 4, index: 4)
+                enc.setBytes(&hDimVal, length: 4, index: 5)
+                enc.setBytes(&pkVal, length: 4, index: 6)
+                enc.dispatchThreadgroups(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                var pf1Off = layer.postFfnNorm1Tensor!.offsetStart
+                enc.setComputePipelineState(rmsnormPipe)
+                enc.setBuffer(hMlpBuf, offset: 0, index: 0)
+                enc.setBuffer(buffers[layer.postFfnNorm1Tensor!.shardIndex]!, offset: 0, index: 1)
+                enc.setBuffer(hMlpBuf, offset: 0, index: 2)
+                enc.setBytes(&pf1Off, length: 8, index: 3)
+                enc.setBytes(&hDimVal, length: 4, index: 4)
+                enc.setBytes(&epsV, length: 4, index: 5)
+                enc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                // Router
+                var rDim = UInt32(hiddenDim)
+                enc.setComputePipelineState(rmsnormNoScalePipe)
+                enc.setBuffer(hMidBuf, offset: 0, index: 0)
+                enc.setBuffer(attnOutBuf, offset: 0, index: 1)
+                enc.setBytes(&rDim, length: 4, index: 2)
+                enc.setBytes(&epsV, length: 4, index: 3)
+                enc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                let rsv = layer.routerScaleVec!
+                var rsvOff = rsv.offsetStart
+                var gemmaScale: Float = 1.0 / Float(Double(hiddenDim).squareRoot())
+                enc.setComputePipelineState(mulByBf16Pipe)
+                enc.setBuffer(attnOutBuf, offset: 0, index: 0)
+                enc.setBuffer(buffers[rsv.shardIndex]!, offset: 0, index: 1)
+                enc.setBuffer(bVecBuf, offset: 0, index: 2)
+                enc.setBytes(&rsvOff, length: 8, index: 3)
+                enc.setBytes(&hDimVal, length: 4, index: 4)
+                enc.setBytes(&gemmaScale, length: 4, index: 5)
+                enc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                let routerTensor = layer.routerTensor!
+                var rOff = routerTensor.offsetStart
+                var nExp: UInt32 = numExperts
+                var kVal: UInt32 = 8
+                enc.setComputePipelineState(routerPipe)
+                enc.setBuffer(buffers[routerTensor.shardIndex]!, offset: 0, index: 0)
+                enc.setBuffer(bVecBuf, offset: 0, index: 1)
+                enc.setBuffer(routerIndicesBuf, offset: 0, index: 2)
+                enc.setBuffer(routerWeightsBuf, offset: 0, index: 3)
+                enc.setBytes(&rOff, length: 8, index: 4)
+                enc.setBytes(&hDimVal, length: 4, index: 5)
+                enc.setBytes(&nExp, length: 4, index: 6)
+                enc.setBytes(&kVal, length: 4, index: 7)
+                enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: Int(numExperts), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+
+                let pes = layer.routerPerExpertScale!
+                var pesOff = pes.offsetStart
+                enc.setComputePipelineState(perExpertScalePipe)
+                enc.setBuffer(routerWeightsBuf, offset: 0, index: 0)
+                enc.setBuffer(routerIndicesBuf, offset: 0, index: 1)
+                enc.setBuffer(buffers[pes.shardIndex]!, offset: 0, index: 2)
+                enc.setBytes(&pesOff, length: 8, index: 3)
+                enc.setBytes(&kVal, length: 4, index: 4)
+                enc.dispatchThreads(MTLSize(width: 8, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 1, depth: 1))
+                enc.endEncoding()
+                cmd.commit()
+                cmd.waitUntilCompleted()
+
+                // MoE branch
+                let gIndPtr = routerIndicesBuf.contents().bindMemory(to: UInt32.self, capacity: 8)
+                let gWPtr = routerWeightsBuf.contents().bindMemory(to: Float.self, capacity: 8)
+                var activeExperts: [(id: Int, weight: Float)] = []
+                for i in 0..<8 {
+                    activeExperts.append((id: Int(gIndPtr[i]), weight: gWPtr[i]))
+                }
+
+                let moeCmd = cmdQueue.makeCommandBuffer()!
+                let moeEnc = moeCmd.makeComputeCommandEncoder()!
+
+                var pf2Off = layer.preFfnNorm2Tensor!.offsetStart
+                moeEnc.setComputePipelineState(rmsnormPipe)
+                moeEnc.setBuffer(hMidBuf, offset: 0, index: 0)
+                moeEnc.setBuffer(buffers[layer.preFfnNorm2Tensor!.shardIndex]!, offset: 0, index: 1)
+                moeEnc.setBuffer(xNorm2Buf, offset: 0, index: 2)
+                moeEnc.setBytes(&pf2Off, length: 8, index: 3)
+                moeEnc.setBytes(&hDimVal, length: 4, index: 4)
+                moeEnc.setBytes(&epsV, length: 4, index: 5)
+                moeEnc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                moeEnc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                moeEnc.memoryBarrier(scope: .buffers)
+
+                moeEnc.setComputePipelineState(clearPipe)
+                moeEnc.setBuffer(xNorm1Buf, offset: 0, index: 0)
+                moeEnc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                moeEnc.memoryBarrier(scope: .buffers)
+
+                var expInterDim = gemmaExpertInterDim
+                let upByteOffset = UInt64(gemmaExpertInterDim) * UInt64(hiddenDim) * 2
+                for exp in activeExperts {
+                    guard let fused = layer.expertFusedGateUpWeights[exp.id],
+                          let down = layer.expertDownWeights[exp.id],
+                          let fusedBuf = buffers[fused.shardIndex],
+                          let downBuf = buffers[down.shardIndex] else { continue }
+                    var egOff = fused.offsetStart
+                    var euOff = fused.offsetStart + upByteOffset
+                    var edOff = down.offsetStart
+                    var epk = exp.weight
+
+                    moeEnc.setComputePipelineState(geluPipe)
+                    moeEnc.setBuffer(fusedBuf, offset: 0, index: 0)
+                    moeEnc.setBuffer(fusedBuf, offset: 0, index: 1)
+                    moeEnc.setBuffer(xNorm2Buf, offset: 0, index: 2)
+                    moeEnc.setBuffer(interBuf, offset: 0, index: 3)
+                    moeEnc.setBytes(&egOff, length: 8, index: 4)
+                    moeEnc.setBytes(&euOff, length: 8, index: 5)
+                    moeEnc.setBytes(&hDimVal, length: 4, index: 6)
+                    moeEnc.setBytes(&expInterDim, length: 4, index: 7)
+                    moeEnc.dispatchThreadgroups(MTLSize(width: Int(expInterDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                    moeEnc.memoryBarrier(scope: .buffers)
+
+                    moeEnc.setComputePipelineState(downPipe)
+                    moeEnc.setBuffer(downBuf, offset: 0, index: 0)
+                    moeEnc.setBuffer(interBuf, offset: 0, index: 1)
+                    moeEnc.setBuffer(xNorm1Buf, offset: 0, index: 2)
+                    moeEnc.setBytes(&edOff, length: 8, index: 3)
+                    moeEnc.setBytes(&expInterDim, length: 4, index: 4)
+                    moeEnc.setBytes(&hDimVal, length: 4, index: 5)
+                    moeEnc.setBytes(&epk, length: 4, index: 6)
+                    moeEnc.dispatchThreadgroups(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                    moeEnc.memoryBarrier(scope: .buffers)
+                }
+
+                var postFfn2Off = layer.postFfnNorm2Tensor!.offsetStart
+                moeEnc.setComputePipelineState(rmsnormPipe)
+                moeEnc.setBuffer(xNorm1Buf, offset: 0, index: 0)
+                moeEnc.setBuffer(buffers[layer.postFfnNorm2Tensor!.shardIndex]!, offset: 0, index: 1)
+                moeEnc.setBuffer(bVecBuf, offset: 0, index: 2)
+                moeEnc.setBytes(&postFfn2Off, length: 8, index: 3)
+                moeEnc.setBytes(&hDimVal, length: 4, index: 4)
+                moeEnc.setBytes(&epsV, length: 4, index: 5)
+                moeEnc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                moeEnc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                moeEnc.memoryBarrier(scope: .buffers)
+
+                moeEnc.setComputePipelineState(addPipe)
+                moeEnc.setBuffer(hMlpBuf, offset: 0, index: 0)
+                moeEnc.setBuffer(bVecBuf, offset: 0, index: 1)
+                moeEnc.setBuffer(hMlpBuf, offset: 0, index: 2)
+                moeEnc.setBytes(&hDimVal, length: 4, index: 3)
+                moeEnc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                moeEnc.memoryBarrier(scope: .buffers)
+
+                var postFfnOff = layer.postFfnNormTensor!.offsetStart
+                moeEnc.setComputePipelineState(rmsnormPipe)
+                moeEnc.setBuffer(hMlpBuf, offset: 0, index: 0)
+                moeEnc.setBuffer(buffers[layer.postFfnNormTensor!.shardIndex]!, offset: 0, index: 1)
+                moeEnc.setBuffer(xNorm2Buf, offset: 0, index: 2)
+                moeEnc.setBytes(&postFfnOff, length: 8, index: 3)
+                moeEnc.setBytes(&hDimVal, length: 4, index: 4)
+                moeEnc.setBytes(&epsV, length: 4, index: 5)
+                moeEnc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                moeEnc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                moeEnc.memoryBarrier(scope: .buffers)
+
+                moeEnc.setComputePipelineState(addPipe)
+                moeEnc.setBuffer(hMidBuf, offset: 0, index: 0)
+                moeEnc.setBuffer(xNorm2Buf, offset: 0, index: 1)
+                moeEnc.setBuffer(nxtH, offset: 0, index: 2)
+                moeEnc.setBytes(&hDimVal, length: 4, index: 3)
+                moeEnc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                moeEnc.memoryBarrier(scope: .buffers)
+
+                let ls = layer.layerScalarTensor!
+                let lsRaw = buffers[ls.shardIndex]!
+                let lsBits = lsRaw.contents().load(fromByteOffset: Int(ls.offsetStart), as: UInt16.self)
+                var scalarVal = Float(bitPattern: UInt32(lsBits) << 16)
+                moeEnc.setComputePipelineState(scaleVectorPipe)
+                moeEnc.setBuffer(nxtH, offset: 0, index: 0)
+                moeEnc.setBytes(&hDimVal, length: 4, index: 1)
+                moeEnc.setBytes(&scalarVal, length: 4, index: 2)
+                moeEnc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+
+                moeEnc.endEncoding()
+                moeCmd.commit()
+                moeCmd.waitUntilCompleted()
+
+                let tmp = curH
+                curH = nxtH
+                nxtH = tmp
+            }
+
+            if computeLogits {
+                let finalCmd = cmdQueue.makeCommandBuffer()!
+                let finalEnc = finalCmd.makeComputeCommandEncoder()!
+                var normOff = normTensor.offsetStart
+                var epsVal = eps
+                finalEnc.setComputePipelineState(rmsnormPipe)
+                finalEnc.setBuffer(curH, offset: 0, index: 0)
+                finalEnc.setBuffer(buffers[normTensor.shardIndex]!, offset: 0, index: 1)
+                finalEnc.setBuffer(xFinalBuf, offset: 0, index: 2)
+                finalEnc.setBytes(&normOff, length: 8, index: 3)
+                finalEnc.setBytes(&hDimVal, length: 4, index: 4)
+                finalEnc.setBytes(&epsVal, length: 4, index: 5)
+                finalEnc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                finalEnc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                finalEnc.memoryBarrier(scope: .buffers)
+
+                dispatchLinearLocal(enc: finalEnc, weight: lmHeadTensor, inBuf: xFinalBuf, outBuf: logitsBuf, inDim: UInt32(hiddenDim), outDim: UInt32(vocabSize))
+                finalEnc.endEncoding()
+                finalCmd.commit()
+                finalCmd.waitUntilCompleted()
+            }
+        }
+
+        let tokPath = "\(snapshotDir)/tokenizer.json"
+        let tokenizer = try DynaMoeTokenizer(tokenizerPath: tokPath)
+        // Prompt: "<bos><|turn>user\nHi<turn|>\n<|turn>model\n"
+        let promptTokens = try tokenizer.encode(text: "<bos><|turn>user\nHi<turn|>\n<|turn>model\n")
+        print("Gemma 4 Prompt tokens (\(promptTokens.count)): \(promptTokens)")
+
+        // 1. Prefill all but last token
+        for step in 0..<(promptTokens.count - 1) {
+            runTokenForward(tokenId: promptTokens[step], step: UInt32(step), computeLogits: false)
+        }
+
+        // 2. Run last token with computeLogits: true
+        let lastStep = promptTokens.count - 1
+        runTokenForward(tokenId: promptTokens[lastStep], step: UInt32(lastStep), computeLogits: true)
+
+        // 3. Generate 3 tokens autoregressively
+        var generatedTokens: [UInt32] = []
+        var curStep = UInt32(promptTokens.count)
+        for genStep in 0..<3 {
+            let lPtr = logitsBuf.contents().bindMemory(to: Float.self, capacity: vocabSize)
+            var topTok: UInt32 = 0
+            var topLogit: Float = -Float.infinity
+            for i in 0..<vocabSize {
+                let v = lPtr[i]
+                if v > topLogit {
+                    topLogit = v
+                    topTok = UInt32(i)
+                }
+            }
+            generatedTokens.append(topTok)
+            let dec = (try? tokenizer.decode(ids: [topTok])) ?? ""
+            print("Gemma 4 Generated token \(genStep + 1): id=\(topTok) ('\(dec)'), logit=\(topLogit)")
+            runTokenForward(tokenId: topTok, step: curStep, computeLogits: true)
+            curStep += 1
+        }
+
+        let fullGeneratedText = (try? tokenizer.decode(ids: generatedTokens)) ?? ""
+        print("Gemma 4 Full Generated Text: '\(fullGeneratedText)'")
+        XCTAssertFalse(generatedTokens.isEmpty)
+    }
+
+    /// End-to-end check of the layer-major batched prefill path: run the whole prompt through
+    /// a single batched forward (mirroring ContentView.runLayerWisePrefill's Gemma branch) and
+    /// assert the last token's next-token prediction matches the HF reference (top-1 = <|channel>,
+    /// id 100). This exercises the batched attention store/decode, dual dense+MoE FFN, and
+    /// layer_scalar orchestration in one shot.
+    func testGemma4BatchedPrefillMatchesReference() throws {
+        print("=== TEST GEMMA 4 BATCHED PREFILL ===")
+        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--google--gemma-4-26B-A4B-it/snapshots/4d7ae4984b7db7de8f8457170b3f1a419ee76d52"
+        guard FileManager.default.fileExists(atPath: snapshotDir) else {
+            throw XCTSkip("Gemma 4 snapshot not found")
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshotDir)
+        var summary = try engine.getSummary()
+        guard let device = MTLCreateSystemDefaultDevice() else { XCTFail("No Metal GPU device"); return }
+
+        summary = try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: UInt64(device.maxBufferLength))
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let address = UInt(shard.baseAddress)
+            guard let ptr = UnsafeMutableRawPointer(bitPattern: address) else { continue }
+            let len = Int(shard.length)
+            if len > 0, len <= Int(device.maxBufferLength),
+               let buf = device.makeBuffer(bytesNoCopy: ptr, length: len, options: .storageModeShared, deallocator: nil) {
+                buffers[shard.index] = buf
+            }
+        }
+
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+        guard let defaultLib = inference.defaultLibrary else { XCTFail("No default Metal library"); return }
+        guard let cmdQueue = device.makeCommandQueue() else { XCTFail("No command queue"); return }
+
+        let config = ModelConfig.load(from: URL(fileURLWithPath: snapshotDir))
+        let cachedLayers = inference.buildCachedLayers(summary: summary, config: config, targetLayerCount: 30)
+
+        let hiddenDim = config?.hiddenSize ?? 2816
+        let vocabSize = config?.vocabSize ?? 262144
+        let numHeads: UInt32 = UInt32(config?.numAttentionHeads ?? 16)
+        let numKvHeads: UInt32 = UInt32(config?.numKeyValueHeads ?? 8)
+        let headDim: UInt32 = UInt32(config?.headDim ?? 256)
+        let globalHeadDim: UInt32 = UInt32(config?.effectiveGlobalHeadDim ?? 512)
+        let numGlobalKvHeads: UInt32 = UInt32(config?.effectiveNumGlobalKeyValueHeads ?? 2)
+        let gemmaKvStride: UInt32 = numKvHeads * headDim
+        let numExperts: UInt32 = UInt32(config?.effectiveNumExperts ?? 128)
+        let gemmaExpertInterDim: UInt32 = UInt32(config?.effectiveMoeIntermediateSize ?? 704)
+        let eps: Float = config?.rmsNormEps ?? 1e-6
+        let maxSeqLen = 64
+        // <bos><|turn>user\nHi<turn|>\n<|turn>model\n
+        let promptTokens: [UInt32] = [2, 105, 2364, 107, 10979, 106, 107, 105, 4368, 107]
+        let P = promptTokens.count
+        let maxQkvDim = Int(numHeads * max(headDim, globalHeadDim))
+
+        for prec in [KVCachePrecision.fp16, .fp32, .fp8] {
+        KVCacheManager.shared.reset(device: device, config: config, actualLayers: 30, totalLoops: 1,
+                                    numKvHeads: Int(numKvHeads), headDim: Int(headDim),
+                                    maxSeqLen: maxSeqLen, precision: prec)
+
+        guard let hBufA = device.makeBuffer(length: P * hiddenDim * 4, options: .storageModeShared),
+              let hBufB = device.makeBuffer(length: P * hiddenDim * 4, options: .storageModeShared),
+              let xNorm1 = device.makeBuffer(length: P * hiddenDim * 4, options: .storageModeShared),
+              let xNorm2 = device.makeBuffer(length: P * hiddenDim * 4, options: .storageModeShared),
+              let attnOut = device.makeBuffer(length: P * hiddenDim * 4, options: .storageModeShared),
+              let hMid = device.makeBuffer(length: P * hiddenDim * 4, options: .storageModeShared),
+              let hMlp = device.makeBuffer(length: P * hiddenDim * 4, options: .storageModeShared),
+              let qGate = device.makeBuffer(length: P * maxQkvDim * 4, options: .storageModeShared),
+              let kVec = device.makeBuffer(length: P * Int(gemmaKvStride) * 4, options: .storageModeShared),
+              let vVec = device.makeBuffer(length: P * Int(gemmaKvStride) * 4, options: .storageModeShared),
+              let attnCtx = device.makeBuffer(length: P * maxQkvDim * 4, options: .storageModeShared),
+              let bVec = device.makeBuffer(length: P * hiddenDim * 4, options: .storageModeShared),
+              let inter = device.makeBuffer(length: P * 2560 * 4, options: .storageModeShared),
+              let rIdx = device.makeBuffer(length: P * 8 * 4, options: .storageModeShared),
+              let rW = device.makeBuffer(length: P * 8 * 4, options: .storageModeShared),
+              let dTok = device.makeBuffer(length: P * 4, options: .storageModeShared),
+              let dWgt = device.makeBuffer(length: P * 4, options: .storageModeShared),
+              let promptBuf = device.makeBuffer(bytes: promptTokens, length: P * 4, options: .storageModeShared),
+              let xFinal = device.makeBuffer(length: hiddenDim * 4, options: .storageModeShared),
+              let logitsBuf = device.makeBuffer(length: vocabSize * 4, options: .storageModeShared) else {
+            XCTFail("buffer alloc failed"); return
+        }
+
+        let dTokPtr = dTok.contents().bindMemory(to: UInt32.self, capacity: P)
+        let dWgtPtr = dWgt.contents().bindMemory(to: Float.self, capacity: P)
+        for i in 0..<P { dTokPtr[i] = UInt32(i); dWgtPtr[i] = 1.0 }
+
+        let embedWeight = summary.tensors.first { $0.name.hasSuffix("embed_tokens.weight") }!
+        let normTensor = summary.tensors.first { $0.name == "model.language_model.norm.weight" || $0.name == "model.norm.weight" }!
+        let lmHeadTensor = summary.tensors.first { $0.name == "lm_head.weight" || $0.name == "model.lm_head.weight" } ?? embedWeight
+
+        let embedPipe = inference.embedPipeline!
+        let rmsnormPipe = inference.rmsnormPipeline!
+        let headRmsnormPipe = inference.headRmsnormPipeline!
+        let ropePipe = inference.ropePipeline!
+        let addPipe = inference.addPipeline!
+        let clearPipe = inference.clearPipeline!
+        let routerPipe = inference.routerPipeline!
+        let gemvPipe = inference.bf16GemvSimdPipeline!
+        let rmsnormNoScalePipe = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: "rmsnorm_no_scale_bf16")!)
+        let ropePropPipe = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: "apply_rope_proportional")!)
+        let storeKvPipe = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: prec == .fp16 ? "store_kv_cache_gemma_f16" : (prec == .fp8 ? "store_kv_cache_gemma_fp8" : "store_kv_cache_gemma"))!)
+        let gqaPipe = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: prec == .fp16 ? "gqa_attention_decode_gemma_f16" : (prec == .fp8 ? "gqa_attention_decode_gemma_fp8" : "gqa_attention_decode_gemma"))!)
+        let mulBf16Pipe = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: "mul_by_bf16_vector")!)
+        let scaleVecPipe = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: "scale_vector_inplace")!)
+        let perExpertPipe = try device.makeComputePipelineState(function: defaultLib.makeFunction(name: "apply_topk_per_expert_scale")!)
+        let geluBatched = try XCTUnwrap(inference.bf16GeluGateUpBatchedPipeline)
+        let downBatched = try XCTUnwrap(inference.bf16DownBatchedPipeline)
+        let geluSimd = inference.bf16GeluGateUpSimdPipeline ?? inference.bf16GeluGateUpPipeline!
+        let downSimd = inference.bf16DownSimdPipeline ?? inference.bf16DownPipeline!
+        let gemmaScale: Float = 1.0 / Float(Double(hiddenDim).squareRoot())
+
+        // Packed expert path (mirrors the app's FlashMoE packed read). Exercises the
+        // component-offset resolution the unpacked path skips.
+        let packedDir = URL(fileURLWithPath: snapshotDir).appendingPathComponent("packed_experts")
+        let packedLayout = try JSONDecoder().decode(FlashMoELayout.self, from: Data(contentsOf: packedDir.appendingPathComponent("layout.json")))
+        ExpertIOThreadPool.shared.initialize(numThreads: 8)
+        let packedExpertSize = Int(packedLayout.expert_size)
+        let compUpW = packedLayout.components.first(where: { $0.name.contains("up_proj") && !$0.name.contains("scale") && !$0.name.contains("bias") })
+        let compDownW = packedLayout.components.first(where: { $0.name.contains("down_proj") && !$0.name.contains("scale") && !$0.name.contains("bias") })
+        XCTAssertNotNil(compUpW, "packed layout must expose an up_proj component")
+        XCTAssertNotNil(compDownW, "packed layout must expose a down_proj component")
+        XCTAssertEqual(compUpW?.offset, 0, "up_proj (fused gate+up) must be the first packed component")
+        let packStaging = device.makeBuffer(length: 128 * packedExpertSize, options: .storageModeShared)!
+
+        func linBatch(_ enc: MTLComputeCommandEncoder, _ weight: TensorMetadata?, _ inBuf: MTLBuffer, _ outBuf: MTLBuffer,
+                      inDim: UInt32, outDim: UInt32, inStride: Int, outStride: Int) {
+            guard let w = weight, let wRaw = buffers[w.shardIndex] else { return }
+            var wOff = w.offsetStart; var inD = inDim; var outD = outDim
+            for r in 0..<P {
+                enc.setComputePipelineState(gemvPipe)
+                enc.setBuffer(wRaw, offset: 0, index: 0)
+                enc.setBuffer(inBuf, offset: r * inStride * 4, index: 1)
+                enc.setBuffer(outBuf, offset: r * outStride * 4, index: 2)
+                enc.setBytes(&wOff, length: 8, index: 3)
+                enc.setBytes(&inD, length: 4, index: 4)
+                enc.setBytes(&outD, length: 4, index: 5)
+                enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            }
+            enc.memoryBarrier(scope: .buffers)
+        }
+
+        // Embed all prompt tokens (with Gemma's sqrt(hidden) embedding scale)
+        let embedCmd = cmdQueue.makeCommandBuffer()!
+        let embedEnc = embedCmd.makeComputeCommandEncoder()!
+        var wOffE = embedWeight.offsetStart; var hDimE = UInt32(hiddenDim); var tokCnt: UInt32 = 1
+        for r in 0..<P {
+            embedEnc.setComputePipelineState(embedPipe)
+            embedEnc.setBuffer(buffers[embedWeight.shardIndex]!, offset: 0, index: 0)
+            embedEnc.setBuffer(promptBuf, offset: r * 4, index: 1)
+            embedEnc.setBuffer(hBufA, offset: r * hiddenDim * 4, index: 2)
+            embedEnc.setBytes(&wOffE, length: 8, index: 3)
+            embedEnc.setBytes(&hDimE, length: 4, index: 4)
+            embedEnc.setBytes(&tokCnt, length: 4, index: 5)
+            embedEnc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+        }
+        embedEnc.memoryBarrier(scope: .buffers)
+        var embScale = Float(Double(hiddenDim).squareRoot())
+        embedEnc.setComputePipelineState(scaleVecPipe)
+        for r in 0..<P {
+            embedEnc.setBuffer(hBufA, offset: r * hiddenDim * 4, index: 0)
+            embedEnc.setBytes(&hDimE, length: 4, index: 1)
+            embedEnc.setBytes(&embScale, length: 4, index: 2)
+            embedEnc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+        }
+        embedEnc.endEncoding(); embedCmd.commit(); embedCmd.waitUntilCompleted()
+
+        var currH = hBufA
+        var nextH = hBufB
+        var hDimV = UInt32(hiddenDim)
+
+        for (l, layer) in cachedLayers.enumerated() {
+            let gSliding = layer.isSlidingAttention
+            let gHeadDim: UInt32 = gSliding ? headDim : max(headDim, globalHeadDim)
+            let gNumKv: UInt32 = gSliding ? numKvHeads : max(1, numGlobalKvHeads)
+            let gQDim: UInt32 = numHeads * gHeadDim
+            let gKvDim: UInt32 = gNumKv * gHeadDim
+            var epsV = eps
+
+            let cmd = cmdQueue.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+
+            if let n1 = layer.norm1Tensor, let n1Raw = buffers[n1.shardIndex] {
+                var gOff = n1.offsetStart
+                enc.setComputePipelineState(rmsnormPipe)
+                enc.setBuffer(currH, offset: 0, index: 0)
+                enc.setBuffer(n1Raw, offset: 0, index: 1)
+                enc.setBuffer(xNorm1, offset: 0, index: 2)
+                enc.setBytes(&gOff, length: 8, index: 3)
+                enc.setBytes(&hDimV, length: 4, index: 4)
+                enc.setBytes(&epsV, length: 4, index: 5)
+                enc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                enc.dispatchThreadgroups(MTLSize(width: P, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+            }
+
+            linBatch(enc, layer.qProjTensor, xNorm1, qGate, inDim: UInt32(hiddenDim), outDim: gQDim, inStride: hiddenDim, outStride: Int(gQDim))
+            linBatch(enc, layer.kProjTensor, xNorm1, kVec, inDim: UInt32(hiddenDim), outDim: gKvDim, inStride: hiddenDim, outStride: Int(gKvDim))
+            if gSliding { linBatch(enc, layer.vProjTensor, xNorm1, vVec, inDim: UInt32(hiddenDim), outDim: gKvDim, inStride: hiddenDim, outStride: Int(gKvDim)) }
+
+            if let vnPipe = Optional(rmsnormNoScalePipe) {
+                var vDim = gHeadDim; var vEps = epsV
+                enc.setComputePipelineState(vnPipe)
+                let vIn = gSliding ? vVec : kVec
+                for r in 0..<P {
+                    let base = r * Int(gKvDim) * 4
+                    enc.setBuffer(vIn, offset: base, index: 0)
+                    enc.setBuffer(vVec, offset: base, index: 1)
+                    enc.setBytes(&vDim, length: 4, index: 2)
+                    enc.setBytes(&vEps, length: 4, index: 3)
+                    enc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                    enc.dispatchThreadgroups(MTLSize(width: Int(gNumKv), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(gHeadDim)), height: 1, depth: 1))
+                }
+                enc.memoryBarrier(scope: .buffers)
+            }
+
+            if let qn = layer.qNormTensor, let qnRaw = buffers[qn.shardIndex] {
+                var off = qn.offsetStart; var nQ = numHeads; var hD = gHeadDim; var hS = gHeadDim
+                enc.setComputePipelineState(headRmsnormPipe)
+                enc.setBuffer(qGate, offset: 0, index: 0)
+                enc.setBuffer(qnRaw, offset: 0, index: 1)
+                enc.setBytes(&off, length: 8, index: 2)
+                enc.setBytes(&nQ, length: 4, index: 3)
+                enc.setBytes(&hD, length: 4, index: 4)
+                enc.setBytes(&hS, length: 4, index: 5)
+                enc.setBytes(&epsV, length: 4, index: 6)
+                enc.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+            }
+            if let kn = layer.kNormTensor, let knRaw = buffers[kn.shardIndex] {
+                var off = kn.offsetStart; var nK = gNumKv; var hD = gHeadDim; var hS = gHeadDim
+                enc.setComputePipelineState(headRmsnormPipe)
+                enc.setBuffer(kVec, offset: 0, index: 0)
+                enc.setBuffer(knRaw, offset: 0, index: 1)
+                enc.setBytes(&off, length: 8, index: 2)
+                enc.setBytes(&nK, length: 4, index: 3)
+                enc.setBytes(&hD, length: 4, index: 4)
+                enc.setBytes(&hS, length: 4, index: 5)
+                enc.setBytes(&epsV, length: 4, index: 6)
+                enc.dispatchThreadgroups(MTLSize(width: Int(gNumKv), height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+            }
+
+            let ropeP: MTLComputePipelineState = gSliding ? ropePipe : ropePropPipe
+            var pos: UInt32 = 0; var nQ = numHeads; var nK = gNumKv; var hD = gHeadDim
+            var rD = UInt32(config?.effectiveRotaryDim(layerIndex: l, headDim: Int(gHeadDim)) ?? Int(headDim))
+            var qStr = gHeadDim; var kStr = gHeadDim
+            var theta = config?.effectiveRopeTheta(layerIndex: l) ?? 10000.0
+            enc.setComputePipelineState(ropeP)
+            enc.setBuffer(qGate, offset: 0, index: 0)
+            enc.setBytes(&pos, length: 4, index: 1)
+            enc.setBytes(&nQ, length: 4, index: 2)
+            enc.setBytes(&hD, length: 4, index: 3)
+            enc.setBytes(&rD, length: 4, index: 4)
+            enc.setBytes(&qStr, length: 4, index: 5)
+            enc.setBytes(&theta, length: 4, index: 6)
+            enc.dispatchThreads(MTLSize(width: Int(numHeads), height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), ropeP.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            enc.setBuffer(kVec, offset: 0, index: 0)
+            enc.setBytes(&pos, length: 4, index: 1)
+            enc.setBytes(&nK, length: 4, index: 2)
+            enc.setBytes(&hD, length: 4, index: 3)
+            enc.setBytes(&rD, length: 4, index: 4)
+            enc.setBytes(&kStr, length: 4, index: 5)
+            enc.setBytes(&theta, length: 4, index: 6)
+            enc.dispatchThreads(MTLSize(width: Int(gNumKv), height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(gNumKv), ropeP.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+
+            let kCache = KVCacheManager.shared.kCacheBuffer!
+            let vCache = KVCacheManager.shared.vCacheBuffer!
+            let slot = layer.fullAttnIndex
+            let layerByteOffset = slot * maxSeqLen * Int(gemmaKvStride) * prec.bytesPerElement
+            var cacheStride = gemmaKvStride
+            var windowSize: UInt32 = gSliding ? UInt32(config?.effectiveSlidingWindow ?? 0) : 0
+            var scaling: Float = 1.0
+            var linearRingLen: UInt32 = 0
+            if prec == .fp8 {
+                let kScale = KVCacheManager.shared.kScaleBuffer!
+                let vScale = KVCacheManager.shared.vScaleBuffer!
+                let scaleByteOffset = slot * maxSeqLen * Int(numKvHeads) * 2
+                enc.setComputePipelineState(storeKvPipe)
+                enc.setBuffer(kVec, offset: 0, index: 0)
+                enc.setBuffer(vVec, offset: 0, index: 1)
+                enc.setBuffer(kCache, offset: layerByteOffset, index: 2)
+                enc.setBuffer(vCache, offset: layerByteOffset, index: 3)
+                enc.setBuffer(kScale, offset: scaleByteOffset, index: 4)
+                enc.setBuffer(vScale, offset: scaleByteOffset, index: 5)
+                enc.setBytes(&pos, length: 4, index: 6)
+                enc.setBytes(&nK, length: 4, index: 7)
+                enc.setBytes(&hD, length: 4, index: 8)
+                enc.setBytes(&cacheStride, length: 4, index: 9)
+                enc.setBytes(&linearRingLen, length: 4, index: 10)
+                enc.dispatchThreadgroups(MTLSize(width: Int(gNumKv), height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+                enc.setComputePipelineState(gqaPipe)
+                for r in 0..<P {
+                    var seqLen = UInt32(r) + 1
+                    let off = r * Int(gQDim) * 4
+                    enc.setBuffer(qGate, offset: off, index: 0)
+                    enc.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                    enc.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                    enc.setBuffer(kScale, offset: scaleByteOffset, index: 3)
+                    enc.setBuffer(vScale, offset: scaleByteOffset, index: 4)
+                    enc.setBuffer(attnCtx, offset: off, index: 5)
+                    enc.setBytes(&seqLen, length: 4, index: 6)
+                    enc.setBytes(&nQ, length: 4, index: 7)
+                    enc.setBytes(&nK, length: 4, index: 8)
+                    enc.setBytes(&hD, length: 4, index: 9)
+                    enc.setBytes(&windowSize, length: 4, index: 10)
+                    enc.setBytes(&scaling, length: 4, index: 11)
+                    enc.setBytes(&cacheStride, length: 4, index: 12)
+                    enc.setBytes(&linearRingLen, length: 4, index: 13)
+                    enc.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                }
+                enc.memoryBarrier(scope: .buffers)
+            } else {
+            enc.setComputePipelineState(storeKvPipe)
+            enc.setBuffer(kVec, offset: 0, index: 0)
+            enc.setBuffer(vVec, offset: 0, index: 1)
+            enc.setBuffer(kCache, offset: layerByteOffset, index: 2)
+            enc.setBuffer(vCache, offset: layerByteOffset, index: 3)
+            enc.setBytes(&pos, length: 4, index: 4)
+            enc.setBytes(&nK, length: 4, index: 5)
+            enc.setBytes(&hD, length: 4, index: 6)
+            enc.setBytes(&cacheStride, length: 4, index: 7)
+            enc.setBytes(&linearRingLen, length: 4, index: 8)
+            enc.dispatchThreads(MTLSize(width: Int(gKvDim), height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(gKvDim), storeKvPipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+            enc.setComputePipelineState(gqaPipe)
+            for r in 0..<P {
+                var seqLen = UInt32(r) + 1
+                let off = r * Int(gQDim) * 4
+                enc.setBuffer(qGate, offset: off, index: 0)
+                enc.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                enc.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                enc.setBuffer(attnCtx, offset: off, index: 3)
+                enc.setBytes(&seqLen, length: 4, index: 4)
+                enc.setBytes(&nQ, length: 4, index: 5)
+                enc.setBytes(&nK, length: 4, index: 6)
+                enc.setBytes(&hD, length: 4, index: 7)
+                enc.setBytes(&windowSize, length: 4, index: 8)
+                enc.setBytes(&scaling, length: 4, index: 9)
+                enc.setBytes(&cacheStride, length: 4, index: 10)
+                enc.setBytes(&linearRingLen, length: 4, index: 11)
+                enc.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            }
+            enc.memoryBarrier(scope: .buffers)
+            }
+
+            linBatch(enc, layer.oProjTensor, attnCtx, attnOut, inDim: gQDim, outDim: UInt32(hiddenDim), inStride: Int(gQDim), outStride: hiddenDim)
+
+            if let n2 = layer.norm2Tensor, let n2Raw = buffers[n2.shardIndex] {
+                var gOff = n2.offsetStart
+                enc.setComputePipelineState(rmsnormPipe)
+                enc.setBuffer(attnOut, offset: 0, index: 0)
+                enc.setBuffer(n2Raw, offset: 0, index: 1)
+                enc.setBuffer(xNorm2, offset: 0, index: 2)
+                enc.setBytes(&gOff, length: 8, index: 3)
+                enc.setBytes(&hDimV, length: 4, index: 4)
+                enc.setBytes(&epsV, length: 4, index: 5)
+                enc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                enc.dispatchThreadgroups(MTLSize(width: P, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+            }
+            enc.setComputePipelineState(addPipe)
+            enc.setBuffer(currH, offset: 0, index: 0)
+            enc.setBuffer(xNorm2, offset: 0, index: 1)
+            enc.setBuffer(hMid, offset: 0, index: 2)
+            enc.setBytes(&hDimV, length: 4, index: 3)
+            enc.dispatchThreads(MTLSize(width: hiddenDim, height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+
+            if let pf = layer.preFfnNormTensor, let pfRaw = buffers[pf.shardIndex] {
+                var gOff = pf.offsetStart
+                enc.setComputePipelineState(rmsnormPipe)
+                enc.setBuffer(hMid, offset: 0, index: 0)
+                enc.setBuffer(pfRaw, offset: 0, index: 1)
+                enc.setBuffer(xNorm2, offset: 0, index: 2)
+                enc.setBytes(&gOff, length: 8, index: 3)
+                enc.setBytes(&hDimV, length: 4, index: 4)
+                enc.setBytes(&epsV, length: 4, index: 5)
+                enc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                enc.dispatchThreadgroups(MTLSize(width: P, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+            }
+            enc.setComputePipelineState(clearPipe)
+            enc.setBuffer(hMlp, offset: 0, index: 0)
+            enc.dispatchThreads(MTLSize(width: hiddenDim, height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+            if let dG = layer.denseGateWeight, let dU = layer.denseUpWeight, let dD = layer.denseDownWeight,
+               let dGRaw = buffers[dG.shardIndex], let dURaw = buffers[dU.shardIndex], let dDRaw = buffers[dD.shardIndex] {
+                var gOff = dG.offsetStart; var uOff = dU.offsetStart; var dOff = dD.offsetStart
+                var interDimV = layer.intermediateDim; var pk: Float = 1.0
+                enc.setComputePipelineState(geluBatched)
+                enc.setBuffer(dGRaw, offset: 0, index: 0)
+                enc.setBuffer(dURaw, offset: 0, index: 1)
+                enc.setBuffer(xNorm2, offset: 0, index: 2)
+                enc.setBuffer(inter, offset: 0, index: 3)
+                enc.setBytes(&gOff, length: 8, index: 4)
+                enc.setBytes(&uOff, length: 8, index: 5)
+                enc.setBytes(&hDimV, length: 4, index: 6)
+                enc.setBytes(&interDimV, length: 4, index: 7)
+                enc.setBuffer(dTok, offset: 0, index: 8)
+                enc.dispatchThreadgroups(MTLSize(width: Int(layer.intermediateDim), height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+                enc.setComputePipelineState(downBatched)
+                enc.setBuffer(dDRaw, offset: 0, index: 0)
+                enc.setBuffer(inter, offset: 0, index: 1)
+                enc.setBuffer(hMlp, offset: 0, index: 2)
+                enc.setBytes(&dOff, length: 8, index: 3)
+                enc.setBytes(&interDimV, length: 4, index: 4)
+                enc.setBytes(&hDimV, length: 4, index: 5)
+                enc.setBytes(&pk, length: 4, index: 6)
+                enc.setBuffer(dTok, offset: 0, index: 7)
+                enc.setBuffer(dWgt, offset: 0, index: 8)
+                enc.dispatchThreadgroups(MTLSize(width: hiddenDim, height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+            }
+            if let p1 = layer.postFfnNorm1Tensor, let p1Raw = buffers[p1.shardIndex] {
+                var gOff = p1.offsetStart
+                enc.setComputePipelineState(rmsnormPipe)
+                enc.setBuffer(hMlp, offset: 0, index: 0)
+                enc.setBuffer(p1Raw, offset: 0, index: 1)
+                enc.setBuffer(hMlp, offset: 0, index: 2)
+                enc.setBytes(&gOff, length: 8, index: 3)
+                enc.setBytes(&hDimV, length: 4, index: 4)
+                enc.setBytes(&epsV, length: 4, index: 5)
+                enc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                enc.dispatchThreadgroups(MTLSize(width: P, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                enc.memoryBarrier(scope: .buffers)
+            }
+
+            // Router
+            enc.setComputePipelineState(rmsnormNoScalePipe)
+            enc.setBuffer(hMid, offset: 0, index: 0)
+            enc.setBuffer(attnOut, offset: 0, index: 1)
+            enc.setBytes(&hDimV, length: 4, index: 2)
+            enc.setBytes(&epsV, length: 4, index: 3)
+            enc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+            enc.dispatchThreadgroups(MTLSize(width: P, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+            enc.memoryBarrier(scope: .buffers)
+            if let rsv = layer.routerScaleVec, let rsvRaw = buffers[rsv.shardIndex] {
+                var rsvOff = rsv.offsetStart; var dimV = UInt32(hiddenDim); var sc = gemmaScale
+                enc.setComputePipelineState(mulBf16Pipe)
+                for r in 0..<P {
+                    let off = r * hiddenDim * 4
+                    enc.setBuffer(attnOut, offset: off, index: 0)
+                    enc.setBuffer(rsvRaw, offset: 0, index: 1)
+                    enc.setBuffer(bVec, offset: off, index: 2)
+                    enc.setBytes(&rsvOff, length: 8, index: 3)
+                    enc.setBytes(&dimV, length: 4, index: 4)
+                    enc.setBytes(&sc, length: 4, index: 5)
+                    enc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                }
+                enc.memoryBarrier(scope: .buffers)
+            }
+            if let rt = layer.routerTensor, let rtRaw = buffers[rt.shardIndex] {
+                var rOff = rt.offsetStart; var nExp = numExperts; var kVal: UInt32 = 8
+                enc.setComputePipelineState(routerPipe)
+                for r in 0..<P {
+                    enc.setBuffer(rtRaw, offset: 0, index: 0)
+                    enc.setBuffer(bVec, offset: r * hiddenDim * 4, index: 1)
+                    enc.setBuffer(rIdx, offset: r * 8 * 4, index: 2)
+                    enc.setBuffer(rW, offset: r * 8 * 4, index: 3)
+                    enc.setBytes(&rOff, length: 8, index: 4)
+                    enc.setBytes(&hDimV, length: 4, index: 5)
+                    enc.setBytes(&nExp, length: 4, index: 6)
+                    enc.setBytes(&kVal, length: 4, index: 7)
+                    enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: Int(numExperts), height: 1, depth: 1))
+                }
+                enc.memoryBarrier(scope: .buffers)
+                if let pes = layer.routerPerExpertScale, let pesRaw = buffers[pes.shardIndex] {
+                    var pesOff = pes.offsetStart; var kTop = kVal
+                    enc.setComputePipelineState(perExpertPipe)
+                    for r in 0..<P {
+                        enc.setBuffer(rW, offset: r * 8 * 4, index: 0)
+                        enc.setBuffer(rIdx, offset: r * 8 * 4, index: 1)
+                        enc.setBuffer(pesRaw, offset: 0, index: 2)
+                        enc.setBytes(&pesOff, length: 8, index: 3)
+                        enc.setBytes(&kTop, length: 4, index: 4)
+                        enc.dispatchThreads(MTLSize(width: 8, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 8, height: 1, depth: 1))
+                    }
+                    enc.memoryBarrier(scope: .buffers)
+                }
+            }
+            enc.endEncoding(); cmd.commit(); cmd.waitUntilCompleted()
+
+            // Phase B: expert-major batched MoE
+            let indPtr = rIdx.contents().bindMemory(to: UInt32.self, capacity: P * 8)
+            let wPtr = rW.contents().bindMemory(to: Float.self, capacity: P * 8)
+            var expMap: [Int: [(UInt32, Float)]] = [:]
+            for p in 0..<P {
+                for i in 0..<8 {
+                    let e = Int(indPtr[p * 8 + i]); let wv = wPtr[p * 8 + i]
+                    if wv > 0.00001 { expMap[e, default: []].append((UInt32(p), wv)) }
+                }
+            }
+
+            let mcmd = cmdQueue.makeCommandBuffer()!
+            let menc = mcmd.makeComputeCommandEncoder()!
+            if let pf2 = layer.preFfnNorm2Tensor, let pf2Raw = buffers[pf2.shardIndex] {
+                var gOff = pf2.offsetStart
+                menc.setComputePipelineState(rmsnormPipe)
+                menc.setBuffer(hMid, offset: 0, index: 0)
+                menc.setBuffer(pf2Raw, offset: 0, index: 1)
+                menc.setBuffer(xNorm2, offset: 0, index: 2)
+                menc.setBytes(&gOff, length: 8, index: 3)
+                menc.setBytes(&hDimV, length: 4, index: 4)
+                menc.setBytes(&epsV, length: 4, index: 5)
+                menc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                menc.dispatchThreadgroups(MTLSize(width: P, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                menc.memoryBarrier(scope: .buffers)
+            }
+            menc.setComputePipelineState(clearPipe)
+            menc.setBuffer(xNorm1, offset: 0, index: 0)
+            menc.dispatchThreads(MTLSize(width: hiddenDim, height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+            menc.memoryBarrier(scope: .buffers)
+
+            // active token/weight arrays
+            var expOffMap: [Int: Int] = [:]
+            var curOff = 0
+            let aTok = device.makeBuffer(length: max(P * 8, 64) * 4, options: .storageModeShared)!
+            let aWgt = device.makeBuffer(length: max(P * 8, 64) * 4, options: .storageModeShared)!
+            let aTokPtr = aTok.contents().bindMemory(to: UInt32.self, capacity: P * 8)
+            let aWgtPtr = aWgt.contents().bindMemory(to: Float.self, capacity: P * 8)
+            for (e, assigns) in expMap {
+                expOffMap[e] = curOff * 4
+                for (t, wv) in assigns { aTokPtr[curOff] = t; aWgtPtr[curOff] = wv; curOff += 1 }
+            }
+            let upByte = UInt64(gemmaExpertInterDim) * UInt64(hiddenDim) * 2
+            // Pread this layer's active experts into staging (mirrors the app's packed read).
+            var packSlot: [Int: Int] = [:]
+            if let fd = ExpertIOThreadPool.shared.getOrOpenLayerFD(layerIndex: l, packedExpertsDir: packedDir) {
+                var tasks: [ExpertPreadTask] = []
+                for (slot, e) in expMap.keys.sorted().enumerated() {
+                    packSlot[e] = slot
+                    tasks.append(ExpertPreadTask(fd: fd, dst: packStaging.contents().advanced(by: slot * packedExpertSize), offset: off_t(e * packedExpertSize), size: packedExpertSize))
+                }
+                if !tasks.isEmpty { ExpertIOThreadPool.shared.dispatchSync(tasks: &tasks) }
+            }
+            for (e, assigns) in expMap {
+                guard let slot = packSlot[e] else { continue }
+                let cnt = assigns.count; if cnt == 0 { continue }
+                let off = expOffMap[e] ?? 0
+                let slotOffset = UInt64(slot * packedExpertSize)
+                var gOff = slotOffset + (compUpW?.offset ?? 0)
+                var uOff = slotOffset + (compUpW?.offset ?? 0) + upByte
+                var dOff = slotOffset + (compDownW?.offset ?? 0)
+                var interDimV = gemmaExpertInterDim; var pk: Float = 1.0
+                menc.setComputePipelineState(geluBatched)
+                menc.setBuffer(packStaging, offset: 0, index: 0)
+                menc.setBuffer(packStaging, offset: 0, index: 1)
+                menc.setBuffer(xNorm2, offset: 0, index: 2)
+                menc.setBuffer(inter, offset: 0, index: 3)
+                menc.setBytes(&gOff, length: 8, index: 4)
+                menc.setBytes(&uOff, length: 8, index: 5)
+                menc.setBytes(&hDimV, length: 4, index: 6)
+                menc.setBytes(&interDimV, length: 4, index: 7)
+                menc.setBuffer(aTok, offset: off, index: 8)
+                menc.dispatchThreadgroups(MTLSize(width: Int(interDimV), height: cnt, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                menc.memoryBarrier(scope: .buffers)
+                menc.setComputePipelineState(downBatched)
+                menc.setBuffer(packStaging, offset: 0, index: 0)
+                menc.setBuffer(inter, offset: 0, index: 1)
+                menc.setBuffer(xNorm1, offset: 0, index: 2)
+                menc.setBytes(&dOff, length: 8, index: 3)
+                menc.setBytes(&interDimV, length: 4, index: 4)
+                menc.setBytes(&hDimV, length: 4, index: 5)
+                menc.setBytes(&pk, length: 4, index: 6)
+                menc.setBuffer(aTok, offset: off, index: 7)
+                menc.setBuffer(aWgt, offset: off, index: 8)
+                menc.dispatchThreadgroups(MTLSize(width: hiddenDim, height: cnt, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                menc.memoryBarrier(scope: .buffers)
+            }
+            if let pf2 = layer.postFfnNorm2Tensor, let pf2Raw = buffers[pf2.shardIndex] {
+                var gOff = pf2.offsetStart
+                menc.setComputePipelineState(rmsnormPipe)
+                menc.setBuffer(xNorm1, offset: 0, index: 0)
+                menc.setBuffer(pf2Raw, offset: 0, index: 1)
+                menc.setBuffer(bVec, offset: 0, index: 2)
+                menc.setBytes(&gOff, length: 8, index: 3)
+                menc.setBytes(&hDimV, length: 4, index: 4)
+                menc.setBytes(&epsV, length: 4, index: 5)
+                menc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                menc.dispatchThreadgroups(MTLSize(width: P, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                menc.memoryBarrier(scope: .buffers)
+            }
+            menc.setComputePipelineState(addPipe)
+            menc.setBuffer(hMlp, offset: 0, index: 0)
+            menc.setBuffer(bVec, offset: 0, index: 1)
+            menc.setBuffer(hMlp, offset: 0, index: 2)
+            menc.setBytes(&hDimV, length: 4, index: 3)
+            menc.dispatchThreads(MTLSize(width: hiddenDim, height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+            menc.memoryBarrier(scope: .buffers)
+            if let pf = layer.postFfnNormTensor, let pfRaw = buffers[pf.shardIndex] {
+                var gOff = pf.offsetStart
+                menc.setComputePipelineState(rmsnormPipe)
+                menc.setBuffer(hMlp, offset: 0, index: 0)
+                menc.setBuffer(pfRaw, offset: 0, index: 1)
+                menc.setBuffer(xNorm2, offset: 0, index: 2)
+                menc.setBytes(&gOff, length: 8, index: 3)
+                menc.setBytes(&hDimV, length: 4, index: 4)
+                menc.setBytes(&epsV, length: 4, index: 5)
+                menc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+                menc.dispatchThreadgroups(MTLSize(width: P, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                menc.memoryBarrier(scope: .buffers)
+            }
+            menc.setComputePipelineState(addPipe)
+            menc.setBuffer(hMid, offset: 0, index: 0)
+            menc.setBuffer(xNorm2, offset: 0, index: 1)
+            menc.setBuffer(nextH, offset: 0, index: 2)
+            menc.setBytes(&hDimV, length: 4, index: 3)
+            menc.dispatchThreads(MTLSize(width: hiddenDim, height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+            menc.memoryBarrier(scope: .buffers)
+            if let ls = layer.layerScalarTensor, let lsRaw = buffers[ls.shardIndex] {
+                let lsBits = lsRaw.contents().load(fromByteOffset: Int(ls.offsetStart), as: UInt16.self)
+                var scalarVal = Float(bitPattern: UInt32(lsBits) << 16)
+                menc.setComputePipelineState(scaleVecPipe)
+                for r in 0..<P {
+                    menc.setBuffer(nextH, offset: r * hiddenDim * 4, index: 0)
+                    menc.setBytes(&hDimV, length: 4, index: 1)
+                    menc.setBytes(&scalarVal, length: 4, index: 2)
+                    menc.dispatchThreads(MTLSize(width: hiddenDim, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+                }
+                menc.memoryBarrier(scope: .buffers)
+            }
+            menc.endEncoding(); mcmd.commit(); mcmd.waitUntilCompleted()
+
+            let tmp = currH; currH = nextH; nextH = tmp
+        }
+
+        // Final norm on the last token row + LM head + softcap
+        let fcmd = cmdQueue.makeCommandBuffer()!
+        let fenc = fcmd.makeComputeCommandEncoder()!
+        var nOff = normTensor.offsetStart; var epsV = eps
+        fenc.setComputePipelineState(rmsnormPipe)
+        fenc.setBuffer(currH, offset: (P - 1) * hiddenDim * 4, index: 0)
+        fenc.setBuffer(buffers[normTensor.shardIndex]!, offset: 0, index: 1)
+        fenc.setBuffer(xFinal, offset: 0, index: 2)
+        fenc.setBytes(&nOff, length: 8, index: 3)
+        fenc.setBytes(&hDimE, length: 4, index: 4)
+        fenc.setBytes(&epsV, length: 4, index: 5)
+        fenc.setThreadgroupMemoryLength(1024 * 4, index: 0)
+        fenc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, hiddenDim), height: 1, depth: 1))
+        fenc.memoryBarrier(scope: .buffers)
+        var wOffL = lmHeadTensor.offsetStart; var inD = UInt32(hiddenDim); var outD = UInt32(vocabSize)
+        fenc.setComputePipelineState(gemvPipe)
+        fenc.setBuffer(buffers[lmHeadTensor.shardIndex]!, offset: 0, index: 0)
+        fenc.setBuffer(xFinal, offset: 0, index: 1)
+        fenc.setBuffer(logitsBuf, offset: 0, index: 2)
+        fenc.setBytes(&wOffL, length: 8, index: 3)
+        fenc.setBytes(&inD, length: 4, index: 4)
+        fenc.setBytes(&outD, length: 4, index: 5)
+        fenc.dispatchThreadgroups(MTLSize(width: Int(vocabSize), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+        fenc.endEncoding(); fcmd.commit(); fcmd.waitUntilCompleted()
+
+        let lPtr = logitsBuf.contents().bindMemory(to: Float.self, capacity: vocabSize)
+        if let cap = config?.effectiveFinalLogitSoftcapping, cap > 0 {
+            for i in 0..<vocabSize { lPtr[i] = tanhf(lPtr[i] / cap) * cap }
+        }
+        var topTok = 0; var topVal = -Float.infinity
+        for i in 0..<vocabSize where lPtr[i] > topVal { topVal = lPtr[i]; topTok = i }
+        print("Gemma 4 batched prefill [\(prec)] top-1: id=\(topTok) logit=\(String(format: "%.3f", topVal))")
+        XCTAssertEqual(topTok, 100, "Batched prefill (\(prec)) should predict <|channel> (id 100) like the reference")
+        }
+    }
+
+    /// Validates the Gemma 4 JetSpec tree kernels against the proven single-token
+    /// decode path. For a single tree node (N=1, depth 0) the tree attention must
+    /// reproduce `gqa_attention_decode_gemma` exactly, including the sliding window.
+    /// Also checks `store_kv_cache_gemma_tree` places node K/V at basePos + depth.
+    func testGemma4TreeVerifyKernelsMatchDecode() throws {
+        print("=== TEST GEMMA 4 TREE VERIFY KERNELS ===")
+        guard let device = MTLCreateSystemDefaultDevice() else { XCTFail("No Metal GPU device"); return }
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+        guard let lib = inference.defaultLibrary else { XCTFail("No Metal library"); return }
+        guard let cmdQueue = device.makeCommandQueue() else { XCTFail("No command queue"); return }
+
+        let numQHeads = 4
+        let numKvHeads = 2
+        let headDim = 64
+        let cacheStride = numKvHeads * headDim
+        let prefixLen = 5
+        let totalSeq = prefixLen + 1
+        let maxSeq = 16
+        let scaling: Float = 1.0
+
+        var seed: UInt32 = 12345
+        func nextRand() -> Float {
+            seed = seed &* 1664525 &+ 1013904223
+            return (Float(seed >> 8) / Float(1 << 24)) - 0.5
+        }
+
+        var kData = [Float](repeating: 0, count: maxSeq * cacheStride)
+        var vData = [Float](repeating: 0, count: maxSeq * cacheStride)
+        for i in 0..<(totalSeq * cacheStride) { kData[i] = nextRand(); vData[i] = nextRand() }
+        var qData = [Float](repeating: 0, count: numQHeads * headDim)
+        for i in 0..<qData.count { qData[i] = nextRand() }
+
+        guard let kCache = device.makeBuffer(bytes: kData, length: kData.count * 4, options: .storageModeShared),
+              let vCache = device.makeBuffer(bytes: vData, length: vData.count * 4, options: .storageModeShared),
+              let qBuf = device.makeBuffer(bytes: qData, length: qData.count * 4, options: .storageModeShared),
+              let decodeOut = device.makeBuffer(length: qData.count * 4, options: .storageModeShared),
+              let treeOut = device.makeBuffer(length: qData.count * 4, options: .storageModeShared),
+              let maskBuf = device.makeBuffer(length: 4, options: .storageModeShared),
+              let depthsBuf = device.makeBuffer(length: 4, options: .storageModeShared) else {
+            XCTFail("buffer alloc failed"); return
+        }
+        maskBuf.contents().bindMemory(to: Float.self, capacity: 1)[0] = 0.0
+        depthsBuf.contents().bindMemory(to: UInt32.self, capacity: 1)[0] = 0
+
+        let decodePipe = try device.makeComputePipelineState(function: try XCTUnwrap(lib.makeFunction(name: "gqa_attention_decode_gemma")))
+        let treePipe = try device.makeComputePipelineState(function: try XCTUnwrap(lib.makeFunction(name: "gqa_attention_tree_verify_gemma")))
+
+        func runDecode(window: UInt32) -> [Float] {
+            let cmd = cmdQueue.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var seqLen = UInt32(totalSeq); var nQ = UInt32(numQHeads); var nK = UInt32(numKvHeads)
+            var hD = UInt32(headDim); var win = window; var sc = scaling; var cs = UInt32(cacheStride)
+            var ringLen: UInt32 = 0
+            enc.setComputePipelineState(decodePipe)
+            enc.setBuffer(qBuf, offset: 0, index: 0)
+            enc.setBuffer(kCache, offset: 0, index: 1)
+            enc.setBuffer(vCache, offset: 0, index: 2)
+            enc.setBuffer(decodeOut, offset: 0, index: 3)
+            enc.setBytes(&seqLen, length: 4, index: 4)
+            enc.setBytes(&nQ, length: 4, index: 5)
+            enc.setBytes(&nK, length: 4, index: 6)
+            enc.setBytes(&hD, length: 4, index: 7)
+            enc.setBytes(&win, length: 4, index: 8)
+            enc.setBytes(&sc, length: 4, index: 9)
+            enc.setBytes(&cs, length: 4, index: 10)
+            enc.setBytes(&ringLen, length: 4, index: 11)
+            enc.dispatchThreadgroups(MTLSize(width: numQHeads, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.endEncoding(); cmd.commit(); cmd.waitUntilCompleted()
+            return Array(UnsafeBufferPointer(start: decodeOut.contents().bindMemory(to: Float.self, capacity: qData.count), count: qData.count))
+        }
+
+        func runTree(window: UInt32) -> [Float] {
+            let cmd = cmdQueue.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var pLen = UInt32(prefixLen); var nNodes = UInt32(1); var nQ = UInt32(numQHeads); var nK = UInt32(numKvHeads)
+            var hD = UInt32(headDim); var win = window; var sc = scaling; var cs = UInt32(cacheStride)
+            var ringLen: UInt32 = 0
+            enc.setComputePipelineState(treePipe)
+            enc.setBuffer(qBuf, offset: 0, index: 0)
+            enc.setBuffer(kCache, offset: 0, index: 1)
+            enc.setBuffer(vCache, offset: 0, index: 2)
+            enc.setBuffer(maskBuf, offset: 0, index: 3)
+            enc.setBuffer(depthsBuf, offset: 0, index: 4)
+            enc.setBuffer(treeOut, offset: 0, index: 5)
+            enc.setBytes(&pLen, length: 4, index: 6)
+            enc.setBytes(&nNodes, length: 4, index: 7)
+            enc.setBytes(&nQ, length: 4, index: 8)
+            enc.setBytes(&nK, length: 4, index: 9)
+            enc.setBytes(&hD, length: 4, index: 10)
+            enc.setBytes(&win, length: 4, index: 11)
+            enc.setBytes(&sc, length: 4, index: 12)
+            enc.setBytes(&cs, length: 4, index: 13)
+            enc.setBytes(&ringLen, length: 4, index: 14)
+            enc.dispatchThreadgroups(MTLSize(width: numQHeads, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.endEncoding(); cmd.commit(); cmd.waitUntilCompleted()
+            return Array(UnsafeBufferPointer(start: treeOut.contents().bindMemory(to: Float.self, capacity: qData.count), count: qData.count))
+        }
+
+        for window: UInt32 in [0, 3] {
+            let d = runDecode(window: window)
+            let t = runTree(window: window)
+            var maxErr: Float = 0
+            for i in 0..<d.count { maxErr = max(maxErr, abs(d[i] - t[i])) }
+            print("Gemma 4 tree vs decode (window=\(window)) maxErr=\(maxErr)")
+            XCTAssertLessThan(maxErr, 1e-4, "Tree attention must match single-token decode (window=\(window))")
+        }
+
+        // store_kv_cache_gemma writes node k at slot basePos + k (tree slots are
+        // contiguous by node index; only RoPE positions use depth).
+        let storePipe = try device.makeComputePipelineState(function: try XCTUnwrap(lib.makeFunction(name: "store_kv_cache_gemma")))
+        let kvDim = numKvHeads * headDim
+        var kNode = [Float](repeating: 0, count: 2 * kvDim)
+        var vNode = [Float](repeating: 0, count: 2 * kvDim)
+        for i in 0..<kvDim { kNode[i] = 1.0 + Float(i); vNode[i] = -1.0 - Float(i) }
+        for i in 0..<kvDim { kNode[kvDim + i] = 100.0 + Float(i); vNode[kvDim + i] = 200.0 + Float(i) }
+        let kCache2 = device.makeBuffer(length: maxSeq * cacheStride * 4, options: .storageModeShared)!
+        let vCache2 = device.makeBuffer(length: maxSeq * cacheStride * 4, options: .storageModeShared)!
+        let kNodeBuf = device.makeBuffer(bytes: kNode, length: kNode.count * 4, options: .storageModeShared)!
+        let vNodeBuf = device.makeBuffer(bytes: vNode, length: vNode.count * 4, options: .storageModeShared)!
+        let storeCmd = cmdQueue.makeCommandBuffer()!
+        let storeEnc = storeCmd.makeComputeCommandEncoder()!
+        var basePos = UInt32(prefixLen); var nKv = UInt32(numKvHeads); var hDs = UInt32(headDim); var cs2 = UInt32(cacheStride)
+        var ringLenS: UInt32 = 0
+        storeEnc.setComputePipelineState(storePipe)
+        storeEnc.setBuffer(kNodeBuf, offset: 0, index: 0)
+        storeEnc.setBuffer(vNodeBuf, offset: 0, index: 1)
+        storeEnc.setBuffer(kCache2, offset: 0, index: 2)
+        storeEnc.setBuffer(vCache2, offset: 0, index: 3)
+        storeEnc.setBytes(&basePos, length: 4, index: 4)
+        storeEnc.setBytes(&nKv, length: 4, index: 5)
+        storeEnc.setBytes(&hDs, length: 4, index: 6)
+        storeEnc.setBytes(&cs2, length: 4, index: 7)
+        storeEnc.setBytes(&ringLenS, length: 4, index: 8)
+        storeEnc.dispatchThreads(MTLSize(width: kvDim, height: 2, depth: 1), threadsPerThreadgroup: MTLSize(width: min(kvDim, storePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+        storeEnc.endEncoding(); storeCmd.commit(); storeCmd.waitUntilCompleted()
+
+        let kPtr = kCache2.contents().bindMemory(to: Float.self, capacity: maxSeq * cacheStride)
+        var storeErr: Float = 0
+        for e in 0..<kvDim {
+            storeErr = max(storeErr, abs(kPtr[(prefixLen + 0) * cacheStride + e] - kNode[e]))
+            storeErr = max(storeErr, abs(kPtr[(prefixLen + 1) * cacheStride + e] - kNode[kvDim + e]))
+        }
+        print("Gemma 4 tree KV store maxErr=\(storeErr)")
+        XCTAssertLessThan(storeErr, 1e-6, "Tree KV store must place node K/V at basePos + nodeIndex")
+    }
+
+    /// Gemma 4 sliding-window ring KV layout: ring slots hold window + slack
+    /// positions addressed position % ringLen, linear slots keep maxSeqLen; a
+    /// prefix splice is only valid while every reused ring row still holds its
+    /// own position (a turn that ran past the pin and wrapped onto the window
+    /// rejects the splice), and a preserved reset relocates exactly the live
+    /// rows into the new buffer.
+    func testGemma4SlidingRingKVLayoutAndPrefixValidation() throws {
+        print("=== TEST GEMMA 4 SLIDING RING KV LAYOUT + PREFIX VALIDATION ===")
+        guard let device = MTLCreateSystemDefaultDevice() else { XCTFail("No Metal GPU device"); return }
+
+        let json = """
+        {
+          "architectures": ["Gemma4ForConditionalGeneration"],
+          "model_type": "gemma4",
+          "text_config": {
+            "model_type": "gemma4_text",
+            "hidden_size": 64,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 32,
+            "head_dim": 32,
+            "sliding_window": 8,
+            "layer_types": ["sliding_attention", "sliding_attention", "full_attention", "sliding_attention", "full_attention", "sliding_attention"]
+          }
+        }
+        """.data(using: .utf8)!
+        let config = try JSONDecoder().decode(ModelConfig.self, from: json)
+        XCTAssertEqual(config.effectiveSlidingWindow, 8)
+
+        let mgr = KVCacheManager.shared
+        // 6 slots: sliding (ring R = 8 + 4) at 0,1,3,5; linear (maxSeq 32) at 2,4.
+        let flags: [Bool] = [true, true, false, true, false, true]
+        let ringLen = 12
+        let kvStride = 32 * 32
+
+        mgr.reset(device: device, config: config, actualLayers: 6, totalLoops: 1,
+                  numKvHeads: 32, headDim: 32, maxSeqLen: 32, precision: .fp16,
+                  slidingSlotFlags: flags, slidingRingLen: ringLen)
+        XCTAssertEqual(mgr.slidingRingLen, ringLen)
+        XCTAssertEqual(mgr.slotPosCount, [12, 12, 32, 12, 32, 12])
+        XCTAssertEqual(mgr.slotPosBase, [0, 12, 24, 56, 68, 100])
+        XCTAssertTrue(mgr.isRingSlot(0))
+        XCTAssertFalse(mgr.isRingSlot(2))
+        XCTAssertEqual(mgr.kvSlotPositionCount(0), 12)
+        XCTAssertEqual(mgr.kvSlotPositionCount(2), 32)
+        XCTAssertEqual(mgr.kvSlotByteOffset(slot: 3, stride: kvStride, elementBytes: 2), 56 * kvStride * 2)
+        XCTAssertEqual(mgr.ringSlotForRow(15, slot: 0), 3, "position 15 maps to ring row 15 % 12")
+        XCTAssertEqual(mgr.ringSlotForRow(15, slot: 2), 15, "linear slots pass positions through")
+        // Ring layout shrinks the cache: 112 positions instead of 6 * 32 = 192.
+        XCTAssertEqual(mgr.kCacheBuffer!.length, 112 * kvStride * 2)
+        XCTAssertEqual(mgr.vCacheBuffer!.length, 112 * kvStride * 2)
+
+        // Inactive ring (all-false flags): uniform slot * maxSeq fallback.
+        mgr.reset(device: device, config: config, actualLayers: 6, totalLoops: 1,
+                  numKvHeads: 32, headDim: 32, maxSeqLen: 32, precision: .fp16,
+                  slidingSlotFlags: [false, false, false, false, false, false], slidingRingLen: ringLen)
+        XCTAssertEqual(mgr.slidingRingLen, 0)
+        XCTAssertTrue(mgr.slotPosBase.isEmpty, "inactive ring layout falls back to the uniform layout")
+        XCTAssertEqual(mgr.kvSlotByteOffset(slot: 3, stride: kvStride, elementBytes: 2), 3 * 32 * kvStride * 2)
+
+        // Bookkeeping: stores validate the rows they claim; a later store that
+        // wraps onto a row the pinned window still needs must reject the splice.
+        mgr.reset(device: device, config: config, actualLayers: 6, totalLoops: 1,
+                  numKvHeads: 32, headDim: 32, maxSeqLen: 32, precision: .fp16,
+                  slidingSlotFlags: flags, slidingRingLen: ringLen)
+        mgr.noteRingStores(range: 0..<10)
+        XCTAssertTrue(mgr.ringPrefixRowsIntact(prefixCount: 10, window: 8),
+                      "rows [2, 10) hold exactly their positions after storing 0..<10")
+        // Positions 10..13 wrap onto rows 10, 11, 0, 1 — none of them are rows
+        // [2, 10), so a pin at 10 stays valid.
+        mgr.noteRingStores(range: 10..<14)
+        XCTAssertTrue(mgr.ringPrefixRowsIntact(prefixCount: 10, window: 8))
+        // Position 14 wraps onto row 2 — exactly a row the pin at 10 needs.
+        mgr.noteRingStores(range: 14..<15)
+        XCTAssertFalse(mgr.ringPrefixRowsIntact(prefixCount: 10, window: 8),
+                       "a store that wraps onto the pinned window's rows must reject the splice")
+        XCTAssertTrue(mgr.ringPrefixRowsIntact(prefixCount: 15, window: 8),
+                      "a pin at the new high-water mark is valid again")
+
+        // Preserved reset across a maxSeqLen change (forced realloc): only the
+        // live window rows move, landing at their ring rows in the new buffer.
+        mgr.reset(device: device, config: config, actualLayers: 6, totalLoops: 1,
+                  numKvHeads: 32, headDim: 32, maxSeqLen: 32, precision: .fp16,
+                  slidingSlotFlags: flags, slidingRingLen: ringLen)
+        // FP16 cache: rows are kvStride UInt16 elements (kvStride * 2 bytes).
+        let rowElems = kvStride
+        guard let oldK = mgr.kCacheBuffer else { XCTFail("no K cache"); return }
+        for pos in 0..<10 {
+            let rowPtr = oldK.contents().advanced(by: (pos % ringLen) * rowElems * 2).bindMemory(to: UInt16.self, capacity: rowElems)
+            for e in 0..<rowElems { rowPtr[e] = UInt16(pos) }
+        }
+        mgr.noteRingStores(range: 0..<10)
+        mgr.reset(device: device, config: config, actualLayers: 6, totalLoops: 1,
+                  numKvHeads: 32, headDim: 32, maxSeqLen: 40, precision: .fp16,
+                  preservePrefixCount: 10, slidingSlotFlags: flags, slidingRingLen: ringLen)
+        guard let newK = mgr.kCacheBuffer else { XCTFail("no preserved K cache"); return }
+        for row in 0..<ringLen {
+            let rowPtr = newK.contents().advanced(by: row * rowElems * 2).bindMemory(to: UInt16.self, capacity: rowElems)
+            let expected = (row >= 2 && row < 10) ? row : 0
+            var rowErr = 0
+            for e in 0..<rowElems { rowErr = max(rowErr, abs(Int(rowPtr[e]) - expected)) }
+            XCTAssertEqual(rowErr, 0, "preserved ring row \(row) must hold position \(row) data (expected \(expected))")
+        }
+        XCTAssertTrue(mgr.ringPrefixRowsIntact(prefixCount: 10, window: 8),
+                      "bookkeeping survives the preserved reset")
+
+        // Restore the shared singleton to a plain uniform layout for other tests.
+        mgr.reset(device: device, actualLayers: 6, totalLoops: 1,
+                  numKvHeads: 32, headDim: 32, maxSeqLen: 32, precision: .fp16)
+    }
+
+    /// The ring Gemma kernels must be numerically equivalent to the linear ones:
+    /// storing a sequence that wraps the ring and decoding/verifying through the
+    /// wrapped window (and through tree node slots that land on dead ring rows)
+    /// must reproduce the linear cache's outputs exactly.
+    func testGemma4SlidingRingKernelEquivalence() throws {
+        print("=== TEST GEMMA 4 SLIDING RING KERNEL EQUIVALENCE ===")
+        guard let device = MTLCreateSystemDefaultDevice() else { XCTFail("No Metal GPU device"); return }
+        let inference = InferenceEngine.shared
+        try inference.initializePipelines(device: device)
+        guard let lib = inference.defaultLibrary else { XCTFail("No Metal library"); return }
+        guard let cmdQueue = device.makeCommandQueue() else { XCTFail("No command queue"); return }
+
+        let storePipe = try device.makeComputePipelineState(function: try XCTUnwrap(lib.makeFunction(name: "store_kv_cache_gemma")))
+        let decodePipe = try device.makeComputePipelineState(function: try XCTUnwrap(lib.makeFunction(name: "gqa_attention_decode_gemma")))
+        let treePipe = try device.makeComputePipelineState(function: try XCTUnwrap(lib.makeFunction(name: "gqa_attention_tree_verify_gemma")))
+
+        let numQHeads = 4
+        let numKvHeads = 2
+        let headDim = 64
+        let cacheStride = numKvHeads * headDim
+        let window: UInt32 = 4
+        let ringLen: UInt32 = 6
+        let storedPositions = 8
+        let linearRows = 16
+        let scaling: Float = 1.0
+        let prefixLen: UInt32 = 5
+
+        var seed: UInt32 = 4242
+        func nextRand() -> Float {
+            seed = seed &* 1664525 &+ 1013904223
+            return (Float(seed >> 8) / Float(1 << 24)) - 0.5
+        }
+
+        // K/V for the 8 stored positions (identical data into both caches).
+        var kvData = [Float](repeating: 0, count: storedPositions * cacheStride * 2)
+        for i in 0..<kvData.count { kvData[i] = nextRand() }
+        // 3 tree nodes: node 0 (depth 0) with children 1, 2 (both depth 1).
+        let numNodes = 3
+        var nodeData = [Float](repeating: 0, count: numNodes * cacheStride * 2)
+        for i in 0..<nodeData.count { nodeData[i] = nextRand() }
+        // Queries: one decode query + numNodes tree queries.
+        var qData = [Float](repeating: 0, count: (1 + numNodes) * numQHeads * headDim)
+        for i in 0..<qData.count { qData[i] = nextRand() }
+
+        guard let ringK = device.makeBuffer(length: Int(ringLen) * cacheStride * 4, options: .storageModeShared),
+              let ringV = device.makeBuffer(length: Int(ringLen) * cacheStride * 4, options: .storageModeShared),
+              let linK = device.makeBuffer(length: linearRows * Int(cacheStride) * 4, options: .storageModeShared),
+              let linV = device.makeBuffer(length: linearRows * Int(cacheStride) * 4, options: .storageModeShared),
+              let kvBuf = device.makeBuffer(bytes: kvData, length: kvData.count * 4, options: .storageModeShared),
+              let nodeBuf = device.makeBuffer(bytes: nodeData, length: nodeData.count * 4, options: .storageModeShared),
+              let qBuf = device.makeBuffer(bytes: qData, length: qData.count * 4, options: .storageModeShared),
+              let ringDecodeOut = device.makeBuffer(length: numQHeads * headDim * 4, options: .storageModeShared),
+              let linDecodeOut = device.makeBuffer(length: numQHeads * headDim * 4, options: .storageModeShared),
+              let ringTreeOut = device.makeBuffer(length: numNodes * numQHeads * headDim * 4, options: .storageModeShared),
+              let linTreeOut = device.makeBuffer(length: numNodes * numQHeads * headDim * 4, options: .storageModeShared) else {
+            XCTFail("buffer alloc failed"); return
+        }
+
+        func storeBatch(kCache: MTLBuffer, vCache: MTLBuffer, source: MTLBuffer, kSrcOffset: Int, vSrcOffset: Int, tokenPos: UInt32, rows: Int, ring: UInt32) {
+            let cmd = cmdQueue.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var pos = tokenPos; var nKv = UInt32(numKvHeads); var hD = UInt32(headDim)
+            var stride = UInt32(cacheStride); var rl = ring
+            enc.setComputePipelineState(storePipe)
+            enc.setBuffer(source, offset: kSrcOffset, index: 0)
+            enc.setBuffer(source, offset: vSrcOffset, index: 1)
+            enc.setBuffer(kCache, offset: 0, index: 2)
+            enc.setBuffer(vCache, offset: 0, index: 3)
+            enc.setBytes(&pos, length: 4, index: 4)
+            enc.setBytes(&nKv, length: 4, index: 5)
+            enc.setBytes(&hD, length: 4, index: 6)
+            enc.setBytes(&stride, length: 4, index: 7)
+            enc.setBytes(&rl, length: 4, index: 8)
+            enc.dispatchThreads(MTLSize(width: Int(cacheStride), height: rows, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(cacheStride), storePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            enc.endEncoding(); cmd.commit(); cmd.waitUntilCompleted()
+            if let err = cmd.error { XCTFail("store batch failed: \(err)") }
+        }
+
+        // Fill both caches with positions 0..<8 one position per command buffer
+        // (decode-order stores: a single batch larger than the ring would race
+        // with itself on the wrapped rows; the app's chunks are always < ringLen).
+        for pos in 0..<storedPositions {
+            let kOff = pos * cacheStride * 4
+            let vOff = (storedPositions + pos) * cacheStride * 4
+            storeBatch(kCache: ringK, vCache: ringV, source: kvBuf, kSrcOffset: kOff, vSrcOffset: vOff, tokenPos: UInt32(pos), rows: 1, ring: ringLen)
+            storeBatch(kCache: linK, vCache: linV, source: kvBuf, kSrcOffset: kOff, vSrcOffset: vOff, tokenPos: UInt32(pos), rows: 1, ring: 0)
+        }
+        // Ring store placement: row 4 holds position 4; row 0 holds position 6
+        // (positions 6, 7 wrapped onto rows 0, 1, overwriting the dead rows).
+        let ringKPtr = ringK.contents().bindMemory(to: Float.self, capacity: Int(ringLen) * cacheStride)
+        var placeErr: Float = 0
+        for e in 0..<cacheStride {
+            placeErr = max(placeErr, abs(ringKPtr[4 * cacheStride + e] - kvData[4 * cacheStride + e]))
+            placeErr = max(placeErr, abs(ringKPtr[0 * cacheStride + e] - kvData[6 * cacheStride + e]))
+        }
+        print("Gemma 4 ring store placement maxErr=\(placeErr)")
+        XCTAssertLessThan(placeErr, 1e-6, "ring rows must hold their wrapped positions (row 4 <- pos 4, row 0 <- pos 6)")
+
+        // Decode at position 7 (seqLen 8, window 4): attends [4, 8) -> ring rows
+        // 4, 5, 0, 1 — a wrapped read window.
+        func runDecode(kCache: MTLBuffer, vCache: MTLBuffer, out: MTLBuffer, ring: UInt32, seqLen: UInt32, qOff: Int) {
+            let cmd = cmdQueue.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var seqLenV = seqLen; var nQ: UInt32 = UInt32(numQHeads); var nK: UInt32 = UInt32(numKvHeads)
+            var hD: UInt32 = UInt32(headDim); var win = window; var sc = scaling
+            var cs: UInt32 = UInt32(cacheStride); var rl = ring
+            enc.setComputePipelineState(decodePipe)
+            enc.setBuffer(qBuf, offset: qOff, index: 0)
+            enc.setBuffer(kCache, offset: 0, index: 1)
+            enc.setBuffer(vCache, offset: 0, index: 2)
+            enc.setBuffer(out, offset: 0, index: 3)
+            enc.setBytes(&seqLenV, length: 4, index: 4)
+            enc.setBytes(&nQ, length: 4, index: 5)
+            enc.setBytes(&nK, length: 4, index: 6)
+            enc.setBytes(&hD, length: 4, index: 7)
+            enc.setBytes(&win, length: 4, index: 8)
+            enc.setBytes(&sc, length: 4, index: 9)
+            enc.setBytes(&cs, length: 4, index: 10)
+            enc.setBytes(&rl, length: 4, index: 11)
+            enc.dispatchThreadgroups(MTLSize(width: numQHeads, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.endEncoding(); cmd.commit(); cmd.waitUntilCompleted()
+            if let err = cmd.error { XCTFail("decode failed: \(err)") }
+        }
+        runDecode(kCache: ringK, vCache: ringV, out: ringDecodeOut, ring: ringLen, seqLen: 8, qOff: 0)
+        runDecode(kCache: linK, vCache: linV, out: linDecodeOut, ring: 0, seqLen: 8, qOff: 0)
+        let rd = ringDecodeOut.contents().bindMemory(to: Float.self, capacity: numQHeads * headDim)
+        let ld = linDecodeOut.contents().bindMemory(to: Float.self, capacity: numQHeads * headDim)
+        var decodeErr: Float = 0
+        for i in 0..<(numQHeads * headDim) { decodeErr = max(decodeErr, abs(rd[i] - ld[i])) }
+        print("Gemma 4 ring vs linear decode maxErr=\(decodeErr)")
+        XCTAssertLessThan(decodeErr, 1e-5, "ring decode through a wrapped window must match the linear cache")
+
+        // Tree node scratch: nodes 0..2 at tokenPos 5 -> ring rows 5, 0, 1 (0 and
+        // 1 reuse dead prefix rows by design); linear rows 5, 6, 7. All three node
+        // slots are distinct, so the single batch cannot race with itself.
+        storeBatch(kCache: ringK, vCache: ringV, source: nodeBuf, kSrcOffset: 0, vSrcOffset: numNodes * cacheStride * 4, tokenPos: prefixLen, rows: numNodes, ring: ringLen)
+        storeBatch(kCache: linK, vCache: linV, source: nodeBuf, kSrcOffset: 0, vSrcOffset: numNodes * cacheStride * 4, tokenPos: prefixLen, rows: numNodes, ring: 0)
+
+        // Tree verification: mask node 0 -> self, node 1 -> {0, self}, node 2 -> {0, self}.
+        var mask = [Float](repeating: -1e9, count: numNodes * numNodes)
+        let allowed = [(0, 0), (1, 0), (1, 1), (2, 0), (2, 2)]
+        for (i, k) in allowed { mask[i * numNodes + k] = 0 }
+        let depths: [UInt32] = [0, 1, 1]
+        guard let maskBuf = device.makeBuffer(bytes: mask, length: mask.count * 4, options: .storageModeShared),
+              let depthsBuf = device.makeBuffer(bytes: depths, length: depths.count * 4, options: .storageModeShared) else {
+            XCTFail("mask buffer alloc failed"); return
+        }
+
+        func runTree(kCache: MTLBuffer, vCache: MTLBuffer, out: MTLBuffer, ring: UInt32) {
+            let cmd = cmdQueue.makeCommandBuffer()!
+            let enc = cmd.makeComputeCommandEncoder()!
+            var pLen = prefixLen; var nNodes: UInt32 = UInt32(numNodes); var nQ: UInt32 = UInt32(numQHeads)
+            var nK: UInt32 = UInt32(numKvHeads); var hD: UInt32 = UInt32(headDim); var win = window
+            var sc = scaling; var cs: UInt32 = UInt32(cacheStride); var rl = ring
+            enc.setComputePipelineState(treePipe)
+            enc.setBuffer(qBuf, offset: Int(numQHeads * headDim) * 4, index: 0)
+            enc.setBuffer(kCache, offset: 0, index: 1)
+            enc.setBuffer(vCache, offset: 0, index: 2)
+            enc.setBuffer(maskBuf, offset: 0, index: 3)
+            enc.setBuffer(depthsBuf, offset: 0, index: 4)
+            enc.setBuffer(out, offset: 0, index: 5)
+            enc.setBytes(&pLen, length: 4, index: 6)
+            enc.setBytes(&nNodes, length: 4, index: 7)
+            enc.setBytes(&nQ, length: 4, index: 8)
+            enc.setBytes(&nK, length: 4, index: 9)
+            enc.setBytes(&hD, length: 4, index: 10)
+            enc.setBytes(&win, length: 4, index: 11)
+            enc.setBytes(&sc, length: 4, index: 12)
+            enc.setBytes(&cs, length: 4, index: 13)
+            enc.setBytes(&rl, length: 4, index: 14)
+            enc.dispatchThreadgroups(MTLSize(width: numQHeads, height: numNodes, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+            enc.endEncoding(); cmd.commit(); cmd.waitUntilCompleted()
+            if let err = cmd.error { XCTFail("tree verify failed: \(err)") }
+        }
+        runTree(kCache: ringK, vCache: ringV, out: ringTreeOut, ring: ringLen)
+        runTree(kCache: linK, vCache: linV, out: linTreeOut, ring: 0)
+        let rt = ringTreeOut.contents().bindMemory(to: Float.self, capacity: numNodes * numQHeads * headDim)
+        let lt = linTreeOut.contents().bindMemory(to: Float.self, capacity: numNodes * numQHeads * headDim)
+        var treeErr: Float = 0
+        for i in 0..<(numNodes * numQHeads * headDim) { treeErr = max(treeErr, abs(rt[i] - lt[i])) }
+        print("Gemma 4 ring vs linear tree verify maxErr=\(treeErr)")
+        XCTAssertLessThan(treeErr, 1e-5, "ring tree verify (prefix wrap + node slots on dead rows) must match the linear cache")
+
+        // Batched prefill pattern: one store dispatch for a chunk of B < ringLen
+        // positions that wraps the ring (rows 0, 1, 2 re-used for positions 6, 7,
+        // 8), then per-row attention whose window crosses the wrap boundary.
+        // The chunk re-stores positions 6, 7 with fresh data and adds position 8;
+        // both caches also still carry the tree's node scratch at rows 5, 0, 1 /
+        // 5, 6, 7, which the equivalence comparison reads identically.
+        var chunkData = [Float](repeating: 0, count: 3 * cacheStride * 2)
+        for i in 0..<chunkData.count { chunkData[i] = nextRand() }
+        guard let chunkBuf = device.makeBuffer(bytes: chunkData, length: chunkData.count * 4, options: .storageModeShared) else {
+            XCTFail("chunk buffer alloc failed"); return
+        }
+        storeBatch(kCache: ringK, vCache: ringV, source: chunkBuf, kSrcOffset: 0, vSrcOffset: 3 * cacheStride * 4, tokenPos: 6, rows: 3, ring: ringLen)
+        storeBatch(kCache: linK, vCache: linV, source: chunkBuf, kSrcOffset: 0, vSrcOffset: 3 * cacheStride * 4, tokenPos: 6, rows: 3, ring: 0)
+        // Ring rows 0, 1, 2 now hold chunk positions 6, 7, 8; rows 3, 4 keep the
+        // original fill and row 5 keeps the tree's node-0 scratch.
+        for e in 0..<cacheStride {
+            placeErr = max(placeErr, abs(ringKPtr[2 * cacheStride + e] - chunkData[2 * cacheStride + e]))
+            placeErr = max(placeErr, abs(ringKPtr[4 * cacheStride + e] - kvData[4 * cacheStride + e]))
+        }
+        print("Gemma 4 ring chunked store placement maxErr=\(placeErr)")
+        XCTAssertLessThan(placeErr, 1e-6, "the chunked store must wrap onto rows 0-2 while keeping rows 3-5")
+        for r in 0..<3 {
+            let qOff = (1 + r) * numQHeads * headDim * 4
+            let seqLen = UInt32(6 + r + 1)
+            runDecode(kCache: ringK, vCache: ringV, out: ringDecodeOut, ring: ringLen, seqLen: seqLen, qOff: qOff)
+            runDecode(kCache: linK, vCache: linV, out: linDecodeOut, ring: 0, seqLen: seqLen, qOff: qOff)
+            var prefillErr: Float = 0
+            for i in 0..<(numQHeads * headDim) { prefillErr = max(prefillErr, abs(rd[i] - ld[i])) }
+            print("Gemma 4 ring vs linear chunked prefill row \(r) (seqLen \(seqLen)) maxErr=\(prefillErr)")
+            XCTAssertLessThan(prefillErr, 1e-5, "chunked prefill row \(r) must attend identical rows through the wrap")
+        }
+    }
+
+    /// The prefill transient pool reuses buffers across chunked-prefill calls
+    /// (same size => same instance; a larger request grows; drain releases all)
+    /// so the chunked prefill never re-allocates the multi-GB expert staging on
+    /// every chunk while the weight residency grows toward the memory budget.
+    func testPrefillTransientPoolReuseAndDrain() throws {
+        print("=== TEST PREFILL TRANSIENT POOL REUSE + DRAIN ===")
+        guard let device = MTLCreateSystemDefaultDevice() else { XCTFail("No Metal GPU device"); return }
+        let pool = PrefillTransientPool.shared
+        pool.drain()
+        let a = pool.buffer(device: device, name: "test.buf", byteCount: 1 << 20)
+        XCTAssertNotNil(a)
+        let b = pool.buffer(device: device, name: "test.buf", byteCount: 1 << 20)
+        XCTAssertTrue(a === b, "same-name same-size requests must reuse the pooled buffer")
+        let c = pool.buffer(device: device, name: "test.buf", byteCount: 1 << 19)
+        XCTAssertTrue(a === c, "smaller requests reuse the larger pooled buffer")
+        let d = pool.buffer(device: device, name: "test.buf", byteCount: 4 << 20)
+        XCTAssertNotNil(d)
+        XCTAssertFalse(a === d, "a larger request must reallocate")
+        XCTAssertEqual(pool.heldBytes, 4 << 20)
+        let e = pool.buffer(device: device, name: "test.other", byteCount: 1 << 20)
+        XCTAssertNotNil(e)
+        XCTAssertEqual(pool.heldBytes, 5 << 20, "each name holds exactly one buffer")
+        pool.drain()
+        XCTAssertEqual(pool.heldBytes, 0, "drain releases every pooled buffer")
+        let f = pool.buffer(device: device, name: "test.buf", byteCount: 1 << 20)
+        XCTAssertNotNil(f)
+        XCTAssertFalse(a === f, "a request after drain allocates anew")
+        pool.drain()
+    }
+
     func testOrnithSystemPromptDetection() throws {
         print("=== TEST ORNITH SYSTEM PROMPT RESOLUTION ===")
         let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--mlx-community--Ornith-1.5-9B-OptiQ-4bit/snapshots/ad2e7748e8c9d36b82bb88307fd21c0d50be85b8"
@@ -9208,11 +12360,13 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         XCTAssertEqual(preservedVPtr[0], Float16(84.0), "V-cache Token 0 should be preserved")
         XCTAssertEqual(preservedVPtr[prefixToPreserve * stride - 1], Float16(84.0), "V-cache token at end of prefix should be preserved")
 
-        // Verify tail beyond prefix was zeroed
+        // Verify the tail beyond the prefix is deliberately NOT cleared: since the
+        // lazy-commit fix every KV position is written before it is ever read, so a
+        // retained (non-reallocating) preserve keeps the stale tail bytes untouched.
         let tailOffset = (prefixToPreserve + 2) * stride
         if tailOffset < seqLen * stride {
-            XCTAssertEqual(preservedKPtr[tailOffset], Float16(0.0), "Tail beyond preserved prefix should be zeroed")
-            XCTAssertEqual(preservedVPtr[tailOffset], Float16(0.0), "V-cache tail should be zeroed")
+            XCTAssertEqual(preservedKPtr[tailOffset], Float16(42.0), "Tail beyond preserved prefix is not zeroed (lazy commit)")
+            XCTAssertEqual(preservedVPtr[tailOffset], Float16(84.0), "V-cache tail is not zeroed (lazy commit)")
         }
     }
 
@@ -10107,6 +13261,48 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         XCTAssertTrue(splitProseClose.thinkClose)
         XCTAssertTrue(splitProseClose.think.contains("response counts"))
         XCTAssertEqual(splitProseClose.resp, "Here is the report.")
+
+        // Scenario 8: Gemma 4 reasoning channel — `<|channel>thought … <channel|>`. The
+        // leading `thought` channel label must be stripped and the closing tag must end
+        // the thinking block, leaving the post-`<channel|>` text as the response.
+        let gemmaRaw = "<|channel>thought\nThe user said \"hello!\".\nRespond with a friendly greeting.<channel|>Hello! How can I help you today?"
+        let splitGemma = ContentView.splitThinkingAndResponse(raw: gemmaRaw, promptRequestsThinking: false)
+        XCTAssertTrue(splitGemma.thinkClose)
+        XCTAssertEqual(splitGemma.think, "The user said \"hello!\".\nRespond with a friendly greeting.")
+        XCTAssertEqual(splitGemma.resp, "Hello! How can I help you today?")
+
+        // Mid-stream (open channel, no closing tag yet) must be treated as open thinking
+        // with the label already stripped.
+        let gemmaOpen = "<|channel>thought\nThe user said \"hello!\"."
+        let splitGemmaOpen = ContentView.splitThinkingAndResponse(raw: gemmaOpen, promptRequestsThinking: false)
+        XCTAssertTrue(splitGemmaOpen.thinkOpen)
+        XCTAssertFalse(splitGemmaOpen.thinkClose)
+        XCTAssertEqual(splitGemmaOpen.think, "The user said \"hello!\".")
+        XCTAssertEqual(splitGemmaOpen.resp, "")
+        // Scenario 9: Gemma 4 agent continuation. formatGemmaToolResponseTurn ends the
+        // continuation prompt with <|channel>thought\n, so the model does NOT re-emit the opener:
+        // its reasoning streams with no open tag, closed only by <channel|>. The prompt must be
+        // recognized as requesting thinking, or the reasoning renders as the response body
+        // until the close arrives, then jumps into the thinking accordion. Regression for
+        // the post-web_search render leak.
+        let gemmaContinuationPrompt = "<bos><|turn>system\n<|think|>\nSYS<turn|>\n<|turn>model\n<|channel>thought\n"
+        XCTAssertTrue(ContentView.promptRequestsThinking(gemmaContinuationPrompt),
+                      "Gemma continuation prompt ends on the channel opener and must request thinking")
+
+        let contStream = "I should search for the latest version."
+        let contOpen = ContentView.splitThinkingAndResponse(raw: contStream, promptRequestsThinking: ContentView.promptRequestsThinking(gemmaContinuationPrompt))
+        XCTAssertTrue(contOpen.thinkOpen, "untagged continuation reasoning must stay in the thinking block")
+        XCTAssertEqual(contOpen.resp, "")
+
+        let contClosed = ContentView.splitThinkingAndResponse(raw: contStream + "<channel|>Here is the answer.", promptRequestsThinking: ContentView.promptRequestsThinking(gemmaContinuationPrompt))
+        XCTAssertTrue(contClosed.thinkClose)
+        XCTAssertEqual(contClosed.think, "I should search for the latest version.")
+        XCTAssertEqual(contClosed.resp, "Here is the answer.")
+
+        // Thinking-disabled first turn ends on the closed empty channel: no thinking requested.
+        XCTAssertFalse(ContentView.promptRequestsThinking("<|turn>model\n<|channel>thought\n<channel|>"))
+        // A plain Gemma first turn (model emits its own opener) is unaffected.
+        XCTAssertFalse(ContentView.promptRequestsThinking("<|turn>model\n"))
     }
 
     func testSparkForwardDiagnostics() throws {

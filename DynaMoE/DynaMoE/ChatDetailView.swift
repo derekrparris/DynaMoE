@@ -25,6 +25,10 @@ struct ChatDetailView: View {
     var jetSpecMeanTau: Double = 1.0
     var jetSpecDraftAccepted: Int = 0
     var modelName: String?
+    /// True when the active model emits the native Gemma tool-call dialect. Gates the
+    /// Gemma-specific display cleanup so a non-Gemma answer that merely documents the
+    /// `<|tool_call>` token is not truncated.
+    var isGemmaDialect: Bool = false
     var tokenizer: DynaMoeTokenizer? = nil
     var activeProfile: ModelProfileType = .coder
     var onSelectProfile: ((ModelProfileType) -> Void)? = nil
@@ -312,6 +316,7 @@ struct ChatDetailView: View {
                                         isGenerating: isGenerating && message.id == session.messages.last?.id,
                                         isStreamingOffDisk: isStreamingOffDisk,
                                         isCompactingConversation: message.id == compactionProgressMessageId,
+                                        isGemmaDialect: isGemmaDialect,
                                         isExpanded: Binding(
                                             get: { isReasoningExpanded[message.id] ?? reasoningExpandedByDefault },
                                             set: { isReasoningExpanded[message.id] = $0 }
@@ -1100,12 +1105,28 @@ struct ChatMessageView: View {
     var isGenerating: Bool = false
     var isStreamingOffDisk: Bool = false
     var isCompactingConversation: Bool = false
+    /// True when the active model emits the native Gemma dialect; gates the Gemma
+    /// display cleanup so other models' answers are never truncated at the token.
+    var isGemmaDialect: Bool = false
     @Binding var isExpanded: Bool
     @State private var isCopied = false
     @State private var feedback: String? = nil
 
     private var displayMarkdownContent: String {
-        var clean = message.content
+        Self.cleanedMarkdown(message.content, isGemmaDialect: isGemmaDialect)
+    }
+
+    /// Strips tool-call markup from assistant text for display. The Gemma truncation is
+    /// gated on the active dialect: Gemma permits no suffix after a tool call, but a
+    /// non-Gemma answer that merely documents `<|tool_call>` must keep the rest of its text.
+    static func cleanedMarkdown(_ content: String, isGemmaDialect: Bool) -> String {
+        var clean = content
+        // Truncate at the Gemma opener before regex stripping so the remainder of the
+        // call (which may contain a quoted terminator) is never shown as an answer.
+        if isGemmaDialect, let gemmaStart = clean.range(of: "<|tool_call>") {
+            clean = String(clean[..<gemmaStart.lowerBound])
+        }
+        clean = clean
             .replacingOccurrences(of: "<tool_call>[\\s\\S]*?</tool_call>", with: "", options: .regularExpression)
             .replacingOccurrences(of: "<tool_response>[\\s\\S]*?</tool_response>", with: "", options: .regularExpression)
         if let toolCallRange = clean.range(of: "<tool_call>") {

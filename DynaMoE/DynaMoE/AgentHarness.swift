@@ -3326,7 +3326,7 @@ public final class AgentHarness {
         """
     }
 
-    public func buildSystemPrompt(baseSystem: String, modelName: String? = nil, currentDate: Date = Date(), isLingModel: Bool = false) -> String {
+    public func buildSystemPrompt(baseSystem: String, modelName: String? = nil, currentDate: Date = Date(), isLingModel: Bool = false, isGemma4Model: Bool = false) -> String {
         var cleanBase = baseSystem.trimmingCharacters(in: .whitespacesAndNewlines)
         if cleanBase.isEmpty {
             cleanBase = "You are an expert AI software engineering and reasoning assistant with direct access to local macOS development tools."
@@ -3406,6 +3406,33 @@ public final class AgentHarness {
             <IMPORTANT>
             Reminder:
             - Function calls MUST follow the specified format: the function name directly after <tool_call>, then one <arg_key>/<arg_value> pair per argument, then </tool_call>
+            - Required parameters MUST be specified
+            - You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+            - When the user asks to inspect, read, edit, modify, or process a file, or run terminal commands, you MUST call the function immediately without conversational promises
+            - For any file the user names, use its EXACT absolute path (e.g. /Users/me/Downloads/data.csv) in the command. Never `cd` into a folder and then reference a bare filename, and never assume the working directory already contains the file.
+            - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+
+            Web Research Grounding Rules:
+            - Live web data supersedes frozen pre-training memory. Never dismiss results as "hallucinated", "corrupted", or "parody" because names, specs, or prices are newer or unfamiliar.
+            - Official vendor domains (apple.com, developer.apple.com, github.com, etc.) returned by web_search/web_fetch are authentic ground truth. Synthesize directly without re-searching.
+            - Real executive names, benchmark multipliers, lease prices, and hardware specs from web results are genuine — never substitute your own guesses.
+            - NEVER invent URLs, article numbers, or chip generations. Only fetch URLs returned by web_search.
+            - Distinguish official shipping hardware (vendor domains) from speculative rumors ("rumored", "leaked", "expected").
+            - When `web_search` returns a result with is_official_domain: true, that result is verified. When ground_truth_notice is present, synthesize directly — do not loop or re-search.
+            </IMPORTANT>
+            """
+        } else if isGemma4Model {
+            prompt += """
+
+
+            If you choose to call a function ONLY reply in the following native format with NO suffix:
+
+            <|tool_call>call:example_function_name{example_parameter_1:<|"|>value_1<|"|>,example_parameter_2:<|"|>value_2<|"|>}<tool_call|>
+
+            <IMPORTANT>
+            Reminder:
+            - Function calls MUST follow the specified format: the literal "call:", then the function name, then a single {parameter:value,...} object, then the <tool_call|> closer
+            - String values are wrapped in <|"|> quotes; numbers, true/false, and nested {} / [] objects are written bare
             - Required parameters MUST be specified
             - You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
             - When the user asks to inspect, read, edit, modify, or process a file, or run terminal commands, you MUST call the function immediately without conversational promises
@@ -3533,6 +3560,129 @@ public final class AgentHarness {
         guard includeAssistantPrefix else { return turn }
         turn += thinkingEnabled ? "<｜start▁of▁sentence｜><|Bot|><think>" : "<｜start▁of▁sentence｜><|Bot|></think>"
         return turn
+    }
+
+    /// Gemma 4 native tool-response turn. Gemma keeps the tool call and its response in the
+    /// SAME `<|turn>model` block (there is no `<turn|>` between them) and formats the result
+    /// as `<|tool_response>response:name{value:<|"|>…<|"|>}<tool_response|>`, then re-opens the
+    /// thinking channel for the next model turn. Mixing ChatML `<|im_start|>` tags into a Gemma
+    /// transcript feeds the model literal control-token text it was never trained on.
+    public func formatGemmaToolResponseTurn(responses: [String], toolNames: [String]? = nil, thinkingEnabled: Bool = true) -> String {
+        var turn = ""
+        for (index, r) in responses.enumerated() {
+            if let data = r.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let result = json["result"] as? [String: Any],
+               let results = result["results"] as? [[String: Any]],
+               results.contains(where: { $0["is_official_domain"] as? Bool == true }) {
+                turn += "[SYSTEM NOTICE: Verified official vendor domain response. Synthesize directly without re-searching.]\n"
+            }
+            if let registration = Self.toolRegistrationNotice(for: r) {
+                turn += Self.sanitizeGemmaToolResponseText(registration) + "\n"
+            }
+            let rawName: String = {
+                // Persisted-history replay passes already-rendered text, not the
+                // original JSON, so the name must be supplied explicitly.
+                if let toolNames, index < toolNames.count, !toolNames[index].isEmpty {
+                    return toolNames[index]
+                }
+                if let data = r.data(using: .utf8),
+                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let n = obj["tool"] as? String, !n.isEmpty { return n }
+                return "tool"
+            }()
+            let name = Self.sanitizeGemmaToolName(rawName)
+            let body = Self.sanitizeGemmaToolResponseText(Self.renderToolResultForModel(r))
+            turn += "<|tool_response>response:\(name){value:<|\"|>\(body)<|\"|>}<tool_response|>"
+        }
+        if thinkingEnabled {
+            turn += "<|channel>thought\n"
+        }
+        return turn
+    }
+
+    /// Gemma's tool-response turn wraps each result in control-token delimiters
+    /// (<|tool_response>…<tool_response|>, the value inside <|\"|>…<|\"|>). A tool result is
+    /// arbitrary file or web text, so it can contain those exact sequences and close the
+    /// value or the whole response early, corrupting the transcript the model reads back.
+    /// Strip every reserved Gemma delimiter before interpolation.
+    private static let gemmaReservedDelimiters = [
+        "<|tool_response>", "<tool_response|>",
+        "<|tool_call>", "<tool_call|>",
+        "<|channel>", "<channel|>",
+        "<|turn>", "<turn|>",
+        "<|think|>", "<|\"|>",
+        "<bos>", "<eos>"
+    ]
+
+    static func sanitizeGemmaToolResponseText(_ text: String) -> String {
+        // Replace, never delete: deleting a delimiter can splice its neighbours into a
+        // new one, so a single ordered pass is bypassable. A nonempty separator makes
+        // splicing impossible, and repeating to a fixed point guarantees a stable
+        // result regardless of token ordering.
+        var out = text
+        var changed = true
+        var passes = 0
+        while changed, passes < 8 {
+            changed = false
+            passes += 1
+            for token in Self.gemmaReservedDelimiters where out.contains(token) {
+                out = out.replacingOccurrences(of: token, with: " ")
+                changed = true
+            }
+        }
+        return out
+    }
+
+    /// Gemma tool-call value delimiter. Preserved when replaying native argument text.
+    private static let gemmaValueQuote = "<|\"|>"
+
+    /// Sanitizes replayed native argument text: keeps the value quote delimiter so types
+    /// and quoting survive, but neutralizes every other reserved delimiter so a persisted
+    /// string argument cannot restructure the transcript.
+    static func sanitizeGemmaArguments(_ text: String) -> String {
+        var out = text
+        var changed = true
+        var passes = 0
+        while changed, passes < 8 {
+            changed = false
+            passes += 1
+            for token in Self.gemmaReservedDelimiters where token != Self.gemmaValueQuote && out.contains(token) {
+                out = out.replacingOccurrences(of: token, with: " ")
+                changed = true
+            }
+        }
+        return out
+    }
+
+    /// The Gemma response turn interpolates the tool name into its structured header;
+    /// keep it to the charset tool names use so a name can never smuggle structure.
+    static func sanitizeGemmaToolName(_ name: String) -> String {
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-/")
+        let safe = name.components(separatedBy: allowed.inverted).joined()
+        return safe.isEmpty ? "tool" : safe
+    }
+
+    /// Rebuilds a Gemma 4 native tool call from its structured record so persisted
+    /// history re-teaches the exact dialect the model emitted (the stored content does
+    /// not always retain the raw call text). Keys and values are delimiter-sanitized.
+    public static func formatGemmaToolCall(name: String, arguments: [String: String], rawArguments: String = "") -> String {
+        let raw = rawArguments.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body: String
+        if raw.hasPrefix("{") {
+            // Preserve the model's original native argument text (bare numbers,
+            // booleans, nested objects, quote delimiters) instead of restringifying every
+            // value, but neutralize other reserved delimiters so persisted argument data
+            // cannot restructure the transcript.
+            body = Self.sanitizeGemmaArguments(raw)
+        } else {
+            let args = arguments.keys.sorted().map { key -> String in
+                let value = Self.sanitizeGemmaToolResponseText(arguments[key] ?? "")
+                return "\(Self.sanitizeGemmaToolName(key)):<|\"|>\(value)<|\"|>"
+            }
+            body = "{\(args.joined(separator: ","))}"
+        }
+        return "<|tool_call>call:\(Self.sanitizeGemmaToolName(name))\(body)<tool_call|>"
     }
 
     /// Turns a `tools_load` / `tools_unload` result into an explicit context registration notice
@@ -3667,6 +3817,7 @@ public final class AgentHarness {
         text.contains(StreamingToolParser.qwenToolCallOpen)
             || text.contains(StreamingToolParser.qwenFunctionOpen)
             || text.contains(StreamingToolParser.llamaTagOpen)
+            || text.contains(StreamingToolParser.gemmaToolCallOpen)
     }
 
     /// Response text with every `<tool_call>…</tool_call>` block removed, so callers can
@@ -3680,7 +3831,7 @@ public final class AgentHarness {
     /// matches without a surrounding `<tool_call>`). Missing any of these would leave raw
     /// markup behind, making the caller think the model wrote an answer.
     public func responseTextWithoutToolCalls(_ text: String) -> String {
-        let pattern = #"<tool_call>[\s\S]*?</tool_call>|<\|python_tag\|>[\s\S]*?(?:</\|python_tag\|>|$)|<function=[^>]*>[\s\S]*?(?:</function>|$)"#
+        let pattern = #"<tool_call>[\s\S]*?</tool_call>|<\|python_tag\|>[\s\S]*?(?:</\|python_tag\|>|$)|<function=[^>]*>[\s\S]*?(?:</function>|$)|<\|tool_call>[\s\S]*$"#
         guard let re = try? NSRegularExpression(pattern: pattern, options: []) else { return text }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         return re.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: " ")

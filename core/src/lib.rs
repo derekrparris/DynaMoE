@@ -226,6 +226,15 @@ fn parse_layer_and_expert(name: &str) -> (String, Option<u32>, Option<u32>) {
         return (cat.to_string(), None, None);
     }
 
+    // Gemma 4 multimodal wrapper: vision/audio towers and the embedding projector
+    // live alongside the language model and would otherwise pollute backbone layers.
+    if name.contains("vision_tower") || name.contains("embed_vision") {
+        return ("Vision".to_string(), None, None);
+    }
+    if name.contains("audio_tower") || name.contains("embed_audio") {
+        return ("Audio".to_string(), None, None);
+    }
+
     let mut layer_idx = None;
     let mut expert_idx = None;
 
@@ -265,6 +274,10 @@ fn parse_layer_and_expert(name: &str) -> (String, Option<u32>, Option<u32>) {
         "Self-Attention (QSA)".to_string()
     } else if name.contains("shared_expert_gate") {
         "Shared Expert Gate".to_string()
+    } else if name.contains(".router.") || name.ends_with(".router") {
+        "MoE Router".to_string()
+    } else if name.contains("layer_scalar") {
+        "Layer Scalar".to_string()
     } else if (name.contains("mlp.gate.") || name.ends_with("mlp.gate")) && !name.contains("switch_mlp") && !name.contains("shared") && !name.contains("proj") {
         "MoE Router".to_string()
     } else if name.contains("shared_expert") || name.contains("shared_experts") {
@@ -1956,6 +1969,36 @@ mod tests {
 
         let (cat_mtp, _, _) = parse_layer_and_expert("mtp.layers.0.mlp.gate_proj.weight");
         assert_eq!(cat_mtp, "Multi-Token Prediction");
+    }
+
+    #[test]
+    fn test_gemma4_tensor_parsing() {
+        // Gemma 4 nests the decoder under model.language_model and uses a
+        // dedicated router + per-layer scalar, plus vision/audio towers that
+        // must never be folded into the language-model backbone layers.
+        let (cat_router, layer_router, _) = parse_layer_and_expert("model.language_model.layers.0.router.proj.weight");
+        assert_eq!(cat_router, "MoE Router");
+        assert_eq!(layer_router, Some(0));
+
+        let (cat_router_scale, _, _) = parse_layer_and_expert("model.language_model.layers.5.router.scale");
+        assert_eq!(cat_router_scale, "MoE Router");
+
+        let (cat_scalar, layer_scalar, _) = parse_layer_and_expert("model.language_model.layers.2.layer_scalar");
+        assert_eq!(cat_scalar, "Layer Scalar");
+        assert_eq!(layer_scalar, Some(2));
+
+        let (cat_attn, layer_attn, _) = parse_layer_and_expert("model.language_model.layers.5.self_attn.q_proj.weight");
+        assert_eq!(cat_attn, "Self-Attention (QSA)");
+        assert_eq!(layer_attn, Some(5));
+
+        // Vision tower layers must be excluded from the backbone entirely.
+        let (cat_vision, layer_vision, _) = parse_layer_and_expert("model.vision_tower.encoder.layers.3.self_attn.q_proj.linear.weight");
+        assert_eq!(cat_vision, "Vision");
+        assert_eq!(layer_vision, None);
+
+        let (cat_embed_vision, layer_embed_vision, _) = parse_layer_and_expert("model.embed_vision.embedding_projection.weight");
+        assert_eq!(cat_embed_vision, "Vision");
+        assert_eq!(layer_embed_vision, None);
     }
 
     #[test]

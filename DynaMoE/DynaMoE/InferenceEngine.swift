@@ -9,6 +9,28 @@ import Foundation
 import Metal
 import Accelerate
 
+/// Raised when a single tensor's page-aligned span cannot fit in one Metal buffer,
+/// so no amount of shard segmentation can address it. Surfaced to the model loader as a
+/// hard failure rather than a summary whose tensors silently map to nothing.
+public enum MetalSegmentationError: Error, LocalizedError {
+    case tensorExceedsBufferLimit(name: String, alignedSpanBytes: UInt64, maxBufferLength: UInt64)
+    case tensorOutsideSegments(name: String, offsetStart: UInt64, offsetEnd: UInt64)
+    case unknownShardIndex(name: String, shardIndex: UInt32)
+
+    public var errorDescription: String? {
+        switch self {
+        case let .tensorExceedsBufferLimit(name, alignedSpanBytes, maxBufferLength):
+            let spanGB = Double(alignedSpanBytes) / 1_073_741_824.0
+            let capGB = Double(maxBufferLength) / 1_073_741_824.0
+            return "Tensor \(name) needs a \(String(format: "%.2f", spanGB)) GB page-aligned buffer, above the \(String(format: "%.2f", capGB)) GB Metal buffer limit; it cannot be split across buffers."
+        case let .tensorOutsideSegments(name, offsetStart, offsetEnd):
+            return "Tensor \(name) spans bytes \(offsetStart)..<\(offsetEnd), which no segmented buffer of its shard covers; the manifest is malformed or corrupt."
+        case let .unknownShardIndex(name, shardIndex):
+            return "Tensor \(name) references shard \(shardIndex), which is not present in the model summary; the manifest is corrupt."
+        }
+    }
+}
+
 public enum MemoryExecutionMode: String, CaseIterable, Identifiable, Codable {
     case autoDetect = "Auto (Smart)"
     case residentRAM = "Full RAM"
@@ -179,6 +201,18 @@ public struct EngineCachedLayer {
 
     // MoE Router Expert Bias (Ling-3.0-tiny)
     public let routerExpertBias: TensorMetadata?
+
+    // Gemma 4 hybrid-attention MoE: router norm/scale, dual FFN norms, per-layer
+    // scalar, and fused gate+up routed-expert weights.
+    public let routerScaleVec: TensorMetadata?
+    public let routerPerExpertScale: TensorMetadata?
+    public let preFfnNormTensor: TensorMetadata?
+    public let preFfnNorm2Tensor: TensorMetadata?
+    public let postFfnNormTensor: TensorMetadata?
+    public let postFfnNorm1Tensor: TensorMetadata?
+    public let postFfnNorm2Tensor: TensorMetadata?
+    public let layerScalarTensor: TensorMetadata?
+    public let expertFusedGateUpWeights: [Int: TensorMetadata]
 }
 
 public final class InferenceEngine {
@@ -294,6 +328,7 @@ public final class InferenceEngine {
     public var gatherGdnTreeParentStatesPipeline: MTLComputePipelineState?
     public var commitGdnTreeWinningStatePipeline: MTLComputePipelineState?
     public var applyRopeTreePipeline: MTLComputePipelineState?
+    public var applyRopeTreeProportionalPipeline: MTLComputePipelineState?
     public var compactKvCacheSlotsF32Pipeline: MTLComputePipelineState?
     public var compactKvCacheSlotsF16Pipeline: MTLComputePipelineState?
 
@@ -611,6 +646,9 @@ public final class InferenceEngine {
         if let ropeTreeFunc = defaultLib.makeFunction(name: "apply_rope_tree") {
             applyRopeTreePipeline = try device.makeComputePipelineState(function: ropeTreeFunc)
         }
+        if let ropeTreePropFunc = defaultLib.makeFunction(name: "apply_rope_tree_proportional") {
+            applyRopeTreeProportionalPipeline = try device.makeComputePipelineState(function: ropeTreePropFunc)
+        }
         if let compactF32Func = defaultLib.makeFunction(name: "compact_kv_cache_slots_f32") {
             compactKvCacheSlotsF32Pipeline = try device.makeComputePipelineState(function: compactF32Func)
         }
@@ -654,6 +692,19 @@ public final class InferenceEngine {
             let routerScale = layerTensors.first(where: { ($0.category == "MoE Router" || ($0.name.contains("mlp.gate") && !$0.name.contains("switch_mlp") && !$0.name.contains("proj") && !$0.name.contains("shared"))) && ($0.name.contains("scale") || $0.name.contains("scales")) })
             let routerBias = layerTensors.first(where: { ($0.category == "MoE Router" || ($0.name.contains("mlp.gate") && !$0.name.contains("switch_mlp") && !$0.name.contains("proj") && !$0.name.contains("shared"))) && ($0.name.contains("bias") || $0.name.contains("biases")) && !$0.name.contains("expert_bias") })
             let routerExpBias = layerTensors.first(where: { $0.name.contains("mlp.gate.expert_bias") || ($0.category == "MoE Router" && $0.name.contains("expert_bias")) })
+
+            // Gemma 4 router: dedicated norm (scale-free, so no tensor), a per-hidden-dim
+            // scale vector, and a per-expert scale applied to the selected top-k weights.
+            let routerScaleVec = layerTensors.first(where: { $0.name.hasSuffix("router.scale") })
+            let routerPerExpertScale = layerTensors.first(where: { $0.name.hasSuffix("router.per_expert_scale") })
+
+            // Gemma 4 dual FFN norms + per-layer output scalar.
+            let preFfnNorm = layerTensors.first(where: { $0.name.hasSuffix("pre_feedforward_layernorm.weight") })
+            let preFfnNorm2 = layerTensors.first(where: { $0.name.hasSuffix("pre_feedforward_layernorm_2.weight") })
+            let postFfnNorm = layerTensors.first(where: { $0.name.hasSuffix("post_feedforward_layernorm.weight") })
+            let postFfnNorm1 = layerTensors.first(where: { $0.name.hasSuffix("post_feedforward_layernorm_1.weight") })
+            let postFfnNorm2 = layerTensors.first(where: { $0.name.hasSuffix("post_feedforward_layernorm_2.weight") })
+            let layerScalar = layerTensors.first(where: { $0.name.hasSuffix("layer_scalar") })
 
             // Shared Gate
             let sharedGate = layerTensors.first(where: { ($0.category == "Shared Expert Gate" || $0.name.contains("shared_expert_gate")) && !$0.name.contains("scale") && !$0.name.contains("bias") })
@@ -765,12 +816,19 @@ public final class InferenceEngine {
             var expGB: [Int: TensorMetadata] = [:]
             var expUB: [Int: TensorMetadata] = [:]
             var expDB: [Int: TensorMetadata] = [:]
+            var expFusedGU: [Int: TensorMetadata] = [:]
 
             for t in layerTensors {
                 guard let expId = t.expertId else { continue }
                 let exp = Int(expId)
                 let isScale = t.name.contains("scale") || t.name.contains("scales")
                 let isBias = t.name.contains("bias") || t.name.contains("biases")
+
+                // Gemma 4 packs gate and up into a single [2*inter, hidden] tensor per expert.
+                if t.name.contains("gate_up_proj") {
+                    if !isScale && !isBias { expFusedGU[exp] = t }
+                    continue
+                }
 
                 if t.name.contains("gate_proj") {
                     if isScale { expGS[exp] = t }
@@ -787,18 +845,34 @@ public final class InferenceEngine {
                 }
             }
 
+            // FlashMoE-packed Gemma-style experts store the fused gate+up under a single
+            // "up_proj" component ([2*inter, hidden]) with no separate gate_proj. Fold it
+            // into the fused-expert map so the Gemma decoder finds its routed experts.
+            if expFusedGU.isEmpty, expGW.isEmpty, !expUW.isEmpty, config?.isGemma4Model == true {
+                expFusedGU = expUW
+                expUW = [:]
+            }
+
             var interDim: UInt32 = 512
+            var parsedInter: UInt32? = nil
             if let targetGate = dGate ?? sharedGateW ?? expGW.values.first {
                 let cleanShape = targetGate.shapeDisplay.replacingOccurrences(of: "[", with: "").replacingOccurrences(of: "]", with: "").replacingOccurrences(of: " ", with: "")
                 let parts = cleanShape.split(separator: ",")
                 if let first = parts.first, let parsed = UInt32(first), parsed > 0 {
-                    interDim = parsed
+                    parsedInter = parsed
                 }
+            }
+            if let p = parsedInter {
+                interDim = p
+            } else if let cfgInter = config?.effectiveIntermediateSize, cfgInter > 0 {
+                // Packed formats report empty shapes; fall back to the config's dense
+                // MLP width (Gemma 4 keeps it in the nested text_config).
+                interDim = UInt32(cfgInter)
             } else if let cfgInter = config?.intermediateSize {
                 interDim = UInt32(cfgInter)
             }
 
-            let mlpType: LayerMlpType = (arch == .denseTransformer || expGW.isEmpty) ? .denseMlp : .moeExperts
+            let mlpType: LayerMlpType = (arch == .denseTransformer || (expGW.isEmpty && expFusedGU.isEmpty)) ? .denseMlp : .moeExperts
 
             let grRead = layerTensors.first(where: { $0.name.contains("gated_residual.read") || $0.name.contains("residual_gate.read") })
             let grWrite = layerTensors.first(where: { $0.name.contains("gated_residual.write") || $0.name.contains("residual_gate.write") })
@@ -916,11 +990,160 @@ public final class InferenceEngine {
                 mlaKVALayernorm: mlaKVALN,
                 mlaKVBProj: mlaKVB,
                 mlaGateProj: mlaGate,
-                routerExpertBias: routerExpBias
+                routerExpertBias: routerExpBias,
+                routerScaleVec: routerScaleVec,
+                routerPerExpertScale: routerPerExpertScale,
+                preFfnNormTensor: preFfnNorm,
+                preFfnNorm2Tensor: preFfnNorm2,
+                postFfnNormTensor: postFfnNorm,
+                postFfnNorm1Tensor: postFfnNorm1,
+                postFfnNorm2Tensor: postFfnNorm2,
+                layerScalarTensor: layerScalar,
+                expertFusedGateUpWeights: expFusedGU
             ))
         }
 
         return cached
+    }
+
+    /// Splits any shard larger than `maxBufferLength` into segments that each fit in a
+    /// single Metal buffer, rewriting every tensor's `shardIndex` and offsets to address
+    /// its containing segment. Each segment base is aligned to the system page size
+    /// (`vm_page_size`, 16 KB on Apple Silicon) as `makeBuffer(bytesNoCopy:)` requires,
+    /// and the segment is sized to cover its tensors end-to-end; adjacent segments may
+    /// share at most one page, which Metal permits. Returns the summary unchanged when
+    /// every shard already fits.
+    public static func segmentShardsForMetal(_ summary: ModelSummary, maxBufferLength: UInt64) throws -> ModelSummary {
+        guard maxBufferLength > 0 else { return summary }
+
+        // Validate every tensor against its referenced shard BEFORE deciding whether
+        // segmentation is needed. Otherwise a tensor with an unknown shard, an inverted
+        // range, or an end past a normal-sized shard passes through unchanged and can
+        // later address outside its mapped buffer.
+        var shardLengths: [UInt32: UInt64] = [:]
+        for shard in summary.shards { shardLengths[shard.index] = shard.length }
+        for t in summary.tensors {
+            guard let total = shardLengths[t.shardIndex] else {
+                throw MetalSegmentationError.unknownShardIndex(name: t.name, shardIndex: t.shardIndex)
+            }
+            guard t.offsetEnd >= t.offsetStart, t.offsetEnd <= total else {
+                throw MetalSegmentationError.tensorOutsideSegments(
+                    name: t.name, offsetStart: t.offsetStart, offsetEnd: t.offsetEnd)
+            }
+        }
+
+        guard summary.shards.contains(where: { $0.length > maxBufferLength }) else {
+            return summary
+        }
+
+        var tensorsByShard: [UInt32: [TensorMetadata]] = [:]
+        for t in summary.tensors { tensorsByShard[t.shardIndex, default: []].append(t) }
+
+        let page = UInt64(vm_page_size)
+        func alignDown(_ x: UInt64) -> UInt64 { x & ~(page - 1) }
+        func alignUp(_ x: UInt64) -> UInt64 { (x + page - 1) & ~(page - 1) }
+
+        var newShards: [ShardMetadata] = []
+        var remap: [UInt32: [(index: UInt32, start: UInt64, len: UInt64)]] = [:]
+        var nextIndex: UInt32 = 0
+
+        for shard in summary.shards {
+            let total = shard.length
+            if total <= maxBufferLength {
+                let idx = nextIndex; nextIndex += 1
+                newShards.append(ShardMetadata(index: idx, filename: shard.filename, baseAddress: shard.baseAddress, length: total))
+                remap[shard.index] = [(idx, 0, total)]
+                continue
+            }
+
+            let tensors = (tensorsByShard[shard.index] ?? []).sorted { $0.offsetStart < $1.offsetStart }
+            var segs: [(index: UInt32, start: UInt64, len: UInt64)] = []
+            var curFirst: UInt64? = nil
+            var curLastEnd: UInt64 = 0
+
+            func flush() {
+                guard let first = curFirst else { return }
+                let start = alignDown(first)
+                let end = min(alignUp(curLastEnd), total)
+                let idx = nextIndex; nextIndex += 1
+                let len = end - start
+                newShards.append(ShardMetadata(index: idx, filename: "\(shard.filename)#\(segs.count)", baseAddress: shard.baseAddress + start, length: len))
+                segs.append((idx, start, len))
+                curFirst = nil
+            }
+
+            for t in tensors {
+                // A single tensor whose page-aligned span exceeds the buffer limit cannot
+                // be contained by any segment. Without this check it is emitted in an
+                // oversized segment, the loader silently skips that buffer, and the tensor
+                // is left unavailable while loading continues. Fail the load with a named
+                // error instead of returning a summary with unmappable tensors.
+                // Validate the range before unsigned alignment math: a malformed
+                // manifest with offsetEnd < offsetStart underflows the subtraction, and
+                // an end past the shard cannot be contained by any segment. Fail with a
+                // named load error so corrupt metadata is rejected cleanly.
+                guard t.offsetEnd >= t.offsetStart, t.offsetEnd <= total else {
+                    throw MetalSegmentationError.tensorOutsideSegments(
+                        name: t.name, offsetStart: t.offsetStart, offsetEnd: t.offsetEnd)
+                }
+                // Mirror flush(): page-round the end but clip it to the shard EOF. A
+                // tensor ending at a non-page-aligned EOF would otherwise compute a span
+                // past the mapped shard and be falsely rejected even though its clipped
+                // segment fits.
+                let singleSpan = min(alignUp(t.offsetEnd), total) - alignDown(t.offsetStart)
+                guard singleSpan <= maxBufferLength else {
+                    throw MetalSegmentationError.tensorExceedsBufferLimit(
+                        name: t.name, alignedSpanBytes: singleSpan, maxBufferLength: maxBufferLength)
+                }
+                if let first = curFirst {
+                    let projected = alignUp(t.offsetEnd) - alignDown(first)
+                    if projected > maxBufferLength {
+                        flush()
+                    }
+                }
+                if curFirst == nil { curFirst = t.offsetStart }
+                curLastEnd = max(curLastEnd, t.offsetEnd)
+            }
+            flush()
+            remap[shard.index] = segs
+            print("ℹ️ [Metal] Split shard #\(shard.index) (\(shard.filename), \(String(format: "%.2f", Double(total) / 1073741824.0)) GB) into \(segs.count) buffers")
+        }
+
+        var newTensors: [TensorMetadata] = []
+        newTensors.reserveCapacity(summary.tensors.count)
+        for t in summary.tensors {
+            // Every shard in the summary was remapped above; a tensor whose shard has no
+            // remap references a shard that does not exist, so it would load unmapped.
+            guard let segs = remap[t.shardIndex], !segs.isEmpty else {
+                throw MetalSegmentationError.unknownShardIndex(name: t.name, shardIndex: t.shardIndex)
+            }
+            guard let seg = segs.first(where: { t.offsetStart >= $0.start && t.offsetEnd <= $0.start + $0.len }) else {
+                throw MetalSegmentationError.tensorOutsideSegments(
+                    name: t.name, offsetStart: t.offsetStart, offsetEnd: t.offsetEnd)
+            }
+            newTensors.append(TensorMetadata(
+                name: t.name,
+                shapeDisplay: t.shapeDisplay,
+                dtype: t.dtype,
+                sizeMb: t.sizeMb,
+                shardIndex: seg.index,
+                offsetStart: t.offsetStart - seg.start,
+                offsetEnd: t.offsetEnd - seg.start,
+                category: t.category,
+                layerIndex: t.layerIndex,
+                expertId: t.expertId
+            ))
+        }
+
+        return ModelSummary(
+            sizeGb: summary.sizeGb,
+            tensorCount: UInt32(newTensors.count),
+            layerCount: summary.layerCount,
+            maxExpertId: summary.maxExpertId,
+            shards: newShards,
+            tensors: newTensors,
+            layers: summary.layers
+        )
     }
 }
 
@@ -968,7 +1191,12 @@ extension EngineCachedLayer {
             kdaQConv1d, kdaKConv1d, kdaVConv1d,
             mlaQAProj, mlaQALayernorm, mlaQBProj,
             mlaKVAProjWithMqa, mlaKVALayernorm, mlaKVBProj,
-            mlaGateProj, routerExpertBias
+            mlaGateProj, routerExpertBias,
+            routerScaleVec, routerPerExpertScale,
+            preFfnNormTensor, preFfnNorm2Tensor,
+            postFfnNormTensor,
+            postFfnNorm1Tensor, postFfnNorm2Tensor,
+            layerScalarTensor
         ]
         for c in candidates {
             if let t = c {
