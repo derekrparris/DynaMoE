@@ -5758,6 +5758,26 @@ final class DynaMoETests: XCTestCase {
         }
     }
 
+    func testRejectsInvalidTensorWhenNoShardNeedsSegmentation() throws {
+        // No shard exceeds the buffer limit, so segmentation is skipped; the manifest
+        // must still be validated (here an unknown shard).
+        let maxBufferLength: UInt64 = 8 << 30
+        let shards = [ShardMetadata(index: 0, filename: "small.safetensors", baseAddress: 0x1_0000_0000, length: 1 << 30)]
+        let tensors = [TensorMetadata(
+            name: "ghost.weight",
+            shapeDisplay: "[]", dtype: "BF16", sizeMb: 1,
+            shardIndex: 9, offsetStart: 0, offsetEnd: 1024,
+            category: "Other", layerIndex: 0, expertId: nil
+        )]
+        let summary = ModelSummary(sizeGb: 1, tensorCount: 1, layerCount: 1, maxExpertId: 0, shards: shards, tensors: tensors, layers: [])
+
+        XCTAssertThrowsError(try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: maxBufferLength)) { error in
+            guard case MetalSegmentationError.unknownShardIndex = error else {
+                return XCTFail("Expected unknownShardIndex, got \(error)")
+            }
+        }
+    }
+
     func testGemma4LayerTensorResolution() throws {
         let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--google--gemma-4-26B-A4B-it/snapshots/4d7ae4984b7db7de8f8457170b3f1a419ee76d52"
         guard FileManager.default.fileExists(atPath: snapshotDir) else {
@@ -5866,6 +5886,13 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(parser.parseStreamingToolCalls(from: "<|tool_call>call:x{command \"rm -rf /\"}<tool_call|>").calls.count, 0)
         // Colon present but no value.
         XCTAssertEqual(parser.parseStreamingToolCalls(from: "<|tool_call>call:x{command:}<tool_call|>").calls.count, 0)
+    }
+
+    func testGemma4RejectsUnexpectedObjectSeparator() throws {
+        // Two fields separated by a stray ";" must not be accepted (which would let a
+        // later field overwrite an earlier one).
+        let semi = "<|tool_call>call:x{command:\"safe\";command:\"danger\"}<tool_call|>"
+        XCTAssertEqual(StreamingToolParser.shared.parseStreamingToolCalls(from: semi).calls.count, 0)
     }
 
     func testGemma4RebuildPreservesRawArguments() throws {

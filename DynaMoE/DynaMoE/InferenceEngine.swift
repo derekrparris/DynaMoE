@@ -1014,7 +1014,25 @@ public final class InferenceEngine {
     /// share at most one page, which Metal permits. Returns the summary unchanged when
     /// every shard already fits.
     public static func segmentShardsForMetal(_ summary: ModelSummary, maxBufferLength: UInt64) throws -> ModelSummary {
-        guard maxBufferLength > 0, summary.shards.contains(where: { $0.length > maxBufferLength }) else {
+        guard maxBufferLength > 0 else { return summary }
+
+        // Validate every tensor against its referenced shard BEFORE deciding whether
+        // segmentation is needed. Otherwise a tensor with an unknown shard, an inverted
+        // range, or an end past a normal-sized shard passes through unchanged and can
+        // later address outside its mapped buffer.
+        var shardLengths: [UInt32: UInt64] = [:]
+        for shard in summary.shards { shardLengths[shard.index] = shard.length }
+        for t in summary.tensors {
+            guard let total = shardLengths[t.shardIndex] else {
+                throw MetalSegmentationError.unknownShardIndex(name: t.name, shardIndex: t.shardIndex)
+            }
+            guard t.offsetEnd >= t.offsetStart, t.offsetEnd <= total else {
+                throw MetalSegmentationError.tensorOutsideSegments(
+                    name: t.name, offsetStart: t.offsetStart, offsetEnd: t.offsetEnd)
+            }
+        }
+
+        guard summary.shards.contains(where: { $0.length > maxBufferLength }) else {
             return summary
         }
 

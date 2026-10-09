@@ -1127,7 +1127,10 @@ private struct GemmaArgumentParser {
             skipWhitespace()
             if peek() == "," { idx += 1; continue }
             if peek() == "}" { idx += 1; closed = true; break }
-            if idx < chars.count { idx += 1 }
+            // Any other separator (a stray token, `;`, etc.) means the object is
+            // malformed: mark it incomplete so it cannot execute.
+            complete = false
+            break
         }
         if !closed { complete = false }
         return obj
@@ -1145,7 +1148,9 @@ private struct GemmaArgumentParser {
             skipWhitespace()
             if peek() == "," { idx += 1; continue }
             if peek() == "]" { idx += 1; closed = true; break }
-            if idx < chars.count { idx += 1 }
+            // Any other separator means the array is malformed.
+            complete = false
+            break
         }
         if !closed { complete = false }
         return arr
