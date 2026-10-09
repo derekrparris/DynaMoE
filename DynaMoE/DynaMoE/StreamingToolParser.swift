@@ -14,6 +14,17 @@ public enum ToolCallFormat: String, CaseIterable, Codable {
     case qwenXML = "qwen_xml"
     case hermeticJSON = "hermetic_json"
     case llama3 = "llama_3"
+    case gemma = "gemma_native"
+
+    /// The tool-call dialect the active model emits. Gemma 4 uses its own native
+    /// `<|tool_call>call:name{...}<tool_call|>` protocol; every other supported family
+    /// (Qwen, Ling/Bailing, Spark, Llama 3) is handled by the canonical XML/JSON path.
+    /// Detection must be explicit: scanning every stream for Gemma markers lets a
+    /// Qwen/Llama argument that merely contains a literal Gemma block be reinterpreted
+    /// and executed as a different tool.
+    public static func forModel(isGemma4: Bool) -> ToolCallFormat {
+        isGemma4 ? .gemma : .qwenXML
+    }
 }
 
 public final class StreamingToolParser {
@@ -249,13 +260,15 @@ public final class StreamingToolParser {
         deltaText: String,
         format: ToolCallFormat = .qwenXML
     ) -> Bool {
-        // Gemma 4 native tool calls freeze only once a complete, parseable block has
-        // arrived. Checking the opener and closer independently could freeze on a stray
-        // closer in prose followed by a later, incomplete opener that never parses.
-        if !Self.parseGemmaBlocks(in: accumulatedText).isEmpty {
-            return true
-        }
         switch format {
+        case .gemma:
+            // Gemma 4 native tool calls freeze only once a complete, parseable block has
+            // arrived. Checking the opener and closer independently could freeze on a stray
+            // closer in prose followed by a later, incomplete opener that never parses.
+            // Gated on the active dialect so a Qwen/Llama argument carrying a literal Gemma
+            // block cannot freeze generation before its own outer call closes.
+            return !Self.parseGemmaBlocks(in: accumulatedText).isEmpty
+
         case .qwenXML:
             // Check if </tool_call> has been closed
             if accumulatedText.contains(Self.qwenToolCallClose) || deltaText.contains(Self.qwenToolCallClose) {
@@ -772,11 +785,13 @@ public final class StreamingToolParser {
         from text: String,
         format: ToolCallFormat = .qwenXML
     ) -> (calls: [ParsedToolCall], brokenFragments: [String]) {
-        // Gemma 4 native blocks are parsed FIRST: a Gemma string argument can contain
-        // text that resembles another protocol, which the dialect normalization and the
-        // earlier parsers below would otherwise claim. Parsing the outer Gemma block first
-        // keeps argument data from being reinterpreted as a different tool protocol.
-        if text.contains(Self.gemmaToolCallOpen) {
+        // Gemma 4 native blocks are parsed FIRST when the active model uses that dialect:
+        // a Gemma string argument can contain text that resembles another protocol, which
+        // the dialect normalization and the earlier parsers below would otherwise claim.
+        // Parsing the outer Gemma block first keeps argument data from being reinterpreted
+        // as a different tool protocol. Gated on the active dialect so a Qwen/Llama
+        // argument that merely contains a literal Gemma block is not claimed here.
+        if format == .gemma, text.contains(Self.gemmaToolCallOpen) {
             let gemmaFirst = Self.parseGemmaBlocks(in: text)
             if !gemmaFirst.isEmpty {
                 return (calls: gemmaFirst, brokenFragments: [])
@@ -919,9 +934,10 @@ public final class StreamingToolParser {
             }
         }
 
-        // 5. Gemma 4 native format (already tried first on the raw text; retry on the
-        //    normalized text in case normalization revealed a complete block).
-        if text.contains(Self.gemmaToolCallOpen) {
+        // 5. Gemma 4 native format (already tried first on the raw text when the active
+        //    dialect is Gemma; retry on the normalized text in case normalization revealed
+        //    a complete block). Gated on the active dialect for the same reason as above.
+        if format == .gemma, text.contains(Self.gemmaToolCallOpen) {
             let gemmaCalls = Self.parseGemmaBlocks(in: text)
             if !gemmaCalls.isEmpty {
                 return (calls: gemmaCalls, brokenFragments: [])

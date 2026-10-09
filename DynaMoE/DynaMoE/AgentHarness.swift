@@ -3831,7 +3831,7 @@ public final class AgentHarness {
     /// matches without a surrounding `<tool_call>`). Missing any of these would leave raw
     /// markup behind, making the caller think the model wrote an answer.
     public func responseTextWithoutToolCalls(_ text: String) -> String {
-        let pattern = #"<tool_call>[\s\S]*?</tool_call>|<|python_tag|>[\s\S]*?(?:</|python_tag|>|$)|<function=[^>]*>[\s\S]*?(?:</function>|$)|<|tool_call>[\s\S]*$"#
+        let pattern = #"<tool_call>[\s\S]*?</tool_call>|<\|python_tag\|>[\s\S]*?(?:</\|python_tag\|>|$)|<function=[^>]*>[\s\S]*?(?:</function>|$)|<\|tool_call>[\s\S]*$"#
         guard let re = try? NSRegularExpression(pattern: pattern, options: []) else { return text }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         return re.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: " ")

@@ -15063,7 +15063,7 @@ if layer.attnGateProjTensor != nil,
                     }
 
                     // Pre-Execution Catching: Freeze decoding immediately when </tool_call> closes
-                    if runAgentTools && StreamingToolParser.shared.shouldFreezeGeneration(accumulatedText: accumulatedDecodedText, deltaText: deltaText) {
+                    if runAgentTools && StreamingToolParser.shared.shouldFreezeGeneration(accumulatedText: accumulatedDecodedText, deltaText: deltaText, format: ToolCallFormat.forModel(isGemma4: modelConfig?.isGemma4Model == true)) {
                         shouldBreak = true
                         breakReason = "tool-parser-freeze"
                         break
@@ -15298,7 +15298,7 @@ if layer.attnGateProjTensor != nil,
             }
 
             // Agent Harness Multi-Step Tool Check
-            let parsedResult = runAgentTools ? StreamingToolParser.shared.parseStreamingToolCalls(from: finalDecoded) : (calls: [], brokenFragments: [])
+            let parsedResult = runAgentTools ? StreamingToolParser.shared.parseStreamingToolCalls(from: finalDecoded, format: ToolCallFormat.forModel(isGemma4: modelConfig?.isGemma4Model == true)) : (calls: [], brokenFragments: [])
             // No-op "gesture" calls (shell_run echo/true/:) are the model's way of
             // signalling it is finished. Executing them restarts the loop and
             // produces a duplicate answer bubble, so treat them as turn end.

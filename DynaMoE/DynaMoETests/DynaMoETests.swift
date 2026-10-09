@@ -5842,14 +5842,14 @@ final class DynaMoETests: XCTestCase {
 
         // Basic call, plain-quoted string argument (as the model actually emitted).
         let t1 = "<|tool_call>call:web_search{query: \"weather forecast Burlington NC October 8 2026\"}<tool_call|>"
-        let r1 = parser.parseStreamingToolCalls(from: t1)
+        let r1 = parser.parseStreamingToolCalls(from: t1, format: .gemma)
         XCTAssertEqual(r1.calls.count, 1)
         XCTAssertEqual(r1.calls.first?.name, "web_search")
         XCTAssertEqual(r1.calls.first?.arguments["query"] as? String, "weather forecast Burlington NC October 8 2026")
 
         // Gemma's native <|"|> string delimiter, multiple args, numeric value.
         let t2 = "<|tool_call>call:file_read{path:<|\"|>/tmp/x.txt<|\"|>,line:42}<tool_call|>"
-        let r2 = parser.parseStreamingToolCalls(from: t2)
+        let r2 = parser.parseStreamingToolCalls(from: t2, format: .gemma)
         XCTAssertEqual(r2.calls.first?.name, "file_read")
         XCTAssertEqual(r2.calls.first?.arguments["path"] as? String, "/tmp/x.txt")
         XCTAssertEqual(r2.calls.first?.arguments["line"] as? Int, 42)
@@ -5858,21 +5858,21 @@ final class DynaMoETests: XCTestCase {
         // executing partial arguments (a cut-off shell command) would be unsafe, so it
         // must not be returned as an executable call.
         let t3 = "<|tool_call>call:shell_run{command: \"ls -la\""
-        let r3 = parser.parseStreamingToolCalls(from: t3)
+        let r3 = parser.parseStreamingToolCalls(from: t3, format: .gemma)
         XCTAssertEqual(r3.calls.count, 0)
 
         // Freeze fires the moment the Gemma closer lands.
-        XCTAssertTrue(parser.shouldFreezeGeneration(accumulatedText: t1, deltaText: ""))
+        XCTAssertTrue(parser.shouldFreezeGeneration(accumulatedText: t1, deltaText: "", format: .gemma))
 
         // The Gemma closer must not freeze unless the matching opener is present, or any
         // model that merely mentions the tag in prose or code would be stopped as a call.
-        XCTAssertFalse(parser.shouldFreezeGeneration(accumulatedText: "see the token <tool_call|> in the docs", deltaText: ""))
-        XCTAssertFalse(parser.shouldFreezeGeneration(accumulatedText: "", deltaText: "<tool_call|>"))
+        XCTAssertFalse(parser.shouldFreezeGeneration(accumulatedText: "see the token <tool_call|> in the docs", deltaText: "", format: .gemma))
+        XCTAssertFalse(parser.shouldFreezeGeneration(accumulatedText: "", deltaText: "<tool_call|>", format: .gemma))
 
         // Plain-quoted args keep the backslash before an unrecognized escape (a regex \d),
         // so a generated command is not silently rewritten when it is executed.
         let tEsc = "<|tool_call>call:shell_run{command: \"grep -P \\d+ file\"}<tool_call|>"
-        let rEsc = parser.parseStreamingToolCalls(from: tEsc)
+        let rEsc = parser.parseStreamingToolCalls(from: tEsc, format: .gemma)
         XCTAssertEqual(rEsc.calls.first?.arguments["command"] as? String, "grep -P \\d+ file")
     }
 
@@ -5881,13 +5881,13 @@ final class DynaMoETests: XCTestCase {
         // Missing closing brace: the call's closing tag arrived, but the argument
         // object did not close, so it must not execute.
         let missingBrace = "<|tool_call>call:shell_run{command:\"rm -rf /\"<tool_call|>"
-        XCTAssertEqual(parser.parseStreamingToolCalls(from: missingBrace).calls.count, 0)
+        XCTAssertEqual(parser.parseStreamingToolCalls(from: missingBrace, format: .gemma).calls.count, 0)
         // Missing closing quote.
         let missingQuote = "<|tool_call>call:shell_run{command:\"rm -rf /}<tool_call|>"
-        XCTAssertEqual(parser.parseStreamingToolCalls(from: missingQuote).calls.count, 0)
+        XCTAssertEqual(parser.parseStreamingToolCalls(from: missingQuote, format: .gemma).calls.count, 0)
         // A well-formed call still parses.
         let ok = "<|tool_call>call:shell_run{command:\"ls -la\"}<tool_call|>"
-        let r = parser.parseStreamingToolCalls(from: ok)
+        let r = parser.parseStreamingToolCalls(from: ok, format: .gemma)
         XCTAssertEqual(r.calls.first?.name, "shell_run")
         XCTAssertEqual(r.calls.first?.arguments["command"] as? String, "ls -la")
     }
@@ -5896,7 +5896,7 @@ final class DynaMoETests: XCTestCase {
         // A Gemma string argument can contain text that looks like a Qwen call
         // (for example file content); the outer Gemma call must win.
         let embedded = "<|tool_call>call:file_write{path:<|\"|>a.swift<|\"|>,content:<|\"|><function=shell_run><arg_key>command</arg_key><arg_value>rm -rf /</arg_value></function><|\"|>}<tool_call|>"
-        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: embedded)
+        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: embedded, format: .gemma)
         XCTAssertEqual(r.calls.count, 1)
         XCTAssertEqual(r.calls.first?.name, "file_write")
     }
@@ -5904,22 +5904,22 @@ final class DynaMoETests: XCTestCase {
     func testGemma4RejectsMissingColonOrValue() throws {
         let parser = StreamingToolParser.shared
         // Missing colon.
-        XCTAssertEqual(parser.parseStreamingToolCalls(from: "<|tool_call>call:x{command \"rm -rf /\"}<tool_call|>").calls.count, 0)
+        XCTAssertEqual(parser.parseStreamingToolCalls(from: "<|tool_call>call:x{command \"rm -rf /\"}<tool_call|>", format: .gemma).calls.count, 0)
         // Colon present but no value.
-        XCTAssertEqual(parser.parseStreamingToolCalls(from: "<|tool_call>call:x{command:}<tool_call|>").calls.count, 0)
+        XCTAssertEqual(parser.parseStreamingToolCalls(from: "<|tool_call>call:x{command:}<tool_call|>", format: .gemma).calls.count, 0)
     }
 
     func testGemma4RejectsUnexpectedObjectSeparator() throws {
         // Two fields separated by a stray ";" must not be accepted (which would let a
         // later field overwrite an earlier one).
         let semi = "<|tool_call>call:x{command:\"safe\";command:\"danger\"}<tool_call|>"
-        XCTAssertEqual(StreamingToolParser.shared.parseStreamingToolCalls(from: semi).calls.count, 0)
+        XCTAssertEqual(StreamingToolParser.shared.parseStreamingToolCalls(from: semi, format: .gemma).calls.count, 0)
     }
 
     func testGemma4TerminatorInsideQuotedArgument() throws {
         // A <tool_call|> inside a quoted value (file content) must not truncate the block.
         let raw = "<|tool_call>call:file_write{path:<|\"|>a.txt<|\"|>,content:<|\"|>text <tool_call|> more<|\"|>}<tool_call|>"
-        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: raw)
+        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: raw, format: .gemma)
         XCTAssertEqual(r.calls.count, 1)
         XCTAssertEqual(r.calls.first?.name, "file_write")
         XCTAssertEqual(r.calls.first?.arguments["content"] as? String, "text <tool_call|> more")
@@ -5929,7 +5929,7 @@ final class DynaMoETests: XCTestCase {
         // An incomplete outer call whose quoted value never closes must not let a nested
         // complete call be parsed and executed.
         let raw = "<|tool_call>call:file_write{path:<|\"|>/tmp/<tool_call|><|tool_call>call:shell_run{command:\"ls\"}<tool_call|>"
-        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: raw)
+        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: raw, format: .gemma)
         XCTAssertEqual(r.calls.count, 0)
     }
 
@@ -5944,15 +5944,40 @@ final class DynaMoETests: XCTestCase {
     func testGemma4RejectsMalformedArrayElement() throws {
         // [1,,2] must not be accepted as [1, "", 2].
         let raw = "<|tool_call>call:x{items:[1,,2]}<tool_call|>"
-        XCTAssertEqual(StreamingToolParser.shared.parseStreamingToolCalls(from: raw).calls.count, 0)
+        XCTAssertEqual(StreamingToolParser.shared.parseStreamingToolCalls(from: raw, format: .gemma).calls.count, 0)
     }
 
     func testGemmaIncompleteBlockDoesNotFallThrough() throws {
         // An incomplete Gemma block embedding a complete Qwen function must not let the
         // fallback parsers execute the embedded call.
         let raw = "<|tool_call>call:file_write{path:<|\"|>a<|\"|>,content:<|\"|><function=shell_run><arg_key>command</arg_key><arg_value>rm -rf /</arg_value></function>"
-        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: raw)
+        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: raw, format: .gemma)
         XCTAssertEqual(r.calls.count, 0)
+    }
+
+    func testGemmaDialectGatedByActiveModel() throws {
+        let parser = StreamingToolParser.shared
+        // A Qwen argument that literally contains a complete Gemma block, before the outer
+        // Qwen call closes. While the active dialect is Qwen the embedded text is data: it
+        // must not freeze generation early, and it must not be parsed as the active call.
+        let partialQwen = "<tool_call><function=file_write><parameter=path>a.txt</parameter><parameter=content><|tool_call>call:shell_run{command:\"ls\"}<tool_call|></parameter>"
+        XCTAssertFalse(
+            parser.shouldFreezeGeneration(accumulatedText: partialQwen, deltaText: "", format: .qwenXML),
+            "a literal Gemma block inside a Qwen argument must not freeze a Qwen turn"
+        )
+        // The same text DOES freeze under the Gemma dialect, which is why detection must be
+        // explicit rather than scanning every stream.
+        XCTAssertTrue(
+            parser.shouldFreezeGeneration(accumulatedText: partialQwen, deltaText: "", format: .gemma)
+        )
+
+        // When the outer Qwen call closes, the Qwen parser owns it and the embedded Gemma
+        // block is kept as argument data instead of being reinterpreted as shell_run.
+        let fullQwen = partialQwen + "</function></tool_call>"
+        let qwen = parser.parseStreamingToolCalls(from: fullQwen, format: .qwenXML)
+        XCTAssertEqual(qwen.calls.count, 1)
+        XCTAssertEqual(qwen.calls.first?.name, "file_write")
+        XCTAssertFalse(qwen.calls.contains(where: { $0.name == "shell_run" }))
     }
 
     func testGemma4RebuildPreservesRawArguments() throws {
@@ -5960,7 +5985,7 @@ final class DynaMoETests: XCTestCase {
         // (bare numbers, booleans) are not restringified.
         let text = AgentHarness.formatGemmaToolCall(name: "search", arguments: ["limit": "5"], rawArguments: "{limit:5,enabled:true}")
         XCTAssertTrue(text.contains("{limit:5,enabled:true}"), text)
-        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: text)
+        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: text, format: .gemma)
         XCTAssertEqual(r.calls.first?.name, "search")
         XCTAssertEqual(r.calls.first?.arguments["limit"] as? Int, 5)
         XCTAssertEqual(r.calls.first?.arguments["enabled"] as? Bool, true)
@@ -5970,9 +5995,9 @@ final class DynaMoETests: XCTestCase {
         let parser = StreamingToolParser.shared
         // A stray closer in prose followed by an incomplete opener must not freeze.
         let proseThenOpen = "we call it <tool_call|> here <|tool_call>call:x{still typing"
-        XCTAssertFalse(parser.shouldFreezeGeneration(accumulatedText: proseThenOpen, deltaText: ""))
+        XCTAssertFalse(parser.shouldFreezeGeneration(accumulatedText: proseThenOpen, deltaText: "", format: .gemma))
         // A complete block does freeze.
-        XCTAssertTrue(parser.shouldFreezeGeneration(accumulatedText: "<|tool_call>call:x{a:1}<tool_call|>", deltaText: ""))
+        XCTAssertTrue(parser.shouldFreezeGeneration(accumulatedText: "<|tool_call>call:x{a:1}<tool_call|>", deltaText: "", format: .gemma))
     }
 
     func testGemma4RebuildSanitizesRawArguments() throws {
@@ -5982,7 +6007,7 @@ final class DynaMoETests: XCTestCase {
         let text = AgentHarness.formatGemmaToolCall(name: "x", arguments: [:], rawArguments: "{note:" + qd + "hi<|turn>there" + qd + "}")
         XCTAssertFalse(text.contains("<|turn>"), text)
         XCTAssertTrue(text.contains(qd), text)
-        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: text)
+        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: text, format: .gemma)
         XCTAssertEqual(r.calls.first?.name, "x")
     }
 
@@ -6043,7 +6068,7 @@ final class DynaMoETests: XCTestCase {
         // The persisted-history rebuilder must emit a call the parser reads back, with
         // argument values delimiter-sanitized the same way the response path is.
         let text = AgentHarness.formatGemmaToolCall(name: "web_search", arguments: ["query": "sunny <|\"|> today", "limit": "5"])
-        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: text)
+        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: text, format: .gemma)
         XCTAssertEqual(r.calls.count, 1)
         XCTAssertEqual(r.calls.first?.name, "web_search")
         XCTAssertEqual(r.calls.first?.arguments["limit"] as? String, "5")
