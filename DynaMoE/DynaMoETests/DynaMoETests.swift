@@ -5980,6 +5980,19 @@ final class DynaMoETests: XCTestCase {
         XCTAssertFalse(qwen.calls.contains(where: { $0.name == "shell_run" }))
     }
 
+    func testGemmaDisplayCleanupGatedByDialect() throws {
+        // A non-Gemma answer that merely documents the Gemma opener must keep its text:
+        // truncating globally stripped everything from the token onward.
+        let docAnswer = "Gemma emits <|tool_call>call:name{...}<tool_call|> for a call."
+        let nonGemma = ChatMessageView.cleanedMarkdown(docAnswer, isGemmaDialect: false)
+        XCTAssertTrue(nonGemma.contains("for a call."), nonGemma)
+
+        // Under the Gemma dialect nothing after the opener is shown, since a real call
+        // permits no suffix.
+        let gemma = ChatMessageView.cleanedMarkdown(docAnswer, isGemmaDialect: true)
+        XCTAssertEqual(gemma, "Gemma emits")
+    }
+
     func testGemma4RebuildPreservesRawArguments() throws {
         // Persisted-history replay keeps the model's own argument text so native types
         // (bare numbers, booleans) are not restringified.

@@ -2127,6 +2127,7 @@ struct ContentView: View {
                     jetSpecMeanTau: jetSpecMeanTau,
                     jetSpecDraftAccepted: jetSpecTotalDraftAccepted,
                     modelName: activeModelDisplayName,
+                    isGemmaDialect: modelConfig?.isGemma4Model == true,
                     tokenizer: tokenizer,
                     activeProfile: activeProfile,
                     onSelectProfile: { profile in
