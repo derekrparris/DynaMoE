@@ -5674,6 +5674,28 @@ final class DynaMoETests: XCTestCase {
         }
     }
 
+    func testShardSegmentationRejectsTensorOutsideSegments() throws {
+        // A corrupt manifest can place tensor offsets beyond the shard; segmentation
+        // must reject it rather than fall back to the last segment (which underflows or
+        // addresses bytes outside the mapped buffer).
+        let maxBufferLength: UInt64 = 2 << 30
+        let shardLength: UInt64 = 3 << 30
+        let shards = [ShardMetadata(index: 0, filename: "big.safetensors", baseAddress: 0x1_0000_0000, length: shardLength)]
+        let tensors = [TensorMetadata(
+            name: "model.tie.weight",
+            shapeDisplay: "[]", dtype: "BF16", sizeMb: 1,
+            shardIndex: 0, offsetStart: shardLength - 1024, offsetEnd: shardLength + 1024,
+            category: "Other", layerIndex: 0, expertId: nil
+        )]
+        let summary = ModelSummary(sizeGb: 3, tensorCount: 1, layerCount: 1, maxExpertId: 0, shards: shards, tensors: tensors, layers: [])
+
+        XCTAssertThrowsError(try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: maxBufferLength)) { error in
+            guard case MetalSegmentationError.tensorOutsideSegments = error else {
+                return XCTFail("Expected tensorOutsideSegments, got \(error)")
+            }
+        }
+    }
+
     func testGemma4LayerTensorResolution() throws {
         let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--google--gemma-4-26B-A4B-it/snapshots/4d7ae4984b7db7de8f8457170b3f1a419ee76d52"
         guard FileManager.default.fileExists(atPath: snapshotDir) else {

@@ -14,6 +14,7 @@ import Accelerate
 /// hard failure rather than a summary whose tensors silently map to nothing.
 public enum MetalSegmentationError: Error, LocalizedError {
     case tensorExceedsBufferLimit(name: String, alignedSpanBytes: UInt64, maxBufferLength: UInt64)
+    case tensorOutsideSegments(name: String, offsetStart: UInt64, offsetEnd: UInt64)
 
     public var errorDescription: String? {
         switch self {
@@ -21,6 +22,8 @@ public enum MetalSegmentationError: Error, LocalizedError {
             let spanGB = Double(alignedSpanBytes) / 1_073_741_824.0
             let capGB = Double(maxBufferLength) / 1_073_741_824.0
             return "Tensor \(name) needs a \(String(format: "%.2f", spanGB)) GB page-aligned buffer, above the \(String(format: "%.2f", capGB)) GB Metal buffer limit; it cannot be split across buffers."
+        case let .tensorOutsideSegments(name, offsetStart, offsetEnd):
+            return "Tensor \(name) spans bytes \(offsetStart)..<\(offsetEnd), which no segmented buffer of its shard covers; the manifest is malformed or corrupt."
         }
     }
 }
@@ -1077,7 +1080,10 @@ public final class InferenceEngine {
         newTensors.reserveCapacity(summary.tensors.count)
         for t in summary.tensors {
             guard let segs = remap[t.shardIndex], !segs.isEmpty else { newTensors.append(t); continue }
-            let seg = segs.first(where: { t.offsetStart >= $0.start && t.offsetEnd <= $0.start + $0.len }) ?? segs[segs.count - 1]
+            guard let seg = segs.first(where: { t.offsetStart >= $0.start && t.offsetEnd <= $0.start + $0.len }) else {
+                throw MetalSegmentationError.tensorOutsideSegments(
+                    name: t.name, offsetStart: t.offsetStart, offsetEnd: t.offsetEnd)
+            }
             newTensors.append(TensorMetadata(
                 name: t.name,
                 shapeDisplay: t.shapeDisplay,
