@@ -1160,9 +1160,6 @@ extension EngineCachedLayer {
                 list.append(t)
             }
         }
-        for t in expertFusedGateUpWeights.values {
-            list.append(t)
-        }
         return list
     }
 }

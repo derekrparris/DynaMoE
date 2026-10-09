@@ -3578,7 +3578,7 @@ public final class AgentHarness {
                 turn += "[SYSTEM NOTICE: Verified official vendor domain response. Synthesize directly without re-searching.]\n"
             }
             if let registration = Self.toolRegistrationNotice(for: r) {
-                turn += registration + "\n"
+                turn += Self.sanitizeGemmaToolResponseText(registration) + "\n"
             }
             let rawName: String = {
                 // Persisted-history replay passes already-rendered text, not the
