@@ -1106,14 +1106,17 @@ struct ChatMessageView: View {
 
     private var displayMarkdownContent: String {
         var clean = message.content
+        // Gemma permits no suffix after a tool call, and the call may contain a quoted
+        // terminator; truncate at its opener before regex stripping so the remainder of
+        // the call is never shown as an answer.
+        if let gemmaStart = clean.range(of: "<|tool_call>") {
+            clean = String(clean[..<gemmaStart.lowerBound])
+        }
+        clean = clean
             .replacingOccurrences(of: "<tool_call>[\\s\\S]*?</tool_call>", with: "", options: .regularExpression)
-            .replacingOccurrences(of: "<\\|tool_call>[\\s\\S]*?<tool_call\\|>", with: "", options: .regularExpression)
             .replacingOccurrences(of: "<tool_response>[\\s\\S]*?</tool_response>", with: "", options: .regularExpression)
         if let toolCallRange = clean.range(of: "<tool_call>") {
             clean = String(clean[..<toolCallRange.lowerBound])
-        }
-        if let gemmaCallRange = clean.range(of: "<|tool_call>") {
-            clean = String(clean[..<gemmaCallRange.lowerBound])
         }
         return clean.trimmingCharacters(in: .whitespacesAndNewlines)
     }

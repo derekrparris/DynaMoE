@@ -982,7 +982,9 @@ public final class StreamingToolParser {
                 calls.append(call)
                 remaining = candidate.dropFirst(consumed)
             } else {
-                remaining = candidate.dropFirst(gemmaToolCallOpen.count)
+                // A malformed opener stops the scan: advancing past it would let a nested
+                // opener inside the incomplete block be parsed as a top-level call.
+                break
             }
         }
         return calls
@@ -1177,7 +1179,9 @@ private struct GemmaArgumentParser {
             skipWhitespace()
             if idx >= chars.count { break }
             if chars[idx] == "]" { idx += 1; closed = true; break }
-            if let value = parseValue() { arr.append(value) }
+            let valueStart = idx
+            guard let value = parseValue(), idx > valueStart else { complete = false; break }
+            arr.append(value)
             skipWhitespace()
             if peek() == "," { idx += 1; continue }
             if peek() == "]" { idx += 1; closed = true; break }

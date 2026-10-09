@@ -5925,6 +5925,28 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(r.calls.first?.arguments["content"] as? String, "text <tool_call|> more")
     }
 
+    func testGemmaNestedCallInsideMalformedOpenerNotExecuted() throws {
+        // An incomplete outer call whose quoted value never closes must not let a nested
+        // complete call be parsed and executed.
+        let raw = "<|tool_call>call:file_write{path:<|\"|>/tmp/<tool_call|><|tool_call>call:shell_run{command:\"ls\"}<tool_call|>"
+        let r = StreamingToolParser.shared.parseStreamingToolCalls(from: raw)
+        XCTAssertEqual(r.calls.count, 0)
+    }
+
+    func testResponseTextWithoutToolCallsStripsWholeGemmaCall() throws {
+        let raw = "Here you go. <|tool_call>call:file_write{content:<|\"|>text <tool_call|> more<|\"|>}<tool_call|> trailing"
+        let stripped = AgentHarness.shared.responseTextWithoutToolCalls(raw)
+        XCTAssertTrue(stripped.contains("Here you go."), stripped)
+        XCTAssertFalse(stripped.contains("<|tool_call>"), stripped)
+        XCTAssertFalse(stripped.contains("<tool_call|>"), stripped)
+    }
+
+    func testGemma4RejectsMalformedArrayElement() throws {
+        // [1,,2] must not be accepted as [1, "", 2].
+        let raw = "<|tool_call>call:x{items:[1,,2]}<tool_call|>"
+        XCTAssertEqual(StreamingToolParser.shared.parseStreamingToolCalls(from: raw).calls.count, 0)
+    }
+
     func testGemmaIncompleteBlockDoesNotFallThrough() throws {
         // An incomplete Gemma block embedding a complete Qwen function must not let the
         // fallback parsers execute the embedded call.
