@@ -663,8 +663,17 @@ public struct ModelConfig: Codable {
         // partial_rotary_factor * global_head_dim dims (0.25 * 512 = 128).
         if isGemma4Model {
             if lt?.contains("sliding") ?? false { return hd }
-            let f = textConfig?.ropeParameters?.partialRotaryFactor ?? partialRotaryFactor ?? 0.25
-            return max(32, Int(Float(hd) * f))
+            // Global layers use proportional RoPE. Honor the per-layer full-attention
+            // factor first, then every config-level factor, before the 0.25 default, so a
+            // config whose global factor differs is not run at the wrong rotary dimension.
+            var gemmaFactor: Float? = nil
+            if let params = ropeParametersByLayerType {
+                gemmaFactor = params.fullAttention?.partialRotaryFactor
+            }
+            if gemmaFactor == nil {
+                gemmaFactor = textConfig?.partialRotaryFactor ?? partialRotaryFactor ?? textConfig?.ropeParameters?.partialRotaryFactor ?? ropeParameters?.partialRotaryFactor
+            }
+            return max(32, Int(Float(hd) * (gemmaFactor ?? 0.25)))
         }
         var factor: Float? = nil
         if let params = ropeParametersByLayerType {

@@ -5606,6 +5606,28 @@ final class DynaMoETests: XCTestCase {
         print("✅ [TEST] Gemma 4 config parsing verified.")
     }
 
+    func testGemma4RotaryDimHonorsConfigFactor() throws {
+        // A Gemma config whose global partial_rotary_factor differs from the 0.25 default
+        // must drive the proportional RoPE dimension instead of the hard-coded fallback.
+        let json = """
+        {
+          "architectures": ["Gemma4ForConditionalGeneration"],
+          "model_type": "gemma4",
+          "text_config": {
+            "model_type": "gemma4_text",
+            "head_dim": 256,
+            "global_head_dim": 512,
+            "partial_rotary_factor": 0.5,
+            "layer_types": ["full_attention"]
+          }
+        }
+        """.data(using: .utf8)!
+        let config = try JSONDecoder().decode(ModelConfig.self, from: json)
+        XCTAssertTrue(config.isGemma4Model)
+        XCTAssertEqual(config.effectiveRotaryDim(layerIndex: 0, headDim: 512), 256,
+                       "Global layers must honor the configured partial rotary factor, not 0.25")
+    }
+
     func testShardSegmentationForMetal() throws {
         // A shard larger than the device's maxBufferLength (e.g. Gemma 4's 46 GB shard on
         // an 8.88 GB-limit GPU) must be split into page-aligned segments, with every
@@ -5696,6 +5718,26 @@ final class DynaMoETests: XCTestCase {
         }
     }
 
+    func testShardSegmentationRejectsInvertedRange() throws {
+        // A malformed manifest with offsetEnd < offsetStart must fail with the named load
+        // error, not trap on the unsigned alignment subtraction.
+        let maxBufferLength: UInt64 = 2 << 30
+        let shards = [ShardMetadata(index: 0, filename: "big.safetensors", baseAddress: 0x1_0000_0000, length: 3 << 30)]
+        let tensors = [TensorMetadata(
+            name: "bad.inverted",
+            shapeDisplay: "[]", dtype: "BF16", sizeMb: 1,
+            shardIndex: 0, offsetStart: 1 << 20, offsetEnd: (1 << 20) - 1,
+            category: "Other", layerIndex: 0, expertId: nil
+        )]
+        let summary = ModelSummary(sizeGb: 3, tensorCount: 1, layerCount: 1, maxExpertId: 0, shards: shards, tensors: tensors, layers: [])
+
+        XCTAssertThrowsError(try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: maxBufferLength)) { error in
+            guard case MetalSegmentationError.tensorOutsideSegments = error else {
+                return XCTFail("Expected tensorOutsideSegments, got \(error)")
+            }
+        }
+    }
+
     func testGemma4LayerTensorResolution() throws {
         let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--google--gemma-4-26B-A4B-it/snapshots/4d7ae4984b7db7de8f8457170b3f1a419ee76d52"
         guard FileManager.default.fileExists(atPath: snapshotDir) else {
@@ -5751,11 +5793,12 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(r2.calls.first?.arguments["path"] as? String, "/tmp/x.txt")
         XCTAssertEqual(r2.calls.first?.arguments["line"] as? Int, 42)
 
-        // Truncated call (generation froze mid-stream, no closing tag).
+        // A truncated call (no closing tag) only occurs on EOS or the token cap, where
+        // executing partial arguments (a cut-off shell command) would be unsafe, so it
+        // must not be returned as an executable call.
         let t3 = "<|tool_call>call:shell_run{command: \"ls -la\""
         let r3 = parser.parseStreamingToolCalls(from: t3)
-        XCTAssertEqual(r3.calls.first?.name, "shell_run")
-        XCTAssertEqual(r3.calls.first?.arguments["command"] as? String, "ls -la")
+        XCTAssertEqual(r3.calls.count, 0)
 
         // Freeze fires the moment the Gemma closer lands.
         XCTAssertTrue(parser.shouldFreezeGeneration(accumulatedText: t1, deltaText: ""))

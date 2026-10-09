@@ -312,7 +312,7 @@ public final class StreamingToolParser {
     /// Truncated blocks (no closing tag) are handled too, since generation may freeze mid-stream.
     public static func normalizeBareNameToolCalls(_ raw: String) -> String {
         guard raw.contains(qwenToolCallOpen) else { return raw }
-        let blockPattern = "<tool_call>([\\s\\S]*?)(</tool_call>|$)"
+            let blockPattern = "<\\|tool_call>([\\s\\S]*?)(<tool_call\\|>)"
         guard let blockRegex = try? NSRegularExpression(pattern: blockPattern, options: []),
               let nameRegex = try? NSRegularExpression(pattern: "^\\s*([A-Za-z_][A-Za-z0-9_.\\-]*)", options: []) else {
             return raw
@@ -931,15 +931,17 @@ public final class StreamingToolParser {
     /// Parses a Gemma 4 native tool call of the form
     /// `<|tool_call>call:name{key:value,...}<tool_call|>`. Argument values use Gemma's
     /// `<|"|>` string delimiter (also tolerates plain quotes), nested `{}`/`[]`, and bare
-    /// literals. The block may be truncated (no closing tag) when generation froze mid-stream.
+    /// literals. A call is only returned once its closing tag has arrived.
     static func parseGemmaToolCall(_ block: String) -> ParsedToolCall? {
         var body = block.trimmingCharacters(in: .whitespacesAndNewlines)
         if body.hasPrefix(gemmaToolCallOpen) {
             body = String(body.dropFirst(gemmaToolCallOpen.count))
         }
-        if let closeRange = body.range(of: gemmaToolCallClose) {
-            body = String(body[..<closeRange.lowerBound])
-        }
+        // A truncated call (no closing tag) only occurs on EOS or the token cap, where
+        // executing partial arguments (a cut-off shell command) is unsafe. Require the
+        // closer before returning a call.
+        guard let closeRange = body.range(of: gemmaToolCallClose) else { return nil }
+        body = String(body[..<closeRange.lowerBound])
         body = body.trimmingCharacters(in: .whitespacesAndNewlines)
         if body.hasPrefix("call:") {
             body = String(body.dropFirst("call:".count))

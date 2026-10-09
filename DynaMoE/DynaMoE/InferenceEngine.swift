@@ -1057,6 +1057,14 @@ public final class InferenceEngine {
                 // oversized segment, the loader silently skips that buffer, and the tensor
                 // is left unavailable while loading continues. Fail the load with a named
                 // error instead of returning a summary with unmappable tensors.
+                // Validate the range before unsigned alignment math: a malformed
+                // manifest with offsetEnd < offsetStart underflows the subtraction, and
+                // an end past the shard cannot be contained by any segment. Fail with a
+                // named load error so corrupt metadata is rejected cleanly.
+                guard t.offsetEnd >= t.offsetStart, t.offsetEnd <= total else {
+                    throw MetalSegmentationError.tensorOutsideSegments(
+                        name: t.name, offsetStart: t.offsetStart, offsetEnd: t.offsetEnd)
+                }
                 let singleSpan = alignUp(t.offsetEnd) - alignDown(t.offsetStart)
                 guard singleSpan <= maxBufferLength else {
                     throw MetalSegmentationError.tensorExceedsBufferLimit(
