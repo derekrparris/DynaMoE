@@ -1414,19 +1414,21 @@ struct ChatMessageView: View {
                                 .buttonStyle(.plain)
                                 .help("Copy full response")
 
-                                // Audio speak
-                                Button(action: {
-                                    NSSpeechSynthesizer().startSpeaking(message.content)
-                                }) {
-                                    Image(systemName: "speaker.wave.2")
-                                        .font(.system(size: max(8.5, 11 * zoomManager.zoomScale)))
-                                        .foregroundColor(.secondary)
-                                        .padding(4)
-                                        .background(Color.secondary.opacity(0.06))
-                                        .cornerRadius(4)
+                                // Audio speak (model replies only)
+                                if message.role == .assistant {
+                                    Button(action: {
+                                        NSSpeechSynthesizer().startSpeaking(displayContent)
+                                    }) {
+                                        Image(systemName: "speaker.wave.2")
+                                            .font(.system(size: max(8.5, 11 * zoomManager.zoomScale)))
+                                            .foregroundColor(.secondary)
+                                            .padding(4)
+                                            .background(Color.secondary.opacity(0.06))
+                                            .cornerRadius(4)
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Read response aloud")
                                 }
-                                .buttonStyle(.plain)
-                                .help("Read response aloud")
                             }
                         }
                         .padding(.top, 4)
