@@ -5993,6 +5993,42 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(gemma, "Gemma emits")
     }
 
+    func testToolCallOpenerDetectionForWorkingIndicator() throws {
+        // A mid-stream call (markup only, no visible text) must be recognized so the
+        // inline "Working..." pill appears and the raw markup is not rendered, for
+        // every dialect — including bare Qwen <function=...> and Llama <|python_tag|>.
+        XCTAssertTrue(ChatMessageView.isToolOnlyStreamingContent("<tool_call><function=shell_run", isGemmaDialect: false))
+        XCTAssertTrue(ChatMessageView.isToolOnlyStreamingContent("<function=file_write>", isGemmaDialect: false))
+        XCTAssertTrue(ChatMessageView.isToolOnlyStreamingContent("<|python_tag|>{\"name\"", isGemmaDialect: false))
+        XCTAssertTrue(ChatMessageView.isToolOnlyStreamingContent("<|tool_call>call:shell_run{", isGemmaDialect: true))
+
+        // Visible prose before the opener means it is not a tool-only stream.
+        XCTAssertFalse(ChatMessageView.isToolOnlyStreamingContent("Let me check. <function=shell_run>", isGemmaDialect: false))
+        XCTAssertFalse(ChatMessageView.isToolOnlyStreamingContent("Just a normal answer.", isGemmaDialect: false))
+        XCTAssertFalse(ChatMessageView.isToolOnlyStreamingContent("Here is a list:\n1. one\n2. two", isGemmaDialect: false))
+
+        // The Gemma marker is only an opener under the Gemma dialect, so a non-Gemma
+        // answer documenting <|tool_call> keeps its text and never enters the working state.
+        XCTAssertFalse(ChatMessageView.isToolOnlyStreamingContent("<|tool_call>call:shell_run{", isGemmaDialect: false))
+        XCTAssertTrue(ChatMessageView.cleanedMarkdown("Gemma emits <|tool_call>call:x", isGemmaDialect: false)
+            .contains("Gemma emits"))
+
+        // The render predicate is independent of parse state, so bare Qwen/Llama calls
+        // stay suppressed (and their copy/speaker actions hidden) after a ToolCallRecord
+        // has parsed — the parsed-state check lives only in the working-indicator path.
+        XCTAssertEqual(ChatMessageView.responseDisplayContent("<function=file_write>", isGemmaDialect: false), "")
+        XCTAssertEqual(ChatMessageView.responseDisplayContent("<|python_tag|>{\"name\"", isGemmaDialect: false), "")
+        XCTAssertEqual(ChatMessageView.responseDisplayContent("<tool_call><function=shell_run", isGemmaDialect: false), "")
+        XCTAssertEqual(ChatMessageView.responseDisplayContent("<|tool_call>call:shell_run{", isGemmaDialect: true), "")
+
+        // Text before the opener is real response content and must survive.
+        XCTAssertEqual(ChatMessageView.responseDisplayContent("Just an answer.", isGemmaDialect: false), "Just an answer.")
+        XCTAssertTrue(ChatMessageView.responseDisplayContent("Let me check. <function=shell_run>", isGemmaDialect: false)
+            .contains("Let me check."))
+        XCTAssertTrue(ChatMessageView.responseDisplayContent("Gemma emits <|tool_call>call:x", isGemmaDialect: false)
+            .contains("Gemma emits"))
+    }
+
     func testGemma4RebuildPreservesRawArguments() throws {
         // Persisted-history replay keeps the model's own argument text so native types
         // (bare numbers, booleans) are not restringified.
