@@ -6012,6 +6012,21 @@ final class DynaMoETests: XCTestCase {
         XCTAssertFalse(ChatMessageView.isToolOnlyStreamingContent("<|tool_call>call:shell_run{", isGemmaDialect: false))
         XCTAssertTrue(ChatMessageView.cleanedMarkdown("Gemma emits <|tool_call>call:x", isGemmaDialect: false)
             .contains("Gemma emits"))
+
+        // The render predicate is independent of parse state, so bare Qwen/Llama calls
+        // stay suppressed (and their copy/speaker actions hidden) after a ToolCallRecord
+        // has parsed — the parsed-state check lives only in the working-indicator path.
+        XCTAssertEqual(ChatMessageView.responseDisplayContent("<function=file_write>", isGemmaDialect: false), "")
+        XCTAssertEqual(ChatMessageView.responseDisplayContent("<|python_tag|>{\"name\"", isGemmaDialect: false), "")
+        XCTAssertEqual(ChatMessageView.responseDisplayContent("<tool_call><function=shell_run", isGemmaDialect: false), "")
+        XCTAssertEqual(ChatMessageView.responseDisplayContent("<|tool_call>call:shell_run{", isGemmaDialect: true), "")
+
+        // Text before the opener is real response content and must survive.
+        XCTAssertEqual(ChatMessageView.responseDisplayContent("Just an answer.", isGemmaDialect: false), "Just an answer.")
+        XCTAssertTrue(ChatMessageView.responseDisplayContent("Let me check. <function=shell_run>", isGemmaDialect: false)
+            .contains("Let me check."))
+        XCTAssertTrue(ChatMessageView.responseDisplayContent("Gemma emits <|tool_call>call:x", isGemmaDialect: false)
+            .contains("Gemma emits"))
     }
 
     func testGemma4RebuildPreservesRawArguments() throws {

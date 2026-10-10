@@ -1111,10 +1111,6 @@ struct ChatMessageView: View {
     @Binding var isExpanded: Bool
     @State private var isCopied = false
 
-    private var displayMarkdownContent: String {
-        Self.cleanedMarkdown(message.content, isGemmaDialect: isGemmaDialect)
-    }
-
     /// True when the footer has any telemetry to show. Kept separate from the
     /// display-content check so tool-only assistant turns (which clean down to
     /// empty text) still surface TTFT, throughput, and token counts while the
@@ -1162,6 +1158,16 @@ struct ChatMessageView: View {
         }
         let prefix = String(raw[..<range.lowerBound])
         return cleanedMarkdown(prefix, isGemmaDialect: isGemmaDialect).isEmpty
+    }
+
+    /// The response text to render for a turn. Empty when the raw text is only
+    /// tool-call markup, so bare `<function=...>` / `<|python_tag|>` calls never
+    /// reappear as raw response text (nor expose the copy/speaker actions) once a
+    /// `ToolCallRecord` has parsed — the parsed-state check lives only in the
+    /// working-indicator predicate, not here.
+    static func responseDisplayContent(_ raw: String, isGemmaDialect: Bool) -> String {
+        if isToolOnlyStreamingContent(raw, isGemmaDialect: isGemmaDialect) { return "" }
+        return cleanedMarkdown(raw, isGemmaDialect: isGemmaDialect)
     }
 
     /// True while the agent is actively working on a tool call, either streaming
@@ -1367,8 +1373,9 @@ struct ChatMessageView: View {
                     }
 
                     // Main Response Text rendered via Rich Markdown Engine.
-                    // Raw call markup is suppressed while a call is still streaming.
-                    let displayContent = isStreamingToolCall ? "" : displayMarkdownContent
+                    // Raw call markup is suppressed for tool-only turns, both while
+                    // streaming and after the call has parsed.
+                    let displayContent = Self.responseDisplayContent(message.content, isGemmaDialect: isGemmaDialect)
                     if !displayContent.isEmpty {
                         MarkdownMessageView(
                             content: displayContent,
