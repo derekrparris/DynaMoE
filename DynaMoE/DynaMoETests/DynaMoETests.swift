@@ -5993,6 +5993,19 @@ final class DynaMoETests: XCTestCase {
         XCTAssertEqual(gemma, "Gemma emits")
     }
 
+    func testToolCallOpenerDetectionForWorkingIndicator() throws {
+        // A mid-stream call (markup only, no visible text) must be recognized so the
+        // inline "Working..." pill appears while the arguments are still streaming.
+        XCTAssertTrue(ChatMessageView.containsToolCallOpener("<tool_call><function=shell_run"))
+        XCTAssertTrue(ChatMessageView.containsToolCallOpener("<function=file_write>"))
+        XCTAssertTrue(ChatMessageView.containsToolCallOpener("<|python_tag|>{\"name\""))
+        XCTAssertTrue(ChatMessageView.containsToolCallOpener("<|tool_call>call:shell_run{"))
+
+        // Ordinary prose with no call markup is not treated as a live call.
+        XCTAssertFalse(ChatMessageView.containsToolCallOpener("Just a normal answer."))
+        XCTAssertFalse(ChatMessageView.containsToolCallOpener("Here is a list:\n1. one\n2. two"))
+    }
+
     func testGemma4RebuildPreservesRawArguments() throws {
         // Persisted-history replay keeps the model's own argument text so native types
         // (bare numbers, booleans) are not restringified.

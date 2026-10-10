@@ -1115,6 +1115,45 @@ struct ChatMessageView: View {
         Self.cleanedMarkdown(message.content, isGemmaDialect: isGemmaDialect)
     }
 
+    /// True when the footer has any telemetry to show. Kept separate from the
+    /// display-content check so tool-only assistant turns (which clean down to
+    /// empty text) still surface TTFT, throughput, and token counts while the
+    /// agent runs their calls.
+    private var hasTelemetry: Bool {
+        message.timeToFirstTokenSeconds != nil
+            || message.tokensPerSec > 0
+            || message.tokenCount > 0
+            || (message.jetSpecTau ?? 0) > 1.0
+    }
+
+    /// True when the raw content holds a tool-call opener that has not yet parsed
+    /// into a concrete call, i.e. the model is mid-stream on the call's arguments.
+    private var isStreamingToolCall: Bool {
+        if let calls = message.toolCalls, !calls.isEmpty { return false }
+        guard displayMarkdownContent.isEmpty else { return false }
+        return Self.containsToolCallOpener(message.content)
+    }
+
+    /// True when raw assistant text carries any dialect's tool-call opener. Used to
+    /// distinguish a mid-stream call (markup only, nothing visible yet) from an
+    /// ordinary empty generation, so the inline "Working..." pill shows for the former.
+    static func containsToolCallOpener(_ raw: String) -> Bool {
+        raw.contains(StreamingToolParser.qwenToolCallOpen)
+            || raw.contains(StreamingToolParser.qwenFunctionOpen)
+            || raw.contains(StreamingToolParser.llamaTagOpen)
+            || raw.contains(StreamingToolParser.gemmaToolCallOpen)
+    }
+
+    /// True while the agent is actively working on a tool call, either streaming
+    /// the call's tokens or executing it. Drives the inline "Working..." indicator.
+    private var isAgentWorkingOnToolCall: Bool {
+        guard message.role == .assistant, isGenerating else { return false }
+        if let calls = message.toolCalls, calls.contains(where: { $0.status == .running }) {
+            return true
+        }
+        return isStreamingToolCall
+    }
+
     /// Strips tool-call markup from assistant text for display. The Gemma truncation is
     /// gated on the active dialect: Gemma permits no suffix after a tool call, but a
     /// non-Gemma answer that merely documents `<|tool_call>` must keep the rest of its text.
@@ -1299,6 +1338,14 @@ struct ChatMessageView: View {
                         }
                     }
 
+                    // Inline agent-work indicator: shown while the model streams a
+                    // tool call's arguments or the harness executes a running call,
+                    // so slow calls (e.g. writing a script) still read as active work.
+                    if isAgentWorkingOnToolCall {
+                        AgentWorkingIndicatorView()
+                            .padding(.top, 2)
+                    }
+
                     // Main Response Text rendered via Rich Markdown Engine
                     let displayContent = displayMarkdownContent
                     if !displayContent.isEmpty {
@@ -1307,7 +1354,7 @@ struct ChatMessageView: View {
                             isStreaming: (isGenerating || isCompactingConversation) && message.isThinking == false,
                             isStreamingOffDisk: isStreamingOffDisk
                         )
-                    } else if (isGenerating || isCompactingConversation) && !message.isThinking && !hasThinkingContent && (message.toolCalls == nil || message.toolCalls!.isEmpty) {
+                    } else if (isGenerating || isCompactingConversation) && !message.isThinking && !hasThinkingContent && (message.toolCalls == nil || message.toolCalls!.isEmpty) && !isStreamingToolCall {
                         // Only for non-thinking models during initial prefill / generation,
                         // or the /compact progress bubble before its first summary text
                         if let prefill = message.prefillStatus {
@@ -1334,7 +1381,7 @@ struct ChatMessageView: View {
                     }
 
                     // Action & Metrics Footer (Osaurus Style Telemetry & Actions)
-                    if (!message.isThinking || !isGenerating) && !displayContent.isEmpty {
+                    if (!message.isThinking || !isGenerating) && (hasTelemetry || !displayContent.isEmpty) {
                         HStack(spacing: 12) {
                             // Telemetry
                             HStack(spacing: 6) {
@@ -1386,48 +1433,50 @@ struct ChatMessageView: View {
 
                             Spacer()
 
-                            // Action Buttons
-                            HStack(spacing: 8) {
-                                // Copy button
-                                Button(action: {
-                                    NSPasteboard.general.clearContents()
-                                    NSPasteboard.general.setString(message.content, forType: .string)
-                                    isCopied = true
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                                        isCopied = false
-                                    }
-                                }) {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
-                                            .font(.system(size: max(8.5, 11 * zoomManager.zoomScale)))
-                                        if isCopied {
-                                            Text("Copied")
-                                                .font(.system(size: max(8.5, 11 * zoomManager.zoomScale)))
-                                        }
-                                    }
-                                    .foregroundColor(isCopied ? .green : .secondary)
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 3)
-                                    .background(Color.secondary.opacity(0.06))
-                                    .cornerRadius(4)
-                                }
-                                .buttonStyle(.plain)
-                                .help("Copy full response")
-
-                                // Audio speak (model replies only)
-                                if message.role == .assistant {
+                            // Action Buttons (only when there is visible text to act on)
+                            if !displayContent.isEmpty {
+                                HStack(spacing: 8) {
+                                    // Copy button
                                     Button(action: {
-                                        NSSpeechSynthesizer().startSpeaking(displayContent)
+                                        NSPasteboard.general.clearContents()
+                                        NSPasteboard.general.setString(message.content, forType: .string)
+                                        isCopied = true
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                            isCopied = false
+                                        }
                                     }) {
-                                        Image(systemName: "speaker.wave.2")
-                                            .font(.system(size: max(8.5, 11 * zoomManager.zoomScale)))
-                                            .foregroundColor(.secondary)
-                                            .padding(4)
-                                            .background(Color.secondary.opacity(0.06))
-                                            .cornerRadius(4)
+                                        HStack(spacing: 4) {
+                                            Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
+                                                .font(.system(size: max(8.5, 11 * zoomManager.zoomScale)))
+                                            if isCopied {
+                                                Text("Copied")
+                                                    .font(.system(size: max(8.5, 11 * zoomManager.zoomScale)))
+                                            }
+                                        }
+                                        .foregroundColor(isCopied ? .green : .secondary)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 3)
+                                        .background(Color.secondary.opacity(0.06))
+                                        .cornerRadius(4)
                                     }
                                     .buttonStyle(.plain)
-                                    .help("Read response aloud")
+                                    .help("Copy full response")
+
+                                    // Audio speak (model replies only)
+                                    if message.role == .assistant {
+                                        Button(action: {
+                                            NSSpeechSynthesizer().startSpeaking(displayContent)
+                                        }) {
+                                            Image(systemName: "speaker.wave.2")
+                                                .font(.system(size: max(8.5, 11 * zoomManager.zoomScale)))
+                                                .foregroundColor(.secondary)
+                                                .padding(4)
+                                                .background(Color.secondary.opacity(0.06))
+                                                .cornerRadius(4)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .help("Read response aloud")
+                                    }
                                 }
                             }
                         }
@@ -2069,6 +2118,47 @@ struct StreamingPaceIndicatorView: View {
             }
         }
         .help(isOffDisk ? "Streaming MoE experts off NVMe SSD (Paging)" : "Fast Streaming in Unified RAM (Dense / Resident)")
+    }
+}
+
+// MARK: - Agent Working Indicator (Inline Tool-Call Activity)
+
+/// A pulsing "Working..." pill shown inline in the chat while the agent streams
+/// or executes a tool call, so long-running calls read as active work rather than
+/// a stalled conversation.
+struct AgentWorkingIndicatorView: View {
+    var label: String = "Working..."
+    @ObservedObject private var zoomManager = AppZoomManager.shared
+    @State private var isFading: Bool = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "gearshape.2.fill")
+                .font(.system(size: max(9, 11 * zoomManager.zoomScale), weight: .semibold))
+                .foregroundStyle(
+                    LinearGradient(colors: [.purple, .indigo, .cyan], startPoint: .topLeading, endPoint: .bottomTrailing)
+                )
+                .opacity(isFading ? 1.0 : 0.3)
+                .scaleEffect(isFading ? 1.08 : 0.92)
+
+            Text(label)
+                .font(.system(size: max(9.5, 12 * zoomManager.zoomScale), weight: .medium))
+                .foregroundColor(.secondary)
+                .opacity(isFading ? 1.0 : 0.5)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.purple.opacity(isFading ? 0.12 : 0.03))
+        .cornerRadius(6)
+        .onAppear {
+            withAnimation(
+                Animation.easeInOut(duration: 0.85)
+                    .repeatForever(autoreverses: true)
+            ) {
+                isFading = true
+            }
+        }
+        .help("The agent is working on a tool call")
     }
 }
 
