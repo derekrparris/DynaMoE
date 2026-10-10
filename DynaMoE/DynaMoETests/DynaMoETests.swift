@@ -5995,15 +5995,23 @@ final class DynaMoETests: XCTestCase {
 
     func testToolCallOpenerDetectionForWorkingIndicator() throws {
         // A mid-stream call (markup only, no visible text) must be recognized so the
-        // inline "Working..." pill appears while the arguments are still streaming.
-        XCTAssertTrue(ChatMessageView.containsToolCallOpener("<tool_call><function=shell_run"))
-        XCTAssertTrue(ChatMessageView.containsToolCallOpener("<function=file_write>"))
-        XCTAssertTrue(ChatMessageView.containsToolCallOpener("<|python_tag|>{\"name\""))
-        XCTAssertTrue(ChatMessageView.containsToolCallOpener("<|tool_call>call:shell_run{"))
+        // inline "Working..." pill appears and the raw markup is not rendered, for
+        // every dialect — including bare Qwen <function=...> and Llama <|python_tag|>.
+        XCTAssertTrue(ChatMessageView.isToolOnlyStreamingContent("<tool_call><function=shell_run", isGemmaDialect: false))
+        XCTAssertTrue(ChatMessageView.isToolOnlyStreamingContent("<function=file_write>", isGemmaDialect: false))
+        XCTAssertTrue(ChatMessageView.isToolOnlyStreamingContent("<|python_tag|>{\"name\"", isGemmaDialect: false))
+        XCTAssertTrue(ChatMessageView.isToolOnlyStreamingContent("<|tool_call>call:shell_run{", isGemmaDialect: true))
 
-        // Ordinary prose with no call markup is not treated as a live call.
-        XCTAssertFalse(ChatMessageView.containsToolCallOpener("Just a normal answer."))
-        XCTAssertFalse(ChatMessageView.containsToolCallOpener("Here is a list:\n1. one\n2. two"))
+        // Visible prose before the opener means it is not a tool-only stream.
+        XCTAssertFalse(ChatMessageView.isToolOnlyStreamingContent("Let me check. <function=shell_run>", isGemmaDialect: false))
+        XCTAssertFalse(ChatMessageView.isToolOnlyStreamingContent("Just a normal answer.", isGemmaDialect: false))
+        XCTAssertFalse(ChatMessageView.isToolOnlyStreamingContent("Here is a list:\n1. one\n2. two", isGemmaDialect: false))
+
+        // The Gemma marker is only an opener under the Gemma dialect, so a non-Gemma
+        // answer documenting <|tool_call> keeps its text and never enters the working state.
+        XCTAssertFalse(ChatMessageView.isToolOnlyStreamingContent("<|tool_call>call:shell_run{", isGemmaDialect: false))
+        XCTAssertTrue(ChatMessageView.cleanedMarkdown("Gemma emits <|tool_call>call:x", isGemmaDialect: false)
+            .contains("Gemma emits"))
     }
 
     func testGemma4RebuildPreservesRawArguments() throws {

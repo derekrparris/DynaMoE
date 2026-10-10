@@ -1130,18 +1130,38 @@ struct ChatMessageView: View {
     /// into a concrete call, i.e. the model is mid-stream on the call's arguments.
     private var isStreamingToolCall: Bool {
         if let calls = message.toolCalls, !calls.isEmpty { return false }
-        guard displayMarkdownContent.isEmpty else { return false }
-        return Self.containsToolCallOpener(message.content)
+        return Self.isToolOnlyStreamingContent(message.content, isGemmaDialect: isGemmaDialect)
     }
 
-    /// True when raw assistant text carries any dialect's tool-call opener. Used to
-    /// distinguish a mid-stream call (markup only, nothing visible yet) from an
-    /// ordinary empty generation, so the inline "Working..." pill shows for the former.
-    static func containsToolCallOpener(_ raw: String) -> Bool {
-        raw.contains(StreamingToolParser.qwenToolCallOpen)
-            || raw.contains(StreamingToolParser.qwenFunctionOpen)
-            || raw.contains(StreamingToolParser.llamaTagOpen)
-            || raw.contains(StreamingToolParser.gemmaToolCallOpen)
+    /// The range of the earliest tool-call opener of the active dialect, or nil when
+    /// the text carries none. The Gemma marker is only an opener under the Gemma
+    /// dialect, so a non-Gemma answer that documents `<|tool_call>` keeps its text.
+    static func firstToolCallOpenerRange(in raw: String, isGemmaDialect: Bool) -> Range<String.Index>? {
+        var openers = [
+            StreamingToolParser.qwenToolCallOpen,
+            StreamingToolParser.qwenFunctionOpen,
+            StreamingToolParser.llamaTagOpen,
+        ]
+        if isGemmaDialect { openers.append(StreamingToolParser.gemmaToolCallOpen) }
+        var earliest: Range<String.Index>? = nil
+        for opener in openers {
+            guard let r = raw.range(of: opener) else { continue }
+            if earliest == nil || r.lowerBound < earliest!.lowerBound { earliest = r }
+        }
+        return earliest
+    }
+
+    /// True when `raw` holds a tool-call opener with no visible text before it, i.e.
+    /// the model is mid-stream on a call and has produced nothing readable yet. This
+    /// is what suppresses raw call markup (bare `<function=...>` / `<|python_tag|>`)
+    /// from rendering and drives the inline "Working..." pill. Documented markers in
+    /// prose keep their preceding text, so they never qualify.
+    static func isToolOnlyStreamingContent(_ raw: String, isGemmaDialect: Bool) -> Bool {
+        guard let range = firstToolCallOpenerRange(in: raw, isGemmaDialect: isGemmaDialect) else {
+            return false
+        }
+        let prefix = String(raw[..<range.lowerBound])
+        return cleanedMarkdown(prefix, isGemmaDialect: isGemmaDialect).isEmpty
     }
 
     /// True while the agent is actively working on a tool call, either streaming
@@ -1346,8 +1366,9 @@ struct ChatMessageView: View {
                             .padding(.top, 2)
                     }
 
-                    // Main Response Text rendered via Rich Markdown Engine
-                    let displayContent = displayMarkdownContent
+                    // Main Response Text rendered via Rich Markdown Engine.
+                    // Raw call markup is suppressed while a call is still streaming.
+                    let displayContent = isStreamingToolCall ? "" : displayMarkdownContent
                     if !displayContent.isEmpty {
                         MarkdownMessageView(
                             content: displayContent,
