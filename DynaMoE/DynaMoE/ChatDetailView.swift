@@ -1110,7 +1110,6 @@ struct ChatMessageView: View {
     var isGemmaDialect: Bool = false
     @Binding var isExpanded: Bool
     @State private var isCopied = false
-    @State private var feedback: String? = nil
 
     private var displayMarkdownContent: String {
         Self.cleanedMarkdown(message.content, isGemmaDialect: isGemmaDialect)
@@ -1335,7 +1334,7 @@ struct ChatMessageView: View {
                     }
 
                     // Action & Metrics Footer (Osaurus Style Telemetry & Actions)
-                    if (!message.isThinking || !isGenerating) && !message.content.isEmpty {
+                    if (!message.isThinking || !isGenerating) && !displayContent.isEmpty {
                         HStack(spacing: 12) {
                             // Telemetry
                             HStack(spacing: 6) {
@@ -1414,33 +1413,6 @@ struct ChatMessageView: View {
                                 }
                                 .buttonStyle(.plain)
                                 .help("Copy full response")
-
-                                // Thumbs up / down
-                                Button(action: {
-                                    feedback = feedback == "up" ? nil : "up"
-                                }) {
-                                    Image(systemName: feedback == "up" ? "hand.thumbsup.fill" : "hand.thumbsup")
-                                        .font(.system(size: max(8.5, 11 * zoomManager.zoomScale)))
-                                        .foregroundColor(feedback == "up" ? .purple : .secondary)
-                                        .padding(4)
-                                        .background(Color.secondary.opacity(0.06))
-                                        .cornerRadius(4)
-                                }
-                                .buttonStyle(.plain)
-                                .help("Good response")
-
-                                Button(action: {
-                                    feedback = feedback == "down" ? nil : "down"
-                                }) {
-                                    Image(systemName: feedback == "down" ? "hand.thumbsdown.fill" : "hand.thumbsdown")
-                                        .font(.system(size: max(8.5, 11 * zoomManager.zoomScale)))
-                                        .foregroundColor(feedback == "down" ? .purple : .secondary)
-                                        .padding(4)
-                                        .background(Color.secondary.opacity(0.06))
-                                        .cornerRadius(4)
-                                }
-                                .buttonStyle(.plain)
-                                .help("Bad response")
 
                                 // Audio speak
                                 Button(action: {
