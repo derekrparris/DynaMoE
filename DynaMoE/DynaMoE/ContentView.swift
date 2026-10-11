@@ -5219,7 +5219,10 @@ struct ContentView: View {
                         self.sessions[sIdx].messages[mIdx].timeToFirstTokenSeconds = max(firstPartialAt - generationStartTime, 0.0)
                         // Keep the odometer ticking with the streamed tokens so
                         // the header counter grows live like the weights path.
-                        self.sessions[sIdx].cumulativeTokenCount = afmCumulativeBase + approxTokens
+                        // Empty snapshots (the speaker-label retraction reset)
+                        // carry the UI-stat floor of one token, so they must
+                        // contribute zero here.
+                        self.sessions[sIdx].cumulativeTokenCount = afmCumulativeBase + (partialText.isEmpty ? 0 : approxTokens)
                     }
                 }
             } catch {
@@ -5282,7 +5285,9 @@ struct ContentView: View {
                 self.sessions[sIdx].messages[mIdx].isThinking = false
                 self.sessions[sIdx].messages[mIdx].tokenCount = approxTokens
                 self.sessions[sIdx].messages[mIdx].tokensPerSec = finalTokPerSec
-                self.sessions[sIdx].cumulativeTokenCount = afmCumulativeBase + approxTokens
+                // An empty response floors at one token for the UI stats, but
+                // the odometer must not count a token that was never generated.
+                self.sessions[sIdx].cumulativeTokenCount = afmCumulativeBase + (finalText.isEmpty ? 0 : approxTokens)
                 if sawFirstPartial {
                     self.sessions[sIdx].messages[mIdx].timeToFirstTokenSeconds = max(firstPartialAt - generationStartTime, 0.0)
                 }
