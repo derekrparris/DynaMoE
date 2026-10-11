@@ -89,6 +89,7 @@ struct SidebarView: View {
                                 onRename: { newTitle in
                                     if let idx = sessions.firstIndex(where: { $0.id == session.id }) {
                                         sessions[idx].title = newTitle
+                                        sessions[idx].titleOrigin = .user
                                     }
                                 },
                                 onDelete: {

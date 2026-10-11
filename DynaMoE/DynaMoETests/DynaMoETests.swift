@@ -15901,33 +15901,42 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertEqual(ChatSession.autoTitle(forFirstMessage: "   "), "Chat")
     }
 
-    func testDisplayTitleMarksTruncatedAutoTitle() {
-        let longMessage = String(repeating: "word ", count: 20)
-        let truncated = ChatSession.autoTitle(forFirstMessage: longMessage)
-        XCTAssertEqual(truncated.count, ChatSession.autoTitlePrefixLength)
+    func testAutoTitleOriginMarksTruncation() {
+        XCTAssertEqual(ChatSession.autoTitleOrigin(forFirstMessage: "Short prompt"), .autoComplete)
+        XCTAssertEqual(ChatSession.autoTitleOrigin(forFirstMessage: String(repeating: "word ", count: 20)), .autoTruncated)
+    }
 
-        let session = ChatSession(
-            title: truncated,
-            messages: [ChatMessage(role: .user, content: longMessage)]
-        )
+    func testDisplayTitleMarksTruncatedAutoTitle() {
+        let truncated = ChatSession.autoTitle(forFirstMessage: String(repeating: "word ", count: 20))
+        let session = ChatSession(title: truncated, titleOrigin: .autoTruncated)
         XCTAssertEqual(session.displayTitle, truncated + "…")
     }
 
-    func testDisplayTitleLeavesShortTitleUnchanged() {
-        let session = ChatSession(
-            title: "Short",
-            messages: [ChatMessage(role: .user, content: "Short")]
-        )
+    func testDisplayTitleLeavesCompleteAutoTitleUnchanged() {
+        let session = ChatSession(title: "Short", titleOrigin: .autoComplete)
         XCTAssertEqual(session.displayTitle, "Short")
     }
 
     func testDisplayTitleLeavesRenamedTitleUnchanged() {
-        let longMessage = String(repeating: "word ", count: 20)
-        let session = ChatSession(
-            title: "My custom name",
-            messages: [ChatMessage(role: .user, content: longMessage)]
-        )
+        let session = ChatSession(title: "My custom name", titleOrigin: .user)
         XCTAssertEqual(session.displayTitle, "My custom name")
+    }
+
+    func testTitleOriginSurvivesPersistenceRoundTrip() throws {
+        let session = ChatSession(title: "Truncated name", titleOrigin: .autoTruncated)
+        let data = try JSONEncoder().encode(session)
+        let decoded = try JSONDecoder().decode(ChatSession.self, from: data)
+        XCTAssertEqual(decoded.titleOrigin, .autoTruncated)
+    }
+
+    func testLegacySessionWithoutTitleOriginDecodesAsNil() throws {
+        let session = ChatSession(title: "Legacy", titleOrigin: .user)
+        let data = try JSONEncoder().encode(session)
+        var object = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        object.removeValue(forKey: "titleOrigin")
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(ChatSession.self, from: legacyData)
+        XCTAssertNil(decoded.titleOrigin)
     }
 
     // MARK: - Retention plan (pure logic)

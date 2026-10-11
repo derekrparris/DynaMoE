@@ -2179,6 +2179,7 @@ struct ContentView: View {
                               let sid = selectedSessionId ?? sessions.first?.id,
                               let idx = sessions.firstIndex(where: { $0.id == sid }) else { return }
                         sessions[idx].title = trimmed
+                        sessions[idx].titleOrigin = .user
                     }
                 )
                 .safeAreaInset(edge: .top, spacing: 0) {
@@ -2978,9 +2979,14 @@ struct ContentView: View {
         let userMsg = ChatMessage(role: .user, content: text)
         sessions[sessionIdx].messages.append(userMsg)
         
-        // Auto-title session if it's the first user message
+        // Auto-title session if it's the first user message, unless the user
+        // already named this conversation before sending (the rename controls
+        // are available on an empty chat), in which case their name wins.
         if sessions[sessionIdx].messages.filter({ $0.role == .user }).count == 1 {
-            sessions[sessionIdx].title = ChatSession.autoTitle(forFirstMessage: text)
+            if sessions[sessionIdx].titleOrigin != .user {
+                sessions[sessionIdx].title = ChatSession.autoTitle(forFirstMessage: text)
+                sessions[sessionIdx].titleOrigin = ChatSession.autoTitleOrigin(forFirstMessage: text)
+            }
             sessions[sessionIdx].createdAt = Date()
         }
         
