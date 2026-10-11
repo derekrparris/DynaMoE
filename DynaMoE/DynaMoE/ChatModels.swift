@@ -336,6 +336,22 @@ public extension ChatSession {
         return blocks.isEmpty ? nil : blocks.joined(separator: "\n\n")
     }
 
+    /// Odometer arithmetic for one generation step's prompt ingestion: the
+    /// conversation total after a turn's prompt tokens land on it. An unmetered
+    /// conversation (`nil` — a pre-feature history, or one just compacted, whose
+    /// pin is also invalid) seeds from the entire prompt, because that prompt
+    /// IS its context size; a metered one adds only the tokens the pinned prefix
+    /// did not already supply, so prefix reuse never double counts. Generated
+    /// tokens are added on top of the returned base as they stream.
+    nonisolated static func cumulativeTokenBase(
+        previousTotal: Int?,
+        promptTokenCount: Int,
+        prefixTokensReused: Int
+    ) -> Int {
+        guard let previousTotal else { return promptTokenCount }
+        return previousTotal + max(0, promptTokenCount - prefixTokensReused)
+    }
+
     /// Neutralizes chat-template control tokens in a compaction digest before it
     /// rides inside the system block. The digests are derived from arbitrary
     /// user messages and tool output, and every weights dialect wraps the system

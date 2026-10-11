@@ -15958,6 +15958,32 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertNil(decoded.cumulativeTokenCount)
     }
 
+    // MARK: - Cumulative token odometer (pure logic)
+
+    func testUnmeteredSessionSeedsOdometerFromFullPrompt() {
+        // A conversation with no meter yet — a pre-feature history, or a fresh
+        // /compact reset — counts its next turn's entire prompt as the base,
+        // because that prompt IS the conversation's context size. Seeding
+        // ignores prefix reuse: the unmetered tail was never counted before.
+        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: nil, promptTokenCount: 1200, prefixTokensReused: 0), 1200)
+        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: nil, promptTokenCount: 1200, prefixTokensReused: 800), 1200)
+        // Generated tokens add on top of the seeded base as the turn streams.
+        let seeded = ChatSession.cumulativeTokenBase(previousTotal: nil, promptTokenCount: 1200, prefixTokensReused: 0)
+        XCTAssertEqual(seeded + 300, 1500)
+    }
+
+    func testMeteredSessionAddsOnlyNonReusedPromptTokens() {
+        // Only the part of the prompt the pinned prefix did not already cover
+        // counts again, so prefix reuse never double-counts context.
+        let base = ChatSession.cumulativeTokenBase(previousTotal: 5000, promptTokenCount: 1200, prefixTokensReused: 800)
+        XCTAssertEqual(base, 5400)
+        XCTAssertEqual(base + 300, 5700)
+        // Reuse at or beyond the prompt's length contributes nothing, never a
+        // negative delta.
+        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: 5000, promptTokenCount: 100, prefixTokensReused: 100), 5000)
+        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: 5000, promptTokenCount: 100, prefixTokensReused: 300), 5000)
+    }
+
     func testPlaceholderIsUnusedOnlyWhenEmptyAndUntitled() {
         XCTAssertTrue(ChatSession(messages: [], titleOrigin: nil).isUnusedPlaceholder)
         XCTAssertFalse(ChatSession(messages: [], titleOrigin: .user).isUnusedPlaceholder, "A rename must keep the placeholder from being discarded at startup")
