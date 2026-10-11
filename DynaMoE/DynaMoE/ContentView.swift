@@ -2887,6 +2887,11 @@ struct ContentView: View {
                     content: "🗂 \(evictedCount) messages compacted into a rolling summary by Apple Foundation Model. The conversation continues from that summary context."
                 )
                 self.sessions[liveIdx].messages = [marker]
+                // The context the odometer was counting is gone: reset it to
+                // unmetered so the next send seeds a fresh total from the
+                // compacted prompt (summary + marker + new message), which is
+                // the conversation's new context size.
+                self.sessions[liveIdx].cumulativeTokenCount = nil
                 // The token prefix changed: any pinned KV state for this
                 // conversation no longer matches, and reusing it would splice
                 // summaries into stale slots. One full re-prefill is the cost
@@ -5145,6 +5150,16 @@ struct ContentView: View {
         // loop uses Task.detached because its per-token Metal work must not
         // occupy the main actor; this path only suspends on the on-device
         // model's snapshots between paced reveals, so nothing blocks here.
+        // The framework re-sends the whole context (persona + history transcript)
+        // every turn and reports no token accounting, so the session odometer's
+        // input side uses the same character-based approximation; streaming and
+        // finalization add the generated tokens on top of this base.
+        let afmTurnInputTokens = AppleFoundationModelService.approximateTokenCount(for: instructionsText)
+            + AppleFoundationModelService.approximateTokenCount(for: userPrompt)
+        let afmCumulativeBase = (sessions.first(where: { $0.id == sessionId })?.cumulativeTokenCount ?? 0) + afmTurnInputTokens
+        if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }) {
+            sessions[sIdx].cumulativeTokenCount = afmCumulativeBase
+        }
         generationTask = Task(priority: .userInitiated) {
             var latestPartial = ""
             var sawFirstPartial = false
@@ -5189,6 +5204,9 @@ struct ContentView: View {
                         self.sessions[sIdx].messages[mIdx].tokenCount = approxTokens
                         self.sessions[sIdx].messages[mIdx].tokensPerSec = tokPerSec
                         self.sessions[sIdx].messages[mIdx].timeToFirstTokenSeconds = max(firstPartialAt - generationStartTime, 0.0)
+                        // Keep the odometer ticking with the streamed tokens so
+                        // the header counter grows live like the weights path.
+                        self.sessions[sIdx].cumulativeTokenCount = afmCumulativeBase + approxTokens
                     }
                 }
             } catch {
@@ -5242,6 +5260,7 @@ struct ContentView: View {
                 self.sessions[sIdx].messages[mIdx].isThinking = false
                 self.sessions[sIdx].messages[mIdx].tokenCount = approxTokens
                 self.sessions[sIdx].messages[mIdx].tokensPerSec = finalTokPerSec
+                self.sessions[sIdx].cumulativeTokenCount = afmCumulativeBase + approxTokens
                 if sawFirstPartial {
                     self.sessions[sIdx].messages[mIdx].timeToFirstTokenSeconds = max(firstPartialAt - generationStartTime, 0.0)
                 }
@@ -14797,6 +14816,14 @@ if layer.attnGateProjTensor != nil,
             var accumulatedDecodedText = ""
             var lastUIUpdateTime = CFAbsoluteTimeGetCurrent()
 
+            // Session token odometer state for this step: `cumulativeStepBase`
+            // holds the conversation total once this step's newly ingested prompt
+            // tokens are metered on, and decode adds its generated tokens on top.
+            // `cumulativeStepTracked` stays false until that commits, so a
+            // superseded generation's stragglers never write the total.
+            var cumulativeStepBase: Int = 0
+            var cumulativeStepTracked = false
+
             if isFullRAM && WorkingSetManager.shared.residentExpertsCount < WorkingSetManager.shared.totalExpertKeysCount {
                 await MainActor.run {
                     self.generationStatusText = "⚡ Priming resident weights into RAM..."
@@ -14917,6 +14944,24 @@ if layer.attnGateProjTensor != nil,
                        let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
                         self.sessions[sIdx].messages[mIdx].prefillStatus = nil
                     }
+                }
+            }
+
+            // Meter newly ingested prompt tokens onto the session's cumulative
+            // odometer before decode begins. A conversation with no meter yet
+            // (a history from before the counter existed) initializes from the
+            // full prompt — that IS its context size — while metered ones add
+            // only the non-reused delta so pinned prefix tokens never count twice.
+            await MainActor.run {
+                guard self.ownsGeneration(myGenerationId) else { return }
+                if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
+                    let previouslyMetered = self.sessions[sIdx].cumulativeTokenCount
+                    let newlyIngested = (previouslyMetered == nil)
+                        ? promptTokenIds.count
+                        : max(0, promptTokenIds.count - prefixTokensReused)
+                    cumulativeStepBase = (previouslyMetered ?? 0) + newlyIngested
+                    self.sessions[sIdx].cumulativeTokenCount = cumulativeStepBase
+                    cumulativeStepTracked = true
                 }
             }
 
@@ -15191,6 +15236,9 @@ if layer.attnGateProjTensor != nil,
                                 self.sessions[sIdx].messages[mIdx].thinkingTimeSeconds = liveThinkDuration
                                 self.sessions[sIdx].messages[mIdx].jetSpecTau = (effectiveJetSpec && self.jetSpecTotalDraftProposed > 0) ? self.jetSpecMeanTau : nil
                                 self.sessions[sIdx].messages[mIdx].jetSpecDraftAccepted = (effectiveJetSpec && self.jetSpecTotalDraftAccepted > 0) ? self.jetSpecTotalDraftAccepted : nil
+                                if cumulativeStepTracked {
+                                    self.sessions[sIdx].cumulativeTokenCount = cumulativeStepBase + tokensGenerated
+                                }
                             }
                         }
                     }
@@ -15239,6 +15287,13 @@ if layer.attnGateProjTensor != nil,
             // from the streaming updates above, so nothing is lost by returning.
             if Task.isCancelled {
                 print("⏹ [GEN] cancelled at \(tokensGenerated) tokens — skipping finalization")
+                if cumulativeStepTracked, let sId = sessionId {
+                    await MainActor.run {
+                        if let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
+                            self.sessions[sIdx].cumulativeTokenCount = cumulativeStepBase + tokensGenerated
+                        }
+                    }
+                }
                 return
             }
 
@@ -15411,6 +15466,9 @@ if layer.attnGateProjTensor != nil,
                         self.sessions[sIdx].messages[mIdx].thinkingTimeSeconds = finalThinkDuration
                         self.sessions[sIdx].messages[mIdx].jetSpecTau = (effectiveJetSpec && self.jetSpecTotalDraftProposed > 0) ? self.jetSpecMeanTau : nil
                         self.sessions[sIdx].messages[mIdx].jetSpecDraftAccepted = (effectiveJetSpec && self.jetSpecTotalDraftAccepted > 0) ? self.jetSpecTotalDraftAccepted : nil
+                        if cumulativeStepTracked {
+                            self.sessions[sIdx].cumulativeTokenCount = cumulativeStepBase + tokensGenerated
+                        }
                     }
                 }
                 // FIX #10: snapshot the GDN recurrent + conv states at the exact

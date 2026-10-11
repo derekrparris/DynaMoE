@@ -15939,6 +15939,25 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertNil(decoded.titleOrigin)
     }
 
+    func testCumulativeTokenCountSurvivesPersistenceRoundTrip() throws {
+        var session = ChatSession(title: "Metered")
+        session.cumulativeTokenCount = 12_345
+        let data = try JSONEncoder().encode(session)
+        let decoded = try JSONDecoder().decode(ChatSession.self, from: data)
+        XCTAssertEqual(decoded.cumulativeTokenCount, 12_345)
+    }
+
+    func testLegacySessionWithoutCumulativeTokenCountDecodesAsNil() throws {
+        var session = ChatSession(title: "Legacy")
+        session.cumulativeTokenCount = 999
+        let data = try JSONEncoder().encode(session)
+        var object = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        object.removeValue(forKey: "cumulativeTokenCount")
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(ChatSession.self, from: legacyData)
+        XCTAssertNil(decoded.cumulativeTokenCount)
+    }
+
     func testPlaceholderIsUnusedOnlyWhenEmptyAndUntitled() {
         XCTAssertTrue(ChatSession(messages: [], titleOrigin: nil).isUnusedPlaceholder)
         XCTAssertFalse(ChatSession(messages: [], titleOrigin: .user).isUnusedPlaceholder, "A rename must keep the placeholder from being discarded at startup")

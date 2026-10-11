@@ -257,6 +257,19 @@ struct ChatDetailView: View {
                                     }
                                 }
                             }
+                            if let cumulativeTokens = session?.cumulativeTokenCount, cumulativeTokens > 0 {
+                                Text("•")
+                                    .foregroundColor(.secondary)
+                                HStack(spacing: 3) {
+                                    Image(systemName: "number.circle")
+                                        .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .semibold))
+                                        .foregroundColor(.secondary)
+                                    Text(cumulativeTokens.formatted())
+                                        .font(.system(size: max(9, 11 * zoomManager.zoomScale), design: .monospaced))
+                                        .foregroundColor(.secondary)
+                                }
+                                .help("Running total of session context: prompt tokens ingested plus tokens generated across every turn")
+                            }
                         }
                         .padding(.horizontal, 10)
                         .padding(.vertical, 4)
