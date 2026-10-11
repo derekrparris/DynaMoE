@@ -275,6 +275,14 @@ public extension ChatSession {
         titleOrigin == .autoTruncated ? title + "…" : title
     }
 
+    /// True when a conversation still holds nothing the user chose: no messages
+    /// and a title that was never set by hand. The startup history merge uses
+    /// this to decide whether the launch placeholder can be replaced by loaded
+    /// history, so a rename to that placeholder is not discarded.
+    nonisolated var isUnusedPlaceholder: Bool {
+        messages.isEmpty && titleOrigin != .user
+    }
+
     /// The most recent timestamp we can actually trust for a conversation.
     ///
     /// `updatedAt` is only set at creation/decode; the UI mutation paths that

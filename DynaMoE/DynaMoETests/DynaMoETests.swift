@@ -15939,6 +15939,12 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertNil(decoded.titleOrigin)
     }
 
+    func testPlaceholderIsUnusedOnlyWhenEmptyAndUntitled() {
+        XCTAssertTrue(ChatSession(messages: [], titleOrigin: nil).isUnusedPlaceholder)
+        XCTAssertFalse(ChatSession(messages: [], titleOrigin: .user).isUnusedPlaceholder, "A rename must keep the placeholder from being discarded at startup")
+        XCTAssertFalse(ChatSession(messages: [ChatMessage(role: .user, content: "hi")], titleOrigin: nil).isUnusedPlaceholder)
+    }
+
     // MARK: - Retention plan (pure logic)
 
     func testRetentionPlanKeepsMostRecentWithinLimit() {

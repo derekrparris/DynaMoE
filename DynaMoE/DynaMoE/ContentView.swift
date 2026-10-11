@@ -1922,11 +1922,12 @@ struct ContentView: View {
         // to disk. So keep the live value on overlap and append only history that
         // memory does not already have. The untouched launch placeholder is
         // dropped by identity rather than by being empty, so a New Chat created
-        // before the load finished survives even with no messages.
+        // before the load finished survives even with no messages. A rename marks
+        // the placeholder as used, so its new title is kept too.
         let memoryIds = Set(sessions.map(\.id))
         let diskOnly = loaded.filter { !memoryIds.contains($0.id) }
         let keptFromMemory = sessions.filter { session in
-            if session.id == launchPlaceholderId, session.messages.isEmpty { return false }
+            if session.id == launchPlaceholderId, session.isUnusedPlaceholder { return false }
             return true
         }
 
