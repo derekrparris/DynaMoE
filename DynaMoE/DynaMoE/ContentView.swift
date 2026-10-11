@@ -2887,6 +2887,11 @@ struct ContentView: View {
                     content: "🗂 \(evictedCount) messages compacted into a rolling summary by Apple Foundation Model. The conversation continues from that summary context."
                 )
                 self.sessions[liveIdx].messages = [marker]
+                // The context the odometer was counting is gone: reset it to
+                // unmetered so the next send seeds a fresh total from the
+                // compacted prompt (summary + marker + new message), which is
+                // the conversation's new context size.
+                self.sessions[liveIdx].cumulativeTokenCount = nil
                 // The token prefix changed: any pinned KV state for this
                 // conversation no longer matches, and reusing it would splice
                 // summaries into stale slots. One full re-prefill is the cost
@@ -5145,11 +5150,34 @@ struct ContentView: View {
         // loop uses Task.detached because its per-token Metal work must not
         // occupy the main actor; this path only suspends on the on-device
         // model's snapshots between paced reveals, so nothing blocks here.
+        // The framework re-sends the whole context (persona + history transcript)
+        // every turn and reports no token accounting, so the session odometer's
+        // input side uses the same character-based approximation; streaming and
+        // finalization add the generated tokens on top of this base.
+        let afmTurnInputTokens = AppleFoundationModelService.approximateTokenCount(for: instructionsText)
+            + AppleFoundationModelService.approximateTokenCount(for: userPrompt)
+        let afmCumulativeBase = (sessions.first(where: { $0.id == sessionId })?.cumulativeTokenCount ?? 0) + afmTurnInputTokens
+        if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }) {
+            sessions[sIdx].cumulativeTokenCount = afmCumulativeBase
+        }
         generationTask = Task(priority: .userInitiated) {
             var latestPartial = ""
             var sawFirstPartial = false
             var firstPartialAt = 0.0
             var lastUIUpdateTime = 0.0
+
+            // Cancellation and error exits below bypass the success finalizer,
+            // so the odometer would otherwise be left at the last throttled
+            // streaming write and drop the tail of the final snapshot.
+            // Committing here — only while this task still owns the generation,
+            // which holds because a replacement cannot start until this task
+            // returns — keeps stopped and failed turns fully counted.
+            func commitOdometerTail() {
+                guard !latestPartial.isEmpty, self.ownsGeneration(myGenerationId),
+                      let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) else { return }
+                self.sessions[sIdx].cumulativeTokenCount = afmCumulativeBase
+                    + AppleFoundationModelService.approximateTokenCount(for: latestPartial)
+            }
 
             do {
                 latestPartial = try await AppleFoundationModelService.streamChatTurn(
@@ -5189,12 +5217,24 @@ struct ContentView: View {
                         self.sessions[sIdx].messages[mIdx].tokenCount = approxTokens
                         self.sessions[sIdx].messages[mIdx].tokensPerSec = tokPerSec
                         self.sessions[sIdx].messages[mIdx].timeToFirstTokenSeconds = max(firstPartialAt - generationStartTime, 0.0)
+                        // Keep the odometer ticking with the streamed tokens so
+                        // the header counter grows live like the weights path.
+                        // Empty snapshots (the speaker-label retraction reset)
+                        // carry the UI-stat floor of one token, so they must
+                        // contribute zero here.
+                        self.sessions[sIdx].cumulativeTokenCount = afmCumulativeBase + (partialText.isEmpty ? 0 : approxTokens)
                     }
                 }
             } catch {
+                // The turn ends here instead of in the success finalizer below —
+                // stopped, superseded, or errored — so the odometer needs the
+                // tail of the final snapshot either way.
+                commitOdometerTail()
                 // Stop-button cancellation throws out of the stream iteration;
                 // whatever partial text already streamed stays in the message.
-                if Task.isCancelled || !self.ownsGeneration(myGenerationId) { return }
+                if Task.isCancelled || !self.ownsGeneration(myGenerationId) {
+                    return
+                }
                 let errText = "⚠️ Apple Foundation Model error: \(error.localizedDescription)"
                 self.isGeneratingText = false
                 self.generationTask = nil
@@ -5218,7 +5258,10 @@ struct ContentView: View {
             // generation owns the UI flags and task handle now (see
             // `ownsGeneration`). The streamed partial text already landed in the
             // message and is intentionally preserved.
-            if Task.isCancelled || !self.ownsGeneration(myGenerationId) { return }
+            if Task.isCancelled || !self.ownsGeneration(myGenerationId) {
+                commitOdometerTail()
+                return
+            }
 
             let finalElapsed = max(CFAbsoluteTimeGetCurrent() - generationStartTime, 0.001)
             let finalText = latestPartial
@@ -5242,6 +5285,9 @@ struct ContentView: View {
                 self.sessions[sIdx].messages[mIdx].isThinking = false
                 self.sessions[sIdx].messages[mIdx].tokenCount = approxTokens
                 self.sessions[sIdx].messages[mIdx].tokensPerSec = finalTokPerSec
+                // An empty response floors at one token for the UI stats, but
+                // the odometer must not count a token that was never generated.
+                self.sessions[sIdx].cumulativeTokenCount = afmCumulativeBase + (finalText.isEmpty ? 0 : approxTokens)
                 if sawFirstPartial {
                     self.sessions[sIdx].messages[mIdx].timeToFirstTokenSeconds = max(firstPartialAt - generationStartTime, 0.0)
                 }
@@ -14797,6 +14843,14 @@ if layer.attnGateProjTensor != nil,
             var accumulatedDecodedText = ""
             var lastUIUpdateTime = CFAbsoluteTimeGetCurrent()
 
+            // Session token odometer state for this step: `cumulativeStepBase`
+            // holds the conversation total once this step's newly ingested prompt
+            // tokens are metered on, and decode adds its generated tokens on top.
+            // `cumulativeStepTracked` stays false until that commits, so a
+            // superseded generation's stragglers never write the total.
+            var cumulativeStepBase: Int = 0
+            var cumulativeStepTracked = false
+
             if isFullRAM && WorkingSetManager.shared.residentExpertsCount < WorkingSetManager.shared.totalExpertKeysCount {
                 await MainActor.run {
                     self.generationStatusText = "⚡ Priming resident weights into RAM..."
@@ -14920,6 +14974,24 @@ if layer.attnGateProjTensor != nil,
                 }
             }
 
+            // Meter newly ingested prompt tokens onto the session's cumulative
+            // odometer before decode begins. The seeding/delta rule
+            // (`ChatSession.cumulativeTokenBase`) counts a full prompt for an
+            // unmetered conversation and only the non-reused delta otherwise;
+            // generated tokens then add on top of the base as they stream.
+            await MainActor.run {
+                guard self.ownsGeneration(myGenerationId) else { return }
+                if let sId = sessionId, let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
+                    cumulativeStepBase = ChatSession.cumulativeTokenBase(
+                        previousTotal: self.sessions[sIdx].cumulativeTokenCount,
+                        promptTokenCount: promptTokenIds.count,
+                        prefixTokensReused: prefixTokensReused
+                    )
+                    self.sessions[sIdx].cumulativeTokenCount = cumulativeStepBase
+                    cumulativeStepTracked = true
+                }
+            }
+
             // Autoregressive generation loop
             var generationStartTime = CFAbsoluteTimeGetCurrent()
 
@@ -14953,6 +15025,14 @@ if layer.attnGateProjTensor != nil,
                                let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
                                let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
                                 self.sessions[sIdx].messages[mIdx].isThinking = false
+                            }
+                            // The turn dies here instead of in the finalizer, so
+                            // the odometer needs the exact tail — the throttled
+                            // streaming writes may sit a few tokens behind this
+                            // failure.
+                            if cumulativeStepTracked, let sId = sessionId,
+                               let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
+                                self.sessions[sIdx].cumulativeTokenCount = cumulativeStepBase + tokensGenerated
                             }
                         }
                         return
@@ -15191,6 +15271,9 @@ if layer.attnGateProjTensor != nil,
                                 self.sessions[sIdx].messages[mIdx].thinkingTimeSeconds = liveThinkDuration
                                 self.sessions[sIdx].messages[mIdx].jetSpecTau = (effectiveJetSpec && self.jetSpecTotalDraftProposed > 0) ? self.jetSpecMeanTau : nil
                                 self.sessions[sIdx].messages[mIdx].jetSpecDraftAccepted = (effectiveJetSpec && self.jetSpecTotalDraftAccepted > 0) ? self.jetSpecTotalDraftAccepted : nil
+                                if cumulativeStepTracked {
+                                    self.sessions[sIdx].cumulativeTokenCount = cumulativeStepBase + tokensGenerated
+                                }
                             }
                         }
                     }
@@ -15239,6 +15322,13 @@ if layer.attnGateProjTensor != nil,
             // from the streaming updates above, so nothing is lost by returning.
             if Task.isCancelled {
                 print("⏹ [GEN] cancelled at \(tokensGenerated) tokens — skipping finalization")
+                if cumulativeStepTracked, let sId = sessionId {
+                    await MainActor.run {
+                        if let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
+                            self.sessions[sIdx].cumulativeTokenCount = cumulativeStepBase + tokensGenerated
+                        }
+                    }
+                }
                 return
             }
 
@@ -15278,6 +15368,16 @@ if layer.attnGateProjTensor != nil,
                 // stop.
                 if Task.isCancelled {
                     print("⏹ [GEN] cancelled during prefix backfill — skipping finalization")
+                    // The earlier cancellation guard passed before the cancel
+                    // landed, so the odometer still sits at the last throttled
+                    // streaming write; commit the exact tail before returning.
+                    if cumulativeStepTracked, let sId = sessionId {
+                        await MainActor.run {
+                            if let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
+                                self.sessions[sIdx].cumulativeTokenCount = cumulativeStepBase + tokensGenerated
+                            }
+                        }
+                    }
                     return
                 }
                 // A failed forward means the tail is short of the tokens the pin
@@ -15300,6 +15400,12 @@ if layer.attnGateProjTensor != nil,
                            let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
                             self.sessions[sIdx].messages[mIdx].prefillStatus = nil
                             self.sessions[sIdx].messages[mIdx].isThinking = false
+                        }
+                        // The turn ends here without the finalizer's reconcile;
+                        // keep the odometer exact through the failure.
+                        if cumulativeStepTracked, let sId = sessionId,
+                           let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
+                            self.sessions[sIdx].cumulativeTokenCount = cumulativeStepBase + tokensGenerated
                         }
                     }
                     return
@@ -15411,6 +15517,9 @@ if layer.attnGateProjTensor != nil,
                         self.sessions[sIdx].messages[mIdx].thinkingTimeSeconds = finalThinkDuration
                         self.sessions[sIdx].messages[mIdx].jetSpecTau = (effectiveJetSpec && self.jetSpecTotalDraftProposed > 0) ? self.jetSpecMeanTau : nil
                         self.sessions[sIdx].messages[mIdx].jetSpecDraftAccepted = (effectiveJetSpec && self.jetSpecTotalDraftAccepted > 0) ? self.jetSpecTotalDraftAccepted : nil
+                        if cumulativeStepTracked {
+                            self.sessions[sIdx].cumulativeTokenCount = cumulativeStepBase + tokensGenerated
+                        }
                     }
                 }
                 // FIX #10: snapshot the GDN recurrent + conv states at the exact

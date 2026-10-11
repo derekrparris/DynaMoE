@@ -15939,6 +15939,51 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertNil(decoded.titleOrigin)
     }
 
+    func testCumulativeTokenCountSurvivesPersistenceRoundTrip() throws {
+        var session = ChatSession(title: "Metered")
+        session.cumulativeTokenCount = 12_345
+        let data = try JSONEncoder().encode(session)
+        let decoded = try JSONDecoder().decode(ChatSession.self, from: data)
+        XCTAssertEqual(decoded.cumulativeTokenCount, 12_345)
+    }
+
+    func testLegacySessionWithoutCumulativeTokenCountDecodesAsNil() throws {
+        var session = ChatSession(title: "Legacy")
+        session.cumulativeTokenCount = 999
+        let data = try JSONEncoder().encode(session)
+        var object = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        object.removeValue(forKey: "cumulativeTokenCount")
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(ChatSession.self, from: legacyData)
+        XCTAssertNil(decoded.cumulativeTokenCount)
+    }
+
+    // MARK: - Cumulative token odometer (pure logic)
+
+    func testUnmeteredSessionSeedsOdometerFromFullPrompt() {
+        // A conversation with no meter yet — a pre-feature history, or a fresh
+        // /compact reset — counts its next turn's entire prompt as the base,
+        // because that prompt IS the conversation's context size. Seeding
+        // ignores prefix reuse: the unmetered tail was never counted before.
+        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: nil, promptTokenCount: 1200, prefixTokensReused: 0), 1200)
+        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: nil, promptTokenCount: 1200, prefixTokensReused: 800), 1200)
+        // Generated tokens add on top of the seeded base as the turn streams.
+        let seeded = ChatSession.cumulativeTokenBase(previousTotal: nil, promptTokenCount: 1200, prefixTokensReused: 0)
+        XCTAssertEqual(seeded + 300, 1500)
+    }
+
+    func testMeteredSessionAddsOnlyNonReusedPromptTokens() {
+        // Only the part of the prompt the pinned prefix did not already cover
+        // counts again, so prefix reuse never double-counts context.
+        let base = ChatSession.cumulativeTokenBase(previousTotal: 5000, promptTokenCount: 1200, prefixTokensReused: 800)
+        XCTAssertEqual(base, 5400)
+        XCTAssertEqual(base + 300, 5700)
+        // Reuse at or beyond the prompt's length contributes nothing, never a
+        // negative delta.
+        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: 5000, promptTokenCount: 100, prefixTokensReused: 100), 5000)
+        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: 5000, promptTokenCount: 100, prefixTokensReused: 300), 5000)
+    }
+
     func testPlaceholderIsUnusedOnlyWhenEmptyAndUntitled() {
         XCTAssertTrue(ChatSession(messages: [], titleOrigin: nil).isUnusedPlaceholder)
         XCTAssertFalse(ChatSession(messages: [], titleOrigin: .user).isUnusedPlaceholder, "A rename must keep the placeholder from being discarded at startup")

@@ -170,6 +170,14 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
     /// Persisted so the truncation marker survives compaction (which replaces
     /// `messages` and would otherwise erase the evidence) and renames.
     public var titleOrigin: SessionTitleOrigin?
+    /// Running total of every token this conversation has consumed: the prompt
+    /// tokens each turn actually ingested (the portion the pinned prefix did
+    /// not already cover) plus every generated token, across all agent steps.
+    /// `nil` when unmetered — a history from before the counter existed, or a
+    /// conversation freshly compacted by /compact, which resets the total —
+    /// and the next send then initializes it from that turn's full prompt,
+    /// which is the conversation's context size.
+    public var cumulativeTokenCount: Int?
 
     public init(
         id: UUID = UUID(),
@@ -185,7 +193,8 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         queuedPrompts: [QueuedPrompt] = [],
         rollingSummary: String? = nil,
         recentWorkDigest: String? = nil,
-        titleOrigin: SessionTitleOrigin? = nil
+        titleOrigin: SessionTitleOrigin? = nil,
+        cumulativeTokenCount: Int? = nil
     ) {
         self.id = id
         self.title = title
@@ -201,6 +210,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         self.rollingSummary = rollingSummary
         self.recentWorkDigest = recentWorkDigest
         self.titleOrigin = titleOrigin
+        self.cumulativeTokenCount = cumulativeTokenCount
     }
 
     enum CodingKeys: String, CodingKey {
@@ -210,6 +220,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         case queuedPrompts
         case rollingSummary, recentWorkDigest
         case titleOrigin
+        case cumulativeTokenCount
     }
 
     public init(from decoder: Decoder) throws {
@@ -228,6 +239,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         self.rollingSummary = try container.decodeIfPresent(String.self, forKey: .rollingSummary)
         self.recentWorkDigest = try container.decodeIfPresent(String.self, forKey: .recentWorkDigest)
         self.titleOrigin = try container.decodeIfPresent(SessionTitleOrigin.self, forKey: .titleOrigin)
+        self.cumulativeTokenCount = try container.decodeIfPresent(Int.self, forKey: .cumulativeTokenCount)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -246,6 +258,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         try container.encodeIfPresent(rollingSummary, forKey: .rollingSummary)
         try container.encodeIfPresent(recentWorkDigest, forKey: .recentWorkDigest)
         try container.encodeIfPresent(titleOrigin, forKey: .titleOrigin)
+        try container.encodeIfPresent(cumulativeTokenCount, forKey: .cumulativeTokenCount)
     }
 }
 
@@ -321,6 +334,22 @@ public extension ChatSession {
             blocks.append("The most recently compacted work, kept in detail:\n\(detail)")
         }
         return blocks.isEmpty ? nil : blocks.joined(separator: "\n\n")
+    }
+
+    /// Odometer arithmetic for one generation step's prompt ingestion: the
+    /// conversation total after a turn's prompt tokens land on it. An unmetered
+    /// conversation (`nil` — a pre-feature history, or one just compacted, whose
+    /// pin is also invalid) seeds from the entire prompt, because that prompt
+    /// IS its context size; a metered one adds only the tokens the pinned prefix
+    /// did not already supply, so prefix reuse never double counts. Generated
+    /// tokens are added on top of the returned base as they stream.
+    nonisolated static func cumulativeTokenBase(
+        previousTotal: Int?,
+        promptTokenCount: Int,
+        prefixTokensReused: Int
+    ) -> Int {
+        guard let previousTotal else { return promptTokenCount }
+        return previousTotal + max(0, promptTokenCount - prefixTokensReused)
     }
 
     /// Neutralizes chat-template control tokens in a compaction digest before it
