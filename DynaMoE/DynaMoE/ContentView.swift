@@ -2173,10 +2173,12 @@ struct ContentView: View {
                             sessions[idx].isAgentToolsEnabled = enabled
                         }
                     },
-                    onToggleSidebar: {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            columnVisibility = (columnVisibility == .detailOnly) ? .all : .detailOnly
-                        }
+                    onRenameSession: { newTitle in
+                        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !trimmed.isEmpty,
+                              let sid = selectedSessionId ?? sessions.first?.id,
+                              let idx = sessions.firstIndex(where: { $0.id == sid }) else { return }
+                        sessions[idx].title = trimmed
                     }
                 )
                 .safeAreaInset(edge: .top, spacing: 0) {
@@ -2978,8 +2980,7 @@ struct ContentView: View {
         
         // Auto-title session if it's the first user message
         if sessions[sessionIdx].messages.filter({ $0.role == .user }).count == 1 {
-            let cleanTitle = text.prefix(28).trimmingCharacters(in: .whitespacesAndNewlines)
-            sessions[sessionIdx].title = cleanTitle.isEmpty ? "Chat" : String(cleanTitle)
+            sessions[sessionIdx].title = ChatSession.autoTitle(forFirstMessage: text)
             sessions[sessionIdx].createdAt = Date()
         }
         

@@ -15894,6 +15894,42 @@ final class ChatSessionPersistenceTests: XCTestCase {
         ChatSession(title: title, messages: [], createdAt: updatedAt, updatedAt: updatedAt)
     }
 
+    // MARK: - Session title (pure logic)
+
+    func testAutoTitleUsesMessagePrefix() {
+        XCTAssertEqual(ChatSession.autoTitle(forFirstMessage: "Fix the parser"), "Fix the parser")
+        XCTAssertEqual(ChatSession.autoTitle(forFirstMessage: "   "), "Chat")
+    }
+
+    func testDisplayTitleMarksTruncatedAutoTitle() {
+        let longMessage = String(repeating: "word ", count: 20)
+        let truncated = ChatSession.autoTitle(forFirstMessage: longMessage)
+        XCTAssertEqual(truncated.count, ChatSession.autoTitlePrefixLength)
+
+        let session = ChatSession(
+            title: truncated,
+            messages: [ChatMessage(role: .user, content: longMessage)]
+        )
+        XCTAssertEqual(session.displayTitle, truncated + "…")
+    }
+
+    func testDisplayTitleLeavesShortTitleUnchanged() {
+        let session = ChatSession(
+            title: "Short",
+            messages: [ChatMessage(role: .user, content: "Short")]
+        )
+        XCTAssertEqual(session.displayTitle, "Short")
+    }
+
+    func testDisplayTitleLeavesRenamedTitleUnchanged() {
+        let longMessage = String(repeating: "word ", count: 20)
+        let session = ChatSession(
+            title: "My custom name",
+            messages: [ChatMessage(role: .user, content: longMessage)]
+        )
+        XCTAssertEqual(session.displayTitle, "My custom name")
+    }
+
     // MARK: - Retention plan (pure logic)
 
     func testRetentionPlanKeepsMostRecentWithinLimit() {

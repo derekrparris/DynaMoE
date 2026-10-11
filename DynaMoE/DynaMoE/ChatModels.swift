@@ -228,6 +228,28 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
 }
 
 public extension ChatSession {
+    /// Number of leading characters the first user message contributes to an
+    /// auto-generated conversation title.
+    nonisolated static let autoTitlePrefixLength = 28
+
+    /// The auto-generated title for the first user message: its leading
+    /// characters, trimmed, or "Chat" when there is nothing usable.
+    nonisolated static func autoTitle(forFirstMessage text: String) -> String {
+        let cleanTitle = text.prefix(autoTitlePrefixLength).trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleanTitle.isEmpty ? "Chat" : String(cleanTitle)
+    }
+
+    /// The title to render in the UI. When the stored title is the auto-generated
+    /// truncation of the first user message, a trailing ellipsis marks the text
+    /// that was cut off so a shortened name does not read as complete.
+    nonisolated var displayTitle: String {
+        guard let firstUser = messages.first(where: { $0.role == .user }) else { return title }
+        let autoTitle = ChatSession.autoTitle(forFirstMessage: firstUser.content)
+        let fullLength = firstUser.content.trimmingCharacters(in: .whitespacesAndNewlines).count
+        guard title == autoTitle, fullLength > autoTitle.count else { return title }
+        return title + "…"
+    }
+
     /// The most recent timestamp we can actually trust for a conversation.
     ///
     /// `updatedAt` is only set at creation/decode; the UI mutation paths that

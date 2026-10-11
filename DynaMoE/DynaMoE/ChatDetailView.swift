@@ -46,9 +46,12 @@ struct ChatDetailView: View {
     var onOpenSettings: (() -> Void)? = nil
     var onToggleThinking: ((Bool) -> Void)? = nil
     var onToggleAgentTools: ((Bool) -> Void)? = nil
-    var onToggleSidebar: (() -> Void)? = nil
+    var onRenameSession: ((String) -> Void)? = nil
 
     @FocusState private var isInputFocused: Bool
+    @FocusState private var isSessionTitleFocused: Bool
+    @State private var isRenamingSession = false
+    @State private var sessionTitleDraft = ""
     @AppStorage("dynamoe_reasoning_expanded_by_default") private var reasoningExpandedByDefault: Bool = false
     @State private var isReasoningExpanded: [UUID: Bool] = [:]
     @State private var promptTokenCount: Int = 0
@@ -130,6 +133,19 @@ struct ChatDetailView: View {
         return "cube.fill"
     }
 
+    private func beginSessionRename() {
+        sessionTitleDraft = session?.title ?? ""
+        isRenamingSession = true
+    }
+
+    private func commitSessionRename() {
+        let trimmed = sessionTitleDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            onRenameSession?(trimmed)
+        }
+        isRenamingSession = false
+    }
+
     /// One row of the model selector menu. Shared by the system-models and
     /// Hugging Face sections so the AFM entry renders identically to a real
     /// snapshot model (checkmark, size, capability badges).
@@ -167,35 +183,33 @@ struct ChatDetailView: View {
             VStack(spacing: 0) {
                 // Header Bar (Antigravity breadcrumb style)
                 HStack(spacing: 8) {
-                    Button(action: {
-                        if let onToggleSidebar = onToggleSidebar {
-                            onToggleSidebar()
-                        } else {
-                            NSApp.keyWindow?.firstResponder?.tryToPerform(#selector(NSSplitViewController.toggleSidebar(_:)), with: nil)
-                        }
-                    }) {
-                        Image(systemName: "sidebar.leading")
-                            .font(.system(size: max(11, 13 * zoomManager.zoomScale), weight: .medium))
-                            .foregroundColor(.secondary)
-                            .frame(width: max(22, 26 * zoomManager.zoomScale), height: max(22, 26 * zoomManager.zoomScale))
-                            .background(Color.secondary.opacity(0.08))
-                            .clipShape(RoundedRectangle(cornerRadius: 6))
-                    }
-                    .buttonStyle(.plain)
-                    .help("Toggle Sidebar (⌘S)")
+                    if isRenamingSession {
+                        TextField("Session name", text: $sessionTitleDraft)
+                            .textFieldStyle(.plain)
+                            .font(.system(size: max(10, 13 * zoomManager.zoomScale), weight: .semibold))
+                            .foregroundColor(.primary)
+                            .frame(minWidth: max(120, 180 * zoomManager.zoomScale), maxWidth: max(200, 360 * zoomManager.zoomScale))
+                            .focused($isSessionTitleFocused)
+                            .onSubmit { commitSessionRename() }
+                            .onExitCommand { isRenamingSession = false }
+                            .onAppear { isSessionTitleFocused = true }
+                    } else {
+                        Text(session?.displayTitle ?? "App")
+                            .font(.system(size: max(10, 13 * zoomManager.zoomScale), weight: .semibold))
+                            .foregroundColor(.primary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                            .onTapGesture(count: 2) { beginSessionRename() }
+                            .help("Double-click to rename")
 
-                    Text("DynaMoE")
-                        .font(.system(size: max(10, 13 * zoomManager.zoomScale), weight: .regular))
-                        .foregroundColor(.secondary)
-                    
-                    Text("/")
-                        .font(.system(size: max(10, 13 * zoomManager.zoomScale), weight: .regular))
-                        .foregroundColor(.secondary.opacity(0.4))
-                    
-                    Text(session?.title ?? "App")
-                        .font(.system(size: max(10, 13 * zoomManager.zoomScale), weight: .semibold))
-                        .foregroundColor(.primary)
-                        .lineLimit(1)
+                        Button(action: beginSessionRename) {
+                            Image(systemName: "pencil")
+                                .font(.system(size: max(9, 11 * zoomManager.zoomScale), weight: .medium))
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Rename Conversation")
+                    }
                     
                     Spacer()
                     
@@ -301,6 +315,9 @@ struct ChatDetailView: View {
                 .padding(.horizontal, 24)
                 .padding(.vertical, 12)
                 .background(Color(NSColor.windowBackgroundColor))
+                .onChange(of: session?.id) { _ in
+                    isRenamingSession = false
+                }
                 
                 Divider()
 
