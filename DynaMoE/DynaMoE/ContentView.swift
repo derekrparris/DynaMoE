@@ -1922,11 +1922,12 @@ struct ContentView: View {
         // to disk. So keep the live value on overlap and append only history that
         // memory does not already have. The untouched launch placeholder is
         // dropped by identity rather than by being empty, so a New Chat created
-        // before the load finished survives even with no messages.
+        // before the load finished survives even with no messages. A rename marks
+        // the placeholder as used, so its new title is kept too.
         let memoryIds = Set(sessions.map(\.id))
         let diskOnly = loaded.filter { !memoryIds.contains($0.id) }
         let keptFromMemory = sessions.filter { session in
-            if session.id == launchPlaceholderId, session.messages.isEmpty { return false }
+            if session.id == launchPlaceholderId, session.isUnusedPlaceholder { return false }
             return true
         }
 
@@ -2173,10 +2174,13 @@ struct ContentView: View {
                             sessions[idx].isAgentToolsEnabled = enabled
                         }
                     },
-                    onToggleSidebar: {
-                        withAnimation(.easeInOut(duration: 0.2)) {
-                            columnVisibility = (columnVisibility == .detailOnly) ? .all : .detailOnly
-                        }
+                    onRenameSession: { newTitle in
+                        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !trimmed.isEmpty,
+                              let sid = selectedSessionId ?? sessions.first?.id,
+                              let idx = sessions.firstIndex(where: { $0.id == sid }) else { return }
+                        sessions[idx].title = trimmed
+                        sessions[idx].titleOrigin = .user
                     }
                 )
                 .safeAreaInset(edge: .top, spacing: 0) {
@@ -2976,10 +2980,14 @@ struct ContentView: View {
         let userMsg = ChatMessage(role: .user, content: text)
         sessions[sessionIdx].messages.append(userMsg)
         
-        // Auto-title session if it's the first user message
+        // Auto-title session if it's the first user message, unless the user
+        // already named this conversation before sending (the rename controls
+        // are available on an empty chat), in which case their name wins.
         if sessions[sessionIdx].messages.filter({ $0.role == .user }).count == 1 {
-            let cleanTitle = text.prefix(28).trimmingCharacters(in: .whitespacesAndNewlines)
-            sessions[sessionIdx].title = cleanTitle.isEmpty ? "Chat" : String(cleanTitle)
+            if sessions[sessionIdx].titleOrigin != .user {
+                sessions[sessionIdx].title = ChatSession.autoTitle(forFirstMessage: text)
+                sessions[sessionIdx].titleOrigin = ChatSession.autoTitleOrigin(forFirstMessage: text)
+            }
             sessions[sessionIdx].createdAt = Date()
         }
         

@@ -132,6 +132,18 @@ nonisolated public struct QueuedPrompt: Identifiable, Codable, Equatable, Sendab
     }
 }
 
+/// How a conversation's `title` came to be, so the UI can mark a shortened
+/// auto-generated name and the first-message auto-titler can leave a
+/// user-chosen name alone.
+nonisolated public enum SessionTitleOrigin: String, Codable, Equatable, Sendable {
+    /// Generated from the first user message, which fit inside the title.
+    case autoComplete
+    /// Generated from the first user message, which continued past the cut-off.
+    case autoTruncated
+    /// Chosen by the user.
+    case user
+}
+
 nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendable {
     public var id: UUID
     public var title: String
@@ -153,6 +165,11 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
     /// each /compact so recent context survives summarization at full fidelity
     /// until the next compaction folds it into `rollingSummary`.
     public var recentWorkDigest: String?
+    /// Where `title` came from. `nil` for a fresh conversation still showing its
+    /// placeholder name, so the first user message is free to auto-title it.
+    /// Persisted so the truncation marker survives compaction (which replaces
+    /// `messages` and would otherwise erase the evidence) and renames.
+    public var titleOrigin: SessionTitleOrigin?
 
     public init(
         id: UUID = UUID(),
@@ -167,7 +184,8 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         isAgentToolsEnabled: Bool? = nil,
         queuedPrompts: [QueuedPrompt] = [],
         rollingSummary: String? = nil,
-        recentWorkDigest: String? = nil
+        recentWorkDigest: String? = nil,
+        titleOrigin: SessionTitleOrigin? = nil
     ) {
         self.id = id
         self.title = title
@@ -182,6 +200,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         self.queuedPrompts = queuedPrompts
         self.rollingSummary = rollingSummary
         self.recentWorkDigest = recentWorkDigest
+        self.titleOrigin = titleOrigin
     }
 
     enum CodingKeys: String, CodingKey {
@@ -190,6 +209,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         case isThinkingEnabled, isAgentToolsEnabled
         case queuedPrompts
         case rollingSummary, recentWorkDigest
+        case titleOrigin
     }
 
     public init(from decoder: Decoder) throws {
@@ -207,6 +227,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         self.queuedPrompts = try container.decodeIfPresent([QueuedPrompt].self, forKey: .queuedPrompts) ?? []
         self.rollingSummary = try container.decodeIfPresent(String.self, forKey: .rollingSummary)
         self.recentWorkDigest = try container.decodeIfPresent(String.self, forKey: .recentWorkDigest)
+        self.titleOrigin = try container.decodeIfPresent(SessionTitleOrigin.self, forKey: .titleOrigin)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -224,10 +245,44 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         try container.encode(queuedPrompts, forKey: .queuedPrompts)
         try container.encodeIfPresent(rollingSummary, forKey: .rollingSummary)
         try container.encodeIfPresent(recentWorkDigest, forKey: .recentWorkDigest)
+        try container.encodeIfPresent(titleOrigin, forKey: .titleOrigin)
     }
 }
 
 public extension ChatSession {
+    /// Number of leading characters the first user message contributes to an
+    /// auto-generated conversation title.
+    nonisolated static let autoTitlePrefixLength = 28
+
+    /// The auto-generated title for the first user message: its leading
+    /// characters, trimmed, or "Chat" when there is nothing usable.
+    nonisolated static func autoTitle(forFirstMessage text: String) -> String {
+        let cleanTitle = text.prefix(autoTitlePrefixLength).trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleanTitle.isEmpty ? "Chat" : String(cleanTitle)
+    }
+
+    /// The origin to record alongside `autoTitle(forFirstMessage:)`: whether the
+    /// message continued past the characters the title kept.
+    nonisolated static func autoTitleOrigin(forFirstMessage text: String) -> SessionTitleOrigin {
+        let cleanTitle = text.prefix(autoTitlePrefixLength).trimmingCharacters(in: .whitespacesAndNewlines)
+        let fullLength = text.trimmingCharacters(in: .whitespacesAndNewlines).count
+        return fullLength > cleanTitle.count ? .autoTruncated : .autoComplete
+    }
+
+    /// The title to render in the UI, with a trailing ellipsis when the stored
+    /// name is a shortened auto-title so it does not read as complete.
+    nonisolated var displayTitle: String {
+        titleOrigin == .autoTruncated ? title + "…" : title
+    }
+
+    /// True when a conversation still holds nothing the user chose: no messages
+    /// and a title that was never set by hand. The startup history merge uses
+    /// this to decide whether the launch placeholder can be replaced by loaded
+    /// history, so a rename to that placeholder is not discarded.
+    nonisolated var isUnusedPlaceholder: Bool {
+        messages.isEmpty && titleOrigin != .user
+    }
+
     /// The most recent timestamp we can actually trust for a conversation.
     ///
     /// `updatedAt` is only set at creation/decode; the UI mutation paths that

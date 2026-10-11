@@ -86,6 +86,12 @@ struct SidebarView: View {
                                 onSelect: {
                                     selectedSessionId = session.id
                                 },
+                                onRename: { newTitle in
+                                    if let idx = sessions.firstIndex(where: { $0.id == session.id }) {
+                                        sessions[idx].title = newTitle
+                                        sessions[idx].titleOrigin = .user
+                                    }
+                                },
                                 onDelete: {
                                     onDeleteSession(session.id)
                                 }
@@ -175,8 +181,12 @@ struct SidebarSessionRow: View {
     let isSelected: Bool
     var zoomScale: CGFloat = 1.0
     let onSelect: () -> Void
+    let onRename: (String) -> Void
     let onDelete: () -> Void
     @State private var isHovered = false
+    @State private var isRenaming = false
+    @State private var draftTitle = ""
+    @FocusState private var isTitleFieldFocused: Bool
 
     var body: some View {
         HStack(spacing: 8) {
@@ -184,15 +194,33 @@ struct SidebarSessionRow: View {
                 .font(.system(size: max(9.5, 12 * zoomScale)))
                 .foregroundColor(isSelected ? .purple : .secondary)
 
-            Text(session.title)
-                .font(.system(size: max(10, 13 * zoomScale)))
-                .foregroundColor(isSelected ? .primary : .secondary)
-                .lineLimit(1)
-                .truncationMode(.tail)
+            if isRenaming {
+                TextField("Session name", text: $draftTitle)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: max(10, 13 * zoomScale)))
+                    .focused($isTitleFieldFocused)
+                    .onSubmit { commitRename() }
+                    .onExitCommand { isRenaming = false }
+                    .onAppear { isTitleFieldFocused = true }
+            } else {
+                Text(session.displayTitle)
+                    .font(.system(size: max(10, 13 * zoomScale)))
+                    .foregroundColor(isSelected ? .primary : .secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
 
             Spacer()
 
             if isHovered || isSelected {
+                Button(action: beginRename) {
+                    Image(systemName: "pencil")
+                        .font(.system(size: max(8.5, 11 * zoomScale)))
+                        .foregroundColor(.secondary.opacity(0.8))
+                }
+                .buttonStyle(.plain)
+                .help("Rename Conversation")
+
                 Button(action: onDelete) {
                     Image(systemName: "trash")
                         .font(.system(size: max(8.5, 11 * zoomScale)))
@@ -212,10 +240,25 @@ struct SidebarSessionRow: View {
         .cornerRadius(7)
         .contentShape(Rectangle())
         .onTapGesture {
-            onSelect()
+            if !isRenaming {
+                onSelect()
+            }
         }
         .onHover { hovering in
             isHovered = hovering
         }
+    }
+
+    private func beginRename() {
+        draftTitle = session.title
+        isRenaming = true
+    }
+
+    private func commitRename() {
+        let trimmed = draftTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            onRename(trimmed)
+        }
+        isRenaming = false
     }
 }

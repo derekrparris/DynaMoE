@@ -15894,6 +15894,57 @@ final class ChatSessionPersistenceTests: XCTestCase {
         ChatSession(title: title, messages: [], createdAt: updatedAt, updatedAt: updatedAt)
     }
 
+    // MARK: - Session title (pure logic)
+
+    func testAutoTitleUsesMessagePrefix() {
+        XCTAssertEqual(ChatSession.autoTitle(forFirstMessage: "Fix the parser"), "Fix the parser")
+        XCTAssertEqual(ChatSession.autoTitle(forFirstMessage: "   "), "Chat")
+    }
+
+    func testAutoTitleOriginMarksTruncation() {
+        XCTAssertEqual(ChatSession.autoTitleOrigin(forFirstMessage: "Short prompt"), .autoComplete)
+        XCTAssertEqual(ChatSession.autoTitleOrigin(forFirstMessage: String(repeating: "word ", count: 20)), .autoTruncated)
+    }
+
+    func testDisplayTitleMarksTruncatedAutoTitle() {
+        let truncated = ChatSession.autoTitle(forFirstMessage: String(repeating: "word ", count: 20))
+        let session = ChatSession(title: truncated, titleOrigin: .autoTruncated)
+        XCTAssertEqual(session.displayTitle, truncated + "…")
+    }
+
+    func testDisplayTitleLeavesCompleteAutoTitleUnchanged() {
+        let session = ChatSession(title: "Short", titleOrigin: .autoComplete)
+        XCTAssertEqual(session.displayTitle, "Short")
+    }
+
+    func testDisplayTitleLeavesRenamedTitleUnchanged() {
+        let session = ChatSession(title: "My custom name", titleOrigin: .user)
+        XCTAssertEqual(session.displayTitle, "My custom name")
+    }
+
+    func testTitleOriginSurvivesPersistenceRoundTrip() throws {
+        let session = ChatSession(title: "Truncated name", titleOrigin: .autoTruncated)
+        let data = try JSONEncoder().encode(session)
+        let decoded = try JSONDecoder().decode(ChatSession.self, from: data)
+        XCTAssertEqual(decoded.titleOrigin, .autoTruncated)
+    }
+
+    func testLegacySessionWithoutTitleOriginDecodesAsNil() throws {
+        let session = ChatSession(title: "Legacy", titleOrigin: .user)
+        let data = try JSONEncoder().encode(session)
+        var object = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        object.removeValue(forKey: "titleOrigin")
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(ChatSession.self, from: legacyData)
+        XCTAssertNil(decoded.titleOrigin)
+    }
+
+    func testPlaceholderIsUnusedOnlyWhenEmptyAndUntitled() {
+        XCTAssertTrue(ChatSession(messages: [], titleOrigin: nil).isUnusedPlaceholder)
+        XCTAssertFalse(ChatSession(messages: [], titleOrigin: .user).isUnusedPlaceholder, "A rename must keep the placeholder from being discarded at startup")
+        XCTAssertFalse(ChatSession(messages: [ChatMessage(role: .user, content: "hi")], titleOrigin: nil).isUnusedPlaceholder)
+    }
+
     // MARK: - Retention plan (pure logic)
 
     func testRetentionPlanKeepsMostRecentWithinLimit() {
