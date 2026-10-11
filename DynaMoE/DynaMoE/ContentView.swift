@@ -5166,12 +5166,12 @@ struct ContentView: View {
             var firstPartialAt = 0.0
             var lastUIUpdateTime = 0.0
 
-            // Cancellation exits below bypass the success finalizer, so the
-            // odometer would otherwise be left at the last throttled streaming
-            // write and drop the tail of the final snapshot. Committing here —
-            // only while this task still owns the generation, which holds
-            // because a replacement cannot start until this task returns —
-            // keeps stopped turns fully counted.
+            // Cancellation and error exits below bypass the success finalizer,
+            // so the odometer would otherwise be left at the last throttled
+            // streaming write and drop the tail of the final snapshot.
+            // Committing here — only while this task still owns the generation,
+            // which holds because a replacement cannot start until this task
+            // returns — keeps stopped and failed turns fully counted.
             func commitOdometerTail() {
                 guard !latestPartial.isEmpty, self.ownsGeneration(myGenerationId),
                       let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) else { return }
@@ -5223,10 +5223,13 @@ struct ContentView: View {
                     }
                 }
             } catch {
+                // The turn ends here instead of in the success finalizer below —
+                // stopped, superseded, or errored — so the odometer needs the
+                // tail of the final snapshot either way.
+                commitOdometerTail()
                 // Stop-button cancellation throws out of the stream iteration;
                 // whatever partial text already streamed stays in the message.
                 if Task.isCancelled || !self.ownsGeneration(myGenerationId) {
-                    commitOdometerTail()
                     return
                 }
                 let errText = "⚠️ Apple Foundation Model error: \(error.localizedDescription)"
@@ -15018,6 +15021,14 @@ if layer.attnGateProjTensor != nil,
                                let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
                                 self.sessions[sIdx].messages[mIdx].isThinking = false
                             }
+                            // The turn dies here instead of in the finalizer, so
+                            // the odometer needs the exact tail — the throttled
+                            // streaming writes may sit a few tokens behind this
+                            // failure.
+                            if cumulativeStepTracked, let sId = sessionId,
+                               let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
+                                self.sessions[sIdx].cumulativeTokenCount = cumulativeStepBase + tokensGenerated
+                            }
                         }
                         return
                     }
@@ -15384,6 +15395,12 @@ if layer.attnGateProjTensor != nil,
                            let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
                             self.sessions[sIdx].messages[mIdx].prefillStatus = nil
                             self.sessions[sIdx].messages[mIdx].isThinking = false
+                        }
+                        // The turn ends here without the finalizer's reconcile;
+                        // keep the odometer exact through the failure.
+                        if cumulativeStepTracked, let sId = sessionId,
+                           let sIdx = self.sessions.firstIndex(where: { $0.id == sId }) {
+                            self.sessions[sIdx].cumulativeTokenCount = cumulativeStepBase + tokensGenerated
                         }
                     }
                     return
