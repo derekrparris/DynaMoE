@@ -2205,6 +2205,7 @@ struct ContentView: View {
                         Text("DynaMoE")
                             .font(.system(size: max(11, 14 * zoomManager.zoomScale), weight: .bold))
                     }
+                    .padding(.horizontal, 10)
                     .accessibilityElement(children: .combine)
                     .accessibilityLabel("DynaMoE")
                 }
