@@ -325,7 +325,6 @@ struct ChatDetailView: View {
                     .buttonStyle(.plain)
                     .help("Toggle Background Task Manager Drawer (⌘D)")
                 }
-                .focusEffectDisabled()
                 .padding(.horizontal, 24)
                 .padding(.vertical, 12)
                 .background(Color(NSColor.windowBackgroundColor))

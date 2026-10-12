@@ -1395,6 +1395,10 @@ struct ContentView: View {
     /// selection from superseding the user's newer one.
     @State private var modelSwitchRequestId: UInt64 = 0
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    /// Absorbs the window's automatic initial keyboard focus so the first
+    /// interactive control does not greet the user with a focus ring on launch.
+    /// Keyboard navigation moves off this anchor to real controls normally.
+    @FocusState private var launchFocusAnchor: Bool
     /// Reference box holding the `sessions` array. SwiftUI's `@State` exposes only
     /// get/set for its value, so a computed proxy that yields `&storedSessions`
     /// during a nested write (for example `sessions[i].messages[j].content = ...`,
@@ -2067,6 +2071,13 @@ struct ContentView: View {
 
     var body: some View {
         ZStack {
+            Color.clear
+                .frame(width: 1, height: 1)
+                .focusable()
+                .focused($launchFocusAnchor)
+                .focusEffectDisabled()
+                .accessibilityHidden(true)
+
             NavigationSplitView(columnVisibility: $columnVisibility) {
                 SidebarView(
                     // Route the binding through the computed `sessions` so sidebar
@@ -2232,6 +2243,7 @@ struct ContentView: View {
                 .animation(.easeInOut(duration: 0.2), value: zoomManager.hudText)
             }
         }
+        .defaultFocus($launchFocusAnchor, true)
         .onChange(of: isSettingsPresented) { isPresented in
             if isPresented {
                 openSettingsWindow()
