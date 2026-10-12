@@ -287,7 +287,7 @@
   <div>
     <h1>DynaMoE</h1>
     <div class="meta-line">
-      <span class="ver-chip">v26.4</span>            <!-- EDIT: version -->
+      <span class="ver-chip">v26.5</span>            <!-- EDIT: version -->
     </div>
     <div class="tagline">High-Performance MoE Inference Engine for Apple Silicon</div>
   </div>
@@ -297,18 +297,16 @@
 <section>
   <h2>
     <span class="icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.5 14 5v6l-6 3.5L2 11V5l6-3.5Zm0 1.73L3.5 5.87v4.26L8 12.77l4.5-2.64V5.87L8 3.23Zm0 1.6 3.2 1.88v2.58L8 11.17 4.8 9.29V6.71L8 4.83Z"/></svg></span>
-    What's New in 26.4
+    What's New in 26.5
   </h2>
   <div class="card">
-    <h3>Apple Foundation Model support:</h3> Chat with Apple's on-device Foundation Model, with live activity indicator, smoothed streaming, and a per-turn history budget so the transcript honors its context window.
+    <h3>Conversation renaming:</h3> Rename any conversation inline from the sidebar or the active chat header. Titles you set are never overwritten by auto-generated ones, truncated auto-titles are marked with an ellipsis, and both survive /compact and relaunches.
   </br></br>
-    <h3>/compact Conversation Compaction:</h3> Manual /compact slash command (opencode-style) that folds the conversation into two AFM digests — a rolling general summary plus a detailed recap of recent work — injected into every later prompt on both backends. Transactional (a failed model leaves chat untouched), chunked for long histories, includes tool-call records. Auto-compact on context limits is deliberately deferred to a follow-up.
+    <h3>Session token odometer:</h3> The chat header now tracks a live, cumulative token count for the whole conversation: prompt tokens plus everything the model generates, ticking during decoding, persisted with each chat, and reset by /compact. Conversations from before this feature pick the counter up automatically on their next full prompt.
   </br></br>  
-    <h3>Settings Glow-up:</h3> Reworked settings into a sidebar-driven layout matching macOS System Settings: sliders + editable numeric fields replacing steppers, shaded group backgrounds, three-per-row sampling controls with precise inputs, and an updated settings guide.
+    <h3>Inline agent activity:</h3> A pulsing "Working..." indicator now appears in the message stream while the model streams a tool call's arguments or the agent executes it, across all three supported tool-calling dialects, so long tool turns read as live work instead of a frozen transcript.
   </br></br>
-    <h3>Composer polish:</h3> Chat composer default height reduced by a third; minimum fits one line with trimmed chrome.
-  </br></br>
-    <h3>Gemma 4 26B A4B support:</h3> DynaMoE now loads and runs `google/gemma-4-26B-A4B-it` end to end: architecture detection, the interleaved sliding/global attention layers (per-head q/k norms, proportional RoPE on global layers), the dense+MoE decoder block, and the `<|channel>thought … <channel|>` reasoning template. Verified element-for-element against the HF reference forward pass.
+    <h3>Chrome polish:</h3> A single centered app name in the window title bar replaces the duplicated sidebar branding, and the redundant header breadcrumb, sidebar toggle, and thumbs up/down feedback buttons are gone.
   </div>
 </section>
 
@@ -319,15 +317,17 @@
     Fixes
   </h2>
   <ul class="changes">
-    <li><strong>Chat Formatting:</strong> Stop chat messages from truncating and overlapping when selected</li>
-    <li><strong>RAM telemetry:</strong> "Process Heap" mislabeled RSIZE as the Activity Monitor/Xcode number (actually`phys_footprint`, overstated up to 5.2×), and Working Set RAM double-counted weight bytes (~12.9 GB shown was really ~5 GB), evicting experts early. Now shows genuine footprint + a new "Unified Memory Cache" line; budget decisions use RSIZE alone. Also removed the pread-into-read-only-mmap prefetch path that was a silent no-op (EFAULT).</li>
-    <li><strong>FP8 slow at long context:</strong> FP8 KV-cache decode never got the FP16 path's flash-decoding split-K kernels — one thread per head over the whole context. Added FP8 chunked scan kernels for Spark and Ornith, and disabled JetSpec under FP8 (its verify kernels would corrupt a 1-byte-element cache with 4-byte writes). Added fused FP8 attention benchmark coverage.</li>
-    <li><strong>Agent tool-call regressions:</strong> Fixed three tool-call regression causes from live runs, two Spark agent stalls (whitespace loop, missing turn reopen), KV splice relayout corruption on head-count padding / stride shrink, FP8 scale buffers going stale on spliced stride changes, Spark's end-of-text marker leaking into saved replies, and web_fetch now loading by default at session start.</li>
+    <li><strong>Chat actions:</strong> Copy and speaker buttons no longer appear on thinking-only or tool-call-only turns; read-aloud is restricted to assistant replies and speaks only the visible text, never hidden tool markup</li>
+    <li><strong>Tool-stream rendering:</strong> Raw Qwen and Llama tool-call markup no longer leaks into the transcript mid-stream or reappears after a call parses, and tool-only turns keep their time-to-first-token, throughput, and token stats</li>
+    <li><strong>Title persistence:</strong> A conversation renamed before the startup history load finishes is no longer reverted to its previous title</li>
+    <li><strong>Token counting:</strong> Stopped, cancelled, and failed turns now commit their final token counts so the odometer never loses the tail; empty on-device responses no longer add a phantom token</li>
+    <li><strong>Keyboard focus:</strong> No stray focus ring lights up a header button at launch, the rename button no longer steals focus on first open, and Full Keyboard Access users keep their focus indicators with no hidden tab stop</li>
+    <li><strong>Model guidance:</strong> The 16 GB settings profile now recommends native Ornith weights, agreeing with the README's preference for native weights over MLX quantizations</li>
   </ul>
 </section>
 
 <footer>
-  <a class="btn" href="https://github.com/derekrparris/DynaMoE/releases/tag/v26.4">   <!-- EDIT: release URL -->
+  <a class="btn" href="https://github.com/derekrparris/DynaMoE/releases/tag/v26.5">   <!-- EDIT: release URL -->
     <svg viewBox="0 0 16 16" fill="currentColor"><path d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l1.66-1.66a2 2 0 0 0 0-2.83l-.94-.94a2 2 0 0 0-2.83 0L3.51 6.01a2 2 0 0 0 0 2.83l.94.94a.75.75 0 0 0 1.06-1.06l-.94-.94a.5.5 0 0 1 0-.71l2.35-2.35a.5.5 0 0 1 .71 0l.94.94a.5.5 0 0 1 0 .71L6.22 8.72Zm3.56-1.44a.75.75 0 0 0-1.06-1.06L7.06 7.88a2 2 0 0 0 0 2.83l.94.94a2 2 0 0 0 2.83 0l2.35-2.35a2 2 0 0 0 0-2.83l-.94-.94a.75.75 0 0 0-1.06 1.06l.94.94a.5.5 0 0 1 0 .71L9.77 9.59a.5.5 0 0 1-.71 0l-.94-.94a.5.5 0 0 1 0-.71l1.66-1.66Z"/></svg>
     GitHub Release
   </a>
