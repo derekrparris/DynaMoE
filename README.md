@@ -34,15 +34,17 @@ Special thanks and acknowledgement to the open-source projects and research that
 
 DynaMoE supports sparse Mixture-of-Experts, hybrid recurrent SSM/attention architectures, and dense autoregressive transformers with automatic model topology detection.
 
+**Important Note:** DynaMoE uses custom metal kernals and shaders to run models efficiently and to take full advantage of Apple's unified memory architecture. **There is no need to use MLX quantizations** in DynaMoE. In fact, in many cases, an MLX version will run slower or not run at all in DynaMoE. It is advisable to run the native (non MLX and non-GGUF) versions of models in DynaMoE.
+
 On macOS 26 or later with Apple Intelligence enabled, Apple's built-in **on-device Foundation Model** is also selectable as a zero-install chat backend (plain chat; agent tools, JetSpec, thinking blocks, and KV-cache prefixing are local-weights features that do not apply). It appears in the chat model picker under **System Models**, and it powers `/compact` manual conversation compaction on any backend: a rolling general summary plus a detailed recap of the most recent work replace the evicted history — leaving a blank slate with just the compaction marker — in every later prompt.
 
 **The following models have been tested and should run well in DynaMoE:**
 
-* **Gemma 4 26B A4B**
-* **Ornith 1.5 35B A3B**
-* **Ling 3.0 Tiny**
-* **Qwen 3.8 Flash Next FP8 MoE**
-* **Spark-X2.5-4B** - a note on Spark - it uses an interesting hybrid attention architecture with one full attention layer and three sliding-window attention layers. Prefill takes a LONG time on my M1 Pro Macbook, but it has a native 1 million token context. So if you're willing to run it on some interesting longer horizon tasks during downtime, results can be interesting. Fun small model to play with.
+* **google/gemma-4-26B-A4B**
+* **ornith-ai/Ornith-1.5-35B-A3B**
+* **inclusionAI/Ling-3.0-tiny**
+* **Qwen/Qwen3.8-Flash-Next and Qwen/Qwen3.8-Flash-Next-FP8**
+* **XHToken/Spark-X2.5-4B** - a note on Spark - it uses an interesting hybrid attention architecture with one full attention layer and three sliding-window attention layers. Prefill takes a LONG time on my M1 Pro Macbook, but it has a native 1 million token context. So if you're willing to run it on some interesting longer horizon tasks during downtime, results can be interesting. Fun small model to play with.
 
 **Note:** I don't currently have enough disk space to fully repack Qwen3.8 Flash Next to test streaming optimizations. If anyone has the room to test speeds with full repacking, please do let me know. I will be able to conduct further tests once I get a new computer :)
 
