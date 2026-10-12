@@ -2189,6 +2189,27 @@ struct ContentView: View {
                     }
                 }
             }
+            .toolbar(removing: .title)
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "circle.hexagongrid.circle.fill")
+                            .font(.system(size: max(11, 15 * zoomManager.zoomScale)))
+                            .foregroundStyle(
+                                LinearGradient(
+                                    colors: [.purple, .indigo, .blue],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
+                        Text("DynaMoE")
+                            .font(.system(size: max(11, 14 * zoomManager.zoomScale), weight: .bold))
+                    }
+                    .padding(.horizontal, 10)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("DynaMoE")
+                }
+            }
 
             if let hud = zoomManager.hudText {
                 VStack {
@@ -2257,6 +2278,15 @@ struct ContentView: View {
                 applyProfile(initialProfile, for: activeLoadedModelPath ?? localModelManager.defaultModelId)
             }
             updatePagingStats()
+
+            // AppKit hands the window's automatic key-view focus to the first
+            // control as the window appears, lighting up a focus ring the
+            // moment the app opens. Clearing the first responder rests focus on
+            // the window instead, so no control is highlighted until the user
+            // navigates with the keyboard, where the standard ring returns.
+            DispatchQueue.main.async {
+                NSApp.keyWindow?.makeFirstResponder(nil)
+            }
         }
         .onChange(of: selectedSessionId) { newId in
             // The session that was protected from pruning may have just changed,
