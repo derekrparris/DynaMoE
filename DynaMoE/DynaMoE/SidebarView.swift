@@ -20,27 +20,8 @@ struct SidebarView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Header: Branding & New Chat Button
+            // Header: New Chat Button
             VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 8) {
-                    Image(systemName: "circle.hexagongrid.circle.fill")
-                        .font(.system(size: max(15, 20 * zoomManager.zoomScale)))
-                        .foregroundStyle(
-                            LinearGradient(
-                                colors: [.purple, .indigo, .blue],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                    
-                    Text("DynaMoE")
-                        .font(.system(size: max(13, 16 * zoomManager.zoomScale), weight: .bold))
-                    
-                    Spacer()
-                }
-                .padding(.horizontal, 14)
-                .padding(.top, 14)
-
                 // New Chat Action Button
                 Button(action: onNewChat) {
                     HStack(spacing: 8) {
@@ -57,6 +38,7 @@ struct SidebarView: View {
                 }
                 .buttonStyle(.plain)
                 .padding(.horizontal, 12)
+                .padding(.top, 14)
             }
             .padding(.bottom, 8)
 

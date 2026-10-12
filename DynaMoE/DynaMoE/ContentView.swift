@@ -2189,6 +2189,26 @@ struct ContentView: View {
                     }
                 }
             }
+            .toolbar(removing: .title)
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "circle.hexagongrid.circle.fill")
+                            .font(.system(size: max(11, 15 * zoomManager.zoomScale)))
+                            .foregroundStyle(
+                                LinearGradient(
+                                    colors: [.purple, .indigo, .blue],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
+                        Text("DynaMoE")
+                            .font(.system(size: max(11, 14 * zoomManager.zoomScale), weight: .bold))
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("DynaMoE")
+                }
+            }
 
             if let hud = zoomManager.hudText {
                 VStack {
