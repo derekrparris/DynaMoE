@@ -208,6 +208,7 @@ struct ChatDetailView: View {
                                 .foregroundColor(.secondary)
                         }
                         .buttonStyle(.plain)
+                        .focusable(false)
                         .help("Rename Conversation")
                     }
                     
