@@ -81,8 +81,8 @@ The **Models** section acts as your local model registry and management hub.
 ┌────────────────────────────────────────────────────────────────────────┐
 │  Models Section                                                        │
 │  ┌──────────────────────────────────────────────────────────────────┐  │
-│  │ 📦 mlx-community/Ornith-1.5-9B-OptiQ-4bit   [Active] [⋯] [Loaded] │  │
-│  │    Architecture: Hybrid GDN + GQA | Precision: 4-bit | 5.4 GB    │  │
+│  │ 📦 ornith-ai/Ornith-1.5-9B                  [Active] [⋯] [Loaded] │  │
+│  │    Architecture: Hybrid GDN + GQA | Precision: BF16 | 19.3 GB    │  │
 │  └──────────────────────────────────────────────────────────────────┘  │
 │  ┌──────────────────────────────────────────────────────────────────┐  │
 │  │ 📦 Qwen/Qwen3.8-Flash-Next-FP8              [Default] [⋯]  [Load] │  │
@@ -398,8 +398,8 @@ Test GPU compute pipelines in isolation without running full autoregressive gene
 ## 8. Hardware Profiles & Recommended Configurations
 
 ### 16 GB Unified RAM (M1/M2/M3/M4)
-- **Primary Model**: `mlx-community/Ornith-1.5-9B-OptiQ-4bit` (Dense Hybrid GDN).
-- **Memory Execution Mode**: `Auto (Smart)` or `Full RAM`.
+- **Primary Model**: `ornith-ai/Ornith-1.5-9B` (Dense Hybrid GDN; BF16 weights stream from SSD).
+- **Memory Execution Mode**: `Auto (Smart)` (the BF16 model exceeds 16 GB, so weights stream from SSD).
 - **KV Cache Precision**: `FP16` or `FP8 E4M3` (FP8 recommended for $>8,000$ token contexts).
 - **JetSpec**: Disabled (`false`).
 - **Coder Profile**: $T=0.60$, $\text{Top-}P=0.95$, $\text{Top-}K=20$, $\text{RepPen}=1.00$, $\text{PresPen}=0.00$.
