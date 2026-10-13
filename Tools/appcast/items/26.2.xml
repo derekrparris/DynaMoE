@@ -2,6 +2,7 @@
             <title>Version 26.2</title>
             <sparkle:version>26.2</sparkle:version>
             <sparkle:shortVersionString>26.2</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.6</sparkle:minimumSystemVersion>
             <link>https://github.com/derekrparris/DynaMoE/releases/tag/v26.2</link>
             <description><![CDATA[<style>
   :root {
