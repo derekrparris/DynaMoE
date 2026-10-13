@@ -202,6 +202,7 @@ cat > "$ITEMS_DIR/$VERSION.xml" <<EOF
             <title>Version $VERSION</title>
             <sparkle:version>$BUNDLE_VERSION</sparkle:version>
             <sparkle:shortVersionString>$VERSION</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>15.6</sparkle:minimumSystemVersion>
             <link>https://github.com/${REPO_SLUG}/releases/tag/v${VERSION}</link>
             <description><![CDATA[DynaMoE $VERSION]]></description>
             <pubDate>$PUB_DATE</pubDate>

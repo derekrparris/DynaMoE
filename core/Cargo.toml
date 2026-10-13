@@ -9,15 +9,15 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 memmap2 = "0.9"
-safetensors = "0.4"
-uniffi = { version = "0.28", features = ["build", "cli"] }
-tokenizers = "0.20"
+safetensors = "0.8"
+uniffi = { version = "0.32", features = ["build", "cli"] }
+tokenizers = "0.23"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 libc = "0.2"
 
 [build-dependencies]
-uniffi = { version = "0.28", features = ["build"] }
+uniffi = { version = "0.32", features = ["build"] }
 
 [[bin]]
 name = "uniffi-bindgen"

@@ -39,6 +39,52 @@ fileprivate extension ForeignBytes {
     init(bufferPointer: UnsafeBufferPointer<UInt8>) {
         self.init(len: Int32(bufferPointer.count), data: bufferPointer.baseAddress)
     }
+
+    init(rawBufferPointer: UnsafeRawBufferPointer) {
+        self.init(
+            len: Int32(rawBufferPointer.count),
+            data: rawBufferPointer.baseAddress?.assumingMemoryBound(to: UInt8.self)
+        )
+    }
+}
+
+// Converter for `&[u8]` / `[ByRef] bytes` arguments.
+//
+// Conforms to `FfiConverter` so the compiler enforces the full converter
+// method set. Only the scope-bound `lower(_:_body:)` overload is sound —
+// zero-copy byte buffers only flow foreign -> Rust, and only in argument
+// position. The four protocol-witness methods (`lift`, `lower`, `read`,
+// `write`) `fatalError` at runtime if anyone reaches them.
+//
+// The scope-bound `lower` takes a closure because the `ForeignBytes`
+// pointer is only guaranteed valid for the duration of
+// `Data.withUnsafeBytes`. Callers must run the full FFI call inside
+// the closure body.
+fileprivate enum FfiConverterByRefBytes: FfiConverter {
+    typealias SwiftType = Data
+    typealias FfiType = ForeignBytes
+
+    static func lower<R>(_ value: Data, _ body: (ForeignBytes) throws -> R) rethrows -> R {
+        return try value.withUnsafeBytes { rawBuf in
+            try body(ForeignBytes(rawBufferPointer: rawBuf))
+        }
+    }
+
+    static func lower(_ value: Data) -> ForeignBytes {
+        fatalError("ByRef bytes cannot use the plain lower: returning ForeignBytes escapes the Data.withUnsafeBytes scope. Use the scope-bound lower(_:_body:) overload instead.")
+    }
+
+    static func lift(_ value: ForeignBytes) throws -> Data {
+        fatalError("ByRef bytes cannot be lifted: zero-copy &[u8] only flows foreign->Rust")
+    }
+
+    static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Data {
+        fatalError("ByRef bytes cannot be read from a buffer: zero-copy &[u8] is only supported in argument position, not nested in records/options/etc.")
+    }
+
+    static func write(_ value: Data, into buf: inout [UInt8]) {
+        fatalError("ByRef bytes cannot be written to a buffer: zero-copy &[u8] is only supported in argument position, not nested in records/options/etc.")
+    }
 }
 
 // For every type used in the interface, we provide helper methods for conveniently
@@ -281,7 +327,7 @@ private func makeRustCall<T, E: Swift.Error>(
     _ callback: (UnsafeMutablePointer<RustCallStatus>) -> T,
     errorHandler: ((RustBuffer) throws -> E)?
 ) throws -> T {
-    uniffiEnsureInitialized()
+    uniffiEnsureDynamoeCoreInitialized()
     var callStatus = RustCallStatus.init()
     let returnedVal = callback(&callStatus)
     try uniffiCheckCallStatus(callStatus: callStatus, errorHandler: errorHandler)
@@ -352,18 +398,29 @@ private func uniffiTraitInterfaceCallWithError<T, E>(
         callStatus.pointee.errorBuf = FfiConverterString.lower(String(describing: error))
     }
 }
-fileprivate class UniffiHandleMap<T> {
-    private var map: [UInt64: T] = [:]
+// Initial value and increment amount for handles. 
+// These ensure that SWIFT handles always have the lowest bit set
+fileprivate let UNIFFI_HANDLEMAP_INITIAL: UInt64 = 1
+fileprivate let UNIFFI_HANDLEMAP_DELTA: UInt64 = 2
+
+fileprivate final class UniffiHandleMap<T>: @unchecked Sendable {
+    // All mutation happens with this lock held, which is why we implement @unchecked Sendable.
     private let lock = NSLock()
-    private var currentHandle: UInt64 = 1
+    private var map: [UInt64: T] = [:]
+    private var currentHandle: UInt64 = UNIFFI_HANDLEMAP_INITIAL
 
     func insert(obj: T) -> UInt64 {
         lock.withLock {
-            let handle = currentHandle
-            currentHandle += 1
-            map[handle] = obj
-            return handle
+            return doInsert(obj)
         }
+    }
+
+    // Low-level insert function, this assumes `lock` is held.
+    private func doInsert(_ obj: T) -> UInt64 {
+        let handle = currentHandle
+        currentHandle += UNIFFI_HANDLEMAP_DELTA
+        map[handle] = obj
+        return handle
     }
 
      func get(handle: UInt64) throws -> T {
@@ -372,6 +429,15 @@ fileprivate class UniffiHandleMap<T> {
                 throw UniffiInternalError.unexpectedStaleHandle
             }
             return obj
+        }
+    }
+
+     func clone(handle: UInt64) throws -> UInt64 {
+        try lock.withLock {
+            guard let obj = map[handle] else {
+                throw UniffiInternalError.unexpectedStaleHandle
+            }
+            return doInsert(obj)
         }
     }
 
@@ -475,7 +541,11 @@ fileprivate struct FfiConverterString: FfiConverter {
             return String()
         }
         let bytes = UnsafeBufferPointer<UInt8>(start: value.data!, count: Int(value.len))
-        return String(bytes: bytes, encoding: String.Encoding.utf8)!
+        // Use Swift's native UTF-8 decoder; `String(bytes:encoding:.utf8)` goes
+        // through Foundation's NSString and silently strips a leading U+FEFF BOM.
+        // Invalid UTF-8 substitutes U+FFFD instead of trapping (unreachable
+        // given Rust's `String` invariant).
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     public static func lower(_ value: String) -> RustBuffer {
@@ -491,7 +561,8 @@ fileprivate struct FfiConverterString: FfiConverter {
 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> String {
         let len: Int32 = try readInt(&buf)
-        return String(bytes: try readBytes(&buf, count: Int(len)), encoding: String.Encoding.utf8)!
+        // See `lift` above for why we avoid Foundation's NSString-backed decoder here.
+        return String(decoding: try readBytes(&buf, count: Int(len)), as: UTF8.self)
     }
 
     public static func write(_ value: String, into buf: inout [UInt8]) {
@@ -504,7 +575,7 @@ fileprivate struct FfiConverterString: FfiConverter {
 
 
 
-public protocol DynaMoeEngineProtocol : AnyObject {
+public protocol DynaMoeEngineProtocol: AnyObject, Sendable {
     
     /**
      * Asynchronously advises kernel page cache for prefetching (willneed) or proactive eviction (dontneed)
@@ -519,60 +590,63 @@ public protocol DynaMoeEngineProtocol : AnyObject {
     func getSummary() throws  -> ModelSummary
     
 }
+open class DynaMoeEngine: DynaMoeEngineProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
 
-open class DynaMoeEngine:
-    DynaMoeEngineProtocol {
-    fileprivate let pointer: UnsafeMutableRawPointer!
-
-    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    public struct NoPointer {
+    public struct NoHandle {
         public init() {}
     }
 
     // TODO: We'd like this to be `private` but for Swifty reasons,
     // we can't implement `FfiConverter` without making this `required` and we can't
     // make it `required` without making it `public`.
-    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
-        self.pointer = pointer
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
     }
 
     // This constructor can be used to instantiate a fake object.
-    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
     //
     // - Warning:
-    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    public init(noPointer: NoPointer) {
-        self.pointer = nil
+    public init(noHandle: NoHandle) {
+        self.handle = 0
     }
 
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
-        return try! rustCall { uniffi_dynamoe_core_fn_clone_dynamoeengine(self.pointer, $0) }
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_dynamoe_core_fn_clone_dynamoeengine(self.handle, $0) }
     }
 public convenience init(filePath: String)throws  {
-    let pointer =
-        try rustCallWithError(FfiConverterTypeEngineError.lift) {
+    let handle =
+        try rustCallWithError(FfiConverterTypeEngineError_lift) {
+        uniffiCallStatus in
     uniffi_dynamoe_core_fn_constructor_dynamoeengine_new(
-        FfiConverterString.lower(filePath),$0
+        FfiConverterString.lower(filePath),uniffiCallStatus
     )
 }
-    self.init(unsafeFromRawPointer: pointer)
+    self.init(unsafeFromHandle: handle)
 }
 
     deinit {
-        guard let pointer = pointer else {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
             return
         }
 
-        try! rustCall { uniffi_dynamoe_core_fn_free_dynamoeengine(pointer, $0) }
+        try! rustCall { uniffi_dynamoe_core_fn_free_dynamoeengine(handle, $0) }
     }
 
     
@@ -581,12 +655,14 @@ public convenience init(filePath: String)throws  {
     /**
      * Asynchronously advises kernel page cache for prefetching (willneed) or proactive eviction (dontneed)
      */
-open func adviseShardRange(shardIndex: UInt32, offset: UInt64, length: UInt64, advice: String)throws  {try rustCallWithError(FfiConverterTypeEngineError.lift) {
-    uniffi_dynamoe_core_fn_method_dynamoeengine_advise_shard_range(self.uniffiClonePointer(),
+open func adviseShardRange(shardIndex: UInt32, offset: UInt64, length: UInt64, advice: String)throws   {try rustCallWithError(FfiConverterTypeEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_dynamoe_core_fn_method_dynamoeengine_advise_shard_range(
+            self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(shardIndex),
         FfiConverterUInt64.lower(offset),
         FfiConverterUInt64.lower(length),
-        FfiConverterString.lower(advice),$0
+        FfiConverterString.lower(advice),uniffiCallStatus
     )
 }
 }
@@ -594,218 +670,215 @@ open func adviseShardRange(shardIndex: UInt32, offset: UInt64, length: UInt64, a
     /**
      * Resolves sparse N-Gram Predictive Local Embedding (PLE) row offset and length without loading table into RAM
      */
-open func getNgramRowDescriptor(ngramHash: UInt32, hiddenDim: UInt32, bytesPerElem: UInt32)throws  -> NgramRowDescriptor? {
-    return try  FfiConverterOptionTypeNgramRowDescriptor.lift(try rustCallWithError(FfiConverterTypeEngineError.lift) {
-    uniffi_dynamoe_core_fn_method_dynamoeengine_get_ngram_row_descriptor(self.uniffiClonePointer(),
+open func getNgramRowDescriptor(ngramHash: UInt32, hiddenDim: UInt32, bytesPerElem: UInt32)throws  -> NgramRowDescriptor?  {
+    return try  FfiConverterOptionTypeNgramRowDescriptor.lift(try rustCallWithError(FfiConverterTypeEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_dynamoe_core_fn_method_dynamoeengine_get_ngram_row_descriptor(
+            self.uniffiCloneHandle(),
         FfiConverterUInt32.lower(ngramHash),
         FfiConverterUInt32.lower(hiddenDim),
-        FfiConverterUInt32.lower(bytesPerElem),$0
+        FfiConverterUInt32.lower(bytesPerElem),uniffiCallStatus
     )
 })
 }
     
-open func getSummary()throws  -> ModelSummary {
-    return try  FfiConverterTypeModelSummary.lift(try rustCallWithError(FfiConverterTypeEngineError.lift) {
-    uniffi_dynamoe_core_fn_method_dynamoeengine_get_summary(self.uniffiClonePointer(),$0
+open func getSummary()throws  -> ModelSummary  {
+    return try  FfiConverterTypeModelSummary_lift(try rustCallWithError(FfiConverterTypeEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_dynamoe_core_fn_method_dynamoeengine_get_summary(
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
     
 
+    
 }
+
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
 public struct FfiConverterTypeDynaMoeEngine: FfiConverter {
-
-    typealias FfiType = UnsafeMutableRawPointer
+    typealias FfiType = UInt64
     typealias SwiftType = DynaMoeEngine
 
-    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> DynaMoeEngine {
-        return DynaMoeEngine(unsafeFromRawPointer: pointer)
+    public static func lift(_ handle: UInt64) throws -> DynaMoeEngine {
+        return DynaMoeEngine(unsafeFromHandle: handle)
     }
 
-    public static func lower(_ value: DynaMoeEngine) -> UnsafeMutableRawPointer {
-        return value.uniffiClonePointer()
+    public static func lower(_ value: DynaMoeEngine) -> UInt64 {
+        return value.uniffiCloneHandle()
     }
 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DynaMoeEngine {
-        let v: UInt64 = try readInt(&buf)
-        // The Rust code won't compile if a pointer won't fit in a UInt64.
-        // We have to go via `UInt` because that's the thing that's the size of a pointer.
-        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
-        if (ptr == nil) {
-            throw UniffiInternalError.unexpectedNullPointer
-        }
-        return try lift(ptr!)
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
     }
 
     public static func write(_ value: DynaMoeEngine, into buf: inout [UInt8]) {
-        // This fiddling is because `Int` is the thing that's the same size as a pointer.
-        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
-        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+        writeInt(&buf, lower(value))
     }
 }
 
 
-
-
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeDynaMoeEngine_lift(_ pointer: UnsafeMutableRawPointer) throws -> DynaMoeEngine {
-    return try FfiConverterTypeDynaMoeEngine.lift(pointer)
+public func FfiConverterTypeDynaMoeEngine_lift(_ handle: UInt64) throws -> DynaMoeEngine {
+    return try FfiConverterTypeDynaMoeEngine.lift(handle)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeDynaMoeEngine_lower(_ value: DynaMoeEngine) -> UnsafeMutableRawPointer {
+public func FfiConverterTypeDynaMoeEngine_lower(_ value: DynaMoeEngine) -> UInt64 {
     return FfiConverterTypeDynaMoeEngine.lower(value)
 }
 
 
 
 
-public protocol DynaMoeTokenizerProtocol : AnyObject {
+
+
+public protocol DynaMoeTokenizerProtocol: AnyObject, Sendable {
     
     func decode(ids: [UInt32]) throws  -> String
     
     func encode(text: String) throws  -> [UInt32]
     
 }
+open class DynaMoeTokenizer: DynaMoeTokenizerProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
 
-open class DynaMoeTokenizer:
-    DynaMoeTokenizerProtocol {
-    fileprivate let pointer: UnsafeMutableRawPointer!
-
-    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    public struct NoPointer {
+    public struct NoHandle {
         public init() {}
     }
 
     // TODO: We'd like this to be `private` but for Swifty reasons,
     // we can't implement `FfiConverter` without making this `required` and we can't
     // make it `required` without making it `public`.
-    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
-        self.pointer = pointer
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
     }
 
     // This constructor can be used to instantiate a fake object.
-    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
     //
     // - Warning:
-    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    public init(noPointer: NoPointer) {
-        self.pointer = nil
+    public init(noHandle: NoHandle) {
+        self.handle = 0
     }
 
 #if swift(>=5.8)
     @_documentation(visibility: private)
 #endif
-    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
-        return try! rustCall { uniffi_dynamoe_core_fn_clone_dynamoetokenizer(self.pointer, $0) }
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_dynamoe_core_fn_clone_dynamoetokenizer(self.handle, $0) }
     }
 public convenience init(tokenizerPath: String)throws  {
-    let pointer =
-        try rustCallWithError(FfiConverterTypeEngineError.lift) {
+    let handle =
+        try rustCallWithError(FfiConverterTypeEngineError_lift) {
+        uniffiCallStatus in
     uniffi_dynamoe_core_fn_constructor_dynamoetokenizer_new(
-        FfiConverterString.lower(tokenizerPath),$0
+        FfiConverterString.lower(tokenizerPath),uniffiCallStatus
     )
 }
-    self.init(unsafeFromRawPointer: pointer)
+    self.init(unsafeFromHandle: handle)
 }
 
     deinit {
-        guard let pointer = pointer else {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
             return
         }
 
-        try! rustCall { uniffi_dynamoe_core_fn_free_dynamoetokenizer(pointer, $0) }
+        try! rustCall { uniffi_dynamoe_core_fn_free_dynamoetokenizer(handle, $0) }
     }
 
     
 
     
-open func decode(ids: [UInt32])throws  -> String {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeEngineError.lift) {
-    uniffi_dynamoe_core_fn_method_dynamoetokenizer_decode(self.uniffiClonePointer(),
-        FfiConverterSequenceUInt32.lower(ids),$0
+open func decode(ids: [UInt32])throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_dynamoe_core_fn_method_dynamoetokenizer_decode(
+            self.uniffiCloneHandle(),
+        FfiConverterSequenceUInt32.lower(ids),uniffiCallStatus
     )
 })
 }
     
-open func encode(text: String)throws  -> [UInt32] {
-    return try  FfiConverterSequenceUInt32.lift(try rustCallWithError(FfiConverterTypeEngineError.lift) {
-    uniffi_dynamoe_core_fn_method_dynamoetokenizer_encode(self.uniffiClonePointer(),
-        FfiConverterString.lower(text),$0
+open func encode(text: String)throws  -> [UInt32]  {
+    return try  FfiConverterSequenceUInt32.lift(try rustCallWithError(FfiConverterTypeEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_dynamoe_core_fn_method_dynamoetokenizer_encode(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(text),uniffiCallStatus
     )
 })
 }
     
 
+    
 }
+
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
 public struct FfiConverterTypeDynaMoeTokenizer: FfiConverter {
-
-    typealias FfiType = UnsafeMutableRawPointer
+    typealias FfiType = UInt64
     typealias SwiftType = DynaMoeTokenizer
 
-    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> DynaMoeTokenizer {
-        return DynaMoeTokenizer(unsafeFromRawPointer: pointer)
+    public static func lift(_ handle: UInt64) throws -> DynaMoeTokenizer {
+        return DynaMoeTokenizer(unsafeFromHandle: handle)
     }
 
-    public static func lower(_ value: DynaMoeTokenizer) -> UnsafeMutableRawPointer {
-        return value.uniffiClonePointer()
+    public static func lower(_ value: DynaMoeTokenizer) -> UInt64 {
+        return value.uniffiCloneHandle()
     }
 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DynaMoeTokenizer {
-        let v: UInt64 = try readInt(&buf)
-        // The Rust code won't compile if a pointer won't fit in a UInt64.
-        // We have to go via `UInt` because that's the thing that's the size of a pointer.
-        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
-        if (ptr == nil) {
-            throw UniffiInternalError.unexpectedNullPointer
-        }
-        return try lift(ptr!)
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
     }
 
     public static func write(_ value: DynaMoeTokenizer, into buf: inout [UInt8]) {
-        // This fiddling is because `Int` is the thing that's the same size as a pointer.
-        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
-        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+        writeInt(&buf, lower(value))
     }
 }
 
 
-
-
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeDynaMoeTokenizer_lift(_ pointer: UnsafeMutableRawPointer) throws -> DynaMoeTokenizer {
-    return try FfiConverterTypeDynaMoeTokenizer.lift(pointer)
+public func FfiConverterTypeDynaMoeTokenizer_lift(_ handle: UInt64) throws -> DynaMoeTokenizer {
+    return try FfiConverterTypeDynaMoeTokenizer.lift(handle)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeDynaMoeTokenizer_lower(_ value: DynaMoeTokenizer) -> UnsafeMutableRawPointer {
+public func FfiConverterTypeDynaMoeTokenizer_lower(_ value: DynaMoeTokenizer) -> UInt64 {
     return FfiConverterTypeDynaMoeTokenizer.lower(value)
 }
 
 
-public struct DraftCandidateNode {
+
+
+public struct DraftCandidateNode: Equatable, Hashable {
     public var nodeId: UInt32
     public var parentId: UInt32
     public var tokenId: UInt32
@@ -823,43 +896,15 @@ public struct DraftCandidateNode {
         self.branchIdx = branchIdx
         self.score = score
     }
+
+    
+
+    
 }
 
-
-
-extension DraftCandidateNode: Equatable, Hashable {
-    public static func ==(lhs: DraftCandidateNode, rhs: DraftCandidateNode) -> Bool {
-        if lhs.nodeId != rhs.nodeId {
-            return false
-        }
-        if lhs.parentId != rhs.parentId {
-            return false
-        }
-        if lhs.tokenId != rhs.tokenId {
-            return false
-        }
-        if lhs.depth != rhs.depth {
-            return false
-        }
-        if lhs.branchIdx != rhs.branchIdx {
-            return false
-        }
-        if lhs.score != rhs.score {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(nodeId)
-        hasher.combine(parentId)
-        hasher.combine(tokenId)
-        hasher.combine(depth)
-        hasher.combine(branchIdx)
-        hasher.combine(score)
-    }
-}
-
+#if compiler(>=6)
+extension DraftCandidateNode: Sendable {}
+#endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -903,7 +948,7 @@ public func FfiConverterTypeDraftCandidateNode_lower(_ value: DraftCandidateNode
 }
 
 
-public struct JetSpecAcceptedResult {
+public struct JetSpecAcceptedResult: Equatable, Hashable {
     public var acceptedTokens: [UInt32]
     public var acceptedNodeIndices: [UInt32]
     public var bonusToken: UInt32?
@@ -919,39 +964,15 @@ public struct JetSpecAcceptedResult {
         self.acceptedCount = acceptedCount
         self.effectiveTau = effectiveTau
     }
+
+    
+
+    
 }
 
-
-
-extension JetSpecAcceptedResult: Equatable, Hashable {
-    public static func ==(lhs: JetSpecAcceptedResult, rhs: JetSpecAcceptedResult) -> Bool {
-        if lhs.acceptedTokens != rhs.acceptedTokens {
-            return false
-        }
-        if lhs.acceptedNodeIndices != rhs.acceptedNodeIndices {
-            return false
-        }
-        if lhs.bonusToken != rhs.bonusToken {
-            return false
-        }
-        if lhs.acceptedCount != rhs.acceptedCount {
-            return false
-        }
-        if lhs.effectiveTau != rhs.effectiveTau {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(acceptedTokens)
-        hasher.combine(acceptedNodeIndices)
-        hasher.combine(bonusToken)
-        hasher.combine(acceptedCount)
-        hasher.combine(effectiveTau)
-    }
-}
-
+#if compiler(>=6)
+extension JetSpecAcceptedResult: Sendable {}
+#endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -993,7 +1014,7 @@ public func FfiConverterTypeJetSpecAcceptedResult_lower(_ value: JetSpecAccepted
 }
 
 
-public struct JetSpecTreeConfig {
+public struct JetSpecTreeConfig: Equatable, Hashable {
     public var maxDepth: UInt32
     public var branchingFactor: UInt32
     public var topK: UInt32
@@ -1007,35 +1028,15 @@ public struct JetSpecTreeConfig {
         self.topK = topK
         self.maxNodes = maxNodes
     }
+
+    
+
+    
 }
 
-
-
-extension JetSpecTreeConfig: Equatable, Hashable {
-    public static func ==(lhs: JetSpecTreeConfig, rhs: JetSpecTreeConfig) -> Bool {
-        if lhs.maxDepth != rhs.maxDepth {
-            return false
-        }
-        if lhs.branchingFactor != rhs.branchingFactor {
-            return false
-        }
-        if lhs.topK != rhs.topK {
-            return false
-        }
-        if lhs.maxNodes != rhs.maxNodes {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(maxDepth)
-        hasher.combine(branchingFactor)
-        hasher.combine(topK)
-        hasher.combine(maxNodes)
-    }
-}
-
+#if compiler(>=6)
+extension JetSpecTreeConfig: Sendable {}
+#endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -1075,7 +1076,7 @@ public func FfiConverterTypeJetSpecTreeConfig_lower(_ value: JetSpecTreeConfig) 
 }
 
 
-public struct JetSpecTreeMask {
+public struct JetSpecTreeMask: Equatable, Hashable {
     public var nodeCount: UInt32
     public var mask: [Float]
     public var parentIndices: [UInt32]
@@ -1091,39 +1092,15 @@ public struct JetSpecTreeMask {
         self.depths = depths
         self.tokenIds = tokenIds
     }
+
+    
+
+    
 }
 
-
-
-extension JetSpecTreeMask: Equatable, Hashable {
-    public static func ==(lhs: JetSpecTreeMask, rhs: JetSpecTreeMask) -> Bool {
-        if lhs.nodeCount != rhs.nodeCount {
-            return false
-        }
-        if lhs.mask != rhs.mask {
-            return false
-        }
-        if lhs.parentIndices != rhs.parentIndices {
-            return false
-        }
-        if lhs.depths != rhs.depths {
-            return false
-        }
-        if lhs.tokenIds != rhs.tokenIds {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(nodeCount)
-        hasher.combine(mask)
-        hasher.combine(parentIndices)
-        hasher.combine(depths)
-        hasher.combine(tokenIds)
-    }
-}
-
+#if compiler(>=6)
+extension JetSpecTreeMask: Sendable {}
+#endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -1165,7 +1142,7 @@ public func FfiConverterTypeJetSpecTreeMask_lower(_ value: JetSpecTreeMask) -> R
 }
 
 
-public struct LayerSummary {
+public struct LayerSummary: Equatable, Hashable {
     public var layerIndex: UInt32
     public var totalTensors: UInt32
     public var routedExpertCount: UInt32
@@ -1179,35 +1156,15 @@ public struct LayerSummary {
         self.routedExpertCount = routedExpertCount
         self.totalSizeMb = totalSizeMb
     }
+
+    
+
+    
 }
 
-
-
-extension LayerSummary: Equatable, Hashable {
-    public static func ==(lhs: LayerSummary, rhs: LayerSummary) -> Bool {
-        if lhs.layerIndex != rhs.layerIndex {
-            return false
-        }
-        if lhs.totalTensors != rhs.totalTensors {
-            return false
-        }
-        if lhs.routedExpertCount != rhs.routedExpertCount {
-            return false
-        }
-        if lhs.totalSizeMb != rhs.totalSizeMb {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(layerIndex)
-        hasher.combine(totalTensors)
-        hasher.combine(routedExpertCount)
-        hasher.combine(totalSizeMb)
-    }
-}
-
+#if compiler(>=6)
+extension LayerSummary: Sendable {}
+#endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -1247,7 +1204,7 @@ public func FfiConverterTypeLayerSummary_lower(_ value: LayerSummary) -> RustBuf
 }
 
 
-public struct ModelSummary {
+public struct ModelSummary: Equatable, Hashable {
     public var sizeGb: Double
     public var tensorCount: UInt32
     public var layerCount: UInt32
@@ -1267,47 +1224,15 @@ public struct ModelSummary {
         self.tensors = tensors
         self.layers = layers
     }
+
+    
+
+    
 }
 
-
-
-extension ModelSummary: Equatable, Hashable {
-    public static func ==(lhs: ModelSummary, rhs: ModelSummary) -> Bool {
-        if lhs.sizeGb != rhs.sizeGb {
-            return false
-        }
-        if lhs.tensorCount != rhs.tensorCount {
-            return false
-        }
-        if lhs.layerCount != rhs.layerCount {
-            return false
-        }
-        if lhs.maxExpertId != rhs.maxExpertId {
-            return false
-        }
-        if lhs.shards != rhs.shards {
-            return false
-        }
-        if lhs.tensors != rhs.tensors {
-            return false
-        }
-        if lhs.layers != rhs.layers {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(sizeGb)
-        hasher.combine(tensorCount)
-        hasher.combine(layerCount)
-        hasher.combine(maxExpertId)
-        hasher.combine(shards)
-        hasher.combine(tensors)
-        hasher.combine(layers)
-    }
-}
-
+#if compiler(>=6)
+extension ModelSummary: Sendable {}
+#endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -1353,7 +1278,7 @@ public func FfiConverterTypeModelSummary_lower(_ value: ModelSummary) -> RustBuf
 }
 
 
-public struct NgramRowDescriptor {
+public struct NgramRowDescriptor: Equatable, Hashable {
     public var shardIndex: UInt32
     public var rowOffsetBytes: UInt64
     public var rowLengthBytes: UInt64
@@ -1365,31 +1290,15 @@ public struct NgramRowDescriptor {
         self.rowOffsetBytes = rowOffsetBytes
         self.rowLengthBytes = rowLengthBytes
     }
+
+    
+
+    
 }
 
-
-
-extension NgramRowDescriptor: Equatable, Hashable {
-    public static func ==(lhs: NgramRowDescriptor, rhs: NgramRowDescriptor) -> Bool {
-        if lhs.shardIndex != rhs.shardIndex {
-            return false
-        }
-        if lhs.rowOffsetBytes != rhs.rowOffsetBytes {
-            return false
-        }
-        if lhs.rowLengthBytes != rhs.rowLengthBytes {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(shardIndex)
-        hasher.combine(rowOffsetBytes)
-        hasher.combine(rowLengthBytes)
-    }
-}
-
+#if compiler(>=6)
+extension NgramRowDescriptor: Sendable {}
+#endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -1427,7 +1336,7 @@ public func FfiConverterTypeNgramRowDescriptor_lower(_ value: NgramRowDescriptor
 }
 
 
-public struct ShardMetadata {
+public struct ShardMetadata: Equatable, Hashable {
     public var index: UInt32
     public var filename: String
     public var baseAddress: UInt64
@@ -1441,35 +1350,15 @@ public struct ShardMetadata {
         self.baseAddress = baseAddress
         self.length = length
     }
+
+    
+
+    
 }
 
-
-
-extension ShardMetadata: Equatable, Hashable {
-    public static func ==(lhs: ShardMetadata, rhs: ShardMetadata) -> Bool {
-        if lhs.index != rhs.index {
-            return false
-        }
-        if lhs.filename != rhs.filename {
-            return false
-        }
-        if lhs.baseAddress != rhs.baseAddress {
-            return false
-        }
-        if lhs.length != rhs.length {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(index)
-        hasher.combine(filename)
-        hasher.combine(baseAddress)
-        hasher.combine(length)
-    }
-}
-
+#if compiler(>=6)
+extension ShardMetadata: Sendable {}
+#endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -1509,7 +1398,7 @@ public func FfiConverterTypeShardMetadata_lower(_ value: ShardMetadata) -> RustB
 }
 
 
-public struct TensorMetadata {
+public struct TensorMetadata: Equatable, Hashable {
     public var name: String
     public var shapeDisplay: String
     public var dtype: String
@@ -1535,59 +1424,15 @@ public struct TensorMetadata {
         self.layerIndex = layerIndex
         self.expertId = expertId
     }
+
+    
+
+    
 }
 
-
-
-extension TensorMetadata: Equatable, Hashable {
-    public static func ==(lhs: TensorMetadata, rhs: TensorMetadata) -> Bool {
-        if lhs.name != rhs.name {
-            return false
-        }
-        if lhs.shapeDisplay != rhs.shapeDisplay {
-            return false
-        }
-        if lhs.dtype != rhs.dtype {
-            return false
-        }
-        if lhs.sizeMb != rhs.sizeMb {
-            return false
-        }
-        if lhs.shardIndex != rhs.shardIndex {
-            return false
-        }
-        if lhs.offsetStart != rhs.offsetStart {
-            return false
-        }
-        if lhs.offsetEnd != rhs.offsetEnd {
-            return false
-        }
-        if lhs.category != rhs.category {
-            return false
-        }
-        if lhs.layerIndex != rhs.layerIndex {
-            return false
-        }
-        if lhs.expertId != rhs.expertId {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(name)
-        hasher.combine(shapeDisplay)
-        hasher.combine(dtype)
-        hasher.combine(sizeMb)
-        hasher.combine(shardIndex)
-        hasher.combine(offsetStart)
-        hasher.combine(offsetEnd)
-        hasher.combine(category)
-        hasher.combine(layerIndex)
-        hasher.combine(expertId)
-    }
-}
-
+#if compiler(>=6)
+extension TensorMetadata: Sendable {}
+#endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -1639,7 +1484,8 @@ public func FfiConverterTypeTensorMetadata_lower(_ value: TensorMetadata) -> Rus
 }
 
 
-public enum EngineError {
+public 
+enum EngineError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
     
     
@@ -1651,8 +1497,21 @@ public enum EngineError {
     )
     case TokenizerError(details: String
     )
+
+    
+
+    
+
+    
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+    
 }
 
+#if compiler(>=6)
+extension EngineError: Sendable {}
+#endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
@@ -1715,12 +1574,18 @@ public struct FfiConverterTypeEngineError: FfiConverterRustBuffer {
 }
 
 
-extension EngineError: Equatable, Hashable {}
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEngineError_lift(_ buf: RustBuffer) throws -> EngineError {
+    return try FfiConverterTypeEngineError.lift(buf)
+}
 
-extension EngineError: Foundation.LocalizedError {
-    public var errorDescription: String? {
-        String(reflecting: self)
-    }
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEngineError_lower(_ value: EngineError) -> RustBuffer {
+    return FfiConverterTypeEngineError.lower(value)
 }
 
 #if swift(>=5.8)
@@ -1895,42 +1760,46 @@ fileprivate struct FfiConverterSequenceTypeTensorMetadata: FfiConverterRustBuffe
         return seq
     }
 }
-public func buildJetspecCandidateTree(rootTokenId: UInt32, draftTokens: [UInt32], draftScores: [Float], depth: UInt32, branchingFactor: UInt32, maxNodes: UInt32) -> JetSpecTreeMask {
-    return try!  FfiConverterTypeJetSpecTreeMask.lift(try! rustCall() {
+public func buildJetspecCandidateTree(rootTokenId: UInt32, draftTokens: [UInt32], draftScores: [Float], depth: UInt32, branchingFactor: UInt32, maxNodes: UInt32) -> JetSpecTreeMask  {
+    return try!  FfiConverterTypeJetSpecTreeMask_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_dynamoe_core_fn_func_build_jetspec_candidate_tree(
         FfiConverterUInt32.lower(rootTokenId),
         FfiConverterSequenceUInt32.lower(draftTokens),
         FfiConverterSequenceFloat.lower(draftScores),
         FfiConverterUInt32.lower(depth),
         FfiConverterUInt32.lower(branchingFactor),
-        FfiConverterUInt32.lower(maxNodes),$0
+        FfiConverterUInt32.lower(maxNodes),uniffiCallStatus
     )
 })
 }
-public func pruneJetspecTreeMoe(treeTokens: [UInt32], parentIndices: [UInt32], draftScores: [Float], candidateExpertsFlat: [UInt32], expertsPerNode: UInt32, maxUniqueExperts: UInt32) -> JetSpecTreeMask {
-    return try!  FfiConverterTypeJetSpecTreeMask.lift(try! rustCall() {
+public func pruneJetspecTreeMoe(treeTokens: [UInt32], parentIndices: [UInt32], draftScores: [Float], candidateExpertsFlat: [UInt32], expertsPerNode: UInt32, maxUniqueExperts: UInt32) -> JetSpecTreeMask  {
+    return try!  FfiConverterTypeJetSpecTreeMask_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_dynamoe_core_fn_func_prune_jetspec_tree_moe(
         FfiConverterSequenceUInt32.lower(treeTokens),
         FfiConverterSequenceUInt32.lower(parentIndices),
         FfiConverterSequenceFloat.lower(draftScores),
         FfiConverterSequenceUInt32.lower(candidateExpertsFlat),
         FfiConverterUInt32.lower(expertsPerNode),
-        FfiConverterUInt32.lower(maxUniqueExperts),$0
+        FfiConverterUInt32.lower(maxUniqueExperts),uniffiCallStatus
     )
 })
 }
-public func verifyJetspecTreeGreedy(treeTokens: [UInt32], parentIndices: [UInt32], targetLogits: [Float], vocabSize: UInt32) -> JetSpecAcceptedResult {
-    return try!  FfiConverterTypeJetSpecAcceptedResult.lift(try! rustCall() {
+public func verifyJetspecTreeGreedy(treeTokens: [UInt32], parentIndices: [UInt32], targetLogits: [Float], vocabSize: UInt32) -> JetSpecAcceptedResult  {
+    return try!  FfiConverterTypeJetSpecAcceptedResult_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_dynamoe_core_fn_func_verify_jetspec_tree_greedy(
         FfiConverterSequenceUInt32.lower(treeTokens),
         FfiConverterSequenceUInt32.lower(parentIndices),
         FfiConverterSequenceFloat.lower(targetLogits),
-        FfiConverterUInt32.lower(vocabSize),$0
+        FfiConverterUInt32.lower(vocabSize),uniffiCallStatus
     )
 })
 }
-public func verifyJetspecTreeSampling(treeTokens: [UInt32], parentIndices: [UInt32], draftProbs: [Float], targetLogits: [Float], vocabSize: UInt32, temperature: Float, rngSeed: UInt64) -> JetSpecAcceptedResult {
-    return try!  FfiConverterTypeJetSpecAcceptedResult.lift(try! rustCall() {
+public func verifyJetspecTreeSampling(treeTokens: [UInt32], parentIndices: [UInt32], draftProbs: [Float], targetLogits: [Float], vocabSize: UInt32, temperature: Float, rngSeed: UInt64) -> JetSpecAcceptedResult  {
+    return try!  FfiConverterTypeJetSpecAcceptedResult_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_dynamoe_core_fn_func_verify_jetspec_tree_sampling(
         FfiConverterSequenceUInt32.lower(treeTokens),
         FfiConverterSequenceUInt32.lower(parentIndices),
@@ -1938,7 +1807,7 @@ public func verifyJetspecTreeSampling(treeTokens: [UInt32], parentIndices: [UInt
         FfiConverterSequenceFloat.lower(targetLogits),
         FfiConverterUInt32.lower(vocabSize),
         FfiConverterFloat.lower(temperature),
-        FfiConverterUInt64.lower(rngSeed),$0
+        FfiConverterUInt64.lower(rngSeed),uniffiCallStatus
     )
 })
 }
@@ -1950,52 +1819,54 @@ private enum InitializationResult {
 }
 // Use a global variable to perform the versioning checks. Swift ensures that
 // the code inside is only computed once.
-private var initializationResult: InitializationResult = {
+private let initializationResult: InitializationResult = {
     // Get the bindings contract version from our ComponentInterface
-    let bindings_contract_version = 26
+    let bindings_contract_version = 30
     // Get the scaffolding contract version by calling the into the dylib
     let scaffolding_contract_version = ffi_dynamoe_core_uniffi_contract_version()
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_dynamoe_core_checksum_func_build_jetspec_candidate_tree() != 58691) {
+    if (uniffi_dynamoe_core_checksum_func_build_jetspec_candidate_tree() != 19465) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_dynamoe_core_checksum_func_prune_jetspec_tree_moe() != 38728) {
+    if (uniffi_dynamoe_core_checksum_func_prune_jetspec_tree_moe() != 64763) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_dynamoe_core_checksum_func_verify_jetspec_tree_greedy() != 47992) {
+    if (uniffi_dynamoe_core_checksum_func_verify_jetspec_tree_greedy() != 29884) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_dynamoe_core_checksum_func_verify_jetspec_tree_sampling() != 25599) {
+    if (uniffi_dynamoe_core_checksum_func_verify_jetspec_tree_sampling() != 57855) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_dynamoe_core_checksum_method_dynamoeengine_advise_shard_range() != 7519) {
+    if (uniffi_dynamoe_core_checksum_method_dynamoeengine_advise_shard_range() != 31226) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_dynamoe_core_checksum_method_dynamoeengine_get_ngram_row_descriptor() != 11448) {
+    if (uniffi_dynamoe_core_checksum_method_dynamoeengine_get_ngram_row_descriptor() != 62154) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_dynamoe_core_checksum_method_dynamoeengine_get_summary() != 2314) {
+    if (uniffi_dynamoe_core_checksum_method_dynamoeengine_get_summary() != 27679) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_dynamoe_core_checksum_method_dynamoetokenizer_decode() != 8328) {
+    if (uniffi_dynamoe_core_checksum_method_dynamoetokenizer_decode() != 18999) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_dynamoe_core_checksum_method_dynamoetokenizer_encode() != 14674) {
+    if (uniffi_dynamoe_core_checksum_method_dynamoetokenizer_encode() != 8644) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_dynamoe_core_checksum_constructor_dynamoeengine_new() != 45198) {
+    if (uniffi_dynamoe_core_checksum_constructor_dynamoeengine_new() != 42666) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_dynamoe_core_checksum_constructor_dynamoetokenizer_new() != 5615) {
+    if (uniffi_dynamoe_core_checksum_constructor_dynamoetokenizer_new() != 41080) {
         return InitializationResult.apiChecksumMismatch
     }
 
     return InitializationResult.ok
 }()
 
-private func uniffiEnsureInitialized() {
+// Make the ensure init function public so that other modules which have external type references to
+// our types can call it.
+public func uniffiEnsureDynamoeCoreInitialized() {
     switch initializationResult {
     case .ok:
         break
