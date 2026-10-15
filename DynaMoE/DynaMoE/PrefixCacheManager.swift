@@ -10,7 +10,7 @@ import Foundation
 import Metal
 
 /// Telemetry metrics for KV-cache prefix pinning performance
-public struct PrefixCacheMetrics: Sendable, Equatable {
+nonisolated public struct PrefixCacheMetrics: Sendable, Equatable {
     public var totalTurns: Int = 0
     public var cacheHits: Int = 0
     public var totalTokensRequested: Int = 0
@@ -29,16 +29,26 @@ public struct PrefixCacheMetrics: Sendable, Equatable {
 }
 
 /// Coordinates prefix pinning and prompt reuse across conversation turns and tool executions.
-public final class PrefixCacheManager: @unchecked Sendable {
+nonisolated public final class PrefixCacheManager: @unchecked Sendable {
     public static let shared = PrefixCacheManager()
 
-    private let lock = NSLock()
+    private let lock = NSRecursiveLock()
 
     /// The active session ID that owns the currently cached KV states
     private var activeSessionId: UUID?
 
     /// The full sequence of tokens whose KV states are currently pinned in KVCacheManager
     private var pinnedTokenIds: [UInt32] = []
+
+    /// The date whose rendering the active pin's prompt carries, owned by the
+    /// session that will record the next pin. `# Current Date & Time` sits at
+    /// the head of the system prompt with minute+second precision, so a fresh
+    /// `Date()` per turn kills the common token prefix a sentence in — and a
+    /// hybrid (GDN) session, which cannot rewind linear state, then takes a
+    /// full ~30 s re-prefill on every agent step. Turns must render the same
+    /// date the pinned context carries; a new one is minted (owned by that
+    /// session) when the next full prefill is going to pin it anyway.
+    private var pinnedAsOfDate: (sessionId: UUID?, date: Date)? = nil
 
     /// Performance metrics tracking
     public private(set) var metrics = PrefixCacheMetrics()
@@ -90,6 +100,24 @@ public final class PrefixCacheManager: @unchecked Sendable {
         return usablePrefix
     }
 
+    /// The date to render into a turn's system prompt for `sessionId`.
+    /// Returns the date the current pin was built with whenever that session
+    /// owns it (byte-stable across its turns, so tokenized prompts share the
+    /// full pinned prefix); anything else mints a fresh date and takes
+    /// ownership of the \"next pin's\" slot. `invalidate` clears it so a new
+    /// prefill carries fresh temporal context instead of a growing-stale one.
+    public func asOfDate(sessionId: UUID?) -> Date {
+        lock.lock()
+        defer { lock.unlock() }
+        guard isEnabled else { return Date() }
+        if let pinnedAsOfDate, pinnedAsOfDate.sessionId == sessionId {
+            return pinnedAsOfDate.date
+        }
+        let minted = Date()
+        pinnedAsOfDate = (sessionId, minted)
+        return minted
+    }
+
     /// Records the full token sequence after a turn completes (prompt + generated tokens).
     /// - Parameters:
     ///   - promptTokenIds: The prompt tokens used.
@@ -132,9 +160,13 @@ public final class PrefixCacheManager: @unchecked Sendable {
                 self.pinnedTokenIds.removeAll(keepingCapacity: true)
                 self.activeSessionId = nil
             }
+            if self.pinnedAsOfDate?.sessionId == sId {
+                self.pinnedAsOfDate = nil
+            }
         } else {
             self.pinnedTokenIds.removeAll(keepingCapacity: true)
             self.activeSessionId = nil
+            self.pinnedAsOfDate = nil
         }
     }
 

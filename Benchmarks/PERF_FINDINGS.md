@@ -3349,3 +3349,60 @@ launch-side repudiation of old clampedSeqLen expectations is intentional —
 fit/launch gates render that path unreachable for turns that allocate.
 Suites: TurnFitLogicTests (9), KVCacheProvisioningLogicTests (10),
 ServerQueueLogicTests (5), MemorySettingsPersistenceTests (3) — all green.
+
+---
+
+### QA #54 — a fresh `Date()` per server turn split the pinned prefix inside the temporal block, so every opencode step re-prefilled ~7.7K tokens
+
+Field report ("one response takes forever"): opencode's log showed
+`🔁 [PREFIX] partial match 32/815 pinned — hybrid state cannot rewind; full
+re-prefill`, and every agent step of a Spark session re-prefilled the full
+~8K prompt (~32 s per step, ~30 s of it prefill). The system prompt LIST
+was byte-identical every turn, so the pin should have matched at ~7.7K
+tokens — the divergence at token 32 was inside the FIRST sentence.
+
+**Root cause.** The `# Current Date & Time` block sits at the head of the
+effective system prompt (ModelConfig.buildEffectiveSystemPrompt ->
+AgentHarness.formattedDateTimeContext) and renders minute+second precision
+("Wednesday, October 15, 2026 at 3:41 PM -07:00 (2026-10-15T15:41:23-07:00)").
+The interactive chat path already threads a per-conversation date
+(`sessions[idx].createdAt` — cache-friendly by construction), but the server
+turn planner passed a fresh `Date()` per request, so every turn's prompt
+byte-diverged ~32 tokens in — inside the temporal block — and a hybrid (GDN)
+session, whose pins require the ENTIRE pinned prefix to match (linear state
+cannot rewind), got zero reuse for the whole conversation. Attention models
+suffer the same partial-reuse loss (32 of 7,700 tokens).
+
+**Fix (PrefixCacheManager.swift, ServerController.swift).** The temporal
+context is now pinned alongside the KV prefix:
+
+- `PrefixCacheManager` gained `asOfDate(sessionId:)` — a date
+  (`pinnedAsOfDate`) owned by the session that will record the next pin.
+  Same-session asks return the inherited date (byte-stable prompts across
+  turns); different sessions or a cleared pin mint a fresh one;
+  `invalidate(...)` clears it, so a new prefill carries fresh temporal
+  context instead of a growing-stale one. When pinning is disabled it
+  simply serves the current time. The class is now `nonisolated` (the
+  lock-guarded singletons' existing pattern, e.g. GrammarConstrainedSampler)
+  so the nonisolated server planner can call it without an actor hop, and
+  the metrics struct became `nonisolated` for its initializer.
+- `ServerController.buildTurnPlan` renders the temporal block from
+  `PrefixCacheManager.shared.asOfDate(sessionId:)` instead of `Date()`.
+  The server session key is a deterministic FNV-1a hash over (model, first
+  message), so the same opencode conversation mints once and every later
+  turn reproduces the identical temporal block -> the tokenized prompt
+  extends the pin by only the appended turn -> `findCommonPrefix` matches
+  at the full pinned length -> hybrid reuse ("cannot rewind" gate satisfied).
+
+**Net effect.** Each opencode step now prefills only the appended
+conversation delta (tens of tokens) instead of the full ~8K prompt, turning
+the ~30 s step into seconds — the perceived-speed decomposition the field
+report asked for. Only a full re-prefill event (pin invalidated, model or
+KV-precision change) mints a new date, which is exactly when the pin is
+rewritten anyway.
+
+Tests: `PrefixAsOfDateTests` (5 — same-session stability across an ask ->
+repeat-ask and an ask -> recordTurn -> ask cycle, fresh mint for a different
+session, invalidation reset, disabled-pinning freshness). All pure-logic
+suites re-run green (32 tests: PrefixAsOfDate 5, MemorySettings 3,
+ServerQueue 5, TurnFit 9, KVCacheProvisioning 10).

@@ -487,7 +487,13 @@ final class ServerController: ObservableObject {
             summary: engine.loadedSummary,
             modelName: info.displayName,
             modelPath: info.path,
-            currentDate: Date()
+            // The chat UI threads a per-conversation date for prefix reuse; the
+            // server needs the same discipline. A fresh Date() here renders a
+            // new "at 3:41 PM" into the prompt's temporal block every turn,
+            // splitting the common token prefix a sentence in and forcing
+            // hybrid (GDN) sessions — which cannot rewind linear state — into
+            // a full ~30 s re-prefill on every agent step.
+            currentDate: PrefixCacheManager.shared.asOfDate(sessionId: inputs.sessionId)
         ).trimmingCharacters(in: .whitespacesAndNewlines)
 
         if inputs.hasTools, let declaration = inputs.toolDeclaration {
