@@ -165,7 +165,7 @@ flowchart TD
 * **Zero-Copy Apple Silicon Unified Memory Bridge:** Memory-maps multi-gigabyte SafeTensors weight shards via `memmap2` in Rust and wraps raw memory addresses directly into Metal GPU buffers (`MTLBuffer(bytesNoCopy:length:options:deallocator:)` with `.storageModeShared`), eliminating redundant CPU-to-GPU copies.
 * **High-Throughput NVMe Parallel `pread` Bulk Priming Engine:** Dynamically caches read-only file descriptors for all `.safetensors` model shards (e.g. 131 files for Qwen 3.8 Flash Next) and issues multi-threaded contiguous `pread` block transfers (256 KB chunks) alongside kernel readahead advisories (`fcntl(F_RDADVISE)`). Maximizes NVMe throughput at line rate (>2,500 MB/s to >4,100 MB/s), bypassing macOS page-fault traps and dropping cold-expert slice loading times to ~0.45 ms.
 * **Layer-Boundary & Token-Boundary Working Set Memory Management:** Enforces strict memory budgets (`lowMemory`, `balanced16GB`, `unrestricted`) across both prompt prefill and token generation. Automatically evicts stale layer experts at layer boundaries during prefill and evicts inactive experts at token boundaries during generation, eliminating RAM spikes (>16 GB) and keeping physical RAM bounded to the chosen target (e.g. 5.5 GB or 11.5 GB).
-* **Apple Silicon Unified Memory (UMA) Telemetry & Reporting:** Dual memory accounting distinguishing between Darwin's `phys_footprint` (dirty process heap displayed in Activity Monitor / Xcode) and the clean zero-copy pages in the macOS Unified Memory Buffer Cache. Features interactive in-app tooltips explaining memory behavior.
+* **Apple Silicon Unified Memory (UMA) Telemetry & Reporting:** Reports the total RAM attributable to DynaMoE — Darwin's `phys_footprint` (dirty heap, compressed memory, IOKit/GPU, including the FlashMoE pinned backbone) plus the clean zero-copy weight pages held in the macOS Unified Memory Buffer Cache — and breaks the total down in interactive in-app tooltips. Activity Monitor's *Memory* column shows only the footprint, so it omits the multi-GB weight pages; the cache share is reclaimable under memory pressure. The eviction budget deliberately stays on resident size (`mach_task_basic_info.resident_size`), which is the number the working-set trim compares against its target.
 * **SIMD-Coalesced Metal Compute Kernels:** Custom Metal Shading Language (MSL) compute shaders featuring SIMD-coalesced memory access and threadgroup shared memory caching for packed 4-bit/8-bit affine matrix-vector operations, FP8 (`E4M3`/`E5M2`) with block scales (MXFP8), SwiGLU expert projections (`gate_proj`, `up_proj`, `down_proj`), dynamic Top-8/Top-10 routing across up to 512 experts, and token embedding lookups.
 * **FlashMoE Contiguous Expert Repackaging (Optional):** Inspired by Dan Woods' Flash-MoE project, DynaMoE supports restructuring sparse MoE model layers into contiguous per-layer expert binaries (`packed_experts/layer_XX.bin` + `layout.json`) with an 8-thread background POSIX `pread` I/O pool (`ExpertIOThreadPool`) for dedicated single-file streaming.
 * **Quantized FP8 & FP16 KV Cache:** Dynamically configurable KV cache precision (**FP32**, **FP16**, and **FP8 E4M3/E5M2**), reducing attention cache memory footprints by up to 75% and enabling long-context inference (32k+ tokens) on memory-constrained Macs.
@@ -270,6 +270,41 @@ If you want to help test beta releases of the app, check the releases section. u
 Additional things to be aware of: 
 
 Ling 3.0 Tiny does not support FP8 quantization. So if you choose that option in settings, know that DynaMoE will automatically fall back to FP16.
+
+---
+
+## 🌐 Local Inference Server (OpenAI- & Anthropic-compatible APIs)
+
+DynaMoE can serve the currently loaded model as a local inference server on `127.0.0.1` — no external service, no egress. Enable it in **Settings (⌘,) → Server** (it then auto-starts on every launch), or watch live status, queue depth, and request counters in the same tab.
+
+### Endpoints
+
+| Endpoint | Protocol | Notes |
+| --- | --- | --- |
+| `POST /v1/chat/completions` | OpenAI Chat Completions | Streaming (SSE) + non-streaming; `reasoning_content` deltas for thinking models |
+| `POST /v1/messages` | Anthropic Messages | Streaming + non-streaming; `thinking` blocks, `tool_use` blocks, `max_tokens` required |
+| `GET /v1/models` | OpenAI model list | Lists the loaded model |
+| `GET /health` | Liveness/readiness | Reports model + engine state |
+
+### Authentication
+
+Set an API key in **Settings → Server**. When set, clients must present it either as `Authorization: Bearer <key>` (OpenAI convention) or the `x-api-key: <key>` header (Anthropic convention). Empty key = open access to local processes; the server binds only to `127.0.0.1`, so nothing outside your Mac can connect.
+
+### Client setup (e.g. Crush)
+
+Point any OpenAI-compatible client at base URL `http://127.0.0.1:8787/v1`, or any Anthropic client at `http://127.0.0.1:8787`. The `model` field is accepted but ignored — the model loaded in the app answers every request. Streaming, stop sequences, tool/function calling, and usage accounting all work out of the box.
+
+### Guardrails & tuning keys (UserDefaults)
+
+The engine generates one turn at a time; concurrent requests are queued in arrival order (queued streaming clients receive SSE heartbeats so they never time out).
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `dynamoe_server_enabled` | `false` | Auto-start the server at launch |
+| `dynamoe_server_port` | `8787` | Listen port |
+| `dynamoe_server_api_key` | *(empty)* | Required bearer / x-api-key value |
+| `dynamoe_server_queue_timeout` | `120` seconds | Requests waiting longer in the queue are rejected (408 / SSE error). `0` disables |
+| `dynamoe_server_max_prompt_tokens` | `262144` tokens | Longer prompts are rejected with 400 before prefill. `0` disables |
 
 ---
 

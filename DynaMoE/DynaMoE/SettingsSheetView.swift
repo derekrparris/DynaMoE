@@ -4,6 +4,7 @@
 //
 
 import SwiftUI
+import Combine
 import Metal
 
 enum SettingsTab: String, CaseIterable, Identifiable {
@@ -12,6 +13,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     case generation = "Generation"
     case memory = "Memory & SSD"
     case agent = "Agent & Tools"
+    case server = "Server"
     case advanced = "Advanced Diagnostics"
 
     var id: String { rawValue }
@@ -23,6 +25,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .generation: return "slider.horizontal.3"
         case .memory: return "memorychip"
         case .agent: return "wrench.and.screwdriver.fill"
+        case .server: return "server.rack"
         case .advanced: return "waveform.path.ecg"
         }
     }
@@ -40,6 +43,8 @@ enum SettingsTab: String, CaseIterable, Identifiable {
             return "Control memory execution, RAM budgets, KV-cache precision, SSD expert paging, and live diagnostics."
         case .agent:
             return "Configure agent tools, workspace, safety limits, web search, codebase indexing, subagents, and developer tooling."
+        case .server:
+            return "Serve the loaded model over a local OpenAI- and Anthropic-compatible API for clients like Crush; configure access and watch live activity."
         case .advanced:
             return "Inspect sharded SafeTensors metadata and run direct Metal kernel execution harnesses."
         }
@@ -53,6 +58,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .generation: return .purple
         case .memory: return .teal
         case .agent: return .orange
+        case .server: return .blue
         case .advanced: return .pink
         }
     }
@@ -70,6 +76,8 @@ enum SettingsTab: String, CaseIterable, Identifiable {
             return ["memory", "ram", "budget", "kv cache", "precision", "fp8", "fp16", "prefetch", "ssd", "paging", "diagnostics", "cache", "lookahead depth", "execution mode", "working set budget"]
         case .agent:
             return ["agent", "tools", "turbo", "grammar", "workspace", "directory", "search", "brave", "chrome", "index", "rag", "subagent", "git", "lint", "dogfood", "benchmark", "max multi-step agent iterations", "max tool output", "working directory"]
+        case .server:
+            return ["server", "api", "openai", "endpoint", "port", "api key", "completions", "local server", "crush", "http", "chat completions", "inference", "v1"]
         case .advanced:
             return ["diagnostics", "tensor", "inspector", "router", "metal", "kernel", "layer", "shard", "inspect"]
         }
@@ -106,6 +114,20 @@ struct SettingsSheetView: View {
     @ObservedObject private var dogfoodRunner = ModelDogfoodBenchmarkRunner.shared
     @ObservedObject private var updaterViewModel = UpdaterViewModel.shared
     @State private var showDogfoodReportModal: Bool = false
+
+    // Local Inference Server bindings & live dashboard state
+    @ObservedObject private var serverController = ServerController.shared
+    @AppStorage("dynamoe_server_enabled") private var isServerEnabled: Bool = false
+    @AppStorage("dynamoe_server_port") private var serverPort: Int = ServerController.defaultPort
+    @AppStorage("dynamoe_server_api_key") private var serverAPIKey: String = ""
+    @State private var serverPortText: String = ""
+    @State private var serverDashboardModelName: String? = nil
+    @State private var serverDashboardEngineActive: Bool = false
+    @State private var serverDashboardQueueDepth: Int = 0
+    @State private var serverDashboardActiveRequests: Int = 0
+    @State private var serverDashboardTotalRequests: Int = 0
+    @State private var serverModelNameCopied: Bool = false
+    @State private var serverEndpointCopied: Bool = false
 
     // Model Profile Management State
     @ObservedObject private var profileManager = ModelProfileManager.shared
@@ -263,6 +285,8 @@ struct SettingsSheetView: View {
                     memorySettingsSection
                 case .agent:
                     agentSettingsSection
+                case .server:
+                    serverSettingsSection
                 case .advanced:
                     advancedDiagnosticsSection
                 }
@@ -1017,21 +1041,21 @@ struct SettingsSheetView: View {
                 HStack(alignment: .top, spacing: 24) {
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 3) {
-                            Text("WORKING SET RAM")
+                            Text("DYNAMOE MEMORY")
                                 .font(.system(size: 9, weight: .semibold))
                                 .foregroundStyle(.secondary)
                             Image(systemName: "info.circle")
                                 .font(.system(size: 8))
                                 .foregroundStyle(.secondary)
                         }
-                        Text(String(format: "%.2f GB", currentRssGB))
+                        Text(String(format: "%.2f GB", WorkingSetManager.shared.attributedMemoryGB))
                             .font(.system(size: 14, weight: .semibold, design: .monospaced))
                             .foregroundStyle(.indigo)
-                        Text(String(format: "Footprint: %.2f GB", getActivityMonitorFootprintGB()))
+                        Text(String(format: "Footprint: %.2f GB · Cache: %.2f GB", getActivityMonitorFootprintGB(), WorkingSetManager.shared.residentShardBytesGB))
                             .font(.system(size: 9, design: .monospaced))
                             .foregroundStyle(.tertiary)
                     }
-                    .help(String(format: "Working Set RAM: %.2f GB\nProcess Footprint (Activity Monitor): %.2f GB\nUnified Memory Cache: %.2f GB\n\nApple Silicon places clean zero-copy model weights in Darwin's Unified Memory Buffer Cache (residency measured directly over the shard mappings); Activity Monitor's 'Memory' column excludes these clean file-backed pages from the process footprint (dirty heap, compressed memory, IOKit) it displays.", currentRssGB, getActivityMonitorFootprintGB(), WorkingSetManager.shared.residentShardBytesGB))
+                    .help(String(format: "DynaMoE memory: %.2f GB total\nProcess footprint (Activity Monitor): %.2f GB\nWeight pages in the Unified Memory Cache: %.2f GB (reclaimable)\nResident pages (RSIZE): %.2f GB\n\nTotal = the Darwin footprint (dirty heap, compressed memory, IOKit/GPU — including the FlashMoE pinned backbone) plus the clean file-backed model weights Darwin's Unified Memory Buffer Cache holds for the process. Activity Monitor's 'Memory' column excludes those clean pages. The cache share is reclaimable under memory pressure; the footprint is not.", WorkingSetManager.shared.attributedMemoryGB, getActivityMonitorFootprintGB(), WorkingSetManager.shared.residentShardBytesGB, currentRssGB))
 
                     VStack(alignment: .leading, spacing: 3) {
                         Text("RESIDENT EXPERTS")
@@ -1642,7 +1666,293 @@ struct SettingsSheetView: View {
         .cornerRadius(8)
     }
 
-    // MARK: - Tab 5: Advanced Diagnostics & Inspector
+    // MARK: - Tab 5: Local Inference Server
+    private var serverSettingsSection: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            serverStatusCard
+            serverControlCard
+            serverClientCard
+        }
+        .onAppear {
+            serverPortText = "\(effectiveServerPort)"
+            refreshServerDashboard()
+        }
+        .onReceive(Timer.publish(every: 1.0, on: .main, in: .common).autoconnect()) { _ in
+            guard selectedTab == .server else { return }
+            refreshServerDashboard()
+        }
+    }
+
+    private var serverStatusCard: some View {
+        SettingsCard(
+            header: "Live Status",
+            footer: serverController.lastError ?? "The server listens only on 127.0.0.1, so no other machine can reach it."
+        ) {
+            SettingsRow(
+                title: "Server State",
+                subtitle: serverController.lastError
+            ) {
+                SettingsStatusBadge(
+                    text: serverController.isRunning ? "Running" : "Stopped",
+                    systemImage: serverController.isRunning ? "checkmark.circle.fill" : "stop.circle",
+                    tint: serverController.isRunning ? .green : .secondary
+                )
+            }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "Endpoint",
+                subtitle: "The base URL API clients should connect to. Port changes take effect after a restart."
+            ) {
+                HStack(spacing: 6) {
+                    Text("http://\(ServerController.bindHost):\(serverController.isRunning ? serverController.boundPort : effectiveServerPort)/v1")
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(serverController.isRunning ? .primary : .secondary)
+                    Button(action: {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString("http://\(ServerController.bindHost):\(serverController.isRunning ? serverController.boundPort : effectiveServerPort)/v1", forType: .string)
+                        serverEndpointCopied = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { serverEndpointCopied = false }
+                    }) {
+                        Image(systemName: serverEndpointCopied ? "checkmark" : "doc.on.doc")
+                            .font(.system(size: 11))
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Copy the base URL for API harness configuration")
+                }
+            }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "Serving Model",
+                subtitle: "The exact name API clients must reference for the loaded model (GET /v1/models returns the same id). Copy it into your harness config (crush, opencode, etc.); requests are rejected with 503 until a model is loaded."
+            ) {
+                HStack(spacing: 6) {
+                    Text(serverDashboardModelName ?? "No model loaded")
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundStyle(serverDashboardModelName == nil ? .secondary : .primary)
+                    if serverDashboardModelName != nil {
+                        Button(action: copyServingModelName) {
+                            Image(systemName: serverModelNameCopied ? "checkmark" : "doc.on.doc")
+                                .font(.system(size: 11))
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Copy the served model name for API harness configuration")
+                    }
+                }
+            }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "Engine Activity",
+                subtitle: "Whether a completion turn is currently generating on the GPU."
+            ) {
+                SettingsStatusBadge(
+                    text: serverDashboardEngineActive ? "Generating" : "Idle",
+                    systemImage: serverDashboardEngineActive ? "waveform" : "zzz",
+                    tint: serverDashboardEngineActive ? .orange : .secondary
+                )
+            }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "Queued Turns",
+                subtitle: "Requests waiting for the single-flight generation slot, including the one currently running."
+            ) {
+                Text("\(serverDashboardQueueDepth)")
+                    .font(.system(size: 13, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "Requests In Flight",
+                subtitle: "Completion requests being handled right now."
+            ) {
+                Text("\(serverDashboardActiveRequests)")
+                    .font(.system(size: 13, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "Total Requests",
+                subtitle: "Completion requests accepted since the app launched (including rejected ones)."
+            ) {
+                Text("\(serverDashboardTotalRequests)")
+                    .font(.system(size: 13, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "Authentication",
+                subtitle: "When set, clients must send it as a Bearer token. Changes apply immediately."
+            ) {
+                SettingsStatusBadge(
+                    text: trimmedServerAPIKey.isEmpty ? "Open Access" : "API Key",
+                    systemImage: trimmedServerAPIKey.isEmpty ? "lock.open" : "lock",
+                    tint: trimmedServerAPIKey.isEmpty ? .secondary : .green
+                )
+            }
+        }
+    }
+
+    private var serverControlCard: some View {
+        SettingsCard(
+            header: "Control",
+            footer: "Toggling off stops the server immediately and drops any in-flight SSE streams. Port changes require a restart."
+        ) {
+            SettingsRow(
+                title: "Enable Local Server",
+                subtitle: "Starts the API server now and automatically each time you launch DynaMoE."
+            ) {
+                Toggle("Enable Local Server", isOn: $isServerEnabled)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+            }
+            .onChange(of: isServerEnabled) { _, enabled in
+                Task { await serverController.setRunning(enabled) }
+            }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "Port",
+                subtitle: "TCP port for the local API (default \(ServerController.defaultPort))."
+            ) {
+                HStack(spacing: 8) {
+                    TextField("8787", text: $serverPortText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12, design: .monospaced))
+                        .frame(width: 70)
+                        .multilineTextAlignment(.trailing)
+                        .onSubmit(applyServerPort)
+
+                    if serverController.isRunning {
+                        Button(action: restartServer) {
+                            Label("Restart", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .help("Restart the server to apply the new port")
+                    }
+                }
+            }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "API Key",
+                subtitle: "Optional shared secret. Leave empty to accept any local client."
+            ) {
+                SecureField("No authentication", text: $serverAPIKey)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 220)
+            }
+        }
+    }
+
+    private var serverClientCard: some View {
+        SettingsCard(
+            header: "Connecting Clients",
+            footer: "Reasoning-capable models separate their thinking into reasoning_content (OpenAI) or thinking blocks (Anthropic); pass \"enable_thinking\": false on the OpenAI endpoint, or leave \"thinking\" unset on the Anthropic endpoint, to disable it."
+        ) {
+            SettingsRow(
+                title: "Available Endpoints",
+                subtitle: "POST /v1/chat/completions (OpenAI) and POST /v1/messages (Anthropic), streaming + non-streaming. GET /v1/models, GET /health."
+            ) {
+                Text("OpenAI + Anthropic")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "Model Name",
+                subtitle: "The loaded model answers every request: GET /v1/models lists the name below as the id, and any \"model\" string in the request body is accepted (streaming responses echo the caller's value)."
+            ) {
+                HStack(spacing: 6) {
+                    Text(serverDashboardModelName ?? "No model loaded")
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(serverDashboardModelName == nil ? .secondary : .primary)
+                    if serverDashboardModelName != nil {
+                        Button(action: copyServingModelName) {
+                            Image(systemName: serverModelNameCopied ? "checkmark" : "doc.on.doc")
+                                .font(.system(size: 11))
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Copy the model name")
+                    }
+                }
+            }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "Max Tokens Default",
+                subtitle: "Requests without max_tokens fall back to this app-wide default from the Generation tab."
+            ) {
+                Text("\(maxNewTokens)")
+                    .font(.system(size: 13, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var trimmedServerAPIKey: String {
+        serverAPIKey.trimmingCharacters(in: .whitespaces)
+    }
+
+    private var effectiveServerPort: Int {
+        (1...65535).contains(serverPort) ? serverPort : ServerController.defaultPort
+    }
+
+    private func applyServerPort() {
+        let trimmed = serverPortText.trimmingCharacters(in: .whitespaces)
+        guard let parsed = Int(trimmed), (1...65535).contains(parsed) else {
+            serverPortText = "\(effectiveServerPort)"
+            return
+        }
+        serverPort = parsed
+        serverPortText = "\(parsed)"
+    }
+
+    private func restartServer() {
+        Task {
+            await serverController.stop()
+            serverController.start()
+        }
+    }
+
+    private func copyServingModelName() {
+        guard let name = serverDashboardModelName else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(name, forType: .string)
+        serverModelNameCopied = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { serverModelNameCopied = false }
+    }
+
+    private func refreshServerDashboard() {
+        let engine = CompletionEngine.shared
+        serverDashboardEngineActive = engine.isActive
+        serverDashboardModelName = engine.loadedModelInfo?.displayName
+        let stats = ServerController.stats.snapshot()
+        serverDashboardActiveRequests = stats.activeRequests
+        serverDashboardTotalRequests = stats.totalRequests
+        let controller = serverController
+        Task { serverDashboardQueueDepth = await controller.pendingQueueDepth() }
+    }
+
+    // MARK: - Tab 6: Advanced Diagnostics & Inspector
     private var advancedDiagnosticsSection: some View {
         VStack(alignment: .leading, spacing: 16) {
             SettingsCard(spacing: 12) {
