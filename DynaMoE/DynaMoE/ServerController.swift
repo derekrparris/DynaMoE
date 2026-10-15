@@ -33,7 +33,9 @@ enum QueuedTurnEvent: @unchecked Sendable {
     case ping(comment: String?)
     case engine(CompletionEvent)
     /// Synchronous launch failure (model not loaded, engine busy, etc.).
-    case launchFailed(String)
+    /// Carries the wire-shaped error so both protocol adapters render their
+    /// native envelope (status/type included).
+    case launchFailed(ServerAPIError)
 }
 
 /// FIFO queue over the engine's single-flight generation slot. Each request
@@ -74,15 +76,21 @@ actor TurnExecutionQueue {
             }
         }
         let task = Task<Void, Never> { [previous, heartbeat, deadline] in
-            defer { self.completedOperations += 1 }
+            defer {
+                // The heartbeat also serves the RUNNING turn: cancel it here, not
+                // right after the previous turn drains, so the SSE stream keeps
+                // emitting ping frames while a long prefill runs and clients
+                // (and any intermediate proxies) never see a silent socket.
+                self.completedOperations += 1
+                heartbeat.cancel()
+            }
             await previous.value
-            heartbeat.cancel()
             guard !Task.isCancelled else {
                 continuation.finish()
                 return
             }
             if let deadline, Date() >= deadline {
-                continuation.yield(.launchFailed("Request timed out waiting in the generation queue"))
+                continuation.yield(.launchFailed(ServerAPIError.requestTimeout("Request timed out waiting in the generation queue")))
                 continuation.finish()
                 return
             }
@@ -436,6 +444,18 @@ final class ServerController: ObservableObject {
         return info
     }
 
+    /// Maps synchronous launch failures onto the protocol-correct error:
+    /// request-shape problems (prompt too long for this machine's KV budget)
+    /// are 4xx, engine state problems are 503.
+    nonisolated private static func wireLaunchError(_ error: Error) -> ServerAPIError {
+        if let apiError = error as? ServerAPIError { return apiError }
+        if let launchError = error as? CompletionLaunchError {
+            let message = launchError.errorDescription ?? error.localizedDescription
+            return launchError.isClientError ? ServerAPIError.badRequest(message) : ServerAPIError.serviceUnavailable(message)
+        }
+        return ServerAPIError.internalError(error.localizedDescription)
+    }
+
     /// Adapter-neutral inputs to the shared turn-plan builder. Each protocol
     /// adapter resolves its own wire-format defaults (thinking opt-in vs
     /// opt-out, sampler extras, stop-sequence spelling, session identity)
@@ -590,7 +610,7 @@ final class ServerController: ObservableObject {
             do {
                 launch = try CompletionEngine.shared.launchTurn(plan.request)
             } catch {
-                throw ServerAPIError.serviceUnavailable((error as? CompletionLaunchError)?.errorDescription ?? "\(error.localizedDescription)")
+                throw wireLaunchError(error)
             }
             return try await withTaskCancellationHandler {
                 for await event in launch.stream {
@@ -700,10 +720,7 @@ final class ServerController: ObservableObject {
                         launch.handle.cancel()
                     }
                 } catch {
-                    let message = (error as? ServerAPIError)?.message
-                        ?? (error as? CompletionLaunchError)?.errorDescription
-                        ?? error.localizedDescription
-                    emit(.launchFailed(message))
+                    emit(.launchFailed(wireLaunchError(error)))
                 }
             }
             defer { task.cancel() }
@@ -712,8 +729,8 @@ final class ServerController: ObservableObject {
                 switch event {
                 case .ping(let comment):
                     try await ping(comment)
-                case .launchFailed(let message):
-                    let envelope = OpenAIErrorEnvelope(error: .init(message: message, type: "server_error", code: nil))
+                case .launchFailed(let apiError):
+                    let envelope = OpenAIErrorEnvelope(error: .init(message: apiError.message, type: apiError.wireType.rawValue, code: nil))
                     if let data = try? encoder.encode(envelope) {
                         try await sse(ByteBuffer(data: data))
                     }
@@ -866,8 +883,8 @@ final class ServerController: ObservableObject {
             func ping() async throws {
                 try await sse("ping", AnthropicPingEvent())
             }
-            func errorEvent(_ message: String) async throws {
-                try await sse("error", AnthropicErrorEvent(error: .init(type: "api_error", message: message)))
+            func errorEvent(_ message: String, type: String = "api_error") async throws {
+                try await sse("error", AnthropicErrorEvent(error: .init(type: type, message: message)))
             }
 
             var sentStart = false
@@ -926,10 +943,7 @@ final class ServerController: ObservableObject {
                         launch.handle.cancel()
                     }
                 } catch {
-                    let message = (error as? ServerAPIError)?.message
-                        ?? (error as? CompletionLaunchError)?.errorDescription
-                        ?? error.localizedDescription
-                    emit(.launchFailed(message))
+                    emit(.launchFailed(wireLaunchError(error)))
                 }
             }
             defer { task.cancel() }
@@ -938,10 +952,10 @@ final class ServerController: ObservableObject {
                 switch event {
                 case .ping:
                     try await ping()
-                case .launchFailed(let message):
+                case .launchFailed(let apiError):
                     try await ensureStart()
                     try await closeOpenBlocks()
-                    try await errorEvent(message)
+                    try await errorEvent(apiError.message, type: apiError.wireType.rawValue)
                     finishedCleanly = true
                 case .engine(.started):
                     try await ensureStart()

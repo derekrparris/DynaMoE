@@ -385,10 +385,23 @@ internal enum CompletionEvent: @unchecked Sendable {
 /// error text exactly like the old inline guards; the server maps them to 4xx.
 internal enum CompletionLaunchError: Error, LocalizedError, Sendable {
     case engineNotReady(String)
+    /// The prompt cannot fit the KV cache this turn can provision (either
+    /// outright, or with the requested max_tokens headroom). Message carries
+    /// the token counts and budget numbers the caller can act on.
+    case promptTooLong(String)
+
+    /// Chat-shaped launch failures the remote caller can fix (bad request),
+    /// as opposed to server-side conditions (model not loaded, engine busy).
+    var isClientError: Bool {
+        if case .promptTooLong = self { return true }
+        return false
+    }
 
     var errorDescription: String? {
         switch self {
         case let .engineNotReady(message):
+            return message
+        case let .promptTooLong(message):
             return message
         }
     }

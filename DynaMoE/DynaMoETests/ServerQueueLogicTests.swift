@@ -148,8 +148,8 @@ final class ServerQueueLogicTests: XCTestCase {
 
         var sawTimeoutFailure = false
         for await event in secondStream {
-            if case .launchFailed(let message) = event {
-                sawTimeoutFailure = message.contains("timed out")
+            if case .launchFailed(let apiError) = event {
+                sawTimeoutFailure = apiError.message.contains("timed out")
             }
         }
         XCTAssertTrue(sawTimeoutFailure, "the queued streaming turn must surface a timeout launch failure instead of running")

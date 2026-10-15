@@ -696,6 +696,122 @@ enum KVCacheProvisioning {
         let workingReserveGB = 2.5
         return max(0.25, processTargetGB - modelFootprintGB - workingReserveGB)
     }
+
+    // MARK: Turn fit
+
+    /// A margin of KV rows the launch path wants beyond the prompt plus
+    /// generated tokens (logits/sampling scratch, tree slots).
+    static let turnHeadroomRows = 512
+
+    static func neededSeqLen(isAgentSession: Bool, promptTokens: Int, requestedMaxTokens: Int) -> Int {
+        let minSeq = isAgentSession ? 8192 : 2048
+        return max(minSeq, min(32768, promptTokens + max(1, requestedMaxTokens) + turnHeadroomRows))
+    }
+
+    /// Launch-time capability check: the machine's KV budget clamps what a
+    /// turn can actually provision, so a prompt longer than the clamped cache
+    /// must be rejected before prefill drives attention and KV stores past
+    /// the allocated rows (it would silently read/write adjacent slots).
+    ///
+    /// `provisionedSeqLen` is the length the turn WILL provision after clamping
+    /// (floored by `minSeq` exactly like `launchTurn` does). `fit` says how the
+    /// request maps onto it: fits as requested, needs the max-token cap cut,
+    /// or cannot accept the prompt at all.
+    struct TurnFit: Equatable {
+        enum Outcome: Equatable {
+            case ok
+            case maxTokensReduced(provisioned: Int)
+            case promptTooLong(provisioned: Int)
+        }
+
+        var requestedSeqLen: Int
+        var provisionedSeqLen: Int
+        var clampedByBudget: Bool
+        var budgetGB: Double
+        var outcome: Outcome
+        /// Cap the caller should apply to generated tokens for this turn.
+        var effectiveMaxTokens: Int
+    }
+
+    static func turnFit(
+        isAgentSession: Bool,
+        promptTokens: Int,
+        requestedMaxTokens: Int,
+        config: ModelConfig?,
+        actualLayers: Int,
+        totalLoops: Int,
+        numKvHeads: Int,
+        headDim: Int,
+        precision: KVCachePrecision,
+        slidingSlotFlags: [Bool]?,
+        slidingRingLen: Int,
+        budgetMode: MemoryBudgetMode,
+        modelFootprintGB: Double,
+        physicalGB: Double
+    ) -> TurnFit {
+        let requested = neededSeqLen(
+            isAgentSession: isAgentSession,
+            promptTokens: promptTokens,
+            requestedMaxTokens: requestedMaxTokens
+        )
+        let kvGeometry = geometry(
+            config: config,
+            actualLayers: actualLayers,
+            totalLoops: totalLoops,
+            numKvHeads: numKvHeads,
+            headDim: headDim,
+            precision: precision,
+            slidingSlotFlags: slidingSlotFlags,
+            slidingRingLen: slidingRingLen
+        )
+        let budget = budgetGB(physicalGB: physicalGB, modelFootprintGB: modelFootprintGB, budgetMode: budgetMode)
+        let minSeq = isAgentSession ? 8192 : 2048
+        let floorLen = max(minSeq, 1)  // prefix reuse can only raise the floor; treat min as the check floor
+        let provisioned = clampedSeqLen(
+            requested: requested,
+            floor: min(floorLen, max(1, requested)),
+            geometry: kvGeometry,
+            budgetGB: budget
+        )
+        let clamped = provisioned < requested
+        // The prompt itself needs its own row (its tokens live at 0..<prompt,
+        // decode writes at promptTokens...). A small fixed slack keeps sampling
+        // scratch, logits, and one-step generation margins out of the arithmetic.
+        let minimumPromptSlack = 64
+        let headroom = provisioned - promptTokens
+        if headroom < minimumPromptSlack {
+            return TurnFit(
+                requestedSeqLen: requested,
+                provisionedSeqLen: provisioned,
+                clampedByBudget: clamped,
+                budgetGB: budget,
+                outcome: .promptTooLong(provisioned: provisioned),
+                effectiveMaxTokens: 0
+            )
+        }
+        let affordableMaxTokens = headroom - turnHeadroomRows
+        if affordableMaxTokens < max(1, requestedMaxTokens) {
+            // Never collapse below a floor of usable generation when the prompt
+            // still fits: the runtime row guards hard-stop any overrun anyway.
+            let flooredMaxTokens = max(64, affordableMaxTokens)
+            return TurnFit(
+                requestedSeqLen: requested,
+                provisionedSeqLen: provisioned,
+                clampedByBudget: clamped,
+                budgetGB: budget,
+                outcome: .maxTokensReduced(provisioned: provisioned),
+                effectiveMaxTokens: flooredMaxTokens
+            )
+        }
+        return TurnFit(
+            requestedSeqLen: requested,
+            provisionedSeqLen: provisioned,
+            clampedByBudget: clamped,
+            budgetGB: budget,
+            outcome: .ok,
+            effectiveMaxTokens: max(1, requestedMaxTokens)
+        )
+    }
 }
 
 struct ExpertSlice {

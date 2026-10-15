@@ -1211,7 +1211,7 @@ public final class CompletionEngine: @unchecked Sendable {
         let topKVal = sampling.topK
         let repPen = sampling.repetitionPenalty
         let presPen = sampling.presencePenalty
-        let maxTokens = sampling.maxTokens
+        var maxTokens = sampling.maxTokens
         let buffers = shardBuffers
         let effMode = memory.executionMode.resolveEffectiveMode(modelFootprintGB: summary.sizeGb)
         let isFullRAM = (effMode == .residentRAM || memory.budgetMode == .unrestricted)
@@ -1221,6 +1221,53 @@ public final class CompletionEngine: @unchecked Sendable {
         let minSeq = isAgentSession ? 8192 : 2048
         var neededSeqLen = max(minSeq, min(32768, promptTokenIds.count + maxTokens + 512))
         var kvPrec = memory.kvPrecision
+
+        // Reject (or ratchet) turns whose prompt cannot fit the KV cache this
+        // machine can provision. Without this check the prefill kept running
+        // past a clamped allocation and the attention/KV kernels indexed rows
+        // that were never allocated — silently corrupting cache slots and, in
+        // the worst case, walking off the buffer. The check runs before the
+        // multi-GB scratch/KV allocations so a rejected turn costs nothing.
+        let fitPhysicalGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+        let fitCheck = KVCacheProvisioning.turnFit(
+            isAgentSession: isAgentSession,
+            promptTokens: promptTokenIds.count,
+            requestedMaxTokens: maxTokens,
+            config: modelConfig,
+            actualLayers: actualLayers,
+            totalLoops: totalLoops,
+            numKvHeads: Int(numKvHeads),
+            headDim: Int(headDim),
+            precision: memory.kvPrecision,
+            slidingSlotFlags: nil,
+            slidingRingLen: 0,
+            budgetMode: memory.budgetMode,
+            modelFootprintGB: summary.sizeGb,
+            physicalGB: fitPhysicalGB
+        )
+        switch fitCheck.outcome {
+        case .promptTooLong(let provisioned):
+            throw CompletionLaunchError.promptTooLong(
+                "⚠️ Prompt too long: \(promptTokenIds.count) prompt tokens exceed the \(provisioned)-token KV capacity this turn can provision " +
+                "(KV budget \(String(format: "%.2f", fitCheck.budgetGB)) GB on a \(String(format: "%.0f", fitPhysicalGB)) GB machine; " +
+                "shorten the prompt, lower max_tokens, or raise the memory budget)."
+            )
+        case .maxTokensReduced(let provisioned):
+            let capped = max(1, min(maxTokens, fitCheck.effectiveMaxTokens))
+            if capped < maxTokens {
+                print("⚠️ [KVCACHE] clamping max_tokens \(maxTokens) -> \(capped): \(promptTokenIds.count)-token prompt fits a \(provisioned)-token KV provision (budget \(String(format: "%.2f", fitCheck.budgetGB)) GB)")
+                maxTokens = capped
+                // Keep the rest of the launch consistent with the capped budget: the clamp below re-derives
+                // provisioned length from prompt + maxTokens, so mirror the cap there too.
+                neededSeqLen = KVCacheProvisioning.neededSeqLen(
+                    isAgentSession: isAgentSession,
+                    promptTokens: promptTokenIds.count,
+                    requestedMaxTokens: capped
+                )
+            }
+        case .ok:
+            break
+        }
         if modelConfig?.isLingModel == true && kvPrec != .fp16 {
             // Ling MLA KV store/decode kernels are F16-only and their byte-offset math
             // hardcodes MemoryLayout<UInt16>.stride (see the MLA branch in runTokenForward).
@@ -1965,6 +2012,10 @@ public final class CompletionEngine: @unchecked Sendable {
             var packedPrefetchObservedHits = 0
             var packedPrefetchObservedTotal = 0
             func runTokenForward(tokenId: UInt32, step: UInt32, computeLogits: Bool, wait: Bool = true) -> Bool {
+                if Int(step) >= KVCacheManager.shared.allocatedSeqLen {
+                    print("❌ [KVCACHE] step \(step) exceeds the provisioned row length \(KVCacheManager.shared.allocatedSeqLen) — refusing forward (KV precision \(KVCacheManager.shared.activePrecision))")
+                    return false
+                }
                 let tTokenStart = CFAbsoluteTimeGetCurrent()
                 let hadTemporalHistory = !previousLayerActiveExperts.isEmpty
                 var diagLayerRouterMs: Double = 0
@@ -1993,8 +2044,10 @@ public final class CompletionEngine: @unchecked Sendable {
                 var currentH = hCurrBuffer
                 var nextH = hNextBuffer
 
-                guard var activeCmd = commandQueue.makeCommandBuffer() else { return false }
-
+                guard var activeCmd = commandQueue.makeCommandBuffer() else {
+                    print("❌ [METAL] token forward: command buffer allocation failed (step=\(step))")
+                    return false
+                }
                 // Pipelined packed-expert streaming state (per token, packed decode only).
                 // After layer l's router resolves, the l+1 predicted experts are pread into the
                 // OTHER staging buffer while layer l's MoE MLP runs on the GPU; layer l's own
@@ -2094,7 +2147,10 @@ public final class CompletionEngine: @unchecked Sendable {
                         }
 
                         // --- Phase A: Attention & Routing Sub-Block ---
-                        guard let layerEnc1 = activeCmd.makeComputeCommandEncoder() else { return false }
+                        guard let layerEnc1 = activeCmd.makeComputeCommandEncoder() else {
+                            print("❌ [METAL] token forward: Phase A encoder allocation failed (layer \(l), step \(step))")
+                            return false
+                        }
 
                         // Step 0: Embed Token on Loop 0, Layer 0
                         if loopIdx == 0 && l == 0 {
@@ -3567,8 +3623,10 @@ if layer.attnGateProjTensor != nil,
                             }
 
                             guard let gemmaMoeCmd = commandQueue.makeCommandBuffer(),
-                                  let gemmaEnc = gemmaMoeCmd.makeComputeCommandEncoder() else { return false }
-
+                                  let gemmaEnc = gemmaMoeCmd.makeComputeCommandEncoder() else {
+                                print("❌ [METAL] token forward: gemma MoE command buffer failed (layer \(l), step \(step))")
+                                return false
+                            }
                             // pre_feedforward_layernorm_2(hMid) -> xNorm2Buffer
                             if let pf2 = layer.preFfnNorm2Tensor, let pf2Raw = buffers[pf2.shardIndex] {
                                 var gOff = pf2.offsetStart
@@ -3809,7 +3867,10 @@ if layer.attnGateProjTensor != nil,
                                 return false
                             }
 
-                            guard let nextCmd = commandQueue.makeCommandBuffer() else { return false }
+                            guard let nextCmd = commandQueue.makeCommandBuffer() else {
+                                print("❌ [METAL] token forward: command buffer allocation failed at gemma layer \(l) (step \(step))")
+                                return false
+                            }
                             activeCmd = nextCmd
                         } else {
                         // Step 3: Residual Connection 1 (hMid = currentH + attnOut or 4-stream inject)
@@ -4368,7 +4429,10 @@ if layer.attnGateProjTensor != nil,
                                 print("[DIAG] Layer \(l)\(layer.attentionType == .fullAttention ? "(gqa)" : ""): PhaseA=\(String(format: "%.2f", diagLayerRouterMs))ms IO=\(String(format: "%.1f", tIoElapsed))ms (prefetch \(prefetchHits)/\(activeExperts.count))")
 
                                 guard let moeCmd = commandQueue.makeCommandBuffer(),
-                                      let layerEnc2 = moeCmd.makeComputeCommandEncoder() else { return false }
+                                      let layerEnc2 = moeCmd.makeComputeCommandEncoder() else {
+                                    print("❌ [METAL] token forward: MoE command buffer failed (layer \(l), step \(step), packed)")
+                                    return false
+                                }
 
                                 layerEnc2.setComputePipelineState(clearPipeline)
                                 layerEnc2.setBuffer(hMlpBuffer, offset: 0, index: 0)
@@ -4707,7 +4771,10 @@ if layer.attnGateProjTensor != nil,
                                 }
                             } else {
                                 guard let moeCmd = commandQueue.makeCommandBuffer(),
-                                      let layerEnc2 = moeCmd.makeComputeCommandEncoder() else { return false }
+                                      let layerEnc2 = moeCmd.makeComputeCommandEncoder() else {
+                                    print("❌ [METAL] token forward: MoE command buffer failed (layer \(l), step \(step), unpacked)")
+                                    return false
+                                }
 
                                 layerEnc2.setComputePipelineState(clearPipeline)
                                 layerEnc2.setBuffer(hMlpBuffer, offset: 0, index: 0)
@@ -4813,7 +4880,10 @@ if layer.attnGateProjTensor != nil,
                                 }
                             }
 
-                            guard let nextCmd = commandQueue.makeCommandBuffer() else { return false }
+                            guard let nextCmd = commandQueue.makeCommandBuffer() else {
+                                print("❌ [METAL] token forward: command buffer allocation failed at MoE layer \(l) (step \(step))")
+                                return false
+                            }
                             activeCmd = nextCmd
                         }
                         }
@@ -4825,7 +4895,10 @@ if layer.attnGateProjTensor != nil,
 
                     // Apply intermediate loop final norm if multiple loops exist
                     if loopIdx + 1 < totalLoops, let normTensor = normTensor, let normShardBuffer = normShardBuffer {
-                        guard let loopNormEnc = activeCmd.makeComputeCommandEncoder() else { return false }
+                        guard let loopNormEnc = activeCmd.makeComputeCommandEncoder() else {
+                            print("❌ [METAL] token forward: loop-norm encoder allocation failed (loop \(loopIdx), step \(step))")
+                            return false
+                        }
 
                         var nOff = normOffset
                         var epsVal = eps
@@ -4865,7 +4938,10 @@ if layer.attnGateProjTensor != nil,
                 }
 
                 // 3. Final RMSNorm & LM Head
-                guard let finalEnc = activeCmd.makeComputeCommandEncoder() else { return false }
+                guard let finalEnc = activeCmd.makeComputeCommandEncoder() else {
+                    print("❌ [METAL] token forward: final norm encoder allocation failed (step \(step))")
+                    return false
+                }
 
                 if let finalHcDown = finalHcDownWeight, let finalHcDownRaw = buffers[finalHcDown.shardIndex],
                    let finalHcUp = finalHcUpWeight, let finalHcUpRaw = buffers[finalHcUp.shardIndex],
@@ -4968,6 +5044,10 @@ if layer.attnGateProjTensor != nil,
             func runLayerWisePrefill(promptTokens: [UInt32], startPos: UInt32 = 0, chunkIndex: Int = 0, chunkCount: Int = 1, prefillProgress: ((String, Double, Double) -> Void)? = nil) -> Bool {
                 let P = promptTokens.count
                 guard P > 0 else { return true }
+                if Int(startPos) + P > KVCacheManager.shared.allocatedSeqLen {
+                    print("❌ [KVCACHE] prefill range \(startPos)..<\(Int(startPos) + P) exceeds the provisioned row length \(KVCacheManager.shared.allocatedSeqLen) — refusing chunk (KV precision \(KVCacheManager.shared.activePrecision))")
+                    return false
+                }
 
                 let topKCount = max(Int(modelConfig?.effectiveNumExpertsPerTok ?? (numExperts >= 512 ? 10 : (numExperts > 0 ? 8 : 1))), 1)
                 let hasHc = (cachedLayers.first?.attnHcDownWeight != nil)
@@ -5922,7 +6002,10 @@ if layer.attnGateProjTensor != nil,
 
                         // Phase A: RMSNorm1/HC Blend + Attention/GDN + Residual1/HC Inject + RMSNorm2/HC Blend + Router (batched across all P tokens in ONE encoder)
                         guard let activeCmd = commandQueue.makeCommandBuffer(),
-                              let layerEnc1 = activeCmd.makeComputeCommandEncoder() else { return false }
+                              let layerEnc1 = activeCmd.makeComputeCommandEncoder() else {
+                            print("❌ [METAL] prefill: Phase A command buffer allocation failed (chunk startPos=\(startPos), P=\(P))")
+                            return false
+                        }
 
                         // 1. RMSNorm 1 OR Pre-Attention Hyper-Connection Mixing (dispatched across all P tokens)
                         if let hcDown = layer.attnHcDownWeight, let hcDownRaw = buffers[hcDown.shardIndex],
@@ -7294,7 +7377,10 @@ if layer.attnGateProjTensor != nil,
                                 WorkingSetManager.shared.touchAndEvict(layer: l, activeExpertIds: activeExpIds, mode: budgetMode, shardBuffers: buffers, isPrefill: true)
 
                                 guard let moeCmd = commandQueue.makeCommandBuffer(),
-                                      let layerEnc2 = moeCmd.makeComputeCommandEncoder() else { return false }
+                                      let layerEnc2 = moeCmd.makeComputeCommandEncoder() else {
+                                    print("❌ [METAL] prefill: MoE command buffer allocation failed (layer \(l), chunk startPos=\(startPos), P=\(P))")
+                                    return false
+                                }
 
                                 layerEnc2.setComputePipelineState(clearPipeline)
                                 layerEnc2.setBuffer(hMlpBuffer_all, offset: 0, index: 0)
@@ -7599,7 +7685,10 @@ if layer.attnGateProjTensor != nil,
                     // Apply intermediate loop final norm if multiple loops exist
                     if loopIdx + 1 < totalLoops, let normTensor = normTensor, let normShardBuffer = normShardBuffer {
                         guard let loopNormCmd = commandQueue.makeCommandBuffer(),
-                              let loopNormEnc = loopNormCmd.makeComputeCommandEncoder() else { return false }
+                              let loopNormEnc = loopNormCmd.makeComputeCommandEncoder() else {
+                            print("❌ [METAL] prefill: loop-norm command buffer allocation failed (chunk startPos=\(startPos), P=\(P))")
+                            return false
+                        }
 
                         var nOff = normOffset
                         var epsVal = eps
@@ -7637,7 +7726,10 @@ if layer.attnGateProjTensor != nil,
 
                 if hasHc, let ext0 = extractStream0Pipeline {
                     guard let extCmd = commandQueue.makeCommandBuffer(),
-                          let extEnc = extCmd.makeComputeCommandEncoder() else { return false }
+                          let extEnc = extCmd.makeComputeCommandEncoder() else {
+                        print("❌ [METAL] prefill: HC extract command buffer allocation failed")
+                        return false
+                    }
                     let lastHcTokenOffset = (P - 1) * 4 * Int(hiddenDim) * MemoryLayout<Float>.stride
                     extEnc.setComputePipelineState(ext0)
                     extEnc.setBuffer(hcStreamsBuffer_all, offset: lastHcTokenOffset, index: 0)
@@ -7655,7 +7747,10 @@ if layer.attnGateProjTensor != nil,
                     // Copy final prompt token (P - 1)'s hidden state into hCurrBuffer so generation continues seamlessly
                     let lastTokenOffset = (P - 1) * Int(hiddenDim) * MemoryLayout<Float>.stride
                     guard let copyCmd = commandQueue.makeCommandBuffer(),
-                          let blit = copyCmd.makeBlitCommandEncoder() else { return false }
+                          let blit = copyCmd.makeBlitCommandEncoder() else {
+                        print("❌ [METAL] prefill: buffer-copy command allocation failed")
+                        return false
+                    }
                     blit.copy(from: currHBuf, sourceOffset: lastTokenOffset, to: hCurrBuffer, destinationOffset: 0, size: Int(hiddenDim) * MemoryLayout<Float>.stride)
                     blit.endEncoding()
                     copyCmd.commit()
@@ -9665,7 +9760,11 @@ if layer.attnGateProjTensor != nil,
                                 runTokenForward(tokenId: pTok, step: UInt32(startPos + idx), computeLogits: false)
                             }
                             if !stepOk {
-                                print("❌ [PREFILL] Token \(idx + 1)/\(totalTokens) (id=\(pTok), step=\(startPos + idx)) forward pass failed — see prior diagnostics for the failing layer/buffer.")
+                                if Task.isCancelled {
+                                    print("🛑 [PREFILL] Token \(idx + 1)/\(totalTokens) stopped by user at step \(startPos + idx) — not a forward-pass error.")
+                                } else {
+                                    print("❌ [PREFILL] Token \(idx + 1)/\(totalTokens) (id=\(pTok), step=\(startPos + idx)) forward pass failed — see prior diagnostics for the failing layer/buffer.")
+                                }
                                 prefillSuccess = false
                                 break
                             }

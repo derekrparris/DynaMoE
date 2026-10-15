@@ -2837,6 +2837,74 @@ stride, or precision): the resident allocation now records its geometry
 realloc, for the FP8 scale buffers too. Test:
 `testKVCacheManagerReleasesStaleGeometryOnModelSwitch`.
 
+### QA #52 — Server turns on prompts the machine cannot serve: silent KV overrun, minute-long SSE silence, and unexplained "forward pass failed"
+
+Field report (server testing with crush as the client): a request starts, then
+the turn "just dies in different ways" — once on Spark, once on Ornith. Live
+reproduction with the exact failed-run prompt (19,352 tokens on Ornith, loaded
+from the server prompt dumps) pinned three concrete defects, each confirmed on
+the 16 GB M1 Pro with the Release binary:
+
+1. **The KV clamp does not bound prefill.** `neededSeqLen` shrinks to the
+   machine's KV budget (⚠️ `[KVCACHE]` line), but prefill kept ingesting all
+   19,352 tokens into a cache provisioned for fewer rows. Attention reads and
+   KV stores index rows past the allocation: adjacent slots absorb the
+   overflow as silent corruption, and the final slot's rows fall off the end
+   of the buffer. Nothing prints; the turn may still "succeed" with garbage.
+2. **The SSE stream goes silent for the whole prefill.** The streaming relay
+   cancelled the queue heartbeat the moment the previous turn drained (and the
+   generic batched prefill path emits nothing until a layer-chunk boundary),
+   so a client saw zero bytes — not even HTTP headers flushing — while the
+   engine ground through a prefill that measured at 10–100 s per layer under
+   memory compression (`waitUntilCompleted` parked for 40+ minutes; process
+   footprint 9.1 GB with 5.5 GB compressed; no crash report, because the app
+   never crashed — the turn just ran for hours). To the client this is exactly
+   "the process died in different ways".
+3. **Silent allocation-failure sites return false with no diagnostic.** The
+   per-token Spark runs failed mid-prefill (step 862 / step 225, two runs) with
+   only the useless "see prior diagnostics" line — there were no prior
+   diagnostics because every Metal allocation-failure guard along that path
+   returns without printing. With ~4 GB of FP16 KV provisioned against a
+   3.8 GB budget on a 16 GB machine plus the pinned backbone, an allocator
+   failure mid-prefill is plausible; the code hid it.
+
+Fixes (CompletionEngine.swift, EngineRuntime.swift, ServerController.swift):
+
+- `KVCacheProvisioning.turnFit(...)` — pure fit check at launch: computes the
+  engine's exact post-clamp provision and either `.ok`, `.maxTokensReduced`
+  (headroom capped to a floored 64 tokens when the affirmative budget would
+  push generation negative), or `.promptTooLong` → new `CompletionLaunchError.promptTooLong`. Rejection happens before any scratch
+  or KV allocation, so a bad turn costs nothing. The server maps it to a
+  400-shaped `invalid_request_error` in both protocols' streaming and
+  non-streaming envelopes (`launchFailed` now carries the full `ServerAPIError`
+  so status/type render correctly).
+- Runtime row guards: `runTokenForward` refuses `step >= allocatedSeqLen` and
+  `runLayerWisePrefill` refuses chunks extending past the provisioned length,
+  each with a `❌ [KVCACHE]` line naming the numbers.
+- Every silent `return false` guard in `runTokenForward` / `runLayerWisePrefill`
+  (command-buffer nil, encoder nil) now prints the failing site, layer, and
+  step; the generic prefill fails through the same path.
+- The queue heartbeat now runs for the lifetime of the turn (cancel moved into
+  the task's `defer`), so supervision pings flow while the engine is IN
+  prefill, not only while waiting behind earlier turns.
+
+Measured on the post-fix binary (16 GB M1 Pro, Ornith):
+
+| probe | before | after |
+| --- | --- | --- |
+| 19,352-token prompt | prefill ran 40+ min past a 8k-row KV clamp, zero frames to client | rejected in **0.01 s** with `invalid_request_error` envelope ("19,360 prompt tokens exceed the 3,276-token KV capacity this turn can provision (KV budget 0.25 GB on a 16 GB machine)") |
+| SSE first byte (idle queue) | ~50 s of silence, then 10 buffered pings at once | **0.04 s** |
+| SSE pings while queue busy behind a long turn | none until buffered flush | **5.3 s cadence**, continuous |
+| short streaming turn (191 tokens) | worked | works end-to-end: role chunk at turn start, `:prefill:` progress comments every ~1 s (12 → 15 tok/s), then reasoning deltas, `[DONE]` |
+
+Tests: `TurnFitLogicTests` (seven cases: ample budget, prompt overrun rejection,
+floored max-token ratchet, near-full agent prompt, agent-session floor,
+needed-length formula), and `ServerQueueLogicTests` updated for the typed
+`launchFailed` error. All existing pure-logic suites still green
+(engine/adapters/queue/hardening). The per-token prefill failure print is
+cancellation-aware so a user stop reports `🛑 stopped by user` instead of a
+forward-pass error.
+
 ## FIX #13: STALE TOOL BLOCK AFTER tools_load (SHIPPED)
 
 Third live-run forensics round (13:03–13:14Z, post scale-fix binary — steps were
