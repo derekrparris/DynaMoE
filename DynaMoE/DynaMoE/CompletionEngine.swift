@@ -1430,12 +1430,35 @@ public final class CompletionEngine: @unchecked Sendable {
             slidingSlotFlags: gemmaSlidingSlotFlags,
             slidingRingLen: gemmaSlidingRingLen
         )
+        // The fit check ran before the Ling/Gemma precision overrides, so this
+        // launch-side re-derivation is the only one computed from the EFFECTIVE
+        // KV precision. Re-gate here: when the budget cannot hold the session
+        // floor or the pinned prefix, fail fast in milliseconds instead of
+        // over-provisioning the floor size past the budget and thrashing to
+        // death mid-generation (the 16 GB repro: a 8,798-token turn accepted,
+        // 4.3 s/layer, dead at token 913).
+        let preservedRows = max(minSeq, prefixTokensReused)
+        let affordability = KVCacheProvisioning.affordableSeqLen(geometry: kvGeometry, budgetGB: kvBudgetGB)
+        if affordability < preservedRows {
+            throw CompletionLaunchError.promptTooLong(
+                "⚠️ KV budget \(String(format: "%.2f", kvBudgetGB)) GB on a \(String(format: "%.0f", physicalGB)) GB machine cannot hold the \(preservedRows)-row floor this turn must provision " +
+                "(affords \(affordability) rows: pinned prefix \(prefixTokensReused), session floor \(minSeq), \(kvPrec) KV cache). " +
+                "Raise the memory budget mode or lower the KV cache precision."
+            )
+        }
         let clampedSeqLen = KVCacheProvisioning.clampedSeqLen(
             requested: neededSeqLen,
-            floor: max(minSeq, prefixTokensReused),
+            floor: preservedRows,
             geometry: kvGeometry,
             budgetGB: kvBudgetGB
         )
+        if clampedSeqLen < promptTokenIds.count + 64 {
+            throw CompletionLaunchError.promptTooLong(
+                "⚠️ \(promptTokenIds.count) prompt tokens exceed the \(clampedSeqLen)-row KV provision the budget affords " +
+                "(KV budget \(String(format: "%.2f", kvBudgetGB)) GB on a \(String(format: "%.0f", physicalGB)) GB machine at \(kvPrec) KV cache; " +
+                "shorten the prompt, raise the memory budget mode, or lower the KV cache precision)."
+            )
+        }
         if clampedSeqLen < neededSeqLen {
             let kvGB = Double(KVCacheProvisioning.requiredBytes(maxSeqLen: clampedSeqLen, geometry: kvGeometry)) / 1_073_741_824
             print("⚠️ [KVCACHE] clamping provisioned seq len \(neededSeqLen) -> \(clampedSeqLen) (KV \(String(format: "%.2f", kvGB)) GB against a \(String(format: "%.2f", kvBudgetGB)) GB budget on a \(String(format: "%.1f", physicalGB)) GB machine; set the memory budget mode to raise it)")

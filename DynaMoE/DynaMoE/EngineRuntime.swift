@@ -671,18 +671,26 @@ enum KVCacheProvisioning {
         return rows * (geometry.kStride + geometry.vStride) * geometry.elementBytes
     }
 
-    /// Largest sequence length whose KV allocation fits `budgetGB`, never below
-    /// `floor`. An infinite budget (or a request already at/below the floor)
-    /// passes through unchanged.
-    static func clampedSeqLen(requested: Int, floor: Int, geometry: Geometry, budgetGB: Double) -> Int {
-        guard requested > floor, budgetGB.isFinite else { return requested }
+    /// Sequence rows the KV budget alone can hold for `geometry`. Unconstrained
+    /// layouts (no linear slots, or a non-finite budget) return `Int.max`.
+    static func affordableSeqLen(geometry: Geometry, budgetGB: Double) -> Int {
         let ringSlots = ringSlotCount(geometry)
         let linearSlots = max(0, geometry.totalSlots - ringSlots)
         let bytesPerLinearPosition = Double((geometry.kStride + geometry.vStride) * geometry.elementBytes)
-        guard linearSlots > 0, bytesPerLinearPosition > 0 else { return requested }
+        guard linearSlots > 0, bytesPerLinearPosition > 0, budgetGB.isFinite else { return Int.max }
         let fixedRingBytes = Double(ringSlots * geometry.slidingRingLen) * bytesPerLinearPosition
         let budgetBytes = max(0.0, budgetGB * 1_073_741_824)
-        let affordable = Int((max(0.0, budgetBytes - fixedRingBytes)) / (Double(linearSlots) * bytesPerLinearPosition))
+        return Int((max(0.0, budgetBytes - fixedRingBytes)) / (Double(linearSlots) * bytesPerLinearPosition))
+    }
+
+    /// Largest sequence length whose KV allocation fits `budgetGB`, never below
+    /// `floor`. An infinite budget (or a request already at/below the floor)
+    /// passes through unchanged. The floor deliberately wins over the budget,
+    /// so callers that must never provision past the budget check
+    /// `affordableSeqLen` (and reject) before trusting this raising behavior.
+    static func clampedSeqLen(requested: Int, floor: Int, geometry: Geometry, budgetGB: Double) -> Int {
+        guard requested > floor, budgetGB.isFinite else { return requested }
+        let affordable = affordableSeqLen(geometry: geometry, budgetGB: budgetGB)
         return max(floor, min(requested, affordable))
     }
 
@@ -713,10 +721,16 @@ enum KVCacheProvisioning {
     /// must be rejected before prefill drives attention and KV stores past
     /// the allocated rows (it would silently read/write adjacent slots).
     ///
-    /// `provisionedSeqLen` is the length the turn WILL provision after clamping
-    /// (floored by `minSeq` exactly like `launchTurn` does). `fit` says how the
-    /// request maps onto it: fits as requested, needs the max-token cap cut,
-    /// or cannot accept the prompt at all.
+    /// The memory budget is the authority over the session floor: when the
+    /// budget cannot hold even the `minSeq` floor the turn is rejected outright
+    /// (`.promptTooLong`) rather than provisioned at the floor size, which
+    /// would thrash until the runtime row guards kill it mid-generation.
+    ///
+    /// `provisionedSeqLen` is the length the turn WILL provision after the
+    /// budget clamp (floored by `minSeq` exactly like `launchTurn` does — and
+    /// always at least `minSeq`, or the turn was rejected above). `fit` says
+    /// how the request maps onto it: fits as requested, needs the max-token
+    /// cap cut, or cannot accept the prompt at all.
     struct TurnFit: Equatable {
         enum Outcome: Equatable {
             case ok
@@ -766,6 +780,17 @@ enum KVCacheProvisioning {
         )
         let budget = budgetGB(physicalGB: physicalGB, modelFootprintGB: modelFootprintGB, budgetMode: budgetMode)
         let minSeq = isAgentSession ? 8192 : 2048
+        let affordable = affordableSeqLen(geometry: kvGeometry, budgetGB: budget)
+        if affordable < minSeq {
+            return TurnFit(
+                requestedSeqLen: requested,
+                provisionedSeqLen: affordable,
+                clampedByBudget: true,
+                budgetGB: budget,
+                outcome: .promptTooLong(provisioned: affordable),
+                effectiveMaxTokens: 0
+            )
+        }
         let floorLen = max(minSeq, 1)  // prefix reuse can only raise the floor; treat min as the check floor
         let provisioned = clampedSeqLen(
             requested: requested,

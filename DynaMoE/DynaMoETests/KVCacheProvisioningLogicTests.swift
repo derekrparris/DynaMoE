@@ -88,6 +88,16 @@ final class KVCacheProvisioningLogicTests: XCTestCase {
                        "an ample budget never clamps")
     }
 
+    func testAffordableSeqLenDerivesRowsFromBudget() {
+        let geometry = sparkGeometry()
+        // Same arithmetic the budget clamp uses: floor(budget / bytes-per-row-slot).
+        XCTAssertEqual(KVCacheProvisioning.affordableSeqLen(geometry: geometry, budgetGB: 1.0),
+                       Int(1_073_741_824 / (36 * 4096)))
+        XCTAssertEqual(KVCacheProvisioning.affordableSeqLen(geometry: geometry, budgetGB: 0), 0)
+        // A non-finite budget means unconstrained, and must not trap the Int cast.
+        XCTAssertEqual(KVCacheProvisioning.affordableSeqLen(geometry: geometry, budgetGB: .infinity), Int.max)
+    }
+
     // MARK: - Machine/model/mode budget
 
     func testBudgetReservesWeightsAndWorkingSet() {

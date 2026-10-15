@@ -3295,3 +3295,57 @@ Note for future runs: a `❌ [PREFILL] transient buffer '...' failed to
 allocate` line means the budget-capped residency plus staging genuinely
 exceeds the machine — lower the memory budget mode (8 GB => 5.5 GB cap) or
 the model's resident set, not the chunking.
+
+---
+
+### QA #53 — the KV agent floor overruled the memory budget, so under-budget turns were accepted and thrashed until they died
+
+Follow-up to the settings wiring (server turns now read the in-app memory
+policy, QA #52's fit check) and the same 16 GB thread of observations:
+Spark on `balanced16GB` budgets 0.25 GB of KV (~910 rows at the engine's
+8-head shape), `neededSeqLen`'s 8,192-row agent floor deliberately won over
+that budget in `clampedSeqLen` (`max(floor, min(requested, affordable))`),
+so the allocator provisioned the floor anyway — roughly 9x the KV budget in
+a real repro: a 8,798-token turn was accepted, ran at 4.3 s/layer, and died
+at token 913 on runtime row guards, instead of failing fast with a
+diagnosable message. The same floor-wins math also let a turn that passed
+the fit check under the REQUESTED KV precision survive the mid-launch
+Ling/Gemma fp8 -> fp16 overrides and still over-provision with the
+effective (2x-byte) cache.
+
+Fix (EngineRuntime.swift, CompletionEngine.swift): the memory budget is now
+the authority, the floor is a secondary preference.
+
+- `KVCacheProvisioning.affordableSeqLen(geometry:budgetGB:)` extracted from
+  the clamp arithmetic (the pure "rows the budget can hold" number; the
+  `clampedSeqLen` contract itself is unchanged for its other callers).
+- `turnFit` rejects the turn outright as `.promptTooLong(provisioned:
+  affordable)` when the budget cannot hold even the `minSeq` floor — pure
+  math, milliseconds, before any allocation. `clampedSeqLen` never gets
+  asked to raise a request above what the budget affords on this path.
+- The launch-time clamp re-derives affordability from the EFFECTIVE KV
+  precision (after the fp16 overrides, which the fit check cannot see) and
+  throws `CompletionLaunchError.promptTooLong` when the budget cannot hold
+  the session floor or the pinned prefix, plus a prompt-vs-provision guard
+  for the same drift; both run before the multi-GB `KVCacheManager.reset`.
+
+Behavior after the fix on the 16 GB M1 Pro: agent turns (8,192-row floor)
+fail fast with "KV budget 0.25 GB ... cannot hold the 8192-row floor ...
+affords 910 rows ... raise the memory budget mode or lower the KV cache
+precision" instead of a 4.3 s/layer spiral and a dead generation; a budget
+that holds the floor keeps the previous ratchet semantics intact (thin
+headroom floors max_tokens at 64 rather than rejecting).
+
+Tests: `TurnFitLogicTests` reworked — the budget-below-floor cases now
+expect `.promptTooLong` with the affordable provision (910 rows), the
+floor-holds cases pin their budgets to exactly the floor's cost
+(0.5625 / 1.25 GB shapes) so the max-token ratchet coverage survives the
+law change; new `testBudgetBelowAgentFloorFailsFastEvenForShortPrompts`
+pins the fail-fast for prompts the budget could otherwise nominally fit;
+`KVCacheProvisioningLogicTests.testAffordableSeqLenDerivesRowsFromBudget`
+covers the helper (including the non-finite-budget no-trap guard); the
+launch-side repudiation of old clampedSeqLen expectations is intentional —
+`clampedSeqLen`'s own floor-wins contract tests are unchanged because the
+fit/launch gates render that path unreachable for turns that allocate.
+Suites: TurnFitLogicTests (9), KVCacheProvisioningLogicTests (10),
+ServerQueueLogicTests (5), MemorySettingsPersistenceTests (3) — all green.
