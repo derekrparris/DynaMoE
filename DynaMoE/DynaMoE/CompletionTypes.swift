@@ -59,6 +59,18 @@ internal struct TurnMemorySettings: Sendable {
         self.budgetMode = budgetMode
         self.kvPrecision = kvPrecision
     }
+
+    /// Resolves the in-app memory settings the chat UI persists via @AppStorage
+    /// ("dynamoe_memory_execution_mode" / "dynamoe_memory_budget_mode" /
+    /// "dynamoe_kv_cache_precision"). The local server builds every turn from
+    /// this so external clients run under the same budget the UI configured
+    /// instead of a hardcoded default.
+    nonisolated static func persisted(_ defaults: UserDefaults = .standard) -> TurnMemorySettings {
+        let executionMode = MemoryExecutionMode(rawValue: defaults.string(forKey: "dynamoe_memory_execution_mode") ?? "") ?? .autoDetect
+        let budgetMode = MemoryBudgetMode(rawValue: defaults.string(forKey: "dynamoe_memory_budget_mode") ?? "") ?? .balanced16GB
+        let kvPrecision = KVCachePrecision(rawValue: defaults.string(forKey: "dynamoe_kv_cache_precision") ?? "") ?? .fp16
+        return TurnMemorySettings(executionMode: executionMode, budgetMode: budgetMode, kvPrecision: kvPrecision)
+    }
 }
 
 // MARK: - Turn Request

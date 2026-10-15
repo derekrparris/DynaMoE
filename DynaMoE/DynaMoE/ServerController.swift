@@ -532,9 +532,7 @@ final class ServerController: ObservableObject {
             maxTokens: maxTokens
         )
 
-        let kvRaw = defaults.string(forKey: "dynamoe_kv_cache_precision") ?? ""
-        let kvPrecision = KVCachePrecision(rawValue: kvRaw) ?? .fp16
-        let memory = TurnMemorySettings(executionMode: .autoDetect, budgetMode: .balanced16GB, kvPrecision: kvPrecision)
+        let memory = TurnMemorySettings.persisted(defaults)
 
         let turnRequest = CompletionTurnRequest(
             promptTokenIds: promptTokenIds,

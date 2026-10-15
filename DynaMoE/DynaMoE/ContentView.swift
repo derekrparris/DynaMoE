@@ -318,9 +318,10 @@ struct ContentView: View {
     /// or schedule another turn — see `ownsGeneration`.
     @State private var generationId: UInt64 = 0
 
-    // Working Set & Dynamic SSD Expert Paging State
-    @State private var memoryExecutionMode: MemoryExecutionMode = .autoDetect
-    @State private var memoryBudgetMode: MemoryBudgetMode = .balanced16GB
+    // Working Set & Dynamic SSD Expert Paging State. Memory settings persist via
+    // @AppStorage so the local server reads the same policy the UI configured.
+    @AppStorage("dynamoe_memory_execution_mode") private var memoryExecutionModeRaw: String = MemoryExecutionMode.autoDetect.rawValue
+    @AppStorage("dynamoe_memory_budget_mode") private var memoryBudgetModeRaw: String = MemoryBudgetMode.balanced16GB.rawValue
     @AppStorage("dynamoe_kv_cache_precision") private var kvCachePrecisionRaw: String = KVCachePrecision.fp16.rawValue
     @AppStorage("dynamoe_speculative_prefetch_enabled") private var speculativePrefetchEnabled: Bool = true
     @AppStorage("dynamoe_prefetch_lookahead_depth") private var prefetchLookaheadDepth: Int = 1
@@ -337,6 +338,24 @@ struct ContentView: View {
         Binding(
             get: { KVCachePrecision(rawValue: kvCachePrecisionRaw) ?? .fp16 },
             set: { kvCachePrecisionRaw = $0.rawValue }
+        )
+    }
+    var memoryExecutionMode: MemoryExecutionMode {
+        MemoryExecutionMode(rawValue: memoryExecutionModeRaw) ?? .autoDetect
+    }
+    var memoryExecutionModeBinding: Binding<MemoryExecutionMode> {
+        Binding(
+            get: { memoryExecutionMode },
+            set: { memoryExecutionModeRaw = $0.rawValue }
+        )
+    }
+    var memoryBudgetMode: MemoryBudgetMode {
+        MemoryBudgetMode(rawValue: memoryBudgetModeRaw) ?? .balanced16GB
+    }
+    var memoryBudgetModeBinding: Binding<MemoryBudgetMode> {
+        Binding(
+            get: { memoryBudgetMode },
+            set: { memoryBudgetModeRaw = $0.rawValue }
         )
     }
     var kvCachePrecision: KVCachePrecision {
@@ -1381,8 +1400,8 @@ struct ContentView: View {
             systemPrompt: $systemPrompt,
             targetLayerCount: $targetLayerCount,
             activeProfile: $activeProfile,
-            memoryExecutionMode: $memoryExecutionMode,
-            memoryBudgetMode: $memoryBudgetMode,
+            memoryExecutionMode: memoryExecutionModeBinding,
+            memoryBudgetMode: memoryBudgetModeBinding,
             kvCachePrecision: kvCachePrecisionBinding,
             speculativePrefetchEnabled: $speculativePrefetchEnabled,
             prefetchLookaheadDepth: $prefetchLookaheadDepth,
