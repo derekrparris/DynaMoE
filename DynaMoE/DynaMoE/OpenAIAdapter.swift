@@ -195,7 +195,8 @@ struct OpenAIResponseMessage: Encodable {
     let toolCalls: [OpenAIToolCallOut]?
 
     enum CodingKeys: String, CodingKey {
-        case role, content, toolCalls
+        case role, content
+        case toolCalls = "tool_calls"
         case reasoningContent = "reasoning_content"
     }
 }
@@ -227,7 +228,8 @@ struct OpenAIStreamDelta: Encodable {
     let toolCalls: [OpenAIToolCallOut]?
 
     enum CodingKeys: String, CodingKey {
-        case role, content, toolCalls
+        case role, content
+        case toolCalls = "tool_calls"
         case reasoningContent = "reasoning_content"
     }
 }
@@ -299,6 +301,13 @@ enum OpenAIAdapter {
     /// appended to the effective system prompt. Mirrors the shape the in-app
     /// agent system prompt uses (a JSON array of function definitions) so
     /// grammar-masked tool-call models recognize the vocabulary.
+    ///
+    /// The instruction teaches the engine's canonical tagged call markup, not
+    /// bare JSON: the bare-JSON fallback only recognizes built-in tool names,
+    /// so a client-defined tool emitted as bare JSON would be returned as
+    /// ordinary text. The tagged markup parses for any tool name and is the
+    /// exact shape the grammar masks enforce, so constrained sampling stays
+    /// compatible.
     static func toolDeclarationText(_ tools: [OpenAIChatRequest.Tool]) -> String? {
         let fns = tools.filter { ($0.type ?? "function") == "function" }
         guard !fns.isEmpty else { return nil }
@@ -316,8 +325,18 @@ enum OpenAIAdapter {
         }
         guard let data = try? JSONSerialization.data(withJSONObject: definitions, options: [.sortedKeys]),
               let json = String(data: data, encoding: .utf8) else { return nil }
+        let open = StreamingToolParser.qwenToolCallOpen
+        let close = StreamingToolParser.qwenToolCallClose
+        let fnOpen = StreamingToolParser.qwenFunctionOpen
+        let fnClose = StreamingToolParser.qwenFunctionClose
+        let paramOpen = "<parameter="
+        let paramClose = "</parameter>"
         return """
-        You have access to the following functions. When you need to use one, emit a JSON object of the form {"name": <function name>, "arguments": {<argument name>: <value>}} describing a single call, then stop; the client will execute the call and send the result back before your next turn. Do not fabricate results.
+        You have access to the following functions. When you need to use one, emit a single call in the tagged form below, then stop; the client will execute the call and send the result back before your next turn. Do not fabricate results.
+
+        \(open)\(fnOpen)FUNCTION_NAME>\(paramOpen)ARG_NAME>ARG_VALUE\(paramClose)\(fnClose)\(close)
+
+        Wrap each argument as \(paramOpen)ARG_NAME>ARG_VALUE\(paramClose); omit the parameter markup entirely for a call with no arguments. Emit the call alone, with no extra prose after the closing tag.
 
         FUNCTIONS: \(json)
         """

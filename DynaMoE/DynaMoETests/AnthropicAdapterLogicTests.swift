@@ -90,7 +90,7 @@ final class AnthropicAdapterLogicTests: XCTestCase {
         """)
         XCTAssertEqual(request.tools?.count, 1)
         XCTAssertEqual(request.tools?[0].name, "get_weather")
-        let schemaJSON = try XCTUnwrap(request.tools?[0].inputSchemaData).flatMap { String(data: $0, encoding: .utf8) }
+        let schemaJSON = try String(data: XCTUnwrap(request.tools?[0].inputSchemaData), encoding: .utf8)
         XCTAssertTrue(schemaJSON?.contains("\"city\"") == true, "schema must embed parameter names")
         XCTAssertEqual(request.thinking?.type, "enabled")
         XCTAssertEqual(request.thinking?.budgetTokens, 2048)
@@ -159,6 +159,26 @@ final class AnthropicAdapterLogicTests: XCTestCase {
 
     func testToolDeclarationNilWithoutTools() {
         XCTAssertNil(AnthropicAdapter.toolDeclarationText([]))
+    }
+
+    func testClientToolCallEmittedPerDeclarationIsParsed() throws {
+        // The declaration must teach the parser-recognized tagged markup: a
+        // client-defined tool is not in the built-in catalog, so a bare-JSON
+        // emission would be returned as plain text instead of tool_use.
+        let request = try decodeRequest("""
+        {"max_tokens":10,"tools":[{"name":"get_weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}],"messages":[{"role":"user","content":"hi"}]}
+        """)
+        let text = try XCTUnwrap(AnthropicAdapter.toolDeclarationText(try XCTUnwrap(request.tools)))
+        XCTAssertTrue(text.contains(StreamingToolParser.qwenToolCallOpen), "declaration must teach the tagged call format")
+        XCTAssertTrue(text.contains(StreamingToolParser.qwenFunctionOpen), "declaration must teach the function tag")
+
+        let emitted = StreamingToolParser.qwenToolCallOpen
+            + "<function=get_weather><parameter=city>Oslo</parameter></function>"
+            + StreamingToolParser.qwenToolCallClose
+        let parsed = StreamingToolParser.shared.parseStreamingToolCalls(from: emitted, format: .qwenXML)
+        XCTAssertEqual(parsed.calls.count, 1, "a client tool emitted per the declaration must parse as a call")
+        XCTAssertEqual(parsed.calls.first?.name, "get_weather")
+        XCTAssertEqual(parsed.calls.first?.arguments["city"] as? String, "Oslo")
     }
 
     // MARK: - Session keys

@@ -66,7 +66,7 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         """)
         XCTAssertEqual(request.tools?.count, 1)
         XCTAssertEqual(request.tools?[0].function.name, "get_weather")
-        let argsJSON = try XCTUnwrap(request.tools?[0].function.parametersData).flatMap { String(data: $0, encoding: .utf8) }
+        let argsJSON = try String(data: XCTUnwrap(request.tools?[0].function.parametersData), encoding: .utf8)
         XCTAssertTrue(argsJSON?.contains("\"city\"") == true, "schema must embed parameter names")
     }
 
@@ -113,6 +113,47 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         XCTAssertEqual(OpenAIAdapter.finishReasonString(.eos, hasToolCalls: true), "tool_calls")
     }
 
+    // MARK: - Response wire format
+
+    func testResponseMessageEncodesSnakeCaseToolCalls() throws {
+        let call = OpenAIToolCallOut(
+            index: nil,
+            id: "call_1",
+            type: "function",
+            function: .init(name: "get_weather", arguments: "{\"city\":\"Oslo\"}"),
+        )
+        let response = OpenAIChatResponse(
+            id: "chatcmpl_1",
+            created: 1,
+            model: "m",
+            choices: [.init(index: 0, message: .init(content: nil, reasoningContent: nil, toolCalls: [call]), finishReason: "tool_calls")],
+            usage: .init(promptTokens: 1, completionTokens: 1),
+        )
+        let data = try JSONEncoder().encode(response)
+        let json = try XCTUnwrap(String(data: data, encoding: .utf8))
+        XCTAssertTrue(json.contains("\"tool_calls\""), "non-streaming message must use the OpenAI wire key")
+        XCTAssertFalse(json.contains("toolCalls"), "Swift property name must not leak into the payload")
+    }
+
+    func testStreamDeltaEncodesSnakeCaseToolCalls() throws {
+        let call = OpenAIToolCallOut(
+            index: 0,
+            id: "call_1",
+            type: "function",
+            function: .init(name: "get_weather", arguments: "{\"city\":\"Oslo\"}"),
+        )
+        let chunk = OpenAIChatChunk(
+            id: "chatcmpl_1",
+            created: 1,
+            model: "m",
+            choices: [.init(index: 0, delta: .init(role: nil, content: nil, reasoningContent: nil, toolCalls: [call]), finishReason: nil)],
+        )
+        let data = try JSONEncoder().encode(chunk)
+        let json = try XCTUnwrap(String(data: data, encoding: .utf8))
+        XCTAssertTrue(json.contains("\"tool_calls\""), "streaming deltas must use the OpenAI wire key")
+        XCTAssertFalse(json.contains("toolCalls"), "Swift property name must not leak into the payload")
+    }
+
     // MARK: - Tool declarations
 
     func testToolDeclarationEmbedsSchemasAsValidJSON() throws {
@@ -135,6 +176,26 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         """)
         XCTAssertNotNil(OpenAIAdapter.toolDeclarationText(request.tools!))
         XCTAssertNil(OpenAIAdapter.toolDeclarationText([]))
+    }
+
+    func testClientToolCallEmittedPerDeclarationIsParsed() throws {
+        // The declaration must teach the parser-recognized tagged markup: a
+        // client-defined tool is not in the built-in catalog, so a bare-JSON
+        // emission would be returned as plain text instead of a tool call.
+        let request = try decodeRequest("""
+        {"messages":[],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}
+        """)
+        let text = try XCTUnwrap(OpenAIAdapter.toolDeclarationText(try XCTUnwrap(request.tools)))
+        XCTAssertTrue(text.contains(StreamingToolParser.qwenToolCallOpen), "declaration must teach the tagged call format")
+        XCTAssertTrue(text.contains(StreamingToolParser.qwenFunctionOpen), "declaration must teach the function tag")
+
+        let emitted = StreamingToolParser.qwenToolCallOpen
+            + "<function=get_weather><parameter=city>Oslo</parameter></function>"
+            + StreamingToolParser.qwenToolCallClose
+        let parsed = StreamingToolParser.shared.parseStreamingToolCalls(from: emitted, format: .qwenXML)
+        XCTAssertEqual(parsed.calls.count, 1, "a client tool emitted per the declaration must parse as a call")
+        XCTAssertEqual(parsed.calls.first?.name, "get_weather")
+        XCTAssertEqual(parsed.calls.first?.arguments["city"] as? String, "Oslo")
     }
 
     // MARK: - Session keys

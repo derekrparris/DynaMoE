@@ -660,15 +660,20 @@ final class ServerController: ObservableObject {
     }
 
     /// The engine parses arguments into a dictionary; re-serialize for the
-    /// OpenAI `function.arguments` JSON-string field (raw text when valid).
-    nonisolated private static func toolArgumentsJSON(_ call: ParsedToolCall) -> String {
-        if !call.rawArguments.isEmpty, call.rawArguments.contains(":") || call.rawArguments.contains("{") {
-            return call.rawArguments
-        }
+    /// OpenAI `function.arguments` JSON-string field. `rawArguments` can hold
+    /// parser artifacts (a Swift dictionary description, or the whole hermetic
+    /// call envelope), so the parsed dictionary wins whenever it is available
+    /// and raw text is trusted only if it parses back as a JSON object.
+    nonisolated static func toolArgumentsJSON(_ call: ParsedToolCall) -> String {
         if !call.arguments.isEmpty,
            let data = try? JSONSerialization.data(withJSONObject: call.arguments, options: [.sortedKeys]),
            let json = String(data: data, encoding: .utf8) {
             return json
+        }
+        if !call.rawArguments.isEmpty,
+           let data = call.rawArguments.data(using: .utf8),
+           (try? JSONSerialization.jsonObject(with: data)) is [String: Any] {
+            return call.rawArguments
         }
         return "{}"
     }
@@ -879,7 +884,7 @@ final class ServerController: ObservableObject {
 
         let body = ResponseBody { writer in
             func sse<E: Encodable>(_ eventName: String, _ payload: E) async throws {
-                var frame = ByteBuffer(string: "event: \(eventName)\n")
+                var frame = ByteBuffer(string: "event: \(eventName)\ndata: ")
                 frame.writeImmutableBuffer(ByteBuffer(data: try encoder.encode(payload)))
                 frame.writeString("\n\n")
                 try await writer.write(frame)

@@ -217,16 +217,26 @@ final class ServerControllerSmokeTests: XCTestCase {
 
         var sawMessageStart = false
         var sawErrorEvent = false
+        var sawJSONPayloadOnError = false
+        var currentEventName: String?
         for try await line in bytes.lines {
             if line.hasPrefix("event: ") {
-                let eventName = String(line.dropFirst("event: ".count))
-                if eventName == "message_start" { sawMessageStart = true }
-                if eventName == "error" { sawErrorEvent = true }
+                currentEventName = String(line.dropFirst("event: ".count))
+                if currentEventName == "message_start" { sawMessageStart = true }
+            } else if line.hasPrefix("data: ") {
+                let payload = String(line.dropFirst("data: ".count))
+                if currentEventName == "error" {
+                    sawErrorEvent = true
+                    let parsed = try? JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any]
+                    sawJSONPayloadOnError = parsed?["error"] != nil
+                }
+                currentEventName = nil
             }
             if sawErrorEvent { break }
         }
         XCTAssertTrue(sawMessageStart, "the stream must open with message_start")
         XCTAssertTrue(sawErrorEvent, "the stream must surface the launch failure as an error event")
+        XCTAssertTrue(sawJSONPayloadOnError, "an SSE parser must receive the JSON payload on the data: line")
     }
 
     func testAPIKeyRejectsUnauthorizedRequests() async throws {
