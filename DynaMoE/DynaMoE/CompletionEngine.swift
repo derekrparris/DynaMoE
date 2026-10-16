@@ -31,6 +31,11 @@ public enum TurnTextSplitter {
     /// Reasoning open/close marker tags used across model families (Qwen, DeepSeek, Ornith, etc.).
     private static let openTags = ["<think>", "<thought>", "<|thought|>", "<|channel>"]
     private static let closeTags = ["</think>", "</thought>", "</|thought|>", "<channel|>"]
+    /// Canonical reasoning markers. Exposed so the API adapters can re-render
+    /// reasoning a client echoed back without retyping the tag literals
+    /// (AGENTS.md: never retype tag-bearing strings).
+    public static var canonicalReasoningOpenTag: String { openTags[0] }
+    public static var canonicalReasoningCloseTag: String { closeTags[0] }
 
     /// Gemma 4 emits reasoning inside a `<|channel>` block whose first line is the
     /// channel label (`thought`). Strip that label so the accordion shows only the

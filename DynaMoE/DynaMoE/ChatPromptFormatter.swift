@@ -210,4 +210,15 @@ public enum ChatPromptFormatter {
         p += assistantPrefix
         return p
     }
+
+    /// The tag that closes an assistant turn for this family, or nil when the
+    /// family's assistant turns carry no explicit closer. The server drops a
+    /// trailing closer from a recorded raw generation before splicing it into
+    /// history, so the renderer does not close the turn twice.
+    public static func assistantTurnCloseTag(modelConfig: ModelConfig?) -> String? {
+        if modelConfig?.isLingModel == true { return "<|role_end|>" }
+        if modelConfig?.isSparkModel == true { return nil }
+        if modelConfig?.isGemma4Model == true { return "<turn|>" }
+        return "<|im_end|>"
+    }
 }

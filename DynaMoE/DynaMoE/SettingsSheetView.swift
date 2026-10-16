@@ -118,6 +118,7 @@ struct SettingsSheetView: View {
     // Local Inference Server bindings & live dashboard state
     @ObservedObject private var serverController = ServerController.shared
     @AppStorage("dynamoe_server_enabled") private var isServerEnabled: Bool = false
+    @AppStorage("dynamoe_server_inline_reasoning") private var serverInlineReasoning: Bool = false
     @AppStorage("dynamoe_server_port") private var serverPort: Int = ServerController.defaultPort
     @AppStorage("dynamoe_server_api_key") private var serverAPIKey: String = ""
     @State private var serverPortText: String = ""
@@ -1856,6 +1857,17 @@ struct SettingsSheetView: View {
                 SecureField("No authentication", text: $serverAPIKey)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 220)
+            }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "Reasoning in Content",
+                subtitle: "Off: reasoning is reported out-of-band as reasoning_content (DeepSeek-style); clients that ignore that extension show no thinking. On: it is emitted as content ahead of the answer, closed with the canonical reasoning tag, so every OpenAI-compatible client displays it — and echoes it back, which lets the next turn reuse the pinned KV prefix. Applies to the OpenAI endpoint; Anthropic clients get native thinking blocks."
+            ) {
+                Toggle("Reasoning in Content", isOn: $serverInlineReasoning)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
             }
         }
     }

@@ -26,12 +26,17 @@ struct OpenAIChatRequest: Decodable {
         /// String form, or the concatenated text parts when the client sends
         /// the multi-part content array. Nil for assistant tool-call turns.
         let contentText: String?
+        /// Reasoning a client echoed back (the `reasoning_content` extension
+        /// this server emits). Clients that keep it let the next turn
+        /// reproduce the pinned generation instead of only its visible tail.
+        let reasoningContent: String?
         let name: String?
         let toolCalls: [AssistantToolCallIn]?
         let toolCallId: String?
 
         enum CodingKeys: String, CodingKey {
             case role, content, name
+            case reasoningContent = "reasoning_content"
             case toolCalls = "tool_calls"
             case toolCallId = "tool_call_id"
         }
@@ -42,6 +47,7 @@ struct OpenAIChatRequest: Decodable {
             self.name = try container.decodeIfPresent(String.self, forKey: .name)
             self.toolCalls = try container.decodeIfPresent([AssistantToolCallIn].self, forKey: .toolCalls)
             self.toolCallId = try container.decodeIfPresent(String.self, forKey: .toolCallId)
+            self.reasoningContent = try container.decodeIfPresent(String.self, forKey: .reasoningContent)
             if let s = try? container.decode(String.self, forKey: .content) {
                 self.contentText = s
             } else if let parts = try? container.decode([ContentPart].self, forKey: .content) {
@@ -53,9 +59,10 @@ struct OpenAIChatRequest: Decodable {
         }
 
         /// Convenience constructor for tests and internal assembly.
-        init(role: String, contentText: String?, name: String? = nil, toolCalls: [AssistantToolCallIn]? = nil, toolCallId: String? = nil) {
+        init(role: String, contentText: String?, name: String? = nil, toolCalls: [AssistantToolCallIn]? = nil, toolCallId: String? = nil, reasoningContent: String? = nil) {
             self.role = role
             self.contentText = contentText
+            self.reasoningContent = reasoningContent
             self.name = name
             self.toolCalls = toolCalls
             self.toolCallId = toolCallId
@@ -369,6 +376,13 @@ enum OpenAIAdapter {
                 turns.append(.init(role: .user, text: message.contentText ?? ""))
             case "assistant":
                 var lines: [String] = []
+                // Reasoning a client echoed back is re-rendered ahead of the
+                // answer, closed with the canonical tag, so the turn reproduces
+                // what was generated rather than only its visible tail.
+                if let reasoning = message.reasoningContent?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !reasoning.isEmpty {
+                    lines.append(reasoning + TurnTextSplitter.canonicalReasoningCloseTag)
+                }
                 if let content = message.contentText, !content.isEmpty {
                     lines.append("\(content)")
                 }

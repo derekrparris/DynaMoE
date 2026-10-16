@@ -268,6 +268,92 @@ private final class ServerTurnCancelBox: @unchecked Sendable {
     }
 }
 
+// MARK: - Completed-turn memory
+
+/// Memory of the last completed server turn, mirroring the engine's
+/// single-slot prefix pin: one session's prompt+generation is pinned at a
+/// time, so one record is all that can ever be reused.
+///
+/// The pin covers the *generated* tokens, which include the model's reasoning.
+/// A stateless API client echoes back only the visible answer, so without this
+/// record a follow-up turn cannot reproduce the pinned prefix and every
+/// multi-turn request re-prefills from scratch — on a hybrid (GDN) model that
+/// is the whole prompt, because its recurrent state only matches at the exact
+/// pinned boundary. The in-app chat loop has this information first-hand (it
+/// re-sends `TurnResult.rawDecodedText`); the server has to keep it.
+final class ServerTurnMemory: @unchecked Sendable {
+    static let shared = ServerTurnMemory()
+
+    struct Record: Sendable {
+        var sessionId: UUID
+        var modelName: String
+        /// The turn exactly as generated, reasoning and control markers included.
+        var rawDecodedText: String
+        /// What the client is expected to echo back as its assistant content.
+        var visibleResponse: String
+        var promptTokenIds: [UInt32]
+        var generatedTokenIds: [UInt32]
+    }
+
+    private let lock = NSLock()
+    private var record: Record?
+
+    init() {}
+
+    func store(_ new: Record) {
+        lock.lock()
+        record = new
+        lock.unlock()
+    }
+
+    func clear() {
+        lock.lock()
+        record = nil
+        lock.unlock()
+    }
+
+    /// The recorded raw turn text for `sessionId`, available only when the
+    /// record clearly belongs to this turn and the client's echoed assistant
+    /// text is compatible with what was generated.
+    ///
+    /// `turnCloser` is the family's assistant-turn close tag. It is dropped
+    /// before comparing and returning: the model emits it as tokens, but a
+    /// client never sees it (it is not part of `content`), and the renderer
+    /// appends it again when the turn is re-rendered.
+    func recordedRawTurn(sessionId: UUID, modelName: String, echoedByClient: String, turnCloser: String?) -> String? {
+        lock.lock()
+        let current = record
+        lock.unlock()
+        guard let current,
+              current.sessionId == sessionId,
+              current.modelName == modelName else { return nil }
+        let raw = Self.droppingTrailingCloser(current.rawDecodedText, closer: turnCloser)
+        guard Self.isCompatible(echo: echoedByClient, visibleResponse: current.visibleResponse, rawTurn: raw) else {
+            return nil
+        }
+        return raw
+    }
+
+    /// Drops a trailing assistant-turn closer, if one is present.
+    nonisolated static func droppingTrailingCloser(_ text: String, closer: String?) -> String {
+        guard let closer, !closer.isEmpty, text.hasSuffix(closer) else { return text }
+        return String(text.dropLast(closer.count))
+    }
+
+    /// Whether a client's echo of the assistant turn is consistent with the
+    /// recorded turn. A client may echo the visible answer, the full raw turn
+    /// (when it kept the reasoning), or nothing at all (assistant tool-call
+    /// turns carry the call structure instead of text). Anything else means the
+    /// history was edited or the session key collided, so the record is not safe
+    /// to splice in.
+    nonisolated static func isCompatible(echo: String, visibleResponse: String, rawTurn: String) -> Bool {
+        let client = echo.trimmingCharacters(in: .whitespacesAndNewlines)
+        if client.isEmpty { return true }
+        if client == visibleResponse.trimmingCharacters(in: .whitespacesAndNewlines) { return true }
+        return rawTurn.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix(client)
+    }
+}
+
 // MARK: - Request statistics
 
 /// Lock-guarded request counters shared between the nonisolated static route
@@ -404,6 +490,7 @@ final class ServerController: ObservableObject {
     static let apiKeyKey = "dynamoe_server_api_key"
     static let queueTimeoutKey = "dynamoe_server_queue_timeout"
     static let maxPromptTokensKey = "dynamoe_server_max_prompt_tokens"
+    static let inlineReasoningKey = "dynamoe_server_inline_reasoning"
     static let defaultPort = 8787
     static let bindHost = "127.0.0.1"
 
@@ -429,6 +516,32 @@ final class ServerController: ObservableObject {
     nonisolated static var resolvedMaxPromptTokens: Int {
         guard let stored = UserDefaults.standard.object(forKey: maxPromptTokensKey) as? Int else { return 262_144 }
         return stored > 0 ? stored : Int.max
+    }
+
+    /// When on, the OpenAI endpoint folds reasoning into `content` inside the
+    /// canonical think tags instead of reporting it out-of-band as
+    /// `reasoning_content`. Most OpenAI-compatible clients ignore that
+    /// extension, so inlining is what makes reasoning visible in them — and
+    /// because the tags then travel in `content`, a client echoes them back and
+    /// the next turn can reproduce the pinned generation. Absent → off (the
+    /// out-of-band field stays the default, matching DeepSeek-style clients).
+    nonisolated static var resolvedInlineReasoning: Bool {
+        UserDefaults.standard.bool(forKey: inlineReasoningKey)
+    }
+
+    /// Composes the inline reasoning form of a response: the reasoning followed
+    /// by the canonical close tag and the visible answer. The *open* tag is
+    /// deliberately omitted — it already sits at the end of the prompt, so
+    /// emitting it here would double it when the turn is re-rendered out of
+    /// history and the pinned prefix would no longer match. This shape is the
+    /// model's own generation, so a client that echoes it back reproduces the
+    /// pin exactly. Returns the answer untouched when there is no reasoning.
+    nonisolated static func inlineReasoningText(thinking: String, response: String) -> String {
+        let think = thinking.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !think.isEmpty else { return response }
+        let answer = response.trimmingCharacters(in: .whitespacesAndNewlines)
+        let tagged = think + TurnTextSplitter.canonicalReasoningCloseTag
+        return answer.isEmpty ? tagged : tagged + "\n\n" + answer
     }
 
     nonisolated private static var resolvedAPIKey: String? {
@@ -475,6 +588,9 @@ final class ServerController: ObservableObject {
         // directly (not through this queue), so its in-flight response must
         // survive a server restart or settings change.
         await queue.cancelLiveWork()
+        // The recorded turn belongs to the server's lifetime; a restart starts
+        // a fresh session history anyway.
+        ServerTurnMemory.shared.clear()
         await group.triggerGracefulShutdown()
         isRunning = false
         boundPort = 0
@@ -648,15 +764,24 @@ final class ServerController: ObservableObject {
         }
 
         let thinkingEnabled = info.supportsThinking && inputs.thinkingRequested
+        // Splice in the raw generation recorded for this session (reasoning
+        // included) so the rendered prompt reproduces the pinned
+        // prompt+generation; a client's echo of the visible answer alone cannot.
+        let conversation = Self.substitutingRecordedTurn(
+            inputs.conversation,
+            sessionId: inputs.sessionId,
+            modelName: info.displayName,
+            modelConfig: engine.promptModelConfig
+        )
         // A single plain user turn renders exactly as before (native template
         // with zero wrapper noise). A real history renders with the family's
         // native role boundaries, so this turn's formatted prompt is a strict
         // extension of the previous turn's prompt+generation and the pinned
         // KV prefix stays reusable across turns.
         let formattedPrompt: String
-        if inputs.conversation.count == 1, inputs.conversation[0].role == .user {
+        if conversation.count == 1, conversation[0].role == .user {
             formattedPrompt = ChatPromptFormatter.formatPrompt(
-                prompt: inputs.conversation[0].text,
+                prompt: conversation[0].text,
                 cleanSystem: cleanSystem,
                 thinkingEnabled: thinkingEnabled,
                 modelSupportsThinking: info.supportsThinking,
@@ -664,7 +789,7 @@ final class ServerController: ObservableObject {
             )
         } else {
             formattedPrompt = ChatPromptFormatter.formatConversation(
-                turns: inputs.conversation,
+                turns: conversation,
                 cleanSystem: cleanSystem,
                 thinkingEnabled: thinkingEnabled,
                 modelSupportsThinking: info.supportsThinking,
@@ -768,6 +893,47 @@ final class ServerController: ObservableObject {
 
     // MARK: Non-streaming handling
 
+    /// Remembers one completed turn so the next turn for the same session can
+    /// reproduce its generated tokens — reasoning included — instead of trusting
+    /// the client's echo of the visible answer alone.
+    nonisolated private static func recordCompletedTurn(plan: TurnPlan, result: TurnResult) {
+        // No session identity means no pin to extend, so there is nothing to
+        // reuse (the server always sets one from the adapter's session key).
+        guard let sessionId = plan.request.sessionId else { return }
+        ServerTurnMemory.shared.store(.init(
+            sessionId: sessionId,
+            modelName: plan.modelName,
+            rawDecodedText: result.rawDecodedText,
+            visibleResponse: result.responseText,
+            promptTokenIds: result.promptTokenIds,
+            generatedTokenIds: result.generatedTokenIds
+        ))
+    }
+
+    /// Replaces the client's echo of the last assistant turn with the raw
+    /// generation recorded for this session, so the rendered prompt reproduces
+    /// the pinned prompt+generation (and the prefix stays reusable). Falls back
+    /// to the client's own text whenever the record does not clearly belong to
+    /// this turn — see `ServerTurnMemory.isCompatible`.
+    nonisolated private static func substitutingRecordedTurn(
+        _ conversation: [ChatPromptFormatter.ConversationTurn],
+        sessionId: UUID,
+        modelName: String,
+        modelConfig: ModelConfig?
+    ) -> [ChatPromptFormatter.ConversationTurn] {
+        let closer = ChatPromptFormatter.assistantTurnCloseTag(modelConfig: modelConfig)
+        guard let index = conversation.lastIndex(where: { $0.role == .assistant }),
+              let recorded = ServerTurnMemory.shared.recordedRawTurn(
+                  sessionId: sessionId,
+                  modelName: modelName,
+                  echoedByClient: conversation[index].text,
+                  turnCloser: closer
+              ) else { return conversation }
+        var turns = conversation
+        turns[index].text = recorded
+        return turns
+    }
+
     /// Runs a planned turn through the FIFO queue to completion. Shared by
     /// both adapters' non-streaming paths.
     nonisolated private static func runTurn(plan: TurnPlan, queue: TurnExecutionQueue) async throws -> TurnResult {
@@ -786,6 +952,7 @@ final class ServerController: ObservableObject {
                         if failure.cancelled { throw ServerAPIError.serviceUnavailable("Generation cancelled") }
                         throw ServerAPIError.internalError(failure.message)
                     case .finished(let result):
+                        Self.recordCompletedTurn(plan: plan, result: result)
                         return result
                     case .started, .priming, .prefillProgress, .frame:
                         continue
@@ -807,9 +974,15 @@ final class ServerController: ObservableObject {
             }
             : nil
 
+        // Inline-reasoning mode folds the reasoning into `content` (wrapped in
+        // the canonical think tags) so clients that ignore `reasoning_content`
+        // still display it, and echo it back on the next turn.
+        let inlineReasoning = Self.resolvedInlineReasoning
         let message = OpenAIResponseMessage(
-            content: result.responseText,
-            reasoningContent: result.thinkingText.isEmpty ? nil : result.thinkingText,
+            content: inlineReasoning
+                ? Self.inlineReasoningText(thinking: result.thinkingText, response: result.responseText)
+                : result.responseText,
+            reasoningContent: (!inlineReasoning && !result.thinkingText.isEmpty) ? result.thinkingText : nil,
             toolCalls: (toolCalls?.isEmpty == false) ? toolCalls : nil
         )
         let finishReason = OpenAIAdapter.finishReasonString(result.finishReason, hasToolCalls: !(toolCalls ?? []).isEmpty)
@@ -912,6 +1085,38 @@ final class ServerController: ObservableObject {
             var sentThinking = ""
             var sentContent = ""
             let promptTokensBox = PromptCountBox()
+
+            // Inline-reasoning mode: reasoning is streamed as `content` inside
+            // the canonical think tags, so clients that ignore the
+            // `reasoning_content` extension still display it — and because the
+            // tags travel in `content`, they come back on the next turn and the
+            // pinned generation can be reproduced.
+            let inlineReasoning = Self.resolvedInlineReasoning
+            var inlineReasoningSeen = false
+            var inlineReasoningClosed = false
+
+            func emitReasoning(_ delta: String) async throws {
+                // Once answer text has gone out, the reasoning can no longer be
+                // closed ahead of it; fall back to the out-of-band field rather
+                // than emitting the tag out of order.
+                guard inlineReasoning, sentContent.isEmpty else {
+                    try await sse(chunkBuffer(.init(role: nil, content: nil, reasoningContent: delta, toolCalls: nil), finishReason: nil))
+                    return
+                }
+                inlineReasoningSeen = true
+                try await sse(chunkBuffer(.init(role: nil, content: delta, reasoningContent: nil, toolCalls: nil), finishReason: nil))
+            }
+
+            /// Closes the inline reasoning before any answer text, so the tag
+            /// never straddles the response. Emitting only the close tag keeps
+            /// the stream byte-identical to the generation the prompt setup
+            /// implies (the open tag is already the end of the prompt).
+            func closeInlineReasoning() async throws {
+                guard inlineReasoning, inlineReasoningSeen, !inlineReasoningClosed else { return }
+                inlineReasoningClosed = true
+                let close = TurnTextSplitter.canonicalReasoningCloseTag
+                try await sse(chunkBuffer(.init(role: nil, content: close + "\n\n", reasoningContent: nil, toolCalls: nil), finishReason: nil))
+            }
             let (relay, task) = await queue.streamTurn(queueWaitTimeout: resolvedQueueWaitTimeout) { emit in
                 do {
                     let plan = try ServerController.buildTurnPlan(apiRequest)
@@ -923,6 +1128,9 @@ final class ServerController: ObservableObject {
                     }
                     await withTaskCancellationHandler {
                         for await event in launch.stream {
+                            if case .finished(let result) = event {
+                                ServerController.recordCompletedTurn(plan: plan, result: result)
+                            }
                             emit(.engine(event))
                         }
                     } onCancel: {
@@ -972,10 +1180,11 @@ final class ServerController: ObservableObject {
                     let thinkingDelta = Self.safeStreamDelta(accumulated: frame.thinkingText, sent: sentThinking, stopSequences: stopSequences)
                     if !thinkingDelta.isEmpty {
                         sentThinking += thinkingDelta
-                        try await sse(chunkBuffer(.init(role: nil, content: nil, reasoningContent: thinkingDelta, toolCalls: nil), finishReason: nil))
+                        try await emitReasoning(thinkingDelta)
                     }
                     let contentDelta = Self.safeStreamDelta(accumulated: frame.responseText, sent: sentContent, stopSequences: stopSequences)
                     if !contentDelta.isEmpty {
+                        try await closeInlineReasoning()
                         sentContent += contentDelta
                         try await sse(chunkBuffer(.init(role: nil, content: contentDelta, reasoningContent: nil, toolCalls: nil), finishReason: nil))
                     }
@@ -996,8 +1205,9 @@ final class ServerController: ObservableObject {
                     // hold-back applies here.
                     let tailThinking = Self.safeStreamDelta(accumulated: result.thinkingText, sent: sentThinking, stopSequences: [])
                     if !tailThinking.isEmpty {
-                        try await sse(chunkBuffer(.init(role: nil, content: nil, reasoningContent: tailThinking, toolCalls: nil), finishReason: nil))
+                        try await emitReasoning(tailThinking)
                     }
+                    try await closeInlineReasoning()
                     let tailContent = Self.safeStreamDelta(accumulated: result.responseText, sent: sentContent, stopSequences: [])
                     if !tailContent.isEmpty {
                         try await sse(chunkBuffer(.init(role: nil, content: tailContent, reasoningContent: nil, toolCalls: nil), finishReason: nil))
@@ -1129,6 +1339,15 @@ final class ServerController: ObservableObject {
             }
             func closeThinkingBlock() async throws {
                 if let ti = thinkingIndex, !thinkingClosed {
+                    // Anthropic closes a thinking block with a signature_delta:
+                    // clients echo it back so the reasoning survives the round
+                    // trip (SDKs drop unsigned thinking blocks).
+                    if !sentThinking.isEmpty {
+                        try await sse("content_block_delta", AnthropicContentBlockDeltaEvent(
+                            index: ti,
+                            delta: .signature(AnthropicAdapter.thinkingSignature(for: sentThinking))
+                        ))
+                    }
                     try await sse("content_block_stop", AnthropicContentBlockStopEvent(index: ti))
                     thinkingClosed = true
                 }
@@ -1161,6 +1380,9 @@ final class ServerController: ObservableObject {
                     }
                     await withTaskCancellationHandler {
                         for await event in launch.stream {
+                            if case .finished(let result) = event {
+                                ServerController.recordCompletedTurn(plan: plan, result: result)
+                            }
                             emit(.engine(event))
                         }
                     } onCancel: {

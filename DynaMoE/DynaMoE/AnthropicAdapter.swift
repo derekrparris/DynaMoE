@@ -29,12 +29,17 @@ struct AnthropicMessagesRequest: Decodable {
         /// Bare string content, or the concatenated text blocks. Nil when the
         /// message carries only tool_use / tool_result blocks.
         let contentText: String?
+        /// Reasoning a client echoed back in a `thinking` block. Clients that
+        /// keep the block (SDKs do, once it is signed) let the next turn
+        /// reproduce the pinned generation instead of only its visible tail.
+        let reasoningText: String?
         let toolUses: [ToolUseIn]?
         let toolResults: [ToolResultIn]?
 
-        init(role: String, contentText: String?, toolUses: [ToolUseIn]? = nil, toolResults: [ToolResultIn]? = nil) {
+        init(role: String, contentText: String?, toolUses: [ToolUseIn]? = nil, toolResults: [ToolResultIn]? = nil, reasoningText: String? = nil) {
             self.role = role
             self.contentText = contentText
+            self.reasoningText = reasoningText
             self.toolUses = toolUses
             self.toolResults = toolResults
         }
@@ -43,6 +48,7 @@ struct AnthropicMessagesRequest: Decodable {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             self.role = try container.decode(String.self, forKey: .role)
             var text: String?
+            var reasoning: String?
             var toolUses: [ToolUseIn] = []
             var toolResults: [ToolResultIn] = []
             if let s = try? container.decode(String.self, forKey: .content) {
@@ -50,10 +56,13 @@ struct AnthropicMessagesRequest: Decodable {
             } else if let blocks = try? container.decode([ContentBlockIn].self, forKey: .content) {
                 let joined = blocks.compactMap(\.text).filter { !$0.isEmpty }.joined(separator: "\n")
                 text = joined.isEmpty ? nil : joined
+                let thoughts = blocks.compactMap(\.thinking).filter { !$0.isEmpty }.joined(separator: "\n")
+                reasoning = thoughts.isEmpty ? nil : thoughts
                 toolUses = blocks.compactMap(\.toolUse)
                 toolResults = blocks.compactMap(\.toolResult)
             }
             self.contentText = text
+            self.reasoningText = reasoning
             self.toolUses = toolUses.isEmpty ? nil : toolUses
             self.toolResults = toolResults.isEmpty ? nil : toolResults
         }
@@ -63,6 +72,7 @@ struct AnthropicMessagesRequest: Decodable {
 
     struct ContentBlockIn: Decodable {
         let text: String?
+        let thinking: String?
         let toolUse: ToolUseIn?
         let toolResult: ToolResultIn?
 
@@ -70,11 +80,12 @@ struct AnthropicMessagesRequest: Decodable {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             let type = try container.decodeIfPresent(String.self, forKey: .type) ?? ""
             self.text = type == "text" ? try container.decodeIfPresent(String.self, forKey: .text) : nil
+            self.thinking = type == "thinking" ? try container.decodeIfPresent(String.self, forKey: .thinking) : nil
             self.toolUse = type == "tool_use" ? try ToolUseIn(from: decoder) : nil
             self.toolResult = type == "tool_result" ? try ToolResultIn(from: decoder) : nil
         }
 
-        enum CodingKeys: String, CodingKey { case type, text }
+        enum CodingKeys: String, CodingKey { case type, text, thinking }
     }
 
     struct ToolUseIn: Decodable {
@@ -225,7 +236,7 @@ enum AnthropicContentBlock: Encodable {
     case thinking(String)
     case toolUse(id: String, name: String, inputJSON: String)
 
-    enum CodingKeys: String, CodingKey { case type, text, thinking, id, name, input }
+    enum CodingKeys: String, CodingKey { case type, text, thinking, signature, id, name, input }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
@@ -236,6 +247,10 @@ enum AnthropicContentBlock: Encodable {
         case .thinking(let thinking):
             try container.encode("thinking", forKey: .type)
             try container.encode(thinking, forKey: .thinking)
+            // Anthropic clients treat `signature` as an opaque provider token,
+            // echo it back verbatim, and drop unsigned thinking blocks. Without
+            // it a client's reasoning never survives the round trip.
+            try container.encode(AnthropicAdapter.thinkingSignature(for: thinking), forKey: .signature)
         case .toolUse(let id, let name, let inputJSON):
             try container.encode("tool_use", forKey: .type)
             try container.encode(id, forKey: .id)
@@ -343,9 +358,10 @@ struct AnthropicContentBlockStartEvent: Encodable {
 enum AnthropicStreamDelta: Encodable {
     case text(String)
     case thinking(String)
+    case signature(String)
     case inputJSON(String)
 
-    enum CodingKeys: String, CodingKey { case type, text, thinking, partialJSON = "partial_json" }
+    enum CodingKeys: String, CodingKey { case type, text, thinking, signature, partialJSON = "partial_json" }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
@@ -356,6 +372,9 @@ enum AnthropicStreamDelta: Encodable {
         case .thinking(let delta):
             try container.encode("thinking_delta", forKey: .type)
             try container.encode(delta, forKey: .thinking)
+        case .signature(let signature):
+            try container.encode("signature_delta", forKey: .type)
+            try container.encode(signature, forKey: .signature)
         case .inputJSON(let json):
             try container.encode("input_json_delta", forKey: .type)
             try container.encode(json, forKey: .partialJSON)
@@ -409,6 +428,29 @@ struct AnthropicPingEvent: Encodable {
 /// Pure protocol-mapping logic for the Anthropic adapter. Every function is a
 /// free static so it is unit-testable without a live engine or socket.
 enum AnthropicAdapter {
+
+    /// Opaque, deterministic signature for a thinking block. Anthropic treats
+    /// `signature` as provider-private: clients echo it back verbatim when they
+    /// return the assistant turn, and SDKs drop unsigned thinking blocks — so
+    /// without one a client's reasoning never survives the round trip, and the
+    /// pinned prompt+generation cannot be reproduced on the next turn. Stable
+    /// over the block's text so a re-sent turn stays self-consistent.
+    static func thinkingSignature(for text: String) -> String {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in text.utf8 {
+            hash = (hash ^ UInt64(byte)) &* 0x100000001b3
+        }
+        var digest = [UInt8]()
+        digest.reserveCapacity(24)
+        var current = hash
+        for _ in 0..<3 {
+            for shift in stride(from: 56, through: 0, by: -8) {
+                digest.append(UInt8(truncatingIfNeeded: current >> UInt64(shift)))
+            }
+            current = current &* 0x100000001b3 ^ 0x9e3779b97f4a7c15
+        }
+        return Data(digest).base64EncodedString()
+    }
 
     /// Maps the engine's terminal reasons onto Anthropic stop_reason values.
     static func finishReasonString(_ reason: TurnFinishReason, hasToolCalls: Bool) -> String? {
@@ -501,6 +543,13 @@ enum AnthropicAdapter {
                 turns.append(.init(role: .user, text: body.isEmpty ? "(no content)" : body))
             case "assistant":
                 var parts: [String] = []
+                // Reasoning a client echoed back is re-rendered ahead of the
+                // answer, closed with the canonical tag, so the turn reproduces
+                // what was generated rather than only its visible tail.
+                if let reasoning = message.reasoningText?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !reasoning.isEmpty {
+                    parts.append(reasoning + TurnTextSplitter.canonicalReasoningCloseTag)
+                }
                 if let text = message.contentText, !text.isEmpty {
                     parts.append(text)
                 }
