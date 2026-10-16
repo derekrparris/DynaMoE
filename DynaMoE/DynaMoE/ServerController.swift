@@ -564,6 +564,11 @@ final class ServerController: ObservableObject {
     private var serviceGroup: ServiceGroup?
     private let queue = TurnExecutionQueue()
 
+    /// Identity of the newest lifecycle transition. A `stop()` that is still
+    /// draining when a newer `start()` lands must not publish its terminal state
+    /// over the server that start brought up.
+    private var lifecycleGeneration: UInt64 = 0
+
     static let enabledKey = "dynamoe_server_enabled"
     static let portKey = "dynamoe_server_port"
     static let apiKeyKey = "dynamoe_server_api_key"
@@ -580,6 +585,14 @@ final class ServerController: ObservableObject {
     nonisolated static var resolvedPort: Int {
         let stored = UserDefaults.standard.integer(forKey: portKey)
         return (1...65535).contains(stored) ? stored : defaultPort
+    }
+
+    /// Whether the settings toggle currently asks for the server to be running.
+    /// `@AppStorage` writes `dynamoe_server_enabled` before the change handler
+    /// runs, so this is the intent a lifecycle transition has to satisfy when it
+    /// lands — not the state it happened to observe when it started.
+    nonisolated static var isEnabledRequested: Bool {
+        UserDefaults.standard.bool(forKey: enabledKey)
     }
 
     /// Seconds a request may wait in the generation queue before it is
@@ -639,6 +652,7 @@ final class ServerController: ObservableObject {
 
     func start() {
         guard !isRunning else { return }
+        lifecycleGeneration &+= 1
         lastError = nil
         let port = Self.resolvedPort
         let router = Self.buildRouter(queue: queue)
@@ -647,6 +661,7 @@ final class ServerController: ObservableObject {
             configuration: .init(address: .hostname(Self.bindHost, port: port), serverName: "DynaMoE")
         )
         let group = ServiceGroup(services: [app])
+        let transition = lifecycleGeneration
         serviceGroup = group
         boundPort = port
         isRunning = true
@@ -654,7 +669,7 @@ final class ServerController: ObservableObject {
             do {
                 try await group.run()
             } catch {
-                await self?.noteError("Server stopped with error: \(error.localizedDescription)")
+                await self?.noteError("Server stopped with error: \(error.localizedDescription)", transition: transition)
             }
         }
         NSLog("🌐 [SERVER] listening on %@:%d", Self.bindHost, port)
@@ -662,6 +677,8 @@ final class ServerController: ObservableObject {
 
     func stop() async {
         guard let group = serviceGroup else { return }
+        lifecycleGeneration &+= 1
+        let transition = lifecycleGeneration
         serviceGroup = nil
         // Cancel only turns the server owns. The chat UI drives the engine
         // directly (not through this queue), so its in-flight response must
@@ -671,20 +688,34 @@ final class ServerController: ObservableObject {
         // a fresh session history anyway.
         ServerTurnMemory.shared.clear()
         await group.triggerGracefulShutdown()
+        // A newer transition (a toggle that went straight back on, or a restart)
+        // owns the published state now: this shutdown must not report the server
+        // as stopped on top of the server that started meanwhile.
+        guard transition == lifecycleGeneration else { return }
         isRunning = false
         boundPort = 0
         print("🌐 [SERVER] stopped")
     }
 
-    func setRunning(_ running: Bool) async {
-        if running && !isRunning {
-            start()
-        } else if !running && isRunning {
+    /// Applies the requested state (`dynamoe_server_enabled`), which the
+    /// settings toggle persists *before* it asks for the change. Reconciling to
+    /// the persisted value rather than to the caller's argument is what makes the
+    /// newest request win when two toggles race — and the check after a shutdown
+    /// is what honors a toggle that flipped back on while that shutdown was still
+    /// draining, instead of letting the shutdown decide the final state.
+    func applyRequestedState() async {
+        if isRunning && !Self.isEnabledRequested {
             await stop()
+        }
+        if Self.isEnabledRequested && !isRunning {
+            start()
         }
     }
 
-    private func noteError(_ message: String) {
+    /// A server that has already been replaced must not publish its own failure
+    /// (or its shutdown) as the current server's state.
+    private func noteError(_ message: String, transition: UInt64) {
+        guard transition == lifecycleGeneration else { return }
         lastError = message
         isRunning = false
         boundPort = 0

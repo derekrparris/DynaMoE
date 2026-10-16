@@ -9,6 +9,7 @@
 //
 
 import XCTest
+import HTTPTypes
 @testable import DynaMoE
 
 final class AnthropicAdapterLogicTests: XCTestCase {
@@ -130,6 +131,53 @@ final class AnthropicAdapterLogicTests: XCTestCase {
         XCTAssertThrowsError(try AnthropicAdapter.splitMessages([]))
         let invalid = [AnthropicMessagesRequest.Message(role: "system", contentText: "no", toolUses: nil, toolResults: nil)]
         XCTAssertThrowsError(try AnthropicAdapter.splitMessages(invalid))
+    }
+
+    // MARK: - Response prefills
+
+    func testRejectsAResponsePrefill() throws {
+        // Anthropic reads a trailing assistant message as "continue this text".
+        // The engine generates a whole assistant turn from its own prompt prefix
+        // and the server reports only what was generated, so the request is
+        // rejected instead of being silently answered a second time.
+        let prefilled = try decodeRequest("""
+        {"max_tokens":10,"messages":[
+            {"role":"user","content":"list the files as json"},
+            {"role":"assistant","content":"["}
+        ]}
+        """)
+        do {
+            _ = try AnthropicAdapter.splitMessages(prefilled.messages)
+            XCTFail("a request ending in assistant text must be rejected")
+        } catch let error as ServerAPIError {
+            XCTAssertEqual(error.status, .badRequest)
+            XCTAssertEqual(error.wireType, .invalidRequest)
+            XCTAssertTrue(error.message.contains("prefill"), error.message)
+        }
+
+        // A reasoning block is the same prefill in another shape.
+        let reasoningPrefill = try decodeRequest("""
+        {"max_tokens":10,"messages":[
+            {"role":"user","content":"go"},
+            {"role":"assistant","content":[{"type":"thinking","thinking":"let me think"}]}
+        ]}
+        """)
+        XCTAssertThrowsError(try AnthropicAdapter.splitMessages(reasoningPrefill.messages))
+    }
+
+    func testAcceptsATrailingAssistantTurnWithoutTextOfItsOwn() throws {
+        // A trailing assistant turn carrying only tool calls is not a prefill:
+        // there is no supplied text to continue, so it renders as the transcript
+        // of a completed call turn.
+        let request = try decodeRequest("""
+        {"max_tokens":10,"messages":[
+            {"role":"user","content":"go"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"shell_run","input":{"cmd":"ls"}}]}
+        ]}
+        """)
+        let turns = try AnthropicAdapter.splitMessages(request.messages)
+        XCTAssertEqual(turns.map(\.role), [.user, .assistant])
+        XCTAssertTrue(turns[1].text.contains("shell_run"))
     }
 
     // MARK: - Finish reasons

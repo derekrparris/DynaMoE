@@ -296,6 +296,52 @@ final class ChatPromptFormatterConversationTests: XCTestCase {
         )
     }
 
+    // MARK: - Reasoning across a thinking toggle
+
+    func testHistoricalReasoningStaysInItsBlockWhenThinkingIsTurnedOff() throws {
+        // A client that kept the reasoning of an earlier thinking turn sends it
+        // again after thinking has been disabled for the follow-up. That earlier
+        // turn must still render with its reasoning block open, and Gemma's must
+        // render in its native channel: placing the reasoning after an
+        // already-closed empty block would put it outside the block it belongs to
+        // and re-render the turn differently from the pinned prompt.
+        let canonicalClose = TurnTextSplitter.canonicalReasoningCloseTag
+        for (name, family) in try families() {
+            let prompt = ChatPromptFormatter.formatConversation(
+                turns: [
+                    .init(role: .user, text: "hello"),
+                    .init(role: .assistant, text: "why" + canonicalClose + "\n\nANSWER"),
+                    .init(role: .user, text: "again"),
+                ],
+                cleanSystem: system,
+                thinkingEnabled: false,
+                modelSupportsThinking: true,
+                modelConfig: family
+            )
+            let open = name == "gemma4"
+                ? ChatPromptFormatter.gemmaReasoningOpen
+                : TurnTextSplitter.canonicalReasoningOpenTag
+            let close = name == "gemma4"
+                ? ChatPromptFormatter.gemmaReasoningClose
+                : canonicalClose
+            let opened = try XCTUnwrap(prompt.range(of: open), "\(name): the reasoning block must be opened")
+            let afterOpen = prompt[opened.upperBound...]
+            let closed = try XCTUnwrap(afterOpen.range(of: close), "\(name): the open block must be closed again")
+            let reasoning = try XCTUnwrap(afterOpen.range(of: "why"), "\(name): the echoed reasoning must survive")
+            XCTAssertLessThan(
+                reasoning.lowerBound,
+                closed.lowerBound,
+                "\(name): the reasoning must sit inside its block, not after a closed empty one"
+            )
+            if name == "gemma4" {
+                XCTAssertFalse(
+                    prompt.contains(canonicalClose),
+                    "gemma4: the echoed reasoning must use the native channel markers"
+                )
+            }
+        }
+    }
+
     func testSparkAssistantTurnsCarryEndOfSentenceMarker() throws {
         let spark = try config("spark")
         let prompt = ChatPromptFormatter.formatConversation(

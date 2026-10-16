@@ -532,6 +532,26 @@ enum AnthropicAdapter {
         """
     }
 
+    /// Rejects a request that ends with an assistant message carrying text or
+    /// reasoning. Anthropic reads that as a response prefill — "start the answer
+    /// with this" — but the engine generates a complete assistant turn from its
+    /// own prompt prefix and the server reports only what was generated, so
+    /// honoring it silently would return a second answer rather than a
+    /// continuation of the supplied text. Rejecting names the limitation where
+    /// the client can see it; a trailing assistant message with no content of
+    /// its own (tool calls, or an empty block) is just the usual generation
+    /// request and stays accepted.
+    static func rejectUnsupportedPrefill(_ messages: [AnthropicMessagesRequest.Message]) throws {
+        guard let last = messages.last, last.role == "assistant" else { return }
+        let prefilled = [last.contentText, last.reasoningText]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .contains { !$0.isEmpty }
+        guard prefilled else { return }
+        throw ServerAPIError.badRequest(
+            "A request may not end with an assistant message that carries text: this server does not support response prefills (the continuation cannot be reported as an Anthropic message). End the request with a user message."
+        )
+    }
+
     /// Renders the message list into role-tagged turns. The Anthropic system
     /// prompt lives in the top-level `system` field, so only the conversation
     /// body is assembled here.
@@ -550,6 +570,7 @@ enum AnthropicAdapter {
         if let invalidRole = invalidRole {
             throw ServerAPIError.badRequest("messages roles must be \"user\" or \"assistant\", got \"\(invalidRole)\"")
         }
+        try rejectUnsupportedPrefill(messages)
 
         var turns: [ChatPromptFormatter.ConversationTurn] = []
         for message in messages {

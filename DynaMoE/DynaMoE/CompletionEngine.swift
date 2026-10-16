@@ -37,6 +37,14 @@ public enum TurnTextSplitter {
     public static var canonicalReasoningOpenTag: String { openTags[0] }
     public static var canonicalReasoningCloseTag: String { closeTags[0] }
 
+    /// Whether `text` carries a reasoning block, i.e. contains one of the
+    /// families' reasoning close markers. Lets the prompt formatters render a
+    /// historical turn from its own content rather than from the setting of the
+    /// turn being generated now, without retyping the tag literals (AGENTS.md).
+    public static func containsReasoningClose(_ text: String) -> Bool {
+        closeTags.contains { !$0.isEmpty && text.contains($0) }
+    }
+
     /// Gemma 4 emits reasoning inside a `<|channel>` block whose first line is the
     /// channel label (`thought`). Strip that label so the accordion shows only the
     /// model's actual reasoning text.

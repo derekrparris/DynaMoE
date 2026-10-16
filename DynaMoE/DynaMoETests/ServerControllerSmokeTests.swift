@@ -276,4 +276,41 @@ final class ServerControllerSmokeTests: XCTestCase {
         let apiKeyHttp = try XCTUnwrap(apiKeyResponse as? HTTPURLResponse)
         XCTAssertEqual(apiKeyHttp.statusCode, 200, "the x-api-key header must be accepted as an alternative presentation shape")
     }
+
+    // MARK: - Lifecycle transitions
+
+    func testToggleBackOnDuringShutdownLeavesTheServerRunning() async throws {
+        // Turning the server off and straight back on used to leave it stopped:
+        // the "on" request observed `isRunning == true` (the shutdown had not
+        // drained yet) and did nothing, and the shutdown then published
+        // "stopped". The controller reconciles to the persisted request after
+        // draining, so the newest request decides.
+        await ensureServerRunning()
+        let defaults = UserDefaults.standard
+        defaults.set(false, forKey: ServerController.enabledKey)
+
+        let disabling = Task { await ServerController.shared.applyRequestedState() }
+        // Let the main-actor controller reach the shutdown's first suspension,
+        // then flip the request back on while that shutdown is still draining.
+        await MainActor.run {}
+        defaults.set(true, forKey: ServerController.enabledKey)
+        await disabling.value
+
+        let running = await MainActor.run { ServerController.shared.isRunning }
+        XCTAssertTrue(running, "the last requested state was on, so the server must be running once the shutdown drains")
+    }
+
+    func testRestartAfterADisableLeavesTheServerStopped() async throws {
+        // `restartServer` stops and then reconciles instead of starting
+        // unconditionally, so a disable that landed while the shutdown was
+        // draining is not undone by the restart.
+        await ensureServerRunning()
+        UserDefaults.standard.set(false, forKey: ServerController.enabledKey)
+
+        await ServerController.shared.stop()
+        await ServerController.shared.applyRequestedState()
+
+        let running = await MainActor.run { ServerController.shared.isRunning }
+        XCTAssertFalse(running, "a restart must not force the server back on after the user disabled it")
+    }
 }

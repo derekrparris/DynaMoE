@@ -1819,8 +1819,11 @@ struct SettingsSheetView: View {
                     .toggleStyle(.switch)
                     .labelsHidden()
             }
-            .onChange(of: isServerEnabled) { _, enabled in
-                Task { await serverController.setRunning(enabled) }
+            .onChange(of: isServerEnabled) { _, _ in
+                // The controller reconciles to the persisted setting rather than
+                // to this callback's value, so a toggle that raced a shutdown
+                // still ends in the state the user last asked for.
+                Task { await serverController.applyRequestedState() }
             }
 
             SettingsRowDivider()
@@ -1944,8 +1947,11 @@ struct SettingsSheetView: View {
         // port without requiring an explicit submit first.
         applyServerPort()
         Task {
+            // Reconcile instead of starting unconditionally: the enable setting
+            // is the user's intent, and turning it off while this restart drains
+            // must leave the server stopped rather than undoing the change.
             await serverController.stop()
-            serverController.start()
+            await serverController.applyRequestedState()
         }
     }
 

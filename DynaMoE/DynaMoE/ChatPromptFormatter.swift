@@ -29,9 +29,9 @@ public enum ChatPromptFormatter {
     ) -> String {
         let thinkSuffix: String
         if thinkingEnabled {
-            thinkSuffix = "<think>\n"
+            thinkSuffix = Self.openReasoningSuffix
         } else if modelSupportsThinking {
-            thinkSuffix = "<think>\n\n</think>\n\n"
+            thinkSuffix = Self.emptyReasoningSuffix
         } else {
             thinkSuffix = ""
         }
@@ -125,6 +125,33 @@ public enum ChatPromptFormatter {
     public static let openAIToolCallEchoPrefix = "Function calls made:"
     public static let anthropicToolCallEchoPrefix = "Tool calls made:"
 
+    /// The reasoning suffix a family's assistant prefix carries when its
+    /// reasoning block is open, and when it is empty (opened and immediately
+    /// closed). Assembled from the canonical tags so the literals are never
+    /// retyped (AGENTS.md).
+    static let openReasoningSuffix = TurnTextSplitter.canonicalReasoningOpenTag + "\n"
+    static let emptyReasoningSuffix =
+        TurnTextSplitter.canonicalReasoningOpenTag + "\n\n" + TurnTextSplitter.canonicalReasoningCloseTag + "\n\n"
+
+    /// Whether a *historical* assistant turn is rendered with its reasoning block
+    /// open.
+    ///
+    /// A turn whose own text carries reasoning was generated inside an open
+    /// block, so it is re-opened here even when thinking has since been turned
+    /// off: rendering it after an already-closed empty block would put its
+    /// reasoning outside the block it belongs to and re-render the turn
+    /// differently from the prompt the pin recorded. Every other turn follows
+    /// this turn's setting, which is the only signal available for a turn that
+    /// was generated without reasoning at all.
+    private static func opensReasoningForHistory(
+        thinkingEnabled: Bool,
+        modelSupportsThinking: Bool,
+        text: String
+    ) -> Bool {
+        guard modelSupportsThinking else { return false }
+        return thinkingEnabled || TurnTextSplitter.containsReasoningClose(text)
+    }
+
     /// Renders a *completed* historical assistant turn's body. When the family's
     /// assistant prefix opened a reasoning block (thinking enabled) a client's
     /// echo (the visible answer, not the reasoning) must not be presented as
@@ -140,23 +167,22 @@ public enum ChatPromptFormatter {
     }
 
     /// The Gemma counterpart of `completedAssistantBody`. Gemma's assistant
-    /// prefix leaves the reasoning channel open (`<|turn>model\n`), and the
-    /// adapters hand us the flattened canonical form (`reasoning` + canonical
-    /// close + answer), so the channel boundaries are restored here: the echo
-    /// then reproduces what the model generated instead of replaying reasoning
-    /// as bare text. A body already carrying the native markers (a
-    /// server-spliced raw generation) is left untouched.
-    private static func completedGemmaBody(thinkingEnabled: Bool, text: String) -> String {
-        guard thinkingEnabled, !text.contains(gemmaReasoningClose) else { return text }
+    /// prefix leaves the reasoning channel open (`<|turn>model\n`) and the model
+    /// opens the channel itself, so the channel is the body's business: reasoning
+    /// a client echoed back arrives in the flattened canonical form (`reasoning`
+    /// + canonical close + answer) and is converted to the native markers here,
+    /// whether or not this turn still has thinking enabled — the turn's own text
+    /// is what says it was generated with reasoning. A turn without reasoning
+    /// gets an explicitly closed, empty channel, and a body already carrying the
+    /// native markers (a server-spliced raw generation) is left untouched.
+    private static func completedGemmaBody(text: String) -> String {
+        guard !text.contains(gemmaReasoningClose) else { return text }
         if let close = text.range(of: TurnTextSplitter.canonicalReasoningCloseTag) {
             return gemmaReasoningOpen
                 + text[text.startIndex..<close.lowerBound]
                 + gemmaReasoningClose
                 + text[close.upperBound...]
         }
-        // Thinking was on but the client dropped the reasoning: keep the
-        // channel explicitly closed and empty rather than letting the answer
-        // read as an unfinished thought.
         return gemmaReasoningOpen + gemmaReasoningClose + text
     }
 
@@ -202,36 +228,46 @@ public enum ChatPromptFormatter {
         if modelConfig?.isLingModel == true {
             let lingThinking = thinkingEnabled ? "detailed thinking on" : "detailed thinking off"
             let sysPart = cleanSystem.isEmpty ? lingThinking : "\(cleanSystem)\n\(lingThinking)"
-            let assistantPrefix = "<role>ASSISTANT</role>" + (thinkingEnabled ? "\n<think>" : "\n<think></think>")
+            // The Ling assistant prefix with its reasoning block open, and with
+            // it empty (a completed turn that carried no reasoning).
+            let openPrefix = "<role>ASSISTANT</role>" + "\n" + TurnTextSplitter.canonicalReasoningOpenTag
+            let emptyPrefix = openPrefix + TurnTextSplitter.canonicalReasoningCloseTag
             var p = "<role>SYSTEM</role>" + sysPart + "<|role_end|>"
             for turn in turns {
                 if turn.role == .user {
                     p += "<role>HUMAN</role>" + turn.text + "<|role_end|>"
                 } else {
-                    p += assistantPrefix + Self.completedAssistantBody(prefixOpensReasoning: thinkingEnabled, text: turn.text) + "<|role_end|>"
+                    let opens = thinkingEnabled || TurnTextSplitter.containsReasoningClose(turn.text)
+                    p += (opens ? openPrefix : emptyPrefix)
+                        + Self.completedAssistantBody(prefixOpensReasoning: opens, text: turn.text)
+                        + "<|role_end|>"
                 }
             }
-            p += assistantPrefix
+            p += (thinkingEnabled ? openPrefix : emptyPrefix)
             return p
         }
 
         if modelConfig?.isSparkModel == true {
             let sysLine = cleanSystem.isEmpty ? "You are a helpful assistant." : cleanSystem
-            let assistantPrefix = "<｜start▁of▁sentence｜><|Bot|>" + (thinkingEnabled ? "<think>" : "<think></think>")
+            let openPrefix = "<｜start▁of▁sentence｜><|Bot|>" + TurnTextSplitter.canonicalReasoningOpenTag
+            let emptyPrefix = openPrefix + TurnTextSplitter.canonicalReasoningCloseTag
             var p = "<｜start▁of▁sentence｜><|System|>\n" + sysLine + "<｜end▁of▁sentence｜>"
             for turn in turns {
                 if turn.role == .user {
                     p += "<｜start▁of▁sentence｜><|User|>" + turn.text + "<｜end▁of▁sentence｜>"
                 } else {
-                    p += assistantPrefix + Self.completedAssistantBody(prefixOpensReasoning: thinkingEnabled, text: turn.text) + Self.sparkEndOfSentence
+                    let opens = thinkingEnabled || TurnTextSplitter.containsReasoningClose(turn.text)
+                    p += (opens ? openPrefix : emptyPrefix)
+                        + Self.completedAssistantBody(prefixOpensReasoning: opens, text: turn.text)
+                        + Self.sparkEndOfSentence
                 }
             }
-            p += assistantPrefix
+            p += (thinkingEnabled ? openPrefix : emptyPrefix)
             return p
         }
 
         if modelConfig?.isGemma4Model == true {
-            let assistantPrefix = "<|turn>model\n" + (thinkingEnabled ? "" : Self.gemmaReasoningOpen + Self.gemmaReasoningClose)
+            let trailingPrefix = "<|turn>model\n" + (thinkingEnabled ? "" : Self.gemmaReasoningOpen + Self.gemmaReasoningClose)
             var p = "<bos>"
             if thinkingEnabled {
                 p += "<|turn>system\n<|think|>\n" + cleanSystem + "<turn|>\n"
@@ -242,15 +278,27 @@ public enum ChatPromptFormatter {
                 if turn.role == .user {
                     p += "<|turn>user\n" + turn.text + "<turn|>\n"
                 } else {
-                    p += assistantPrefix + Self.completedGemmaBody(thinkingEnabled: thinkingEnabled, text: turn.text) + "<turn|>\n"
+                    // The model opens its own reasoning channel, so the body owns
+                    // it: an echoed reasoning is converted to the native markers
+                    // even when thinking has since been turned off, and a turn
+                    // without reasoning gets an explicitly empty channel.
+                    p += "<|turn>model\n" + Self.completedGemmaBody(text: turn.text) + "<turn|>\n"
                 }
             }
-            p += assistantPrefix
+            p += trailingPrefix
             return p
         }
 
-        let thinkSuffix = thinkingEnabled ? "<think>\n" : (modelSupportsThinking ? "<think>\n\n</think>\n\n" : "")
-        let assistantPrefix = "<|im_start|>assistant\n" + thinkSuffix
+        // The default dialect. A completed turn is rendered from its own text
+        // whenever that text carries reasoning, because the turn's content is
+        // what says its block was open: thinking that has since been disabled
+        // must not push earlier reasoning out of the block it belongs to, which
+        // would also re-render that turn differently from the prompt the pin
+        // recorded.
+        let emptySuffix = modelSupportsThinking ? Self.emptyReasoningSuffix : ""
+        let emptyPrefix = "<|im_start|>assistant\n" + emptySuffix
+        let openPrefix = "<|im_start|>assistant\n" + Self.openReasoningSuffix
+        let assistantPrefix = thinkingEnabled ? openPrefix : emptyPrefix
         var p = ""
         if !cleanSystem.isEmpty {
             p += "<|im_start|>system\n" + cleanSystem + "<|im_end|>\n"
@@ -259,7 +307,14 @@ public enum ChatPromptFormatter {
             if turn.role == .user {
                 p += "<|im_start|>user\n" + turn.text + "<|im_end|>\n"
             } else {
-                p += assistantPrefix + Self.completedAssistantBody(prefixOpensReasoning: thinkingEnabled, text: turn.text) + "<|im_end|>\n"
+                let opens = Self.opensReasoningForHistory(
+                    thinkingEnabled: thinkingEnabled,
+                    modelSupportsThinking: modelSupportsThinking,
+                    text: turn.text
+                )
+                p += (opens ? openPrefix : emptyPrefix)
+                    + Self.completedAssistantBody(prefixOpensReasoning: opens, text: turn.text)
+                    + "<|im_end|>\n"
             }
         }
         p += assistantPrefix
