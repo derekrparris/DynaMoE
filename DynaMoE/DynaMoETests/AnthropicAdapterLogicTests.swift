@@ -1,0 +1,339 @@
+//
+//  AnthropicAdapterLogicTests.swift
+//  DynaMoE
+//
+//  Pure-logic coverage for the Anthropic adapter's protocol mapping: request
+//  decoding (string + block content, system field, tools, thinking config),
+//  message splitting, tool declarations, finish-reason mapping, and stable
+//  session keys.
+//
+
+import XCTest
+import HTTPTypes
+@testable import DynaMoE
+
+final class AnthropicAdapterLogicTests: XCTestCase {
+
+    private func decodeRequest(_ json: String) throws -> AnthropicMessagesRequest {
+        let decoder = JSONDecoder()
+        return try decoder.decode(AnthropicMessagesRequest.self, from: Data(json.utf8))
+    }
+
+    // MARK: - Request decoding
+
+    func testDecodesMinimalRequestWithStringContent() throws {
+        let request = try decodeRequest("""
+        {"model":"m","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}
+        """)
+        XCTAssertEqual(request.messages.count, 1)
+        XCTAssertEqual(request.messages[0].contentText, "hi")
+        XCTAssertEqual(request.maxTokens, 100)
+        XCTAssertEqual(request.stream, nil)
+        XCTAssertEqual(request.systemText, nil)
+    }
+
+    func testDecodesSystemAsBareStringAndBlockArray() throws {
+        let stringForm = try decodeRequest("""
+        {"max_tokens":10,"system":"be terse","messages":[{"role":"user","content":"hi"}]}
+        """)
+        XCTAssertEqual(stringForm.systemText, "be terse")
+
+        let blockForm = try decodeRequest("""
+        {"max_tokens":10,"system":[{"type":"text","text":"part one"},{"type":"text","text":"part two"}],"messages":[{"role":"user","content":"hi"}]}
+        """)
+        XCTAssertEqual(blockForm.systemText, "part one\n\npart two")
+    }
+
+    func testDecodesMultipartContentBlocks() throws {
+        let request = try decodeRequest("""
+        {"max_tokens":10,"messages":[{"role":"user","content":[{"type":"text","text":"part one"},{"type":"text","text":"part two"}]}]}
+        """)
+        XCTAssertEqual(request.messages[0].contentText, "part one\npart two")
+    }
+
+    func testDecodesToolUseAndToolResultBlocks() throws {
+        let request = try decodeRequest("""
+        {"max_tokens":10,"messages":[
+            {"role":"assistant","content":[
+                {"type":"text","text":"I'll run that."},
+                {"type":"tool_use","id":"toolu_1","name":"shell_run","input":{"cmd":"make test"}}
+            ]},
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"all green"}]}
+            ]}
+        ]}
+        """)
+        XCTAssertEqual(request.messages[0].contentText, "I'll run that.")
+        let use = try XCTUnwrap(request.messages[0].toolUses?.first)
+        XCTAssertEqual(use.name, "shell_run")
+        XCTAssertEqual(use.id, "toolu_1")
+        XCTAssertTrue(use.inputJSON?.contains("make test") == true)
+        let result = try XCTUnwrap(request.messages[1].toolResults?.first)
+        XCTAssertEqual(result.toolUseId, "toolu_1")
+        XCTAssertEqual(result.content, "all green")
+    }
+
+    func testDecodesSamplerAndStreamExtras() throws {
+        let request = try decodeRequest("""
+        {"max_tokens":123,"temperature":0.3,"top_p":0.8,"top_k":40,"stop_sequences":["END"],"stream":true,"messages":[{"role":"user","content":"hi"}]}
+        """)
+        XCTAssertEqual(request.maxTokens, 123)
+        XCTAssertEqual(request.temperature ?? -1, 0.3, accuracy: 0.0001)
+        XCTAssertEqual(request.topP ?? -1, 0.8, accuracy: 0.0001)
+        XCTAssertEqual(request.topK, 40)
+        XCTAssertEqual(request.stopSequences, ["END"])
+        XCTAssertEqual(request.stream, true)
+    }
+
+    func testDecodesToolSchemasAndThinkingConfig() throws {
+        let request = try decodeRequest("""
+        {"max_tokens":10,"thinking":{"type":"enabled","budget_tokens":2048},"tool_choice":{"type":"auto"},"tools":[{"name":"get_weather","description":"Get weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],"messages":[{"role":"user","content":"hi"}]}
+        """)
+        XCTAssertEqual(request.tools?.count, 1)
+        XCTAssertEqual(request.tools?[0].name, "get_weather")
+        let schemaJSON = try String(data: XCTUnwrap(request.tools?[0].inputSchemaData), encoding: .utf8)
+        XCTAssertTrue(schemaJSON?.contains("\"city\"") == true, "schema must embed parameter names")
+        XCTAssertEqual(request.thinking?.type, "enabled")
+        XCTAssertEqual(request.thinking?.budgetTokens, 2048)
+        XCTAssertEqual(request.toolChoiceType, "auto")
+    }
+
+    // MARK: - Message splitting
+
+    func testSingleTurnPassesUserTextThroughVerbatim() throws {
+        let messages = [
+            AnthropicMessagesRequest.Message(role: "user", contentText: "what is 2+2", toolUses: nil, toolResults: nil),
+        ]
+        let turns = try AnthropicAdapter.splitMessages(messages)
+        XCTAssertEqual(turns.count, 1)
+        XCTAssertEqual(turns[0].role, .user)
+        XCTAssertEqual(turns[0].text, "what is 2+2")
+    }
+
+    func testToolContinuationRendersAsTranscript() throws {
+        let request = try decodeRequest("""
+        {"max_tokens":10,"messages":[
+            {"role":"user","content":"run the tests"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"shell_run","input":{"cmd":"make test"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"all green"}]}
+        ]}
+        """)
+        let turns = try AnthropicAdapter.splitMessages(request.messages)
+        XCTAssertEqual(turns.map(\.role), [.user, .assistant, .user], "roles must stay native, not flattened into one user block")
+        XCTAssertEqual(turns[0].text, "run the tests")
+        XCTAssertTrue(turns[1].text.contains("shell_run"))
+        XCTAssertTrue(turns[1].text.contains("make test"))
+        XCTAssertTrue(turns[2].text.contains("Tool result (toolu_1)"))
+        XCTAssertTrue(turns[2].text.contains("all green"))
+    }
+
+    func testRejectsEmptyMessagesAndInvalidRoles() {
+        XCTAssertThrowsError(try AnthropicAdapter.splitMessages([]))
+        let invalid = [AnthropicMessagesRequest.Message(role: "system", contentText: "no", toolUses: nil, toolResults: nil)]
+        XCTAssertThrowsError(try AnthropicAdapter.splitMessages(invalid))
+    }
+
+    // MARK: - Response prefills
+
+    func testRejectsAResponsePrefill() throws {
+        // Anthropic reads a trailing assistant message as "continue this text".
+        // The engine generates a whole assistant turn from its own prompt prefix
+        // and the server reports only what was generated, so the request is
+        // rejected instead of being silently answered a second time.
+        let prefilled = try decodeRequest("""
+        {"max_tokens":10,"messages":[
+            {"role":"user","content":"list the files as json"},
+            {"role":"assistant","content":"["}
+        ]}
+        """)
+        do {
+            _ = try AnthropicAdapter.splitMessages(prefilled.messages)
+            XCTFail("a request ending in assistant text must be rejected")
+        } catch let error as ServerAPIError {
+            XCTAssertEqual(error.status, .badRequest)
+            XCTAssertEqual(error.wireType, .invalidRequest)
+            XCTAssertTrue(error.message.contains("prefill"), error.message)
+        }
+
+        // A reasoning block is the same prefill in another shape.
+        let reasoningPrefill = try decodeRequest("""
+        {"max_tokens":10,"messages":[
+            {"role":"user","content":"go"},
+            {"role":"assistant","content":[{"type":"thinking","thinking":"let me think"}]}
+        ]}
+        """)
+        XCTAssertThrowsError(try AnthropicAdapter.splitMessages(reasoningPrefill.messages))
+    }
+
+    func testAcceptsATrailingAssistantTurnWithoutTextOfItsOwn() throws {
+        // A trailing assistant turn carrying only tool calls is not a prefill:
+        // there is no supplied text to continue, so it renders as the transcript
+        // of a completed call turn.
+        let request = try decodeRequest("""
+        {"max_tokens":10,"messages":[
+            {"role":"user","content":"go"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"shell_run","input":{"cmd":"ls"}}]}
+        ]}
+        """)
+        let turns = try AnthropicAdapter.splitMessages(request.messages)
+        XCTAssertEqual(turns.map(\.role), [.user, .assistant])
+        XCTAssertTrue(turns[1].text.contains("shell_run"))
+    }
+
+    // MARK: - Finish reasons
+
+    func testFinishReasonMapping() {
+        XCTAssertEqual(AnthropicAdapter.finishReasonString(.eos, hasToolCalls: false), "end_turn")
+        XCTAssertEqual(AnthropicAdapter.finishReasonString(.endTag, hasToolCalls: false), "end_turn")
+        XCTAssertEqual(AnthropicAdapter.finishReasonString(.stopped, hasToolCalls: false), "end_turn")
+        XCTAssertEqual(AnthropicAdapter.finishReasonString(.degenerateCycle, hasToolCalls: false), "end_turn")
+        XCTAssertEqual(AnthropicAdapter.finishReasonString(.lengthCapped, hasToolCalls: false), "max_tokens")
+        XCTAssertEqual(AnthropicAdapter.finishReasonString(.stoppedBySequence, hasToolCalls: false), "stop_sequence")
+        XCTAssertEqual(AnthropicAdapter.finishReasonString(.toolFreeze, hasToolCalls: true), "tool_use")
+        XCTAssertEqual(AnthropicAdapter.finishReasonString(.eos, hasToolCalls: true), "tool_use")
+    }
+
+    // MARK: - Tool declarations
+
+    func testToolDeclarationEmbedsSchemasAsValidJSON() throws {
+        let request = try decodeRequest("""
+        {"max_tokens":10,"tools":[{"name":"list_files","input_schema":{"type":"object","properties":{}}}],"messages":[{"role":"user","content":"hi"}]}
+        """)
+        let text = try XCTUnwrap(AnthropicAdapter.toolDeclarationText(try XCTUnwrap(request.tools)))
+        XCTAssertTrue(text.contains("list_files"))
+        XCTAssertTrue(text.contains("FUNCTIONS: ["))
+        let jsonStart = try XCTUnwrap(text.range(of: "FUNCTIONS: "))
+        let jsonText = String(text[jsonStart.upperBound...])
+        let parsed = try JSONSerialization.jsonObject(with: Data(jsonText.utf8))
+        XCTAssertTrue(parsed is [[String: Any]], "declaration must embed a JSON array")
+    }
+
+    func testToolDeclarationNilWithoutTools() {
+        XCTAssertNil(AnthropicAdapter.toolDeclarationText([]))
+    }
+
+    func testClientToolCallEmittedPerDeclarationIsParsed() throws {
+        // The declaration must teach the parser-recognized tagged markup: a
+        // client-defined tool is not in the built-in catalog, so a bare-JSON
+        // emission would be returned as plain text instead of tool_use.
+        let request = try decodeRequest("""
+        {"max_tokens":10,"tools":[{"name":"get_weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}}}}],"messages":[{"role":"user","content":"hi"}]}
+        """)
+        let text = try XCTUnwrap(AnthropicAdapter.toolDeclarationText(try XCTUnwrap(request.tools)))
+        XCTAssertTrue(text.contains(StreamingToolParser.qwenToolCallOpen), "declaration must teach the tagged call format")
+        XCTAssertTrue(text.contains(StreamingToolParser.qwenFunctionOpen), "declaration must teach the function tag")
+
+        let emitted = StreamingToolParser.qwenToolCallOpen
+            + "<function=get_weather><parameter=city>Oslo</parameter></function>"
+            + StreamingToolParser.qwenToolCallClose
+        let parsed = StreamingToolParser.shared.parseStreamingToolCalls(from: emitted, format: .qwenXML)
+        XCTAssertEqual(parsed.calls.count, 1, "a client tool emitted per the declaration must parse as a call")
+        XCTAssertEqual(parsed.calls.first?.name, "get_weather")
+        XCTAssertEqual(parsed.calls.first?.arguments["city"] as? String, "Oslo")
+    }
+
+    // MARK: - Session keys
+
+    func testSessionKeyStableAcrossConversationTurns() throws {
+        let first = try decodeRequest("""
+        {"max_tokens":10,"messages":[{"role":"user","content":"turn one"}]}
+        """)
+        let second = try decodeRequest("""
+        {"max_tokens":10,"messages":[{"role":"user","content":"turn one"},{"role":"assistant","content":"answer one"},{"role":"user","content":"turn two"}]}
+        """)
+        XCTAssertEqual(
+            AnthropicAdapter.sessionKey(for: first.messages, model: "m"),
+            AnthropicAdapter.sessionKey(for: second.messages, model: "m"),
+            "appending turns must keep the session identity stable"
+        )
+    }
+
+    func testSessionKeyDiffersAcrossConversationsAndModels() throws {
+        let a = try decodeRequest(#"{"max_tokens":10,"messages":[{"role":"user","content":"hello"}]}"#)
+        let b = try decodeRequest(#"{"max_tokens":10,"messages":[{"role":"user","content":"different"}]}"#)
+        XCTAssertNotEqual(
+            AnthropicAdapter.sessionKey(for: a.messages, model: "m"),
+            AnthropicAdapter.sessionKey(for: b.messages, model: "m")
+        )
+        XCTAssertNotEqual(
+            AnthropicAdapter.sessionKey(for: a.messages, model: "m1"),
+            AnthropicAdapter.sessionKey(for: a.messages, model: "m2")
+        )
+    }
+
+    // MARK: - Response encoding
+
+    func testContentBlockEncodingRoundTrips() throws {
+        let textData = try JSONEncoder().encode(AnthropicContentBlock.text("hello"))
+        let textJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: textData) as? [String: Any])
+        XCTAssertEqual(textJSON["type"] as? String, "text")
+        XCTAssertEqual(textJSON["text"] as? String, "hello")
+
+        let toolData = try JSONEncoder().encode(AnthropicContentBlock.toolUse(id: "toolu_1", name: "shell_run", inputJSON: #"{"cmd":"ls"}"#))
+        let toolJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: toolData) as? [String: Any])
+        XCTAssertEqual(toolJSON["type"] as? String, "tool_use")
+        XCTAssertEqual(toolJSON["name"] as? String, "shell_run")
+        let input = try XCTUnwrap(toolJSON["input"] as? [String: Any])
+        XCTAssertEqual(input["cmd"] as? String, "ls")
+    }
+
+    func testStreamDeltaEncoding() throws {
+        let textDelta = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(AnthropicStreamDelta.text("abc"))) as? [String: Any])
+        XCTAssertEqual(textDelta["type"] as? String, "text_delta")
+        XCTAssertEqual(textDelta["text"] as? String, "abc")
+
+        let jsonDelta = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(AnthropicStreamDelta.inputJSON(#"{"a":1}"#))) as? [String: Any])
+        XCTAssertEqual(jsonDelta["type"] as? String, "input_json_delta")
+        XCTAssertEqual(jsonDelta["partial_json"] as? String, #"{"a":1}"#)
+    }
+
+    // MARK: - Tool choice
+
+    func testToolChoiceNameIsPreservedAndForcedChoiceIsRejected() throws {
+        let auto = try decodeRequest("""
+        {"max_tokens":10,"tools":[{"name":"get_weather"}],"tool_choice":{"type":"auto"},"messages":[{"role":"user","content":"hi"}]}
+        """)
+        XCTAssertEqual(auto.toolChoiceType, "auto")
+        XCTAssertTrue(try AnthropicAdapter.toolUseEnabled(auto.toolChoice))
+        XCTAssertFalse(try AnthropicAdapter.toolUseEnabled(.init(type: "none", name: nil)))
+
+        let forced = try decodeRequest("""
+        {"max_tokens":10,"tools":[{"name":"get_weather"}],"tool_choice":{"type":"tool","name":"get_weather"},"messages":[{"role":"user","content":"hi"}]}
+        """)
+        XCTAssertEqual(forced.toolChoice?.name, "get_weather", "the demanded tool name must not be discarded")
+        XCTAssertThrowsError(try AnthropicAdapter.toolUseEnabled(forced.toolChoice)) { error in
+            XCTAssertTrue("\(error)".contains("get_weather"), "the rejection must name the demanded tool")
+        }
+
+        let any = try decodeRequest("""
+        {"max_tokens":10,"tools":[{"name":"get_weather"}],"tool_choice":{"type":"any"},"messages":[{"role":"user","content":"hi"}]}
+        """)
+        XCTAssertThrowsError(try AnthropicAdapter.toolUseEnabled(any.toolChoice))
+    }
+
+    // MARK: - Tool IDs in history
+
+    func testAssistantHistoryKeepsToolUseIds() throws {
+        let request = try decodeRequest("""
+        {"max_tokens":10,"messages":[
+            {"role":"user","content":"go"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"toolu_abc","name":"shell_run","input":{"cmd":"ls"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_abc","content":"ok"}]}
+        ]}
+        """)
+        let turns = try AnthropicAdapter.splitMessages(request.messages)
+        XCTAssertTrue(turns[1].text.contains("toolu_abc"), "the opaque tool_use id must reach history so results can be matched to calls")
+    }
+
+    // MARK: - Null preservation in tool inputs
+
+    func testToolUseInputPreservesNullValues() throws {
+        let request = try decodeRequest("""
+        {"max_tokens":10,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"set_value","input":{"value":null}}]},{"role":"user","content":"ok"}]}
+        """)
+        let use = try XCTUnwrap(request.messages[0].toolUses?.first)
+        let json = try XCTUnwrap(use.inputJSON)
+        XCTAssertTrue(json.contains("\"value\":null"), "a null tool input must survive, not become \"\"")
+        XCTAssertFalse(json.contains("\"value\":\"\""))
+    }
+}

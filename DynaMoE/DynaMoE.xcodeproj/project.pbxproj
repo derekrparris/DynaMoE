@@ -11,6 +11,8 @@
 		ABCD95923034F3D100186C2F /* ComputeShaders.metal in Sources */ = {isa = PBXBuildFile; fileRef = ABCD95913034F3D100186C2F /* ComputeShaders.metal */; };
 		ABD5C1EA3033AB4D009C869C /* dynamoe_core.swift in Sources */ = {isa = PBXBuildFile; fileRef = ABD5C1E93033AB4D009C869C /* dynamoe_core.swift */; };
 		ABF1A2B0305E000100000001 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = ABF1A2B1305E000100000001 /* Sparkle */; };
+		ABF1A2B0305E100200000001 /* Hummingbird in Frameworks */ = {isa = PBXBuildFile; productRef = ABF1A2B1305E100200000001 /* Hummingbird */; };
+		ABF1A2B0305E100300000001 /* ServiceLifecycle in Frameworks */ = {isa = PBXBuildFile; productRef = ABF1A2B1305E100300000001 /* ServiceLifecycle */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -78,6 +80,8 @@
 			files = (
 				AB74544B30326473008D5321 /* libdynamoe_core.a in Frameworks */,
 				ABF1A2B0305E000100000001 /* Sparkle in Frameworks */,
+				ABF1A2B0305E100200000001 /* Hummingbird in Frameworks */,
+				ABF1A2B0305E100300000001 /* ServiceLifecycle in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -152,6 +156,8 @@
 			name = DynaMoE;
 			packageProductDependencies = (
 				ABF1A2B1305E000100000001 /* Sparkle */,
+				ABF1A2B1305E100200000001 /* Hummingbird */,
+				ABF1A2B1305E100300000001 /* ServiceLifecycle */,
 			);
 			productName = DynaMoE;
 			productReference = AB4C57BA30324B5A0082A516 /* DynaMoE.app */;
@@ -237,6 +243,8 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				ABF1A2B1305E000100000002 /* XCRemoteSwiftPackageReference "Sparkle" */,
+				ABF1A2B1305E100200000002 /* XCRemoteSwiftPackageReference "hummingbird" */,
+				ABF1A2B1305E100300000002 /* XCRemoteSwiftPackageReference "swift-service-lifecycle" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = AB4C57BB30324B5A0082A516 /* Products */;
@@ -746,6 +754,22 @@
 				version = 2.10.0;
 			};
 		};
+		ABF1A2B1305E100200000002 /* XCRemoteSwiftPackageReference "hummingbird" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/hummingbird-project/hummingbird";
+			requirement = {
+				kind = exactVersion;
+				version = 2.0.0;
+			};
+		};
+		ABF1A2B1305E100300000002 /* XCRemoteSwiftPackageReference "swift-service-lifecycle" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/swift-server/swift-service-lifecycle";
+			requirement = {
+				kind = exactVersion;
+				version = 2.13.0;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -753,6 +777,16 @@
 			isa = XCSwiftPackageProductDependency;
 			package = ABF1A2B1305E000100000002 /* XCRemoteSwiftPackageReference "Sparkle" */;
 			productName = Sparkle;
+		};
+		ABF1A2B1305E100200000001 /* Hummingbird */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = ABF1A2B1305E100200000002 /* XCRemoteSwiftPackageReference "hummingbird" */;
+			productName = Hummingbird;
+		};
+		ABF1A2B1305E100300000001 /* ServiceLifecycle */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = ABF1A2B1305E100300000002 /* XCRemoteSwiftPackageReference "swift-service-lifecycle" */;
+			productName = ServiceLifecycle;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

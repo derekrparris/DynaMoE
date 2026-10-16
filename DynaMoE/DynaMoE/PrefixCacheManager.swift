@@ -10,7 +10,7 @@ import Foundation
 import Metal
 
 /// Telemetry metrics for KV-cache prefix pinning performance
-public struct PrefixCacheMetrics: Sendable, Equatable {
+nonisolated public struct PrefixCacheMetrics: Sendable, Equatable {
     public var totalTurns: Int = 0
     public var cacheHits: Int = 0
     public var totalTokensRequested: Int = 0
@@ -29,16 +29,35 @@ public struct PrefixCacheMetrics: Sendable, Equatable {
 }
 
 /// Coordinates prefix pinning and prompt reuse across conversation turns and tool executions.
-public final class PrefixCacheManager: @unchecked Sendable {
+nonisolated public final class PrefixCacheManager: @unchecked Sendable {
     public static let shared = PrefixCacheManager()
 
-    private let lock = NSLock()
+    private let lock = NSRecursiveLock()
 
     /// The active session ID that owns the currently cached KV states
     private var activeSessionId: UUID?
 
     /// The full sequence of tokens whose KV states are currently pinned in KVCacheManager
     private var pinnedTokenIds: [UInt32] = []
+
+    /// The date whose rendering the active pin's prompt carries, owned by the
+    /// session that will record the next pin. `# Current Date & Time` sits at
+    /// the head of the system prompt with minute+second precision, so a fresh
+    /// `Date()` per turn kills the common token prefix a sentence in — and a
+    /// hybrid (GDN) session, which cannot rewind linear state, then takes a
+    /// full ~30 s re-prefill on every agent step. Turns must render the same
+    /// date the pinned context carries; a new one is minted (owned by that
+    /// session) when the next full prefill is going to pin it anyway.
+    private var pinnedAsOfDate: (sessionId: UUID?, date: Date)? = nil
+
+    /// Dates minted for sessions that have rendered a turn but not yet recorded
+    /// (pinned) one. A request is planned (and mints its date) long before it is
+    /// admitted, so a rejected or timed-out turn from another session must not
+    /// clobber the live pin's date; its date waits here until its own turn
+    /// actually pins. Bounded so a long-lived server cannot accumulate one entry
+    /// per conversation ever seen.
+    private var pendingAsOfDates: [(sessionId: UUID, date: Date)] = []
+    private let maxPendingAsOfDates = 64
 
     /// Performance metrics tracking
     public private(set) var metrics = PrefixCacheMetrics()
@@ -90,12 +109,63 @@ public final class PrefixCacheManager: @unchecked Sendable {
         return usablePrefix
     }
 
+    /// The date to render into a turn's system prompt for `sessionId`.
+    /// Returns the date the current pin was built with whenever that session
+    /// owns it (byte-stable across its turns, so tokenized prompts share the
+    /// full pinned prefix). A session that does not own the pin gets a date
+    /// cached in `pendingAsOfDates` that stays stable across its own planning
+    /// calls, but does NOT take over the live pin's slot: only a turn that
+    /// actually pins (see `promoteAsOfDateLocked`) replaces it, so a rejected or
+    /// timed-out request cannot invalidate another session's pinned prefix.
+    /// `invalidate` clears it so a new prefill carries fresh temporal context
+    /// instead of a growing-stale one.
+    public func asOfDate(sessionId: UUID?) -> Date {
+        lock.lock()
+        defer { lock.unlock() }
+        guard isEnabled else { return Date() }
+        if let pinnedAsOfDate, pinnedAsOfDate.sessionId == sessionId {
+            return pinnedAsOfDate.date
+        }
+        if let sessionId, let pending = pendingAsOfDates.first(where: { $0.sessionId == sessionId }) {
+            return pending.date
+        }
+        let minted = Date()
+        if let sessionId {
+            pendingAsOfDates.append((sessionId, minted))
+            if pendingAsOfDates.count > maxPendingAsOfDates {
+                pendingAsOfDates.removeFirst(pendingAsOfDates.count - maxPendingAsOfDates)
+            }
+        }
+        return minted
+    }
+
+    /// Makes `sessionId` the owner of the live pin's rendered date. Callers that
+    /// know the date their prompt embedded pass it in (`renderedAsOfDate`); that
+    /// is the authoritative value, because the pin has to carry the temporal
+    /// context the prompt actually rendered. Without it the date minted for this
+    /// session at planning time is used. A session the manager never handed a
+    /// date to claims nothing rather than minting a completion-time date that no
+    /// prompt ever rendered.
+    private func promoteAsOfDateLocked(for sessionId: UUID?, renderedAsOfDate: Date?) {
+        guard let sessionId else { return }
+        if let idx = pendingAsOfDates.firstIndex(where: { $0.sessionId == sessionId }) {
+            let pending = pendingAsOfDates.remove(at: idx).date
+            pinnedAsOfDate = (sessionId, renderedAsOfDate ?? pending)
+            return
+        }
+        guard let renderedAsOfDate else { return }
+        pinnedAsOfDate = (sessionId, renderedAsOfDate)
+    }
+
     /// Records the full token sequence after a turn completes (prompt + generated tokens).
     /// - Parameters:
     ///   - promptTokenIds: The prompt tokens used.
     ///   - generatedTokenIds: The tokens generated during this turn.
     ///   - sessionId: The active session ID.
-    public func recordTurn(promptTokenIds: [UInt32], generatedTokenIds: [UInt32], sessionId: UUID?) {
+    ///   - asOfDate: The date this turn's prompt rendered, when the caller knows
+    ///     it. Preferred over the planning-time mint so the pin always carries
+    ///     the rendered context (`invalidate` can drop that mint mid-turn).
+    public func recordTurn(promptTokenIds: [UInt32], generatedTokenIds: [UInt32], sessionId: UUID?, asOfDate: Date? = nil) {
         lock.lock()
         defer { lock.unlock() }
 
@@ -104,6 +174,7 @@ public final class PrefixCacheManager: @unchecked Sendable {
         var full = promptTokenIds
         full.append(contentsOf: generatedTokenIds)
         self.pinnedTokenIds = full
+        promoteAsOfDateLocked(for: sessionId, renderedAsOfDate: asOfDate)
     }
 
     /// Explicitly updates the pinned token list (e.g. after prefill or partial generation).
@@ -132,9 +203,15 @@ public final class PrefixCacheManager: @unchecked Sendable {
                 self.pinnedTokenIds.removeAll(keepingCapacity: true)
                 self.activeSessionId = nil
             }
+            if self.pinnedAsOfDate?.sessionId == sId {
+                self.pinnedAsOfDate = nil
+            }
+            pendingAsOfDates.removeAll { $0.sessionId == sId }
         } else {
             self.pinnedTokenIds.removeAll(keepingCapacity: true)
             self.activeSessionId = nil
+            self.pinnedAsOfDate = nil
+            pendingAsOfDates.removeAll(keepingCapacity: true)
         }
     }
 

@@ -306,7 +306,7 @@ When running sparse MoE models in SSD streaming mode:
 - **Prefetch Depth**: Number of layers ahead to issue prefetch instructions ($1\text{–}4$). Recommended: $2$.
 
 ### Live Diagnostics & Working Set Metrics
-- **Resident Process RSS**: Actual physical RAM occupied by DynaMoE.
+- **DynaMoE Memory**: Total RAM attributable to DynaMoE — Darwin's `phys_footprint` (dirty heap, compressed memory, IOKit/GPU, including the FlashMoE pinned backbone) **plus** the clean file-backed model weights held in the Unified Memory Buffer Cache. Activity Monitor's *Memory* column shows only the footprint, so it omits those multi-GB weight pages; the cache share is reclaimable under memory pressure. The tooltip breaks the total into footprint, cache, and resident pages (RSIZE).
 - **Cache Hit Rate**: Percentage of expert routing requests served directly from RAM without SSD I/O.
 - **Paging Latency**: Time spent by the I/O pool reading expert slices from disk.
 - **Prefetch Efficiency**: Ratio of prefetched pages that were successfully utilized.

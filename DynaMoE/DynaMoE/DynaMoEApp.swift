@@ -116,6 +116,17 @@ struct DynaMoEApp: App {
     @Environment(\.openWindow) private var openWindow
     @StateObject private var updaterViewModel = UpdaterViewModel.shared
 
+    init() {
+        // Local OpenAI-compatible server (M2): auto-start when previously
+        // enabled via the Settings tab (`dynamoe_server_enabled`). App init is
+        // deterministic where view .onAppear ordering is not.
+        if !isTesting,
+           UserDefaults.standard.object(forKey: ServerController.enabledKey) != nil,
+           UserDefaults.standard.bool(forKey: ServerController.enabledKey) {
+            ServerController.shared.start()
+        }
+    }
+
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
             Item.self,

@@ -94,6 +94,7 @@ struct SidebarView: View {
             VStack(spacing: 6) {
                 // Model Status Pill (if loaded)
                 if let model = modelName {
+                    let attributedGB = WorkingSetManager.shared.attributedMemoryGB
                     HStack(spacing: 6) {
                         Circle()
                             .fill(isGenerating ? Color.green : Color.purple)
@@ -103,11 +104,11 @@ struct SidebarView: View {
                             .lineLimit(1)
                             .foregroundColor(.secondary)
                         Spacer()
-                        if currentRssGB > 0 {
-                            Text(String(format: "%.1f GB", currentRssGB))
+                        if attributedGB > 0 {
+                            Text(String(format: "%.1f GB", attributedGB))
                                 .font(.system(size: max(8, 10 * zoomManager.zoomScale), design: .monospaced))
                                 .foregroundColor(.secondary.opacity(0.8))
-                                .help(String(format: "Working Set RAM: %.1f GB\nProcess Footprint (Activity Monitor / Xcode): %.1f GB\nUnified Memory Cache (resident weight pages): %.1f GB\n\nApple Silicon maps zero-copy model weights directly into the Unified Memory buffer cache, with residency measured directly over the shard mappings; Activity Monitor and Xcode display the process footprint (dirty heap, compressed memory, IOKit), which excludes those clean file-backed pages.", currentRssGB, getActivityMonitorFootprintGB(), WorkingSetManager.shared.residentShardBytesGB))
+                                .help(String(format: "DynaMoE memory: %.1f GB\nProcess footprint (Activity Monitor / Xcode): %.1f GB\nWeight pages in the Unified Memory Cache: %.1f GB (reclaimable)\nResident pages (RSIZE): %.1f GB\n\nTotal = what this process is holding in RAM for the model: the Darwin footprint (dirty heap, compressed memory, IOKit/GPU — including the FlashMoE pinned backbone) plus the clean file-backed model weights Darwin's Unified Memory Buffer Cache is holding on its behalf. Activity Monitor's 'Memory' column shows only the footprint, so it excludes those clean pages. The cache share is reclaimable under memory pressure; the footprint is not.", attributedGB, getActivityMonitorFootprintGB(), WorkingSetManager.shared.residentShardBytesGB, currentRssGB))
                         }
                     }
                     .padding(.horizontal, 10)

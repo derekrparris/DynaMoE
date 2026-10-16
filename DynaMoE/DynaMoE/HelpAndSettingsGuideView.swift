@@ -17,6 +17,7 @@ enum HelpTopic: String, CaseIterable, Identifiable {
     case kvCache = "KV Cache Precision"
     case jetSpec = "JetSpec Acceleration"
     case agent = "Agent & Tool Execution"
+    case server = "Local Inference Server"
     case diagnostics = "Advanced Diagnostics"
     case hardware = "Hardware Profiles (16GB - 128GB)"
     case faq = "Troubleshooting & FAQs"
@@ -33,6 +34,7 @@ enum HelpTopic: String, CaseIterable, Identifiable {
         case .kvCache: return "externaldrive.badge.icloud"
         case .jetSpec: return "bolt.fill"
         case .agent: return "wrench.and.screwdriver.fill"
+        case .server: return "server.rack"
         case .diagnostics: return "waveform.path.ecg"
         case .hardware: return "laptopcomputer"
         case .faq: return "questionmark.circle.fill"
@@ -173,6 +175,8 @@ struct HelpAndSettingsGuideView: View {
             jetSpecSection
         case .agent:
             agentSection
+        case .server:
+            serverSection
         case .diagnostics:
             diagnosticsSection
         case .hardware:
@@ -496,7 +500,36 @@ struct HelpAndSettingsGuideView: View {
         }
     }
 
-    // MARK: - 9. Advanced Diagnostics
+    // MARK: - 9. Local Inference Server
+    private var serverSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            headerBadge("Server Section", color: .blue)
+
+            Text("Local OpenAI-Compatible API Server")
+                .font(.title2).bold()
+
+            Text("DynaMoE can expose the currently loaded model as a local inference server on 127.0.0.1. Any client that speaks the OpenAI Chat Completions or Anthropic Messages API — including coding agents like Crush — can connect to it with no external service involved.")
+                .font(.body)
+
+            VStack(alignment: .leading, spacing: 8) {
+                bulletPoint("Enable It", "Open Settings (⌘,) → Server and turn on 'Enable Local Server'. The server starts immediately and automatically each launch, listening on the configured port (default 8787).")
+                bulletPoint("Endpoints", "POST /v1/chat/completions (OpenAI) and POST /v1/messages (Anthropic) are the main APIs, each supporting both streaming (SSE) and non-streaming responses. GET /v1/models lists the loaded model, and GET /health reports readiness.")
+                bulletPoint("Authentication", "Set an optional API key in the Server tab. When set, clients must present it as an Authorization: Bearer header (or the x-api-key header for Anthropic clients); when empty, any local process may call the API. The server binds only to 127.0.0.1, so nothing outside your Mac can connect.")
+                bulletPoint("Queuing", "The engine generates one turn at a time. Concurrent requests are queued in arrival order; queued streaming clients receive SSE heartbeat pings so they never time out while waiting.")
+                bulletPoint("Guardrails", "Requests waiting in the queue longer than 120 seconds (dynamoe_server_queue_timeout) are rejected, and prompts longer than 262,144 tokens (dynamoe_server_max_prompt_tokens) are refused before prefill. Both keys are set via the defaults command; setting either to 0 disables it.")
+                bulletPoint("Request Options", "Per-request samplers (temperature, top_p, top_k, min_p, repetition_penalty, penalties, max_tokens, stop) map onto the engine. Pass \"enable_thinking\": false to disable reasoning on the OpenAI endpoint (or \"thinking\": {\"type\": \"enabled\"} to opt in on the Anthropic endpoint); when enabled, thinking arrives separated in reasoning_content deltas or thinking blocks. Tool schemas passed via \"tools\" are supported and parsed tool calls return as tool_calls or tool_use blocks.")
+                bulletPoint("Client Setup", "Point an OpenAI-compatible client at base URL http://127.0.0.1:8787/v1, or an Anthropic client at http://127.0.0.1:8787, with any model name (it is ignored) and your API key if one is configured. Max tokens defaults to the app's Generation setting when the OpenAI request omits it (Anthropic requests must send max_tokens).")
+            }
+
+            infoBox(title: "Crush Example", icon: "terminal") {
+                Text("Set the provider's base URL to http://127.0.0.1:8787/v1, the model to the name shown in the Server tab (or any string), and the API key if configured. Streaming, stop sequences, and usage accounting work out of the box.")
+                    .font(.system(size: 12))
+                    .lineSpacing(3)
+            }
+        }
+    }
+
+    // MARK: - 10. Advanced Diagnostics
     private var diagnosticsSection: some View {
         VStack(alignment: .leading, spacing: 16) {
             headerBadge("Advanced Diagnostics Section", color: .red)
@@ -516,7 +549,7 @@ struct HelpAndSettingsGuideView: View {
         }
     }
 
-    // MARK: - 10. Hardware Profiles
+    // MARK: - 11. Hardware Profiles
     private var hardwareSection: some View {
         VStack(alignment: .leading, spacing: 16) {
             headerBadge("Hardware Recommendations", color: .mint)
@@ -532,7 +565,7 @@ struct HelpAndSettingsGuideView: View {
         }
     }
 
-    // MARK: - 11. Troubleshooting & FAQs
+    // MARK: - 12. Troubleshooting & FAQs
     private var faqSection: some View {
         VStack(alignment: .leading, spacing: 16) {
             headerBadge("FAQs & Troubleshooting", color: .pink)

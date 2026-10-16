@@ -2708,6 +2708,203 @@ recur on a fixed build: `dynamoe_disable_prefix_reuse` (all turns full
 re-prefill) and a temporary FP16 KV setting (isolates quantization noise from
 splice mechanics).
 
+### QA #51 — KV provisioning ignored the machine's RAM, and "Full RAM" mode removed the ceiling
+
+Field report: on the 16 GB M1 Pro, the sidebar tooltip read "Working Set RAM:
+0.6 GB / Process Footprint: 20.6 GB / Unified Memory Cache: 7.7 GB" while idle
+with Spark X2.5 4B loaded — 20.6 GB on a 16 GB machine.
+
+Measured against the live Release process (`footprint -p`, `vmmap`, `ps`, and a
+standalone probe), not inferred:
+
+- `phys_footprint` 20.6 GB (peak 26.4 GB); `vmmap` reported writable regions
+  `resident 39.6 G / swapped_out 20.5 G (51 %)`.
+- `mach_task_basic_info.resident_size` 0.39 GB — the "Working Set RAM" number.
+  A probe proved RSIZE *does* count mapped file pages and CPU-written
+  `storageModeShared` Metal buffers (2 GB touched through a mapping → +2.00 GB
+  RSIZE; 1 GB anon + 2×2 GB shared MTLBuffers → +5.00 GB). So the 0.6 GB reading
+  is not "RSIZE misses Metal" — it is RSIZE counting only *resident* pages while
+  the OS had swapped the app's GPU allocations out. Under pressure the working-set
+  display collapses to a meaningless number while the real footprint stays 20.6 GB.
+- `IOAccelerator (graphics)`: **19.4 GB resident, 113 regions**, in repeated
+  identical sets — 8 × 3.0 GB, 4 × 2.5 GB, 4 × 1.2 GB. Those sizes match KV
+  caches (`kvStride = 4 heads × 256 = 1024`, fp16 → 2 KB/position; 2.5 GB ≈
+  36 slots × 32768 positions).
+
+Root cause: `neededSeqLen = max(minSeq, min(32768, prompt + maxTokens + 512))`
+capped provisioning at a flat 32k tokens regardless of the model's per-token KV
+cost or the machine. For Spark that is 36 slots × 32768 × 1024 × 2 B ≈ **4.8 GB
+per K+V pair** — and Auto/Smart mode resolves this model on this machine to
+"Full RAM" (`physicalRAM >= model × 1.25` → 16 ≥ 9.6), which mapped to
+`budgetMode == .unrestricted` and therefore disabled every budgeting rule. A
+small model on a roomy-looking machine was the one case with no KV ceiling at
+all.
+
+Fix (`EngineRuntime.swift`, `CompletionEngine.swift`):
+
+- New `KVCacheProvisioning` enum holding the layout math once — `geometry(...)`
+  (slot count, ring flags/len, K/V strides, element bytes), `positions`,
+  `requiredBytes`, `ringSlotCount`, `clampedSeqLen`, and `budgetGB`. `reset()`
+  now *derives its layout from the same `geometry(...)`* it previously computed
+  inline (with a debug `assert` that its slot bookkeeping still matches
+  `positions`), so the clamp and the allocation can never drift.
+- The launch path clamps provisioning before `reset()`:
+  `budgetGB = (budgetMode == .unrestricted ? physicalRAM × 0.75 : targetMaxRssGB)
+  − modelFootprintGB − 2.5 GB working reserve`, floored at 0.25 GB; the clamped
+  length never goes below `max(minSeq, prefixTokensReused)` so a pinned prefix is
+  never invalidated. Clamping prints a `⚠️ [KVCACHE]` line with the budget, the
+  resulting KV size, and the machine's RAM.
+
+On the reported machine (16 GB, 7.7 GB model): Full-RAM target 12 GB − 7.7 − 2.5
+= **1.8 GB KV budget** → ~12k tokens instead of 32k (~4.8 GB); balanced16GB gives
+1.3 GB → ~9k tokens. A 64 GB machine with a 37 GB model still gets 8.5 GB (no
+clamp at 32k). Tests: `KVCacheProvisioningLogicTests` (bytes/positions/precision
+math, ring slots, clamp floors and pass-throughs, budget modes).
+
+**Display metric fixed (same day).** The user-facing memory figure no longer
+reports RSIZE. `WorkingSetManager.attributedMemoryGB` = `phys_footprint` +
+`residentShardBytesGB` (cached weight pages), which cannot double count because
+footprint excludes clean file-backed pages and the shard registry excludes the
+pinned backbone. Shown in the sidebar pill (`SidebarView.swift`), the settings
+stats row (relabelled `DYNAMOE MEMORY`, `SettingsSheetView.swift`), with tooltips
+breaking out footprint / cache (reclaimable) / resident pages. The eviction budget
+is untouched: `effectiveResidentMemoryGB` and `trimToBudget` still compare RSIZE
+against the mode target, so eviction timing is unchanged — the display metric is
+the accurate "how much is DynaMoE using" number, the budget input remains the
+resident one. Docs updated (`SETTINGS_GUIDE.md` "Live Diagnostics", README UMA
+bullet). Tests: `MemoryTelemetryLogicTests` pins all three contracts.
+
+**Follow-up (measured live after the clamp, 2 turns, Spark 4B):** footprint
+**20.6 GB → 6.4 GB** (peak 26.4 → 6.4 GB) and `IOAccelerator (graphics)`
+**19.4 GB → 5.5 GB**.
+
+**Correction to an earlier read of that follow-up.** The residual 5.5 GB was
+first decoded as a stale KV allocation (3 GiB is exactly `48 slots × 32768
+positions × 2048 B`), but the console disproved it: the app's own log shows
+`🔍 [KVCACHE] splice reset: pin=470 maxSeq 4809->5090 … slots=36` — KV is
+**36 slots × ~5k positions (~750 MB)**, and the clamp never fires because
+`neededSeqLen` stays far under the budget. The 5.5 GB is the FlashMoE backbone
+pin, printed as `⚡ [FlashMoE] Pinned backbone (5.53 GB) into anonymous GPU
+memory`, i.e. intended behaviour (dense backbone pread once into an anonymous
+`.storageModeShared` buffer). The 48 × 32768 arithmetic was an over-fit
+coincidence; do not repeat that inference without a matching console line.
+
+That leaves the 20.6 GB unexplained by KV: it is ~4 × the 5.53 GB pin, so the
+open hypothesis is that **backbone pins stack across model (re)loads** (each
+FlashMoE load preads `model_weights.bin` into a fresh 5.5 GB buffer, and the pin
+has no release log). The load path already serialises loads, waits generations
+out, and replaces `shardBuffers`/the engine's buffer dict, so the retainer is not
+obvious. A probe was added: each pin now prints its ordinal, how many *previous*
+pins are still alive through a weak reference, and the process footprint
+before/after (`… (pin #N; prior pins alive: k = X GB; footprint A -> B GB,
+delta +C)`), which makes stacking vs. genuine one-shot allocation black-and-white.
+
+**CONFIRMED — pins stack** (console, three consecutive loads):
+`5.53 GB`, `5.53 GB`, `4.19 GB` all pinned, i.e. **15.25 GB resident across three
+pins**, one of them a different model's backbone size. With KV only ~750 MB, that
+accounts for the ~20 GB footprint on a 16 GB machine. No engine or view property
+holds shard buffers (`grep` for `[UInt32: MTLBuffer]` finds only the two dicts
+replaced on every load, plus locals captured by in-flight turn closures), so the
+fix chosen is structural rather than a hunt for the retainer:
+
+Fix (`ContentView.swift`) — `BackbonePinPool`: one retained pin buffer, reused
+when a later model's backbone fits and grown only when it does not, released on
+model teardown (load failure and Apple Foundation Model activation). Pin memory is
+therefore bounded by the *largest* backbone loaded in a session, not by the number
+of loads. The pin log now says `(reused retained pin)` or `(new allocation)` next
+to the ordinal/footprint fields, so the effect is verifiable per load. Caveat
+noted in the code path: reuse rewrites the buffer in place, which is safe because
+`awaitGenerationTeardown()` (engine `awaitIdle`) runs before a load — no live turn
+holds a previous model's buffers.
+
+**Verified** (same session, Spark 4B → 4.19 GB-backbone model → Spark 4B):
+
+| pin | backbone | path | footprint |
+| --- | --- | --- | --- |
+| #1 | 5.53 GB | new allocation | 0.30 → 5.70 GB |
+| #2 | 4.19 GB | reused retained pin | 5.86 → 5.86 GB (+0.00) |
+| #3 | 5.53 GB | reused retained pin | 5.81 → 5.81 GB (+0.00) |
+
+Footprint holds at ~5.8 GB across model switches instead of climbing ~5.5 GB per
+load (20.6 GB before). The telemetry's live-pin accounting reports *distinct*
+buffers (`ObjectIdentifier`-deduped): with one reused buffer, a per-pin sum read
+`2 = 9.72 GB` for a single 5.53 GB allocation.
+
+Separately, the reuse check *was* capacity-only and is fixed as a correctness
+issue (it could reuse a buffer laid out for a different model's slot count,
+stride, or precision): the resident allocation now records its geometry
+(`allocatedSlotCount`/`KStride`/`VStride`/`elementBytes`) and any change forces a
+realloc, for the FP8 scale buffers too. Test:
+`testKVCacheManagerReleasesStaleGeometryOnModelSwitch`.
+
+### QA #52 — Server turns on prompts the machine cannot serve: silent KV overrun, minute-long SSE silence, and unexplained "forward pass failed"
+
+Field report (server testing with crush as the client): a request starts, then
+the turn "just dies in different ways" — once on Spark, once on Ornith. Live
+reproduction with the exact failed-run prompt (19,352 tokens on Ornith, loaded
+from the server prompt dumps) pinned three concrete defects, each confirmed on
+the 16 GB M1 Pro with the Release binary:
+
+1. **The KV clamp does not bound prefill.** `neededSeqLen` shrinks to the
+   machine's KV budget (⚠️ `[KVCACHE]` line), but prefill kept ingesting all
+   19,352 tokens into a cache provisioned for fewer rows. Attention reads and
+   KV stores index rows past the allocation: adjacent slots absorb the
+   overflow as silent corruption, and the final slot's rows fall off the end
+   of the buffer. Nothing prints; the turn may still "succeed" with garbage.
+2. **The SSE stream goes silent for the whole prefill.** The streaming relay
+   cancelled the queue heartbeat the moment the previous turn drained (and the
+   generic batched prefill path emits nothing until a layer-chunk boundary),
+   so a client saw zero bytes — not even HTTP headers flushing — while the
+   engine ground through a prefill that measured at 10–100 s per layer under
+   memory compression (`waitUntilCompleted` parked for 40+ minutes; process
+   footprint 9.1 GB with 5.5 GB compressed; no crash report, because the app
+   never crashed — the turn just ran for hours). To the client this is exactly
+   "the process died in different ways".
+3. **Silent allocation-failure sites return false with no diagnostic.** The
+   per-token Spark runs failed mid-prefill (step 862 / step 225, two runs) with
+   only the useless "see prior diagnostics" line — there were no prior
+   diagnostics because every Metal allocation-failure guard along that path
+   returns without printing. With ~4 GB of FP16 KV provisioned against a
+   3.8 GB budget on a 16 GB machine plus the pinned backbone, an allocator
+   failure mid-prefill is plausible; the code hid it.
+
+Fixes (CompletionEngine.swift, EngineRuntime.swift, ServerController.swift):
+
+- `KVCacheProvisioning.turnFit(...)` — pure fit check at launch: computes the
+  engine's exact post-clamp provision and either `.ok`, `.maxTokensReduced`
+  (headroom capped to a floored 64 tokens when the affirmative budget would
+  push generation negative), or `.promptTooLong` → new `CompletionLaunchError.promptTooLong`. Rejection happens before any scratch
+  or KV allocation, so a bad turn costs nothing. The server maps it to a
+  400-shaped `invalid_request_error` in both protocols' streaming and
+  non-streaming envelopes (`launchFailed` now carries the full `ServerAPIError`
+  so status/type render correctly).
+- Runtime row guards: `runTokenForward` refuses `step >= allocatedSeqLen` and
+  `runLayerWisePrefill` refuses chunks extending past the provisioned length,
+  each with a `❌ [KVCACHE]` line naming the numbers.
+- Every silent `return false` guard in `runTokenForward` / `runLayerWisePrefill`
+  (command-buffer nil, encoder nil) now prints the failing site, layer, and
+  step; the generic prefill fails through the same path.
+- The queue heartbeat now runs for the lifetime of the turn (cancel moved into
+  the task's `defer`), so supervision pings flow while the engine is IN
+  prefill, not only while waiting behind earlier turns.
+
+Measured on the post-fix binary (16 GB M1 Pro, Ornith):
+
+| probe | before | after |
+| --- | --- | --- |
+| 19,352-token prompt | prefill ran 40+ min past a 8k-row KV clamp, zero frames to client | rejected in **0.01 s** with `invalid_request_error` envelope ("19,360 prompt tokens exceed the 3,276-token KV capacity this turn can provision (KV budget 0.25 GB on a 16 GB machine)") |
+| SSE first byte (idle queue) | ~50 s of silence, then 10 buffered pings at once | **0.04 s** |
+| SSE pings while queue busy behind a long turn | none until buffered flush | **5.3 s cadence**, continuous |
+| short streaming turn (191 tokens) | worked | works end-to-end: role chunk at turn start, `:prefill:` progress comments every ~1 s (12 → 15 tok/s), then reasoning deltas, `[DONE]` |
+
+Tests: `TurnFitLogicTests` (seven cases: ample budget, prompt overrun rejection,
+floored max-token ratchet, near-full agent prompt, agent-session floor,
+needed-length formula), and `ServerQueueLogicTests` updated for the typed
+`launchFailed` error. All existing pure-logic suites still green
+(engine/adapters/queue/hardening). The per-token prefill failure print is
+cancellation-aware so a user stop reports `🛑 stopped by user` instead of a
+forward-pass error.
+
 ## FIX #13: STALE TOOL BLOCK AFTER tools_load (SHIPPED)
 
 Third live-run forensics round (13:03–13:14Z, post scale-fix binary — steps were
@@ -3098,3 +3295,114 @@ Note for future runs: a `❌ [PREFILL] transient buffer '...' failed to
 allocate` line means the budget-capped residency plus staging genuinely
 exceeds the machine — lower the memory budget mode (8 GB => 5.5 GB cap) or
 the model's resident set, not the chunking.
+
+---
+
+### QA #53 — the KV agent floor overruled the memory budget, so under-budget turns were accepted and thrashed until they died
+
+Follow-up to the settings wiring (server turns now read the in-app memory
+policy, QA #52's fit check) and the same 16 GB thread of observations:
+Spark on `balanced16GB` budgets 0.25 GB of KV (~910 rows at the engine's
+8-head shape), `neededSeqLen`'s 8,192-row agent floor deliberately won over
+that budget in `clampedSeqLen` (`max(floor, min(requested, affordable))`),
+so the allocator provisioned the floor anyway — roughly 9x the KV budget in
+a real repro: a 8,798-token turn was accepted, ran at 4.3 s/layer, and died
+at token 913 on runtime row guards, instead of failing fast with a
+diagnosable message. The same floor-wins math also let a turn that passed
+the fit check under the REQUESTED KV precision survive the mid-launch
+Ling/Gemma fp8 -> fp16 overrides and still over-provision with the
+effective (2x-byte) cache.
+
+Fix (EngineRuntime.swift, CompletionEngine.swift): the memory budget is now
+the authority, the floor is a secondary preference.
+
+- `KVCacheProvisioning.affordableSeqLen(geometry:budgetGB:)` extracted from
+  the clamp arithmetic (the pure "rows the budget can hold" number; the
+  `clampedSeqLen` contract itself is unchanged for its other callers).
+- `turnFit` rejects the turn outright as `.promptTooLong(provisioned:
+  affordable)` when the budget cannot hold even the `minSeq` floor — pure
+  math, milliseconds, before any allocation. `clampedSeqLen` never gets
+  asked to raise a request above what the budget affords on this path.
+- The launch-time clamp re-derives affordability from the EFFECTIVE KV
+  precision (after the fp16 overrides, which the fit check cannot see) and
+  throws `CompletionLaunchError.promptTooLong` when the budget cannot hold
+  the session floor or the pinned prefix, plus a prompt-vs-provision guard
+  for the same drift; both run before the multi-GB `KVCacheManager.reset`.
+
+Behavior after the fix on the 16 GB M1 Pro: agent turns (8,192-row floor)
+fail fast with "KV budget 0.25 GB ... cannot hold the 8192-row floor ...
+affords 910 rows ... raise the memory budget mode or lower the KV cache
+precision" instead of a 4.3 s/layer spiral and a dead generation; a budget
+that holds the floor keeps the previous ratchet semantics intact (thin
+headroom floors max_tokens at 64 rather than rejecting).
+
+Tests: `TurnFitLogicTests` reworked — the budget-below-floor cases now
+expect `.promptTooLong` with the affordable provision (910 rows), the
+floor-holds cases pin their budgets to exactly the floor's cost
+(0.5625 / 1.25 GB shapes) so the max-token ratchet coverage survives the
+law change; new `testBudgetBelowAgentFloorFailsFastEvenForShortPrompts`
+pins the fail-fast for prompts the budget could otherwise nominally fit;
+`KVCacheProvisioningLogicTests.testAffordableSeqLenDerivesRowsFromBudget`
+covers the helper (including the non-finite-budget no-trap guard); the
+launch-side repudiation of old clampedSeqLen expectations is intentional —
+`clampedSeqLen`'s own floor-wins contract tests are unchanged because the
+fit/launch gates render that path unreachable for turns that allocate.
+Suites: TurnFitLogicTests (9), KVCacheProvisioningLogicTests (10),
+ServerQueueLogicTests (5), MemorySettingsPersistenceTests (3) — all green.
+
+---
+
+### QA #54 — a fresh `Date()` per server turn split the pinned prefix inside the temporal block, so every opencode step re-prefilled ~7.7K tokens
+
+Field report ("one response takes forever"): opencode's log showed
+`🔁 [PREFIX] partial match 32/815 pinned — hybrid state cannot rewind; full
+re-prefill`, and every agent step of a Spark session re-prefilled the full
+~8K prompt (~32 s per step, ~30 s of it prefill). The system prompt LIST
+was byte-identical every turn, so the pin should have matched at ~7.7K
+tokens — the divergence at token 32 was inside the FIRST sentence.
+
+**Root cause.** The `# Current Date & Time` block sits at the head of the
+effective system prompt (ModelConfig.buildEffectiveSystemPrompt ->
+AgentHarness.formattedDateTimeContext) and renders minute+second precision
+("Wednesday, October 15, 2026 at 3:41 PM -07:00 (2026-10-15T15:41:23-07:00)").
+The interactive chat path already threads a per-conversation date
+(`sessions[idx].createdAt` — cache-friendly by construction), but the server
+turn planner passed a fresh `Date()` per request, so every turn's prompt
+byte-diverged ~32 tokens in — inside the temporal block — and a hybrid (GDN)
+session, whose pins require the ENTIRE pinned prefix to match (linear state
+cannot rewind), got zero reuse for the whole conversation. Attention models
+suffer the same partial-reuse loss (32 of 7,700 tokens).
+
+**Fix (PrefixCacheManager.swift, ServerController.swift).** The temporal
+context is now pinned alongside the KV prefix:
+
+- `PrefixCacheManager` gained `asOfDate(sessionId:)` — a date
+  (`pinnedAsOfDate`) owned by the session that will record the next pin.
+  Same-session asks return the inherited date (byte-stable prompts across
+  turns); different sessions or a cleared pin mint a fresh one;
+  `invalidate(...)` clears it, so a new prefill carries fresh temporal
+  context instead of a growing-stale one. When pinning is disabled it
+  simply serves the current time. The class is now `nonisolated` (the
+  lock-guarded singletons' existing pattern, e.g. GrammarConstrainedSampler)
+  so the nonisolated server planner can call it without an actor hop, and
+  the metrics struct became `nonisolated` for its initializer.
+- `ServerController.buildTurnPlan` renders the temporal block from
+  `PrefixCacheManager.shared.asOfDate(sessionId:)` instead of `Date()`.
+  The server session key is a deterministic FNV-1a hash over (model, first
+  message), so the same opencode conversation mints once and every later
+  turn reproduces the identical temporal block -> the tokenized prompt
+  extends the pin by only the appended turn -> `findCommonPrefix` matches
+  at the full pinned length -> hybrid reuse ("cannot rewind" gate satisfied).
+
+**Net effect.** Each opencode step now prefills only the appended
+conversation delta (tens of tokens) instead of the full ~8K prompt, turning
+the ~30 s step into seconds — the perceived-speed decomposition the field
+report asked for. Only a full re-prefill event (pin invalidated, model or
+KV-precision change) mints a new date, which is exactly when the pin is
+rewritten anyway.
+
+Tests: `PrefixAsOfDateTests` (5 — same-session stability across an ask ->
+repeat-ask and an ask -> recordTurn -> ask cycle, fresh mint for a different
+session, invalidation reset, disabled-pinning freshness). All pure-logic
+suites re-run green (32 tests: PrefixAsOfDate 5, MemorySettings 3,
+ServerQueue 5, TurnFit 9, KVCacheProvisioning 10).

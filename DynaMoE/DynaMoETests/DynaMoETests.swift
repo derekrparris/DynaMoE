@@ -10308,7 +10308,7 @@ final class DynaMoETests: XCTestCase {
         <arg_value>import BYD vehicles to US</arg_value>
         </tool_call>
         """
-        let split = ContentView.splitThinkingAndResponse(raw: raw, promptRequestsThinking: true)
+        let split = TurnTextSplitter.splitThinkingAndResponse(raw: raw, promptRequestsThinking: true)
         XCTAssertTrue(split.thinkClose)
         XCTAssertFalse(split.thinkOpen)
         XCTAssertEqual(split.think, "The user wants current information. Let me search.")
@@ -11313,22 +11313,22 @@ final class DynaMoETests: XCTestCase {
         let sentinelDecode: ([UInt32]) -> String = { ids in
             ids.map { $0 == 10 ? "PY" : ($0 == 11 ? "EOF" : "\n") }.joined()
         }
-        XCTAssertEqual(ContentView.detectDegenerateCycle(tokenIds: spam, decodeUnit: sentinelDecode), 3)
+        XCTAssertEqual(TurnTextSplitter.detectDegenerateCycle(tokenIds: spam, decodeUnit: sentinelDecode), 3)
 
         // A long run of `}\n` is legitimate formatting: the unit has no letter/digit.
         let braces: [UInt32] = Array(repeating: [UInt32(20), UInt32(21)] as [UInt32], count: 40).flatMap { $0 }
         let braceDecode: ([UInt32]) -> String = { ids in ids.map { $0 == 20 ? "}" : "\n" }.joined() }
-        XCTAssertNil(ContentView.detectDegenerateCycle(tokenIds: braces, decodeUnit: braceDecode))
+        XCTAssertNil(TurnTextSplitter.detectDegenerateCycle(tokenIds: braces, decodeUnit: braceDecode))
 
         // A short alphanumeric repeat is legitimate output, not degeneration: an
         // alternating data column (`yes`, `no`) four times must not truncate the turn.
         let shortAlternating: [UInt32] = Array(repeating: [UInt32(30), UInt32(31)] as [UInt32], count: 4).flatMap { $0 }
         let yesNoDecode: ([UInt32]) -> String = { ids in ids.map { $0 == 30 ? "yes" : "no" }.joined(separator: " ") }
-        XCTAssertNil(ContentView.detectDegenerateCycle(tokenIds: shortAlternating, decodeUnit: yesNoDecode))
+        XCTAssertNil(TurnTextSplitter.detectDegenerateCycle(tokenIds: shortAlternating, decodeUnit: yesNoDecode))
 
         // Diverse output never trips.
         let diverse: [UInt32] = (0..<80).map { UInt32($0) }
-        XCTAssertNil(ContentView.detectDegenerateCycle(tokenIds: diverse, decodeUnit: { _ in "word" }))
+        XCTAssertNil(TurnTextSplitter.detectDegenerateCycle(tokenIds: diverse, decodeUnit: { _ in "word" }))
     }
 
     /// When reads keep failing the model invents hosts instead of reusing the ones
@@ -12406,6 +12406,55 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         }
     }
 
+    func testKVCacheManagerReleasesStaleGeometryOnModelSwitch() {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("Metal is required for this test")
+            return
+        }
+        let kvManager = KVCacheManager.shared
+
+        // A previous model's 48-slot layout at the old 32k cap (the field bug: 3 GiB).
+        kvManager.reset(
+            device: device,
+            actualLayers: 48,
+            totalLoops: 1,
+            numKvHeads: 8,
+            headDim: 128,
+            maxSeqLen: 32768,
+            precision: .fp16,
+            preservePrefixCount: 0
+        )
+        guard let bigK = kvManager.kCacheBuffer else {
+            XCTFail("initial KV buffer failed to allocate")
+            return
+        }
+        let bigLength = bigK.length
+        XCTAssertGreaterThan(bigLength, 0)
+
+        // Switch to a different model geometry mid-session with a pinned prefix:
+        // the retained buffer must NOT be reused, it must be resized to the new
+        // geometry (and the stale multi-GB allocation released).
+        kvManager.reset(
+            device: device,
+            actualLayers: 2,
+            totalLoops: 1,
+            numKvHeads: 8,
+            headDim: 128,
+            maxSeqLen: 256,
+            precision: .fp16,
+            preservePrefixCount: 32
+        )
+        guard let smallK = kvManager.kCacheBuffer, let smallV = kvManager.vCacheBuffer else {
+            XCTFail("resized KV buffer failed to allocate")
+            return
+        }
+        let expectedBytes = 2 * 256 * 1024 * 2
+        XCTAssertEqual(smallK.length, expectedBytes, "the KV buffer must be sized to the new geometry, not the stale one")
+        XCTAssertEqual(smallV.length, expectedBytes)
+        XCTAssertLessThan(smallK.length, bigLength, "the stale layout must be released, not carried")
+        XCTAssertEqual(kvManager.allocatedSeqLen, 256)
+    }
+
     func testDogfoodBenchmarkRunnerMultiTurnExecution() async throws {
         let runner = await ModelDogfoodBenchmarkRunner.shared
 
@@ -13224,7 +13273,7 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         </function>
         </tool_call>
         """
-        let split1 = ContentView.splitThinkingAndResponse(raw: turn1Raw, promptRequestsThinking: true)
+        let split1 = TurnTextSplitter.splitThinkingAndResponse(raw: turn1Raw, promptRequestsThinking: true)
         XCTAssertFalse(split1.thinkOpen, "Thinking must be closed")
         XCTAssertTrue(split1.thinkClose, "Thinking close delimiter must be detected")
         XCTAssertEqual(split1.think, "The user is asking about newly announced Apple Mac Studios. Let me search the web for the latest information.")
@@ -13243,7 +13292,7 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
 
         // Scenario 3: Mid-stream reasoning (tokens arriving, </think> not yet emitted)
         let midStreamRaw = "The web_search returned a single combined result set. Let me synthesize..."
-        let splitMid = ContentView.splitThinkingAndResponse(raw: midStreamRaw, promptRequestsThinking: true)
+        let splitMid = TurnTextSplitter.splitThinkingAndResponse(raw: midStreamRaw, promptRequestsThinking: true)
         XCTAssertTrue(splitMid.thinkOpen, "Thinking must be open while generating before </think>")
         XCTAssertFalse(splitMid.thinkClose, "Thinking close must be false while generating")
         XCTAssertEqual(splitMid.think, midStreamRaw)
@@ -13256,7 +13305,7 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
 
         Apple has announced the new Mac Studio with M4 Max and M4 Ultra chips starting at $1,999.
         """
-        let split2 = ContentView.splitThinkingAndResponse(raw: turn2Raw, promptRequestsThinking: true)
+        let split2 = TurnTextSplitter.splitThinkingAndResponse(raw: turn2Raw, promptRequestsThinking: true)
         XCTAssertFalse(split2.thinkOpen)
         XCTAssertTrue(split2.thinkClose)
         XCTAssertEqual(split2.think, "The web_search returned a single combined result set. Let me synthesize the specs.")
@@ -13264,7 +13313,7 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
 
         // Scenario 5: Non-thinking model or thinking disabled (promptRequestsThinking: false, no think tags)
         let directRaw = "Here is the direct answer without any reasoning block."
-        let splitDirect = ContentView.splitThinkingAndResponse(raw: directRaw, promptRequestsThinking: false)
+        let splitDirect = TurnTextSplitter.splitThinkingAndResponse(raw: directRaw, promptRequestsThinking: false)
         XCTAssertFalse(splitDirect.thinkOpen)
         XCTAssertFalse(splitDirect.thinkClose)
         XCTAssertEqual(splitDirect.think, "")
@@ -13272,7 +13321,7 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
 
         // Scenario 6: Alternative tag formats (<thought> and <|thought|>)
         let thoughtRaw = "<thought>\nSome internal thought.\n</thought>\nFinal output."
-        let splitThought = ContentView.splitThinkingAndResponse(raw: thoughtRaw, promptRequestsThinking: false)
+        let splitThought = TurnTextSplitter.splitThinkingAndResponse(raw: thoughtRaw, promptRequestsThinking: false)
         XCTAssertTrue(splitThought.thinkClose)
         XCTAssertEqual(splitThought.think, "Some internal thought.")
         XCTAssertEqual(splitThought.resp, "Final output.")
@@ -13285,7 +13334,7 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         1. Overall stats subagent: response counts, NPS, coach ratings average
         2. Text feedback subagent: group by sentiment
         """
-        let splitProse = ContentView.splitThinkingAndResponse(raw: proseRaw, promptRequestsThinking: true)
+        let splitProse = TurnTextSplitter.splitThinkingAndResponse(raw: proseRaw, promptRequestsThinking: true)
         XCTAssertTrue(splitProse.thinkOpen, "prose 'response' must not close the thinking block")
         XCTAssertFalse(splitProse.thinkClose)
         XCTAssertEqual(splitProse.resp, "")
@@ -13293,7 +13342,7 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         // The real delimiter still splits, and all the reasoning (including the word
         // "response") lands in `think`.
         let proseThenClose = proseRaw + "\n</think>\nHere is the report."
-        let splitProseClose = ContentView.splitThinkingAndResponse(raw: proseThenClose, promptRequestsThinking: true)
+        let splitProseClose = TurnTextSplitter.splitThinkingAndResponse(raw: proseThenClose, promptRequestsThinking: true)
         XCTAssertTrue(splitProseClose.thinkClose)
         XCTAssertTrue(splitProseClose.think.contains("response counts"))
         XCTAssertEqual(splitProseClose.resp, "Here is the report.")
@@ -13302,7 +13351,7 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         // leading `thought` channel label must be stripped and the closing tag must end
         // the thinking block, leaving the post-`<channel|>` text as the response.
         let gemmaRaw = "<|channel>thought\nThe user said \"hello!\".\nRespond with a friendly greeting.<channel|>Hello! How can I help you today?"
-        let splitGemma = ContentView.splitThinkingAndResponse(raw: gemmaRaw, promptRequestsThinking: false)
+        let splitGemma = TurnTextSplitter.splitThinkingAndResponse(raw: gemmaRaw, promptRequestsThinking: false)
         XCTAssertTrue(splitGemma.thinkClose)
         XCTAssertEqual(splitGemma.think, "The user said \"hello!\".\nRespond with a friendly greeting.")
         XCTAssertEqual(splitGemma.resp, "Hello! How can I help you today?")
@@ -13310,7 +13359,7 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         // Mid-stream (open channel, no closing tag yet) must be treated as open thinking
         // with the label already stripped.
         let gemmaOpen = "<|channel>thought\nThe user said \"hello!\"."
-        let splitGemmaOpen = ContentView.splitThinkingAndResponse(raw: gemmaOpen, promptRequestsThinking: false)
+        let splitGemmaOpen = TurnTextSplitter.splitThinkingAndResponse(raw: gemmaOpen, promptRequestsThinking: false)
         XCTAssertTrue(splitGemmaOpen.thinkOpen)
         XCTAssertFalse(splitGemmaOpen.thinkClose)
         XCTAssertEqual(splitGemmaOpen.think, "The user said \"hello!\".")
@@ -13322,23 +13371,23 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
         // until the close arrives, then jumps into the thinking accordion. Regression for
         // the post-web_search render leak.
         let gemmaContinuationPrompt = "<bos><|turn>system\n<|think|>\nSYS<turn|>\n<|turn>model\n<|channel>thought\n"
-        XCTAssertTrue(ContentView.promptRequestsThinking(gemmaContinuationPrompt),
+        XCTAssertTrue(TurnTextSplitter.promptRequestsThinking(gemmaContinuationPrompt),
                       "Gemma continuation prompt ends on the channel opener and must request thinking")
 
         let contStream = "I should search for the latest version."
-        let contOpen = ContentView.splitThinkingAndResponse(raw: contStream, promptRequestsThinking: ContentView.promptRequestsThinking(gemmaContinuationPrompt))
+        let contOpen = TurnTextSplitter.splitThinkingAndResponse(raw: contStream, promptRequestsThinking: TurnTextSplitter.promptRequestsThinking(gemmaContinuationPrompt))
         XCTAssertTrue(contOpen.thinkOpen, "untagged continuation reasoning must stay in the thinking block")
         XCTAssertEqual(contOpen.resp, "")
 
-        let contClosed = ContentView.splitThinkingAndResponse(raw: contStream + "<channel|>Here is the answer.", promptRequestsThinking: ContentView.promptRequestsThinking(gemmaContinuationPrompt))
+        let contClosed = TurnTextSplitter.splitThinkingAndResponse(raw: contStream + "<channel|>Here is the answer.", promptRequestsThinking: TurnTextSplitter.promptRequestsThinking(gemmaContinuationPrompt))
         XCTAssertTrue(contClosed.thinkClose)
         XCTAssertEqual(contClosed.think, "I should search for the latest version.")
         XCTAssertEqual(contClosed.resp, "Here is the answer.")
 
         // Thinking-disabled first turn ends on the closed empty channel: no thinking requested.
-        XCTAssertFalse(ContentView.promptRequestsThinking("<|turn>model\n<|channel>thought\n<channel|>"))
+        XCTAssertFalse(TurnTextSplitter.promptRequestsThinking("<|turn>model\n<|channel>thought\n<channel|>"))
         // A plain Gemma first turn (model emits its own opener) is unaffected.
-        XCTAssertFalse(ContentView.promptRequestsThinking("<|turn>model\n"))
+        XCTAssertFalse(TurnTextSplitter.promptRequestsThinking("<|turn>model\n"))
     }
 
     func testSparkForwardDiagnostics() throws {
