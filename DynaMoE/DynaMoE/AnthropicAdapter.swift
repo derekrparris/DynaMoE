@@ -177,7 +177,7 @@ struct AnthropicMessagesRequest: Decodable {
     let stopSequences: [String]?
     let stream: Bool?
     let tools: [Tool]?
-    let toolChoiceType: String?
+    let toolChoice: ToolChoice?
     let thinking: ThinkingConfig?
 
     enum CodingKeys: String, CodingKey {
@@ -209,13 +209,16 @@ struct AnthropicMessagesRequest: Decodable {
         self.stopSequences = try container.decodeIfPresent([String].self, forKey: .stopSequences)
         self.stream = try container.decodeIfPresent(Bool.self, forKey: .stream)
         self.tools = try container.decodeIfPresent([Tool].self, forKey: .tools)
-        if let choice = try? container.decode(ToolChoice.self, forKey: .toolChoice) {
-            self.toolChoiceType = choice.type
-        } else {
-            self.toolChoiceType = nil
-        }
+        // Keep the whole choice, not just its `type`: a forced `{"type":"tool",
+        // "name":"get_weather"}` must be able to name the tool it demands
+        // (silently dropping the name would make it behave like `auto`).
+        self.toolChoice = try? container.decode(ToolChoice.self, forKey: .toolChoice)
         self.thinking = try container.decodeIfPresent(ThinkingConfig.self, forKey: .thinking)
     }
+
+    /// The `tool_choice.type` value, for callers (and tests) that only need the
+    /// mode rather than the full choice.
+    var toolChoiceType: String? { toolChoice?.type }
 }
 
 // MARK: - Response types
@@ -452,6 +455,27 @@ enum AnthropicAdapter {
         return Data(digest).base64EncodedString()
     }
 
+    /// Whether tools may be offered for this request. Anthropic's forced
+    /// choices (`any`, or a named `tool`) demand a generation constraint this
+    /// server cannot enforce; silently treating them as `auto` would let the
+    /// model answer with a different tool or no tool at all. Reject them
+    /// explicitly instead.
+    static func toolUseEnabled(_ choice: AnthropicMessagesRequest.ToolChoice?) throws -> Bool {
+        guard let type = choice?.type else { return true }
+        switch type {
+        case "auto":
+            return true
+        case "none":
+            return false
+        case "any":
+            throw ServerAPIError.badRequest("tool_choice type \"any\" is not supported: this server cannot force a tool call. Use \"auto\" or \"none\".")
+        case "tool":
+            throw ServerAPIError.badRequest("tool_choice for a specific tool (\"\(choice?.name ?? "")\") is not supported: this server cannot force a tool call. Use \"auto\" or \"none\".")
+        default:
+            return true
+        }
+    }
+
     /// Maps the engine's terminal reasons onto Anthropic stop_reason values.
     static func finishReasonString(_ reason: TurnFinishReason, hasToolCalls: Bool) -> String? {
         switch reason {
@@ -556,6 +580,13 @@ enum AnthropicAdapter {
                 if let uses = message.toolUses, !uses.isEmpty {
                     let rendered = uses.map { use in
                         var obj: [String: String] = ["name": use.name]
+                        // Keep the opaque tool_use id: the tool_result turns
+                        // below reference it, and with several calls (or
+                        // reordered results) the id is the only thing tying a
+                        // result back to the call it answers.
+                        if let id = use.id, !id.isEmpty {
+                            obj["id"] = id
+                        }
                         if let input = use.inputJSON, !input.isEmpty {
                             obj["arguments"] = input
                         }

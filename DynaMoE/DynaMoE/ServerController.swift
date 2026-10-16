@@ -695,6 +695,11 @@ final class ServerController: ObservableObject {
         var promptTokenCount: Int
         var modelName: String
         var hasTools: Bool
+        /// Client tool schemas for the grammar mask (empty when the turn offers
+        /// no tools). Installed around the generation so the mask constrains the
+        /// model to the client's own tool vocabulary rather than the in-app
+        /// agent catalog.
+        var maskSchemas: [GrammarToolSchema] = []
     }
 
     nonisolated private static func requireLoadedModel() throws -> CompletionEngine.LoadedModelInfo {
@@ -737,6 +742,7 @@ final class ServerController: ObservableObject {
         var thinkingRequested: Bool
         var hasTools: Bool
         var toolDeclaration: String?
+        var maskSchemas: [GrammarToolSchema]
         var sessionId: UUID
     }
 
@@ -841,13 +847,35 @@ final class ServerController: ObservableObject {
             isSplicedContinuation: false,
             stopSequences: inputs.stopSequences
         )
-        return TurnPlan(request: turnRequest, promptTokenCount: promptTokenIds.count, modelName: info.displayName, hasTools: inputs.hasTools)
+        return TurnPlan(request: turnRequest, promptTokenCount: promptTokenIds.count, modelName: info.displayName, hasTools: inputs.hasTools, maskSchemas: inputs.maskSchemas)
+    }
+
+    /// Installs the turn's own tool schemas into the grammar mask for the
+    /// duration of its generation, then restores the registry that was live
+    /// before it. The mask resolves tool names and parameter keys from the
+    /// in-app agent catalog; a client-defined API tool is not in it, so without
+    /// this a masked sample could rewrite the client's tool name into a built-in
+    /// one (or withhold the client's parameter keys) and the call could never be
+    /// emitted. The engine is single-flight and this queue serializes server
+    /// turns, so the installed registry is never shared by two live turns.
+    nonisolated private static func withTurnToolMask<T>(
+        _ schemas: [GrammarToolSchema],
+        _ body: () async throws -> T
+    ) async rethrows -> T {
+        guard !schemas.isEmpty else { return try await body() }
+        let previous = GrammarConstrainedSampler.shared.snapshotRegistry()
+        GrammarConstrainedSampler.shared.registerToolSchemas(schemas)
+        defer { GrammarConstrainedSampler.shared.restoreRegistry(previous) }
+        return try await body()
     }
 
     nonisolated private static func buildTurnPlan(_ apiRequest: OpenAIChatRequest) throws -> TurnPlan {
+        // Reject a forced tool choice before touching engine state, so the
+        // client gets a clear error instead of a silently unconstrained turn.
+        let toolsEnabled = try OpenAIAdapter.toolUseEnabled(apiRequest.toolChoice)
         let info = try requireLoadedModel()
         let (systemPrompt, turns) = try OpenAIAdapter.splitMessages(apiRequest.messages)
-        let hasTools = !(apiRequest.tools ?? []).isEmpty && apiRequest.toolChoice != "none"
+        let hasTools = !(apiRequest.tools ?? []).isEmpty && toolsEnabled
         return try buildTurnPlan(TurnPlanInputs(
             systemPrompt: systemPrompt,
             conversation: turns,
@@ -862,6 +890,9 @@ final class ServerController: ObservableObject {
             thinkingRequested: apiRequest.enableThinking ?? true,
             hasTools: hasTools,
             toolDeclaration: hasTools ? OpenAIAdapter.toolDeclarationText(apiRequest.tools ?? []) : nil,
+            maskSchemas: hasTools ? (apiRequest.tools ?? []).filter { ($0.type ?? "function") == "function" }.map {
+                GrammarToolSchema(name: $0.function.name, schemaJSON: $0.function.parametersData)
+            } : [],
             sessionId: OpenAIAdapter.sessionKey(for: apiRequest.messages, model: info.displayName)
         ))
     }
@@ -870,9 +901,12 @@ final class ServerController: ObservableObject {
         guard let maxTokens = apiRequest.maxTokens else {
             throw ServerAPIError.badRequest("max_tokens is a required field")
         }
+        // Reject a forced tool choice before touching engine state, so the
+        // client gets a clear error instead of a silently unconstrained turn.
+        let toolsEnabled = try AnthropicAdapter.toolUseEnabled(apiRequest.toolChoice)
         let info = try requireLoadedModel()
         let turns = try AnthropicAdapter.splitMessages(apiRequest.messages)
-        let hasTools = !(apiRequest.tools ?? []).isEmpty && apiRequest.toolChoiceType != "none"
+        let hasTools = !(apiRequest.tools ?? []).isEmpty && toolsEnabled
         return try buildTurnPlan(TurnPlanInputs(
             systemPrompt: apiRequest.systemText ?? "",
             conversation: turns,
@@ -887,6 +921,9 @@ final class ServerController: ObservableObject {
             thinkingRequested: apiRequest.thinking?.type == "enabled",
             hasTools: hasTools,
             toolDeclaration: hasTools ? AnthropicAdapter.toolDeclarationText(apiRequest.tools ?? []) : nil,
+            maskSchemas: hasTools ? (apiRequest.tools ?? []).map {
+                GrammarToolSchema(name: $0.name, schemaJSON: $0.inputSchemaData)
+            } : [],
             sessionId: AnthropicAdapter.sessionKey(for: apiRequest.messages, model: info.displayName)
         ))
     }
@@ -939,28 +976,30 @@ final class ServerController: ObservableObject {
     nonisolated private static func runTurn(plan: TurnPlan, queue: TurnExecutionQueue) async throws -> TurnResult {
         try await queue.perform(queueWaitTimeout: resolvedQueueWaitTimeout) {
             () async throws -> TurnResult in
-            let launch: CompletionLaunch
-            do {
-                launch = try CompletionEngine.shared.launchTurn(plan.request)
-            } catch {
-                throw wireLaunchError(error)
-            }
-            return try await withTaskCancellationHandler {
-                for await event in launch.stream {
-                    switch event {
-                    case .failedTurn(let failure):
-                        if failure.cancelled { throw ServerAPIError.serviceUnavailable("Generation cancelled") }
-                        throw ServerAPIError.internalError(failure.message)
-                    case .finished(let result):
-                        Self.recordCompletedTurn(plan: plan, result: result)
-                        return result
-                    case .started, .priming, .prefillProgress, .frame:
-                        continue
-                    }
+            try await withTurnToolMask(plan.maskSchemas) {
+                let launch: CompletionLaunch
+                do {
+                    launch = try CompletionEngine.shared.launchTurn(plan.request)
+                } catch {
+                    throw wireLaunchError(error)
                 }
-                throw ServerAPIError.internalError("Generation stream closed without a result")
-            } onCancel: {
-                launch.handle.cancel()
+                return try await withTaskCancellationHandler {
+                    for await event in launch.stream {
+                        switch event {
+                        case .failedTurn(let failure):
+                            if failure.cancelled { throw ServerAPIError.serviceUnavailable("Generation cancelled") }
+                            throw ServerAPIError.internalError(failure.message)
+                        case .finished(let result):
+                            Self.recordCompletedTurn(plan: plan, result: result)
+                            return result
+                        case .started, .priming, .prefillProgress, .frame:
+                            continue
+                        }
+                    }
+                    throw ServerAPIError.internalError("Generation stream closed without a result")
+                } onCancel: {
+                    launch.handle.cancel()
+                }
             }
         }
     }
@@ -1121,20 +1160,22 @@ final class ServerController: ObservableObject {
                 do {
                     let plan = try ServerController.buildTurnPlan(apiRequest)
                     promptTokensBox.set(plan.promptTokenCount)
-                    let launch = try CompletionEngine.shared.launchTurn(plan.request)
-                    if Task.isCancelled {
-                        launch.handle.cancel()
-                        return
-                    }
-                    await withTaskCancellationHandler {
-                        for await event in launch.stream {
-                            if case .finished(let result) = event {
-                                ServerController.recordCompletedTurn(plan: plan, result: result)
-                            }
-                            emit(.engine(event))
+                    try await ServerController.withTurnToolMask(plan.maskSchemas) {
+                        let launch = try CompletionEngine.shared.launchTurn(plan.request)
+                        if Task.isCancelled {
+                            launch.handle.cancel()
+                            return
                         }
-                    } onCancel: {
-                        launch.handle.cancel()
+                        await withTaskCancellationHandler {
+                            for await event in launch.stream {
+                                if case .finished(let result) = event {
+                                    ServerController.recordCompletedTurn(plan: plan, result: result)
+                                }
+                                emit(.engine(event))
+                            }
+                        } onCancel: {
+                            launch.handle.cancel()
+                        }
                     }
                 } catch {
                     emit(.launchFailed(wireLaunchError(error)))
@@ -1373,20 +1414,22 @@ final class ServerController: ObservableObject {
                 do {
                     let plan = try ServerController.buildTurnPlan(apiRequest)
                     promptTokensBox.set(plan.promptTokenCount)
-                    let launch = try CompletionEngine.shared.launchTurn(plan.request)
-                    if Task.isCancelled {
-                        launch.handle.cancel()
-                        return
-                    }
-                    await withTaskCancellationHandler {
-                        for await event in launch.stream {
-                            if case .finished(let result) = event {
-                                ServerController.recordCompletedTurn(plan: plan, result: result)
-                            }
-                            emit(.engine(event))
+                    try await ServerController.withTurnToolMask(plan.maskSchemas) {
+                        let launch = try CompletionEngine.shared.launchTurn(plan.request)
+                        if Task.isCancelled {
+                            launch.handle.cancel()
+                            return
                         }
-                    } onCancel: {
-                        launch.handle.cancel()
+                        await withTaskCancellationHandler {
+                            for await event in launch.stream {
+                                if case .finished(let result) = event {
+                                    ServerController.recordCompletedTurn(plan: plan, result: result)
+                                }
+                                emit(.engine(event))
+                            }
+                        } onCancel: {
+                            launch.handle.cancel()
+                        }
                     }
                 } catch {
                     emit(.launchFailed(wireLaunchError(error)))

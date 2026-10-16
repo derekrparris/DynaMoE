@@ -238,4 +238,54 @@ final class AnthropicAdapterLogicTests: XCTestCase {
         XCTAssertEqual(jsonDelta["type"] as? String, "input_json_delta")
         XCTAssertEqual(jsonDelta["partial_json"] as? String, #"{"a":1}"#)
     }
+
+    // MARK: - Tool choice
+
+    func testToolChoiceNameIsPreservedAndForcedChoiceIsRejected() throws {
+        let auto = try decodeRequest("""
+        {"max_tokens":10,"tools":[{"name":"get_weather"}],"tool_choice":{"type":"auto"},"messages":[{"role":"user","content":"hi"}]}
+        """)
+        XCTAssertEqual(auto.toolChoiceType, "auto")
+        XCTAssertTrue(try AnthropicAdapter.toolUseEnabled(auto.toolChoice))
+        XCTAssertFalse(try AnthropicAdapter.toolUseEnabled(.init(type: "none", name: nil)))
+
+        let forced = try decodeRequest("""
+        {"max_tokens":10,"tools":[{"name":"get_weather"}],"tool_choice":{"type":"tool","name":"get_weather"},"messages":[{"role":"user","content":"hi"}]}
+        """)
+        XCTAssertEqual(forced.toolChoice?.name, "get_weather", "the demanded tool name must not be discarded")
+        XCTAssertThrowsError(try AnthropicAdapter.toolUseEnabled(forced.toolChoice)) { error in
+            XCTAssertTrue("\(error)".contains("get_weather"), "the rejection must name the demanded tool")
+        }
+
+        let any = try decodeRequest("""
+        {"max_tokens":10,"tools":[{"name":"get_weather"}],"tool_choice":{"type":"any"},"messages":[{"role":"user","content":"hi"}]}
+        """)
+        XCTAssertThrowsError(try AnthropicAdapter.toolUseEnabled(any.toolChoice))
+    }
+
+    // MARK: - Tool IDs in history
+
+    func testAssistantHistoryKeepsToolUseIds() throws {
+        let request = try decodeRequest("""
+        {"max_tokens":10,"messages":[
+            {"role":"user","content":"go"},
+            {"role":"assistant","content":[{"type":"tool_use","id":"toolu_abc","name":"shell_run","input":{"cmd":"ls"}}]},
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_abc","content":"ok"}]}
+        ]}
+        """)
+        let turns = try AnthropicAdapter.splitMessages(request.messages)
+        XCTAssertTrue(turns[1].text.contains("toolu_abc"), "the opaque tool_use id must reach history so results can be matched to calls")
+    }
+
+    // MARK: - Null preservation in tool inputs
+
+    func testToolUseInputPreservesNullValues() throws {
+        let request = try decodeRequest("""
+        {"max_tokens":10,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"set_value","input":{"value":null}}]},{"role":"user","content":"ok"}]}
+        """)
+        let use = try XCTUnwrap(request.messages[0].toolUses?.first)
+        let json = try XCTUnwrap(use.inputJSON)
+        XCTAssertTrue(json.contains("\"value\":null"), "a null tool input must survive, not become \"\"")
+        XCTAssertFalse(json.contains("\"value\":\"\""))
+    }
 }

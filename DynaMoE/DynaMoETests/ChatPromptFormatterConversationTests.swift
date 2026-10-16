@@ -151,4 +151,89 @@ final class ChatPromptFormatterConversationTests: XCTestCase {
             ""
         )
     }
+
+    // MARK: - Completed-turn shape
+
+    func testCompletedAssistantTurnClosesReasoningBlock() throws {
+        // A client echoes only the visible answer; with thinking on it must not
+        // be rendered as an unfinished thought inside an open reasoning block.
+        let close = TurnTextSplitter.canonicalReasoningCloseTag
+        for (name, family) in try families() where name != "gemma4" {
+            let prompt = ChatPromptFormatter.formatConversation(
+                turns: [
+                    .init(role: .user, text: "hello"),
+                    .init(role: .assistant, text: "ANSWER"),
+                    .init(role: .user, text: "again"),
+                ],
+                cleanSystem: system,
+                thinkingEnabled: true,
+                modelSupportsThinking: true,
+                modelConfig: family
+            )
+            XCTAssertTrue(prompt.contains(close + "ANSWER"), "\(name): a completed answer must sit outside the reasoning block")
+        }
+    }
+
+    func testRecordedReasoningIsNotDoubleClosed() throws {
+        // The server splices the recorded raw generation (reasoning + close +
+        // answer); re-rendering must not add a second close marker, so the
+        // pinned prompt+generation prefix stays reusable.
+        let close = TurnTextSplitter.canonicalReasoningCloseTag
+        let raw = "reasoning" + close + "ANSWER"
+        let turn1 = ChatPromptFormatter.formatPrompt(
+            prompt: "hello",
+            cleanSystem: system,
+            thinkingEnabled: true,
+            modelSupportsThinking: true,
+            modelConfig: nil
+        )
+        let prompt = ChatPromptFormatter.formatConversation(
+            turns: [
+                .init(role: .user, text: "hello"),
+                .init(role: .assistant, text: raw),
+                .init(role: .user, text: "again"),
+            ],
+            cleanSystem: system,
+            thinkingEnabled: true,
+            modelSupportsThinking: true,
+            modelConfig: nil
+        )
+        XCTAssertEqual(
+            prompt.components(separatedBy: close).count - 1,
+            1,
+            "the reasoning close marker must appear exactly once"
+        )
+        XCTAssertTrue(prompt.hasPrefix(turn1 + raw), "the recorded raw generation must still extend the pinned prefix")
+    }
+
+    func testSparkAssistantTurnsCarryEndOfSentenceMarker() throws {
+        let spark = try config("spark")
+        let prompt = ChatPromptFormatter.formatConversation(
+            turns: [
+                .init(role: .user, text: "hello"),
+                .init(role: .assistant, text: "ANSWER"),
+                .init(role: .user, text: "again"),
+            ],
+            cleanSystem: system,
+            thinkingEnabled: false,
+            modelSupportsThinking: false,
+            modelConfig: spark
+        )
+        XCTAssertTrue(
+            prompt.contains("ANSWER" + ChatPromptFormatter.sparkEndOfSentence),
+            "a completed Spark assistant turn must end with its native terminator"
+        )
+        XCTAssertFalse(
+            prompt.hasSuffix(ChatPromptFormatter.sparkEndOfSentence),
+            "the final generation prefix must stay open"
+        )
+        let turn1 = ChatPromptFormatter.formatPrompt(
+            prompt: "hello",
+            cleanSystem: system,
+            thinkingEnabled: false,
+            modelSupportsThinking: false,
+            modelConfig: spark
+        )
+        XCTAssertTrue(prompt.hasPrefix(turn1), "the prompt prefix must survive the added terminator")
+    }
 }

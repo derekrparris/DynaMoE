@@ -104,6 +104,24 @@ public enum ChatPromptFormatter {
         return formattedPrompt
     }
 
+    /// Spark 2.5 (DeepSeek-style) end-of-sentence marker. Built from unicode
+    /// escapes so a renderer can never mangle the fullwidth bars / block
+    /// underscores (AGENTS.md: "Reading files safely").
+    public static let sparkEndOfSentence = "<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}>"
+
+    /// Renders a *completed* historical assistant turn's body. When the family's
+    /// assistant prefix opened a reasoning block (thinking enabled) a client's
+    /// echo (the visible answer, not the reasoning) must not be presented as
+    /// an unfinished thought, so the reasoning close marker is inserted ahead of
+    /// it. A recorded raw generation (server-spliced, reasoning included)
+    /// already carries the marker and is left untouched, keeping the pinned
+    /// prompt+generation prefix intact.
+    private static func completedAssistantBody(prefixOpensReasoning: Bool, text: String) -> String {
+        guard prefixOpensReasoning else { return text }
+        let close = TurnTextSplitter.canonicalReasoningCloseTag
+        guard !text.contains(close) else { return text }
+        return close + text
+    }
 
     /// One role-tagged turn of a conversation, before family templating.
     public struct ConversationTurn: Sendable, Equatable {
@@ -153,7 +171,7 @@ public enum ChatPromptFormatter {
                 if turn.role == .user {
                     p += "<role>HUMAN</role>" + turn.text + "<|role_end|>"
                 } else {
-                    p += assistantPrefix + turn.text + "<|role_end|>"
+                    p += assistantPrefix + Self.completedAssistantBody(prefixOpensReasoning: thinkingEnabled, text: turn.text) + "<|role_end|>"
                 }
             }
             p += assistantPrefix
@@ -168,7 +186,7 @@ public enum ChatPromptFormatter {
                 if turn.role == .user {
                     p += "<｜start▁of▁sentence｜><|User|>" + turn.text + "<｜end▁of▁sentence｜>"
                 } else {
-                    p += assistantPrefix + turn.text
+                    p += assistantPrefix + Self.completedAssistantBody(prefixOpensReasoning: thinkingEnabled, text: turn.text) + Self.sparkEndOfSentence
                 }
             }
             p += assistantPrefix
@@ -204,7 +222,7 @@ public enum ChatPromptFormatter {
             if turn.role == .user {
                 p += "<|im_start|>user\n" + turn.text + "<|im_end|>\n"
             } else {
-                p += assistantPrefix + turn.text + "<|im_end|>\n"
+                p += assistantPrefix + Self.completedAssistantBody(prefixOpensReasoning: thinkingEnabled, text: turn.text) + "<|im_end|>\n"
             }
         }
         p += assistantPrefix

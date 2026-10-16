@@ -50,6 +50,15 @@ nonisolated public final class PrefixCacheManager: @unchecked Sendable {
     /// session) when the next full prefill is going to pin it anyway.
     private var pinnedAsOfDate: (sessionId: UUID?, date: Date)? = nil
 
+    /// Dates minted for sessions that have rendered a turn but not yet recorded
+    /// (pinned) one. A request is planned (and mints its date) long before it is
+    /// admitted, so a rejected or timed-out turn from another session must not
+    /// clobber the live pin's date; its date waits here until its own turn
+    /// actually pins. Bounded so a long-lived server cannot accumulate one entry
+    /// per conversation ever seen.
+    private var pendingAsOfDates: [(sessionId: UUID, date: Date)] = []
+    private let maxPendingAsOfDates = 64
+
     /// Performance metrics tracking
     public private(set) var metrics = PrefixCacheMetrics()
 
@@ -103,9 +112,13 @@ nonisolated public final class PrefixCacheManager: @unchecked Sendable {
     /// The date to render into a turn's system prompt for `sessionId`.
     /// Returns the date the current pin was built with whenever that session
     /// owns it (byte-stable across its turns, so tokenized prompts share the
-    /// full pinned prefix); anything else mints a fresh date and takes
-    /// ownership of the \"next pin's\" slot. `invalidate` clears it so a new
-    /// prefill carries fresh temporal context instead of a growing-stale one.
+    /// full pinned prefix). A session that does not own the pin gets a date
+    /// cached in `pendingAsOfDates` that stays stable across its own planning
+    /// calls, but does NOT take over the live pin's slot: only a turn that
+    /// actually pins (see `promoteAsOfDateLocked`) replaces it, so a rejected or
+    /// timed-out request cannot invalidate another session's pinned prefix.
+    /// `invalidate` clears it so a new prefill carries fresh temporal context
+    /// instead of a growing-stale one.
     public func asOfDate(sessionId: UUID?) -> Date {
         lock.lock()
         defer { lock.unlock() }
@@ -113,9 +126,29 @@ nonisolated public final class PrefixCacheManager: @unchecked Sendable {
         if let pinnedAsOfDate, pinnedAsOfDate.sessionId == sessionId {
             return pinnedAsOfDate.date
         }
+        if let sessionId, let pending = pendingAsOfDates.first(where: { $0.sessionId == sessionId }) {
+            return pending.date
+        }
         let minted = Date()
-        pinnedAsOfDate = (sessionId, minted)
+        if let sessionId {
+            pendingAsOfDates.append((sessionId, minted))
+            if pendingAsOfDates.count > maxPendingAsOfDates {
+                pendingAsOfDates.removeFirst(pendingAsOfDates.count - maxPendingAsOfDates)
+            }
+        }
         return minted
+    }
+
+    /// Makes `sessionId` the owner of the live pin's rendered date. Called only
+    /// when a turn actually records a pin, so a session that never runs leaves
+    /// the existing pin's date untouched.
+    private func promoteAsOfDateLocked(for sessionId: UUID?) {
+        guard let sessionId else { return }
+        if let idx = pendingAsOfDates.firstIndex(where: { $0.sessionId == sessionId }) {
+            pinnedAsOfDate = (sessionId, pendingAsOfDates.remove(at: idx).date)
+        } else if pinnedAsOfDate?.sessionId != sessionId {
+            pinnedAsOfDate = (sessionId, Date())
+        }
     }
 
     /// Records the full token sequence after a turn completes (prompt + generated tokens).
@@ -132,6 +165,7 @@ nonisolated public final class PrefixCacheManager: @unchecked Sendable {
         var full = promptTokenIds
         full.append(contentsOf: generatedTokenIds)
         self.pinnedTokenIds = full
+        promoteAsOfDateLocked(for: sessionId)
     }
 
     /// Explicitly updates the pinned token list (e.g. after prefill or partial generation).
@@ -163,10 +197,12 @@ nonisolated public final class PrefixCacheManager: @unchecked Sendable {
             if self.pinnedAsOfDate?.sessionId == sId {
                 self.pinnedAsOfDate = nil
             }
+            pendingAsOfDates.removeAll { $0.sessionId == sId }
         } else {
             self.pinnedTokenIds.removeAll(keepingCapacity: true)
             self.activeSessionId = nil
             self.pinnedAsOfDate = nil
+            pendingAsOfDates.removeAll(keepingCapacity: true)
         }
     }
 

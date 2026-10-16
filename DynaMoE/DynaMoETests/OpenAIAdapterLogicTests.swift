@@ -229,4 +229,55 @@ final class OpenAIAdapterLogicTests: XCTestCase {
             OpenAIAdapter.sessionKey(for: a.messages, model: "m2")
         )
     }
+
+    // MARK: - Tool choice
+
+    func testObjectValuedToolChoiceDecodesAndForcedChoiceIsRejected() throws {
+        // OpenAI's object form must decode rather than failing the body.
+        let named = try decodeRequest("""
+        {"messages":[],"tools":[{"type":"function","function":{"name":"get_weather"}}],"tool_choice":{"type":"function","function":{"name":"get_weather"}}}
+        """)
+        XCTAssertEqual(named.toolChoice, .function(name: "get_weather"))
+        XCTAssertThrowsError(try OpenAIAdapter.toolUseEnabled(named.toolChoice)) { error in
+            XCTAssertTrue("\(error)".contains("get_weather"), "the rejection must name the forced function")
+        }
+
+        let none = try decodeRequest(#"{"messages":[],"tool_choice":"none"}"#)
+        XCTAssertEqual(none.toolChoice, OpenAIChatRequest.ToolChoice.none)
+        XCTAssertFalse(try OpenAIAdapter.toolUseEnabled(none.toolChoice))
+
+        let required = try decodeRequest(#"{"messages":[],"tool_choice":"required"}"#)
+        XCTAssertThrowsError(try OpenAIAdapter.toolUseEnabled(required.toolChoice))
+
+        let auto = try decodeRequest(#"{"messages":[],"tool_choice":"auto"}"#)
+        XCTAssertEqual(auto.toolChoice, .auto)
+        XCTAssertTrue(try OpenAIAdapter.toolUseEnabled(auto.toolChoice))
+    }
+
+    // MARK: - Tool IDs in history
+
+    func testAssistantHistoryKeepsToolCallIds() throws {
+        let body = """
+        {"messages":[
+            {"role":"user","content":"go"},
+            {"role":"assistant","content":null,"tool_calls":[{"id":"call_abc","type":"function","function":{"name":"shell_run","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"call_abc","content":"ok"}
+        ]}
+        """
+        let request = try decodeRequest(body)
+        let (_, turns) = try OpenAIAdapter.splitMessages(request.messages)
+        XCTAssertTrue(turns[1].text.contains("call_abc"), "the call id must reach history so results can be matched to calls")
+    }
+
+    // MARK: - Null preservation in tool schemas
+
+    func testToolSchemaPreservesNullValues() throws {
+        let request = try decodeRequest("""
+        {"messages":[],"tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"unit":{"enum":["c","f"],"default":null}},"required":["unit"]}}}]}
+        """)
+        let data = try XCTUnwrap(request.tools?[0].function.parametersData)
+        let json = try XCTUnwrap(String(data: data, encoding: .utf8))
+        XCTAssertTrue(json.contains("\"default\":null"), "a null schema default must survive, not become \"\"")
+        XCTAssertFalse(json.contains("\"default\":\"\""))
+    }
 }

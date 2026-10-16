@@ -107,6 +107,42 @@ struct OpenAIChatRequest: Decodable {
         let function: Function
     }
 
+    /// `tool_choice` accepts either a bare string (`"none"` / `"auto"` /
+    /// `"required"`) or a `{"type":"function","function":{"name":"..."}}`
+    /// object. Both forms are decoded so a valid named-function request is not
+    /// rejected as an invalid body; the mode is honored (or explicitly
+    /// rejected) in `OpenAIAdapter.toolUseEnabled`.
+    enum ToolChoice: Decodable, Equatable {
+        case auto
+        case none
+        case required
+        case function(name: String)
+
+        private enum CodingKeys: String, CodingKey { case type, function }
+        private enum FunctionKeys: String, CodingKey { case name }
+
+        init(from decoder: Decoder) throws {
+            if let container = try? decoder.singleValueContainer(),
+               let raw = try? container.decode(String.self) {
+                switch raw {
+                case "none": self = .none
+                case "required": self = .required
+                default: self = .auto
+                }
+                return
+            }
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            let type = try container.decodeIfPresent(String.self, forKey: .type)
+            if type == "function",
+               let fn = try? container.nestedContainer(keyedBy: FunctionKeys.self, forKey: .function),
+               let name = try? fn.decode(String.self, forKey: .name) {
+                self = .function(name: name)
+            } else {
+                self = .auto
+            }
+        }
+    }
+
     let model: String?
     let messages: [Message]
     let temperature: Float?
@@ -119,7 +155,7 @@ struct OpenAIChatRequest: Decodable {
     let stream: Bool?
     let stop: [String]?
     let tools: [Tool]?
-    let toolChoice: String?
+    let toolChoice: ToolChoice?
     let enableThinking: Bool?
     let reasoningEffort: String?
 
@@ -156,7 +192,10 @@ struct OpenAIChatRequest: Decodable {
             self.stop = try container.decodeIfPresent([String].self, forKey: .stop)
         }
         self.tools = try container.decodeIfPresent([Tool].self, forKey: .tools)
-        self.toolChoice = try container.decodeIfPresent(String.self, forKey: .toolChoice)
+        // OpenAI allows a bare string or an object-valued tool_choice; decoding
+        // only the string form rejected valid named-function requests as
+        // invalid bodies before generation.
+        self.toolChoice = try container.decodeIfPresent(ToolChoice.self, forKey: .toolChoice)
         self.enableThinking = try container.decodeIfPresent(Bool.self, forKey: .enableThinking)
         self.reasoningEffort = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
     }
@@ -292,6 +331,24 @@ struct OpenAIErrorEnvelope: Encodable {
 /// free static so it is unit-testable without a live engine or socket.
 enum OpenAIAdapter {
 
+    /// Whether tools may be offered for this request. OpenAI's forced choices
+    /// (`"required"`, or a named-function object) demand a generation
+    /// constraint this server cannot enforce; silently treating them as `auto`
+    /// would let the model answer with a different tool or no tool at all.
+    /// Reject them explicitly instead.
+    static func toolUseEnabled(_ choice: OpenAIChatRequest.ToolChoice?) throws -> Bool {
+        switch choice {
+        case nil, .some(.auto):
+            return true
+        case .some(.none):
+            return false
+        case .some(.required):
+            throw ServerAPIError.badRequest("tool_choice \"required\" is not supported: this server cannot force a tool call. Use \"auto\" or \"none\".")
+        case .some(.function(let name)):
+            throw ServerAPIError.badRequest("tool_choice for a specific function (\"\(name)\") is not supported: this server cannot force a tool call. Use \"auto\" or \"none\".")
+        }
+    }
+
     /// Maps the engine's terminal reasons onto OpenAI finish_reason values.
     static func finishReasonString(_ reason: TurnFinishReason, hasToolCalls: Bool) -> String {
         switch reason {
@@ -389,6 +446,13 @@ enum OpenAIAdapter {
                 if let calls = message.toolCalls, !calls.isEmpty {
                     let rendered = calls.map { call in
                         var obj: [String: String] = ["name": call.function.name]
+                        // Keep the call id: the tool-result turns below
+                        // reference it via tool_call_id, and with several calls
+                        // (or repeated calls to the same function) the id is the
+                        // only thing tying a result back to its arguments.
+                        if let id = call.id, !id.isEmpty {
+                            obj["id"] = id
+                        }
                         if let args = call.function.arguments, !args.isEmpty {
                             obj["arguments"] = args
                         }

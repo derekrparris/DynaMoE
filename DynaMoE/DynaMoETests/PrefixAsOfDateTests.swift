@@ -77,4 +77,39 @@ final class PrefixAsOfDateTests: XCTestCase {
         Thread.sleep(forTimeInterval: 0.01)
         XCTAssertNotEqual(PrefixCacheManager.shared.asOfDate(sessionId: UUID()), stale)
     }
+
+    func testRejectedRequestFromAnotherSessionLeavesLiveDateIntact() {
+        // A's turn mints its date and pins it. A request from B is then planned
+        // (minting a date) but rejected before it runs: it must not take over
+        // A's pinned temporal context, or A's next request loses its prefix.
+        let a = UUID()
+        let dateA = PrefixCacheManager.shared.asOfDate(sessionId: a)
+        PrefixCacheManager.shared.recordTurn(promptTokenIds: [1, 2, 3], generatedTokenIds: [], sessionId: a)
+
+        let b = UUID()
+        let _ = PrefixCacheManager.shared.asOfDate(sessionId: b)
+        XCTAssertEqual(
+            PrefixCacheManager.shared.asOfDate(sessionId: a),
+            dateA,
+            "a rejected request from another session must not re-mint the live pin's date"
+        )
+    }
+
+    func testAdmittedTurnKeepsTheDateItRendered() {
+        // B is admitted and pins: it must keep the date it rendered so its own
+        // next turn renders the byte-identical temporal block.
+        let a = UUID()
+        let _ = PrefixCacheManager.shared.asOfDate(sessionId: a)
+        PrefixCacheManager.shared.recordTurn(promptTokenIds: [1], generatedTokenIds: [], sessionId: a)
+
+        let b = UUID()
+        let dateB = PrefixCacheManager.shared.asOfDate(sessionId: b)
+        Thread.sleep(forTimeInterval: 0.01)
+        PrefixCacheManager.shared.recordTurn(promptTokenIds: [9], generatedTokenIds: [], sessionId: b)
+        XCTAssertEqual(
+            PrefixCacheManager.shared.asOfDate(sessionId: b),
+            dateB,
+            "an admitted turn must keep the date it rendered"
+        )
+    }
 }

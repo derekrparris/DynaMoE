@@ -47,7 +47,13 @@ public struct AnyCodable: Codable, Equatable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
-        if let val = try? container.decode(String.self) {
+        if container.decodeNil() {
+            // JSON null must survive as null: collapsing it to "" rewrote
+            // client tool inputs ({"value":null} -> {"value":""}), historical
+            // Anthropic tool-use inputs, and both adapters' tool schemas
+            // (including `const: null` and nullable enums) on the round trip.
+            value = NSNull()
+        } else if let val = try? container.decode(String.self) {
             value = val
         } else if let val = try? container.decode(Int.self) {
             value = val
@@ -66,7 +72,9 @@ public struct AnyCodable: Codable, Equatable {
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.singleValueContainer()
-        if let val = value as? String {
+        if value is NSNull {
+            try container.encodeNil()
+        } else if let val = value as? String {
             try container.encode(val)
         } else if let val = value as? Int {
             try container.encode(val)
@@ -84,6 +92,9 @@ public struct AnyCodable: Codable, Equatable {
     }
 
     public static func == (lhs: AnyCodable, rhs: AnyCodable) -> Bool {
+        if lhs.value is NSNull || rhs.value is NSNull {
+            return (lhs.value is NSNull) && (rhs.value is NSNull)
+        }
         return String(describing: lhs.value) == String(describing: rhs.value)
     }
 }

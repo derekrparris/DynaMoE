@@ -70,6 +70,47 @@ nonisolated public final class TokenTrieNode {
 
 // MARK: - Grammar-Constrained Sampler
 
+/// One tool schema reduced to the parts the grammar mask enforces (name plus
+/// parameter/required keys). Built from a client request's tool definitions,
+/// which have no in-app `ToolDefinition` to register.
+public struct GrammarToolSchema: Sendable, Equatable {
+    public var name: String
+    public var parameterKeys: Set<String>
+    public var requiredKeys: Set<String>
+
+    public init(name: String, parameterKeys: Set<String> = [], requiredKeys: Set<String> = []) {
+        self.name = name
+        self.parameterKeys = parameterKeys
+        self.requiredKeys = requiredKeys
+    }
+
+    /// Extracts the name/parameter/required keys from a raw JSON-Schema object.
+    /// Returns an empty-key schema when the JSON is absent or malformed.
+    public init(name: String, schemaJSON: Data?) {
+        self.name = name
+        self.parameterKeys = []
+        self.requiredKeys = []
+        guard let schemaJSON,
+              let obj = try? JSONSerialization.jsonObject(with: schemaJSON) as? [String: Any] else { return }
+        if let props = obj["properties"] as? [String: Any] {
+            self.parameterKeys = Set(props.keys)
+        }
+        if let required = obj["required"] as? [String] {
+            self.requiredKeys = Set(required)
+        } else if let requiredAny = obj["required"] as? [Any] {
+            self.requiredKeys = Set(requiredAny.compactMap { $0 as? String })
+        }
+    }
+}
+
+/// Snapshot of the sampler's registered tool schemas, so a turn that installs
+/// its own client tool schemas can restore the previous (in-app) registry.
+public struct GrammarToolRegistry: Sendable {
+    public var names: Set<String>
+    public var parameterKeys: [String: Set<String>]
+    public var requiredKeys: [String: Set<String>]
+}
+
 /// Thread-safe by explicit locking, not by actor isolation: the live state
 /// machine is driven from the detached generation task
 /// (`ContentView.startAutoregressiveGeneration`), so `nonisolated` states the
@@ -164,16 +205,13 @@ nonisolated public final class GrammarConstrainedSampler {
     // MARK: - Schema Registration
 
     public func registerTools(_ tools: [ToolDefinition]) {
-        registrationLock.lock()
-        registeredToolNames.removeAll()
-        toolParameterKeys.removeAll()
-        toolRequiredKeys.removeAll()
-        toolTrie = TokenTrieNode()
+        var names = Set<String>()
+        var parameterKeys: [String: Set<String>] = [:]
+        var requiredKeys: [String: Set<String>] = [:]
 
         for tool in tools {
             let name = tool.function.name
-            registeredToolNames.insert(name)
-            toolTrie.insert(word: name)
+            names.insert(name)
 
             var paramKeys = Set<String>()
             if let props = tool.function.parameters["properties"]?.value as? [String: Any] {
@@ -181,15 +219,60 @@ nonisolated public final class GrammarConstrainedSampler {
                     paramKeys.insert(key)
                 }
             }
-            toolParameterKeys[name] = paramKeys
+            parameterKeys[name] = paramKeys
 
-            var requiredKeys = Set<String>()
+            var reqKeys = Set<String>()
             if let required = tool.function.parameters["required"]?.value as? [String] {
-                requiredKeys.formUnion(required)
+                reqKeys.formUnion(required)
             } else if let requiredAny = tool.function.parameters["required"]?.value as? [Any] {
-                requiredKeys.formUnion(requiredAny.compactMap { $0 as? String })
+                reqKeys.formUnion(requiredAny.compactMap { $0 as? String })
             }
-            toolRequiredKeys[name] = requiredKeys
+            requiredKeys[name] = reqKeys
+        }
+        applyRegistry(names: names, parameterKeys: parameterKeys, requiredKeys: requiredKeys)
+    }
+
+    /// Registers tool schemas that did not come from the in-app catalog (a
+    /// client-supplied API tool has no `ToolDefinition`). Replaces the whole
+    /// registry, exactly like `registerTools`; callers that must not disturb the
+    /// in-app registry should snapshot it first and restore it afterwards.
+    public func registerToolSchemas(_ schemas: [GrammarToolSchema]) {
+        var names = Set<String>()
+        var parameterKeys: [String: Set<String>] = [:]
+        var requiredKeys: [String: Set<String>] = [:]
+        for schema in schemas {
+            names.insert(schema.name)
+            parameterKeys[schema.name] = schema.parameterKeys
+            requiredKeys[schema.name] = schema.requiredKeys
+        }
+        applyRegistry(names: names, parameterKeys: parameterKeys, requiredKeys: requiredKeys)
+    }
+
+    /// Snapshot of the current registry, for callers that install temporary
+    /// schemas and need to restore what was live before.
+    public func snapshotRegistry() -> GrammarToolRegistry {
+        registrationLock.lock()
+        defer { registrationLock.unlock() }
+        return GrammarToolRegistry(
+            names: registeredToolNames,
+            parameterKeys: toolParameterKeys,
+            requiredKeys: toolRequiredKeys
+        )
+    }
+
+    /// Restores a registry captured by `snapshotRegistry`.
+    public func restoreRegistry(_ registry: GrammarToolRegistry) {
+        applyRegistry(names: registry.names, parameterKeys: registry.parameterKeys, requiredKeys: registry.requiredKeys)
+    }
+
+    private func applyRegistry(names: Set<String>, parameterKeys: [String: Set<String>], requiredKeys: [String: Set<String>]) {
+        registrationLock.lock()
+        registeredToolNames = names
+        toolParameterKeys = parameterKeys
+        toolRequiredKeys = requiredKeys
+        toolTrie = TokenTrieNode()
+        for name in names {
+            toolTrie.insert(word: name)
         }
         registrationLock.unlock()
     }
