@@ -53,6 +53,25 @@ final class ServerQueueLogicTests: XCTestCase {
         XCTFail("Condition not met within \(timeout)s")
     }
 
+    /// Lock-guarded bool for cross-task assertions (a plain captured var
+    /// would race between the queue task and the test task).
+    private final class FlagBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+
+        func set(_ newValue: Bool) {
+            lock.lock()
+            value = newValue
+            lock.unlock()
+        }
+
+        func get() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
     func testPendingCountTracksQueuedPerformWork() async throws {
         let queue = TurnExecutionQueue()
         let gate = Gate()
@@ -155,6 +174,150 @@ final class ServerQueueLogicTests: XCTestCase {
         XCTAssertTrue(sawTimeoutFailure, "the queued streaming turn must surface a timeout launch failure instead of running")
         XCTAssertEqual(firstTask.isCancelled, false)
         XCTAssertEqual(secondTask.isCancelled, false)
+        try await waitUntil { await queue.pendingCount == 0 }
+    }
+
+    func testPerformTimeoutFiresWhileLeaderGateClosed() async throws {
+        let queue = TurnExecutionQueue()
+        let gate = Gate()
+
+        let first = Task { try await queue.perform { await gate.wait(); return 1 } }
+        try await waitUntil { await queue.pendingCount == 1 }
+        let second = Task { try await queue.perform({ () async throws -> Int in 2 }, queueWaitTimeout: 0.2) }
+        try await waitUntil { await queue.pendingCount == 2 }
+
+        // The leader's gate stays shut well past the follower's deadline: the
+        // timeout must still be delivered instead of waiting out the leader.
+        let started = Date()
+        do {
+            let value = try await second.value
+            XCTFail("the queued turn must time out without the leader draining (got \(value))")
+        } catch let error as ServerAPIError {
+            XCTAssertEqual(error.status, .requestTimeout)
+        }
+        let elapsed = Date().timeIntervalSince(started)
+        XCTAssertLessThan(elapsed, 1.5, "the timeout must not wait for the stalled predecessor")
+
+        gate.open()
+        let firstValue = try await first.value
+        XCTAssertEqual(firstValue, 1)
+        try await waitUntil { await queue.pendingCount == 0 }
+    }
+
+    func testTimedOutTurnKeepsFIFOBarrierForSuccessors() async throws {
+        let queue = TurnExecutionQueue()
+        let gate = Gate()
+        let box = FlagBox()
+
+        let first = Task { try await queue.perform { () async throws -> Int in
+            await gate.wait()
+            box.set(true)
+            return 1
+        } }
+        try await waitUntil { await queue.pendingCount == 1 }
+        let second = Task { try await queue.perform({ () async throws -> Int in 2 }, queueWaitTimeout: 0.2) }
+        try await waitUntil { await queue.pendingCount == 2 }
+        let third = Task { try await queue.perform { () async throws -> Int in
+            guard box.get() else {
+                XCTFail("the successor must not run before the leader's work drained")
+                return -1
+            }
+            return 3
+        } }
+        try await waitUntil { await queue.pendingCount == 3 }
+
+        // The middle turn times out while the leader is gated.
+        do {
+            _ = try await second.value
+            XCTFail("the middle turn must time out")
+        } catch let error as ServerAPIError {
+            XCTAssertEqual(error.status, .requestTimeout)
+        }
+
+        gate.open()
+        let firstValue = try await first.value
+        let thirdValue = try await third.value
+        XCTAssertEqual(firstValue, 1)
+        XCTAssertEqual(thirdValue, 3, "the turn behind a timed-out turn must still run after the leader drains")
+        try await waitUntil { await queue.pendingCount == 0 }
+    }
+
+    func testCancellingCallerPreventsQueuedWorkFromLaunching() async throws {
+        let queue = TurnExecutionQueue()
+        let gate = Gate()
+        let box = FlagBox()
+
+        let first = Task { try await queue.perform { await gate.wait(); return 1 } }
+        try await waitUntil { await queue.pendingCount == 1 }
+        let second = Task { try await queue.perform { () async throws -> Int in
+            box.set(true)
+            return 2
+        } }
+        try await waitUntil { await queue.pendingCount == 2 }
+
+        // The caller goes away while its turn is still queued.
+        second.cancel()
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        gate.open()
+        do {
+            _ = try await second.value
+            XCTFail("the cancelled caller's queued work must not run")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+        let firstValue = try await first.value
+        XCTAssertEqual(firstValue, 1)
+        XCTAssertFalse(box.get(), "cancelled work must never launch")
+        try await waitUntil { await queue.pendingCount == 0 }
+    }
+
+    func testCancelLiveWorkCancelsServerOwnedTurnsOnly() async throws {
+        let queue = TurnExecutionQueue()
+        let gate = Gate()
+        let cancelReachedWork = FlagBox()
+        let workRan = FlagBox()
+
+        // The running turn models the engine contract: its work observes
+        // cancellation through a cancellation handler (like runTurn's
+        // onCancel → engine handle cancel).
+        let first = Task { try await queue.perform { () async throws -> Int in
+            try await withTaskCancellationHandler {
+                await gate.wait()
+                try Task.checkCancellation()
+                workRan.set(true)
+                return 1
+            } onCancel: {
+                cancelReachedWork.set(true)
+            }
+        } }
+        try await waitUntil { await queue.pendingCount == 1 }
+        let second = Task { try await queue.perform { () async throws -> Int in
+            workRan.set(true)
+            return 2
+        } }
+        try await waitUntil { await queue.pendingCount == 2 }
+
+        await queue.cancelLiveWork()
+
+        gate.open()
+        do {
+            _ = try await first.value
+            XCTFail("the running turn must be cancelled by shutdown")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+        do {
+            _ = try await second.value
+            XCTFail("the queued turn must be cancelled by shutdown")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+        XCTAssertTrue(cancelReachedWork.get(), "cancellation must reach the running work (engine handle analog)")
+        XCTAssertFalse(workRan.get(), "no server-owned work may run after cancelLiveWork")
         try await waitUntil { await queue.pendingCount == 0 }
     }
 

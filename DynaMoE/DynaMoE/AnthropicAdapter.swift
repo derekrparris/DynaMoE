@@ -466,16 +466,17 @@ enum AnthropicAdapter {
         """
     }
 
-    /// Renders the message list into the final user prompt. The Anthropic
-    /// system prompt lives in the top-level `system` field, so only the
-    /// conversation body is assembled here.
+    /// Renders the message list into role-tagged turns. The Anthropic system
+    /// prompt lives in the top-level `system` field, so only the conversation
+    /// body is assembled here.
     ///
-    /// Single-turn requests (exactly one user message with plain text, no
-    /// tool results, no prior assistant history) pass through verbatim so the
-    /// underlying ChatPromptFormatter produces the exact native template
-    /// with zero wrapper noise. Multi-turn and tool-continuation requests
-    /// are rendered as a structured transcript.
-    static func splitMessages(_ messages: [AnthropicMessagesRequest.Message]) throws -> String {
+    /// History stays role-structured (rather than being flattened into one
+    /// user block with "User:"/"Assistant:" labels) so the server can render it
+    /// with the model family's native role boundaries. A flattened transcript
+    /// re-tokenizes the whole conversation every turn, so each turn's prompt
+    /// can no longer extend the previous turn's pinned prompt+generation and
+    /// multi-turn requests fully re-prefill.
+    static func splitMessages(_ messages: [AnthropicMessagesRequest.Message]) throws -> [ChatPromptFormatter.ConversationTurn] {
         guard !messages.isEmpty else {
             throw ServerAPIError.badRequest("messages must contain at least one message")
         }
@@ -484,15 +485,7 @@ enum AnthropicAdapter {
             throw ServerAPIError.badRequest("messages roles must be \"user\" or \"assistant\", got \"\(invalidRole)\"")
         }
 
-        // Single-turn fast path: one user message, nothing before it.
-        if messages.count == 1,
-           messages[0].role == "user",
-           (messages[0].toolResults ?? []).isEmpty,
-           let text = messages[0].contentText {
-            return text
-        }
-
-        var blocks: [String] = []
+        var turns: [ChatPromptFormatter.ConversationTurn] = []
         for message in messages {
             switch message.role {
             case "user":
@@ -505,7 +498,7 @@ enum AnthropicAdapter {
                     parts.append("Tool result (\(label)):\n\(result.content ?? "(no result)")")
                 }
                 let body = parts.joined(separator: "\n\n")
-                blocks.append("User: \(body.isEmpty ? "(no content)" : body)")
+                turns.append(.init(role: .user, text: body.isEmpty ? "(no content)" : body))
             case "assistant":
                 var parts: [String] = []
                 if let text = message.contentText, !text.isEmpty {
@@ -527,14 +520,17 @@ enum AnthropicAdapter {
                     parts.append("Tool calls made:\n\(rendered)")
                 }
                 let body = parts.joined(separator: "\n\n")
-                blocks.append("Assistant: \(body.isEmpty ? "(no content)" : body)")
+                turns.append(.init(role: .assistant, text: body.isEmpty ? "(no content)" : body))
             default:
                 if let content = message.contentText, !content.isEmpty {
-                    blocks.append("\(message.role.capitalized): \(content)")
+                    turns.append(.init(role: .user, text: "\(message.role.capitalized): \(content)"))
                 }
             }
         }
-        return blocks.joined(separator: "\n\n")
+        guard !turns.isEmpty else {
+            throw ServerAPIError.badRequest("messages must contain at least one message")
+        }
+        return turns
     }
 
     /// Stable prefix-cache session key, mirroring the OpenAI adapter scheme:

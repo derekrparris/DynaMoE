@@ -307,6 +307,9 @@ internal struct TurnResult: @unchecked Sendable {
     var gestureSkipNotices: [Int: String]
     /// Unparseable tool-call fragments (recovery-prompt input for the UI layer).
     var brokenFragments: [String]
+    /// The configured stop sequence that ended the turn (when `finishReason`
+    /// is `.stoppedBySequence`); protocol adapters surface it to clients.
+    var matchedStopSequence: String?
 
     init(
         finishReason: TurnFinishReason,
@@ -335,7 +338,8 @@ internal struct TurnResult: @unchecked Sendable {
         parsedToolCalls: [ParsedToolCall],
         actionableCallIndices: [Int],
         gestureSkipNotices: [Int: String],
-        brokenFragments: [String]
+        brokenFragments: [String],
+        matchedStopSequence: String? = nil
     ) {
         self.finishReason = finishReason
         self.formattedPrompt = formattedPrompt
@@ -364,6 +368,7 @@ internal struct TurnResult: @unchecked Sendable {
         self.actionableCallIndices = actionableCallIndices
         self.gestureSkipNotices = gestureSkipNotices
         self.brokenFragments = brokenFragments
+        self.matchedStopSequence = matchedStopSequence
     }
 }
 

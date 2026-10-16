@@ -77,9 +77,11 @@ final class OpenAIAdapterLogicTests: XCTestCase {
             OpenAIChatRequest.Message(role: "system", contentText: "sys prompt", name: nil, toolCalls: nil, toolCallId: nil),
             OpenAIChatRequest.Message(role: "user", contentText: "what is 2+2", name: nil, toolCalls: nil, toolCallId: nil),
         ]
-        let (system, user) = try OpenAIAdapter.splitMessages(messages)
+        let (system, turns) = try OpenAIAdapter.splitMessages(messages)
         XCTAssertEqual(system, "sys prompt")
-        XCTAssertEqual(user, "what is 2+2")
+        XCTAssertEqual(turns.count, 1)
+        XCTAssertEqual(turns[0].role, .user)
+        XCTAssertEqual(turns[0].text, "what is 2+2")
     }
 
     func testAssistantToolCallRendersAsJSON() throws {
@@ -91,13 +93,14 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         ]}
         """
         let request = try decodeRequest(body)
-        let (system, user) = try OpenAIAdapter.splitMessages(request.messages)
+        let (system, turns) = try OpenAIAdapter.splitMessages(request.messages)
         XCTAssertEqual(system, "")
-        XCTAssertTrue(user.contains("User: run the tests"))
-        XCTAssertTrue(user.contains("shell_run"))
-        XCTAssertTrue(user.contains("make test"))
-        XCTAssertTrue(user.contains("Function result (call_1)"))
-        XCTAssertTrue(user.contains("all green"))
+        XCTAssertEqual(turns.map(\.role), [.user, .assistant, .user], "roles must stay native, not flattened into one user block")
+        XCTAssertEqual(turns[0].text, "run the tests")
+        XCTAssertTrue(turns[1].text.contains("shell_run"))
+        XCTAssertTrue(turns[1].text.contains("make test"))
+        XCTAssertTrue(turns[2].text.contains("Function result (call_1)"))
+        XCTAssertTrue(turns[2].text.contains("all green"))
     }
 
     // MARK: - Finish reasons

@@ -1927,6 +1927,10 @@ struct SettingsSheetView: View {
     }
 
     private func restartServer() {
+        // The text field's edited value is only committed by its Return
+        // handler; apply it here too so Restart picks up a freshly typed
+        // port without requiring an explicit submit first.
+        applyServerPort()
         Task {
             await serverController.stop()
             serverController.start()

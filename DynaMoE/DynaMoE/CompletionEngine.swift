@@ -9854,6 +9854,7 @@ if layer.attnGateProjTensor != nil,
             var generationStartTime = CFAbsoluteTimeGetCurrent()
 
             var breakReasonText = ""
+            var matchedStopSequence: String?
             for _ in 0..<maxTokens {
                 if Task.isCancelled {
                     let tailText = (try? tokenizer.decode(ids: Array(generatedTokenIds.suffix(48)))) ?? ""
@@ -10008,6 +10009,7 @@ if layer.attnGateProjTensor != nil,
                         }
                         if let match = stopMatch {
                             accumulatedDecodedText = String(emittable[..<match.offset])
+                            matchedStopSequence = match.sequence
                             shouldBreak = true
                             breakReasonText = "stop-sequence"
                             break
@@ -10249,7 +10251,8 @@ if layer.attnGateProjTensor != nil,
                 parsedToolCalls: parsedResult.calls,
                 actionableCallIndices: gestureSplit.actionableIndices,
                 gestureSkipNotices: gestureSplit.skipNotices,
-                brokenFragments: parsedResult.brokenFragments
+                brokenFragments: parsedResult.brokenFragments,
+                matchedStopSequence: matchedStopSequence
             )))
         }
         stateLock.lock()

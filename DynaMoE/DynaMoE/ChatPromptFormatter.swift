@@ -103,4 +103,111 @@ public enum ChatPromptFormatter {
         }
         return formattedPrompt
     }
+
+
+    /// One role-tagged turn of a conversation, before family templating.
+    public struct ConversationTurn: Sendable, Equatable {
+        public enum Role: Sendable, Equatable {
+            case user
+            case assistant
+        }
+
+        public var role: Role
+        public var text: String
+
+        public init(role: Role, text: String) {
+            self.role = role
+            self.text = text
+        }
+    }
+
+    /// Renders a multi-turn conversation with the model family's native
+    /// role boundaries, mirroring `formatPrompt`'s per-family templates.
+    /// Each assistant turn opens with the same assistant prefix the
+    /// single-turn template emits (role marker plus the family's thinking
+    /// markers): those tokens belong to the *prompt*, so the next turn must
+    /// reproduce them to stay prefix-compatible with the previous turn's
+    /// pinned prompt+generation.
+    ///
+    /// History used to be flattened into a single user block carrying
+    /// synthetic "User:"/"Assistant:" labels, which re-tokenized the whole
+    /// conversation every turn: turn N+1's prompt could no longer extend
+    /// turn N's pin, so multi-turn requests fully re-prefilled — and hybrid
+    /// (GDN) models, whose recurrent state only matches at the exact pinned
+    /// token boundary, could not reuse it at all.
+    public static func formatConversation(
+        turns: [ConversationTurn],
+        cleanSystem: String,
+        thinkingEnabled: Bool,
+        modelSupportsThinking: Bool,
+        modelConfig: ModelConfig?
+    ) -> String {
+        guard !turns.isEmpty else { return "" }
+
+        if modelConfig?.isLingModel == true {
+            let lingThinking = thinkingEnabled ? "detailed thinking on" : "detailed thinking off"
+            let sysPart = cleanSystem.isEmpty ? lingThinking : "\(cleanSystem)\n\(lingThinking)"
+            let assistantPrefix = "<role>ASSISTANT</role>" + (thinkingEnabled ? "\n<think>" : "\n<think></think>")
+            var p = "<role>SYSTEM</role>" + sysPart + "<|role_end|>"
+            for turn in turns {
+                if turn.role == .user {
+                    p += "<role>HUMAN</role>" + turn.text + "<|role_end|>"
+                } else {
+                    p += assistantPrefix + turn.text + "<|role_end|>"
+                }
+            }
+            p += assistantPrefix
+            return p
+        }
+
+        if modelConfig?.isSparkModel == true {
+            let sysLine = cleanSystem.isEmpty ? "You are a helpful assistant." : cleanSystem
+            let assistantPrefix = "<｜start▁of▁sentence｜><|Bot|>" + (thinkingEnabled ? "<think>" : "<think></think>")
+            var p = "<｜start▁of▁sentence｜><|System|>\n" + sysLine + "<｜end▁of▁sentence｜>"
+            for turn in turns {
+                if turn.role == .user {
+                    p += "<｜start▁of▁sentence｜><|User|>" + turn.text + "<｜end▁of▁sentence｜>"
+                } else {
+                    p += assistantPrefix + turn.text
+                }
+            }
+            p += assistantPrefix
+            return p
+        }
+
+        if modelConfig?.isGemma4Model == true {
+            let assistantPrefix = "<|turn>model\n" + (thinkingEnabled ? "" : "<|channel>thought\n<channel|>")
+            var p = "<bos>"
+            if thinkingEnabled {
+                p += "<|turn>system\n<|think|>\n" + cleanSystem + "<turn|>\n"
+            } else if !cleanSystem.isEmpty {
+                p += "<|turn>system\n" + cleanSystem + "<turn|>\n"
+            }
+            for turn in turns {
+                if turn.role == .user {
+                    p += "<|turn>user\n" + turn.text + "<turn|>\n"
+                } else {
+                    p += assistantPrefix + turn.text + "<turn|>\n"
+                }
+            }
+            p += assistantPrefix
+            return p
+        }
+
+        let thinkSuffix = thinkingEnabled ? "<think>\n" : (modelSupportsThinking ? "<think>\n\n</think>\n\n" : "")
+        let assistantPrefix = "<|im_start|>assistant\n" + thinkSuffix
+        var p = ""
+        if !cleanSystem.isEmpty {
+            p += "<|im_start|>system\n" + cleanSystem + "<|im_end|>\n"
+        }
+        for turn in turns {
+            if turn.role == .user {
+                p += "<|im_start|>user\n" + turn.text + "<|im_end|>\n"
+            } else {
+                p += assistantPrefix + turn.text + "<|im_end|>\n"
+            }
+        }
+        p += assistantPrefix
+        return p
+    }
 }

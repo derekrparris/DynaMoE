@@ -41,11 +41,21 @@ enum QueuedTurnEvent: @unchecked Sendable {
 /// FIFO queue over the engine's single-flight generation slot. Each request
 /// enqueues its whole turn; the work only begins once every earlier turn has
 /// fully drained. Cancellation propagates to the owner task, which cancels
-/// the engine turn handle.
+/// the engine turn handle. Queue-wait timeouts are delivered at their
+/// deadline even when a predecessor is stalled; the timed-out turn leaves
+/// the queue without running work, while turns queued behind it still wait
+/// for their predecessors' drain.
 actor TurnExecutionQueue {
+    /// Chain element for successor turns: resolves only once every earlier
+    /// operation's work has drained. A timed-out operation contributes no
+    /// work, so its chain element resolves when its own predecessor drains.
     private var tail: Task<Void, Never> = Task {}
     private var enqueuedOperations = 0
     private var completedOperations = 0
+    /// Live server-owned operations, each with a cancel invoker. Server
+    /// shutdown cancels exactly these; engine turns launched by the chat UI
+    /// never route through this queue and must not be touched.
+    private var liveCancelBoxes: [UUID: ServerTurnCancelBox] = [:]
 
     /// Turns enqueued but not yet drained (queued or currently running) —
     /// surfaced by the Server settings dashboard.
@@ -53,11 +63,55 @@ actor TurnExecutionQueue {
         max(0, enqueuedOperations - completedOperations)
     }
 
+    /// Cancels every live server-owned turn (queued or running). Called on
+    /// server shutdown only.
+    func cancelLiveWork() {
+        for box in liveCancelBoxes.values {
+            box.invoke()
+        }
+    }
+
+    private func registerCancelBox(_ box: ServerTurnCancelBox) -> UUID {
+        let id = UUID()
+        liveCancelBoxes[id] = box
+        return id
+    }
+
+    private func deregisterCancelBox(_ id: UUID) {
+        liveCancelBoxes[id] = nil
+    }
+
+    /// Waits for the predecessor to drain, but gives up at `deadline` so a
+    /// stalled or long-running leader cannot hold a timed-out request past
+    /// its deadline. `Task.value` awaits ignore cancellation, so the
+    /// predecessor's completion is observed by a detached watcher and raced
+    /// against the deadline on a short poll cadence; the watcher is
+    /// abandoned on timeout and completes on its own. Returning `true` means
+    /// the slot is genuinely open — the FIFO barrier for real work is
+    /// untouched, since callers run work only after this returns true.
+    nonisolated private static func waitForSlot(_ previous: Task<Void, Never>, deadline: Date) async throws -> Bool {
+        let drained = DrainFlag()
+        let watcher = Task.detached(priority: .utility) { [previous, drained] in
+            _ = await previous.value
+            drained.mark()
+        }
+        defer { watcher.cancel() }
+        while !drained.isDrained {
+            try Task.checkCancellation()
+            if Date() >= deadline {
+                return false
+            }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return true
+    }
+
     /// Enqueues streaming work. Returns the event relay stream plus the task
     /// that owns the work (cancel it to abort a queued/running turn).
     /// `queueWaitTimeout` bounds how long the turn may sit behind earlier
     /// turns; when it expires the relay emits a launchFailed event instead of
-    /// running the work. Nil (the default) waits indefinitely.
+    /// running the work — promptly, even if an earlier turn is stalled. Nil
+    /// (the default) waits indefinitely.
     func streamTurn(
         _ work: @escaping @Sendable (_ emit: @escaping @Sendable (QueuedTurnEvent) -> Void) async -> Void,
         queueWaitTimeout: TimeInterval? = nil
@@ -66,6 +120,8 @@ actor TurnExecutionQueue {
         let previous = tail
         enqueuedOperations += 1
         let deadline = queueWaitTimeout.map { Date().addingTimeInterval($0) }
+        let cancelBox = ServerTurnCancelBox()
+        let hookID = registerCancelBox(cancelBox)
         let heartbeat = Task {
             // Queue-wait heartbeat so clients don't idle-timeout while a long
             // turn ahead of us holds the single-flight slot.
@@ -82,31 +138,55 @@ actor TurnExecutionQueue {
                 // emitting ping frames while a long prefill runs and clients
                 // (and any intermediate proxies) never see a silent socket.
                 self.completedOperations += 1
+                self.deregisterCancelBox(hookID)
                 heartbeat.cancel()
             }
-            await previous.value
-            guard !Task.isCancelled else {
+            do {
+                let slotOpened: Bool
+                if let deadline {
+                    slotOpened = try await Self.waitForSlot(previous, deadline: deadline)
+                } else {
+                    await previous.value
+                    slotOpened = true
+                }
+                guard slotOpened else {
+                    continuation.yield(.launchFailed(ServerAPIError.requestTimeout("Request timed out waiting in the generation queue")))
+                    continuation.finish()
+                    return
+                }
+            } catch {
+                // waitForSlot throws only on cancellation.
                 continuation.finish()
                 return
             }
-            if let deadline, Date() >= deadline {
-                continuation.yield(.launchFailed(ServerAPIError.requestTimeout("Request timed out waiting in the generation queue")))
+            guard !Task.isCancelled else {
                 continuation.finish()
                 return
             }
             await work { continuation.yield($0) }
             continuation.finish()
         }
+        cancelBox.set { task.cancel() }
+        // Successors wait for this turn's full drain, not merely its task
+        // completion: a turn that timed out without running still holds its
+        // predecessors' drain for the turns queued behind it.
+        let gate = Task<Void, Never> { [previous, task] in
+            await previous.value
+            _ = await task.value
+        }
         // Keep the chain element alive regardless of this task's outcome.
-        tail = task
+        tail = gate
         return (stream, task)
     }
 
     /// Enqueues value-returning work (non-streaming requests and other
     /// engine-facing endpoints). `queueWaitTimeout` bounds how long the work
     /// may sit behind earlier turns; when it expires the perform throws a
-    /// request-timeout error instead of running the work. Nil (the default)
-    /// waits indefinitely.
+    /// request-timeout error instead of running the work — promptly, even if
+    /// an earlier turn is stalled. Nil (the default) waits indefinitely.
+    /// Cancelling the caller cancels the queued work: a cancelled request
+    /// neither launches after its predecessor drains nor leaves a running
+    /// engine turn unreachable by the work's own cancellation hook.
     func perform<T: Sendable>(
         _ work: @escaping @Sendable () async throws -> T,
         queueWaitTimeout: TimeInterval? = nil
@@ -114,16 +194,77 @@ actor TurnExecutionQueue {
         let previous = tail
         enqueuedOperations += 1
         let deadline = queueWaitTimeout.map { Date().addingTimeInterval($0) }
+        let cancelBox = ServerTurnCancelBox()
+        let hookID = registerCancelBox(cancelBox)
         let task = Task<T, Error> { [previous, deadline] in
-            defer { self.completedOperations += 1 }
-            await previous.value
-            if let deadline, Date() >= deadline {
+            defer {
+                self.completedOperations += 1
+                self.deregisterCancelBox(hookID)
+            }
+            let slotOpened: Bool
+            if let deadline {
+                slotOpened = try await Self.waitForSlot(previous, deadline: deadline)
+            } else {
+                await previous.value
+                slotOpened = true
+            }
+            guard slotOpened else {
                 throw ServerAPIError.requestTimeout("Request timed out waiting in the generation queue")
             }
+            try Task.checkCancellation()
             return try await work()
         }
-        tail = Task { _ = try? await task.value }
-        return try await task.value
+        cancelBox.set { task.cancel() }
+        let gate = Task<Void, Never> { [previous, task] in
+            await previous.value
+            _ = try? await task.value
+        }
+        tail = gate
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+}
+
+/// Lock-guarded one-shot flag so a queue slot wait can poll its
+/// predecessor's drain without a data race.
+private final class DrainFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var drained = false
+
+    func mark() {
+        lock.lock()
+        drained = true
+        lock.unlock()
+    }
+
+    var isDrained: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return drained
+    }
+}
+
+/// Cancel invoker for a queued turn's shutdown registry entry. The work task
+/// does not exist yet at enqueue time, so the real cancel closure is
+/// installed right after task creation; `invoke` before that is a no-op.
+private final class ServerTurnCancelBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancel: (() -> Void)?
+
+    func set(_ newCancel: @escaping () -> Void) {
+        lock.lock()
+        cancel = newCancel
+        lock.unlock()
+    }
+
+    func invoke() {
+        lock.lock()
+        let target = cancel
+        lock.unlock()
+        target?()
     }
 }
 
@@ -330,7 +471,10 @@ final class ServerController: ObservableObject {
     func stop() async {
         guard let group = serviceGroup else { return }
         serviceGroup = nil
-        CompletionEngine.shared.cancelActiveTurn()
+        // Cancel only turns the server owns. The chat UI drives the engine
+        // directly (not through this queue), so its in-flight response must
+        // survive a server restart or settings change.
+        await queue.cancelLiveWork()
         await group.triggerGracefulShutdown()
         isRunning = false
         boundPort = 0
@@ -462,7 +606,10 @@ final class ServerController: ObservableObject {
     /// before handing the resolved values to the shared core.
     struct TurnPlanInputs: Sendable {
         var systemPrompt: String
-        var userPrompt: String
+        /// Role-tagged conversation history. The server renders it with the
+        /// model family's native role boundaries so later turns extend the
+        /// previous turn's pinned prefix instead of re-prefilling.
+        var conversation: [ChatPromptFormatter.ConversationTurn]
         var temperature: Float?
         var topP: Float?
         var topK: Int?
@@ -501,13 +648,29 @@ final class ServerController: ObservableObject {
         }
 
         let thinkingEnabled = info.supportsThinking && inputs.thinkingRequested
-        let formattedPrompt = ChatPromptFormatter.formatPrompt(
-            prompt: inputs.userPrompt,
-            cleanSystem: cleanSystem,
-            thinkingEnabled: thinkingEnabled,
-            modelSupportsThinking: info.supportsThinking,
-            modelConfig: engine.promptModelConfig
-        )
+        // A single plain user turn renders exactly as before (native template
+        // with zero wrapper noise). A real history renders with the family's
+        // native role boundaries, so this turn's formatted prompt is a strict
+        // extension of the previous turn's prompt+generation and the pinned
+        // KV prefix stays reusable across turns.
+        let formattedPrompt: String
+        if inputs.conversation.count == 1, inputs.conversation[0].role == .user {
+            formattedPrompt = ChatPromptFormatter.formatPrompt(
+                prompt: inputs.conversation[0].text,
+                cleanSystem: cleanSystem,
+                thinkingEnabled: thinkingEnabled,
+                modelSupportsThinking: info.supportsThinking,
+                modelConfig: engine.promptModelConfig
+            )
+        } else {
+            formattedPrompt = ChatPromptFormatter.formatConversation(
+                turns: inputs.conversation,
+                cleanSystem: cleanSystem,
+                thinkingEnabled: thinkingEnabled,
+                modelSupportsThinking: info.supportsThinking,
+                modelConfig: engine.promptModelConfig
+            )
+        }
 
         let promptTokenIds: [UInt32]
         do {
@@ -558,11 +721,11 @@ final class ServerController: ObservableObject {
 
     nonisolated private static func buildTurnPlan(_ apiRequest: OpenAIChatRequest) throws -> TurnPlan {
         let info = try requireLoadedModel()
-        let (systemPrompt, userPrompt) = try OpenAIAdapter.splitMessages(apiRequest.messages)
+        let (systemPrompt, turns) = try OpenAIAdapter.splitMessages(apiRequest.messages)
         let hasTools = !(apiRequest.tools ?? []).isEmpty && apiRequest.toolChoice != "none"
         return try buildTurnPlan(TurnPlanInputs(
             systemPrompt: systemPrompt,
-            userPrompt: userPrompt,
+            conversation: turns,
             temperature: apiRequest.temperature,
             topP: apiRequest.topP,
             topK: apiRequest.topK,
@@ -583,11 +746,11 @@ final class ServerController: ObservableObject {
             throw ServerAPIError.badRequest("max_tokens is a required field")
         }
         let info = try requireLoadedModel()
-        let userPrompt = try AnthropicAdapter.splitMessages(apiRequest.messages)
+        let turns = try AnthropicAdapter.splitMessages(apiRequest.messages)
         let hasTools = !(apiRequest.tools ?? []).isEmpty && apiRequest.toolChoiceType != "none"
         return try buildTurnPlan(TurnPlanInputs(
             systemPrompt: apiRequest.systemText ?? "",
-            userPrompt: userPrompt,
+            conversation: turns,
             temperature: apiRequest.temperature,
             topP: apiRequest.topP,
             topK: apiRequest.topK,
@@ -678,12 +841,49 @@ final class ServerController: ObservableObject {
         return "{}"
     }
 
+    /// Length of the longest suffix of `text` that is a prefix of (or exactly)
+    /// one of `stopSequences` — the portion that could still grow into a
+    /// match the engine will trim, so it must not reach an append-only
+    /// streaming client yet.
+    nonisolated static func unsafeSuffixLength(_ text: String, stopSequences: [String]) -> Int {
+        var longest = 0
+        for stop in stopSequences where !stop.isEmpty {
+            var length = min(text.count, stop.count)
+            while length > longest {
+                if stop.hasPrefix(text.suffix(length)) {
+                    longest = length
+                    break
+                }
+                length -= 1
+            }
+        }
+        return longest
+    }
+
+    /// Append-safe delta of `accumulated` beyond the already-delivered `sent`.
+    /// Empty when the engine's snapshot no longer extends what was sent: a
+    /// streaming client can only append, so re-sending a repaired snapshot
+    /// would duplicate the delivered prefix. Also holds back the suffix that
+    /// could still complete a configured stop sequence, so the engine's
+    /// eventual trim cannot leave phantom text in the client's assembled
+    /// message. Pass empty `stopSequences` at terminal flush, where the
+    /// engine has already trimmed matches and every remaining character is
+    /// final.
+    nonisolated static func safeStreamDelta(accumulated: String, sent: String, stopSequences: [String]) -> String {
+        guard accumulated.hasPrefix(sent) else { return "" }
+        let delta = accumulated.dropFirst(sent.count)
+        guard !delta.isEmpty else { return "" }
+        let hold = min(unsafeSuffixLength(accumulated, stopSequences: stopSequences), delta.count)
+        return String(delta.dropLast(hold))
+    }
+
     // MARK: Streaming handling
 
     nonisolated private static func streamingResponse(apiRequest: OpenAIChatRequest, queue: TurnExecutionQueue) -> Response {
         let encoder = JSONEncoder()
         let id = "chatcmpl-\(UUID().uuidString.prefix(24))"
         let created = Int(Date().timeIntervalSince1970)
+        let stopSequences = (apiRequest.stop ?? []).filter { !$0.isEmpty }
         let model = apiRequest.model ?? CompletionEngine.shared.loadedModelInfo?.displayName ?? "dynamoe"
 
         func chunkBuffer(_ delta: OpenAIStreamDelta, finishReason: String?) throws -> ByteBuffer {
@@ -765,22 +965,19 @@ final class ServerController: ObservableObject {
                         sentRole = true
                         try await sse(chunkBuffer(.init(role: "assistant", content: nil, reasoningContent: nil, toolCalls: nil), finishReason: nil))
                     }
-                    if frame.thinkingText.count > sentThinking.count && frame.thinkingText.hasPrefix(sentThinking) {
-                        let delta = String(frame.thinkingText.dropFirst(sentThinking.count))
-                        sentThinking = frame.thinkingText
-                        try await sse(chunkBuffer(.init(role: nil, content: nil, reasoningContent: delta, toolCalls: nil), finishReason: nil))
-                    } else if frame.thinkingText.count > sentThinking.count {
-                        // UTF-8 repair mid-stream: re-render rather than fork.
-                        sentThinking = frame.thinkingText
-                        try await sse(chunkBuffer(.init(role: nil, content: nil, reasoningContent: frame.thinkingText, toolCalls: nil), finishReason: nil))
+                    // Append-only safety: a snapshot that no longer extends the
+                    // delivered text is skipped (clients cannot replace), and
+                    // any suffix that could still grow into a stop sequence is
+                    // withheld until later frames prove it safe.
+                    let thinkingDelta = Self.safeStreamDelta(accumulated: frame.thinkingText, sent: sentThinking, stopSequences: stopSequences)
+                    if !thinkingDelta.isEmpty {
+                        sentThinking += thinkingDelta
+                        try await sse(chunkBuffer(.init(role: nil, content: nil, reasoningContent: thinkingDelta, toolCalls: nil), finishReason: nil))
                     }
-                    if frame.responseText.count > sentContent.count && frame.responseText.hasPrefix(sentContent) {
-                        let delta = String(frame.responseText.dropFirst(sentContent.count))
-                        sentContent = frame.responseText
-                        try await sse(chunkBuffer(.init(role: nil, content: delta, reasoningContent: nil, toolCalls: nil), finishReason: nil))
-                    } else if frame.responseText.count > sentContent.count {
-                        sentContent = frame.responseText
-                        try await sse(chunkBuffer(.init(role: nil, content: frame.responseText, reasoningContent: nil, toolCalls: nil), finishReason: nil))
+                    let contentDelta = Self.safeStreamDelta(accumulated: frame.responseText, sent: sentContent, stopSequences: stopSequences)
+                    if !contentDelta.isEmpty {
+                        sentContent += contentDelta
+                        try await sse(chunkBuffer(.init(role: nil, content: contentDelta, reasoningContent: nil, toolCalls: nil), finishReason: nil))
                     }
                 case .engine(.failedTurn(let failure)):
                     let envelope = OpenAIErrorEnvelope(error: .init(
@@ -794,12 +991,16 @@ final class ServerController: ObservableObject {
                     try await sseRaw("[DONE]")
                     finishedCleanly = true
                 case .engine(.finished(let result)):
-                    // Tail text the throttle never emitted.
-                    if result.thinkingText.count > sentThinking.count && result.thinkingText.hasPrefix(sentThinking) {
-                        try await sse(chunkBuffer(.init(role: nil, content: nil, reasoningContent: String(result.thinkingText.dropFirst(sentThinking.count)), toolCalls: nil), finishReason: nil))
+                    // Tail text the throttle never emitted. The engine has
+                    // already trimmed stop matches from the final text, so no
+                    // hold-back applies here.
+                    let tailThinking = Self.safeStreamDelta(accumulated: result.thinkingText, sent: sentThinking, stopSequences: [])
+                    if !tailThinking.isEmpty {
+                        try await sse(chunkBuffer(.init(role: nil, content: nil, reasoningContent: tailThinking, toolCalls: nil), finishReason: nil))
                     }
-                    if result.responseText.count > sentContent.count && result.responseText.hasPrefix(sentContent) {
-                        try await sse(chunkBuffer(.init(role: nil, content: String(result.responseText.dropFirst(sentContent.count)), reasoningContent: nil, toolCalls: nil), finishReason: nil))
+                    let tailContent = Self.safeStreamDelta(accumulated: result.responseText, sent: sentContent, stopSequences: [])
+                    if !tailContent.isEmpty {
+                        try await sse(chunkBuffer(.init(role: nil, content: tailContent, reasoningContent: nil, toolCalls: nil), finishReason: nil))
                     }
                     let toolCalls: [OpenAIToolCallOut]? = {
                         guard !result.parsedToolCalls.isEmpty || result.finishReason == .toolFreeze else { return nil }
@@ -870,7 +1071,7 @@ final class ServerController: ObservableObject {
             model: plan.modelName,
             content: blocks,
             stopReason: AnthropicAdapter.finishReasonString(result.finishReason, hasToolCalls: !result.parsedToolCalls.isEmpty),
-            stopSequence: nil,
+            stopSequence: result.matchedStopSequence,
             usage: .init(inputTokens: plan.promptTokenCount, outputTokens: result.tokensGenerated)
         )
     }
@@ -881,6 +1082,7 @@ final class ServerController: ObservableObject {
         let encoder = JSONEncoder()
         let id = "msg-\(UUID().uuidString.prefix(24))"
         let model = apiRequest.model ?? CompletionEngine.shared.loadedModelInfo?.displayName ?? "dynamoe"
+        let stopSequences = (apiRequest.stopSequences ?? []).filter { !$0.isEmpty }
 
         let body = ResponseBody { writer in
             func sse<E: Encodable>(_ eventName: String, _ payload: E) async throws {
@@ -901,6 +1103,11 @@ final class ServerController: ObservableObject {
             var sentContent = ""
             var thinkingIndex: Int?
             var contentIndex: Int?
+            // Anthropic blocks follow a strict sequential start/delta/stop
+            // lifecycle; the flags keep terminal cleanup from stopping a
+            // block twice.
+            var thinkingClosed = false
+            var contentClosed = false
             var nextIndex = 0
             let promptTokensBox = PromptCountBox()
 
@@ -920,18 +1127,26 @@ final class ServerController: ObservableObject {
                 nextIndex += 1
                 try await sse("content_block_start", AnthropicContentBlockStartEvent(index: thinkingIndex ?? 0, contentBlock: .thinking))
             }
+            func closeThinkingBlock() async throws {
+                if let ti = thinkingIndex, !thinkingClosed {
+                    try await sse("content_block_stop", AnthropicContentBlockStopEvent(index: ti))
+                    thinkingClosed = true
+                }
+            }
             func openContent() async throws {
+                // Blocks are strictly sequential: the thinking block must
+                // stop before the text block starts.
+                try await closeThinkingBlock()
                 guard contentIndex == nil else { return }
                 contentIndex = nextIndex
                 nextIndex += 1
                 try await sse("content_block_start", AnthropicContentBlockStartEvent(index: contentIndex ?? 0, contentBlock: .text))
             }
             func closeOpenBlocks() async throws {
-                if let ti = thinkingIndex {
-                    try await sse("content_block_stop", AnthropicContentBlockStopEvent(index: ti))
-                }
-                if let ci = contentIndex {
+                try await closeThinkingBlock()
+                if let ci = contentIndex, !contentClosed {
                     try await sse("content_block_stop", AnthropicContentBlockStopEvent(index: ci))
+                    contentClosed = true
                 }
             }
 
@@ -977,26 +1192,20 @@ final class ServerController: ObservableObject {
                     }
                 case .engine(.frame(let frame)):
                     try await ensureStart()
-                    if frame.thinkingText.count > sentThinking.count && frame.thinkingText.hasPrefix(sentThinking) {
+                    // Append-only safety, mirroring the OpenAI writer: skip
+                    // non-extending snapshots, hold back possible stop-sequence
+                    // suffixes.
+                    let thinkingDelta = Self.safeStreamDelta(accumulated: frame.thinkingText, sent: sentThinking, stopSequences: stopSequences)
+                    if !thinkingDelta.isEmpty {
                         try await openThinking()
-                        let delta = String(frame.thinkingText.dropFirst(sentThinking.count))
-                        sentThinking = frame.thinkingText
-                        try await sse("content_block_delta", AnthropicContentBlockDeltaEvent(index: thinkingIndex ?? 0, delta: .thinking(delta)))
-                    } else if frame.thinkingText.count > sentThinking.count {
-                        // UTF-8 repair mid-stream: re-render rather than fork.
-                        try await openThinking()
-                        sentThinking = frame.thinkingText
-                        try await sse("content_block_delta", AnthropicContentBlockDeltaEvent(index: thinkingIndex ?? 0, delta: .thinking(frame.thinkingText)))
+                        sentThinking += thinkingDelta
+                        try await sse("content_block_delta", AnthropicContentBlockDeltaEvent(index: thinkingIndex ?? 0, delta: .thinking(thinkingDelta)))
                     }
-                    if frame.responseText.count > sentContent.count && frame.responseText.hasPrefix(sentContent) {
+                    let contentDelta = Self.safeStreamDelta(accumulated: frame.responseText, sent: sentContent, stopSequences: stopSequences)
+                    if !contentDelta.isEmpty {
                         try await openContent()
-                        let delta = String(frame.responseText.dropFirst(sentContent.count))
-                        sentContent = frame.responseText
-                        try await sse("content_block_delta", AnthropicContentBlockDeltaEvent(index: contentIndex ?? 0, delta: .text(delta)))
-                    } else if frame.responseText.count > sentContent.count {
-                        try await openContent()
-                        sentContent = frame.responseText
-                        try await sse("content_block_delta", AnthropicContentBlockDeltaEvent(index: contentIndex ?? 0, delta: .text(frame.responseText)))
+                        sentContent += contentDelta
+                        try await sse("content_block_delta", AnthropicContentBlockDeltaEvent(index: contentIndex ?? 0, delta: .text(contentDelta)))
                     }
                 case .engine(.failedTurn(let failure)):
                     try await ensureStart()
@@ -1005,16 +1214,19 @@ final class ServerController: ObservableObject {
                     finishedCleanly = true
                 case .engine(.finished(let result)):
                     try await ensureStart()
-                    // Tail text the throttle never emitted.
-                    if result.thinkingText.count > sentThinking.count && result.thinkingText.hasPrefix(sentThinking) {
+                    // Tail text the throttle never emitted; the engine has
+                    // already trimmed stop matches, so no hold-back applies.
+                    let tailThinking = Self.safeStreamDelta(accumulated: result.thinkingText, sent: sentThinking, stopSequences: [])
+                    if !tailThinking.isEmpty {
                         try await openThinking()
-                        try await sse("content_block_delta", AnthropicContentBlockDeltaEvent(index: thinkingIndex ?? 0, delta: .thinking(String(result.thinkingText.dropFirst(sentThinking.count)))))
-                        sentThinking = result.thinkingText
+                        try await sse("content_block_delta", AnthropicContentBlockDeltaEvent(index: thinkingIndex ?? 0, delta: .thinking(tailThinking)))
+                        sentThinking += tailThinking
                     }
-                    if result.responseText.count > sentContent.count && result.responseText.hasPrefix(sentContent) {
+                    let tailContent = Self.safeStreamDelta(accumulated: result.responseText, sent: sentContent, stopSequences: [])
+                    if !tailContent.isEmpty {
                         try await openContent()
-                        try await sse("content_block_delta", AnthropicContentBlockDeltaEvent(index: contentIndex ?? 0, delta: .text(String(result.responseText.dropFirst(sentContent.count)))))
-                        sentContent = result.responseText
+                        try await sse("content_block_delta", AnthropicContentBlockDeltaEvent(index: contentIndex ?? 0, delta: .text(tailContent)))
+                        sentContent += tailContent
                     }
                     try await closeOpenBlocks()
                     for call in result.parsedToolCalls {
@@ -1026,8 +1238,11 @@ final class ServerController: ObservableObject {
                         try await sse("content_block_stop", AnthropicContentBlockStopEvent(index: toolIndex))
                     }
                     let stopReason = AnthropicAdapter.finishReasonString(result.finishReason, hasToolCalls: !result.parsedToolCalls.isEmpty)
+                    // Surface which requested sequence ended generation; nil
+                    // (the JSON default) for every other stop reason.
+                    let matchedStop = result.finishReason == .stoppedBySequence ? result.matchedStopSequence : nil
                     try await sse("message_delta", AnthropicMessageDeltaEvent(
-                        delta: .init(stopReason: stopReason, stopSequence: nil),
+                        delta: .init(stopReason: stopReason, stopSequence: matchedStop),
                         usage: .init(outputTokens: result.tokensGenerated)
                     ))
                     try await sse("message_stop", AnthropicMessageStopEvent())

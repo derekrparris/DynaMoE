@@ -342,14 +342,15 @@ enum OpenAIAdapter {
         """
     }
 
-    /// Splits the message list into (systemPrompt, finalUserPromptText).
+    /// Splits the message list into the system prompt and role-tagged turns.
     ///
-    /// Single-turn requests (exactly one non-system message that is the final
-    /// user turn, no prior assistant/tool history) pass through verbatim so
-    /// the underlying ChatPromptFormatter produces the exact native template
-    /// with zero wrapper noise. Multi-turn and tool-continuation requests are
-    /// rendered as a structured transcript.
-    static func splitMessages(_ messages: [OpenAIChatRequest.Message]) throws -> (systemPrompt: String, userPrompt: String) {
+    /// History stays role-structured (rather than being flattened into one
+    /// user block with "User:"/"Assistant:" labels) so the server can render it
+    /// with the model family's native role boundaries. A flattened transcript
+    /// re-tokenizes the whole conversation every turn, so each turn's prompt
+    /// can no longer extend the previous turn's pinned prompt+generation and
+    /// multi-turn requests fully re-prefill.
+    static func splitMessages(_ messages: [OpenAIChatRequest.Message]) throws -> (systemPrompt: String, turns: [ChatPromptFormatter.ConversationTurn]) {
         let systemTexts = messages
             .filter { $0.role == "system" || $0.role == "developer" }
             .compactMap(\.contentText)
@@ -361,18 +362,11 @@ enum OpenAIAdapter {
             throw ServerAPIError.badRequest("messages must contain at least one non-system message")
         }
 
-        // Single-turn fast path: one user message, nothing before it.
-        if conversation.count == 1,
-           conversation[0].role == "user",
-           let text = conversation[0].contentText {
-            return (systemPrompt, text)
-        }
-
-        var blocks: [String] = []
+        var turns: [ChatPromptFormatter.ConversationTurn] = []
         for message in conversation {
             switch message.role {
             case "user":
-                blocks.append("User: \(message.contentText ?? "")")
+                turns.append(.init(role: .user, text: message.contentText ?? ""))
             case "assistant":
                 var lines: [String] = []
                 if let content = message.contentText, !content.isEmpty {
@@ -394,18 +388,21 @@ enum OpenAIAdapter {
                     lines.append("Function calls made:\n\(rendered)")
                 }
                 let body = lines.joined(separator: "\n\n")
-                blocks.append("Assistant: \(body.isEmpty ? "(no content)" : body)")
+                turns.append(.init(role: .assistant, text: body.isEmpty ? "(no content)" : body))
             case "tool", "function":
                 let label = message.name ?? message.toolCallId ?? "tool"
                 let args = message.contentText ?? "(no result)"
-                blocks.append("Function result (\(label)):\n\(args)")
+                turns.append(.init(role: .user, text: "Function result (\(label)):\n\(args)"))
             default:
                 if let content = message.contentText, !content.isEmpty {
-                    blocks.append("\(message.role.capitalized): \(content)")
+                    turns.append(.init(role: .user, text: "\(message.role.capitalized): \(content)"))
                 }
             }
         }
-        return (systemPrompt, blocks.joined(separator: "\n\n"))
+        guard !turns.isEmpty else {
+            throw ServerAPIError.badRequest("messages must contain at least one non-system message")
+        }
+        return (systemPrompt, turns)
     }
 
     /// Stable prefix-cache session key. The OpenAI protocol is stateless, so

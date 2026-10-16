@@ -103,8 +103,10 @@ final class AnthropicAdapterLogicTests: XCTestCase {
         let messages = [
             AnthropicMessagesRequest.Message(role: "user", contentText: "what is 2+2", toolUses: nil, toolResults: nil),
         ]
-        let userPrompt = try AnthropicAdapter.splitMessages(messages)
-        XCTAssertEqual(userPrompt, "what is 2+2")
+        let turns = try AnthropicAdapter.splitMessages(messages)
+        XCTAssertEqual(turns.count, 1)
+        XCTAssertEqual(turns[0].role, .user)
+        XCTAssertEqual(turns[0].text, "what is 2+2")
     }
 
     func testToolContinuationRendersAsTranscript() throws {
@@ -115,12 +117,13 @@ final class AnthropicAdapterLogicTests: XCTestCase {
             {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"all green"}]}
         ]}
         """)
-        let userPrompt = try AnthropicAdapter.splitMessages(request.messages)
-        XCTAssertTrue(userPrompt.contains("User: run the tests"))
-        XCTAssertTrue(userPrompt.contains("shell_run"))
-        XCTAssertTrue(userPrompt.contains("make test"))
-        XCTAssertTrue(userPrompt.contains("Tool result (toolu_1)"))
-        XCTAssertTrue(userPrompt.contains("all green"))
+        let turns = try AnthropicAdapter.splitMessages(request.messages)
+        XCTAssertEqual(turns.map(\.role), [.user, .assistant, .user], "roles must stay native, not flattened into one user block")
+        XCTAssertEqual(turns[0].text, "run the tests")
+        XCTAssertTrue(turns[1].text.contains("shell_run"))
+        XCTAssertTrue(turns[1].text.contains("make test"))
+        XCTAssertTrue(turns[2].text.contains("Tool result (toolu_1)"))
+        XCTAssertTrue(turns[2].text.contains("all green"))
     }
 
     func testRejectsEmptyMessagesAndInvalidRoles() {
