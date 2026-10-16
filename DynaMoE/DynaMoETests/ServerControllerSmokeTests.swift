@@ -15,14 +15,20 @@ final class ServerControllerSmokeTests: XCTestCase {
 
     private var savedServerEnabled: Any?
     private var savedServerPort: Any?
+    private var savedServerAPIKey: Any?
 
     override func setUp() {
         super.setUp()
         let defaults = UserDefaults.standard
         savedServerEnabled = defaults.object(forKey: ServerController.enabledKey)
         savedServerPort = defaults.object(forKey: ServerController.portKey)
+        savedServerAPIKey = defaults.object(forKey: ServerController.apiKeyKey)
         defaults.set(true, forKey: ServerController.enabledKey)
         defaults.set(8787, forKey: ServerController.portKey)
+        // The suite sends unauthenticated requests, so a key saved in the app's
+        // settings (the developer's own machine) must not turn every expectation
+        // into a 401. `testAPIKeyRejectsUnauthorizedRequests` sets its own key.
+        defaults.removeObject(forKey: ServerController.apiKeyKey)
     }
 
     override func tearDown() {
@@ -36,6 +42,11 @@ final class ServerControllerSmokeTests: XCTestCase {
             defaults.set(port, forKey: ServerController.portKey)
         } else {
             defaults.removeObject(forKey: ServerController.portKey)
+        }
+        if let apiKey = savedServerAPIKey {
+            defaults.set(apiKey, forKey: ServerController.apiKeyKey)
+        } else {
+            defaults.removeObject(forKey: ServerController.apiKeyKey)
         }
         super.tearDown()
     }

@@ -206,6 +206,96 @@ final class ChatPromptFormatterConversationTests: XCTestCase {
         XCTAssertTrue(prompt.hasPrefix(turn1 + raw), "the recorded raw generation must still extend the pinned prefix")
     }
 
+    // MARK: - Gemma reasoning channel
+
+    func testGemmaCompletedTurnRewrapsEchoedReasoningInItsChannelBlock() throws {
+        // Gemma's reasoning lives in a native `<|channel>` block. The adapters
+        // fold an echoed reasoning into `reasoning + canonical close + answer`,
+        // which must be re-wrapped here: replayed as bare text the turn neither
+        // reproduces the pinned generation nor reads as a finished answer.
+        let gemma = try config("gemma4")
+        let open = ChatPromptFormatter.gemmaReasoningOpen
+        let close = ChatPromptFormatter.gemmaReasoningClose
+        let prompt = ChatPromptFormatter.formatConversation(
+            turns: [
+                .init(role: .user, text: "hello"),
+                .init(role: .assistant, text: "why" + TurnTextSplitter.canonicalReasoningCloseTag + "ANSWER"),
+                .init(role: .user, text: "again"),
+            ],
+            cleanSystem: system,
+            thinkingEnabled: true,
+            modelSupportsThinking: true,
+            modelConfig: gemma
+        )
+        XCTAssertTrue(
+            prompt.hasPrefix(try gemmaTurnOne() + open + "why" + close + "ANSWER"),
+            "echoed reasoning must be re-wrapped in Gemma's native channel block"
+        )
+        XCTAssertFalse(
+            prompt.contains(TurnTextSplitter.canonicalReasoningCloseTag),
+            "the canonical marker belongs to the other families"
+        )
+    }
+
+    func testGemmaRecordedRawGenerationIsNotRewrapped() throws {
+        // A server-spliced raw generation already carries the native markers;
+        // adding a second channel block would break the pinned prefix.
+        let gemma = try config("gemma4")
+        let raw = ChatPromptFormatter.gemmaReasoningOpen + "why" + ChatPromptFormatter.gemmaReasoningClose + "ANSWER"
+        let prompt = ChatPromptFormatter.formatConversation(
+            turns: [
+                .init(role: .user, text: "hello"),
+                .init(role: .assistant, text: raw),
+                .init(role: .user, text: "again"),
+            ],
+            cleanSystem: system,
+            thinkingEnabled: true,
+            modelSupportsThinking: true,
+            modelConfig: gemma
+        )
+        XCTAssertTrue(prompt.hasPrefix(try gemmaTurnOne() + raw), "the recorded raw generation must extend the pinned prefix")
+    }
+
+    func testGemmaCompletedAnswerWithoutReasoningKeepsAnEmptyChannel() throws {
+        // Thinking was on but the client dropped the reasoning (and the server
+        // had no record to splice): the channel stays explicitly closed and
+        // empty, exactly as the non-thinking template emits it, rather than
+        // leaving the answer inside an unfinished thought.
+        let gemma = try config("gemma4")
+        let prompt = ChatPromptFormatter.formatConversation(
+            turns: [
+                .init(role: .user, text: "hello"),
+                .init(role: .assistant, text: "ANSWER"),
+                .init(role: .user, text: "again"),
+            ],
+            cleanSystem: system,
+            thinkingEnabled: true,
+            modelSupportsThinking: true,
+            modelConfig: gemma
+        )
+        XCTAssertTrue(
+            prompt.hasPrefix(
+                try gemmaTurnOne()
+                    + ChatPromptFormatter.gemmaReasoningOpen
+                    + ChatPromptFormatter.gemmaReasoningClose
+                    + "ANSWER"
+            ),
+            "a completed answer must sit outside an explicitly closed channel block"
+        )
+    }
+
+    /// The single-turn template for a Gemma thinking conversation: the prompt
+    /// every follow-up turn must extend.
+    private func gemmaTurnOne() throws -> String {
+        ChatPromptFormatter.formatPrompt(
+            prompt: "hello",
+            cleanSystem: system,
+            thinkingEnabled: true,
+            modelSupportsThinking: true,
+            modelConfig: try config("gemma4")
+        )
+    }
+
     func testSparkAssistantTurnsCarryEndOfSentenceMarker() throws {
         let spark = try config("spark")
         let prompt = ChatPromptFormatter.formatConversation(

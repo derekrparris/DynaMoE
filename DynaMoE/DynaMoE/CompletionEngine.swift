@@ -335,6 +335,7 @@ public final class CompletionEngine: @unchecked Sendable {
         let promptTokenIds = request.promptTokenIds
         let formattedPrompt = request.formattedPrompt
         let sessionId = request.sessionId
+        let renderedAsOfDate = request.asOfDate
         let agentStep = request.agentStep
         let thinkingEnabled = request.thinkingEnabled
         let promptTokens: [UInt32]? = request.isSplicedContinuation ? request.promptTokenIds : nil
@@ -10211,7 +10212,8 @@ if layer.attnGateProjTensor != nil,
             PrefixCacheManager.shared.recordTurn(
                 promptTokenIds: promptTokenIds,
                 generatedTokenIds: generatedTokenIds,
-                sessionId: sessionId
+                sessionId: sessionId,
+                asOfDate: renderedAsOfDate
             )
             print("📌 [PREFIX] pinned \(promptTokenIds.count + generatedTokenIds.count) tokens (prompt=\(promptTokenIds.count) gen=\(generatedTokenIds.count))")
 

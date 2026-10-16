@@ -112,4 +112,50 @@ final class PrefixAsOfDateTests: XCTestCase {
             "an admitted turn must keep the date it rendered"
         )
     }
+
+    func testPrecisionChangeStillPinsTheDateThePromptRendered() {
+        // A KV-precision change invalidates the pin from inside the turn, after
+        // the prompt was already rendered with `rendered`. Pinning a
+        // completion-time date instead would make the next turn render a
+        // different timestamp, so the pin that was just written could never be
+        // reused (a full re-prefill on a hybrid model).
+        let session = UUID()
+        let rendered = PrefixCacheManager.shared.asOfDate(sessionId: session)
+        PrefixCacheManager.shared.invalidate()
+        Thread.sleep(forTimeInterval: 0.01)
+        PrefixCacheManager.shared.recordTurn(
+            promptTokenIds: [1, 2, 3],
+            generatedTokenIds: [],
+            sessionId: session,
+            asOfDate: rendered
+        )
+        XCTAssertEqual(
+            PrefixCacheManager.shared.asOfDate(sessionId: session),
+            rendered,
+            "the pin must carry the date its prompt actually rendered"
+        )
+    }
+
+    func testUntrackedSessionClaimsNoDateInsteadOfMintingOne() {
+        // Recording a date no prompt ever rendered would make the next turn
+        // diverge from the pin that was just written, so a session the manager
+        // never handed a date to leaves the live pin's date alone.
+        let live = UUID()
+        let liveDate = PrefixCacheManager.shared.asOfDate(sessionId: live)
+        PrefixCacheManager.shared.recordTurn(promptTokenIds: [1], generatedTokenIds: [], sessionId: live)
+
+        let other = UUID()
+        Thread.sleep(forTimeInterval: 0.01)
+        PrefixCacheManager.shared.recordTurn(promptTokenIds: [2], generatedTokenIds: [], sessionId: other)
+        XCTAssertEqual(
+            PrefixCacheManager.shared.asOfDate(sessionId: live),
+            liveDate,
+            "another session must not take over the live pin's date"
+        )
+        XCTAssertNotEqual(
+            PrefixCacheManager.shared.asOfDate(sessionId: other),
+            liveDate,
+            "the untracked session renders its own date"
+        )
+    }
 }

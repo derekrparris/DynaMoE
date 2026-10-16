@@ -293,6 +293,19 @@ final class ServerTurnMemory: @unchecked Sendable {
         var visibleResponse: String
         var promptTokenIds: [UInt32]
         var generatedTokenIds: [UInt32]
+        /// Whether the recorded turn emitted tool calls. Such a turn is echoed
+        /// back as the adapters' decorated call description rather than the raw
+        /// tagged markup, so compatibility must accept that shape (for these
+        /// turns only).
+        var hadToolCalls: Bool = false
+        /// How many leading conversation turns the record's prompt was rendered
+        /// from, and a digest over them plus the rendered system prompt. The
+        /// session key is only a hash of the conversation's opening message, so
+        /// two unrelated conversations can share it; this is what proves the
+        /// record actually belongs to the history on the wire before its raw
+        /// generation is spliced in.
+        var historyTurnCount: Int = 0
+        var historyDigest: UInt64 = 0
     }
 
     private let lock = NSLock()
@@ -320,18 +333,84 @@ final class ServerTurnMemory: @unchecked Sendable {
     /// before comparing and returning: the model emits it as tokens, but a
     /// client never sees it (it is not part of `content`), and the renderer
     /// appends it again when the turn is re-rendered.
-    func recordedRawTurn(sessionId: UUID, modelName: String, echoedByClient: String, turnCloser: String?) -> String? {
+    ///
+    /// `conversation` and `systemPrompt` are the history the request actually
+    /// carries. The session key alone cannot identify a conversation (it hashes
+    /// only the opening message, which unrelated conversations commonly share),
+    /// so the recorded history must match before the raw generation is trusted:
+    /// a colliding conversation whose history diverges is rejected instead of
+    /// having another conversation's private reasoning spliced into its prompt.
+    func recordedRawTurn(
+        sessionId: UUID,
+        modelName: String,
+        echoedByClient: String,
+        turnCloser: String?,
+        conversation: [ChatPromptFormatter.ConversationTurn] = [],
+        systemPrompt: String = ""
+    ) -> String? {
         lock.lock()
         let current = record
         lock.unlock()
         guard let current,
               current.sessionId == sessionId,
               current.modelName == modelName else { return nil }
+        guard Self.historyMatches(
+            systemPrompt: systemPrompt,
+            conversation: conversation,
+            turnCount: current.historyTurnCount,
+            digest: current.historyDigest
+        ) else { return nil }
         let raw = Self.droppingTrailingCloser(current.rawDecodedText, closer: turnCloser)
-        guard Self.isCompatible(echo: echoedByClient, visibleResponse: current.visibleResponse, rawTurn: raw) else {
-            return nil
-        }
+        let echoMatches = Self.isCompatible(echo: echoedByClient, visibleResponse: current.visibleResponse, rawTurn: raw)
+            || (current.hadToolCalls && Self.isToolCallEcho(echoedByClient))
+        guard echoMatches else { return nil }
         return raw
+    }
+
+    /// Whether the request's history still carries the leading turns the
+    /// record's prompt was rendered from. A record with no recorded history
+    /// (non-conversational callers) imposes no constraint.
+    nonisolated static func historyMatches(
+        systemPrompt: String,
+        conversation: [ChatPromptFormatter.ConversationTurn],
+        turnCount: Int,
+        digest: UInt64
+    ) -> Bool {
+        guard turnCount > 0 else { return true }
+        guard conversation.count >= turnCount else { return false }
+        return historyDigest(systemPrompt: systemPrompt, turns: conversation[..<turnCount]) == digest
+    }
+
+    /// FNV-1a digest of the leading conversation turns plus the rendered system
+    /// prompt. Cheap, order-sensitive, and stable across the turns of one
+    /// conversation, which is all the turn memory needs to tell a follow-up
+    /// from an unrelated conversation that merely shares a session key.
+    nonisolated static func historyDigest(
+        systemPrompt: String,
+        turns: ArraySlice<ChatPromptFormatter.ConversationTurn>
+    ) -> UInt64 {
+        var hash: UInt64 = 0xcbf29ce484222325
+        func mix(_ byte: UInt8) { hash = (hash ^ UInt64(byte)) &* 0x100000001b3 }
+        func mixString(_ s: String) {
+            for byte in s.utf8 { mix(byte) }
+            mix(0x1f)
+        }
+        mixString(systemPrompt)
+        for turn in turns {
+            mixString(turn.role == .user ? "user" : "assistant")
+            mixString(turn.text)
+        }
+        return hash
+    }
+
+    /// Whether a client's echoed assistant turn is the adapters' decorated
+    /// tool-call description rather than model text. A faithful echo of a
+    /// tool-call turn can only take this form, so it neither equals the
+    /// recorded visible response nor tail-matches the raw tagged generation.
+    nonisolated static func isToolCallEcho(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return [ChatPromptFormatter.openAIToolCallEchoPrefix, ChatPromptFormatter.anthropicToolCallEchoPrefix]
+            .contains { trimmed.hasPrefix($0) }
     }
 
     /// Drops a trailing assistant-turn closer, if one is present.
@@ -343,9 +422,9 @@ final class ServerTurnMemory: @unchecked Sendable {
     /// Whether a client's echo of the assistant turn is consistent with the
     /// recorded turn. A client may echo the visible answer, the full raw turn
     /// (when it kept the reasoning), or nothing at all (assistant tool-call
-    /// turns carry the call structure instead of text). Anything else means the
-    /// history was edited or the session key collided, so the record is not safe
-    /// to splice in.
+    /// turns carry the call structure instead of text; those are recognized
+    /// separately via `isToolCallEcho`). Anything else means the history was
+    /// edited, so the record is not safe to splice in.
     nonisolated static func isCompatible(echo: String, visibleResponse: String, rawTurn: String) -> Bool {
         let client = echo.trimmingCharacters(in: .whitespacesAndNewlines)
         if client.isEmpty { return true }
@@ -695,6 +774,12 @@ final class ServerController: ObservableObject {
         var promptTokenCount: Int
         var modelName: String
         var hasTools: Bool
+        /// How many leading conversation turns this turn's prompt was rendered
+        /// from, plus a digest over them and the rendered system prompt. Kept on
+        /// the plan so the completed turn can record what a follow-up must
+        /// reproduce before its raw generation may be spliced back in.
+        var historyTurnCount: Int
+        var historyDigest: UInt64
         /// Client tool schemas for the grammar mask (empty when the turn offers
         /// no tools). Installed around the generation so the mask constrains the
         /// model to the client's own tool vocabulary rather than the in-app
@@ -750,6 +835,13 @@ final class ServerController: ObservableObject {
         let engine = CompletionEngine.shared
         let info = try requireLoadedModel()
 
+        // The temporal context this prompt is rendered with. Threaded through the
+        // turn request so the completed turn pins the date its prompt actually
+        // carries: a KV-precision change can invalidate the pin after planning,
+        // and pinning a completion-time date instead would make the next turn
+        // render a different timestamp and lose the prefix.
+        let renderedAsOfDate = PrefixCacheManager.shared.asOfDate(sessionId: inputs.sessionId)
+
         var cleanSystem = ModelConfig.buildEffectiveSystemPrompt(
             userPrompt: inputs.systemPrompt,
             config: engine.promptModelConfig,
@@ -762,7 +854,7 @@ final class ServerController: ObservableObject {
             // splitting the common token prefix a sentence in and forcing
             // hybrid (GDN) sessions — which cannot rewind linear state — into
             // a full ~30 s re-prefill on every agent step.
-            currentDate: PrefixCacheManager.shared.asOfDate(sessionId: inputs.sessionId)
+            currentDate: renderedAsOfDate
         ).trimmingCharacters(in: .whitespacesAndNewlines)
 
         if inputs.hasTools, let declaration = inputs.toolDeclaration {
@@ -770,6 +862,14 @@ final class ServerController: ObservableObject {
         }
 
         let thinkingEnabled = info.supportsThinking && inputs.thinkingRequested
+        // What a follow-up request has to reproduce before its own raw turn can
+        // be trusted: the leading history as the client sent it, plus the system
+        // prompt it was rendered against. Computed before substitution so both
+        // sides of the comparison see the same client-authored turns.
+        let historyDigest = ServerTurnMemory.historyDigest(
+            systemPrompt: cleanSystem,
+            turns: inputs.conversation[...]
+        )
         // Splice in the raw generation recorded for this session (reasoning
         // included) so the rendered prompt reproduces the pinned
         // prompt+generation; a client's echo of the visible answer alone cannot.
@@ -777,7 +877,8 @@ final class ServerController: ObservableObject {
             inputs.conversation,
             sessionId: inputs.sessionId,
             modelName: info.displayName,
-            modelConfig: engine.promptModelConfig
+            modelConfig: engine.promptModelConfig,
+            systemPrompt: cleanSystem
         )
         // A single plain user turn renders exactly as before (native template
         // with zero wrapper noise). A real history renders with the family's
@@ -845,9 +946,18 @@ final class ServerController: ObservableObject {
             agentStep: 0,
             forceSynthesis: false,
             isSplicedContinuation: false,
-            stopSequences: inputs.stopSequences
+            stopSequences: inputs.stopSequences,
+            asOfDate: renderedAsOfDate
         )
-        return TurnPlan(request: turnRequest, promptTokenCount: promptTokenIds.count, modelName: info.displayName, hasTools: inputs.hasTools, maskSchemas: inputs.maskSchemas)
+        return TurnPlan(
+            request: turnRequest,
+            promptTokenCount: promptTokenIds.count,
+            modelName: info.displayName,
+            hasTools: inputs.hasTools,
+            historyTurnCount: inputs.conversation.count,
+            historyDigest: historyDigest,
+            maskSchemas: inputs.maskSchemas
+        )
     }
 
     /// Installs the turn's own tool schemas into the grammar mask for the
@@ -943,20 +1053,31 @@ final class ServerController: ObservableObject {
             rawDecodedText: result.rawDecodedText,
             visibleResponse: result.responseText,
             promptTokenIds: result.promptTokenIds,
-            generatedTokenIds: result.generatedTokenIds
+            generatedTokenIds: result.generatedTokenIds,
+            hadToolCalls: Self.turnEmittedToolCalls(result),
+            historyTurnCount: plan.historyTurnCount,
+            historyDigest: plan.historyDigest
         ))
+    }
+
+    /// Whether a finished turn emitted tool calls: a tool freeze, or any call
+    /// the parser recovered. Such a turn reaches a client as a call structure
+    /// rather than as text, which is what the turn memory has to expect back.
+    nonisolated static func turnEmittedToolCalls(_ result: TurnResult) -> Bool {
+        result.finishReason == .toolFreeze || !result.parsedToolCalls.isEmpty
     }
 
     /// Replaces the client's echo of the last assistant turn with the raw
     /// generation recorded for this session, so the rendered prompt reproduces
     /// the pinned prompt+generation (and the prefix stays reusable). Falls back
     /// to the client's own text whenever the record does not clearly belong to
-    /// this turn — see `ServerTurnMemory.isCompatible`.
+    /// this turn — see `ServerTurnMemory.recordedRawTurn`.
     nonisolated private static func substitutingRecordedTurn(
         _ conversation: [ChatPromptFormatter.ConversationTurn],
         sessionId: UUID,
         modelName: String,
-        modelConfig: ModelConfig?
+        modelConfig: ModelConfig?,
+        systemPrompt: String
     ) -> [ChatPromptFormatter.ConversationTurn] {
         let closer = ChatPromptFormatter.assistantTurnCloseTag(modelConfig: modelConfig)
         guard let index = conversation.lastIndex(where: { $0.role == .assistant }),
@@ -964,7 +1085,9 @@ final class ServerController: ObservableObject {
                   sessionId: sessionId,
                   modelName: modelName,
                   echoedByClient: conversation[index].text,
-                  turnCloser: closer
+                  turnCloser: closer,
+                  conversation: conversation,
+                  systemPrompt: systemPrompt
               ) else { return conversation }
         var turns = conversation
         turns[index].text = recorded
@@ -1007,7 +1130,7 @@ final class ServerController: ObservableObject {
     nonisolated private static func nonStreamingResponse(plan: TurnPlan, queue: TurnExecutionQueue) async throws -> OpenAIChatResponse {
         let result = try await runTurn(plan: plan, queue: queue)
 
-        let toolCalls = result.finishReason == .toolFreeze || !result.parsedToolCalls.isEmpty
+        let toolCalls = Self.turnEmittedToolCalls(result)
             ? result.parsedToolCalls.map { call in
                 OpenAIToolCallOut(index: nil, id: "call-\(UUID().uuidString.prefix(8))", type: "function", function: .init(name: call.name, arguments: Self.toolArgumentsJSON(call)))
             }

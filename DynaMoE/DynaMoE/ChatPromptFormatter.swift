@@ -78,7 +78,7 @@ public enum ChatPromptFormatter {
                 if thinkingEnabled {
                     p += "<|turn>model\n"
                 } else {
-                    p += "<|turn>model\n<|channel>thought\n<channel|>"
+                    p += "<|turn>model\n" + Self.gemmaReasoningOpen + Self.gemmaReasoningClose
                 }
                 formattedPrompt = p
             }
@@ -109,6 +109,22 @@ public enum ChatPromptFormatter {
     /// underscores (AGENTS.md: "Reading files safely").
     public static let sparkEndOfSentence = "<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}>"
 
+    /// Gemma 4's native reasoning channel markers. The model opens the channel
+    /// itself after `<|turn>model` when thinking is on, so a completed turn's
+    /// echoed reasoning must be re-wrapped in them: the canonical
+    /// ` thinking`/`</think>` markers the adapters fold in are the *other*
+    /// families' tags and would not reproduce the pinned generation.
+    static let gemmaReasoningOpen = "<|channel>thought\n"
+    static let gemmaReasoningClose = "<channel|>"
+
+    /// Prefixes the protocol adapters use to re-render an assistant tool-call
+    /// turn out of a client's echoed `tool_calls` / `tool_use` structure. A
+    /// faithful echo of a tool-call turn only ever arrives in this form (never
+    /// as the raw tagged markup the model emitted), so the server's turn memory
+    /// has to recognize it to reproduce the pinned generation.
+    public static let openAIToolCallEchoPrefix = "Function calls made:"
+    public static let anthropicToolCallEchoPrefix = "Tool calls made:"
+
     /// Renders a *completed* historical assistant turn's body. When the family's
     /// assistant prefix opened a reasoning block (thinking enabled) a client's
     /// echo (the visible answer, not the reasoning) must not be presented as
@@ -121,6 +137,27 @@ public enum ChatPromptFormatter {
         let close = TurnTextSplitter.canonicalReasoningCloseTag
         guard !text.contains(close) else { return text }
         return close + text
+    }
+
+    /// The Gemma counterpart of `completedAssistantBody`. Gemma's assistant
+    /// prefix leaves the reasoning channel open (`<|turn>model\n`), and the
+    /// adapters hand us the flattened canonical form (`reasoning` + canonical
+    /// close + answer), so the channel boundaries are restored here: the echo
+    /// then reproduces what the model generated instead of replaying reasoning
+    /// as bare text. A body already carrying the native markers (a
+    /// server-spliced raw generation) is left untouched.
+    private static func completedGemmaBody(thinkingEnabled: Bool, text: String) -> String {
+        guard thinkingEnabled, !text.contains(gemmaReasoningClose) else { return text }
+        if let close = text.range(of: TurnTextSplitter.canonicalReasoningCloseTag) {
+            return gemmaReasoningOpen
+                + text[text.startIndex..<close.lowerBound]
+                + gemmaReasoningClose
+                + text[close.upperBound...]
+        }
+        // Thinking was on but the client dropped the reasoning: keep the
+        // channel explicitly closed and empty rather than letting the answer
+        // read as an unfinished thought.
+        return gemmaReasoningOpen + gemmaReasoningClose + text
     }
 
     /// One role-tagged turn of a conversation, before family templating.
@@ -194,7 +231,7 @@ public enum ChatPromptFormatter {
         }
 
         if modelConfig?.isGemma4Model == true {
-            let assistantPrefix = "<|turn>model\n" + (thinkingEnabled ? "" : "<|channel>thought\n<channel|>")
+            let assistantPrefix = "<|turn>model\n" + (thinkingEnabled ? "" : Self.gemmaReasoningOpen + Self.gemmaReasoningClose)
             var p = "<bos>"
             if thinkingEnabled {
                 p += "<|turn>system\n<|think|>\n" + cleanSystem + "<turn|>\n"
@@ -205,7 +242,7 @@ public enum ChatPromptFormatter {
                 if turn.role == .user {
                     p += "<|turn>user\n" + turn.text + "<turn|>\n"
                 } else {
-                    p += assistantPrefix + turn.text + "<turn|>\n"
+                    p += assistantPrefix + Self.completedGemmaBody(thinkingEnabled: thinkingEnabled, text: turn.text) + "<turn|>\n"
                 }
             }
             p += assistantPrefix

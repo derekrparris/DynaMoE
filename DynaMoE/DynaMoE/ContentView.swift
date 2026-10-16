@@ -4550,7 +4550,8 @@ struct ContentView: View {
             thinkingEnabled: thinkingEnabled,
             agentStep: agentStep,
             forceSynthesis: forceSynthesis,
-            isSplicedContinuation: (promptTokens?.isEmpty == false)
+            isSplicedContinuation: (promptTokens?.isEmpty == false),
+            asOfDate: generationDate
         )
 
         let launch: CompletionLaunch

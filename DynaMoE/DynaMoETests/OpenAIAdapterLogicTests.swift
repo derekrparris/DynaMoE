@@ -204,7 +204,7 @@ final class OpenAIAdapterLogicTests: XCTestCase {
     // MARK: - Session keys
 
     func testSessionKeyStableAcrossConversationTurns() throws {
-        // The key is anchored on the conversation's first message, which
+        // The key is anchored on the conversation's first USER message, which
         // stateless clients resend verbatim with every turn.
         let first = try decodeRequest("""
         {"messages":[{"role":"system","content":"you are helpful"},{"role":"user","content":"turn one"}]}
@@ -215,6 +215,23 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         let keyOne = OpenAIAdapter.sessionKey(for: first.messages, model: "m")
         let keyTwo = OpenAIAdapter.sessionKey(for: second.messages, model: "m")
         XCTAssertEqual(keyOne, keyTwo, "appending turns must keep the session identity stable")
+    }
+
+    func testSessionKeyDistinguishesConversationsSharingASystemMessage() throws {
+        // Every conversation a client opens usually carries the same system
+        // message, so anchoring on the first message (rather than on the first
+        // user turn) handed unrelated conversations a single session identity.
+        let a = try decodeRequest("""
+        {"messages":[{"role":"system","content":"you are helpful"},{"role":"user","content":"first question"}]}
+        """)
+        let b = try decodeRequest("""
+        {"messages":[{"role":"system","content":"you are helpful"},{"role":"user","content":"another question"}]}
+        """)
+        XCTAssertNotEqual(
+            OpenAIAdapter.sessionKey(for: a.messages, model: "m"),
+            OpenAIAdapter.sessionKey(for: b.messages, model: "m"),
+            "conversations that share only their system message must not share a session"
+        )
     }
 
     func testSessionKeyDiffersAcrossConversationsAndModels() throws {

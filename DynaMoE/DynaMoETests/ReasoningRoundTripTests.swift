@@ -157,6 +157,178 @@ final class ReasoningRoundTripTests: XCTestCase {
         )
     }
 
+    // MARK: - Session-key collision safety
+
+    /// A record whose prompt was rendered from `turns` against `system`.
+    private func storedRecord(
+        session: UUID,
+        system: String,
+        turns: [ChatPromptFormatter.ConversationTurn],
+        raw: String,
+        visible: String,
+        hadToolCalls: Bool = false
+    ) -> ServerTurnMemory.Record {
+        ServerTurnMemory.Record(
+            sessionId: session,
+            modelName: "m",
+            rawDecodedText: raw,
+            visibleResponse: visible,
+            promptTokenIds: [],
+            generatedTokenIds: [],
+            hadToolCalls: hadToolCalls,
+            historyTurnCount: turns.count,
+            historyDigest: ServerTurnMemory.historyDigest(systemPrompt: system, turns: turns[...])
+        )
+    }
+
+    func testCollidingSessionKeyCannotSpliceAnotherConversationsReasoning() {
+        // Two conversations can share a session key (same opening message and
+        // model) and can even share an echoed reply such as "OK". The history
+        // check is then the only thing between one conversation's private
+        // reasoning and the other's prompt.
+        let memory = ServerTurnMemory()
+        let session = UUID()
+        let raw = "private reasoning" + reasoningClose + "OK"
+        let recordedHistory: [ChatPromptFormatter.ConversationTurn] = [
+            .init(role: .user, text: "hi"),
+            .init(role: .assistant, text: "OK"),
+            .init(role: .user, text: "next"),
+        ]
+        memory.store(storedRecord(
+            session: session,
+            system: "you are helpful",
+            turns: recordedHistory,
+            raw: raw,
+            visible: "OK"
+        ))
+
+        let diverged: [ChatPromptFormatter.ConversationTurn] = [
+            .init(role: .user, text: "hi"),
+            .init(role: .assistant, text: "OK"),
+            .init(role: .user, text: "something else entirely"),
+            .init(role: .assistant, text: "OK"),
+        ]
+        XCTAssertNil(
+            memory.recordedRawTurn(
+                sessionId: session,
+                modelName: "m",
+                echoedByClient: "OK",
+                turnCloser: nil,
+                conversation: diverged,
+                systemPrompt: "you are helpful"
+            ),
+            "a conversation whose history diverged must not receive the recorded reasoning"
+        )
+        XCTAssertNil(
+            memory.recordedRawTurn(
+                sessionId: session,
+                modelName: "m",
+                echoedByClient: "OK",
+                turnCloser: nil,
+                conversation: [.init(role: .user, text: "hi")],
+                systemPrompt: "you are helpful"
+            ),
+            "a history shorter than the recorded one cannot vouch for it"
+        )
+        XCTAssertNil(
+            memory.recordedRawTurn(
+                sessionId: session,
+                modelName: "m",
+                echoedByClient: "OK",
+                turnCloser: nil,
+                conversation: recordedHistory,
+                systemPrompt: "a different system prompt"
+            ),
+            "a different system prompt is a different conversation"
+        )
+
+        // The conversation that actually produced the turn still reuses it.
+        XCTAssertEqual(
+            memory.recordedRawTurn(
+                sessionId: session,
+                modelName: "m",
+                echoedByClient: "OK",
+                turnCloser: nil,
+                conversation: recordedHistory + [
+                    .init(role: .assistant, text: "OK"),
+                    .init(role: .user, text: "again"),
+                ],
+                systemPrompt: "you are helpful"
+            ),
+            raw
+        )
+    }
+
+    func testToolCallTurnsAcceptTheDecoratedEchoTheirClientSends() {
+        // A tool-call turn reaches a client as a call structure, so a faithful
+        // echo arrives as the adapters' decorated description — never as the raw
+        // tagged markup — and must still reproduce the pinned generation.
+        let memory = ServerTurnMemory()
+        let session = UUID()
+        let opening: [ChatPromptFormatter.ConversationTurn] = [.init(role: .user, text: "hi")]
+        let raw = StreamingToolParser.qwenToolCallOpen
+            + "<function=get_weather><parameter=city>Oslo</parameter></function>"
+            + StreamingToolParser.qwenToolCallClose
+        let decorated = ChatPromptFormatter.openAIToolCallEchoPrefix
+            + "\n" + #"{"arguments":"{\"city\":\"Oslo\"}","id":"call-1","name":"get_weather"}"#
+        memory.store(storedRecord(
+            session: session,
+            system: "you are helpful",
+            turns: opening,
+            raw: raw,
+            visible: "",
+            hadToolCalls: true
+        ))
+        let followUp: [ChatPromptFormatter.ConversationTurn] = opening + [
+            .init(role: .assistant, text: decorated),
+            .init(role: .user, text: "Function result (call-1):\n18 degrees"),
+        ]
+        XCTAssertEqual(
+            memory.recordedRawTurn(
+                sessionId: session,
+                modelName: "m",
+                echoedByClient: decorated,
+                turnCloser: nil,
+                conversation: followUp,
+                systemPrompt: "you are helpful"
+            ),
+            raw,
+            "a decorated tool-call echo must reproduce the tagged generation"
+        )
+        XCTAssertEqual(
+            memory.recordedRawTurn(
+                sessionId: session,
+                modelName: "m",
+                echoedByClient: ChatPromptFormatter.anthropicToolCallEchoPrefix + "\n" + #"{"name":"get_weather"}"#,
+                turnCloser: nil,
+                conversation: followUp,
+                systemPrompt: "you are helpful"
+            ),
+            raw,
+            "the Anthropic adapter's spelling must be recognized too"
+        )
+
+        // A turn that emitted no calls cannot legitimately receive that shape.
+        memory.store(storedRecord(
+            session: session,
+            system: "you are helpful",
+            turns: opening,
+            raw: "just an answer",
+            visible: "just an answer"
+        ))
+        XCTAssertNil(
+            memory.recordedRawTurn(
+                sessionId: session,
+                modelName: "m",
+                echoedByClient: decorated,
+                turnCloser: nil,
+                conversation: followUp,
+                systemPrompt: "you are helpful"
+            ),
+            "an unrelated text turn must not accept a tool-call echo"
+        )
+    }
+
     // MARK: - Inline reasoning (the OpenAI server setting)
 
     func testInlineReasoningTextMirrorsTheGeneration() {

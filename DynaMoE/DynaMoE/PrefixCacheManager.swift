@@ -139,16 +139,22 @@ nonisolated public final class PrefixCacheManager: @unchecked Sendable {
         return minted
     }
 
-    /// Makes `sessionId` the owner of the live pin's rendered date. Called only
-    /// when a turn actually records a pin, so a session that never runs leaves
-    /// the existing pin's date untouched.
-    private func promoteAsOfDateLocked(for sessionId: UUID?) {
+    /// Makes `sessionId` the owner of the live pin's rendered date. Callers that
+    /// know the date their prompt embedded pass it in (`renderedAsOfDate`); that
+    /// is the authoritative value, because the pin has to carry the temporal
+    /// context the prompt actually rendered. Without it the date minted for this
+    /// session at planning time is used. A session the manager never handed a
+    /// date to claims nothing rather than minting a completion-time date that no
+    /// prompt ever rendered.
+    private func promoteAsOfDateLocked(for sessionId: UUID?, renderedAsOfDate: Date?) {
         guard let sessionId else { return }
         if let idx = pendingAsOfDates.firstIndex(where: { $0.sessionId == sessionId }) {
-            pinnedAsOfDate = (sessionId, pendingAsOfDates.remove(at: idx).date)
-        } else if pinnedAsOfDate?.sessionId != sessionId {
-            pinnedAsOfDate = (sessionId, Date())
+            let pending = pendingAsOfDates.remove(at: idx).date
+            pinnedAsOfDate = (sessionId, renderedAsOfDate ?? pending)
+            return
         }
+        guard let renderedAsOfDate else { return }
+        pinnedAsOfDate = (sessionId, renderedAsOfDate)
     }
 
     /// Records the full token sequence after a turn completes (prompt + generated tokens).
@@ -156,7 +162,10 @@ nonisolated public final class PrefixCacheManager: @unchecked Sendable {
     ///   - promptTokenIds: The prompt tokens used.
     ///   - generatedTokenIds: The tokens generated during this turn.
     ///   - sessionId: The active session ID.
-    public func recordTurn(promptTokenIds: [UInt32], generatedTokenIds: [UInt32], sessionId: UUID?) {
+    ///   - asOfDate: The date this turn's prompt rendered, when the caller knows
+    ///     it. Preferred over the planning-time mint so the pin always carries
+    ///     the rendered context (`invalidate` can drop that mint mid-turn).
+    public func recordTurn(promptTokenIds: [UInt32], generatedTokenIds: [UInt32], sessionId: UUID?, asOfDate: Date? = nil) {
         lock.lock()
         defer { lock.unlock() }
 
@@ -165,7 +174,7 @@ nonisolated public final class PrefixCacheManager: @unchecked Sendable {
         var full = promptTokenIds
         full.append(contentsOf: generatedTokenIds)
         self.pinnedTokenIds = full
-        promoteAsOfDateLocked(for: sessionId)
+        promoteAsOfDateLocked(for: sessionId, renderedAsOfDate: asOfDate)
     }
 
     /// Explicitly updates the pinned token list (e.g. after prefill or partial generation).

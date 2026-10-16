@@ -109,6 +109,12 @@ internal struct CompletionTurnRequest: Sendable {
     /// New in the API path: arbitrary stop sequences, matched incrementally
     /// against decoded text. Empty for chat turns (EOS/end-tag guards govern).
     var stopSequences: [String]
+    /// The date the caller rendered into this prompt's temporal block (`nil`
+    /// when the caller renders no date). Pinned with the turn so the next turn
+    /// reproduces the byte-identical temporal context: a re-minted date would
+    /// split the common token prefix and force a full re-prefill, which a
+    /// hybrid (GDN) session cannot rewind.
+    var asOfDate: Date?
 
     init(
         promptTokenIds: [UInt32],
@@ -121,7 +127,8 @@ internal struct CompletionTurnRequest: Sendable {
         agentStep: Int = 0,
         forceSynthesis: Bool = false,
         isSplicedContinuation: Bool = false,
-        stopSequences: [String] = []
+        stopSequences: [String] = [],
+        asOfDate: Date? = nil
     ) {
         self.promptTokenIds = promptTokenIds
         self.formattedPrompt = formattedPrompt
@@ -134,6 +141,7 @@ internal struct CompletionTurnRequest: Sendable {
         self.forceSynthesis = forceSynthesis
         self.isSplicedContinuation = isSplicedContinuation
         self.stopSequences = stopSequences
+        self.asOfDate = asOfDate
     }
 }
 

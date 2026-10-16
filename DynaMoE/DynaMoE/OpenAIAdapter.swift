@@ -463,7 +463,7 @@ enum OpenAIAdapter {
                         return "{\"name\": \"\(call.function.name)\"}"
                     }
                     .joined(separator: "\n")
-                    lines.append("Function calls made:\n\(rendered)")
+                    lines.append(ChatPromptFormatter.openAIToolCallEchoPrefix + "\n" + rendered)
                 }
                 let body = lines.joined(separator: "\n\n")
                 turns.append(.init(role: .assistant, text: body.isEmpty ? "(no content)" : body))
@@ -484,14 +484,15 @@ enum OpenAIAdapter {
     }
 
     /// Stable prefix-cache session key. The OpenAI protocol is stateless, so
-    /// identity is derived from the conversation's FIRST message plus the
-    /// model: stateless clients resend the full history, and that first
-    /// message is the anchor that never changes as a conversation grows.
-    /// That keeps the engine's single-slot prefix pin matching across turns.
-    /// Collisions across conversations sharing a first message are harmless —
-    /// reuse is still gated on exact token-prefix equality inside
-    /// PrefixCacheManager.findCommonPrefix. Deterministic UUID (FNV-1a over
-    /// two lanes); pure and testable.
+    /// identity is anchored on the conversation's FIRST USER message plus the
+    /// model: stateless clients resend the full history, that message never
+    /// changes as a conversation grows, and — unlike the leading system
+    /// message, which every conversation a client opens usually shares — it is
+    /// what distinguishes unrelated conversations. Deterministic UUID (FNV-1a
+    /// over two lanes); pure and testable. Two conversations that open
+    /// identically still collide, so reuse is additionally gated on exact
+    /// token-prefix equality inside PrefixCacheManager.findCommonPrefix and on
+    /// `ServerTurnMemory` re-validating the rendered history.
     static func sessionKey(for messages: [OpenAIChatRequest.Message], model: String?) -> UUID {
         var lane0: UInt64 = 0xcbf29ce484222325
         var lane1: UInt64 = 0x9e3779b97f4a7c15
@@ -505,14 +506,14 @@ enum OpenAIAdapter {
             mix(0x1f)
         }
         mixString(model ?? "")
-        if let first = messages.first {
-            mixString(first.role)
-            mixString(first.contentText ?? "")
-            for call in first.toolCalls ?? [] {
+        if let anchor = messages.first(where: { $0.role == "user" }) ?? messages.first {
+            mixString(anchor.role)
+            mixString(anchor.contentText ?? "")
+            for call in anchor.toolCalls ?? [] {
                 mixString("call:" + call.function.name)
                 mixString(call.function.arguments ?? "")
             }
-            mixString(first.name ?? "")
+            mixString(anchor.name ?? "")
         }
 
         var bytes = [UInt8](repeating: 0, count: 16)

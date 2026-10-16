@@ -597,7 +597,7 @@ enum AnthropicAdapter {
                         return "{\"name\": \"\(use.name)\"}"
                     }
                     .joined(separator: "\n")
-                    parts.append("Tool calls made:\n\(rendered)")
+                    parts.append(ChatPromptFormatter.anthropicToolCallEchoPrefix + "\n" + rendered)
                 }
                 let body = parts.joined(separator: "\n\n")
                 turns.append(.init(role: .assistant, text: body.isEmpty ? "(no content)" : body))
@@ -614,13 +614,13 @@ enum AnthropicAdapter {
     }
 
     /// Stable prefix-cache session key, mirroring the OpenAI adapter scheme:
-    /// identity is anchored on the conversation's FIRST message (stateless
-    /// clients resend the full history, and the first message never changes
-    /// as a conversation grows) plus the model. Collisions across
-    /// conversations sharing a first message are harmless — reuse is still
-    /// gated on exact token-prefix equality inside
-    /// PrefixCacheManager.findCommonPrefix. Deterministic UUID (FNV-1a over
-    /// two lanes); pure and testable.
+    /// identity is anchored on the conversation's FIRST USER message
+    /// (stateless clients resend the full history, and the opening message
+    /// never changes as a conversation grows) plus the model. Deterministic
+    /// UUID (FNV-1a over two lanes); pure and testable. Two conversations that
+    /// open identically still collide, so reuse is additionally gated on exact
+    /// token-prefix equality inside PrefixCacheManager.findCommonPrefix and on
+    /// `ServerTurnMemory` re-validating the rendered history.
     static func sessionKey(for messages: [AnthropicMessagesRequest.Message], model: String?) -> UUID {
         var lane0: UInt64 = 0xcbf29ce484222325
         var lane1: UInt64 = 0x9e3779b97f4a7c15
@@ -634,14 +634,14 @@ enum AnthropicAdapter {
             mix(0x1f)
         }
         mixString(model ?? "")
-        if let first = messages.first {
-            mixString(first.role)
-            mixString(first.contentText ?? "")
-            for use in first.toolUses ?? [] {
+        if let anchor = messages.first(where: { $0.role == "user" }) ?? messages.first {
+            mixString(anchor.role)
+            mixString(anchor.contentText ?? "")
+            for use in anchor.toolUses ?? [] {
                 mixString("call:" + use.name)
                 mixString(use.inputJSON ?? "")
             }
-            for result in first.toolResults ?? [] {
+            for result in anchor.toolResults ?? [] {
                 mixString("result:" + (result.toolUseId ?? ""))
                 mixString(result.content ?? "")
             }
