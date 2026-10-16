@@ -31,14 +31,21 @@ A comprehensive, practical guide to configuring, tuning, and operating DynaMoE o
    - [Safety Limits (Max Output & Max Steps)](#safety-limits)
    - [Search Integrations (Headless Chrome & Brave Search)](#search-integrations)
    - [Built-In Local Tools Reference](#built-in-local-tools-reference)
-7. [Advanced Diagnostics](#7-advanced-diagnostics)
+7. [Local Inference Server](#7-local-inference-server)
+   - [Enabling the Server](#enabling-the-server)
+   - [Live Status](#live-status)
+   - [Endpoints & Authentication](#endpoints--authentication)
+   - [Reasoning in Content](#reasoning-in-content)
+   - [Queueing & Guardrails](#queueing--guardrails)
+   - [Client Setup](#client-setup)
+8. [Advanced Diagnostics](#advanced-diagnostics)
    - [SafeTensors Sharded Metadata & Search](#safetensors-sharded-metadata--search)
    - [Direct Metal Kernel Execution Harness](#direct-metal-kernel-execution-harness)
-8. [Hardware Profiles & Recommended Configurations](#8-hardware-profiles--recommended-configurations)
+9. [Hardware Profiles & Recommended Configurations](#9-hardware-profiles--recommended-configurations)
    - [16 GB Unified RAM (M1/M2/M3/M4)](#16-gb-unified-ram-m1m2m3m4)
    - [24 GB – 36 GB Unified RAM](#24-gb--36-gb-unified-ram)
    - [64 GB – 128 GB+ Unified RAM (M-Max / M-Ultra)](#64-gb--128-gb-unified-ram-m-max--m-ultra)
-9. [Frequently Asked Questions & Troubleshooting](#9-frequently-asked-questions--troubleshooting)
+10. [Frequently Asked Questions & Troubleshooting](#10-frequently-asked-questions--troubleshooting)
 
 ---
 
@@ -364,7 +371,66 @@ DynaMoE equips models with the following native tools:
 
 ---
 
-## 7. Advanced Diagnostics
+## 7. Local Inference Server
+
+The **Local Inference Server** section turns DynaMoE into a local API server: the model loaded in the app answers OpenAI Chat Completions and Anthropic Messages requests from any client on your Mac, with no external service and no network egress. It drives the same headless engine as the chat UI, so a client gets what the app would have generated: the same chat templates, samplers, KV-cache prefix reuse, grammar-constrained tool calls, reasoning splitting and stop-sequence handling.
+
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│  Local Inference Server Section                                        │
+│  Live Status:                                                          │
+│  Server State:      [● Running]                                        │
+│  Endpoint:          [http://127.0.0.1:8787/v1] [Copy]                  │
+│  Serving Model:     [Qwen3.8-Flash-Next] [Copy]                        │
+│  Engine Activity:   [Generating | Idle]                                │
+│  Queued Turns:      [1]     Requests In Flight: [1]                    │
+│  Total Requests:    [42]    Authentication: [Open Access | API Key]    │
+│                                                                        │
+│  Control:                                                              │
+│  Enable Local Server:  [ON]                                            │
+│  Port:                 [8787]  [Restart]                               │
+│  Reasoning in Content: [OFF]                                           │
+│                                                                        │
+│  Connecting Clients:                                                   │
+│  Available Endpoints: POST /v1/chat/completions, POST /v1/messages,    │
+│                       GET /v1/models, GET /health                      │
+│  Model Name:          [loaded model name] [Copy]                       │
+│  Max Tokens Default:  [Generation tab value]                           │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### Enabling the Server
+- **Enable Local Server**: Starts the server immediately and automatically on every subsequent launch. Toggling it off stops the server at once and drops any in-flight SSE streams (an in-progress in-app response is left alone).
+- **Port**: The TCP port the server listens on (default 8787). A changed port takes effect after a restart, which the **Restart** button performs without touching the enable setting.
+- The server binds to `127.0.0.1` only, so nothing outside your Mac can reach it, and only locally loaded weights are servable (the Apple system model is a separate, chat-only backend).
+
+### Live Status
+- **Server State** and **Engine Activity**: Whether the server is listening, and whether a completion turn is generating on the GPU right now.
+- **Endpoint** and **Serving Model**: The base URL and the model id clients should reference (also what `GET /v1/models` returns). Both have copy buttons. Requests are rejected with `503` until a model is loaded.
+- **Queued Turns**, **Requests In Flight**, **Total Requests**: The in-process queue depth (including the running turn), the completions being handled right now, and the total accepted since launch. **Authentication** reports whether an API key is required.
+
+### Endpoints & Authentication
+- `POST /v1/chat/completions` (OpenAI) and `POST /v1/messages` (Anthropic), each streaming (SSE) or non-streaming, plus `GET /v1/models` and `GET /health` (`status`, `model_loaded`, `model`, `engine_active`).
+- Set an API key to require it as `Authorization: Bearer <key>` (OpenAI convention) or `x-api-key: <key>` (Anthropic convention). An empty key accepts any local process. Changes apply immediately.
+
+### Reasoning in Content
+- **Reasoning in Content** (OpenAI endpoint only): When on, reasoning is folded into `content` inside the model's own reasoning tags instead of being reported as `reasoning_content` deltas, so clients that ignore that extension still display it, and they echo it back on the next turn.
+
+### Queueing & Guardrails
+- **One turn at a time**: The engine is single-flight, so concurrent requests queue in arrival order and queued streaming clients receive SSE heartbeats so they never idle-timeout while waiting. A request that arrives while an in-app response is generating is answered with `503` once it reaches the front of the queue.
+- **Queue deadline**: `dynamoe_server_queue_timeout` (default 120 seconds) rejects requests that wait too long with `408` (or an SSE error). `0` waits indefinitely.
+- **Prompt ceiling**: `dynamoe_server_max_prompt_tokens` (default 262,144 tokens) rejects oversized prompts with `400` before prefill. `0` disables the check.
+- **Multi-turn prefix reuse**: A client resends the whole conversation every turn, so the server records the last completed turn (reasoning included) and replays it whenever the echoed history matches, letting a follow-up extend the pinned prompt instead of re-prefilling it. Reuse is refused whenever the history, rendered system prompt or echoed answer no longer match.
+
+### Client Setup
+- Point an OpenAI-compatible client at `http://127.0.0.1:8787/v1` or an Anthropic client at `http://127.0.0.1:8787`. Any `model` string is accepted; the loaded model answers every request.
+- Anthropic requests must send `max_tokens`; an OpenAI request that omits it falls back to the **Max Tokens Default** shown above (the Generation tab value).
+- Reasoning-capable models separate their thinking into `reasoning_content` (OpenAI) or thinking blocks (Anthropic): pass `"enable_thinking": false` on the OpenAI endpoint to disable it, or leave `thinking` unset on the Anthropic endpoint.
+- Tool schemas sent in `tools` are honored: calls return as `tool_calls` (OpenAI) or `tool_use` blocks (Anthropic), and sending the results back continues the loop. `tool_choice` accepts `auto` and `none`; forced choices are rejected with `400`, and an Anthropic request that ends with assistant text (a response prefill) is rejected as well.
+
+---
+
+## 8. Advanced Diagnostics
 
 The **Advanced Diagnostics** section is an engineering inspection suite for validating Metal shaders, examining raw SafeTensors tensors, and testing layer forward execution independently of chat generation.
 
@@ -395,7 +461,7 @@ Test GPU compute pipelines in isolation without running full autoregressive gene
 
 ---
 
-## 8. Hardware Profiles & Recommended Configurations
+## 9. Hardware Profiles & Recommended Configurations
 
 ### 16 GB Unified RAM (M1/M2/M3/M4)
 - **Primary Model**: `ornith-ai/Ornith-1.5-9B` (Dense Hybrid GDN; BF16 weights stream from SSD).
@@ -423,7 +489,7 @@ Test GPU compute pipelines in isolation without running full autoregressive gene
 
 ---
 
-## 9. Frequently Asked Questions & Troubleshooting
+## 10. Frequently Asked Questions & Troubleshooting
 
 #### Q: Why does token generation speed gradually decrease over a long thinking chain?
 **A:** This occurs primarily because of the model's hybrid architecture. For example, Ornith 1.5 9B has 24 Gated DeltaNet layers (which run in constant $O(1)$ time) and 8 full Grouped-Query Attention (GQA) layers (which must scan all previous tokens in the KV cache on every step, scaling $O(T)$). Additionally, the displayed tokens/sec is a cumulative running average from token 1, meaning as instantaneous speed naturally drops at 4,000+ tokens, the displayed average will gradually slide toward 1.5–2.0 tok/s.

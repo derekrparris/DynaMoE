@@ -1,8 +1,8 @@
 # DynaMoE
 
-*Dynamic, SSD-Streamed Mixture-of-Experts, Hybrid Attention, JetSpec Speculative Tree Acceleration, and Native Autonomous Coding Agent on Apple Silicon.*
+*Dynamic, SSD-Streamed Mixture-of-Experts, Hybrid Attention, JetSpec Speculative Tree Acceleration, Native Autonomous Coding Agent, and Local OpenAI/Anthropic-Compatible Inference Server on Apple Silicon.*
 
-DynaMoE is a high-performance native macOS application, local inference engine, and autonomous developer assistant.
+DynaMoE is a high-performance native macOS application, a local inference engine, an autonomous developer assistant, and a local inference server that other tools on your Mac can talk to over OpenAI- and Anthropic-compatible APIs.
 
 Engineered specifically for Apple Silicon's Unified Memory Architecture (UMA), DynaMoE runs massive Mixture-of-Experts (MoE) and cutting-edge hybrid attention architectures that exceed physical system RAM by dynamically memory-mapping and streaming weights directly from high-speed NVMe storage to the GPU. It also runs dense language models.
 
@@ -21,10 +21,11 @@ The following AI models have been used to code DynaMoE:
 * Deepseek V4.1 Flash
 * Kimi K3
 
-Special thanks and acknowledgement to the open-source projects and research that inspired and influenced this architecture:
+Special thanks and acknowledgement to the open-source projects, dependencies, and research that inspired this architecture and power it today:
 * **JetSpec** (Hao AI Lab / UC San Diego — [arXiv:2606.18394](https://arxiv.org/html/2606.18394v2)): Causal parallel tree drafting and tree-causal attention verification for breakthrough speculative decoding throughput.
 * **Flash-MoE** (https://github.com/danveloper/flash-moe) by Dan Woods: Pioneering work on MoE expert repackaging format and contiguous binary layer storage layout (`packed_experts/layer_XX.bin`). DynaMoE builds upon Flash-MoE's expert restructuring concepts to enable high-throughput asynchronous POSIX `pread` file streaming directly into shared Metal GPU buffers.
 * **Colibri** (https://github.com/JustVugg/colibri): Pioneering work on high-speed off-disk model execution.
+* **Hummingbird** (https://github.com/hummingbird-project/hummingbird): The Swift server framework that backs DynaMoE's local inference server, exposing the loaded model over OpenAI- and Anthropic-compatible APIs.
 
 ---
 
@@ -36,7 +37,7 @@ DynaMoE supports sparse Mixture-of-Experts, hybrid recurrent SSM/attention archi
 
 **Important Note:** DynaMoE uses custom Metal kernels and shaders to run models efficiently and to take full advantage of Apple's unified memory architecture. **There is no need to use MLX quantizations** in DynaMoE. In fact, in many cases, an MLX version will run slower or not run at all in DynaMoE. It is advisable to run the native (non MLX and non-GGUF) versions of models in DynaMoE.
 
-On macOS 26 or later with Apple Intelligence enabled, Apple's built-in **on-device Foundation Model** is also selectable as a zero-install chat backend (plain chat; agent tools, JetSpec, thinking blocks, and KV-cache prefixing are local-weights features that do not apply). It appears in the chat model picker under **System Models**, and it powers `/compact` manual conversation compaction on any backend: a rolling general summary plus a detailed recap of the most recent work replace the evicted history — leaving a blank slate with just the compaction marker — in every later prompt.
+On macOS 26 or later with Apple Intelligence enabled, Apple's built-in **on-device Foundation Model** is also selectable as a zero-install chat backend (plain chat; agent tools, JetSpec, thinking blocks, and KV-cache prefixing are local-weights features that do not apply). It appears in the chat model picker under **System Models**, and it powers `/compact` manual conversation compaction on any backend: a rolling general summary plus a detailed recap of the most recent work replace the evicted history — leaving a blank slate with just the compaction marker — in every later prompt. The system model is a chat-only backend: the local inference server (below) always serves the locally loaded weights.
 
 **The following models have been tested and should run well in DynaMoE:**
 
@@ -62,6 +63,7 @@ On macOS 26 or later with Apple Intelligence enabled, Apple's built-in **on-devi
 * **Direct Unpacked Shard Streaming**: Direct POSIX `pread` bulk priming from 100+ HuggingFace `.safetensors` shards at sequential NVMe line rate (>4.1 GB/s) without requiring disk-doubling weight repacking.
 * **Strict Working Set RAM Budgeting**: Double-bounded expert cache (`WorkingSetManager`) that evicts stale experts at layer boundaries during prefill and at token boundaries during generation, eliminating RAM spikes.
 * **KV-Cache Prefix Pinning & Delta Prefill**: Intelligent token prefix tracking (`PrefixCacheManager`) that preserves cached Key/Value slots across conversation turns, coupled with a custom Metal GQA kernel protocol that skips redundant invariant tokens to deliver $2.0\times - 3.5\times$ TTFT speedups.
+* **Headless Turn Engine & Local API Server**: One single-flight `CompletionEngine` owns prompt templating, prefill/decode dispatch, KV and working-set policing, sampling, stop sequences, and tool-call freezing, so the chat UI and the local server drive the same machinery. A Hummingbird-based server speaks OpenAI Chat Completions and Anthropic Messages (streaming and non-streaming), reuses the pinned KV prefix across stateless API turns by replaying each turn's recorded generation, installs a client's own tool schemas into the grammar mask for the duration of its turn, and serializes concurrent requests through an in-process FIFO queue.
 * **4-Stream Gated Residuals & N-Gram PLE Support**: 4 parallel structural residual streams with rank-320 bottleneck read/write gates, unit-offset RMSNorms, and zero-copy Layer 2 N-gram Predictive Local Embedding (PLE) row gathering.
 * **JetSpec Speculative Tree Acceleration**: Parallel candidate tree drafting with tree-causal attention masking, expert-aware MoE pruning, and speculative KV cache compaction/rollback.
 * **Dynamic Architecture Auto-Detection**: Inspects `config.json`, SafeTensors headers, and tensor topologies to automatically configure layer count, hidden dimensions, attention heads, KV heads, RoPE theta, RMSNorm eps, unit offsets, and MLP projection types.
@@ -178,6 +180,7 @@ flowchart TD
 * **Antigravity-Style Multi-Session Chat UI:** Full multi-session chat workspace with persistent session history, creation, renaming, deletion, an interactive model switcher, and a 1-click **Profile Selector** (Coder vs. Assistant) in the chat toolbar.
 * **Native macOS View Menu & Zoom Controls:** Top "View" menu options with standard keyboard shortcuts for **Actual Size** (`⌘0`), **Zoom In** (`⌘+`), and **Zoom Out** (`⌘-`) featuring proportional pixel-perfect geometry scaling.
 * **In-App Help & Comprehensive Settings Guide:** Native documentation viewer accessible via **Help $\to$ DynaMoE Help & Settings Guide** (`⌘?`), Settings header button, or offline via [`SETTINGS_GUIDE.md`](SETTINGS_GUIDE.md).
+* **Local Inference Server (OpenAI- & Anthropic-Compatible):** Serves the loaded model on `127.0.0.1` over `/v1/chat/completions`, `/v1/messages`, `/v1/models` and `/health`, with SSE streaming, tool calling, reasoning, stop sequences, usage accounting, optional API-key auth, an in-process request queue, and KV-prefix reuse across stateless client turns. Details in the **Local Inference Server** section below.
 
 ---
 
@@ -185,11 +188,22 @@ flowchart TD
 
 ```text
 DynaMoE/
-├── DynaMoE/                 # Native macOS App (SwiftUI, Metal GPU Pipelines, Inference Engine)
+├── DynaMoE/                 # Native macOS App (SwiftUI, Metal GPU Pipelines, Headless Turn Engine & API Server)
 │   ├── DynaMoEApp.swift     # Application entry point, View/Help menu commands, and AppZoomManager
-│   ├── ContentView.swift    # Core workspace coordinator, Metal compute dispatch, autoregressive engine & prefix pinning
+│   ├── ContentView.swift    # Chat workspace coordinator, Metal compute dispatch and UI wiring around the turn engine
+│   ├── CompletionEngine.swift # Headless single-flight turn executor: prefill/decode dispatch, prefix pinning, tool freeze
+│   ├── CompletionTypes.swift # Turn request, result and event types shared by the UI, the engine and the API server
+│   ├── ChatPromptFormatter.swift # Per-family chat templates and multi-turn rendering that keeps the pin reusable
+│   ├── EngineRuntime.swift  # Engine-runtime state (KV precision, working-set budgets, prefill pools) moved out of the UI
+│   ├── ServerController.swift # Local inference server: routing, auth, SSE writers, FIFO queue and turn lifecycle
+│   ├── OpenAIAdapter.swift  # OpenAI Chat Completions wire types, prompt assembly and response mapping
+│   ├── AnthropicAdapter.swift # Anthropic Messages wire types, thinking blocks, tool_use turns and response mapping
+│   ├── GrammarConstrainedSampler.swift # Token-level grammar mask: tool-call markup and per-turn client tool schemas
+│   ├── NativeToolRegistry.swift # Shell, file and search tool implementations plus the curated child-process environment
 │   ├── ChatDetailView.swift # Antigravity-style chat interface, markdown parser, thinking accordion, model/profile switcher
-│   ├── ChatModels.swift     # Multi-session chat models, message state, and persistence
+│   ├── ChatModels.swift     # Multi-session chat models and message state
+│   ├── ChatSessionStore.swift # Versioned per-conversation JSON persistence, debounced writes and retention pruning
+│   ├── ChatCommand.swift    # Slash commands (compaction and friends) available from the chat composer
 │   ├── AgentHarness.swift   # Autonomous tool calling coordinator, execution pipeline & safety rails
 │   ├── CodebaseIndexer.swift # Background AST document chunker, NL sentence embedder & BM25 inverted index
 │   ├── VectorSearchEngine.swift # Metal GPU cosine similarity kernel dispatch (vector_cosine_similarity_fp32)
@@ -206,7 +220,8 @@ DynaMoE/
 │   ├── ModelProfileManager.swift # Model-specific generation profiles (Coder & Assistant) and persistence
 │   ├── ExpertRepacker.swift # Flash-MoE layer packing utility (packed_experts/layer_XX.bin)
 │   ├── ExpertIOThreadPool.swift # Dedicated background POSIX pread worker pool for packed layers
-│   ├── SettingsSheetView.swift # Comprehensive Settings: Models, Profiles, JetSpec Controls, Dogfooding, Memory Modes
+│   ├── SettingsSheetView.swift # Comprehensive Settings: Models, Profiles, Server, JetSpec Controls, Dogfooding, Memory Modes
+│   ├── SettingsComponents.swift # Reusable settings card, row, badge and status components
 │   ├── SettingsWindowManager.swift # Independent window management for Settings
 │   ├── HelpAndSettingsGuideView.swift # In-app searchable Help & Settings Guide (⌘?)
 │   ├── AboutDynaMoEView.swift # Rich About DynaMoE modal
@@ -219,7 +234,11 @@ DynaMoE/
 ├── core/                    # High-Performance Rust Compute Core (`dynamoe-core`)
 │   ├── Cargo.toml           # Engine dependencies (memmap2, safetensors, uniffi, tokenizers)
 │   ├── src/lib.rs           # Multi-shard mmap engine, index parser, tensor catalog, generalized 3D slicing
-│   └── src/jetspec.rs       # JetSpec candidate tree topology, causal masks, MoE pruner, acceptance oracles
+│   ├── src/jetspec.rs       # JetSpec candidate tree topology, causal masks, MoE pruner, acceptance oracles
+│   └── src/bin/uniffi-bindgen.rs # Bindgen entry point invoked by the app's build phase
+├── DynaMoE/DynaMoETests/    # XCTest suites: pure-logic coverage plus model-bound dogfooding tests
+├── Benchmarks/              # Headless decode benchmark (dynamoe_stream_bench) and the PERF_FINDINGS journal
+├── Tools/                   # Sparkle release, appcast and preflight scripts
 ├── SETTINGS_GUIDE.md        # Complete Settings documentation & hardware tuning guide
 └── README.md
 ```
@@ -232,6 +251,7 @@ DynaMoE/
 - [x] MoE streaming bottleneck resolution (speed increase of over 500% compared to previous streaming speed)
 - [x] Support Apple Foundation Models
 - [x] Use Apple Foundation Model (AFM) to compact conversations
+- [x] Serve the loaded model over OpenAI- and Anthropic-compatible APIs, with streaming, tool calling, reasoning, and prefix reuse across stateless turns
 - [ ] Configurable YaRN RoPE scaling UI toggle for long-context execution up to 1M tokens.
 - [ ] UI/UX refinement
 
@@ -242,9 +262,9 @@ DynaMoE/
 If you're interested in building and running the app in your own development environment:
 
 ### Prerequisites
-* macOS 14.0+ (Sonoma or Sequoia recommended)
+* macOS 15.6+ (macOS 26 or later to use the on-device Apple system model and `/compact` conversation compaction)
 * Apple Silicon Mac (M1/M2/M3/M4/M5/M6, 16 GB+ Unified Memory recommended)
-* Xcode 15.0+ with Command Line Tools
+* Xcode 26 or later with Command Line Tools (the project builds in Swift 5 language mode with default `MainActor` actor isolation)
 * Rust toolchain (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
 
 ### Building and Running
@@ -253,17 +273,17 @@ If you're interested in building and running the app in your own development env
    git clone https://github.com/derekrparris/DynaMoE.git
    cd DynaMoE
    ```
-2. Build the Rust core and generate UniFFI bindings:
+2. Open `DynaMoE/DynaMoE.xcodeproj` in Xcode.
+3. Press **Cmd + R** to build and launch DynaMoE. The app target has a build phase that compiles the Rust core with `cargo` and regenerates the UniFFI Swift bindings into `GeneratedFFI/` on every build, so there is no separate setup step. To do it by hand, the core is a static library:
    ```bash
    cd core
    cargo build --release
-   cargo run --bin uniffi-bindgen generate --library target/release/libdynamoe_core.dylib --language swift --out-dir ../GeneratedFFI
+   cargo run --bin uniffi-bindgen generate --library target/release/libdynamoe_core.a --language swift --no-format --out-dir ../GeneratedFFI
    cd ..
    ```
-3. Open `DynaMoE/DynaMoE.xcodeproj` in Xcode.
-4. Press **Cmd + R** to build and launch DynaMoE.
-5. On startup, DynaMoE automatically scans your `~/.cache/huggingface/hub` directory for downloaded models. Open **Settings (⌘,) $\to$ Models** to select your default model, or select any discovered model directly from the chat dropdown!
-6. For detailed explanations of every setting, sampling formulas, and hardware presets, consult the [**DynaMoE Settings & User Guide**](SETTINGS_GUIDE.md) or open it directly in the app via **Help $\to$ DynaMoE Help & Settings Guide** (`⌘?`).
+   The `--no-format` flag matters: newer `uniffi-bindgen` releases otherwise shell out to `xcrun swift-format`, which can hang the build.
+4. On startup, DynaMoE automatically scans your `~/.cache/huggingface/hub` directory for downloaded models. Open **Settings (⌘,) $\to$ Models** to select your default model, or select any discovered model directly from the chat dropdown!
+5. For detailed explanations of every setting, sampling formulas, and hardware presets, consult the [**DynaMoE Settings & User Guide**](SETTINGS_GUIDE.md) or open it directly in the app via **Help $\to$ DynaMoE Help & Settings Guide** (`⌘?`).
 
 If you want to help test beta releases of the app, check the releases section. use the in-app documentation for guidance on using the various settings.
 
@@ -271,20 +291,36 @@ Additional things to be aware of:
 
 Ling 3.0 Tiny does not support FP8 quantization. So if you choose that option in settings, know that DynaMoE will automatically fall back to FP16.
 
+If a build fails with `error: cannot execute tool 'metal' due to missing Metal Toolchain`, the Metal toolchain is a separately downloaded component on recent Xcode versions: run `xcodebuild -downloadComponent MetalToolchain`.
+
+The Xcode targets always link `core/target/debug/libdynamoe_core.a`; the Release build phase copies the release archive over that path so both configurations work through the same reference. Don't remove that copy step.
+
 ---
 
 ## 🌐 Local Inference Server (OpenAI- & Anthropic-compatible APIs)
 
-DynaMoE can serve the currently loaded model as a local inference server on `127.0.0.1` — no external service, no egress. Enable it in **Settings (⌘,) → Server** (it then auto-starts on every launch), or watch live status, queue depth, and request counters in the same tab.
+DynaMoE can serve the model currently loaded in the app as a local inference server on `127.0.0.1` — no external service, no egress. Enable it in **Settings (⌘,) → Server** (it then auto-starts on every launch), or watch live status, queue depth, request counters and the last error in the same tab.
+
+The server drives the same headless turn engine as the chat UI, so a client gets what the app would have generated: the same per-family chat templates, samplers, KV-cache prefix reuse, grammar-constrained tool calls, reasoning splitting and stop-sequence handling. Two consequences worth knowing up front: only locally loaded weights are servable (the on-device Apple system model is a separate, chat-only backend), and the API shares the engine's single turn slot with the app, so a request that arrives while an in-app response is generating is answered with `503` once it reaches the front of the queue.
 
 ### Endpoints
 
 | Endpoint | Protocol | Notes |
 | --- | --- | --- |
-| `POST /v1/chat/completions` | OpenAI Chat Completions | Streaming (SSE) + non-streaming; `reasoning_content` deltas for thinking models |
-| `POST /v1/messages` | Anthropic Messages | Streaming + non-streaming; `thinking` blocks, `tool_use` blocks, `max_tokens` required |
-| `GET /v1/models` | OpenAI model list | Lists the loaded model |
-| `GET /health` | Liveness/readiness | Reports model + engine state |
+| `POST /v1/chat/completions` | OpenAI Chat Completions | Streaming (SSE) + non-streaming; `reasoning_content` deltas for thinking models, `tool_calls` in responses, `tools` / `tool_choice` (`auto`, `none`), sampler extras (`top_k`, `min_p`, `repetition_penalty`, `presence_penalty`) |
+| `POST /v1/messages` | Anthropic Messages | Streaming + non-streaming; `thinking` blocks, `tool_use` / `tool_result` turns, `max_tokens` required, `stop_reason` reports `stop_sequence` and `tool_use` |
+| `GET /v1/models` | OpenAI model list | Lists the model loaded in the app |
+| `GET /health` | Liveness/readiness | `status`, `model_loaded`, `model`, `engine_active` |
+
+### Server behavior
+
+* **One turn at a time, in arrival order**: the engine is single-flight, so concurrent requests are queued; queued streaming clients receive SSE heartbeats so they never idle-timeout while waiting, and each request's own queue deadline is enforced (see the tuning keys below).
+* **Prefix reuse across stateless API turns**: an API client resends the whole conversation every turn, so the server keeps its own record of the last completed turn (raw generation, reasoning included) and replays it whenever the echoed history matches. A follow-up then extends the pinned prompt+generation instead of re-prefilling the conversation, which is the same `2.0x - 3.5x` TTFT win the chat UI gets. Because the record is server-side, a client that resends only the visible answer still reproduces the pin; a client that also echoes reasoning back (`reasoning_content`, or Anthropic thinking blocks) reproduces it even when the server has no record left. Reuse is refused whenever the history, the rendered system prompt or the echoed answer no longer match, so one conversation's turn is never spliced into another's prompt, and a rejected or timed-out request leaves the live pin's temporal context intact.
+* **Tool calling**: the tool schemas a client sends are installed into the grammar mask for the duration of that turn, so a masked sample can never rewrite the client's own tool name into a built-in one. Calls come back as `tool_calls` (OpenAI) or `tool_use` blocks (Anthropic); send the result back as a `tool` / `tool_result` turn to continue the loop.
+* **Reasoning**: opt out per request with `"enable_thinking": false` (OpenAI) or opt in with `"thinking": {"type": "enabled"}` (Anthropic). Reasoning arrives out of band as `reasoning_content` deltas or thinking blocks, or folded into `content` inside the model's own reasoning tags when inline reasoning mode is enabled.
+* **Stop sequences**: matched incrementally as tokens decode. A trailing suffix that could still complete a configured stop sequence is withheld from the stream (and a repaired snapshot never re-sends text a client cannot un-see), so clients never receive half a stop string.
+* **Cancellation**: stopping or restarting the server cancels only the turns the server owns; an in-progress in-app response is left alone.
+* **Explicit rejections**: unsupported request shapes are refused with `400` where the client can see them instead of being silently ignored — a forced tool choice the engine cannot enforce, and an Anthropic request that ends with an assistant message carrying text (a response prefill the server cannot report back as an Anthropic message).
 
 ### Authentication
 
@@ -292,19 +328,27 @@ Set an API key in **Settings → Server**. When set, clients must present it eit
 
 ### Client setup (e.g. Crush)
 
-Point any OpenAI-compatible client at base URL `http://127.0.0.1:8787/v1`, or any Anthropic client at `http://127.0.0.1:8787`. The `model` field is accepted but ignored — the model loaded in the app answers every request. Streaming, stop sequences, tool/function calling, and usage accounting all work out of the box.
+Point any OpenAI-compatible client at base URL `http://127.0.0.1:8787/v1`, or any Anthropic client at `http://127.0.0.1:8787`. The `model` field is accepted but ignored — the model loaded in the app answers every request. Streaming, stop sequences, tool/function calling, reasoning and usage accounting all work out of the box. Anthropic requests must send `max_tokens`; an OpenAI request that omits it uses the app's Generation setting. Watch the Server tab while a client is connected: it shows the bound port, queue depth, active and total request counters, and the last engine error, which is the fastest way to tell a client-side misconfiguration from a queued-then-503 turn.
 
 ### Guardrails & tuning keys (UserDefaults)
 
-The engine generates one turn at a time; concurrent requests are queued in arrival order (queued streaming clients receive SSE heartbeats so they never time out).
+The Server tab writes the enable toggle, port, API key and inline reasoning keys; the queue timeout and prompt ceiling are set with the `defaults` command (the app reads them at request time, so no restart is needed).
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `dynamoe_server_enabled` | `false` | Auto-start the server at launch |
-| `dynamoe_server_port` | `8787` | Listen port |
+| `dynamoe_server_enabled` | `false` | Auto-start the server at launch (the settings toggle writes this) |
+| `dynamoe_server_port` | `8787` | Listen port (changes require a restart) |
 | `dynamoe_server_api_key` | *(empty)* | Required bearer / x-api-key value |
 | `dynamoe_server_queue_timeout` | `120` seconds | Requests waiting longer in the queue are rejected (408 / SSE error). `0` disables |
 | `dynamoe_server_max_prompt_tokens` | `262144` tokens | Longer prompts are rejected with 400 before prefill. `0` disables |
+| `dynamoe_server_inline_reasoning` | `false` | OpenAI endpoint only: fold reasoning into `content` inside the model's reasoning tags instead of reporting it as `reasoning_content`, so clients that ignore that extension still display it (and echo it back) |
+
+For example, to allow an unlimited queue wait and a 512k prompt ceiling:
+
+```bash
+defaults write DRP.DynaMoE dynamoe_server_queue_timeout -int 0
+defaults write DRP.DynaMoE dynamoe_server_max_prompt_tokens -int 524288
+```
 
 ---
 

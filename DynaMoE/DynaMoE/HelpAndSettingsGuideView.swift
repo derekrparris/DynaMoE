@@ -194,7 +194,7 @@ struct HelpAndSettingsGuideView: View {
             Text("Welcome to DynaMoE")
                 .font(.title2).bold()
 
-            Text("DynaMoE is a native macOS application, local inference engine, and Model Context Protocol (MCP) server engineered specifically for Apple Silicon's Unified Memory Architecture (UMA). It enables you to run models that exceed physical system RAM by dynamically memory-mapping and streaming weights directly from high-speed NVMe storage to the GPU.")
+            Text("DynaMoE is a native macOS application, local inference engine, autonomous developer assistant, and local inference server engineered specifically for Apple Silicon's Unified Memory Architecture (UMA). It enables you to run models that exceed physical system RAM by dynamically memory-mapping and streaming weights directly from high-speed NVMe storage to the GPU, and to serve the loaded model to other tools on your Mac over OpenAI- and Anthropic-compatible APIs.")
                 .font(.body)
                 .lineSpacing(4)
 
@@ -519,6 +519,8 @@ struct HelpAndSettingsGuideView: View {
                 bulletPoint("Guardrails", "Requests waiting in the queue longer than 120 seconds (dynamoe_server_queue_timeout) are rejected, and prompts longer than 262,144 tokens (dynamoe_server_max_prompt_tokens) are refused before prefill. Both keys are set via the defaults command; setting either to 0 disables it.")
                 bulletPoint("Request Options", "Per-request samplers (temperature, top_p, top_k, min_p, repetition_penalty, penalties, max_tokens, stop) map onto the engine. Pass \"enable_thinking\": false to disable reasoning on the OpenAI endpoint (or \"thinking\": {\"type\": \"enabled\"} to opt in on the Anthropic endpoint); when enabled, thinking arrives separated in reasoning_content deltas or thinking blocks. Tool schemas passed via \"tools\" are supported and parsed tool calls return as tool_calls or tool_use blocks.")
                 bulletPoint("Client Setup", "Point an OpenAI-compatible client at base URL http://127.0.0.1:8787/v1, or an Anthropic client at http://127.0.0.1:8787, with any model name (it is ignored) and your API key if one is configured. Max tokens defaults to the app's Generation setting when the OpenAI request omits it (Anthropic requests must send max_tokens).")
+                bulletPoint("Reasoning in Content", "The Server tab's \"Reasoning in Content\" switch (dynamoe_server_inline_reasoning, off by default) affects the OpenAI endpoint only: when on, reasoning is folded into content inside the model's own reasoning tags instead of being reported as reasoning_content deltas, so clients that ignore that extension still display it, and they echo it back on the next turn.")
+                bulletPoint("Prefix Reuse", "Clients resend the whole conversation every turn. The server records the last completed turn (reasoning included) and replays it whenever the echoed history matches, so follow-ups extend the pinned prompt instead of re-prefilling it; reuse is refused when the history, system prompt or echoed answer no longer match.")
             }
 
             infoBox(title: "Crush Example", icon: "terminal") {

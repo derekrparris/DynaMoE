@@ -18,7 +18,11 @@ DynaMoE incorporates, links with, or is inspired by several open-source librarie
    - [JetSpec](#jetspec)
    - [Flash-MoE](#flash-moe)
    - [Colibri](#colibri)
-3. [Apple Frameworks & Swift Standard Library](#apple-frameworks--swift-standard-library)
+3. [Swift Package Dependencies](#swift-package-dependencies)
+   - [Sparkle](#sparkle)
+   - [Hummingbird](#hummingbird)
+   - [Transitive Swift Package Dependencies](#transitive-swift-package-dependencies)
+4. [Apple Frameworks & Swift Standard Library](#apple-frameworks--swift-standard-library)
 
 ---
 
@@ -235,6 +239,65 @@ limitations under the License.
 * **Author:** JustVugg
 * **License:** MIT License / Apache License 2.0
 * **Description:** Pioneering exploration of off-disk model weight execution and memory-mapped inference.
+
+---
+
+## Swift Package Dependencies
+
+DynaMoE's Xcode targets resolve two Swift Package Manager dependencies. The exact resolved graph is pinned in [`Package.resolved`](DynaMoE/DynaMoE.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved).
+
+### Sparkle
+* **Repository:** https://github.com/sparkle-project/Sparkle
+* **Copyright:** Copyright (c) 2006-2013 Andy Matuschak; Copyright (c) 2009-2013 Elgato Systems GmbH; Copyright (c) 2011-2014 Kornel Lesiński; Copyright (c) 2015-2017 Mayur Pawashe; Copyright (c) 2014 C.W. Betts; Copyright (c) 2014 Petroules Corporation; Copyright (c) 2014 Big Nerd Ranch. All rights reserved.
+* **License:** MIT License (the package's own `LICENSE` file also carries external licenses for bundled code, such as bsdiff)
+
+```text
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+---
+
+### Hummingbird
+* **Repository:** https://github.com/hummingbird-project/hummingbird
+* **Copyright:** the Hummingbird project contributors (see the package's `CONTRIBUTORS.txt`)
+* **License:** Apache License 2.0
+
+```text
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
+
+---
+
+### Transitive Swift Package Dependencies
+
+Hummingbird resolves the SwiftNIO server ecosystem plus the HTTP, crypto, collections, configuration, logging and metrics packages it builds on. Each ships its own `LICENSE` file in the SwiftPM checkout and is licensed under the Apache License 2.0:
+
+`async-http-client`, `swift-algorithms`, `swift-asn1`, `swift-async-algorithms`, `swift-atomics`, `swift-certificates`, `swift-collections`, `swift-configuration`, `swift-crypto`, `swift-distributed-tracing`, `swift-http-structured-headers`, `swift-http-types`, `swift-log`, `swift-metrics`, `swift-nio`, `swift-nio-extras`, `swift-nio-http2`, `swift-nio-ssl`, `swift-nio-transport-services`, `swift-numerics`, `swift-service-context`, `swift-service-lifecycle`, `swift-system`.
 
 ---
 
