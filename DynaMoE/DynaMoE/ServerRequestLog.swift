@@ -58,6 +58,12 @@ struct ServerRequestLog: Identifiable, Codable, Sendable, Equatable, Hashable {
     var durationMs: Double = 0
     /// Time from request start to the first streamed token (streaming only).
     var firstTokenMs: Double?
+    /// Time the request spent waiting in the FIFO for the engine's
+    /// single-flight slot, from request arrival to slot-open. Nil when the
+    /// turn never reached the slot (queue timeout, cancellation while
+    /// queued) and never zero-filled, so "no wait" and "never ran" stay
+    /// distinguishable.
+    var queueWaitMs: Double?
     var model: String?
     var inputTokens: Int?
     var outputTokens: Int?
@@ -198,6 +204,9 @@ final class ServerRequestLogRecorder: @unchecked Sendable {
             "→ \(row.httpStatus)",
             String(format: "%.0fms", row.durationMs),
         ]
+        if let wait = row.queueWaitMs, wait > 0 {
+            parts.append("queue=\(Int(wait.rounded()))ms")
+        }
         if row.wasStreaming {
             parts.append("stream=\(row.streamTermination.map { "\($0.rawValue)" } ?? "open")")
             if let ttft = row.firstTokenMs {
@@ -287,6 +296,19 @@ final class ServerRequestLogBox: @unchecked Sendable {
     /// finalization and TTFT at the first streamed token).
     nonisolated func elapsedMs() -> Double {
         Date().timeIntervalSince(startedAt) * 1000
+    }
+
+    /// Stamps the moment the queue's single-flight slot opened for this
+    /// request, as a wait measured from request arrival into `queueWaitMs`.
+    /// First caller wins: exactly one queue wait per row, and requests
+    /// that never reach the slot stay nil instead of reading as a zero
+    /// wait.
+    nonisolated func noteSlotOpened() {
+        lock.lock()
+        if builder.queueWaitMs == nil {
+            builder.queueWaitMs = Date().timeIntervalSince(startedAt) * 1000
+        }
+        lock.unlock()
     }
 
     /// Copy of the staged row as-is.

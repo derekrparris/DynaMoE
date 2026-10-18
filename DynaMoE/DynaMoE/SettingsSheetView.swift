@@ -2066,6 +2066,12 @@ struct SettingsSheetView: View {
                     .lineLimit(1)
             }
 
+            if let wait = log.queueWaitMs, wait >= 1_000 {
+                Text("\(Int(wait))ms queued")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.orange)
+            }
+
             Text("\(Int(log.durationMs))ms")
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(.secondary)
@@ -2114,6 +2120,10 @@ struct SettingsSheetView: View {
                         }
                     }
                     serverRequestLogDetailLine("Duration", String(format: "%.0f ms", log.durationMs))
+                    if let wait = log.queueWaitMs {
+                        serverRequestLogDetailLine("Queue Wait", String(format: "%.0f ms", wait))
+                        serverRequestLogDetailLine("Generation", String(format: "%.0f ms", max(0, log.durationMs - wait)))
+                    }
                     serverRequestLogDetailLine("Model", log.model ?? "—")
                     serverRequestLogDetailLine("Tokens", log.inputTokens.map { input in
                         "\(input) in / \(log.outputTokens.map(String.init) ?? "—") out"

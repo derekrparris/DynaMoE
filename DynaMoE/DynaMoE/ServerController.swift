@@ -31,6 +31,11 @@ import ServiceLifecycle
 enum QueuedTurnEvent: @unchecked Sendable {
     /// Server-level comment ping (queue wait / prefill silence).
     case ping(comment: String?)
+    /// The FIFO slot opened for this turn: queue wait ended, generation
+    /// begins. Relayed exactly once, before any work event; the streaming
+    /// writers consume it to stamp the box's `queueWaitMs` and never
+    /// surface it on the wire.
+    case slotOpened
     case engine(CompletionEvent)
     /// Synchronous launch failure (model not loaded, engine busy, etc.).
     /// Carries the wire-shaped error so both protocol adapters render their
@@ -111,7 +116,9 @@ actor TurnExecutionQueue {
     /// `queueWaitTimeout` bounds how long the turn may sit behind earlier
     /// turns; when it expires the relay emits a launchFailed event instead of
     /// running the work — promptly, even if an earlier turn is stalled. Nil
-    /// (the default) waits indefinitely.
+    /// (the default) waits indefinitely. Exactly one `.slotOpened` relay
+    /// event precedes the work, so consumers can split queue wait from
+    /// generation time.
     func streamTurn(
         _ work: @escaping @Sendable (_ emit: @escaping @Sendable (QueuedTurnEvent) -> Void) async -> Void,
         queueWaitTimeout: TimeInterval? = nil
@@ -163,6 +170,7 @@ actor TurnExecutionQueue {
                 continuation.finish()
                 return
             }
+            continuation.yield(.slotOpened)
             await work { continuation.yield($0) }
             continuation.finish()
         }
@@ -184,12 +192,17 @@ actor TurnExecutionQueue {
     /// may sit behind earlier turns; when it expires the perform throws a
     /// request-timeout error instead of running the work — promptly, even if
     /// an earlier turn is stalled. Nil (the default) waits indefinitely.
+    /// `onSlotOpened` fires exactly once, the instant the FIFO slot opens and
+    /// immediately before the work runs (never on the timeout or
+    /// cancellation paths), so callers can split queue wait from generation
+    /// time.
     /// Cancelling the caller cancels the queued work: a cancelled request
     /// neither launches after its predecessor drains nor leaves a running
     /// engine turn unreachable by the work's own cancellation hook.
     func perform<T: Sendable>(
         _ work: @escaping @Sendable () async throws -> T,
-        queueWaitTimeout: TimeInterval? = nil
+        queueWaitTimeout: TimeInterval? = nil,
+        onSlotOpened: (@Sendable () -> Void)? = nil
     ) async throws -> T {
         let previous = tail
         enqueuedOperations += 1
@@ -212,6 +225,7 @@ actor TurnExecutionQueue {
                 throw ServerAPIError.requestTimeout("Request timed out waiting in the generation queue")
             }
             try Task.checkCancellation()
+            onSlotOpened?()
             return try await work()
         }
         cancelBox.set { task.cancel() }
@@ -1199,10 +1213,10 @@ final class ServerController: ObservableObject {
     }
 
     /// Runs a planned turn through the FIFO queue to completion. Shared by
-    /// both adapters' non-streaming paths.
-    nonisolated private static func runTurn(plan: TurnPlan, queue: TurnExecutionQueue) async throws -> TurnResult {
-        try await queue.perform(queueWaitTimeout: resolvedQueueWaitTimeout) {
-            () async throws -> TurnResult in
+    /// both adapters' non-streaming paths. The slot-open signal stamps the
+    /// box's queue wait so it can be split from generation time.
+    nonisolated private static func runTurn(plan: TurnPlan, queue: TurnExecutionQueue, logBox: ServerRequestLogBox?) async throws -> TurnResult {
+        try await queue.perform({ () async throws -> TurnResult in
             try await withTurnToolMask(plan.maskSchemas) {
                 let launch: CompletionLaunch
                 do {
@@ -1228,11 +1242,11 @@ final class ServerController: ObservableObject {
                     launch.handle.cancel()
                 }
             }
-        }
+        }, queueWaitTimeout: resolvedQueueWaitTimeout, onSlotOpened: { logBox?.noteSlotOpened() })
     }
 
     nonisolated private static func nonStreamingResponse(plan: TurnPlan, queue: TurnExecutionQueue, logBox: ServerRequestLogBox?) async throws -> OpenAIChatResponse {
-        let result = try await runTurn(plan: plan, queue: queue)
+        let result = try await runTurn(plan: plan, queue: queue, logBox: logBox)
 
         let toolCalls = Self.turnEmittedToolCalls(result)
             ? result.parsedToolCalls.map { call in
@@ -1489,6 +1503,8 @@ final class ServerController: ObservableObject {
             var finishedCleanly = false
             for await event in relay {
                 switch event {
+                case .slotOpened:
+                    logBox?.noteSlotOpened()
                 case .ping(let comment):
                     try await ping(comment)
                 case .launchFailed(let apiError):
@@ -1612,7 +1628,7 @@ final class ServerController: ObservableObject {
     // MARK: Anthropic non-streaming handling
 
     nonisolated private static func anthropicNonStreamingResponse(plan: TurnPlan, queue: TurnExecutionQueue, logBox: ServerRequestLogBox?) async throws -> AnthropicMessageResponse {
-        let result = try await runTurn(plan: plan, queue: queue)
+        let result = try await runTurn(plan: plan, queue: queue, logBox: logBox)
 
         var blocks: [AnthropicContentBlock] = []
         if !result.thinkingText.isEmpty {
@@ -1792,6 +1808,8 @@ final class ServerController: ObservableObject {
             var finishedCleanly = false
             for await event in relay {
                 switch event {
+                case .slotOpened:
+                    logBox?.noteSlotOpened()
                 case .ping:
                     try await ping()
                 case .launchFailed(let apiError):

@@ -239,4 +239,49 @@ final class ServerRequestLogLogicTests: XCTestCase {
         XCTAssertEqual(rowWithBodies.requestBody, ServerRequestLog.contentWithheldMarker)
         XCTAssertFalse(ServerRequestLogRecorder.composeLine(rowWithBodies).contains("TOP SECRET"))
     }
+
+    // MARK: Queue wait split
+
+    func testComposedLineSplitsQueueWaitFromDuration() {
+        var row = ServerRequestLog()
+        row.method = "POST"
+        row.path = "/v1/chat/completions"
+        row.durationMs = 123_000
+        row.queueWaitMs = 100_000
+
+        let line = ServerRequestLogRecorder.composeLine(row)
+        XCTAssertTrue(line.contains("queue=100000ms"), "the queue wait must be visible in Console.app to split it from the 123 s duration")
+
+        row.queueWaitMs = nil
+        XCTAssertFalse(
+            ServerRequestLogRecorder.composeLine(row).contains("queue="),
+            "rows that never reached the slot must not read as a zero wait"
+        )
+    }
+
+    func testBoxNotesSlotOpenedOnceAndCarriesItThroughFinalization() {
+        let recorder = ServerRequestLogRecorder.shared
+        let id = "test-\(UUID().uuidString)"
+        let box = recorder.beginBox(requestId: id, method: "POST", path: "/v1/chat/completions")
+        defer { recorder.endBox(requestId: id) }
+
+        XCTAssertNil(box.snapshot().queueWaitMs, "a fresh box has no queue wait")
+
+        box.noteSlotOpened()
+        let stamped = box.snapshot().queueWaitMs
+        XCTAssertNotNil(stamped)
+
+        box.noteSlotOpened()
+        XCTAssertEqual(
+            box.snapshot().queueWaitMs, stamped,
+            "a second slot-open stamp must not move the recorded wait (exactly one per request)"
+        )
+
+        let finalized = box.composeFinal(status: 200, error: nil)
+        XCTAssertEqual(finalized.queueWaitMs, stamped, "the finalized row keeps the stamped queue wait")
+        XCTAssertGreaterThanOrEqual(
+            finalized.durationMs, finalized.queueWaitMs ?? 0,
+            "duration covers arrival-to-end, so it can never be shorter than the queue wait"
+        )
+    }
 }
