@@ -11,10 +11,11 @@
 //  when the request's outcome is known composes the row and records it.
 //
 //  Privacy model (modeled on osaurus): default metadata-only. Body capture is
-//  opt-in via `dynamoe_server_log_store_bodies`; when off, chat/message rows
-//  carry the `contentWithheldMarker` placeholder in place of bodies so "not
-//  stored" is never read as "should have been there". Authorization headers
-//  and the configured API key are never recorded anywhere.
+//  opt-in via `dynamoe_server_log_store_bodies` and covers both entry paths
+//  (API requests and in-app chat/agent turns); when off, rows carry the
+//  `contentWithheldMarker` placeholder in place of bodies so "not stored" is
+//  never read as "should have been there". Authorization headers and the
+//  configured API key are never recorded anywhere.
 //
 
 import Foundation
@@ -456,23 +457,77 @@ extension ServerRequestLog {
     }
 }
 
+// MARK: - Captured bodies
+
+/// Body composition shared by both entry paths, so a row means the same thing
+/// whichever one wrote it. Every helper consults the Store Request Content
+/// toggle at call time and falls back to the withheld marker rather than nil,
+/// keeping "capture is off" distinguishable from "nothing to capture".
+extension ServerRequestLog {
+    /// The prompt side of a row: the normalized client request for server
+    /// rows, the rendered prompt for in-app turns. Nil only when the caller
+    /// has no prompt to offer (a request that never decoded).
+    nonisolated static func capturedRequestBody(_ text: String?) -> String? {
+        guard let text else { return nil }
+        guard ServerRequestLogRecorder.captureBodiesEnabled else { return contentWithheldMarker }
+        return clippedBody(text)
+    }
+
+    /// The answer side of a row: reasoning plus answer. Nil when the turn
+    /// produced no text at all (a failure before the first token), so an
+    /// empty box never masquerades as a captured body.
+    nonisolated static func capturedResponseBody(thinking: String, response: String) -> String? {
+        guard ServerRequestLogRecorder.captureBodiesEnabled else { return contentWithheldMarker }
+        let combined: String
+        if thinking.isEmpty {
+            combined = response
+        } else if response.isEmpty {
+            combined = thinking
+        } else {
+            combined = thinking + "\n\n" + response
+        }
+        return combined.isEmpty ? nil : clippedBody(combined)
+    }
+
+    /// Tool-call records for one turn. Names are metadata and always
+    /// recorded; arguments are content and follow the toggle.
+    nonisolated static func capturedToolCalls(
+        _ calls: [ParsedToolCall],
+        serializeArguments: (ParsedToolCall) -> String
+    ) -> [ToolCallRecord]? {
+        guard !calls.isEmpty else { return nil }
+        let capture = ServerRequestLogRecorder.captureBodiesEnabled
+        return calls.map { call in
+            ToolCallRecord(
+                name: call.name,
+                arguments: capture ? clippedArguments(serializeArguments(call)) : contentWithheldMarker
+            )
+        }
+    }
+}
+
 // MARK: - In-app turn rows
 
 /// One row per in-app chat or agent turn, side by side with server rows in
 /// the same dashboard and unified log: the `source` enum is the single row
-/// vocabulary across both entry paths. Metadata only — in-app content
-/// already has its durable, private home in ChatSessionStore, so request
-/// and response bodies are never captured for `chatUI` rows regardless of
-/// the body-capture toggle; tool names are metadata and their arguments are
-/// always the withheld marker.
+/// vocabulary across both entry paths. Bodies follow the same capture toggle
+/// as server rows: the request side is the rendered prompt (what the model
+/// actually saw, template included) and the response side the turn's
+/// reasoning plus answer, with tool arguments following the toggle too.
 extension ServerRequestLog {
-    nonisolated static func chatTurnLog(model: String?, inputTokens: Int, isAgentTurn: Bool) -> ServerRequestLogBox {
+    nonisolated static func chatTurnLog(
+        model: String?,
+        inputTokens: Int,
+        isAgentTurn: Bool,
+        prompt: String?
+    ) -> ServerRequestLogBox {
         var row = ServerRequestLog()
         row.method = "TURN"
         row.path = isAgentTurn ? "agent" : "chat"
         row.source = .chatUI
         row.model = model
         row.inputTokens = inputTokens
+        row.requestBody = capturedRequestBody(prompt)
         return ServerRequestLogBox(builder: row)
     }
 }
@@ -493,25 +548,33 @@ extension ServerRequestLogBox {
     /// the generation loop's terminal path only: finished (200), failed
     /// (500), cancelled (200: a user action, not an error, with the engine
     /// message still recorded), or the stream closing without a result.
+    /// `thinking`/`response` are the turn's generated text (the terminal
+    /// result's, or the last streamed frame's when the turn failed or was
+    /// cancelled) and `toolCalls` the full parsed calls, so a row's bodies
+    /// follow the Store Request Content toggle exactly as a server row's do.
     nonisolated func recordChatTurn(
         status: Int,
         errorMessage: String?,
         outputTokens: Int,
         finishReason: String?,
-        toolCallNames: [String]?
+        thinking: String,
+        response: String,
+        toolCalls: [ParsedToolCall]
     ) {
         guard claim() else { return }
+        let toolRecords = ServerRequestLog.capturedToolCalls(
+            toolCalls,
+            serializeArguments: ServerController.toolArgumentsJSON
+        )
+        let responseBody = ServerRequestLog.capturedResponseBody(thinking: thinking, response: response)
         lock.lock()
         builder.httpStatus = status
         builder.durationMs = Date().timeIntervalSince(startedAt) * 1000
         builder.outputTokens = outputTokens
         builder.finishReason = finishReason
         builder.errorMessage = errorMessage
-        if let toolCallNames, !toolCallNames.isEmpty {
-            builder.toolCalls = toolCallNames.map {
-                .init(name: $0, arguments: ServerRequestLog.contentWithheldMarker)
-            }
-        }
+        builder.toolCalls = toolRecords
+        builder.responseBody = responseBody
         let row = builder
         lock.unlock()
         ServerRequestLogRecorder.shared.record(row)

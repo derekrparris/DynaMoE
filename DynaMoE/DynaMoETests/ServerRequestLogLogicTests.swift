@@ -590,18 +590,28 @@ final class ServerRequestLogLogicTests: XCTestCase {
         XCTAssertEqual(round.source, .chatUI)
     }
 
-    func testInAppTurnRowIsMetadataOnlyAndRecordsExactlyOnce() async throws {
+    func testInAppTurnRowWithholdsContentByDefaultAndRecordsExactlyOnce() async throws {
         let store = ServerRequestLogStore.inMemory()
         ServerRequestLogRecorder.shared.useOverrideStore(store)
         defer { ServerRequestLogRecorder.shared.useOverrideStore(nil) }
 
-        let box = ServerRequestLog.chatTurnLog(model: "ling-3.0-tiny", inputTokens: 64, isAgentTurn: true)
+        let box = ServerRequestLog.chatTurnLog(
+            model: "ling-3.0-tiny",
+            inputTokens: 64,
+            isAgentTurn: true,
+            prompt: "PROMPT SECRET"
+        )
         let staged = box.snapshot()
         XCTAssertEqual(staged.source, .chatUI)
         XCTAssertEqual(staged.method, "TURN")
         XCTAssertEqual(staged.path, "agent", "an agent turn must be distinguishable from a plain chat turn")
         XCTAssertEqual(staged.model, "ling-3.0-tiny")
         XCTAssertEqual(staged.inputTokens, 64)
+        XCTAssertEqual(
+            staged.requestBody,
+            ServerRequestLog.contentWithheldMarker,
+            "capture is off: the row must say withheld, not silence"
+        )
 
         box.noteFirstToken()
         try await Task.sleep(nanoseconds: 30_000_000)
@@ -610,7 +620,9 @@ final class ServerRequestLogLogicTests: XCTestCase {
             errorMessage: nil,
             outputTokens: 32,
             finishReason: "toolFreeze",
-            toolCallNames: ["shell_run", "file_read"]
+            thinking: "THINK SECRET",
+            response: "ANSWER SECRET",
+            toolCalls: Self.parsedCalls()
         )
         let rows = await store.fetch()
         XCTAssertEqual(rows.count, 1, "the in-app turn must land in the same store as server rows")
@@ -618,15 +630,22 @@ final class ServerRequestLogLogicTests: XCTestCase {
         XCTAssertEqual(recorded.source, .chatUI)
         XCTAssertEqual(recorded.outputTokens, 32)
         XCTAssertEqual(recorded.finishReason, "toolFreeze")
-        XCTAssertEqual(recorded.toolCalls?.map(\.name), ["shell_run", "file_read"])
+        XCTAssertEqual(
+            recorded.toolCalls?.map(\.name),
+            ["shell_run", "file_read"],
+            "tool names are metadata and are recorded with capture off"
+        )
         XCTAssertEqual(
             recorded.toolCalls?.map { $0.arguments == ServerRequestLog.contentWithheldMarker },
             [true, true],
-            "in-app tool arguments follow the withheld policy regardless of the capture toggle"
+            "in-app tool arguments are content and follow the capture toggle"
         )
-        XCTAssertNil(recorded.requestBody)
-        XCTAssertNil(recorded.responseBody)
-        XCTAssertFalse(recorded.hasCapturedContent, "in-app turn rows are metadata only")
+        XCTAssertEqual(recorded.responseBody, ServerRequestLog.contentWithheldMarker)
+        XCTAssertFalse(recorded.hasCapturedContent, "with capture off the row stores no content")
+        XCTAssertFalse(
+            ServerRequestLogRecorder.composeLine(recorded).contains("SECRET"),
+            "bodies never reach the unified-log line, capture or not"
+        )
         XCTAssertFalse(recorded.isError)
         XCTAssertNotNil(recorded.firstTokenMs)
         XCTAssertLessThanOrEqual(recorded.firstTokenMs ?? 0, recorded.durationMs)
@@ -638,10 +657,80 @@ final class ServerRequestLogLogicTests: XCTestCase {
             errorMessage: "duplicate terminal event",
             outputTokens: 1,
             finishReason: nil,
-            toolCallNames: nil
+            thinking: "",
+            response: "",
+            toolCalls: []
         )
         let countAfterDuplicate = await store.count()
         XCTAssertEqual(countAfterDuplicate, 1, "recordChatTurn must be one-shot per turn")
+    }
+
+    func testInAppTurnRowCapturesPromptResponseAndToolArgumentsWhenEnabled() async throws {
+        UserDefaults.standard.set(true, forKey: ServerRequestLogRecorder.captureBodiesKey)
+        let store = ServerRequestLogStore.inMemory()
+        ServerRequestLogRecorder.shared.useOverrideStore(store)
+        defer { ServerRequestLogRecorder.shared.useOverrideStore(nil) }
+
+        let box = ServerRequestLog.chatTurnLog(
+            model: "ling-3.0-tiny",
+            inputTokens: 64,
+            isAgentTurn: false,
+            prompt: "USER: PROMPT SECRET"
+        )
+        box.recordChatTurn(
+            status: 200,
+            errorMessage: nil,
+            outputTokens: 12,
+            finishReason: "eos",
+            thinking: "THINK SECRET",
+            response: "ANSWER SECRET",
+            toolCalls: Self.parsedCalls()
+        )
+        let rows = await store.fetch()
+        let recorded = try XCTUnwrap(rows.first)
+        XCTAssertEqual(
+            recorded.requestBody,
+            "USER: PROMPT SECRET",
+            "the in-app request body is the rendered prompt the model actually saw"
+        )
+        XCTAssertEqual(
+            recorded.responseBody,
+            "THINK SECRET\n\nANSWER SECRET",
+            "reasoning and answer travel together, as they do on server rows"
+        )
+        XCTAssertEqual(recorded.toolCalls?.first?.arguments, #"{"command":"ls"}"#)
+        XCTAssertTrue(recorded.hasCapturedContent)
+        XCTAssertFalse(
+            ServerRequestLogRecorder.composeLine(recorded).contains("SECRET"),
+            "captured bodies stay in the persisted row only, never in the unified log"
+        )
+    }
+
+    func testCapturedBodiesDropEmptyHalvesAndKeepTheWithheldMarkerOff() {
+        UserDefaults.standard.set(true, forKey: ServerRequestLogRecorder.captureBodiesKey)
+        XCTAssertEqual(ServerRequestLog.capturedResponseBody(thinking: "", response: "answer"), "answer")
+        XCTAssertEqual(
+            ServerRequestLog.capturedResponseBody(thinking: "reasoning", response: ""),
+            "reasoning",
+            "a reasoning-only turn must not leave a dangling separator"
+        )
+        XCTAssertNil(
+            ServerRequestLog.capturedResponseBody(thinking: "", response: ""),
+            "a turn that generated nothing has no body to store, even with capture on"
+        )
+        XCTAssertEqual(ServerRequestLog.capturedRequestBody("prompt"), "prompt")
+
+        UserDefaults.standard.set(false, forKey: ServerRequestLogRecorder.captureBodiesKey)
+        XCTAssertEqual(
+            ServerRequestLog.capturedResponseBody(thinking: "", response: ""),
+            ServerRequestLog.contentWithheldMarker,
+            "with capture off the row says withheld, so a silent failure reads as 'not stored', not 'empty'"
+        )
+        XCTAssertEqual(ServerRequestLog.capturedRequestBody("prompt"), ServerRequestLog.contentWithheldMarker)
+        XCTAssertNil(
+            ServerRequestLog.capturedRequestBody(nil),
+            "a caller with no prompt records nil rather than a marker"
+        )
     }
 
     func testFailedInAppTurnRecordsErrorWhileCancelledRecordsInfo() async throws {
@@ -649,21 +738,25 @@ final class ServerRequestLogLogicTests: XCTestCase {
         ServerRequestLogRecorder.shared.useOverrideStore(store)
         defer { ServerRequestLogRecorder.shared.useOverrideStore(nil) }
 
-        let failedBox = ServerRequestLog.chatTurnLog(model: "ling", inputTokens: 10, isAgentTurn: false)
+        let failedBox = ServerRequestLog.chatTurnLog(model: "ling", inputTokens: 10, isAgentTurn: false, prompt: "p")
         failedBox.recordChatTurn(
             status: 500,
             errorMessage: "prefill failed: out of memory",
             outputTokens: 0,
             finishReason: nil,
-            toolCallNames: nil
+            thinking: "",
+            response: "",
+            toolCalls: []
         )
-        let cancelledBox = ServerRequestLog.chatTurnLog(model: "ling", inputTokens: 10, isAgentTurn: false)
+        let cancelledBox = ServerRequestLog.chatTurnLog(model: "ling", inputTokens: 10, isAgentTurn: false, prompt: "p")
         cancelledBox.recordChatTurn(
             status: 200,
             errorMessage: "Generation cancelled",
             outputTokens: 7,
             finishReason: nil,
-            toolCallNames: nil
+            thinking: "partial thinking",
+            response: "partial answer",
+            toolCalls: []
         )
         let rows = await store.fetch()
         XCTAssertEqual(rows.count, 2)
@@ -672,5 +765,24 @@ final class ServerRequestLogLogicTests: XCTestCase {
         let cancelled = try XCTUnwrap(rows.first { $0.errorMessage == "Generation cancelled" })
         XCTAssertFalse(cancelled.isError, "a cancelled turn is a user action, not an error")
         XCTAssertEqual(cancelled.outputTokens, 7, "the partial generation must still be visible in the row")
+    }
+
+    /// Two parsed calls whose arguments are recognizable content: the capture
+    /// tests assert those strings appear only behind the toggle.
+    private static func parsedCalls() -> [ParsedToolCall] {
+        [
+            ParsedToolCall(
+                name: "shell_run",
+                arguments: ["command": "ls"],
+                rawArguments: #"{"command":"ls"}"#,
+                rawText: "raw1"
+            ),
+            ParsedToolCall(
+                name: "file_read",
+                arguments: ["path": "/tmp/secret"],
+                rawArguments: #"{"path":"/tmp/secret"}"#,
+                rawText: "raw2"
+            ),
+        ]
     }
 }

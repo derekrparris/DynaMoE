@@ -1887,7 +1887,7 @@ struct SettingsSheetView: View {
 
             SettingsRow(
                 title: "Store Request Content",
-                subtitle: "When on, completion requests record their prompt and the model's response in the request log (clipped to 32 KB per field). When off, rows keep metadata only: model, token counts, durations, tool names, errors. Existing rows are not retroactively scrubbed when turned off."
+                subtitle: "When on, both API requests and in-app chat/agent turns record their prompt and the model's response (clipped to 32 KB per field); in-app rows store the rendered prompt the model actually saw, template included. When off, rows keep metadata only: model, token counts, durations, tool names, errors. Existing rows are not retroactively scrubbed when turned off."
             ) {
                 Toggle("Store Request Content", isOn: $serverLogCaptureBodies)
                     .toggleStyle(.switch)
@@ -1949,7 +1949,7 @@ struct SettingsSheetView: View {
     private var serverRequestLogCard: some View {
         SettingsCard(
             header: "Request Log",
-            footer: "Every API request and in-app chat/agent turn since the last clear: metadata always (path, status, model, tokens, duration, tool names, errors). Bodies appear only when Store Request Content is on and never for in-app turns, and nothing here is ever sent off this Mac. Rows also land in Console.app under the DRP.DynaMoE subsystem (category server.request). The log keeps the most recent \(ServerRequestLogStore.maxRows) rows."
+            footer: "Every API request and in-app chat/agent turn since the last clear: metadata always (path, status, model, tokens, duration, tool names, errors). Bodies appear only when Store Request Content is on, for API and in-app rows alike, and nothing here is ever sent off this Mac. Rows also land in Console.app under the DRP.DynaMoE subsystem (category server.request). The log keeps the most recent \(ServerRequestLogStore.maxRows) rows."
 
         ) {
             HStack(spacing: 8) {

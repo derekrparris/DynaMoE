@@ -4573,12 +4573,14 @@ struct ContentView: View {
         }
 
         // In-app turn log: one request-log row per chat/agent turn (source
-        // chatUI, metadata only). Begun after a successful launch so launch
-        // failures stay unlogged (the chat surface owns those errors).
+        // chatUI; bodies follow the Store Request Content toggle, the rendered
+        // prompt included). Begun after a successful launch so launch failures
+        // stay unlogged (the chat surface owns those errors).
         let turnLog = ServerRequestLog.chatTurnLog(
             model: generationModelName,
             inputTokens: promptTokenIds.count,
-            isAgentTurn: runAgentTools || agentStep > 0 || forceSynthesis
+            isAgentTurn: runAgentTools || agentStep > 0 || forceSynthesis,
+            prompt: formattedPrompt
         )
 
         // Session token odometer seeding: resolved from turn-start state (it is
@@ -4625,6 +4627,11 @@ struct ContentView: View {
 
         generationTask = Task.detached(priority: .userInitiated) {
             var finishedResult: TurnResult? = nil
+            // Last streamed frame's text: what a failed or cancelled turn still
+            // owes its log row. Frames are consumed in this detached loop, so
+            // the accumulators stay local rather than hopping to the MainActor.
+            var streamedThinking = ""
+            var streamedResponse = ""
             for await event in launch.stream {
                 switch event {
                 case .started:
@@ -4646,6 +4653,8 @@ struct ContentView: View {
                     }
                 case let .frame(frame):
                     turnLog.noteFirstToken()
+                    streamedThinking = frame.thinkingText
+                    streamedResponse = frame.responseText
                     await MainActor.run {
                         self.generatedStreamText = frame.rawText
                         self.thinkingText = frame.thinkingText
@@ -4717,7 +4726,9 @@ struct ContentView: View {
                         errorMessage: failure.message,
                         outputTokens: failure.tokensGenerated,
                         finishReason: nil,
-                        toolCallNames: nil
+                        thinking: streamedThinking,
+                        response: streamedResponse,
+                        toolCalls: []
                     )
                     if failure.cancelled {
                         // Cancellation: exact odometer tail only — the Stop /
@@ -4795,7 +4806,9 @@ struct ContentView: View {
                     errorMessage: "Generation stream closed without a result",
                     outputTokens: 0,
                     finishReason: nil,
-                    toolCallNames: nil
+                    thinking: streamedThinking,
+                    response: streamedResponse,
+                    toolCalls: []
                 )
                 return
             }
@@ -4827,7 +4840,9 @@ struct ContentView: View {
                 errorMessage: nil,
                 outputTokens: tokensGenerated,
                 finishReason: result.finishReason.rawValue,
-                toolCallNames: parsedResult.calls.isEmpty ? nil : parsedResult.calls.map(\.name)
+                thinking: finalThink,
+                response: finalResp,
+                toolCalls: parsedResult.calls
             )
 
             // No-op "gesture" calls (shell_run echo/true/:) are the model's way of

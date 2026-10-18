@@ -814,9 +814,7 @@ final class ServerController: ObservableObject {
                 $0.wasStreaming = apiRequest.stream == true
                 $0.temperature = apiRequest.temperature.map { Double($0) }
                 $0.maxTokens = apiRequest.maxTokens
-                $0.requestBody = ServerRequestLogRecorder.captureBodiesEnabled
-                    ? ServerRequestLog.openAISummary(apiRequest)
-                    : ServerRequestLog.contentWithheldMarker
+                $0.requestBody = ServerRequestLog.capturedRequestBody(ServerRequestLog.openAISummary(apiRequest))
             }
             if apiRequest.stream == true {
                 // Streaming keeps the 200 + text/event-stream contract even when
@@ -848,9 +846,7 @@ final class ServerController: ObservableObject {
                 $0.wasStreaming = apiRequest.stream == true
                 $0.temperature = apiRequest.temperature.map { Double($0) }
                 $0.maxTokens = apiRequest.maxTokens
-                $0.requestBody = ServerRequestLogRecorder.captureBodiesEnabled
-                    ? ServerRequestLog.anthropicSummary(apiRequest)
-                    : ServerRequestLog.contentWithheldMarker
+                $0.requestBody = ServerRequestLog.capturedRequestBody(ServerRequestLog.anthropicSummary(apiRequest))
             }
             if apiRequest.stream == true {
                 // Streaming keeps the 200 + text/event-stream contract even when
@@ -1276,38 +1272,24 @@ final class ServerController: ObservableObject {
         )
     }
 
-    /// Tool names are metadata (they answer "which tools did the model call");
-    /// arguments are content and follow the capture toggle, replaced by the
-    /// withheld marker otherwise.
-    nonisolated private static func logToolCallRecords(_ result: TurnResult) -> [ServerRequestLog.ToolCallRecord]? {
-        guard !result.parsedToolCalls.isEmpty else { return nil }
-        let capture = ServerRequestLogRecorder.captureBodiesEnabled
-        return result.parsedToolCalls.map { call in
-            ServerRequestLog.ToolCallRecord(
-                name: call.name,
-                arguments: capture
-                    ? ServerRequestLog.clippedArguments(Self.toolArgumentsJSON(call))
-                    : ServerRequestLog.contentWithheldMarker
-            )
-        }
-    }
-
     /// Stamp the terminal inference facts (tokens, finish reason, tool calls,
     /// captured response body) onto a completed non-streaming turn's log box.
     /// `finishReason` is optional because the Anthropic adapter maps some
     /// stop reasons to a JSON-absent nil.
     nonisolated private static func recordTurnOutcome(logBox: ServerRequestLogBox?, result: TurnResult, finishReason: String?) {
+        let toolRecords = ServerRequestLog.capturedToolCalls(
+            result.parsedToolCalls,
+            serializeArguments: Self.toolArgumentsJSON
+        )
+        let responseBody = ServerRequestLog.capturedResponseBody(
+            thinking: result.thinkingText,
+            response: result.responseText
+        )
         logBox?.modify { row in
             row.outputTokens = result.tokensGenerated
             row.finishReason = finishReason
-            row.toolCalls = Self.logToolCallRecords(result)
-            row.responseBody = ServerRequestLogRecorder.captureBodiesEnabled
-                ? ServerRequestLog.clippedBody(
-                    result.thinkingText.isEmpty
-                        ? result.responseText
-                        : result.thinkingText + "\n\n" + result.responseText
-                )
-                : ServerRequestLog.contentWithheldMarker
+            row.toolCalls = toolRecords
+            row.responseBody = responseBody
         }
     }
 
