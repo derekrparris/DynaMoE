@@ -136,6 +136,7 @@ struct SettingsSheetView: View {
     @State private var serverLogSelected: ServerRequestLog? = nil
     @State private var serverLogTotalCount: Int = 0
     @State private var serverLogShowClearConfirm: Bool = false
+    @State private var serverLogExportSummary: String? = nil
 
     // Model Profile Management State
     @ObservedObject private var profileManager = ModelProfileManager.shared
@@ -1954,17 +1955,40 @@ struct SettingsSheetView: View {
                 TextField("Search model, path, error…", text: $serverLogSearchText)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 12))
-                    .onChange(of: serverLogSearchText) { _, _ in refreshServerRequestLog() }
+                    .onChange(of: serverLogSearchText) { _, _ in
+                        serverLogExportSummary = nil
+                        refreshServerRequestLog()
+                    }
 
                 Toggle("Errors Only", isOn: $serverLogErrorsOnly)
                     .toggleStyle(.checkbox)
-                    .onChange(of: serverLogErrorsOnly) { _, _ in refreshServerRequestLog() }
+                    .onChange(of: serverLogErrorsOnly) { _, _ in
+                        serverLogExportSummary = nil
+                        refreshServerRequestLog()
+                    }
 
                 Text(serverLogTotalCount == 1 ? "1 row" : "\(serverLogTotalCount) rows")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
 
+                if let summary = serverLogExportSummary {
+                    Text(summary)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .help("Filtered export honors the current search and Errors Only switch")
+                }
+
                 Spacer()
+
+                Button {
+                    exportServerRequestLog()
+                } label: {
+                    Label("Export", systemImage: "square.and.arrow.down")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(serverLogTotalCount == 0)
+                .help("Export the rows matching the current filter as JSON Lines")
 
                 Button(role: .destructive) {
                     serverLogShowClearConfirm = true
@@ -2204,6 +2228,35 @@ struct SettingsSheetView: View {
             serverLogRows = await ServerRequestLogStore.shared.fetch(filter: filter, limit: 200)
             serverLogTotalCount = await ServerRequestLogStore.shared.count()
         }
+    }
+
+    /// Saves the filtered request log as JSON Lines via a save panel. The
+    /// one click a client-format bug report needs: filtered rows, one JSON
+    /// object per line, bodies included only per the capture toggle.
+    private func exportServerRequestLog() {
+        var filter = ServerRequestLogStore.Filter()
+        filter.errorsOnly = serverLogErrorsOnly
+        filter.text = serverLogSearchText
+
+        let panel = NSSavePanel()
+        panel.title = "Export Request Log"
+        panel.message = "Writes the rows matching the current filter, one JSON object per line."
+        panel.nameFieldStringValue = "dynamoe-requests-\(Self.serverLogExportDateStamp).jsonl"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        Task {
+            do {
+                let exported = try await ServerRequestLogStore.shared.exportJSONL(filter: filter, to: url)
+                serverLogExportSummary = "Exported \(exported) \(exported == 1 ? "row" : "rows") → \(url.lastPathComponent)"
+            } catch {
+                serverLogExportSummary = "Export failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private static var serverLogExportDateStamp: String {
+        ISO8601DateFormatter.string(from: Date(), timeZone: .current, formatOptions: [.withFullDate])
     }
 
     private var trimmedServerAPIKey: String {

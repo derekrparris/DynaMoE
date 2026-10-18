@@ -373,4 +373,105 @@ final class ServerRequestLogLogicTests: XCTestCase {
             "the retention prune must also checkpoint, so mass-expired rows release disk space"
         )
     }
+
+    // MARK: JSONL export
+
+    private func makeExportStore() throws -> (store: ServerRequestLogStore, directory: URL) {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dynamoe-log-export-tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let store = ServerRequestLogStore(path: directory.appendingPathComponent("requests.sqlite").path)
+        return (store, directory)
+    }
+
+    private func decodedExportLines(_ url: URL) throws -> [ServerRequestLog] {
+        let text = try String(contentsOf: url, encoding: .utf8)
+        let lines = text.split(separator: "\n").filter { !$0.isEmpty }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .millisecondsSince1970
+        return try lines.map { try decoder.decode(ServerRequestLog.self, from: Data($0.utf8)) }
+    }
+
+    func testExportJSONLWritesFilteredRowsNewestFirst() async throws {
+        let (store, directory) = try makeExportStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // Distinct, spread timestamps so the newest-first order is asserted
+        // on real values instead of rowid tie-breaking.
+        var firstRow = ServerRequestLog()
+        firstRow.method = "POST"
+        firstRow.path = "/v1/chat/completions"
+        firstRow.model = "ling-3.0-tiny"
+        firstRow.timestamp = Date(timeIntervalSinceNow: -3_600)
+        var secondRow = ServerRequestLog()
+        secondRow.method = "POST"
+        secondRow.path = "/v1/messages"
+        secondRow.httpStatus = 400
+        secondRow.timestamp = Date(timeIntervalSinceNow: -1_800)
+        var thirdRow = ServerRequestLog()
+        thirdRow.method = "GET"
+        thirdRow.path = "/v1/models"
+        thirdRow.timestamp = Date(timeIntervalSinceNow: -60)
+        for row in [firstRow, secondRow, thirdRow] {
+            store.append(row)
+            _ = await store.count()
+        }
+
+        let url = directory.appendingPathComponent("all.jsonl")
+        let exported = try await store.exportJSONL(to: url)
+        XCTAssertEqual(exported, 3, "an empty filter exports every stored row")
+        XCTAssertEqual(
+            try decodedExportLines(url).map(\.path),
+            ["/v1/models", "/v1/messages", "/v1/chat/completions"],
+            "exports preserve the dashboard's newest-first order"
+        )
+        XCTAssertEqual(try decodedExportLines(url).map(\.id), [thirdRow.id, secondRow.id, firstRow.id],
+                      "each line must round-trip to the very row that was stored")
+
+        var errorsFilter = ServerRequestLogStore.Filter()
+        errorsFilter.errorsOnly = true
+        let errorURL = directory.appendingPathComponent("errors.jsonl")
+        let errorExported = try await store.exportJSONL(filter: errorsFilter, to: errorURL)
+        XCTAssertEqual(errorExported, 1, "the Errors Only switch must scope the export")
+        XCTAssertEqual(try decodedExportLines(errorURL).first?.id, secondRow.id)
+
+        var textFilter = ServerRequestLogStore.Filter()
+        textFilter.text = "ling-3.0-tiny"
+        let textURL = directory.appendingPathComponent("search.jsonl")
+        let textExported = try await store.exportJSONL(filter: textFilter, to: textURL)
+        XCTAssertEqual(textExported, 1, "the search box must scope the export too")
+        XCTAssertEqual(try decodedExportLines(textURL).first?.id, firstRow.id)
+    }
+
+    func testExportJSONLIsOneJSONObjectPerLine() async throws {
+        let (store, directory) = try makeExportStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        var row = ServerRequestLog()
+        row.method = "POST"
+        row.path = "/v1/chat/completions"
+        row.requestBody = "multi\nline content that must stay inside one JSON string"
+        store.append(row)
+        for _ in 0..<2 {
+            var filler = ServerRequestLog()
+            filler.method = "GET"
+            filler.path = "/v1/models"
+            store.append(filler)
+        }
+        _ = await store.count()
+
+        let url = directory.appendingPathComponent("lines.jsonl")
+        let exported = try await store.exportJSONL(to: url)
+        XCTAssertEqual(exported, 3)
+
+        let text = try String(contentsOf: url, encoding: .utf8)
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+        XCTAssertEqual(lines.count, 3, "JSONL must stay strictly one object per line even when bodies contain newlines")
+        XCTAssertEqual(try decodedExportLines(url).count, 3)
+        XCTAssertEqual(
+            try decodedExportLines(url).first { $0.path == "/v1/chat/completions" }?.requestBody,
+            "multi\nline content that must stay inside one JSON string",
+            "bodies must survive the export byte-exact"
+        )
+    }
 }

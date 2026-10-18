@@ -193,11 +193,14 @@ final class ServerRequestLogStore: @unchecked Sendable {
 
     private enum StoreError: LocalizedError {
         case schemaNewerThanSupported
+        case exportFailed(String)
 
         var errorDescription: String? {
             switch self {
             case .schemaNewerThanSupported:
                 return "on-disk request log schema is newer than this app supports"
+            case .exportFailed(let message):
+                return "request log export failed: \(message)"
             }
         }
     }
@@ -350,12 +353,9 @@ final class ServerRequestLogStore: @unchecked Sendable {
         }
     }
 
-    private func fetchLocked(filter: Filter, limit: Int, offset: Int, completion: ([ServerRequestLog]) -> Void) {
-        ensureOpen()
-        guard db != nil else {
-            completion([])
-            return
-        }
+    /// The filter's WHERE clauses + binds, shared by `fetchLocked` and the
+    /// JSONL export so the two can never drift apart on filter semantics.
+    private func filterClauses(_ filter: Filter) -> (whereSQL: String, binds: [Bind]) {
         var clauses: [String] = []
         var binds: [Bind] = []
 
@@ -384,6 +384,16 @@ final class ServerRequestLogStore: @unchecked Sendable {
         }
 
         let whereSQL = clauses.isEmpty ? "" : " WHERE " + clauses.joined(separator: " AND ")
+        return (whereSQL, binds)
+    }
+
+    private func fetchLocked(filter: Filter, limit: Int, offset: Int, completion: ([ServerRequestLog]) -> Void) {
+        ensureOpen()
+        guard db != nil else {
+            completion([])
+            return
+        }
+        let (whereSQL, binds) = filterClauses(filter)
         let sql = "SELECT payload FROM requests\(whereSQL) ORDER BY ts_ms DESC, rowid DESC LIMIT \(max(0, limit)) OFFSET \(max(0, offset))"
         var rows: [ServerRequestLog] = []
         var statement: OpaquePointer?
@@ -451,5 +461,64 @@ final class ServerRequestLogStore: @unchecked Sendable {
 
     private enum Bind {
         case text(String)
+    }
+
+    // MARK: Export
+
+    /// Writes every row matching `filter` to `url` as JSON Lines: one JSON
+    /// object per line, byte-identical to each row's persisted payload. The
+    /// dashboard's Export button saves the filtered log (bodies included only
+    /// per the capture toggle) for bug reports on client-format issues.
+    /// Returns the number of exported rows.
+    nonisolated func exportJSONL(filter: Filter = .empty, to url: URL) async throws -> Int {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async { [weak self] in
+                do {
+                    guard let self else {
+                        continuation.resume(returning: 0)
+                        return
+                    }
+                    continuation.resume(returning: try self.exportJSONLLocked(filter: filter, to: url))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func exportJSONLLocked(filter: Filter, to url: URL) throws -> Int {
+        ensureOpen()
+        guard db != nil else { return 0 }
+        let (whereSQL, binds) = filterClauses(filter)
+        let sql = "SELECT payload FROM requests\(whereSQL) ORDER BY ts_ms DESC, rowid DESC"
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw StoreError.exportFailed(String(cString: sqlite3_errmsg(db)))
+        }
+        for (index, bind) in binds.enumerated() {
+            if case .text(let value) = bind {
+                sqlite3_bind_text(statement, Int32(index + 1), value, -1, SQLITE_TRANSIENT)
+            }
+        }
+
+        guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
+            throw StoreError.exportFailed("cannot create file at \(url.path)")
+        }
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        let encoder = encoder
+        let decoder = decoder
+        var exported = 0
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let blob = sqlite3_column_blob(statement, 0) else { continue }
+            let payload = Data(bytes: blob, count: Int(sqlite3_column_bytes(statement, 0)))
+            // A row that cannot decode (schema drift from an older build) is
+            // skipped, matching fetch: the export succeeds with what is there.
+            guard let row = try? decoder.decode(ServerRequestLog.self, from: payload) else { continue }
+            try handle.write(contentsOf: encoder.encode(row) + Data("\n".utf8))
+            exported += 1
+        }
+        return exported
     }
 }
