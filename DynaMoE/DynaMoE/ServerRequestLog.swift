@@ -30,6 +30,16 @@ struct ServerRequestLog: Identifiable, Codable, Sendable, Equatable, Hashable {
         case other
     }
 
+    /// Which entry path produced the row. `chatUI` rows are in-app chat and
+    /// agent turns launched from the app's own generation loop; `httpAPI`
+    /// rows came through the local inference server. Rows persisted by
+    /// builds before the split decode with no source and read as legacy
+    /// server rows (the only path those builds had).
+    enum Source: String, Codable, Sendable {
+        case chatUI
+        case httpAPI
+    }
+
     /// How a streaming response ended. Non-streaming rows are `nil`.
     /// A stream's HTTP status is always 200 (errors travel as SSE frames),
     /// so this is the row's real error signal.
@@ -51,6 +61,9 @@ struct ServerRequestLog: Identifiable, Codable, Sendable, Equatable, Hashable {
     var method: String = ""
     var path: String = ""
     var proto: Proto = .other
+    /// Entry path. Nil only on rows decoded from payloads that predate the
+    /// field (legacy server rows); every new row carries it explicitly.
+    var source: Source? = .httpAPI
     var wasStreaming: Bool = false
     /// Wire status. For streaming rows always 200 — see `streamTermination`.
     var httpStatus: Int = 200
@@ -440,5 +453,67 @@ extension ServerRequestLog {
               let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
               let json = String(data: data, encoding: .utf8) else { return nil }
         return clippedBody(json)
+    }
+}
+
+// MARK: - In-app turn rows
+
+/// One row per in-app chat or agent turn, side by side with server rows in
+/// the same dashboard and unified log: the `source` enum is the single row
+/// vocabulary across both entry paths. Metadata only — in-app content
+/// already has its durable, private home in ChatSessionStore, so request
+/// and response bodies are never captured for `chatUI` rows regardless of
+/// the body-capture toggle; tool names are metadata and their arguments are
+/// always the withheld marker.
+extension ServerRequestLog {
+    nonisolated static func chatTurnLog(model: String?, inputTokens: Int, isAgentTurn: Bool) -> ServerRequestLogBox {
+        var row = ServerRequestLog()
+        row.method = "TURN"
+        row.path = isAgentTurn ? "agent" : "chat"
+        row.source = .chatUI
+        row.model = model
+        row.inputTokens = inputTokens
+        return ServerRequestLogBox(builder: row)
+    }
+}
+
+extension ServerRequestLogBox {
+    /// Stamps `firstTokenMs` from turn arrival — first caller wins (the
+    /// in-app generation loop marks its first streamed frame).
+    nonisolated func noteFirstToken() {
+        lock.lock()
+        if builder.firstTokenMs == nil {
+            builder.firstTokenMs = Date().timeIntervalSince(startedAt) * 1000
+        }
+        lock.unlock()
+    }
+
+    /// Finalizes and records the in-app turn row. One-shot per box (the
+    /// broadcast-claim flag doubles as the exactly-once guard). Called from
+    /// the generation loop's terminal path only: finished (200), failed
+    /// (500), cancelled (200: a user action, not an error, with the engine
+    /// message still recorded), or the stream closing without a result.
+    nonisolated func recordChatTurn(
+        status: Int,
+        errorMessage: String?,
+        outputTokens: Int,
+        finishReason: String?,
+        toolCallNames: [String]?
+    ) {
+        guard claim() else { return }
+        lock.lock()
+        builder.httpStatus = status
+        builder.durationMs = Date().timeIntervalSince(startedAt) * 1000
+        builder.outputTokens = outputTokens
+        builder.finishReason = finishReason
+        builder.errorMessage = errorMessage
+        if let toolCallNames, !toolCallNames.isEmpty {
+            builder.toolCalls = toolCallNames.map {
+                .init(name: $0, arguments: ServerRequestLog.contentWithheldMarker)
+            }
+        }
+        let row = builder
+        lock.unlock()
+        ServerRequestLogRecorder.shared.record(row)
     }
 }

@@ -1949,7 +1949,7 @@ struct SettingsSheetView: View {
     private var serverRequestLogCard: some View {
         SettingsCard(
             header: "Request Log",
-            footer: "Every API request since the last clear: metadata always (path, status, model, tokens, duration, tool names, errors). Bodies appear only when Store Request Content is on, and nothing here is ever sent off this Mac. Rows also land in Console.app under the DRP.DynaMoE subsystem (category server.request). The log keeps the most recent \(ServerRequestLogStore.maxRows) rows."
+            footer: "Every API request and in-app chat/agent turn since the last clear: metadata always (path, status, model, tokens, duration, tool names, errors). Bodies appear only when Store Request Content is on and never for in-app turns, and nothing here is ever sent off this Mac. Rows also land in Console.app under the DRP.DynaMoE subsystem (category server.request). The log keeps the most recent \(ServerRequestLogStore.maxRows) rows."
 
         ) {
             HStack(spacing: 8) {
@@ -2079,6 +2079,16 @@ struct SettingsSheetView: View {
                 .background(Color.secondary.opacity(0.12))
                 .cornerRadius(4)
 
+            if log.source == .chatUI {
+                Text("in-app")
+                    .font(.system(size: 10))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Color.purple.opacity(0.12))
+                    .cornerRadius(4)
+                    .help("In-app chat or agent turn (rows without this badge came through the API server)")
+            }
+
             if log.wasStreaming {
                 Text("stream")
                     .font(.system(size: 10))
@@ -2152,6 +2162,7 @@ struct SettingsSheetView: View {
                     serverRequestLogDetailLine("Time", log.timestamp.formatted(date: .abbreviated, time: .standard))
                     serverRequestLogDetailLine("Request ID", log.id.uuidString)
                     serverRequestLogDetailLine("Protocol", log.proto.rawValue)
+                    serverRequestLogDetailLine("Source", log.source?.rawValue ?? "httpAPI (legacy)")
                     if log.wasStreaming {
                         serverRequestLogDetailLine("Streaming", log.streamTermination?.rawValue ?? "open")
                         if let ttft = log.firstTokenMs {

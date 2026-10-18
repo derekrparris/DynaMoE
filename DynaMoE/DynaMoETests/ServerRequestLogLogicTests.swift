@@ -563,4 +563,114 @@ final class ServerRequestLogLogicTests: XCTestCase {
         try await Task.sleep(nanoseconds: 250_000_000)
         XCTAssertEqual(signals.count, 1, "a terminated subscription must hear nothing further")
     }
+
+    // MARK: In-app (chatUI) rows
+
+    func testLegacyRowsDecodeWithNoSource() throws {
+        let legacyJSON = """
+        {"id":"11111111-2222-3333-4444-555555555555","timestamp":1000,"method":"POST","path":"/v1/chat/completions","proto":"openai","wasStreaming":false,"httpStatus":200,"durationMs":5}
+        """
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .millisecondsSince1970
+        let row = try decoder.decode(ServerRequestLog.self, from: Data(legacyJSON.utf8))
+        XCTAssertEqual(row.httpStatus, 200)
+        XCTAssertNil(row.source, "rows persisted before the source split must still decode, as legacy server rows")
+    }
+
+    func testSourceRoundTripsThroughThePersistedPayload() throws {
+        var row = ServerRequestLog()
+        row.method = "TURN"
+        row.path = "chat"
+        row.source = .chatUI
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .millisecondsSince1970
+        let round = try decoder.decode(ServerRequestLog.self, from: try encoder.encode(row))
+        XCTAssertEqual(round.source, .chatUI)
+    }
+
+    func testInAppTurnRowIsMetadataOnlyAndRecordsExactlyOnce() async throws {
+        let store = ServerRequestLogStore.inMemory()
+        ServerRequestLogRecorder.shared.useOverrideStore(store)
+        defer { ServerRequestLogRecorder.shared.useOverrideStore(nil) }
+
+        let box = ServerRequestLog.chatTurnLog(model: "ling-3.0-tiny", inputTokens: 64, isAgentTurn: true)
+        let staged = box.snapshot()
+        XCTAssertEqual(staged.source, .chatUI)
+        XCTAssertEqual(staged.method, "TURN")
+        XCTAssertEqual(staged.path, "agent", "an agent turn must be distinguishable from a plain chat turn")
+        XCTAssertEqual(staged.model, "ling-3.0-tiny")
+        XCTAssertEqual(staged.inputTokens, 64)
+
+        box.noteFirstToken()
+        try await Task.sleep(nanoseconds: 30_000_000)
+        box.recordChatTurn(
+            status: 200,
+            errorMessage: nil,
+            outputTokens: 32,
+            finishReason: "toolFreeze",
+            toolCallNames: ["shell_run", "file_read"]
+        )
+        let rows = await store.fetch()
+        XCTAssertEqual(rows.count, 1, "the in-app turn must land in the same store as server rows")
+        let recorded = try XCTUnwrap(rows.first)
+        XCTAssertEqual(recorded.source, .chatUI)
+        XCTAssertEqual(recorded.outputTokens, 32)
+        XCTAssertEqual(recorded.finishReason, "toolFreeze")
+        XCTAssertEqual(recorded.toolCalls?.map(\.name), ["shell_run", "file_read"])
+        XCTAssertEqual(
+            recorded.toolCalls?.map { $0.arguments == ServerRequestLog.contentWithheldMarker },
+            [true, true],
+            "in-app tool arguments follow the withheld policy regardless of the capture toggle"
+        )
+        XCTAssertNil(recorded.requestBody)
+        XCTAssertNil(recorded.responseBody)
+        XCTAssertFalse(recorded.hasCapturedContent, "in-app turn rows are metadata only")
+        XCTAssertFalse(recorded.isError)
+        XCTAssertNotNil(recorded.firstTokenMs)
+        XCTAssertLessThanOrEqual(recorded.firstTokenMs ?? 0, recorded.durationMs)
+
+        // The boxed claim makes recording one-shot: a late duplicate call
+        // from the generation loop cannot write a second row.
+        box.recordChatTurn(
+            status: 500,
+            errorMessage: "duplicate terminal event",
+            outputTokens: 1,
+            finishReason: nil,
+            toolCallNames: nil
+        )
+        let countAfterDuplicate = await store.count()
+        XCTAssertEqual(countAfterDuplicate, 1, "recordChatTurn must be one-shot per turn")
+    }
+
+    func testFailedInAppTurnRecordsErrorWhileCancelledRecordsInfo() async throws {
+        let store = ServerRequestLogStore.inMemory()
+        ServerRequestLogRecorder.shared.useOverrideStore(store)
+        defer { ServerRequestLogRecorder.shared.useOverrideStore(nil) }
+
+        let failedBox = ServerRequestLog.chatTurnLog(model: "ling", inputTokens: 10, isAgentTurn: false)
+        failedBox.recordChatTurn(
+            status: 500,
+            errorMessage: "prefill failed: out of memory",
+            outputTokens: 0,
+            finishReason: nil,
+            toolCallNames: nil
+        )
+        let cancelledBox = ServerRequestLog.chatTurnLog(model: "ling", inputTokens: 10, isAgentTurn: false)
+        cancelledBox.recordChatTurn(
+            status: 200,
+            errorMessage: "Generation cancelled",
+            outputTokens: 7,
+            finishReason: nil,
+            toolCallNames: nil
+        )
+        let rows = await store.fetch()
+        XCTAssertEqual(rows.count, 2)
+        let failed = try XCTUnwrap(rows.first { $0.errorMessage == "prefill failed: out of memory" })
+        XCTAssertTrue(failed.isError, "a failed in-app turn is an error row")
+        let cancelled = try XCTUnwrap(rows.first { $0.errorMessage == "Generation cancelled" })
+        XCTAssertFalse(cancelled.isError, "a cancelled turn is a user action, not an error")
+        XCTAssertEqual(cancelled.outputTokens, 7, "the partial generation must still be visible in the row")
+    }
 }

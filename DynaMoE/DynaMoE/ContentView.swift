@@ -4572,6 +4572,15 @@ struct ContentView: View {
             return
         }
 
+        // In-app turn log: one request-log row per chat/agent turn (source
+        // chatUI, metadata only). Begun after a successful launch so launch
+        // failures stay unlogged (the chat surface owns those errors).
+        let turnLog = ServerRequestLog.chatTurnLog(
+            model: generationModelName,
+            inputTokens: promptTokenIds.count,
+            isAgentTurn: runAgentTools || agentStep > 0 || forceSynthesis
+        )
+
         // Session token odometer seeding: resolved from turn-start state (it is
         // deterministic — the seeded base reads the same conversation total the
         // old code read at prefill completion, plus the engine-reported prefix
@@ -4636,6 +4645,7 @@ struct ContentView: View {
                         }
                     }
                 case let .frame(frame):
+                    turnLog.noteFirstToken()
                     await MainActor.run {
                         self.generatedStreamText = frame.rawText
                         self.thinkingText = frame.thinkingText
@@ -4702,6 +4712,13 @@ struct ContentView: View {
                         }
                     }
                 case let .failedTurn(failure):
+                    turnLog.recordChatTurn(
+                        status: failure.cancelled ? 200 : 500,
+                        errorMessage: failure.message,
+                        outputTokens: failure.tokensGenerated,
+                        finishReason: nil,
+                        toolCallNames: nil
+                    )
                     if failure.cancelled {
                         // Cancellation: exact odometer tail only — the Stop /
                         // interrupt path already owns the flags and status line,
@@ -4770,7 +4787,18 @@ struct ContentView: View {
                 }
                 if finishedResult != nil { break }
             }
-            guard let result = finishedResult else { return }
+            guard let result = finishedResult else {
+                // The engine delivers failedTurn for cancellations, so a
+                // silent close is exceptional — still owed its row.
+                turnLog.recordChatTurn(
+                    status: 500,
+                    errorMessage: "Generation stream closed without a result",
+                    outputTokens: 0,
+                    finishReason: nil,
+                    toolCallNames: nil
+                )
+                return
+            }
 
             // Engine turn complete: backfill + prefix pin already done. Re-bind
             // the historical local names so the agent-orchestration phase below
@@ -4793,6 +4821,14 @@ struct ContentView: View {
             let finalHitRate = result.cacheHitRatePercent
             let finalPrefetchEff = result.prefetchEfficiencyPercent
             let finalPageLat = result.pagingLatencyMs
+
+            turnLog.recordChatTurn(
+                status: 200,
+                errorMessage: nil,
+                outputTokens: tokensGenerated,
+                finishReason: result.finishReason.rawValue,
+                toolCallNames: parsedResult.calls.isEmpty ? nil : parsedResult.calls.map(\.name)
+            )
 
             // No-op "gesture" calls (shell_run echo/true/:) are the model's way of
             // signalling it is finished. Executing them restarts the loop and
