@@ -240,6 +240,44 @@ final class ServerRequestLogLogicTests: XCTestCase {
         XCTAssertFalse(ServerRequestLogRecorder.composeLine(rowWithBodies).contains("TOP SECRET"))
     }
 
+    // MARK: Console-to-dashboard correlation
+
+    func testComposedLineLeadsWithRowShortId() throws {
+        let uuid = try XCTUnwrap(UUID(uuidString: "A1B2C3D4-1111-4222-8333-444455556666"))
+        var row = ServerRequestLog()
+        row.method = "POST"
+        row.path = "/v1/chat/completions"
+        row.id = uuid
+        XCTAssertEqual(row.shortId, "a1b2c3d4", "the short id is the lowercase 8-digit id prefix")
+
+        let line = ServerRequestLogRecorder.composeLine(row)
+        XCTAssertTrue(line.hasPrefix("id=a1b2c3d4 "), "the line must lead with the row's correlation id so a Console.app line pivots to the dashboard row")
+    }
+
+    func testBeginBoxRowIdReusesWireRequestIdWhenUUIDShaped() {
+        let recorder = ServerRequestLogRecorder.shared
+        let wireId = UUID()
+        let id = "test-\(UUID().uuidString)"
+        let box = recorder.beginBox(requestId: wireId.uuidString, method: "POST", path: "/v1/messages")
+        defer { recorder.endBox(requestId: wireId.uuidString) }
+        XCTAssertEqual(
+            box.snapshot().id, wireId,
+            "the row must carry Hummingbird's request id so all logs for one request share an identity"
+        )
+
+        // Non-UUID registry keys (tests) fall back to a fresh, valid row id.
+        let fallbackBox = recorder.beginBox(requestId: id, method: "GET", path: "/health")
+        defer { recorder.endBox(requestId: id) }
+        let fallbackId = fallbackBox.snapshot().id
+        XCTAssertNotEqual(fallbackId, wireId)
+        XCTAssertFalse(fallbackId.uuidString.isEmpty)
+
+        // Whatever the id's provenance, the composed line always prints a
+        // prefix of the row's own id: the line and the row cannot disagree.
+        let line = ServerRequestLogRecorder.composeLine(fallbackBox.snapshot())
+        XCTAssertTrue(line.hasPrefix("id=\(fallbackBox.snapshot().shortId) "))
+    }
+
     // MARK: Queue wait split
 
     func testComposedLineSplitsQueueWaitFromDuration() {

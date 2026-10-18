@@ -90,6 +90,14 @@ struct ServerRequestLog: Identifiable, Codable, Sendable, Equatable, Hashable {
 
     var isError: Bool { httpStatus >= 400 || streamTermination == .errorFrame }
 
+    /// Short correlation id printed in the unified-log line: the leading 8
+    /// hex digits of the row id. Enough to pivot from a Console.app line to
+    /// the dashboard row (the text filter is a substring match over the
+    /// persisted payload), without flooding the line with a full UUID.
+    var shortId: String {
+        String(id.uuidString.prefix(8)).lowercased()
+    }
+
     /// True when at least one body field holds captured content rather than
     /// the withheld placeholder or nil.
     var hasCapturedContent: Bool {
@@ -143,11 +151,16 @@ final class ServerRequestLogRecorder: @unchecked Sendable {
     // MARK: Box registry
 
     /// Creates the box for one inbound request. Wire fields only; enrichment
-    /// happens in the route as facts resolve.
+    /// happens in the route as facts resolve. The row id reuses the wire
+    /// request id when it is UUID-shaped (Hummingbird's `context.id`), so
+    /// the store's row and any other log keyed by the same request share one
+    /// identity; a non-UUID registry key (tests, alternate request-id
+    /// sources) falls back to a fresh id.
     nonisolated func beginBox(requestId: String, method: String, path: String) -> ServerRequestLogBox {
         var wire = ServerRequestLog()
         wire.method = method
         wire.path = path
+        wire.id = UUID(uuidString: requestId) ?? wire.id
         wire.proto = Self.proto(forPath: path)
         let box = ServerRequestLogBox(builder: wire)
         lock.lock()
@@ -197,9 +210,12 @@ final class ServerRequestLogRecorder: @unchecked Sendable {
 
     /// The metadata-only Console.app line. Structured key=value so a single
     /// request is traceable without flipping a debug flag; never includes
-    /// bodies (they live only in the persisted row, which is opt-in).
+    /// bodies (they live only in the persisted row, which is opt-in). Leads
+    /// with the row's short id so a Console line can be pivoted to the
+    /// dashboard row by search.
     nonisolated static func composeLine(_ row: ServerRequestLog) -> String {
         var parts: [String] = [
+            "id=\(row.shortId)",
             "\(row.method) \(row.path)",
             "→ \(row.httpStatus)",
             String(format: "%.0fms", row.durationMs),

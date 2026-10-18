@@ -2112,6 +2112,7 @@ struct SettingsSheetView: View {
 
                 VStack(alignment: .leading, spacing: 6) {
                     serverRequestLogDetailLine("Time", log.timestamp.formatted(date: .abbreviated, time: .standard))
+                    serverRequestLogDetailLine("Request ID", log.id.uuidString)
                     serverRequestLogDetailLine("Protocol", log.proto.rawValue)
                     if log.wasStreaming {
                         serverRequestLogDetailLine("Streaming", log.streamTermination?.rawValue ?? "open")
