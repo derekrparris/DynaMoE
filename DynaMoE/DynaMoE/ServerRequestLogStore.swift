@@ -311,7 +311,9 @@ final class ServerRequestLogStore: @unchecked Sendable {
     // MARK: Retention
 
     /// Age- and count-based prune. Runs on the store queue (open-time and
-    /// amortized append-time); NOT exposed as a user action.
+    /// amortized append-time); NOT exposed as a user action. Bulk deletes
+    /// finish with a WAL checkpoint so freed pages reach the OS instead of
+    /// lingering in the `-wal` file.
     private func pruneLocked(now: Date = Date()) {
         let cutoffMs = Int64(now.timeIntervalSince1970 * 1000) - Int64(Self.retentionDays) * 86_400_000
         _ = sqliteExec("DELETE FROM requests WHERE ts_ms < \(cutoffMs)")
@@ -324,6 +326,15 @@ final class ServerRequestLogStore: @unchecked Sendable {
                 LIMIT -1 OFFSET \(cap)
             )
             """)
+        checkpointLocked()
+    }
+
+    /// Writes dirty WAL pages back to the database and truncates the `-wal`
+    /// file to zero, returning the space to the OS. In WAL journal mode a
+    /// plain DELETE leaves freed pages in the `-wal` file until a checkpoint,
+    /// so without this a cleared log would keep its size on disk.
+    private func checkpointLocked() {
+        _ = exec("PRAGMA wal_checkpoint(TRUNCATE)")
     }
 
     // MARK: Queries
@@ -420,7 +431,9 @@ final class ServerRequestLogStore: @unchecked Sendable {
         }
     }
 
-    /// Removes every row. The Server dashboard's Clear Log button.
+    /// Removes every row, then checkpoints the WAL so the freed space is
+    /// actually returned to the OS (a plain DELETE would stay in the `-wal`
+    /// file). The Server dashboard's Clear Log button.
     nonisolated func clear() async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             queue.async { [weak self] in
@@ -430,6 +443,7 @@ final class ServerRequestLogStore: @unchecked Sendable {
                 }
                 self.ensureOpen()
                 _ = self.sqliteExec("DELETE FROM requests")
+                self.checkpointLocked()
                 continuation.resume()
             }
         }

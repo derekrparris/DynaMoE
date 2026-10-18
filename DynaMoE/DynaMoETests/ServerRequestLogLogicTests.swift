@@ -322,4 +322,55 @@ final class ServerRequestLogLogicTests: XCTestCase {
             "duration covers arrival-to-end, so it can never be shorter than the queue wait"
         )
     }
+
+    // MARK: Disk reclamation (the one disk-bound test: the in-memory store
+    // has no WAL to reclaim, so a temp-directory store proves the truncation)
+
+    private func walFileSize(atPath path: String) -> Int? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let size = attributes[.size] as? NSNumber else { return nil }
+        return size.intValue
+    }
+
+    func testClearAndPruneCheckpointWALSoDeletedRowsReleaseDiskSpace() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dynamoe-log-store-tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let dbPath = directory.appendingPathComponent("requests.sqlite").path
+        let walPath = dbPath + "-wal"
+        let store = ServerRequestLogStore(path: dbPath)
+
+        func appendRows(_ count: Int) async {
+            let body = String(repeating: "x", count: 128 * 1024)
+            for index in 0..<count {
+                var row = ServerRequestLog()
+                row.method = "POST"
+                row.path = "/v1/chat/completions"
+                row.durationMs = Double(index)
+                row.responseBody = body
+                store.append(row)
+            }
+            // count() runs on the store queue, so it drains the pending
+            // fire-and-forget appends first.
+            _ = await store.count()
+        }
+
+        await appendRows(8)
+        let walAfterAppends = try XCTUnwrap(walFileSize(atPath: walPath))
+        XCTAssertGreaterThan(walAfterAppends, 0, "freshly appended rows live in the WAL before any checkpoint")
+
+        await store.clear()
+        let walAfterClear = try XCTUnwrap(walFileSize(atPath: walPath))
+        XCTAssertEqual(walAfterClear, 0, "clear must TRUNCATE-checkpoint the WAL so cleared rows release disk space")
+
+        await appendRows(4)
+        XCTAssertGreaterThan(try XCTUnwrap(walFileSize(atPath: walPath)), 0, "post-clear appends repopulate the WAL")
+
+        await store.pruneForTesting(now: Date().addingTimeInterval(400 * 86_400))
+        XCTAssertEqual(
+            try XCTUnwrap(walFileSize(atPath: walPath)), 0,
+            "the retention prune must also checkpoint, so mass-expired rows release disk space"
+        )
+    }
 }
