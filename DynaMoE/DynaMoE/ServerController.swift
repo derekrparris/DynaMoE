@@ -1380,7 +1380,12 @@ final class ServerController: ObservableObject {
         // middleware steps aside and the body closure records below with the
         // stream's terminal facts.
         if let logBox {
-            _ = logBox.claim()
+            // claim() must run even in release builds (assert() elides its
+            // autoclosure argument under -O, which would skip the claim and
+            // let the middleware double-record); the assert just turns a
+            // future double-record regression into a test-time failure.
+            let claimed = logBox.claim()
+            assert(claimed, "the streaming writer must win its request-log box claim exactly once")
             logBox.modify { row in
                 row.wasStreaming = true
                 row.model = model
@@ -1670,7 +1675,12 @@ final class ServerController: ObservableObject {
         // Same ownership hand-off as the OpenAI writer: the stream's terminal
         // facts (not the bare 200) are what the row records.
         if let logBox {
-            _ = logBox.claim()
+            // claim() must run even in release builds (assert() elides its
+            // autoclosure argument under -O, which would skip the claim and
+            // let the middleware double-record); the assert just turns a
+            // future double-record regression into a test-time failure.
+            let claimed = logBox.claim()
+            assert(claimed, "the streaming writer must win its request-log box claim exactly once")
             logBox.modify { row in
                 row.wasStreaming = true
                 row.model = model

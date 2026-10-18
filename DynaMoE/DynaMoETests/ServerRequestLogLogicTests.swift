@@ -474,4 +474,93 @@ final class ServerRequestLogLogicTests: XCTestCase {
             "bodies must survive the export byte-exact"
         )
     }
+
+    // MARK: Change observation (the viewer listens instead of polling)
+
+    private func waitUntil(timeout: TimeInterval = 2, _ condition: @escaping @Sendable () async -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await condition() { return }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTFail("Condition not met within \(timeout)s")
+    }
+
+    /// Lock-guarded counter for cross-task signal assertions (a plain
+    /// captured var would race between the consumer task and the test task).
+    private final class SignalCountBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = 0
+        func increment() { lock.lock(); value += 1; lock.unlock() }
+        var count: Int { lock.lock(); defer { lock.unlock() }; return value }
+    }
+
+    func testChangeSignalFiresOnAppendAndClearButNotWhenIdle() async throws {
+        let (store, directory) = try makeExportStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // Open the store (and its one-time open prune) before subscribing so
+        // every signal from here on maps 1:1 to an append or a clear.
+        var opener = ServerRequestLog()
+        opener.method = "GET"
+        opener.path = "/v1/models"
+        store.append(opener)
+        _ = await store.count()
+
+        let signals = SignalCountBox()
+        let stream = store.changes()
+        let consumer = Task {
+            for await _ in stream { signals.increment() }
+        }
+        defer { consumer.cancel() }
+
+        var row = ServerRequestLog()
+        row.method = "POST"
+        row.path = "/v1/chat/completions"
+        store.append(row)
+        _ = await store.count()
+        try await waitUntil { signals.count >= 1 }
+
+        await store.clear()
+        try await waitUntil { signals.count >= 2 }
+
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(
+            signals.count, 2,
+            "idle time must not signal: the viewer refetches only when the log actually changed"
+        )
+    }
+
+    func testChangeSignalTerminationUnregistersTheObserver() async throws {
+        let (store, directory) = try makeExportStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // Same open-before-subscribe ordering as above.
+        var opener = ServerRequestLog()
+        opener.method = "GET"
+        opener.path = "/v1/models"
+        store.append(opener)
+        _ = await store.count()
+
+        let signals = SignalCountBox()
+        let stream = store.changes()
+        let consumer = Task {
+            for await _ in stream { signals.increment() }
+        }
+
+        var row = ServerRequestLog()
+        row.method = "GET"
+        row.path = "/v1/models"
+        store.append(row)
+        _ = await store.count()
+        try await waitUntil { signals.count >= 1 }
+
+        consumer.cancel()
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        store.append(row)
+        _ = await store.count()
+        try await Task.sleep(nanoseconds: 250_000_000)
+        XCTAssertEqual(signals.count, 1, "a terminated subscription must hear nothing further")
+    }
 }

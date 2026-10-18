@@ -52,6 +52,10 @@ final class ServerRequestLogStore: @unchecked Sendable {
     private let databasePath: String?
     private var openFailureLogged = false
     private var appendCounter = 0
+    /// Change observers (the dashboard's log viewer): one signal per append,
+    /// clear, or retention prune, so the viewer never polls.
+    private let observerLock = NSLock()
+    private var observers: [UUID: AsyncStream<Void>.Continuation] = [:]
 
     /// Path resolution follows ChatSessionStore's convention so the log
     /// lives beside session data (durable, backed up) — not in Caches.
@@ -309,6 +313,7 @@ final class ServerRequestLogStore: @unchecked Sendable {
         if appendCounter % Self.pruneEveryAppends == 0 {
             pruneLocked()
         }
+        notifyObservers()
     }
 
     // MARK: Retention
@@ -330,6 +335,7 @@ final class ServerRequestLogStore: @unchecked Sendable {
             )
             """)
         checkpointLocked()
+        notifyObservers()
     }
 
     /// Writes dirty WAL pages back to the database and truncates the `-wal`
@@ -454,6 +460,7 @@ final class ServerRequestLogStore: @unchecked Sendable {
                 self.ensureOpen()
                 _ = self.sqliteExec("DELETE FROM requests")
                 self.checkpointLocked()
+                self.notifyObservers()
                 continuation.resume()
             }
         }
@@ -520,5 +527,38 @@ final class ServerRequestLogStore: @unchecked Sendable {
             exported += 1
         }
         return exported
+    }
+
+    // MARK: Change observation
+
+    /// A stream that signals whenever stored rows change (append, clear,
+    /// retention prune). The dashboard's request-log viewer listens instead
+    /// of polling: it refetches only when the log actually changed. Buffered
+    /// to the single newest element, so a burst of appends collapses into
+    /// one refresh.
+    nonisolated func changes() -> AsyncStream<Void> {
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<Void>.makeStream(of: Void.self, bufferingPolicy: .bufferingNewest(1))
+        observerLock.lock()
+        observers[id] = continuation
+        observerLock.unlock()
+        continuation.onTermination = { [weak self] _ in
+            guard let self else { return }
+            self.observerLock.lock()
+            self.observers[id] = nil
+            self.observerLock.unlock()
+        }
+        return stream
+    }
+
+    /// Wakes every listener. Called on the store queue, where all row
+    /// mutations happen; yields never block the fire-and-forget appends.
+    private func notifyObservers() {
+        observerLock.lock()
+        let continuations = Array(observers.values)
+        observerLock.unlock()
+        for continuation in continuations {
+            continuation.yield(())
+        }
     }
 }

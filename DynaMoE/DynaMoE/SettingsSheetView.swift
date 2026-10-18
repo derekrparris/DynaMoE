@@ -137,6 +137,7 @@ struct SettingsSheetView: View {
     @State private var serverLogTotalCount: Int = 0
     @State private var serverLogShowClearConfirm: Bool = false
     @State private var serverLogExportSummary: String? = nil
+    @State private var serverLogSearchDebounce: Task<Void, Never>? = nil
 
     // Model Profile Management State
     @ObservedObject private var profileManager = ModelProfileManager.shared
@@ -1957,7 +1958,7 @@ struct SettingsSheetView: View {
                     .font(.system(size: 12))
                     .onChange(of: serverLogSearchText) { _, _ in
                         serverLogExportSummary = nil
-                        refreshServerRequestLog()
+                        debounceServerRequestLogRefresh()
                     }
 
                 Toggle("Errors Only", isOn: $serverLogErrorsOnly)
@@ -2037,8 +2038,14 @@ struct SettingsSheetView: View {
         .sheet(item: $serverLogSelected) { log in
             serverRequestLogDetail(log)
         }
-        .onAppear {
+        .task {
             refreshServerRequestLog()
+            // Live without the poll: the store signals only when rows
+            // actually changed (append, clear, prune), so the viewer never
+            // refetches on an idle timer tick.
+            for await _ in ServerRequestLogStore.shared.changes() {
+                refreshServerRequestLog()
+            }
         }
     }
 
@@ -2079,6 +2086,13 @@ struct SettingsSheetView: View {
                     .padding(.vertical, 1)
                     .background(Color.blue.opacity(0.12))
                     .cornerRadius(4)
+            }
+
+            if log.hasCapturedContent {
+                Image(systemName: "doc.text")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .help("Row holds captured request/response content (bodies follow the Store Request Content toggle)")
             }
 
             Spacer()
@@ -2230,6 +2244,18 @@ struct SettingsSheetView: View {
         }
     }
 
+    /// Trailing debounce for the search field: one SQLite query per pause in
+    /// typing (0.25 s), not one per keystroke. Superseded keystrokes collapse
+    /// into the next wait; the Errors Only toggle stays immediate.
+    private func debounceServerRequestLogRefresh() {
+        serverLogSearchDebounce?.cancel()
+        serverLogSearchDebounce = Task {
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
+            refreshServerRequestLog()
+        }
+    }
+
     /// Saves the filtered request log as JSON Lines via a save panel. The
     /// one click a client-format bug report needs: filtered rows, one JSON
     /// object per line, bodies included only per the capture toggle.
@@ -2308,7 +2334,8 @@ struct SettingsSheetView: View {
         serverDashboardTotalRequests = stats.totalRequests
         let controller = serverController
         Task { serverDashboardQueueDepth = await controller.pendingQueueDepth() }
-        refreshServerRequestLog()
+        // The request-log rows refresh through the store's change signal
+        // (see serverRequestLogCard), not this timer-driven stats pass.
     }
 
     // MARK: - Tab 6: Advanced Diagnostics & Inspector
