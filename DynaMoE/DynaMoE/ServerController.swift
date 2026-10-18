@@ -467,6 +467,50 @@ final class ServerStats: @unchecked Sendable {
     }
 }
 
+// MARK: - Request logging middleware
+
+/// Wire-level request logging. Begins one log box per inbound request keyed
+/// by the request context's id, records the row for every request the route
+/// handler does NOT claim (auth failures, decode failures, queue timeouts,
+/// non-streaming completions), and steps aside for streaming responses: the
+/// streaming body closure claims its box before the route returns the 200
+/// and records with the stream's terminal facts instead. Health probes get a
+/// debug-level unified-log line only, so polling never floods the store.
+struct ServerWireLogMiddleware<Context: RequestContext>: RouterMiddleware {
+    @concurrent
+    func handle(
+        _ request: Request,
+        context: Context,
+        next: @concurrent (Request, Context) async throws -> Response
+    ) async throws -> Response {
+        let requestId = context.id
+        let box = ServerRequestLogRecorder.shared.beginBox(
+            requestId: requestId,
+            method: request.method.rawValue,
+            path: request.uri.path
+        )
+        defer { ServerRequestLogRecorder.shared.endBox(requestId: requestId) }
+        do {
+            let response = try await next(request, context)
+            Self.finalize(box: box, path: request.uri.path, status: response.status.code, error: nil)
+            return response
+        } catch {
+            let status = (error as? ServerAPIError)?.status.code ?? 500
+            Self.finalize(box: box, path: request.uri.path, status: status, error: error)
+            throw error
+        }
+    }
+
+    nonisolated private static func finalize(box: ServerRequestLogBox, path: String, status: Int, error: (any Error)?) {
+        if path == "/health" {
+            DiagLog.debug(ServerRequestLogRecorder.requestCategory, "GET /health → \(status)")
+            return
+        }
+        guard !box.isClaimed else { return }
+        ServerRequestLogRecorder.shared.record(box.composeFinal(status: status, error: error))
+    }
+}
+
 // MARK: - ServerController
 
 /// Tiny lock-guarded int so the queued turn task can hand the resolved
@@ -672,7 +716,7 @@ final class ServerController: ObservableObject {
                 await self?.noteError("Server stopped with error: \(error.localizedDescription)", transition: transition)
             }
         }
-        NSLog("🌐 [SERVER] listening on %@:%d", Self.bindHost, port)
+        DiagLog.info("server.lifecycle", "listening on \(Self.bindHost):\(port)")
     }
 
     func stop() async {
@@ -694,7 +738,7 @@ final class ServerController: ObservableObject {
         guard transition == lifecycleGeneration else { return }
         isRunning = false
         boundPort = 0
-        print("🌐 [SERVER] stopped")
+        DiagLog.info("server.lifecycle", "stopped")
     }
 
     /// Applies the requested state (`dynamoe_server_enabled`), which the
@@ -719,13 +763,14 @@ final class ServerController: ObservableObject {
         lastError = message
         isRunning = false
         boundPort = 0
-        NSLog("🌐 [SERVER] error: %@", message)
+        DiagLog.error("server.lifecycle", "server error: \(message)")
     }
 
     // MARK: Router
 
     nonisolated static func buildRouter(queue: TurnExecutionQueue) -> Router<BasicRequestContext> {
         let router = Router()
+        router.add(middleware: ServerWireLogMiddleware<BasicRequestContext>())
 
         router.get("health") { _, _ in
             ServerController.healthBody()
@@ -742,6 +787,8 @@ final class ServerController: ObservableObject {
         router.post("v1/chat/completions") { request, context in
             ServerController.stats.beginRequest()
             defer { ServerController.stats.endRequest() }
+            let logBox = ServerRequestLogRecorder.shared.box(for: context.id)
+            logBox?.modify { $0.requestBytes = Int(request.headers[.contentLength] ?? "") }
             try ServerController.authorizeOrThrow(request)
             let apiRequest: OpenAIChatRequest
             do {
@@ -749,19 +796,33 @@ final class ServerController: ObservableObject {
             } catch {
                 throw ServerAPIError.badRequest("Invalid request body: \(error.localizedDescription)")
             }
+            logBox?.modify {
+                $0.wasStreaming = apiRequest.stream == true
+                $0.temperature = apiRequest.temperature.map { Double($0) }
+                $0.maxTokens = apiRequest.maxTokens
+                $0.requestBody = ServerRequestLogRecorder.captureBodiesEnabled
+                    ? ServerRequestLog.openAISummary(apiRequest)
+                    : ServerRequestLog.contentWithheldMarker
+            }
             if apiRequest.stream == true {
                 // Streaming keeps the 200 + text/event-stream contract even when
                 // the engine can't accept the turn: errors arrive as SSE frames.
-                return ServerController.streamingResponse(apiRequest: apiRequest, queue: queue)
+                return ServerController.streamingResponse(apiRequest: apiRequest, queue: queue, logBox: logBox)
             }
             let plan = try ServerController.buildTurnPlan(apiRequest)
-            let result = try await ServerController.nonStreamingResponse(plan: plan, queue: queue)
+            logBox?.modify {
+                $0.model = plan.modelName
+                $0.inputTokens = plan.promptTokenCount
+            }
+            let result = try await ServerController.nonStreamingResponse(plan: plan, queue: queue, logBox: logBox)
             return try context.responseEncoder.encode(result, from: request, context: context)
         }
 
         router.post("v1/messages") { request, context in
             ServerController.stats.beginRequest()
             defer { ServerController.stats.endRequest() }
+            let logBox = ServerRequestLogRecorder.shared.box(for: context.id)
+            logBox?.modify { $0.requestBytes = Int(request.headers[.contentLength] ?? "") }
             try ServerController.authorizeOrThrow(request)
             let apiRequest: AnthropicMessagesRequest
             do {
@@ -769,13 +830,25 @@ final class ServerController: ObservableObject {
             } catch {
                 throw ServerAPIError.badRequest("Invalid request body: \(error.localizedDescription)")
             }
+            logBox?.modify {
+                $0.wasStreaming = apiRequest.stream == true
+                $0.temperature = apiRequest.temperature.map { Double($0) }
+                $0.maxTokens = apiRequest.maxTokens
+                $0.requestBody = ServerRequestLogRecorder.captureBodiesEnabled
+                    ? ServerRequestLog.anthropicSummary(apiRequest)
+                    : ServerRequestLog.contentWithheldMarker
+            }
             if apiRequest.stream == true {
                 // Streaming keeps the 200 + text/event-stream contract even when
                 // the engine can't accept the turn: errors arrive as SSE frames.
-                return ServerController.anthropicStreamingResponse(apiRequest: apiRequest, queue: queue)
+                return ServerController.anthropicStreamingResponse(apiRequest: apiRequest, queue: queue, logBox: logBox)
             }
             let plan = try ServerController.buildTurnPlan(apiRequest)
-            let result = try await ServerController.anthropicNonStreamingResponse(plan: plan, queue: queue)
+            logBox?.modify {
+                $0.model = plan.modelName
+                $0.inputTokens = plan.promptTokenCount
+            }
+            let result = try await ServerController.anthropicNonStreamingResponse(plan: plan, queue: queue, logBox: logBox)
             return try context.responseEncoder.encode(result, from: request, context: context)
         }
 
@@ -1158,7 +1231,7 @@ final class ServerController: ObservableObject {
         }
     }
 
-    nonisolated private static func nonStreamingResponse(plan: TurnPlan, queue: TurnExecutionQueue) async throws -> OpenAIChatResponse {
+    nonisolated private static func nonStreamingResponse(plan: TurnPlan, queue: TurnExecutionQueue, logBox: ServerRequestLogBox?) async throws -> OpenAIChatResponse {
         let result = try await runTurn(plan: plan, queue: queue)
 
         let toolCalls = Self.turnEmittedToolCalls(result)
@@ -1179,6 +1252,7 @@ final class ServerController: ObservableObject {
             toolCalls: (toolCalls?.isEmpty == false) ? toolCalls : nil
         )
         let finishReason = OpenAIAdapter.finishReasonString(result.finishReason, hasToolCalls: !(toolCalls ?? []).isEmpty)
+        Self.recordTurnOutcome(logBox: logBox, result: result, finishReason: finishReason)
         return OpenAIChatResponse(
             id: "chatcmpl-\(UUID().uuidString.prefix(24))",
             created: Int(Date().timeIntervalSince1970),
@@ -1186,6 +1260,41 @@ final class ServerController: ObservableObject {
             choices: [.init(index: 0, message: message, finishReason: finishReason)],
             usage: .init(promptTokens: plan.promptTokenCount, completionTokens: result.tokensGenerated)
         )
+    }
+
+    /// Tool names are metadata (they answer "which tools did the model call");
+    /// arguments are content and follow the capture toggle, replaced by the
+    /// withheld marker otherwise.
+    nonisolated private static func logToolCallRecords(_ result: TurnResult) -> [ServerRequestLog.ToolCallRecord]? {
+        guard !result.parsedToolCalls.isEmpty else { return nil }
+        let capture = ServerRequestLogRecorder.captureBodiesEnabled
+        return result.parsedToolCalls.map { call in
+            ServerRequestLog.ToolCallRecord(
+                name: call.name,
+                arguments: capture
+                    ? ServerRequestLog.clippedArguments(Self.toolArgumentsJSON(call))
+                    : ServerRequestLog.contentWithheldMarker
+            )
+        }
+    }
+
+    /// Stamp the terminal inference facts (tokens, finish reason, tool calls,
+    /// captured response body) onto a completed non-streaming turn's log box.
+    /// `finishReason` is optional because the Anthropic adapter maps some
+    /// stop reasons to a JSON-absent nil.
+    nonisolated private static func recordTurnOutcome(logBox: ServerRequestLogBox?, result: TurnResult, finishReason: String?) {
+        logBox?.modify { row in
+            row.outputTokens = result.tokensGenerated
+            row.finishReason = finishReason
+            row.toolCalls = Self.logToolCallRecords(result)
+            row.responseBody = ServerRequestLogRecorder.captureBodiesEnabled
+                ? ServerRequestLog.clippedBody(
+                    result.thinkingText.isEmpty
+                        ? result.responseText
+                        : result.thinkingText + "\n\n" + result.responseText
+                )
+                : ServerRequestLog.contentWithheldMarker
+        }
     }
 
     /// The engine parses arguments into a dictionary; re-serialize for the
@@ -1245,12 +1354,24 @@ final class ServerController: ObservableObject {
 
     // MARK: Streaming handling
 
-    nonisolated private static func streamingResponse(apiRequest: OpenAIChatRequest, queue: TurnExecutionQueue) -> Response {
+    nonisolated private static func streamingResponse(apiRequest: OpenAIChatRequest, queue: TurnExecutionQueue, logBox: ServerRequestLogBox?) -> Response {
         let encoder = JSONEncoder()
         let id = "chatcmpl-\(UUID().uuidString.prefix(24))"
         let created = Int(Date().timeIntervalSince1970)
         let stopSequences = (apiRequest.stop ?? []).filter { !$0.isEmpty }
         let model = apiRequest.model ?? CompletionEngine.shared.loadedModelInfo?.displayName ?? "dynamoe"
+
+        // This request's row is finalized when the stream drains (the HTTP
+        // response is already a bare 200 by then), so claim the box: the wire
+        // middleware steps aside and the body closure records below with the
+        // stream's terminal facts.
+        if let logBox {
+            _ = logBox.claim()
+            logBox.modify { row in
+                row.wasStreaming = true
+                row.model = model
+            }
+        }
 
         func chunkBuffer(_ delta: OpenAIStreamDelta, finishReason: String?) throws -> ByteBuffer {
             let chunk = OpenAIChatChunk(id: id, created: created, model: model, choices: [.init(index: 0, delta: delta, finishReason: finishReason)])
@@ -1336,12 +1457,43 @@ final class ServerController: ObservableObject {
                 }
             }
             defer { task.cancel() }
+
+            // Request-log terminal state. `clientDisconnected` is the default:
+            // any path that ends the stream without one of the terminal cases
+            // below (a writer throw on a dropped socket) is a disconnect. The
+            // defer records exactly one row no matter how the stream ends.
+            var logTermination: ServerRequestLog.StreamTermination = .clientDisconnected
+            var logErrorMessage: String?
+            var logFirstTokenMs: Double?
+            var logFinish: TurnResult?
+            defer {
+                if let logBox {
+                    logBox.modify { row in
+                        row.httpStatus = 200
+                        row.durationMs = logBox.elapsedMs()
+                        row.firstTokenMs = logFirstTokenMs
+                        row.streamTermination = logTermination
+                        if promptTokensBox.get() > 0 { row.inputTokens = promptTokensBox.get() }
+                        if let message = logErrorMessage { row.errorMessage = message }
+                    }
+                    if let result = logFinish {
+                        recordTurnOutcome(
+                            logBox: logBox,
+                            result: result,
+                            finishReason: OpenAIAdapter.finishReasonString(result.finishReason, hasToolCalls: !result.parsedToolCalls.isEmpty)
+                        )
+                    }
+                    ServerRequestLogRecorder.shared.record(logBox.snapshot())
+                }
+            }
             var finishedCleanly = false
             for await event in relay {
                 switch event {
                 case .ping(let comment):
                     try await ping(comment)
                 case .launchFailed(let apiError):
+                    logTermination = .errorFrame
+                    logErrorMessage = apiError.message
                     let envelope = OpenAIErrorEnvelope(error: .init(message: apiError.message, type: apiError.wireType.rawValue, code: nil))
                     if let data = try? encoder.encode(envelope) {
                         try await sse(ByteBuffer(data: data))
@@ -1364,6 +1516,7 @@ final class ServerController: ObservableObject {
                         try await ping("prefill: \(status)")
                     }
                 case .engine(.frame(let frame)):
+                    if logFirstTokenMs == nil { logFirstTokenMs = logBox?.elapsedMs() }
                     if !sentRole {
                         sentRole = true
                         try await sse(chunkBuffer(.init(role: "assistant", content: nil, reasoningContent: nil, toolCalls: nil), finishReason: nil))
@@ -1384,6 +1537,8 @@ final class ServerController: ObservableObject {
                         try await sse(chunkBuffer(.init(role: nil, content: contentDelta, reasoningContent: nil, toolCalls: nil), finishReason: nil))
                     }
                 case .engine(.failedTurn(let failure)):
+                    logTermination = .errorFrame
+                    logErrorMessage = failure.cancelled ? "Generation cancelled" : failure.message
                     let envelope = OpenAIErrorEnvelope(error: .init(
                         message: failure.cancelled ? "Generation cancelled" : failure.message,
                         type: failure.cancelled ? "cancelled" : "server_error",
@@ -1433,6 +1588,8 @@ final class ServerController: ObservableObject {
                         try await sse(ByteBuffer(data: data))
                     }
                     try await sseRaw("[DONE]")
+                    logTermination = .completed
+                    logFinish = result
                     finishedCleanly = true
                 }
                 if finishedCleanly { break }
@@ -1454,7 +1611,7 @@ final class ServerController: ObservableObject {
 
     // MARK: Anthropic non-streaming handling
 
-    nonisolated private static func anthropicNonStreamingResponse(plan: TurnPlan, queue: TurnExecutionQueue) async throws -> AnthropicMessageResponse {
+    nonisolated private static func anthropicNonStreamingResponse(plan: TurnPlan, queue: TurnExecutionQueue, logBox: ServerRequestLogBox?) async throws -> AnthropicMessageResponse {
         let result = try await runTurn(plan: plan, queue: queue)
 
         var blocks: [AnthropicContentBlock] = []
@@ -1471,6 +1628,11 @@ final class ServerController: ObservableObject {
             blocks.append(.text(""))
         }
 
+        Self.recordTurnOutcome(
+            logBox: logBox,
+            result: result,
+            finishReason: AnthropicAdapter.finishReasonString(result.finishReason, hasToolCalls: !result.parsedToolCalls.isEmpty)
+        )
         return AnthropicMessageResponse(
             id: "msg-\(UUID().uuidString.prefix(24))",
             model: plan.modelName,
@@ -1483,11 +1645,21 @@ final class ServerController: ObservableObject {
 
     // MARK: Anthropic streaming handling
 
-    nonisolated private static func anthropicStreamingResponse(apiRequest: AnthropicMessagesRequest, queue: TurnExecutionQueue) -> Response {
+    nonisolated private static func anthropicStreamingResponse(apiRequest: AnthropicMessagesRequest, queue: TurnExecutionQueue, logBox: ServerRequestLogBox?) -> Response {
         let encoder = JSONEncoder()
         let id = "msg-\(UUID().uuidString.prefix(24))"
         let model = apiRequest.model ?? CompletionEngine.shared.loadedModelInfo?.displayName ?? "dynamoe"
         let stopSequences = (apiRequest.stopSequences ?? []).filter { !$0.isEmpty }
+
+        // Same ownership hand-off as the OpenAI writer: the stream's terminal
+        // facts (not the bare 200) are what the row records.
+        if let logBox {
+            _ = logBox.claim()
+            logBox.modify { row in
+                row.wasStreaming = true
+                row.model = model
+            }
+        }
 
         let body = ResponseBody { writer in
             func sse<E: Encodable>(_ eventName: String, _ payload: E) async throws {
@@ -1590,12 +1762,41 @@ final class ServerController: ObservableObject {
                 }
             }
             defer { task.cancel() }
+
+            // Request-log terminal state, mirroring the OpenAI writer: the
+            // defer records exactly one row no matter how the stream ends.
+            var logTermination: ServerRequestLog.StreamTermination = .clientDisconnected
+            var logErrorMessage: String?
+            var logFirstTokenMs: Double?
+            var logFinish: TurnResult?
+            defer {
+                if let logBox {
+                    logBox.modify { row in
+                        row.httpStatus = 200
+                        row.durationMs = logBox.elapsedMs()
+                        row.firstTokenMs = logFirstTokenMs
+                        row.streamTermination = logTermination
+                        if promptTokensBox.get() > 0 { row.inputTokens = promptTokensBox.get() }
+                        if let message = logErrorMessage { row.errorMessage = message }
+                    }
+                    if let result = logFinish {
+                        recordTurnOutcome(
+                            logBox: logBox,
+                            result: result,
+                            finishReason: AnthropicAdapter.finishReasonString(result.finishReason, hasToolCalls: !result.parsedToolCalls.isEmpty)
+                        )
+                    }
+                    ServerRequestLogRecorder.shared.record(logBox.snapshot())
+                }
+            }
             var finishedCleanly = false
             for await event in relay {
                 switch event {
                 case .ping:
                     try await ping()
                 case .launchFailed(let apiError):
+                    logTermination = .errorFrame
+                    logErrorMessage = apiError.message
                     try await ensureStart()
                     try await closeOpenBlocks()
                     try await errorEvent(apiError.message, type: apiError.wireType.rawValue)
@@ -1610,6 +1811,7 @@ final class ServerController: ObservableObject {
                         try await ping()
                     }
                 case .engine(.frame(let frame)):
+                    if logFirstTokenMs == nil { logFirstTokenMs = logBox?.elapsedMs() }
                     try await ensureStart()
                     // Append-only safety, mirroring the OpenAI writer: skip
                     // non-extending snapshots, hold back possible stop-sequence
@@ -1627,6 +1829,8 @@ final class ServerController: ObservableObject {
                         try await sse("content_block_delta", AnthropicContentBlockDeltaEvent(index: contentIndex ?? 0, delta: .text(contentDelta)))
                     }
                 case .engine(.failedTurn(let failure)):
+                    logTermination = .errorFrame
+                    logErrorMessage = failure.cancelled ? "Generation cancelled" : failure.message
                     try await ensureStart()
                     try await closeOpenBlocks()
                     try await errorEvent(failure.cancelled ? "Generation cancelled" : failure.message)
@@ -1665,6 +1869,8 @@ final class ServerController: ObservableObject {
                         usage: .init(outputTokens: result.tokensGenerated)
                     ))
                     try await sse("message_stop", AnthropicMessageStopEvent())
+                    logTermination = .completed
+                    logFinish = result
                     finishedCleanly = true
                 }
                 if finishedCleanly { break }

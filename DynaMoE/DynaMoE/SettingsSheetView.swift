@@ -129,6 +129,13 @@ struct SettingsSheetView: View {
     @State private var serverDashboardTotalRequests: Int = 0
     @State private var serverModelNameCopied: Bool = false
     @State private var serverEndpointCopied: Bool = false
+    @AppStorage(ServerRequestLogRecorder.captureBodiesKey) private var serverLogCaptureBodies: Bool = false
+    @State private var serverLogRows: [ServerRequestLog] = []
+    @State private var serverLogErrorsOnly: Bool = false
+    @State private var serverLogSearchText: String = ""
+    @State private var serverLogSelected: ServerRequestLog? = nil
+    @State private var serverLogTotalCount: Int = 0
+    @State private var serverLogShowClearConfirm: Bool = false
 
     // Model Profile Management State
     @ObservedObject private var profileManager = ModelProfileManager.shared
@@ -1673,6 +1680,7 @@ struct SettingsSheetView: View {
             serverStatusCard
             serverControlCard
             serverClientCard
+            serverRequestLogCard
         }
         .onAppear {
             serverPortText = "\(effectiveServerPort)"
@@ -1872,6 +1880,17 @@ struct SettingsSheetView: View {
                     .toggleStyle(.switch)
                     .labelsHidden()
             }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "Store Request Content",
+                subtitle: "When on, completion requests record their prompt and the model's response in the request log (clipped to 32 KB per field). When off, rows keep metadata only: model, token counts, durations, tool names, errors. Existing rows are not retroactively scrubbed when turned off."
+            ) {
+                Toggle("Store Request Content", isOn: $serverLogCaptureBodies)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+            }
         }
     }
 
@@ -1920,6 +1939,259 @@ struct SettingsSheetView: View {
                     .font(.system(size: 13, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
+        }
+    }
+
+    // MARK: - Tab 5: Request log
+
+    private var serverRequestLogCard: some View {
+        SettingsCard(
+            header: "Request Log",
+            footer: "Every API request since the last clear: metadata always (path, status, model, tokens, duration, tool names, errors). Bodies appear only when Store Request Content is on, and nothing here is ever sent off this Mac. Rows also land in Console.app under the DRP.DynaMoE subsystem (category server.request). The log keeps the most recent \(ServerRequestLogStore.maxRows) rows."
+
+        ) {
+            HStack(spacing: 8) {
+                TextField("Search model, path, error…", text: $serverLogSearchText)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12))
+                    .onChange(of: serverLogSearchText) { _, _ in refreshServerRequestLog() }
+
+                Toggle("Errors Only", isOn: $serverLogErrorsOnly)
+                    .toggleStyle(.checkbox)
+                    .onChange(of: serverLogErrorsOnly) { _, _ in refreshServerRequestLog() }
+
+                Text(serverLogTotalCount == 1 ? "1 row" : "\(serverLogTotalCount) rows")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                Button(role: .destructive) {
+                    serverLogShowClearConfirm = true
+                } label: {
+                    Label("Clear", systemImage: "trash")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(serverLogTotalCount == 0)
+                .confirmationDialog(
+                    "Clear every stored request log row?",
+                    isPresented: $serverLogShowClearConfirm,
+                    titleVisibility: .visible
+                ) {
+                    Button("Clear Request Log", role: .destructive) {
+                        Task {
+                            await ServerRequestLogStore.shared.clear()
+                            refreshServerRequestLog()
+                        }
+                    }
+                }
+            }
+
+            Divider()
+
+            if serverLogRows.isEmpty {
+                Text(serverLogSearchText.isEmpty && !serverLogErrorsOnly
+                     ? "No API requests recorded yet. Fire a client at the endpoint above and rows appear here within a second."
+                     : "No rows match the current filter.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 80)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 4) {
+                        ForEach(serverLogRows) { log in
+                            serverRequestLogRow(log)
+                                .contentShape(Rectangle())
+                                .onTapGesture { serverLogSelected = log }
+                        }
+                    }
+                }
+                .frame(height: 240)
+            }
+        }
+        .sheet(item: $serverLogSelected) { log in
+            serverRequestLogDetail(log)
+        }
+        .onAppear {
+            refreshServerRequestLog()
+        }
+    }
+
+    private func serverRequestLogRow(_ log: ServerRequestLog) -> some View {
+        let statusTint: Color = log.isError ? .red : (log.httpStatus < 300 ? .green : .orange)
+        return HStack(spacing: 8) {
+            Text(log.timestamp, style: .time)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(width: 80, alignment: .leading)
+
+            Text("\(String(log.httpStatus))")
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(statusTint)
+                .frame(width: 34, alignment: .trailing)
+
+            Text(log.method)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(width: 34, alignment: .leading)
+
+            Text(displayPath(log))
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(serverLogSelected?.id == log.id ? Color.primary : Color.secondary)
+                .lineLimit(1)
+
+            Text(log.proto.rawValue)
+                .font(.system(size: 10))
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(Color.secondary.opacity(0.12))
+                .cornerRadius(4)
+
+            if log.wasStreaming {
+                Text("stream")
+                    .font(.system(size: 10))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Color.blue.opacity(0.12))
+                    .cornerRadius(4)
+            }
+
+            Spacer()
+
+            if let model = log.model {
+                Text(model)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            Text("\(Int(log.durationMs))ms")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+
+            if let input = log.inputTokens, let output = log.outputTokens {
+                Text("\(input)→\(output) tok")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(serverLogSelected?.id == log.id ? Color.accentColor.opacity(0.10) : Color.clear)
+        .cornerRadius(6)
+    }
+
+    private func displayPath(_ log: ServerRequestLog) -> String {
+        var label = log.path
+        if let message = log.errorMessage, !message.isEmpty {
+            label += " — \(message)"
+        } else if let finish = log.finishReason {
+            label += " — \(finish)"
+        }
+        return label
+    }
+
+    private func serverRequestLogDetail(_ log: ServerRequestLog) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 10) {
+                    Text("\(log.method) \(log.path)")
+                        .font(.system(size: 15, weight: .semibold, design: .monospaced))
+                    Text(String(log.httpStatus))
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(log.isError ? Color.red : Color.green)
+                    Spacer()
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    serverRequestLogDetailLine("Time", log.timestamp.formatted(date: .abbreviated, time: .standard))
+                    serverRequestLogDetailLine("Protocol", log.proto.rawValue)
+                    if log.wasStreaming {
+                        serverRequestLogDetailLine("Streaming", log.streamTermination?.rawValue ?? "open")
+                        if let ttft = log.firstTokenMs {
+                            serverRequestLogDetailLine("First Token", String(format: "%.0f ms", ttft))
+                        }
+                    }
+                    serverRequestLogDetailLine("Duration", String(format: "%.0f ms", log.durationMs))
+                    serverRequestLogDetailLine("Model", log.model ?? "—")
+                    serverRequestLogDetailLine("Tokens", log.inputTokens.map { input in
+                        "\(input) in / \(log.outputTokens.map(String.init) ?? "—") out"
+                    } ?? "—")
+                    serverRequestLogDetailLine("Finish", log.finishReason ?? "—")
+                    serverRequestLogDetailLine("Request Size", log.requestBytes.map { "\(ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file)) (\($0) bytes)" } ?? "—")
+                    if let temperature = log.temperature {
+                        serverRequestLogDetailLine("Temperature", String(temperature))
+                    }
+                    if let maxTokens = log.maxTokens {
+                        serverRequestLogDetailLine("Max Tokens", String(maxTokens))
+                    }
+                    if let error = log.errorMessage {
+                        serverRequestLogDetailLine("Error", error)
+                    }
+                    if let tools = log.toolCalls, !tools.isEmpty {
+                        serverRequestLogDetailLine("Tool Calls", tools.map(\.name).joined(separator: ", "))
+                    }
+                }
+
+                serverRequestLogBodySection("Request", log.requestBody)
+                serverRequestLogBodySection("Response", log.responseBody)
+            }
+            .padding(20)
+            .frame(maxWidth: 640, alignment: .leading)
+        }
+        .frame(minWidth: 520, minHeight: 360)
+    }
+
+    private func serverRequestLogDetailLine(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .top) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 100, alignment: .leading)
+            Text(value)
+                .font(.system(size: 12, design: .monospaced))
+                .textSelection(.enabled)
+            Spacer()
+        }
+    }
+
+    @ViewBuilder
+    private func serverRequestLogBodySection(_ label: String, _ body: String?) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(label)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+            switch body {
+            case nil:
+                Text("Not captured for this request.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+            case ServerRequestLog.contentWithheldMarker:
+                Text("Content withheld — metadata only. Enable \"Store Request Content\" in Control above to record \(label.lowercased()) bodies.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+            default:
+                if let body {
+                    Text(body)
+                        .font(.system(size: 11, design: .monospaced))
+                        .textSelection(.enabled)
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.secondary.opacity(0.08))
+                        .cornerRadius(6)
+                }
+            }
+        }
+    }
+
+    private func refreshServerRequestLog() {
+        Task {
+            var filter = ServerRequestLogStore.Filter()
+            filter.errorsOnly = serverLogErrorsOnly
+            filter.text = serverLogSearchText
+            serverLogRows = await ServerRequestLogStore.shared.fetch(filter: filter, limit: 200)
+            serverLogTotalCount = await ServerRequestLogStore.shared.count()
         }
     }
 
@@ -1972,6 +2244,7 @@ struct SettingsSheetView: View {
         serverDashboardTotalRequests = stats.totalRequests
         let controller = serverController
         Task { serverDashboardQueueDepth = await controller.pendingQueueDepth() }
+        refreshServerRequestLog()
     }
 
     // MARK: - Tab 6: Advanced Diagnostics & Inspector
