@@ -99,6 +99,7 @@ struct ServerRequestLog: Identifiable, Codable, Sendable, Equatable, Hashable {
     static let contentWithheldMarker = "[content withheld — metadata only]"
 
     /// Bodies are clipped so a runaway request can never bloat the database.
+    /// Byte budgets, enforced by `clippedToUTF8Bytes`.
     static let maxBodyCaptureLength = 32 * 1024
     static let maxToolArgumentCaptureLength = 4 * 1024
 
@@ -120,13 +121,29 @@ struct ServerRequestLog: Identifiable, Codable, Sendable, Equatable, Hashable {
     }
 
     static func clippedBody(_ text: String) -> String {
-        guard text.count > maxBodyCaptureLength else { return text }
-        return String(text.prefix(maxBodyCaptureLength))
+        clippedToUTF8Bytes(text, limit: maxBodyCaptureLength)
     }
 
     static func clippedArguments(_ text: String) -> String {
-        guard text.count > maxToolArgumentCaptureLength else { return text }
-        return String(text.prefix(maxToolArgumentCaptureLength))
+        clippedToUTF8Bytes(text, limit: maxToolArgumentCaptureLength)
+    }
+
+    /// Byte-budgeted clip: the capture caps are advertised in bytes, and
+    /// `String.count` counts grapheme clusters — CJK text overshoots a
+    /// count-based cap severalfold and one grapheme with many combining
+    /// marks bypasses it entirely. Walks Unicode scalars (never splitting
+    /// one) so the result is always valid UTF-8 within the byte limit.
+    static func clippedToUTF8Bytes(_ text: String, limit: Int) -> String {
+        guard text.utf8.count > limit else { return text }
+        var clipped = String.UnicodeScalarView()
+        var consumed = 0
+        for scalar in text.unicodeScalars {
+            let width = scalar.value < 0x80 ? 1 : (scalar.value < 0x800 ? 2 : (scalar.value < 0x10000 ? 3 : 4))
+            if consumed + width > limit { break }
+            clipped.append(scalar)
+            consumed += width
+        }
+        return String(clipped)
     }
 }
 

@@ -56,6 +56,49 @@ final class ServerRequestLogLogicTests: XCTestCase {
         )
     }
 
+    func testClippingBoundsBodiesByUTF8Bytes() {
+        // CJK bodies: one grapheme per ideograph, but three UTF-8 bytes each,
+        // so a grapheme-counted cap lets severalfold the byte budget
+        // through.
+        let cjk = String(repeating: "语", count: ServerRequestLog.maxBodyCaptureLength)
+        let clippedCJK = ServerRequestLog.clippedBody(cjk)
+        XCTAssertGreaterThan(clippedCJK.utf8.count, ServerRequestLog.maxBodyCaptureLength / 4, "precondition: the byte budget must actually bite here")
+        XCTAssertLessThanOrEqual(
+            clippedCJK.utf8.count, ServerRequestLog.maxBodyCaptureLength,
+            "CJK bodies must be clipped by bytes, not grapheme count"
+        )
+        XCTAssertGreaterThanOrEqual(
+            clippedCJK.utf8.count, ServerRequestLog.maxBodyCaptureLength - 4,
+            "the clip must fill the budget with whole scalars, not stop early"
+        )
+        XCTAssertEqual(
+            String(decoding: clippedCJK.data(using: .utf8)!, as: UTF8.self), clippedCJK,
+            "the clip must never split a Unicode scalar"
+        )
+    }
+
+    func testClippingBitesOnCombiningMarkGraphemesThatAGraphemeCapBypasses() {
+        // One grapheme built from a huge run of combining marks: a
+        // grapheme-counted "cap" lets it pass whole (count 1 <= limit); the
+        // byte budget must still apply, scalar-aligned.
+        var megaGrapheme = "e"
+        megaGrapheme += String(repeating: "\u{0301}", count: ServerRequestLog.maxBodyCaptureLength)
+        let clippedBody = ServerRequestLog.clippedBody(megaGrapheme)
+        XCTAssertEqual(clippedBody.count, 1, "the clip stays scalar-aligned, so the uncut base-plus-marks grapheme remains one cluster")
+        XCTAssertLessThanOrEqual(
+            clippedBody.utf8.count, ServerRequestLog.maxBodyCaptureLength,
+            "the byte budget must bite even when the whole sample is a single grapheme"
+        )
+
+        let clippedArguments = ServerRequestLog.clippedArguments(megaGrapheme)
+        XCTAssertLessThanOrEqual(clippedArguments.utf8.count, ServerRequestLog.maxToolArgumentCaptureLength)
+        XCTAssertEqual(
+            clippedArguments.unicodeScalars.count,
+            (ServerRequestLog.maxToolArgumentCaptureLength + 1) / 2,
+            "the smaller budget keeps the 1-byte base plus as many whole 2-byte marks as fit"
+        )
+    }
+
     func testHasCapturedContentDistinguishesMarkerFromNilFromContent() {
         var row = ServerRequestLog()
         XCTAssertFalse(row.hasCapturedContent, "an all-nil row stores nothing")
@@ -323,16 +366,70 @@ final class ServerRequestLogLogicTests: XCTestCase {
         )
     }
 
-    // MARK: Disk reclamation (the one disk-bound test: the in-memory store
-    // has no WAL to reclaim, so a temp-directory store proves the truncation)
+    // MARK: Streaming partials (failure or disconnect after output)
 
-    private func walFileSize(atPath path: String) -> Int? {
+    func testStreamedPartialOutcomeKeepsPartialTextAndTokenCount() {
+        UserDefaults.standard.set(true, forKey: ServerRequestLogRecorder.captureBodiesKey)
+        let recorder = ServerRequestLogRecorder.shared
+        let id = "test-\(UUID().uuidString)"
+        let box = recorder.beginBox(requestId: id, method: "POST", path: "/v1/chat/completions")
+        defer { recorder.endBox(requestId: id) }
+
+        ServerController.recordStreamedPartialOutcome(
+            logBox: box,
+            frame: Self.streamedFrame(thinking: "partial thinking", response: "partial answer", tokens: 3),
+            tokenCount: 9
+        )
+        let enriched = box.snapshot()
+        XCTAssertEqual(enriched.outputTokens, 9, "the failure's exact token count must win over the frame's")
+        XCTAssertEqual(enriched.responseBody, "partial thinking\n\npartial answer")
+
+        UserDefaults.standard.set(false, forKey: ServerRequestLogRecorder.captureBodiesKey)
+        ServerController.recordStreamedPartialOutcome(
+            logBox: box,
+            frame: Self.streamedFrame(thinking: "t", response: "r", tokens: 1),
+            tokenCount: 2
+        )
+        XCTAssertEqual(
+            box.snapshot().responseBody, ServerRequestLog.contentWithheldMarker,
+            "a partial streamed body follows the capture toggle like any other"
+        )
+    }
+
+    private static func streamedFrame(thinking: String, response: String, tokens: Int) -> CompletionFrame {
+        CompletionFrame(
+            rawText: thinking + response,
+            thinkingText: thinking,
+            responseText: response,
+            isActivelyThinking: false,
+            tokensGenerated: tokens,
+            elapsedMs: 1,
+            tokensPerSecond: 1,
+            timeToFirstTokenSeconds: nil,
+            thinkingDurationSeconds: nil,
+            jetSpecActive: false,
+            jetSpecMeanTau: 0,
+            jetSpecDraftAccepted: 0,
+            jetSpecDraftProposed: 0,
+            residentMemoryGB: 0,
+            residentExpertCount: 0,
+            totalExpertCount: 0,
+            cacheHitRatePercent: 0,
+            prefetchEfficiencyPercent: 0,
+            pagingLatencyMs: 0
+        )
+    }
+
+    // MARK: Disk reclamation (the disk-bound tests: the in-memory store has
+    // no files to reclaim, so temp-directory stores prove the truncation)
+
+    private func fileSize(atPath path: String) -> Int? {
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
               let size = attributes[.size] as? NSNumber else { return nil }
         return size.intValue
     }
 
-    func testClearAndPruneCheckpointWALSoDeletedRowsReleaseDiskSpace() async throws {
+    func testClearAndMassPruneReleaseWALAndDatabaseFileSpace() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("dynamoe-log-store-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -341,13 +438,16 @@ final class ServerRequestLogLogicTests: XCTestCase {
         let walPath = dbPath + "-wal"
         let store = ServerRequestLogStore(path: dbPath)
 
-        func appendRows(_ count: Int) async {
-            let body = String(repeating: "x", count: 128 * 1024)
-            for index in 0..<count {
+        func combinedFootprint() -> Int {
+            (fileSize(atPath: walPath) ?? 0) + (fileSize(atPath: dbPath) ?? 0)
+        }
+
+        func appendRows(_ count: Int, bodyBytes: Int) async {
+            let body = String(repeating: "x", count: bodyBytes)
+            for _ in 0..<count {
                 var row = ServerRequestLog()
                 row.method = "POST"
                 row.path = "/v1/chat/completions"
-                row.durationMs = Double(index)
                 row.responseBody = body
                 store.append(row)
             }
@@ -356,21 +456,59 @@ final class ServerRequestLogLogicTests: XCTestCase {
             _ = await store.count()
         }
 
-        await appendRows(8)
-        let walAfterAppends = try XCTUnwrap(walFileSize(atPath: walPath))
+        await appendRows(8, bodyBytes: 128 * 1024)
+        let walAfterAppends = try XCTUnwrap(fileSize(atPath: walPath))
         XCTAssertGreaterThan(walAfterAppends, 0, "freshly appended rows live in the WAL before any checkpoint")
+        let peak = combinedFootprint()
 
         await store.clear()
-        let walAfterClear = try XCTUnwrap(walFileSize(atPath: walPath))
+        let walAfterClear = try XCTUnwrap(fileSize(atPath: walPath))
         XCTAssertEqual(walAfterClear, 0, "clear must TRUNCATE-checkpoint the WAL so cleared rows release disk space")
+        XCTAssertLessThanOrEqual(
+            combinedFootprint(), peak / 4,
+            "clear must also VACUUM the database file: DELETE alone leaves the pages on the freelist, so the main file keeps its peak footprint forever"
+        )
 
-        await appendRows(4)
-        XCTAssertGreaterThan(try XCTUnwrap(walFileSize(atPath: walPath)), 0, "post-clear appends repopulate the WAL")
+        // A retention pass below the compaction threshold compacts nothing;
+        // one at or above it must.
+        let compactionRows = ServerRequestLogStore.compactAfterRowsDeleted + 1
+        await appendRows(compactionRows, bodyBytes: 2_048)
+        XCTAssertGreaterThan(combinedFootprint(), peak / 4, "post-clear appends repopulate the database")
 
         await store.pruneForTesting(now: Date().addingTimeInterval(400 * 86_400))
         XCTAssertEqual(
-            try XCTUnwrap(walFileSize(atPath: walPath)), 0,
-            "the retention prune must also checkpoint, so mass-expired rows release disk space"
+            try XCTUnwrap(fileSize(atPath: walPath)), 0,
+            "the mass retention prune must checkpoint, so expired rows release WAL space"
+        )
+        XCTAssertLessThanOrEqual(
+            combinedFootprint(), peak / 4,
+            "a mass prune must VACUUM so expired rows leave the database file, not just its freelist"
+        )
+    }
+
+    func testSchemaVersionSurvivesStoreOpens() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dynamoe-log-schema-tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let dbPath = directory.appendingPathComponent("requests.sqlite").path
+
+        let first = ServerRequestLogStore(path: dbPath)
+        var opener = ServerRequestLog()
+        opener.method = "GET"
+        opener.path = "/v1/models"
+        first.append(opener)
+        _ = await first.count()
+        let firstVersion = await first.schemaVersionForTesting()
+        XCTAssertEqual(firstVersion, 1, "after the schema pass the file must read back user_version = 1")
+
+        let second = ServerRequestLogStore(path: dbPath)
+        second.append(opener)
+        _ = await second.count()
+        let secondVersion = await second.schemaVersionForTesting()
+        XCTAssertEqual(
+            secondVersion, 1,
+            "a fresh open of an already-migrated file must read the persisted schema version instead of re-running the schema pass"
         )
     }
 

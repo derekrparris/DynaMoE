@@ -163,6 +163,31 @@ final class ServerRequestLogStoreTests: XCTestCase {
         XCTAssertEqual(fetched.first?.errorMessage, "prompt tokenization produced 0 tokens")
     }
 
+    func testTextSearchMatchesStoredJSONEncodingOfDisplayText() async {
+        // The payload column is JSON, so a term matches only in its encoded
+        // form: the displayed error `invalid "name"` persists as
+        // `invalid \"name\"` inside the row. Searching what the dashboard
+        // displays must find the row.
+        var quotedRow = row(error: #"invalid "name""#)
+        quotedRow.model = "quoted-model"
+        store.append(quotedRow)
+        store.append(row(error: "plain failure"))
+
+        var filter = ServerRequestLogStore.Filter()
+        filter.text = #"invalid "name""#
+        let fetched = await store.fetch(filter: filter, limit: 10)
+        XCTAssertEqual(
+            fetched.map(\.model),
+            ["quoted-model"],
+            "a search term must match its JSON-encoded form in the payload"
+        )
+
+        // Plain terms still match plainly-encoded fields.
+        filter.text = "plain failure"
+        let plainFetched = await store.fetch(filter: filter, limit: 10)
+        XCTAssertEqual(plainFetched.first?.errorMessage, "plain failure")
+    }
+
     // MARK: Clear + count
 
     func testClearRemovesEverything() async {

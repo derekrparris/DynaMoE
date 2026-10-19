@@ -4627,11 +4627,13 @@ struct ContentView: View {
 
         generationTask = Task.detached(priority: .userInitiated) {
             var finishedResult: TurnResult? = nil
-            // Last streamed frame's text: what a failed or cancelled turn still
-            // owes its log row. Frames are consumed in this detached loop, so
-            // the accumulators stay local rather than hopping to the MainActor.
+            // Last streamed frame's facts: what a failed or cancelled turn
+            // still owes its log row. Frames are consumed in this detached
+            // loop, so the accumulators stay local rather than hopping to the
+            // MainActor.
             var streamedThinking = ""
             var streamedResponse = ""
+            var streamedTokens = 0
             for await event in launch.stream {
                 switch event {
                 case .started:
@@ -4655,6 +4657,7 @@ struct ContentView: View {
                     turnLog.noteFirstToken()
                     streamedThinking = frame.thinkingText
                     streamedResponse = frame.responseText
+                    streamedTokens = frame.tokensGenerated
                     await MainActor.run {
                         self.generatedStreamText = frame.rawText
                         self.thinkingText = frame.thinkingText
@@ -4799,12 +4802,17 @@ struct ContentView: View {
                 if finishedResult != nil { break }
             }
             guard let result = finishedResult else {
-                // The engine delivers failedTurn for cancellations, so a
-                // silent close is exceptional — still owed its row.
+                // The engine delivers failedTurn for cancellations, but Stop
+                // cancels this consumer task too, so the stream can close
+                // before that event arrives. A cancelled close is the user's
+                // own stop: record it as informational (200, engine stop
+                // message), not as a server error. Only an unclosed stream
+                // with no result is exceptional — still owed its row.
+                let cancelled = Task.isCancelled
                 turnLog.recordChatTurn(
-                    status: 500,
-                    errorMessage: "Generation stream closed without a result",
-                    outputTokens: 0,
+                    status: cancelled ? 200 : 500,
+                    errorMessage: cancelled ? "⏹ Generation stopped by user." : "Generation stream closed without a result",
+                    outputTokens: streamedTokens,
                     finishReason: nil,
                     thinking: streamedThinking,
                     response: streamedResponse,

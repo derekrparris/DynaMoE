@@ -34,6 +34,10 @@ final class ServerRequestLogStore: @unchecked Sendable {
     static let maxRows = 20_000
     /// Prune amortization: roll the retention pass every N appended rows.
     private static let pruneEveryAppends = 256
+    /// Compaction threshold: retention passes that delete at least this many
+    /// rows finish with a VACUUM so the database file itself shrinks. Below
+    /// the threshold the freelist keeps the pages warm for append reuse.
+    static let compactAfterRowsDeleted = 2_000
 
     /// Coarse filters over the indexed columns plus a payload text search.
     struct Filter: Sendable, Equatable {
@@ -169,6 +173,22 @@ final class ServerRequestLogStore: @unchecked Sendable {
         }
     }
 
+    /// Test-facing read of the persisted schema version, so tests can assert
+    /// `PRAGMA user_version` survives store opens: the schema pass must run
+    /// once per file, not again on every open.
+    nonisolated func schemaVersionForTesting() async -> Int64 {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Int64, Never>) in
+            queue.async { [weak self] in
+                guard let self else {
+                    continuation.resume(returning: 0)
+                    return
+                }
+                self.ensureOpen()
+                continuation.resume(returning: self.userVersion())
+            }
+        }
+    }
+
     /// Schema versioning via PRAGMA user_version, so a future column change
     /// has a migration base even though v1 is the first.
     private func runSchema() throws {
@@ -209,12 +229,15 @@ final class ServerRequestLogStore: @unchecked Sendable {
         }
     }
 
+    /// Reads `PRAGMA user_version`. `sqliteRun` positions the statement on
+    /// each row before invoking the callback, so the callback reads the
+    /// column without stepping again: stepping here consumes the only row's
+    /// SQLITE_DONE and, on SQLite builds that auto-reset, restarts the query
+    /// so the outer loop replays the row forever on the store queue.
     private func userVersion() -> Int64 {
         var version: Int64 = 0
         sqliteRun("PRAGMA user_version") { statement in
-            if sqlite3_step(statement) == SQLITE_ROW {
-                version = sqlite3_column_int64(statement, 0)
-            }
+            version = sqlite3_column_int64(statement, 0)
         }
         return version
     }
@@ -321,10 +344,13 @@ final class ServerRequestLogStore: @unchecked Sendable {
     /// Age- and count-based prune. Runs on the store queue (open-time and
     /// amortized append-time); NOT exposed as a user action. Bulk deletes
     /// finish with a WAL checkpoint so freed pages reach the OS instead of
-    /// lingering in the `-wal` file.
+    /// lingering in the `-wal` file; passes substantial enough to leave the
+    /// database mostly empty also VACUUM, so the main file shrinks too and
+    /// not just the WAL.
     private func pruneLocked(now: Date = Date()) {
         let cutoffMs = Int64(now.timeIntervalSince1970 * 1000) - Int64(Self.retentionDays) * 86_400_000
         _ = sqliteExec("DELETE FROM requests WHERE ts_ms < \(cutoffMs)")
+        let agePrunedRows = Int(sqlite3_changes(db))
         let cap = Self.maxRows
         // -1 LIMIT with OFFSET keeps OFFSET-skip semantics in SQLite.
         _ = sqliteExec("""
@@ -334,16 +360,32 @@ final class ServerRequestLogStore: @unchecked Sendable {
                 LIMIT -1 OFFSET \(cap)
             )
             """)
+        let capPrunedRows = Int(sqlite3_changes(db))
         checkpointLocked()
+        if agePrunedRows + capPrunedRows >= Self.compactAfterRowsDeleted {
+            compactLocked()
+        }
         notifyObservers()
     }
 
     /// Writes dirty WAL pages back to the database and truncates the `-wal`
-    /// file to zero, returning the space to the OS. In WAL journal mode a
-    /// plain DELETE leaves freed pages in the `-wal` file until a checkpoint,
-    /// so without this a cleared log would keep its size on disk.
+    /// file to zero. In WAL journal mode a plain DELETE leaves freed pages in
+    /// the `-wal` file until a checkpoint, so without this a cleared log
+    /// would keep its size in the WAL.
     private func checkpointLocked() {
         _ = exec("PRAGMA wal_checkpoint(TRUNCATE)")
+    }
+
+    /// Rebuilds the database so freed pages leave the main file. DELETE hands
+    /// pages to the freelist *inside* the database, and a TRUNCATE checkpoint
+    /// only empties the WAL: without a VACUUM, a cleared or mass-pruned log
+    /// keeps its peak database-file footprint forever. In WAL mode the
+    /// rebuilt image travels through the journal, so a trailing checkpoint
+    /// is what actually shrinks the file on disk — vacuum alone leaves both
+    /// files at their old sizes.
+    private func compactLocked() {
+        _ = exec("VACUUM")
+        checkpointLocked()
     }
 
     // MARK: Queries
@@ -380,9 +422,13 @@ final class ServerRequestLogStore: @unchecked Sendable {
         }
         let text = filter.text.trimmingCharacters(in: .whitespacesAndNewlines)
         if !text.isEmpty {
-            // Escape LIKE wildcards in the search term; % as the infix what
-            // a user expects: substring match across the JSON payload.
-            let escaped = text
+            // The payload column is JSON, so the term matches only in its
+            // stored form: displayed text `invalid "name"` persists as
+            // `invalid \"name\"`. Encode the term with the same encoder the
+            // rows were written with, then escape LIKE wildcards — the
+            // encoder's own backslashes first, so `\"` stays literal.
+            let encodedTerm = jsonEncodedSearchFragment(text)
+            let escaped = encodedTerm
                 .replacingOccurrences(of: "\\", with: "\\\\")
                 .replacingOccurrences(of: "%", with: "\\%")
                 .replacingOccurrences(of: "_", with: "\\_")
@@ -391,6 +437,18 @@ final class ServerRequestLogStore: @unchecked Sendable {
 
         let whereSQL = clauses.isEmpty ? "" : " WHERE " + clauses.joined(separator: " AND ")
         return (whereSQL, binds)
+    }
+
+    /// The search term as it appears inside a stored payload: a JSON-encoded
+    /// string minus its surrounding quotes, i.e. the exact bytes the term
+    /// occupies once a row is persisted. Falls back to the raw term if
+    /// encoding fails (it cannot for valid Swift strings).
+    private func jsonEncodedSearchFragment(_ text: String) -> String {
+        guard let data = try? encoder.encode(text),
+              let quoted = String(data: data, encoding: .utf8),
+              quoted.hasPrefix("\""), quoted.hasSuffix("\""),
+              quoted.count >= 2 else { return text }
+        return String(quoted.dropFirst().dropLast())
     }
 
     private func fetchLocked(filter: Filter, limit: Int, offset: Int, completion: ([ServerRequestLog]) -> Void) {
@@ -447,9 +505,10 @@ final class ServerRequestLogStore: @unchecked Sendable {
         }
     }
 
-    /// Removes every row, then checkpoints the WAL so the freed space is
-    /// actually returned to the OS (a plain DELETE would stay in the `-wal`
-    /// file). The Server dashboard's Clear Log button.
+    /// Removes every row, then checkpoints the WAL and compacts the
+    /// database so the freed space is actually returned to the OS (a plain
+    /// DELETE would stay in the `-wal` file, its pages in the main file's
+    /// freelist). The Server dashboard's Clear Log button.
     nonisolated func clear() async {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             queue.async { [weak self] in
@@ -460,6 +519,7 @@ final class ServerRequestLogStore: @unchecked Sendable {
                 self.ensureOpen()
                 _ = self.sqliteExec("DELETE FROM requests")
                 self.checkpointLocked()
+                self.compactLocked()
                 self.notifyObservers()
                 continuation.resume()
             }

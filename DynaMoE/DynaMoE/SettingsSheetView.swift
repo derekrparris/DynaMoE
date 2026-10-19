@@ -138,6 +138,8 @@ struct SettingsSheetView: View {
     @State private var serverLogShowClearConfirm: Bool = false
     @State private var serverLogExportSummary: String? = nil
     @State private var serverLogSearchDebounce: Task<Void, Never>? = nil
+    @State private var serverLogRefreshTask: Task<Void, Never>? = nil
+    @State private var serverLogRefreshQueued: Bool = false
 
     // Model Profile Management State
     @ObservedObject private var profileManager = ModelProfileManager.shared
@@ -2026,9 +2028,12 @@ struct SettingsSheetView: View {
                 ScrollView {
                     LazyVStack(spacing: 4) {
                         ForEach(serverLogRows) { log in
-                            serverRequestLogRow(log)
-                                .contentShape(Rectangle())
-                                .onTapGesture { serverLogSelected = log }
+                            Button {
+                                serverLogSelected = log
+                            } label: {
+                                serverRequestLogRow(log)
+                            }
+                            .buttonStyle(.plain)
                         }
                     }
                 }
@@ -2273,14 +2278,32 @@ struct SettingsSheetView: View {
         }
     }
 
+    /// Coalescing entry point for every refresh trigger — the changes
+    /// stream, the Errors Only toggle, the search debounce, Clear, and the
+    /// initial `.task` load: at most one fetch/count pair runs at a time.
+    /// Calls arriving while a refresh is still decoding rows queue exactly
+    /// one trailing re-run (which reads the newest filter state), so a
+    /// burst of appends cannot enqueue a 200-row fetch per change signal.
     private func refreshServerRequestLog() {
-        Task {
-            var filter = ServerRequestLogStore.Filter()
-            filter.errorsOnly = serverLogErrorsOnly
-            filter.text = serverLogSearchText
-            serverLogRows = await ServerRequestLogStore.shared.fetch(filter: filter, limit: 200)
-            serverLogTotalCount = await ServerRequestLogStore.shared.count()
+        if serverLogRefreshTask != nil {
+            serverLogRefreshQueued = true
+            return
         }
+        serverLogRefreshTask = Task {
+            repeat {
+                serverLogRefreshQueued = false
+                await runServerRequestLogRefresh()
+            } while serverLogRefreshQueued && !Task.isCancelled
+            serverLogRefreshTask = nil
+        }
+    }
+
+    private func runServerRequestLogRefresh() async {
+        var filter = ServerRequestLogStore.Filter()
+        filter.errorsOnly = serverLogErrorsOnly
+        filter.text = serverLogSearchText
+        serverLogRows = await ServerRequestLogStore.shared.fetch(filter: filter, limit: 200)
+        serverLogTotalCount = await ServerRequestLogStore.shared.count()
     }
 
     /// Trailing debounce for the search field: one SQLite query per pause in

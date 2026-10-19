@@ -814,7 +814,13 @@ final class ServerController: ObservableObject {
                 $0.wasStreaming = apiRequest.stream == true
                 $0.temperature = apiRequest.temperature.map { Double($0) }
                 $0.maxTokens = apiRequest.maxTokens
-                $0.requestBody = ServerRequestLog.capturedRequestBody(ServerRequestLog.openAISummary(apiRequest))
+                // Building the normalized summary walks and serializes the
+                // whole conversation. Skip that work entirely when body
+                // capture is off and stage the withheld marker directly:
+                // the produced summary would be discarded on the next line.
+                $0.requestBody = ServerRequestLogRecorder.captureBodiesEnabled
+                    ? ServerRequestLog.capturedRequestBody(ServerRequestLog.openAISummary(apiRequest))
+                    : ServerRequestLog.contentWithheldMarker
             }
             if apiRequest.stream == true {
                 // Streaming keeps the 200 + text/event-stream contract even when
@@ -846,7 +852,11 @@ final class ServerController: ObservableObject {
                 $0.wasStreaming = apiRequest.stream == true
                 $0.temperature = apiRequest.temperature.map { Double($0) }
                 $0.maxTokens = apiRequest.maxTokens
-                $0.requestBody = ServerRequestLog.capturedRequestBody(ServerRequestLog.anthropicSummary(apiRequest))
+                // Same gating as the OpenAI route: never build the summary
+                // just to discard it when body capture is off.
+                $0.requestBody = ServerRequestLogRecorder.captureBodiesEnabled
+                    ? ServerRequestLog.capturedRequestBody(ServerRequestLog.anthropicSummary(apiRequest))
+                    : ServerRequestLog.contentWithheldMarker
             }
             if apiRequest.stream == true {
                 // Streaming keeps the 200 + text/event-stream contract even when
@@ -1293,6 +1303,23 @@ final class ServerController: ObservableObject {
         }
     }
 
+    /// Stamp the partial facts of a streaming turn that died after emitting
+    /// output (failure frame, disconnect, mid-tail writer throw): the latest
+    /// frame's accumulated text and the failure's exact token count. No tool
+    /// calls or finish reason — the row's `streamTermination` and error
+    /// message already carry how it ended. Without this, a failure after
+    /// output would record neither the tokens that streamed nor the text.
+    nonisolated static func recordStreamedPartialOutcome(logBox: ServerRequestLogBox?, frame: CompletionFrame, tokenCount: Int) {
+        let responseBody = ServerRequestLog.capturedResponseBody(
+            thinking: frame.thinkingText,
+            response: frame.responseText
+        )
+        logBox?.modify { row in
+            row.outputTokens = tokenCount
+            row.responseBody = responseBody
+        }
+    }
+
     /// The engine parses arguments into a dictionary; re-serialize for the
     /// OpenAI `function.arguments` JSON-string field. `rawArguments` can hold
     /// parser artifacts (a Swift dictionary description, or the whole hermetic
@@ -1467,6 +1494,11 @@ final class ServerController: ObservableObject {
             var logErrorMessage: String?
             var logFirstTokenMs: Double?
             var logFinish: TurnResult?
+            // A turn that fails — or a socket that drops — after output still
+            // owes its row the partial response and token count: retain the
+            // latest frame for the defer's fallback enrichment.
+            var logFailure: TurnFailure?
+            var logPartialFrame: CompletionFrame?
             defer {
                 if let logBox {
                     logBox.modify { row in
@@ -1482,6 +1514,12 @@ final class ServerController: ObservableObject {
                             logBox: logBox,
                             result: result,
                             finishReason: OpenAIAdapter.finishReasonString(result.finishReason, hasToolCalls: !result.parsedToolCalls.isEmpty)
+                        )
+                    } else if let frame = logPartialFrame {
+                        recordStreamedPartialOutcome(
+                            logBox: logBox,
+                            frame: frame,
+                            tokenCount: logFailure?.tokensGenerated ?? frame.tokensGenerated
                         )
                     }
                     ServerRequestLogRecorder.shared.record(logBox.snapshot())
@@ -1520,6 +1558,7 @@ final class ServerController: ObservableObject {
                     }
                 case .engine(.frame(let frame)):
                     if logFirstTokenMs == nil { logFirstTokenMs = logBox?.elapsedMs() }
+                    logPartialFrame = frame
                     if !sentRole {
                         sentRole = true
                         try await sse(chunkBuffer(.init(role: "assistant", content: nil, reasoningContent: nil, toolCalls: nil), finishReason: nil))
@@ -1541,6 +1580,7 @@ final class ServerController: ObservableObject {
                     }
                 case .engine(.failedTurn(let failure)):
                     logTermination = .errorFrame
+                    logFailure = failure
                     logErrorMessage = failure.cancelled ? "Generation cancelled" : failure.message
                     let envelope = OpenAIErrorEnvelope(error: .init(
                         message: failure.cancelled ? "Generation cancelled" : failure.message,
@@ -1777,6 +1817,10 @@ final class ServerController: ObservableObject {
             var logErrorMessage: String?
             var logFirstTokenMs: Double?
             var logFinish: TurnResult?
+            // Fallback facts for a turn that fails or disconnects after
+            // output, mirroring the OpenAI writer.
+            var logFailure: TurnFailure?
+            var logPartialFrame: CompletionFrame?
             defer {
                 if let logBox {
                     logBox.modify { row in
@@ -1792,6 +1836,12 @@ final class ServerController: ObservableObject {
                             logBox: logBox,
                             result: result,
                             finishReason: AnthropicAdapter.finishReasonString(result.finishReason, hasToolCalls: !result.parsedToolCalls.isEmpty)
+                        )
+                    } else if let frame = logPartialFrame {
+                        recordStreamedPartialOutcome(
+                            logBox: logBox,
+                            frame: frame,
+                            tokenCount: logFailure?.tokensGenerated ?? frame.tokensGenerated
                         )
                     }
                     ServerRequestLogRecorder.shared.record(logBox.snapshot())
@@ -1822,6 +1872,7 @@ final class ServerController: ObservableObject {
                     }
                 case .engine(.frame(let frame)):
                     if logFirstTokenMs == nil { logFirstTokenMs = logBox?.elapsedMs() }
+                    logPartialFrame = frame
                     try await ensureStart()
                     // Append-only safety, mirroring the OpenAI writer: skip
                     // non-extending snapshots, hold back possible stop-sequence
@@ -1840,6 +1891,7 @@ final class ServerController: ObservableObject {
                     }
                 case .engine(.failedTurn(let failure)):
                     logTermination = .errorFrame
+                    logFailure = failure
                     logErrorMessage = failure.cancelled ? "Generation cancelled" : failure.message
                     try await ensureStart()
                     try await closeOpenBlocks()
