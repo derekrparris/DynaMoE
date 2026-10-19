@@ -16,6 +16,8 @@ final class ServerControllerSmokeTests: XCTestCase {
     private var savedServerEnabled: Any?
     private var savedServerPort: Any?
     private var savedServerAPIKey: Any?
+    private var savedCaptureBodies: Any?
+    private var logStore: ServerRequestLogStore!
 
     override func setUp() {
         super.setUp()
@@ -23,12 +25,19 @@ final class ServerControllerSmokeTests: XCTestCase {
         savedServerEnabled = defaults.object(forKey: ServerController.enabledKey)
         savedServerPort = defaults.object(forKey: ServerController.portKey)
         savedServerAPIKey = defaults.object(forKey: ServerController.apiKeyKey)
+        savedCaptureBodies = defaults.object(forKey: ServerRequestLogRecorder.captureBodiesKey)
         defaults.set(true, forKey: ServerController.enabledKey)
         defaults.set(8787, forKey: ServerController.portKey)
         // The suite sends unauthenticated requests, so a key saved in the app's
         // settings (the developer's own machine) must not turn every expectation
         // into a 401. `testAPIKeyRejectsUnauthorizedRequests` sets its own key.
         defaults.removeObject(forKey: ServerController.apiKeyKey)
+        defaults.set(false, forKey: ServerRequestLogRecorder.captureBodiesKey)
+        // Route the server's request logging into an in-memory store so this
+        // suite never writes to the developer's real request log, and every
+        // case reads rows from a clean slate.
+        logStore = ServerRequestLogStore.inMemory()
+        ServerRequestLogRecorder.shared.useOverrideStore(logStore)
     }
 
     override func tearDown() {
@@ -48,6 +57,13 @@ final class ServerControllerSmokeTests: XCTestCase {
         } else {
             defaults.removeObject(forKey: ServerController.apiKeyKey)
         }
+        if let savedCaptureBodies {
+            defaults.set(savedCaptureBodies, forKey: ServerRequestLogRecorder.captureBodiesKey)
+        } else {
+            defaults.set(false, forKey: ServerRequestLogRecorder.captureBodiesKey)
+        }
+        ServerRequestLogRecorder.shared.useOverrideStore(nil)
+        logStore = nil
         super.tearDown()
     }
 
@@ -275,6 +291,145 @@ final class ServerControllerSmokeTests: XCTestCase {
         let (_, apiKeyResponse) = try await URLSession.shared.data(for: apiKeyRequest)
         let apiKeyHttp = try XCTUnwrap(apiKeyResponse as? HTTPURLResponse)
         XCTAssertEqual(apiKeyHttp.statusCode, 200, "the x-api-key header must be accepted as an alternative presentation shape")
+    }
+
+    // MARK: - Request logging
+
+    /// The logging pipeline appends on a background queue, so assertions poll
+    /// briefly instead of sleeping a fixed interval.
+    private func waitForLoggedRow(matching predicate: @escaping (ServerRequestLog) -> Bool) async throws -> ServerRequestLog? {
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            let rows = await logStore.fetch(limit: 50)
+            if let hit = rows.first(where: predicate) {
+                return hit
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let rows = await logStore.fetch(limit: 50)
+        XCTFail("no matching row appeared; store holds \(rows.map { "\(String(describing: $0.method)) \(String(describing: $0.path)) \(String(describing: $0.httpStatus))" })")
+        return nil
+    }
+
+    func testHealthProbesLeaveNoRequestLogRow() async throws {
+        await ensureServerRunning()
+        let (data, _) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:8787/health")!)
+        _ = data
+        // Give the (asynchronous) store append a moment, then assert absence.
+        try await Task.sleep(nanoseconds: 300_000_000)
+        let rows = await logStore.fetch(limit: 50)
+        XCTAssertFalse(rows.contains { $0.path == "/health" }, "health polling must never write a persisted row")
+    }
+
+    func testRequestLogModelsEndpointRowHasWireFields() async throws {
+        await ensureServerRunning()
+        let before = await logStore.count()
+        let (data, response) = try await URLSession.shared.data(from: URL(string: "http://127.0.0.1:8787/v1/models")!)
+        XCTAssertEqual(try XCTUnwrap(response as? HTTPURLResponse).statusCode, 200)
+        _ = data
+
+        let logged = try await waitForLoggedRow { $0.path == "/v1/models" }
+        let row = try XCTUnwrap(logged)
+        XCTAssertEqual(row.httpStatus, 200)
+        XCTAssertEqual(row.method, "GET")
+        XCTAssertEqual(row.proto, .other)
+        XCTAssertFalse(row.isError)
+        XCTAssertNil(row.requestBody, "GET rows carry no captured body")
+        let after = await logStore.count()
+        XCTAssertEqual(after, before + 1)
+    }
+
+    func testRequestLogRecordsDecodeFailureAsErrorRow() async throws {
+        await ensureServerRunning()
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data(#"{"messages":"not an array"}"#.utf8)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        XCTAssertEqual(try XCTUnwrap(response as? HTTPURLResponse).statusCode, 400)
+        _ = data
+
+        let logged = try await waitForLoggedRow { $0.path == "/v1/chat/completions" && $0.isError }
+        let row = try XCTUnwrap(logged)
+        XCTAssertEqual(row.httpStatus, 400)
+        XCTAssertEqual(row.proto, .openai)
+        XCTAssertFalse(row.wasStreaming)
+        XCTAssertTrue(
+            row.errorMessage?.hasPrefix("Invalid request body") == true,
+            "the decode failure must surface its cause in the row (got: \(row.errorMessage ?? "nil"))"
+        )
+    }
+
+    func testRequestLogRecordsUnauthorizedRowWithoutCredentialMaterial() async throws {
+        let defaults = UserDefaults.standard
+        defaults.set("secret-test-key", forKey: ServerController.apiKeyKey)
+        defer { defaults.removeObject(forKey: ServerController.apiKeyKey) }
+        await ensureServerRunning()
+
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/models")!)
+        request.httpMethod = "GET"
+        request.setValue("Bearer secret-test-key-wrong", forHTTPHeaderField: "Authorization")
+        let (_, response) = try await URLSession.shared.data(for: request)
+        XCTAssertEqual(try XCTUnwrap(response as? HTTPURLResponse).statusCode, 401)
+
+        let logged = try await waitForLoggedRow { $0.path == "/v1/models" && $0.isError }
+        let row = try XCTUnwrap(logged)
+        XCTAssertEqual(row.httpStatus, 401)
+        XCTAssertEqual(row.errorMessage, "Invalid or missing API key")
+        XCTAssertFalse(
+            ServerRequestLogRecorder.composeLine(row).contains("secret"),
+            "the presented credential must never reach the unified-log line"
+        )
+    }
+
+    func testRequestLogRecordsStreamingErrorFrameWithTermination() async throws {
+        guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
+            throw XCTSkip("A model is loaded; the SSE error path cannot be exercised")
+        }
+        await ensureServerRunning()
+
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data("""
+        {"model":"any","stream":true,"messages":[{"role":"user","content":"hello"}]}
+        """.utf8)
+        let (bytes, response) = try await URLSession.shared.bytes(for: request)
+        XCTAssertEqual(try XCTUnwrap(response as? HTTPURLResponse).statusCode, 200)
+        for try await _ in bytes.lines {}
+
+        let logged = try await waitForLoggedRow { $0.path == "/v1/chat/completions" && $0.wasStreaming }
+        let row = try XCTUnwrap(logged)
+        XCTAssertEqual(row.httpStatus, 200, "streaming HTTP status stays 200; the error travels as frames")
+        XCTAssertEqual(row.streamTermination, .errorFrame, "the launch failure must read as an error frame")
+        XCTAssertTrue(row.isError)
+        XCTAssertNotNil(row.errorMessage)
+        XCTAssertEqual(row.proto, .openai)
+        XCTAssertNil(row.model, "no model is loaded, so the plan never resolved and the row carries no model rather than the client's alias label")
+    }
+
+    func testRequestLogNonStreaming503RowHasWithheldBodyMarker() async throws {
+        guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
+            throw XCTSkip("A model is loaded; the 503 path cannot be exercised")
+        }
+        await ensureServerRunning()
+
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data("""
+        {"model":"any","messages":[{"role":"user","content":"hello"}]}
+        """.utf8)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        XCTAssertEqual(try XCTUnwrap(response as? HTTPURLResponse).statusCode, 503)
+        _ = data
+
+        let logged = try await waitForLoggedRow { $0.path == "/v1/chat/completions" && $0.httpStatus == 503 }
+        let row = try XCTUnwrap(logged)
+        XCTAssertTrue(row.isError)
+        XCTAssertNil(row.model, "the plan never resolved, so the row has no model")
+        XCTAssertEqual(row.requestBody, ServerRequestLog.contentWithheldMarker, "body capture is off; the row must say withheld, not silence")
+        XCTAssertNil(row.streamTermination)
     }
 
     // MARK: - Lifecycle transitions

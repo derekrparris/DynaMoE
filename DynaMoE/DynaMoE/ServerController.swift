@@ -111,10 +111,17 @@ actor TurnExecutionQueue {
     /// `queueWaitTimeout` bounds how long the turn may sit behind earlier
     /// turns; when it expires the relay emits a launchFailed event instead of
     /// running the work — promptly, even if an earlier turn is stalled. Nil
-    /// (the default) waits indefinitely.
+    /// (the default) waits indefinitely. `onSlotOpened` fires exactly once,
+    /// the instant the FIFO slot opens and immediately before the work runs
+    /// (never on the timeout or cancellation paths), mirroring `perform`: the
+    /// streaming writers stamp their box's `queueWaitMs` through the hook —
+    /// at the producer — because the relay can deliver an event late, so an
+    /// SSE writer blocked on an earlier heartbeat would otherwise stamp
+    /// generation time as queue wait.
     func streamTurn(
         _ work: @escaping @Sendable (_ emit: @escaping @Sendable (QueuedTurnEvent) -> Void) async -> Void,
-        queueWaitTimeout: TimeInterval? = nil
+        queueWaitTimeout: TimeInterval? = nil,
+        onSlotOpened: (@Sendable () -> Void)? = nil
     ) -> (AsyncStream<QueuedTurnEvent>, Task<Void, Never>) {
         let (stream, continuation) = AsyncStream.makeStream(of: QueuedTurnEvent.self, bufferingPolicy: .unbounded)
         let previous = tail
@@ -131,7 +138,7 @@ actor TurnExecutionQueue {
                 continuation.yield(.ping(comment: nil))
             }
         }
-        let task = Task<Void, Never> { [previous, heartbeat, deadline] in
+        let task = Task<Void, Never> { [previous, heartbeat, deadline, onSlotOpened] in
             defer {
                 // The heartbeat also serves the RUNNING turn: cancel it here, not
                 // right after the previous turn drains, so the SSE stream keeps
@@ -163,6 +170,7 @@ actor TurnExecutionQueue {
                 continuation.finish()
                 return
             }
+            onSlotOpened?()
             await work { continuation.yield($0) }
             continuation.finish()
         }
@@ -184,12 +192,17 @@ actor TurnExecutionQueue {
     /// may sit behind earlier turns; when it expires the perform throws a
     /// request-timeout error instead of running the work — promptly, even if
     /// an earlier turn is stalled. Nil (the default) waits indefinitely.
+    /// `onSlotOpened` fires exactly once, the instant the FIFO slot opens and
+    /// immediately before the work runs (never on the timeout or
+    /// cancellation paths), so callers can split queue wait from generation
+    /// time.
     /// Cancelling the caller cancels the queued work: a cancelled request
     /// neither launches after its predecessor drains nor leaves a running
     /// engine turn unreachable by the work's own cancellation hook.
     func perform<T: Sendable>(
         _ work: @escaping @Sendable () async throws -> T,
-        queueWaitTimeout: TimeInterval? = nil
+        queueWaitTimeout: TimeInterval? = nil,
+        onSlotOpened: (@Sendable () -> Void)? = nil
     ) async throws -> T {
         let previous = tail
         enqueuedOperations += 1
@@ -212,6 +225,7 @@ actor TurnExecutionQueue {
                 throw ServerAPIError.requestTimeout("Request timed out waiting in the generation queue")
             }
             try Task.checkCancellation()
+            onSlotOpened?()
             return try await work()
         }
         cancelBox.set { task.cancel() }
@@ -467,6 +481,61 @@ final class ServerStats: @unchecked Sendable {
     }
 }
 
+// MARK: - Request logging middleware
+
+/// Wire-level request logging. Begins one log box per inbound request keyed
+/// by the request context's id, records the row for every request the route
+/// handler does NOT claim (auth failures, decode failures, queue timeouts,
+/// non-streaming completions), and steps aside for streaming responses: the
+/// streaming body closure claims its box before the route returns the 200
+/// and records with the stream's terminal facts instead. Health probes get a
+/// debug-level unified-log line only, so polling never floods the store.
+struct ServerWireLogMiddleware<Context: RequestContext>: RouterMiddleware {
+    @concurrent
+    func handle(
+        _ request: Request,
+        context: Context,
+        next: @concurrent (Request, Context) async throws -> Response
+    ) async throws -> Response {
+        let requestId = context.id
+        let box = ServerRequestLogRecorder.shared.beginBox(
+            requestId: requestId,
+            method: request.method.rawValue,
+            path: request.uri.path
+        )
+        defer { ServerRequestLogRecorder.shared.endBox(requestId: requestId) }
+        do {
+            let response = try await next(request, context)
+            Self.finalize(box: box, path: request.uri.path, status: response.status.code, error: nil)
+            return response
+        } catch {
+            let status = ServerController.recordedStatus(for: error)
+            Self.finalize(box: box, path: request.uri.path, status: status, error: error)
+            throw error
+        }
+    }
+
+    nonisolated private static func finalize(box: ServerRequestLogBox, path: String, status: Int, error: (any Error)?) {
+        if path == "/health" {
+            DiagLog.debug(ServerRequestLogRecorder.requestCategory, "GET /health → \(status)")
+            return
+        }
+        guard !box.isClaimed else { return }
+        ServerRequestLogRecorder.shared.record(box.composeFinal(status: status, error: error))
+    }
+}
+
+extension ServerController {
+    /// The wire status an error rendered to the client: every
+    /// `HTTPResponseError` — `ServerAPIError`, Hummingbird's own `HTTPError`,
+    /// any conformer the router meets — carries its status on itself, so the
+    /// row mirrors what the client actually received. Anything else still
+    /// records as 500, matching the fallback the router itself uses.
+    nonisolated static func recordedStatus(for error: any Error) -> Int {
+        (error as? any HTTPResponseError)?.status.code ?? 500
+    }
+}
+
 // MARK: - ServerController
 
 /// Tiny lock-guarded int so the queued turn task can hand the resolved
@@ -507,27 +576,37 @@ struct ServerAPIError: Error, HTTPResponseError, LocalizedError, Sendable {
     let status: HTTPResponse.Status
     let wireType: WireType
     let message: String
+    /// The log-safe rendering of this error for the persisted row and the
+    /// unified log. The client-facing `message` may echo request values back
+    /// to the client (an invalid role, a demanded tool name) so the client can
+    /// debug its own wire usage — content the request log must not persist
+    /// when body capture is off and must never print publicly — so errors
+    /// that reflect such values carry a log-safe variant here; every other
+    /// error is its own log-safe message.
+    let logSafeMessage: String?
+    /// What the request log and the unified log record for this error.
+    var recordableMessage: String { logSafeMessage ?? message }
 
     var errorDescription: String? { message }
 
-    static func badRequest(_ message: String) -> ServerAPIError {
-        ServerAPIError(status: .badRequest, wireType: .invalidRequest, message: message)
+    static func badRequest(_ message: String, logSafeMessage: String? = nil) -> ServerAPIError {
+        ServerAPIError(status: .badRequest, wireType: .invalidRequest, message: message, logSafeMessage: logSafeMessage)
     }
 
     static func unauthorized(_ message: String) -> ServerAPIError {
-        ServerAPIError(status: .unauthorized, wireType: .authentication, message: message)
+        ServerAPIError(status: .unauthorized, wireType: .authentication, message: message, logSafeMessage: nil)
     }
 
     static func requestTimeout(_ message: String) -> ServerAPIError {
-        ServerAPIError(status: .requestTimeout, wireType: .requestTimeout, message: message)
+        ServerAPIError(status: .requestTimeout, wireType: .requestTimeout, message: message, logSafeMessage: nil)
     }
 
     static func serviceUnavailable(_ message: String) -> ServerAPIError {
-        ServerAPIError(status: .serviceUnavailable, wireType: .overloaded, message: message)
+        ServerAPIError(status: .serviceUnavailable, wireType: .overloaded, message: message, logSafeMessage: nil)
     }
 
     static func internalError(_ message: String) -> ServerAPIError {
-        ServerAPIError(status: .internalServerError, wireType: .api, message: message)
+        ServerAPIError(status: .internalServerError, wireType: .api, message: message, logSafeMessage: nil)
     }
 
     func response(from request: Request, context: some RequestContext) throws -> Response {
@@ -672,7 +751,7 @@ final class ServerController: ObservableObject {
                 await self?.noteError("Server stopped with error: \(error.localizedDescription)", transition: transition)
             }
         }
-        NSLog("🌐 [SERVER] listening on %@:%d", Self.bindHost, port)
+        DiagLog.info("server.lifecycle", "listening on \(Self.bindHost):\(port)")
     }
 
     func stop() async {
@@ -694,7 +773,7 @@ final class ServerController: ObservableObject {
         guard transition == lifecycleGeneration else { return }
         isRunning = false
         boundPort = 0
-        print("🌐 [SERVER] stopped")
+        DiagLog.info("server.lifecycle", "stopped")
     }
 
     /// Applies the requested state (`dynamoe_server_enabled`), which the
@@ -719,13 +798,14 @@ final class ServerController: ObservableObject {
         lastError = message
         isRunning = false
         boundPort = 0
-        NSLog("🌐 [SERVER] error: %@", message)
+        DiagLog.error("server.lifecycle", "server error: \(message)")
     }
 
     // MARK: Router
 
     nonisolated static func buildRouter(queue: TurnExecutionQueue) -> Router<BasicRequestContext> {
         let router = Router()
+        router.add(middleware: ServerWireLogMiddleware<BasicRequestContext>())
 
         router.get("health") { _, _ in
             ServerController.healthBody()
@@ -742,6 +822,8 @@ final class ServerController: ObservableObject {
         router.post("v1/chat/completions") { request, context in
             ServerController.stats.beginRequest()
             defer { ServerController.stats.endRequest() }
+            let logBox = ServerRequestLogRecorder.shared.box(for: context.id)
+            logBox?.modify { $0.requestBytes = Int(request.headers[.contentLength] ?? "") }
             try ServerController.authorizeOrThrow(request)
             let apiRequest: OpenAIChatRequest
             do {
@@ -749,19 +831,37 @@ final class ServerController: ObservableObject {
             } catch {
                 throw ServerAPIError.badRequest("Invalid request body: \(error.localizedDescription)")
             }
+            logBox?.modify {
+                $0.wasStreaming = apiRequest.stream == true
+                $0.temperature = apiRequest.temperature.map { Double($0) }
+                $0.maxTokens = apiRequest.maxTokens
+                // Building the normalized summary walks and serializes the
+                // whole conversation. Skip that work entirely when body
+                // capture is off and stage the withheld marker directly:
+                // the produced summary would be discarded on the next line.
+                $0.requestBody = ServerRequestLogRecorder.captureBodiesEnabled
+                    ? ServerRequestLog.capturedRequestBody(ServerRequestLog.openAISummary(apiRequest))
+                    : ServerRequestLog.contentWithheldMarker
+            }
             if apiRequest.stream == true {
                 // Streaming keeps the 200 + text/event-stream contract even when
                 // the engine can't accept the turn: errors arrive as SSE frames.
-                return ServerController.streamingResponse(apiRequest: apiRequest, queue: queue)
+                return ServerController.streamingResponse(apiRequest: apiRequest, queue: queue, logBox: logBox)
             }
             let plan = try ServerController.buildTurnPlan(apiRequest)
-            let result = try await ServerController.nonStreamingResponse(plan: plan, queue: queue)
+            logBox?.modify {
+                $0.model = plan.modelName
+                $0.inputTokens = plan.promptTokenCount
+            }
+            let result = try await ServerController.nonStreamingResponse(plan: plan, queue: queue, logBox: logBox)
             return try context.responseEncoder.encode(result, from: request, context: context)
         }
 
         router.post("v1/messages") { request, context in
             ServerController.stats.beginRequest()
             defer { ServerController.stats.endRequest() }
+            let logBox = ServerRequestLogRecorder.shared.box(for: context.id)
+            logBox?.modify { $0.requestBytes = Int(request.headers[.contentLength] ?? "") }
             try ServerController.authorizeOrThrow(request)
             let apiRequest: AnthropicMessagesRequest
             do {
@@ -769,13 +869,27 @@ final class ServerController: ObservableObject {
             } catch {
                 throw ServerAPIError.badRequest("Invalid request body: \(error.localizedDescription)")
             }
+            logBox?.modify {
+                $0.wasStreaming = apiRequest.stream == true
+                $0.temperature = apiRequest.temperature.map { Double($0) }
+                $0.maxTokens = apiRequest.maxTokens
+                // Same gating as the OpenAI route: never build the summary
+                // just to discard it when body capture is off.
+                $0.requestBody = ServerRequestLogRecorder.captureBodiesEnabled
+                    ? ServerRequestLog.capturedRequestBody(ServerRequestLog.anthropicSummary(apiRequest))
+                    : ServerRequestLog.contentWithheldMarker
+            }
             if apiRequest.stream == true {
                 // Streaming keeps the 200 + text/event-stream contract even when
                 // the engine can't accept the turn: errors arrive as SSE frames.
-                return ServerController.anthropicStreamingResponse(apiRequest: apiRequest, queue: queue)
+                return ServerController.anthropicStreamingResponse(apiRequest: apiRequest, queue: queue, logBox: logBox)
             }
             let plan = try ServerController.buildTurnPlan(apiRequest)
-            let result = try await ServerController.anthropicNonStreamingResponse(plan: plan, queue: queue)
+            logBox?.modify {
+                $0.model = plan.modelName
+                $0.inputTokens = plan.promptTokenCount
+            }
+            let result = try await ServerController.anthropicNonStreamingResponse(plan: plan, queue: queue, logBox: logBox)
             return try context.responseEncoder.encode(result, from: request, context: context)
         }
 
@@ -939,7 +1053,12 @@ final class ServerController: ObservableObject {
         do {
             promptTokenIds = try engine.tokenize(formattedPrompt)
         } catch {
-            throw ServerAPIError.badRequest("Tokenizer failed to encode the prompt: \(error.localizedDescription)")
+            throw ServerAPIError.badRequest(
+                "Tokenizer failed to encode the prompt: \(error.localizedDescription)",
+                // The cause can quote the offending prompt text (an unknown
+                // special token), so the row keeps the category only.
+                logSafeMessage: "Tokenizer failed to encode the prompt"
+            )
         }
         guard !promptTokenIds.isEmpty else {
             throw ServerAPIError.badRequest("Prompt tokenization produced 0 tokens.")
@@ -1126,10 +1245,10 @@ final class ServerController: ObservableObject {
     }
 
     /// Runs a planned turn through the FIFO queue to completion. Shared by
-    /// both adapters' non-streaming paths.
-    nonisolated private static func runTurn(plan: TurnPlan, queue: TurnExecutionQueue) async throws -> TurnResult {
-        try await queue.perform(queueWaitTimeout: resolvedQueueWaitTimeout) {
-            () async throws -> TurnResult in
+    /// both adapters' non-streaming paths. The slot-open signal stamps the
+    /// box's queue wait so it can be split from generation time.
+    nonisolated private static func runTurn(plan: TurnPlan, queue: TurnExecutionQueue, logBox: ServerRequestLogBox?) async throws -> TurnResult {
+        try await queue.perform({ () async throws -> TurnResult in
             try await withTurnToolMask(plan.maskSchemas) {
                 let launch: CompletionLaunch
                 do {
@@ -1141,6 +1260,9 @@ final class ServerController: ObservableObject {
                     for await event in launch.stream {
                         switch event {
                         case .failedTurn(let failure):
+                            // The throw unwinds before any success-path stamping, so the
+                            // tokens generated before the failure must reach the row here.
+                            Self.recordFailedTurnTokenCount(logBox: logBox, failure: failure)
                             if failure.cancelled { throw ServerAPIError.serviceUnavailable("Generation cancelled") }
                             throw ServerAPIError.internalError(failure.message)
                         case .finished(let result):
@@ -1155,11 +1277,11 @@ final class ServerController: ObservableObject {
                     launch.handle.cancel()
                 }
             }
-        }
+        }, queueWaitTimeout: resolvedQueueWaitTimeout, onSlotOpened: { logBox?.noteSlotOpened() })
     }
 
-    nonisolated private static func nonStreamingResponse(plan: TurnPlan, queue: TurnExecutionQueue) async throws -> OpenAIChatResponse {
-        let result = try await runTurn(plan: plan, queue: queue)
+    nonisolated private static func nonStreamingResponse(plan: TurnPlan, queue: TurnExecutionQueue, logBox: ServerRequestLogBox?) async throws -> OpenAIChatResponse {
+        let result = try await runTurn(plan: plan, queue: queue, logBox: logBox)
 
         let toolCalls = Self.turnEmittedToolCalls(result)
             ? result.parsedToolCalls.map { call in
@@ -1179,6 +1301,7 @@ final class ServerController: ObservableObject {
             toolCalls: (toolCalls?.isEmpty == false) ? toolCalls : nil
         )
         let finishReason = OpenAIAdapter.finishReasonString(result.finishReason, hasToolCalls: !(toolCalls ?? []).isEmpty)
+        Self.recordTurnOutcome(logBox: logBox, result: result, finishReason: finishReason)
         return OpenAIChatResponse(
             id: "chatcmpl-\(UUID().uuidString.prefix(24))",
             created: Int(Date().timeIntervalSince1970),
@@ -1186,6 +1309,56 @@ final class ServerController: ObservableObject {
             choices: [.init(index: 0, message: message, finishReason: finishReason)],
             usage: .init(promptTokens: plan.promptTokenCount, completionTokens: result.tokensGenerated)
         )
+    }
+
+    /// Stamp the terminal inference facts (tokens, finish reason, tool calls,
+    /// captured response body) onto a completed non-streaming turn's log box.
+    /// `finishReason` is optional because the Anthropic adapter maps some
+    /// stop reasons to a JSON-absent nil.
+    nonisolated private static func recordTurnOutcome(logBox: ServerRequestLogBox?, result: TurnResult, finishReason: String?) {
+        let toolRecords = ServerRequestLog.capturedToolCalls(
+            result.parsedToolCalls,
+            serializeArguments: Self.toolArgumentsJSON
+        )
+        let responseBody = ServerRequestLog.capturedResponseBody(
+            thinking: result.thinkingText,
+            response: result.responseText
+        )
+        logBox?.modify { row in
+            row.outputTokens = result.tokensGenerated
+            row.finishReason = finishReason
+            row.toolCalls = toolRecords
+            row.responseBody = responseBody
+        }
+    }
+
+    /// Stamp the partial facts of a streaming turn that died after emitting
+    /// output (failure frame, disconnect, mid-tail writer throw): the latest
+    /// frame's accumulated text and the failure's exact token count. No tool
+    /// calls or finish reason — the row's `streamTermination` and error
+    /// message already carry how it ended. Without this, a failure after
+    /// output would record neither the tokens that streamed nor the text.
+    nonisolated static func recordStreamedPartialOutcome(logBox: ServerRequestLogBox?, frame: CompletionFrame, tokenCount: Int) {
+        let responseBody = ServerRequestLog.capturedResponseBody(
+            thinking: frame.thinkingText,
+            response: frame.responseText
+        )
+        logBox?.modify { row in
+            row.outputTokens = tokenCount
+            row.responseBody = responseBody
+        }
+    }
+
+    /// Stamp a non-streaming turn failure's generated-token count onto the
+    /// log row. `recordTurnOutcome` runs only on success and `runTurn` throws
+    /// on `.failedTurn`, so without this a failure after output would leave
+    /// the persisted error row's output-token count nil — mirroring the
+    /// streaming paths' `recordStreamedPartialOutcome` minus the streamed
+    /// text, which the non-streaming pipeline does not retain per row.
+    nonisolated static func recordFailedTurnTokenCount(logBox: ServerRequestLogBox?, failure: TurnFailure) {
+        logBox?.modify { row in
+            row.outputTokens = failure.tokensGenerated
+        }
     }
 
     /// The engine parses arguments into a dictionary; re-serialize for the
@@ -1245,12 +1418,28 @@ final class ServerController: ObservableObject {
 
     // MARK: Streaming handling
 
-    nonisolated private static func streamingResponse(apiRequest: OpenAIChatRequest, queue: TurnExecutionQueue) -> Response {
+    nonisolated private static func streamingResponse(apiRequest: OpenAIChatRequest, queue: TurnExecutionQueue, logBox: ServerRequestLogBox?) -> Response {
         let encoder = JSONEncoder()
         let id = "chatcmpl-\(UUID().uuidString.prefix(24))"
         let created = Int(Date().timeIntervalSince1970)
         let stopSequences = (apiRequest.stop ?? []).filter { !$0.isEmpty }
         let model = apiRequest.model ?? CompletionEngine.shared.loadedModelInfo?.displayName ?? "dynamoe"
+
+        // This request's row is finalized when the stream drains (the HTTP
+        // response is already a bare 200 by then), so claim the box: the wire
+        // middleware steps aside and the body closure records below with the
+        // stream's terminal facts.
+        if let logBox {
+            // claim() must run even in release builds (assert() elides its
+            // autoclosure argument under -O, which would skip the claim and
+            // let the middleware double-record); the assert just turns a
+            // future double-record regression into a test-time failure.
+            let claimed = logBox.claim()
+            assert(claimed, "the streaming writer must win its request-log box claim exactly once")
+            logBox.modify { row in
+                row.wasStreaming = true
+            }
+        }
 
         func chunkBuffer(_ delta: OpenAIStreamDelta, finishReason: String?) throws -> ByteBuffer {
             let chunk = OpenAIChatChunk(id: id, created: created, model: model, choices: [.init(index: 0, delta: delta, finishReason: finishReason)])
@@ -1310,10 +1499,18 @@ final class ServerController: ObservableObject {
                 let close = TurnTextSplitter.canonicalReasoningCloseTag
                 try await sse(chunkBuffer(.init(role: nil, content: close + "\n\n", reasoningContent: nil, toolCalls: nil), finishReason: nil))
             }
-            let (relay, task) = await queue.streamTurn(queueWaitTimeout: resolvedQueueWaitTimeout) { emit in
+            let (relay, task) = await queue.streamTurn({ emit in
                 do {
                     let plan = try ServerController.buildTurnPlan(apiRequest)
                     promptTokensBox.set(plan.promptTokenCount)
+                    logBox?.modify { row in
+                        // The row names the model that actually ran, not the
+                        // client's label: the plan resolves the loaded model
+                        // behind an alias (or a model switch while queued)
+                        // once the slot drains, mirroring the non-streaming
+                        // rows. A turn that never plans carries no model.
+                        row.model = plan.modelName
+                    }
                     try await ServerController.withTurnToolMask(plan.maskSchemas) {
                         let launch = try CompletionEngine.shared.launchTurn(plan.request)
                         if Task.isCancelled {
@@ -1334,14 +1531,64 @@ final class ServerController: ObservableObject {
                 } catch {
                     emit(.launchFailed(wireLaunchError(error)))
                 }
-            }
+            }, queueWaitTimeout: resolvedQueueWaitTimeout, onSlotOpened: { logBox?.noteSlotOpened() })
             defer { task.cancel() }
+
+            // Request-log terminal state. `clientDisconnected` is the default:
+            // any path that ends the stream without one of the terminal cases
+            // below (a writer throw on a dropped socket) is a disconnect. The
+            // defer records exactly one row no matter how the stream ends.
+            var logTermination: ServerRequestLog.StreamTermination = .clientDisconnected
+            var logErrorMessage: String?
+            var logFirstTokenMs: Double?
+            var logFinish: TurnResult?
+            // A turn that fails — or a socket that drops — after output still
+            // owes its row the partial response and token count: retain the
+            // latest frame for the defer's fallback enrichment.
+            var logFailure: TurnFailure?
+            var logPartialFrame: CompletionFrame?
+            defer {
+                if let logBox {
+                    logBox.modify { row in
+                        row.httpStatus = 200
+                        row.durationMs = logBox.elapsedMs()
+                        row.firstTokenMs = logFirstTokenMs
+                        row.streamTermination = logTermination
+                        if promptTokensBox.get() > 0 { row.inputTokens = promptTokensBox.get() }
+                        if let message = logErrorMessage { row.errorMessage = message }
+                    }
+                    if let result = logFinish {
+                        recordTurnOutcome(
+                            logBox: logBox,
+                            result: result,
+                            finishReason: OpenAIAdapter.finishReasonString(result.finishReason, hasToolCalls: !result.parsedToolCalls.isEmpty)
+                        )
+                    } else if let frame = logPartialFrame {
+                        recordStreamedPartialOutcome(
+                            logBox: logBox,
+                            frame: frame,
+                            tokenCount: logFailure?.tokensGenerated ?? frame.tokensGenerated
+                        )
+                    } else if let failure = logFailure {
+                        // A prefill failure emits `.failedTurn` with no frame and
+                        // no response text; the failure still knows how many
+                        // tokens were generated, so the row keeps that count
+                        // instead of falling back to nil.
+                        recordFailedTurnTokenCount(logBox: logBox, failure: failure)
+                    }
+                    ServerRequestLogRecorder.shared.record(logBox.snapshot())
+                }
+            }
             var finishedCleanly = false
             for await event in relay {
                 switch event {
                 case .ping(let comment):
                     try await ping(comment)
                 case .launchFailed(let apiError):
+                    logTermination = .errorFrame
+                    // The row records the log-safe rendering; the wire envelope
+                    // below keeps echoing the client's values back to the client.
+                    logErrorMessage = apiError.recordableMessage
                     let envelope = OpenAIErrorEnvelope(error: .init(message: apiError.message, type: apiError.wireType.rawValue, code: nil))
                     if let data = try? encoder.encode(envelope) {
                         try await sse(ByteBuffer(data: data))
@@ -1364,6 +1611,8 @@ final class ServerController: ObservableObject {
                         try await ping("prefill: \(status)")
                     }
                 case .engine(.frame(let frame)):
+                    if logFirstTokenMs == nil { logFirstTokenMs = logBox?.elapsedMs() }
+                    logPartialFrame = frame
                     if !sentRole {
                         sentRole = true
                         try await sse(chunkBuffer(.init(role: "assistant", content: nil, reasoningContent: nil, toolCalls: nil), finishReason: nil))
@@ -1384,6 +1633,9 @@ final class ServerController: ObservableObject {
                         try await sse(chunkBuffer(.init(role: nil, content: contentDelta, reasoningContent: nil, toolCalls: nil), finishReason: nil))
                     }
                 case .engine(.failedTurn(let failure)):
+                    logTermination = .errorFrame
+                    logFailure = failure
+                    logErrorMessage = failure.cancelled ? "Generation cancelled" : failure.message
                     let envelope = OpenAIErrorEnvelope(error: .init(
                         message: failure.cancelled ? "Generation cancelled" : failure.message,
                         type: failure.cancelled ? "cancelled" : "server_error",
@@ -1395,6 +1647,14 @@ final class ServerController: ObservableObject {
                     try await sseRaw("[DONE]")
                     finishedCleanly = true
                 case .engine(.finished(let result)):
+                    // Capture the final facts before any fallible terminal
+                    // write: a write throwing after this point (a dropped
+                    // socket, say) still records the final token count,
+                    // response, and tool calls instead of falling back to the
+                    // last partial frame — or worse, recording none at all.
+                    // The `.completed` transition below still marks the
+                    // stream only after the terminal writes succeed.
+                    logFinish = result
                     // Tail text the throttle never emitted. The engine has
                     // already trimmed stop matches from the final text, so no
                     // hold-back applies here.
@@ -1433,6 +1693,7 @@ final class ServerController: ObservableObject {
                         try await sse(ByteBuffer(data: data))
                     }
                     try await sseRaw("[DONE]")
+                    logTermination = .completed
                     finishedCleanly = true
                 }
                 if finishedCleanly { break }
@@ -1454,8 +1715,8 @@ final class ServerController: ObservableObject {
 
     // MARK: Anthropic non-streaming handling
 
-    nonisolated private static func anthropicNonStreamingResponse(plan: TurnPlan, queue: TurnExecutionQueue) async throws -> AnthropicMessageResponse {
-        let result = try await runTurn(plan: plan, queue: queue)
+    nonisolated private static func anthropicNonStreamingResponse(plan: TurnPlan, queue: TurnExecutionQueue, logBox: ServerRequestLogBox?) async throws -> AnthropicMessageResponse {
+        let result = try await runTurn(plan: plan, queue: queue, logBox: logBox)
 
         var blocks: [AnthropicContentBlock] = []
         if !result.thinkingText.isEmpty {
@@ -1471,6 +1732,11 @@ final class ServerController: ObservableObject {
             blocks.append(.text(""))
         }
 
+        Self.recordTurnOutcome(
+            logBox: logBox,
+            result: result,
+            finishReason: AnthropicAdapter.finishReasonString(result.finishReason, hasToolCalls: !result.parsedToolCalls.isEmpty)
+        )
         return AnthropicMessageResponse(
             id: "msg-\(UUID().uuidString.prefix(24))",
             model: plan.modelName,
@@ -1483,11 +1749,25 @@ final class ServerController: ObservableObject {
 
     // MARK: Anthropic streaming handling
 
-    nonisolated private static func anthropicStreamingResponse(apiRequest: AnthropicMessagesRequest, queue: TurnExecutionQueue) -> Response {
+    nonisolated private static func anthropicStreamingResponse(apiRequest: AnthropicMessagesRequest, queue: TurnExecutionQueue, logBox: ServerRequestLogBox?) -> Response {
         let encoder = JSONEncoder()
         let id = "msg-\(UUID().uuidString.prefix(24))"
         let model = apiRequest.model ?? CompletionEngine.shared.loadedModelInfo?.displayName ?? "dynamoe"
         let stopSequences = (apiRequest.stopSequences ?? []).filter { !$0.isEmpty }
+
+        // Same ownership hand-off as the OpenAI writer: the stream's terminal
+        // facts (not the bare 200) are what the row records.
+        if let logBox {
+            // claim() must run even in release builds (assert() elides its
+            // autoclosure argument under -O, which would skip the claim and
+            // let the middleware double-record); the assert just turns a
+            // future double-record regression into a test-time failure.
+            let claimed = logBox.claim()
+            assert(claimed, "the streaming writer must win its request-log box claim exactly once")
+            logBox.modify { row in
+                row.wasStreaming = true
+            }
+        }
 
         let body = ResponseBody { writer in
             func sse<E: Encodable>(_ eventName: String, _ payload: E) async throws {
@@ -1564,10 +1844,16 @@ final class ServerController: ObservableObject {
                 }
             }
 
-            let (relay, task) = await queue.streamTurn(queueWaitTimeout: resolvedQueueWaitTimeout) { emit in
+            let (relay, task) = await queue.streamTurn({ emit in
                 do {
                     let plan = try ServerController.buildTurnPlan(apiRequest)
                     promptTokensBox.set(plan.promptTokenCount)
+                    logBox?.modify { row in
+                        // Same contract as the OpenAI writer: the row names the
+                        // resolved model, and a turn that never plans carries
+                        // no model at all.
+                        row.model = plan.modelName
+                    }
                     try await ServerController.withTurnToolMask(plan.maskSchemas) {
                         let launch = try CompletionEngine.shared.launchTurn(plan.request)
                         if Task.isCancelled {
@@ -1588,14 +1874,59 @@ final class ServerController: ObservableObject {
                 } catch {
                     emit(.launchFailed(wireLaunchError(error)))
                 }
-            }
+            }, queueWaitTimeout: resolvedQueueWaitTimeout, onSlotOpened: { logBox?.noteSlotOpened() })
             defer { task.cancel() }
+
+            // Request-log terminal state, mirroring the OpenAI writer: the
+            // defer records exactly one row no matter how the stream ends.
+            var logTermination: ServerRequestLog.StreamTermination = .clientDisconnected
+            var logErrorMessage: String?
+            var logFirstTokenMs: Double?
+            var logFinish: TurnResult?
+            // Fallback facts for a turn that fails or disconnects after
+            // output, mirroring the OpenAI writer.
+            var logFailure: TurnFailure?
+            var logPartialFrame: CompletionFrame?
+            defer {
+                if let logBox {
+                    logBox.modify { row in
+                        row.httpStatus = 200
+                        row.durationMs = logBox.elapsedMs()
+                        row.firstTokenMs = logFirstTokenMs
+                        row.streamTermination = logTermination
+                        if promptTokensBox.get() > 0 { row.inputTokens = promptTokensBox.get() }
+                        if let message = logErrorMessage { row.errorMessage = message }
+                    }
+                    if let result = logFinish {
+                        recordTurnOutcome(
+                            logBox: logBox,
+                            result: result,
+                            finishReason: AnthropicAdapter.finishReasonString(result.finishReason, hasToolCalls: !result.parsedToolCalls.isEmpty)
+                        )
+                    } else if let frame = logPartialFrame {
+                        recordStreamedPartialOutcome(
+                            logBox: logBox,
+                            frame: frame,
+                            tokenCount: logFailure?.tokensGenerated ?? frame.tokensGenerated
+                        )
+                    } else if let failure = logFailure {
+                        // Mirrors the OpenAI writer: a prefill failure with no
+                        // frame still knows its generated-token count.
+                        recordFailedTurnTokenCount(logBox: logBox, failure: failure)
+                    }
+                    ServerRequestLogRecorder.shared.record(logBox.snapshot())
+                }
+            }
             var finishedCleanly = false
             for await event in relay {
                 switch event {
                 case .ping:
                     try await ping()
                 case .launchFailed(let apiError):
+                    logTermination = .errorFrame
+                    // The row records the log-safe rendering; the wire envelope
+                    // below keeps echoing the client's values back to the client.
+                    logErrorMessage = apiError.recordableMessage
                     try await ensureStart()
                     try await closeOpenBlocks()
                     try await errorEvent(apiError.message, type: apiError.wireType.rawValue)
@@ -1610,6 +1941,8 @@ final class ServerController: ObservableObject {
                         try await ping()
                     }
                 case .engine(.frame(let frame)):
+                    if logFirstTokenMs == nil { logFirstTokenMs = logBox?.elapsedMs() }
+                    logPartialFrame = frame
                     try await ensureStart()
                     // Append-only safety, mirroring the OpenAI writer: skip
                     // non-extending snapshots, hold back possible stop-sequence
@@ -1627,11 +1960,18 @@ final class ServerController: ObservableObject {
                         try await sse("content_block_delta", AnthropicContentBlockDeltaEvent(index: contentIndex ?? 0, delta: .text(contentDelta)))
                     }
                 case .engine(.failedTurn(let failure)):
+                    logTermination = .errorFrame
+                    logFailure = failure
+                    logErrorMessage = failure.cancelled ? "Generation cancelled" : failure.message
                     try await ensureStart()
                     try await closeOpenBlocks()
                     try await errorEvent(failure.cancelled ? "Generation cancelled" : failure.message)
                     finishedCleanly = true
                 case .engine(.finished(let result)):
+                    // Same ordering contract as the OpenAI writer: the row's
+                    // final facts are captured before the first fallible
+                    // write, `.completed` marks only a fully written stream.
+                    logFinish = result
                     try await ensureStart()
                     // Tail text the throttle never emitted; the engine has
                     // already trimmed stop matches, so no hold-back applies.
@@ -1665,6 +2005,7 @@ final class ServerController: ObservableObject {
                         usage: .init(outputTokens: result.tokensGenerated)
                     ))
                     try await sse("message_stop", AnthropicMessageStopEvent())
+                    logTermination = .completed
                     finishedCleanly = true
                 }
                 if finishedCleanly { break }

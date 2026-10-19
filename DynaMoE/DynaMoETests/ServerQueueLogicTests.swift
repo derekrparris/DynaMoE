@@ -336,4 +336,129 @@ final class ServerQueueLogicTests: XCTestCase {
         XCTAssertEqual(snapshot.totalRequests, 2)
         XCTAssertEqual(snapshot.activeRequests, 0, "active count must clamp at zero")
     }
+
+    // MARK: Slot-open signaling (queue wait vs generation time)
+
+    func testStreamTurnInvokesSlotOpenedHookOncePredecessorDrains() async throws {
+        let queue = TurnExecutionQueue()
+        let gate = Gate()
+        let workRan = FlagBox()
+        let slotOpened = FlagBox()
+        let hookRanBeforeWork = FlagBox()
+
+        // Turn 1 runs immediately and hangs on the gate; turn 2 queues behind it.
+        let (firstStream, firstTask) = await queue.streamTurn { _ in
+            await gate.wait()
+        }
+        let (secondStream, secondTask) = await queue.streamTurn({ emit in
+            // The queue invokes the hook immediately before the work runs,
+            // so it must already be true here — and this records the ordering
+            // without racing the producer task.
+            hookRanBeforeWork.set(slotOpened.get())
+            workRan.set(true)
+            emit(.ping(comment: "work began"))
+        }, onSlotOpened: { slotOpened.set(true) })
+        try await waitUntil { await queue.pendingCount == 2 }
+        XCTAssertFalse(workRan.get(), "the queued turn must not run behind the gated leader")
+        XCTAssertFalse(slotOpened.get(), "the hook must not fire while the leader holds the slot")
+
+        gate.open()
+
+        var sawWorkPing = false
+        for await event in secondStream {
+            if case .ping(comment: "work began") = event { sawWorkPing = true }
+        }
+        for await _ in firstStream {}
+
+        XCTAssertTrue(sawWorkPing, "the queued turn's work must run and relay its ping")
+        XCTAssertTrue(workRan.get(), "the work must run after the slot opened")
+        XCTAssertTrue(slotOpened.get(), "the hook must fire exactly once, when the slot opens")
+        XCTAssertTrue(hookRanBeforeWork.get(), "the hook must fire before the work it unblocks, not from a later relay consumer")
+        XCTAssertEqual(firstTask.isCancelled, false)
+        XCTAssertEqual(secondTask.isCancelled, false)
+        try await waitUntil { await queue.pendingCount == 0 }
+    }
+
+    func testStreamTurnSkipsSlotOpenedHookWhenQueueWaitTimesOut() async throws {
+        let queue = TurnExecutionQueue()
+        let gate = Gate()
+        let workRan = FlagBox()
+        let slotOpened = FlagBox()
+
+        let (firstStream, firstTask) = await queue.streamTurn { _ in
+            await gate.wait()
+        }
+        let (secondStream, secondTask) = await queue.streamTurn(
+            { emit in
+                workRan.set(true)
+                emit(.ping(comment: "work began"))
+            },
+            queueWaitTimeout: 0.2,
+            onSlotOpened: { slotOpened.set(true) }
+        )
+
+        try await waitUntil { await queue.pendingCount == 2 }
+        try await Task.sleep(nanoseconds: 350_000_000)
+
+        var sawTimeoutFailure = false
+        for await event in secondStream {
+            if case .launchFailed(let apiError) = event {
+                sawTimeoutFailure = apiError.message.contains("timed out")
+            }
+        }
+        XCTAssertFalse(slotOpened.get(), "a timed-out turn never got the slot, so the hook must not fire and the row must not claim a queue wait")
+        XCTAssertTrue(sawTimeoutFailure)
+        XCTAssertFalse(workRan.get())
+
+        gate.open()
+        for await _ in firstStream {}
+        XCTAssertEqual(firstTask.isCancelled, false)
+        XCTAssertEqual(secondTask.isCancelled, false)
+        try await waitUntil { await queue.pendingCount == 0 }
+    }
+
+    func testPerformInvokesSlotOpenedOnlyWhenSlotOpens() async throws {
+        let queue = TurnExecutionQueue()
+        let gate = Gate()
+        let slotOpened = FlagBox()
+
+        let first = Task { try await queue.perform { await gate.wait(); return 1 } }
+        try await waitUntil { await queue.pendingCount == 1 }
+        let second = Task { try await queue.perform({ () async throws -> Int in 2 }, onSlotOpened: { slotOpened.set(true) }) }
+
+        try await waitUntil { await queue.pendingCount == 2 }
+        XCTAssertFalse(slotOpened.get(), "the hook must not fire while the leader holds the slot")
+
+        gate.open()
+        let secondValue = try await second.value
+        XCTAssertEqual(secondValue, 2, "FIFO order: the queued turn runs after the leader drains")
+        XCTAssertTrue(slotOpened.get(), "the hook must fire exactly once, when the slot opens")
+        let firstValue = try await first.value
+        XCTAssertEqual(firstValue, 1)
+        try await waitUntil { await queue.pendingCount == 0 }
+    }
+
+    func testPerformSkipsSlotOpenedWhenQueueWaitTimesOut() async throws {
+        let queue = TurnExecutionQueue()
+        let gate = Gate()
+        let slotOpened = FlagBox()
+
+        let first = Task { try await queue.perform { await gate.wait(); return 1 } }
+        try await waitUntil { await queue.pendingCount == 1 }
+        let second = Task { try await queue.perform({ () async throws -> Int in 2 }, queueWaitTimeout: 0.2, onSlotOpened: { slotOpened.set(true) }) }
+        try await waitUntil { await queue.pendingCount == 2 }
+
+        do {
+            _ = try await second.value
+            XCTFail("the queued turn must time out, not run")
+        } catch let error as ServerAPIError {
+            XCTAssertEqual(error.status, .requestTimeout)
+        }
+        XCTAssertFalse(slotOpened.get(), "a timed-out turn never got the slot, so the hook must not fire")
+
+        gate.open()
+        let firstValue = try await first.value
+        XCTAssertEqual(firstValue, 1)
+        try await waitUntil { await queue.pendingCount == 0 }
+    }
 }

@@ -4197,6 +4197,23 @@ struct ContentView: View {
         if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }) {
             sessions[sIdx].cumulativeTokenCount = afmCumulativeBase
         }
+
+        // In-app turn log for the on-device path — the same row contract as
+        // a weights turn (see `startAutoregressiveGeneration`): success,
+        // failure, and stop each record exactly one row, bodies follow the
+        // Store Request Content toggle, and the streamed partials reach the
+        // row on a stop or failure. The availability pre-flight above stays
+        // unlogged like an engine launch failure: the chat surface owns that
+        // error display. The request-side analog of the weights path's
+        // rendered prompt is what the framework actually sees this turn:
+        // the assembled instructions plus the user message.
+        let turnLog = ServerRequestLog.chatTurnLog(
+            model: AppleFoundationModelService.displayName,
+            inputTokens: afmTurnInputTokens,
+            isAgentTurn: false,
+            prompt: instructionsText.isEmpty ? userPrompt : instructionsText + "\n\n" + userPrompt
+        )
+
         generationTask = Task(priority: .userInitiated) {
             var latestPartial = ""
             var sawFirstPartial = false
@@ -4224,6 +4241,10 @@ struct ContentView: View {
                     maximumResponseTokens: responseCeiling
                 ) { partialText in
                     latestPartial = partialText
+                    // The row's first-token stamp, mirroring the weights loop's
+                    // first frame (first caller wins; an empty snapshot still
+                    // proves the model began answering).
+                    turnLog.noteFirstToken()
                     // 60fps-throttled streaming UI updates, mirroring the weights path.
                     let now = CFAbsoluteTimeGetCurrent()
                     if now - lastUIUpdateTime < 0.016 { return }
@@ -4270,6 +4291,19 @@ struct ContentView: View {
                 // Stop-button cancellation throws out of the stream iteration;
                 // whatever partial text already streamed stays in the message.
                 if Task.isCancelled || !self.ownsGeneration(myGenerationId) {
+                    // Same cancelled-turn contract as the weights path: a user
+                    // stop is informational (200 with the stop message), never
+                    // an error; a stream closing some other way before a result
+                    // is exceptional, and still owes the row its partial text.
+                    turnLog.recordChatTurn(
+                        status: Task.isCancelled ? 200 : 500,
+                        errorMessage: Task.isCancelled ? "⏹ Generation stopped by user." : "Generation stream closed without a result",
+                        outputTokens: AppleFoundationModelService.recordedOutputTokenCount(for: latestPartial),
+                        finishReason: nil,
+                        thinking: "",
+                        response: latestPartial,
+                        toolCalls: []
+                    )
                     return
                 }
                 let errText = "⚠️ Apple Foundation Model error: \(error.localizedDescription)"
@@ -4284,6 +4318,20 @@ struct ContentView: View {
                     self.sessions[sIdx].messages[mIdx].content = partialPrefix + errText
                     self.sessions[sIdx].messages[mIdx].isThinking = false
                 }
+                // The row keeps the failure shape the weights path uses: the
+                // error text the chat surface displays, plus the partial text
+                // generated before the failure (its approximate token count
+                // stands in for the engine's exact count — the macOS 26
+                // streaming API reports no token usage).
+                turnLog.recordChatTurn(
+                    status: 500,
+                    errorMessage: errText,
+                    outputTokens: AppleFoundationModelService.recordedOutputTokenCount(for: latestPartial),
+                    finishReason: nil,
+                    thinking: "",
+                    response: latestPartial,
+                    toolCalls: []
+                )
                 // The turn failed, but queued prompts must not wait on a
                 // generation that will never complete: drain exactly like the
                 // success path does.
@@ -4297,6 +4345,15 @@ struct ContentView: View {
             // message and is intentionally preserved.
             if Task.isCancelled || !self.ownsGeneration(myGenerationId) {
                 commitOdometerTail()
+                turnLog.recordChatTurn(
+                    status: Task.isCancelled ? 200 : 500,
+                    errorMessage: Task.isCancelled ? "⏹ Generation stopped by user." : "Generation stream closed without a result",
+                    outputTokens: AppleFoundationModelService.recordedOutputTokenCount(for: latestPartial),
+                    finishReason: nil,
+                    thinking: "",
+                    response: latestPartial,
+                    toolCalls: []
+                )
                 return
             }
 
@@ -4329,6 +4386,19 @@ struct ContentView: View {
                     self.sessions[sIdx].messages[mIdx].timeToFirstTokenSeconds = max(firstPartialAt - generationStartTime, 0.0)
                 }
             }
+            // Success: one 200 row with the turn's final text and its
+            // approximate token count. No finish reason and no thinking —
+            // plain chat is the only on-device mode, and the framework
+            // reports neither a stop reason nor token usage.
+            turnLog.recordChatTurn(
+                status: 200,
+                errorMessage: nil,
+                outputTokens: AppleFoundationModelService.recordedOutputTokenCount(for: finalText),
+                finishReason: nil,
+                thinking: "",
+                response: finalText,
+                toolCalls: []
+            )
             self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)
         }
         return true
@@ -4572,6 +4642,17 @@ struct ContentView: View {
             return
         }
 
+        // In-app turn log: one request-log row per chat/agent turn (source
+        // chatUI; bodies follow the Store Request Content toggle, the rendered
+        // prompt included). Begun after a successful launch so launch failures
+        // stay unlogged (the chat surface owns those errors).
+        let turnLog = ServerRequestLog.chatTurnLog(
+            model: generationModelName,
+            inputTokens: promptTokenIds.count,
+            isAgentTurn: runAgentTools || agentStep > 0 || forceSynthesis,
+            prompt: formattedPrompt
+        )
+
         // Session token odometer seeding: resolved from turn-start state (it is
         // deterministic — the seeded base reads the same conversation total the
         // old code read at prefill completion, plus the engine-reported prefix
@@ -4616,6 +4697,13 @@ struct ContentView: View {
 
         generationTask = Task.detached(priority: .userInitiated) {
             var finishedResult: TurnResult? = nil
+            // Last streamed frame's facts: what a failed or cancelled turn
+            // still owes its log row. Frames are consumed in this detached
+            // loop, so the accumulators stay local rather than hopping to the
+            // MainActor.
+            var streamedThinking = ""
+            var streamedResponse = ""
+            var streamedTokens = 0
             for await event in launch.stream {
                 switch event {
                 case .started:
@@ -4636,6 +4724,10 @@ struct ContentView: View {
                         }
                     }
                 case let .frame(frame):
+                    turnLog.noteFirstToken()
+                    streamedThinking = frame.thinkingText
+                    streamedResponse = frame.responseText
+                    streamedTokens = frame.tokensGenerated
                     await MainActor.run {
                         self.generatedStreamText = frame.rawText
                         self.thinkingText = frame.thinkingText
@@ -4702,6 +4794,15 @@ struct ContentView: View {
                         }
                     }
                 case let .failedTurn(failure):
+                    turnLog.recordChatTurn(
+                        status: failure.cancelled ? 200 : 500,
+                        errorMessage: failure.message,
+                        outputTokens: failure.tokensGenerated,
+                        finishReason: nil,
+                        thinking: streamedThinking,
+                        response: streamedResponse,
+                        toolCalls: []
+                    )
                     if failure.cancelled {
                         // Cancellation: exact odometer tail only — the Stop /
                         // interrupt path already owns the flags and status line,
@@ -4770,7 +4871,25 @@ struct ContentView: View {
                 }
                 if finishedResult != nil { break }
             }
-            guard let result = finishedResult else { return }
+            guard let result = finishedResult else {
+                // The engine delivers failedTurn for cancellations, but Stop
+                // cancels this consumer task too, so the stream can close
+                // before that event arrives. A cancelled close is the user's
+                // own stop: record it as informational (200, engine stop
+                // message), not as a server error. Only an unclosed stream
+                // with no result is exceptional — still owed its row.
+                let cancelled = Task.isCancelled
+                turnLog.recordChatTurn(
+                    status: cancelled ? 200 : 500,
+                    errorMessage: cancelled ? "⏹ Generation stopped by user." : "Generation stream closed without a result",
+                    outputTokens: streamedTokens,
+                    finishReason: nil,
+                    thinking: streamedThinking,
+                    response: streamedResponse,
+                    toolCalls: []
+                )
+                return
+            }
 
             // Engine turn complete: backfill + prefix pin already done. Re-bind
             // the historical local names so the agent-orchestration phase below
@@ -4793,6 +4912,16 @@ struct ContentView: View {
             let finalHitRate = result.cacheHitRatePercent
             let finalPrefetchEff = result.prefetchEfficiencyPercent
             let finalPageLat = result.pagingLatencyMs
+
+            turnLog.recordChatTurn(
+                status: 200,
+                errorMessage: nil,
+                outputTokens: tokensGenerated,
+                finishReason: result.finishReason.rawValue,
+                thinking: finalThink,
+                response: finalResp,
+                toolCalls: parsedResult.calls
+            )
 
             // No-op "gesture" calls (shell_run echo/true/:) are the model's way of
             // signalling it is finished. Executing them restarts the loop and

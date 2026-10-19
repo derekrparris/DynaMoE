@@ -152,6 +152,14 @@ final class AppleFoundationModelServiceTests: XCTestCase {
         XCTAssertEqual(AppleFoundationModelService.approximateTokenCount(for: "abcdefgh"), 2)
     }
 
+    func testRecordedOutputTokenCountDropsPhantomTokenForEmptyText() {
+        // The UI floor of one token must not leak into a request-log row: an
+        // empty response generated nothing, so its row records zero tokens.
+        XCTAssertEqual(AppleFoundationModelService.recordedOutputTokenCount(for: ""), 0)
+        XCTAssertEqual(AppleFoundationModelService.recordedOutputTokenCount(for: "abcd"), 1)
+        XCTAssertEqual(AppleFoundationModelService.recordedOutputTokenCount(for: "abcdefgh"), 2)
+    }
+
     func testSendGateAllowsSystemModelSessionsWithoutEngine() {
         // Regression: the gate previously parsed as `tokenizer != nil && (summary != nil || AFM)`,
         // so system-model sessions — which release the tokenizer on activation —

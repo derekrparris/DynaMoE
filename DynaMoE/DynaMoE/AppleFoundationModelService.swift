@@ -503,6 +503,14 @@ public enum AppleFoundationModelService {
         max(1, text.count / 4)
     }
 
+    /// Output-token count for a turn's request-log row. Deliberately distinct
+    /// from `approximateTokenCount`, which floors UI statistics at one token:
+    /// a turn that produced no text generated nothing, so its row must record
+    /// zero rather than a phantom token.
+    nonisolated public static func recordedOutputTokenCount(for text: String) -> Int {
+        text.isEmpty ? 0 : approximateTokenCount(for: text)
+    }
+
     /// The send gate: a turn may start when either a weights engine (tokenizer
     /// AND summary) is installed, or the session runs on the system model,
     /// which needs neither. Expressed here — not inline in the view — because a

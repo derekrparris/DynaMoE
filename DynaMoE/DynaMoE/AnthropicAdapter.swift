@@ -470,7 +470,10 @@ enum AnthropicAdapter {
         case "any":
             throw ServerAPIError.badRequest("tool_choice type \"any\" is not supported: this server cannot force a tool call. Use \"auto\" or \"none\".")
         case "tool":
-            throw ServerAPIError.badRequest("tool_choice for a specific tool (\"\(choice?.name ?? "")\") is not supported: this server cannot force a tool call. Use \"auto\" or \"none\".")
+            throw ServerAPIError.badRequest(
+                "tool_choice for a specific tool (\"\(choice?.name ?? "")\") is not supported: this server cannot force a tool call. Use \"auto\" or \"none\".",
+                logSafeMessage: "tool_choice for a specific tool is not supported: this server cannot force a tool call. Use \"auto\" or \"none\"."
+            )
         default:
             return true
         }
@@ -568,7 +571,10 @@ enum AnthropicAdapter {
         }
         let invalidRole = messages.first { $0.role != "user" && $0.role != "assistant" }?.role
         if let invalidRole = invalidRole {
-            throw ServerAPIError.badRequest("messages roles must be \"user\" or \"assistant\", got \"\(invalidRole)\"")
+            throw ServerAPIError.badRequest(
+                "messages roles must be \"user\" or \"assistant\", got \"\(invalidRole)\"",
+                logSafeMessage: "messages roles must be \"user\" or \"assistant\""
+            )
         }
         try rejectUnsupportedPrefill(messages)
 
