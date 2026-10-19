@@ -330,9 +330,20 @@ Set an API key in **Settings → Server**. When set, clients must present it eit
 
 Point any OpenAI-compatible client at base URL `http://127.0.0.1:8787/v1`, or any Anthropic client at `http://127.0.0.1:8787`. The `model` field is accepted but ignored — the model loaded in the app answers every request. Streaming, stop sequences, tool/function calling, reasoning and usage accounting all work out of the box. Anthropic requests must send `max_tokens`; an OpenAI request that omits it uses the app's Generation setting. Watch the Server tab while a client is connected: it shows the bound port, queue depth, active and total request counters, and the last engine error, which is the fastest way to tell a client-side misconfiguration from a queued-then-503 turn.
 
+### Request logging
+
+Every turn is recorded — API requests and in-app chat/agent turns alike — so you can answer "what did the server actually run?" after the fact without switching on debug flags. The Request Log card in **Settings → Server** shows the live list, and the same rows land in Console.app.
+
+* **Metadata always.** Each row carries the method (a `TURN` for in-app turns), path (`chat` / `agent`, or the API route), `source` (`httpAPI` vs `chatUI`), wire status, streaming termination, model, input/output token counts, total duration, queue wait split from generation time, first-token latency, finish reason, tool names and the error message. The queue wait is stamped the instant the engine's single-flight slot opens, and stays `nil` rather than `0` for a turn that never ran (queue timeout, cancelled while queued), so "no wait" and "never ran" stay distinguishable.
+* **Bodies are opt-in.** Turn on **Store Request Content** (`dynamoe_server_log_store_bodies`) to persist prompts and responses as well, clipped to 32 KB per field. API rows store the normalized client request; in-app rows store the rendered prompt the model actually saw (template included) plus the turn's reasoning and answer. Tool arguments (4 KB cap) follow the same toggle. With capture off, every body field records an explicit `[content withheld — metadata only]` marker, so "withheld" never reads as silence.
+* **Nothing sensitive leaves the machine.** Authorization headers and the configured API key never reach a row or a unified-log line. Wire errors that reflect client-supplied values (an invalid message `role`, a rejected tool choice, a tokenizer failure quoting prompt text) keep those values on the wire for the client but record a value-free rendering, so a persisted or logged error cannot smuggle request content.
+* **Where it lives.** An append-only SQLite database at `~/Library/Application Support/DynaMoE/logs/server-requests.sqlite` (raw SQLite C API; writes are fire-and-forget on a private serial queue). Retention is 30 days / 20,000 rows, and clearing or mass-pruning compacts the file so the disk space is actually reclaimed. `GET /health` is never logged — health polling would otherwise flood the store.
+* **Dashboard and export.** The Request Log card offers full-text search (matched against the persisted JSON, so what you type is what you find), an Errors Only switch, a per-row detail sheet, and **Export** to JSON Lines honoring the current filter. The list refreshes from the store's own change stream, so new rows appear without polling.
+* **Console.app.** Every row also emits a metadata-only line under subsystem `DRP.DynaMoE`, category `server.request`. Each line leads with `id=<shortId>`, the lowercase 8-hex prefix of the row id — paste that short id into the dashboard search to jump straight from a Console line to its row.
+
 ### Guardrails & tuning keys (UserDefaults)
 
-The Server tab writes the enable toggle, port, API key and inline reasoning keys; the queue timeout and prompt ceiling are set with the `defaults` command (the app reads them at request time, so no restart is needed).
+The Server tab writes the enable toggle, port, API key, inline reasoning and content-capture keys; the queue timeout and prompt ceiling are set with the `defaults` command (the app reads them at request time, so no restart is needed).
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -342,6 +353,7 @@ The Server tab writes the enable toggle, port, API key and inline reasoning keys
 | `dynamoe_server_queue_timeout` | `120` seconds | Requests waiting longer in the queue are rejected (408 / SSE error). `0` disables |
 | `dynamoe_server_max_prompt_tokens` | `262144` tokens | Longer prompts are rejected with 400 before prefill. `0` disables |
 | `dynamoe_server_inline_reasoning` | `false` | OpenAI endpoint only: fold reasoning into `content` inside the model's reasoning tags instead of reporting it as `reasoning_content`, so clients that ignore that extension still display it (and echo it back) |
+| `dynamoe_server_log_store_bodies` | `false` | Persist request/response bodies (and tool arguments) in the request log, for API and in-app rows alike. Off keeps rows metadata-only (the Settings → Server "Store Request Content" toggle writes this) |
 
 For example, to allow an unlimited queue wait and a 512k prompt ceiling:
 
