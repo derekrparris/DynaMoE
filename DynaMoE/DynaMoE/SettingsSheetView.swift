@@ -2036,7 +2036,7 @@ struct SettingsSheetView: View {
             }
         }
         .sheet(item: $serverLogSelected) { log in
-            serverRequestLogDetail(log)
+            serverRequestLogDetail(log, onClose: { serverLogSelected = nil })
         }
         .task {
             refreshServerRequestLog()
@@ -2146,7 +2146,13 @@ struct SettingsSheetView: View {
         return label
     }
 
-    private func serverRequestLogDetail(_ log: ServerRequestLog) -> some View {
+    /// One row's request/response detail. Closes via the header button, whose
+    /// `esc` chip advertises the shortcut the sheet also answers to, so the
+    /// modal never reads as a dead end. The close action is passed in rather
+    /// than read from this view's `dismiss`: that value is the settings
+    /// window's, so binding the sheet to it risks closing the whole window
+    /// instead of the sheet.
+    private func serverRequestLogDetail(_ log: ServerRequestLog, onClose: @escaping () -> Void) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
                 HStack(spacing: 10) {
@@ -2156,6 +2162,7 @@ struct SettingsSheetView: View {
                         .font(.system(size: 12, design: .monospaced))
                         .foregroundStyle(log.isError ? Color.red : Color.green)
                     Spacer()
+                    serverRequestLogCloseControl(onClose)
                 }
 
                 VStack(alignment: .leading, spacing: 6) {
@@ -2201,6 +2208,27 @@ struct SettingsSheetView: View {
             .frame(maxWidth: 640, alignment: .leading)
         }
         .frame(minWidth: 520, minHeight: 360)
+    }
+
+    /// The detail sheet's visible exit: a Close button whose `esc` chip names
+    /// the key that also dismisses the sheet, with the same binding attached so
+    /// the label and the behavior cannot disagree.
+    private func serverRequestLogCloseControl(_ onClose: @escaping () -> Void) -> some View {
+        Button(action: onClose) {
+            HStack(spacing: 6) {
+                Text("Close")
+                Text("esc")
+                    .font(.system(size: 10, weight: .medium, design: .monospaced))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Color.secondary.opacity(0.15))
+                    .cornerRadius(4)
+            }
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .keyboardShortcut(.cancelAction)
+        .help("Close this request (Esc)")
     }
 
     private func serverRequestLogDetailLine(_ label: String, _ value: String) -> some View {
