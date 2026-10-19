@@ -445,7 +445,8 @@ final class ServerRequestLogStore: @unchecked Sendable {
             // is escaped yet again there (backslashes doubled, quotes
             // re-escaped). Match every encoding level the term can sit at
             // (raw JSON structure, row-level string fields, embedded request
-            // summaries), then LIKE-escape each pattern — the encoder's own
+            // summaries, and tool arguments nested inside those summaries),
+            // then LIKE-escape each pattern — the encoder's own
             // backslashes first, so `\"` stays literal.
             let likePatterns = jsonEncodedSearchFragments(text).map { fragment in
                 let escaped = fragment
@@ -476,14 +477,17 @@ final class ServerRequestLogStore: @unchecked Sendable {
     /// The term at every JSON-encoding level it can occupy in a stored
     /// payload: the raw term (JSON structure fragments such as `"role":`
     /// appear unescaped in the payload), the term once-encoded (row-level
-    /// string fields), and twice-encoded (the request summaries embedded as
-    /// strings inside `requestBody`). Encoding stabilizes for plain terms,
-    /// collapsing to a single pattern; the ladder stops as soon as a level
-    /// repeats.
+    /// string fields), twice-encoded (the request summaries embedded as
+    /// strings inside `requestBody`), and thrice-encoded — captured tool
+    /// arguments sit one layer deeper still, because OpenAI
+    /// `function.arguments` and Anthropic tool-use `input` are themselves
+    /// JSON strings that the request summary then embeds as a string value.
+    /// Encoding stabilizes for plain terms, collapsing to a single pattern;
+    /// the ladder stops as soon as a level repeats.
     private func jsonEncodedSearchFragments(_ text: String) -> [String] {
         var fragments: [String] = []
         var current = text
-        for _ in 0..<3 {
+        for _ in 0..<4 {
             if !fragments.contains(current) { fragments.append(current) }
             let encoded = jsonEncodedSearchFragment(current)
             if encoded == current { break }
@@ -648,14 +652,21 @@ final class ServerRequestLogStore: @unchecked Sendable {
             try? FileManager.default.removeItem(at: stagingURL)
             throw error
         }
-        do {
-            if FileManager.default.fileExists(atPath: url.path) {
-                _ = try FileManager.default.removeItem(at: url)
+        // Commit with rename(2), which replaces an existing destination in a
+        // single atomic syscall: no delete-first window in which a failed or
+        // interrupted move leaves neither export standing, and the previous
+        // export survives intact until the rename lands. It also refuses to
+        // clobber a destination that is a directory instead of deleting it
+        // the way the remove-first flow did.
+        let exitCode = url.path.withCString { destinationPath in
+            stagingURL.path.withCString { stagingPath in
+                rename(stagingPath, destinationPath)
             }
-            try FileManager.default.moveItem(at: stagingURL, to: url)
-        } catch {
+        }
+        guard exitCode == 0 else {
+            let reason = String(cString: strerror(errno))
             try? FileManager.default.removeItem(at: stagingURL)
-            throw StoreError.exportFailed("cannot move export onto \(url.path): \(error.localizedDescription)")
+            throw StoreError.exportFailed("cannot move export onto \(url.path): \(reason)")
         }
         return exported
     }

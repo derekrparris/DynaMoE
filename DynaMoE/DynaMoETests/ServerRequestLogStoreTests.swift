@@ -237,6 +237,59 @@ final class ServerRequestLogStoreTests: XCTestCase {
         XCTAssertEqual(exported, 2, "the search box must scope the export exactly as it scopes the viewer")
     }
 
+    func testTextSearchMatchesToolArgumentsInsideCapturedRequestBodies() async throws {
+        // Captured tool arguments travel one JSON layer deeper than prompt
+        // text: OpenAI `function.arguments` and Anthropic tool-use `input`
+        // are themselves JSON strings before the request summary and the row
+        // payload each encode them again, so an argument value such as
+        // `invalid "name"` persists triple-escaped there. The ladder must
+        // climb to that third encoded level or rows whose only mention lives
+        // inside tool arguments are invisible to both the viewer and the
+        // filtered export.
+        let openAIJSON = #"""
+        {"model":"ling","messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"run_query","arguments":"{\"query\":\"invalid \\\"name\\\"\"}"}}]}]}
+        """#
+        let openAIRequest = try JSONDecoder().decode(OpenAIChatRequest.self, from: Data(openAIJSON.utf8))
+        var openAIRow = row()
+        // The row's message content stays empty: the term occurs ONLY inside
+        // the captured tool arguments, so a match proves the deep encoding
+        // level is searched, not the shallow ones.
+        openAIRow.requestBody = try XCTUnwrap(ServerRequestLog.openAISummary(openAIRequest))
+        XCTAssertNil(openAIRequest.messages.first?.contentText, "fixture sanity: no prompt text to match shallower")
+
+        let anthropicJSON = #"""
+        {"model":"ling","max_tokens":64,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"run_query","input":{"query":"invalid \"name\""}}]}]}
+        """#
+        let anthropicRequest = try JSONDecoder().decode(AnthropicMessagesRequest.self, from: Data(anthropicJSON.utf8))
+        var anthropicRow = row(path: "/v1/messages")
+        anthropicRow.requestBody = try XCTUnwrap(ServerRequestLog.anthropicSummary(anthropicRequest))
+        XCTAssertNil(anthropicRequest.messages.first?.contentText, "fixture sanity: no prompt text to match shallower")
+
+        openAIRow.model = "openai-tool-argument-row"
+        anthropicRow.model = "anthropic-tool-argument-row"
+        store.append(openAIRow)
+        store.append(anthropicRow)
+        store.append(row(error: "unrelated invalid name failure without quotes")) // decoy: same words, no quotes
+
+        var filter = ServerRequestLogStore.Filter()
+        filter.text = "invalid \"name\""
+        let fetched = await store.fetch(filter: filter, limit: 10)
+        XCTAssertEqual(
+            Set(fetched.map(\.model)),
+            ["openai-tool-argument-row", "anthropic-tool-argument-row"],
+            "the term must match its triply-JSON-encoded form inside captured tool arguments"
+        )
+
+        // The same clauses scope the JSONL export.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dynamoe-log-tool-argument-search-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("matches.jsonl")
+        let exported = try await store.exportJSONL(filter: filter, to: url)
+        XCTAssertEqual(exported, 2, "the search box must scope the export exactly as it scopes the viewer")
+    }
+
     // MARK: Clear + count
 
     func testClearRemovesEverything() async {

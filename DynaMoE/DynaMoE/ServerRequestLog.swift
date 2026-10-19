@@ -282,12 +282,16 @@ final class ServerRequestLogRecorder: @unchecked Sendable {
         return parts.joined(separator: " ")
     }
 
-    /// Extracts the recordable error message for a failed request. Strips
-    /// nothing today, but concentrates the policy decision (message strings
-    /// are wire error messages, never credential material) in one place.
+    /// Extracts the recordable error message for a failed request — the
+    /// policy bottleneck for everything the request log persists and the
+    /// unified log prints. Wire errors that echo request values back to the
+    /// client (for the client's own debugging — an invalid role, a demanded
+    /// tool name) carry a log-safe variant that omits them; every other
+    /// error records its full client-facing message, and credential material
+    /// never enters error strings in the first place.
     nonisolated static func errorMessage(for error: Error) -> String {
         if let apiError = error as? ServerAPIError {
-            return apiError.message
+            return apiError.recordableMessage
         }
         if let localized = error as? LocalizedError, let message = localized.errorDescription {
             return message

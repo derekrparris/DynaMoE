@@ -179,6 +179,73 @@ final class ServerRequestLogLogicTests: XCTestCase {
         XCTAssertFalse(message.contains("Bearer"), "the presented credential must not flow into the row")
     }
 
+    func testReflectedRequestValuesStayOnTheWireAndOutOfRecordedErrors() throws {
+        // Wire diagnostics echo the offending value back so the client can
+        // debug its own request, but the recorded error must omit it: with
+        // body capture off the error message is the only request-derived
+        // content a row carries, and `composeLine` prints it to the public
+        // unified log. Each reflected-value rejection carries a log-safe
+        // variant; everything else records its full client-facing message.
+        let roleError = try XCTUnwrap(extractError {
+            try AnthropicAdapter.splitMessages([
+                AnthropicMessagesRequest.Message(role: "wizard", contentText: "hi")
+            ])
+        }, "role rejection is a ServerAPIError")
+        XCTAssertTrue(roleError.message.contains("wizard"), "the wire error keeps echoing the value for the client")
+        XCTAssertFalse(
+            ServerRequestLogRecorder.errorMessage(for: roleError).contains("wizard"),
+            "the recorded message must omit the echoed request value"
+        )
+
+        let openAIToolChoiceError = try XCTUnwrap(extractError {
+            try OpenAIAdapter.toolUseEnabled(.function(name: "dangerous_client_name"))
+        }, "tool_choice rejection is a ServerAPIError")
+        XCTAssertTrue(openAIToolChoiceError.message.contains("dangerous_client_name"))
+        XCTAssertFalse(ServerRequestLogRecorder.errorMessage(for: openAIToolChoiceError).contains("dangerous_client_name"))
+
+        let anthropicToolChoiceError = try XCTUnwrap(extractError {
+            try AnthropicAdapter.toolUseEnabled(AnthropicMessagesRequest.ToolChoice(type: "tool", name: "exfiltrate"))
+        }, "tool_choice rejection is a ServerAPIError")
+        XCTAssertTrue(anthropicToolChoiceError.message.contains("exfiltrate"))
+        XCTAssertFalse(ServerRequestLogRecorder.errorMessage(for: anthropicToolChoiceError).contains("exfiltrate"))
+
+        // End to end through the box: the finalized row — and therefore the
+        // unified-log line — records only the log-safe text.
+        let recorder = ServerRequestLogRecorder.shared
+        let id = "test-\(UUID().uuidString)"
+        let box = recorder.beginBox(requestId: id, method: "POST", path: "/v1/messages")
+        defer { recorder.endBox(requestId: id) }
+        do {
+            _ = try AnthropicAdapter.splitMessages([
+                AnthropicMessagesRequest.Message(role: "sorcerer", contentText: "hi")
+            ])
+            XCTFail("an invalid role must be rejected")
+        } catch {
+            let finalized = box.composeFinal(status: 400, error: error)
+            XCTAssertNotNil(finalized.errorMessage)
+            XCTAssertFalse(finalized.errorMessage!.contains("sorcerer"), "the persisted row must omit the echoed request value")
+            XCTAssertFalse(
+                ServerRequestLogRecorder.composeLine(finalized).contains("sorcerer"),
+                "the unified-log line must print only the log-safe error text"
+            )
+        }
+    }
+
+    /// Runs a throwing body and returns the `ServerAPIError` it must throw
+    /// (failing the test when it does not throw or throws another type).
+    private func extractError(_ body: () throws -> Any) -> ServerAPIError? {
+        do {
+            _ = try body()
+            XCTFail("rejections must throw")
+            return nil
+        } catch let apiError as ServerAPIError {
+            return apiError
+        } catch {
+            XCTFail("rejections are ServerAPIError, got \(error)")
+            return nil
+        }
+    }
+
     // MARK: Protocol inference
 
     func testProtoInference() {
@@ -419,6 +486,36 @@ final class ServerRequestLogLogicTests: XCTestCase {
             prefetchEfficiencyPercent: 0,
             pagingLatencyMs: 0
         )
+    }
+
+    func testFailedNonStreamingTurnKeepsGeneratedTokenCount() {
+        // The non-streaming pipeline throws on `.failedTurn` before any
+        // success-path stamping (`recordTurnOutcome` runs only on success),
+        // so the token count generated before the failure must be stamped
+        // on the box up front — the mirror of `recordStreamedPartialOutcome`
+        // for a path that never held a frame.
+        let recorder = ServerRequestLogRecorder.shared
+        let id = "test-\(UUID().uuidString)"
+        let box = recorder.beginBox(requestId: id, method: "POST", path: "/v1/chat/completions")
+        defer { recorder.endBox(requestId: id) }
+
+        let failure = TurnFailure(
+            kind: .forwardPassFailed,
+            message: "inference forward pass failed after output",
+            cancelled: false,
+            tokensGenerated: 17
+        )
+        ServerController.recordFailedTurnTokenCount(logBox: box, failure: failure)
+        let finalized = box.composeFinal(status: 500, error: ServerAPIError.internalError(failure.message))
+        XCTAssertEqual(finalized.outputTokens, 17, "a failure after output must keep its generated-token count")
+        XCTAssertEqual(finalized.errorMessage, "inference forward pass failed after output")
+
+        // Cancelled failures carry their count too, and a missing box (no
+        // logging on the turn) must be tolerated.
+        let cancelled = TurnFailure(kind: .cancelled, message: "stopped", cancelled: true, tokensGenerated: 4)
+        ServerController.recordFailedTurnTokenCount(logBox: box, failure: cancelled)
+        XCTAssertEqual(box.snapshot().outputTokens, 4, "a cancellation after output keeps its token count")
+        ServerController.recordFailedTurnTokenCount(logBox: nil, failure: cancelled)
     }
 
     // MARK: Disk reclamation (the disk-bound tests: the in-memory store has
@@ -715,6 +812,72 @@ final class ServerRequestLogLogicTests: XCTestCase {
             previousExport,
             "a failed export must leave the previous export file untouched"
         )
+    }
+
+    func testExportJSONLAtomicallyReplacesAnExistingExport() async throws {
+        let (store, directory) = try makeExportStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        func appendRow(path: String) async {
+            var row = ServerRequestLog()
+            row.method = "POST"
+            row.path = path
+            store.append(row)
+            _ = await store.count()
+        }
+
+        let url = directory.appendingPathComponent("requests.jsonl")
+        await appendRow(path: "/v1/models")
+        let firstExport = try await store.exportJSONL(to: url)
+        XCTAssertEqual(firstExport, 1)
+        XCTAssertEqual(try decodedExportLines(url).map(\.path), ["/v1/models"])
+
+        // Re-exporting over the same destination must replace it via one
+        // atomic rename — no delete-first window, no stale bytes, and no
+        // staging file left behind.
+        await appendRow(path: "/v1/messages")
+        let secondExport = try await store.exportJSONL(to: url)
+        XCTAssertEqual(secondExport, 2)
+        XCTAssertEqual(try decodedExportLines(url).map(\.path).count, 2, "the second export must fully replace the first")
+        XCTAssertTrue(try decodedExportLines(url).contains { $0.path == "/v1/messages" })
+        XCTAssertTrue(leftoverStagingFiles(in: directory).isEmpty, "a successful export must not leave staging files behind")
+    }
+
+    func testExportJSONLFailingCommitLeavesDestinationAndDirectoryClean() async throws {
+        let (store, directory) = try makeExportStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        var row = ServerRequestLog()
+        row.method = "POST"
+        row.path = "/v1/messages"
+        store.append(row)
+        _ = await store.count()
+
+        // A destination that is a directory cannot be replaced by an atomic
+        // rename, so the commit fails — loudly, with the destination intact
+        // and no partial export left standing. The old delete-first flow
+        // would have removed the directory outright before failing.
+        let destination = directory.appendingPathComponent("requests.jsonl", isDirectory: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+        let sentinel = destination.appendingPathComponent("user-notes.txt")
+        try "user data the export must never destroy".write(to: sentinel, atomically: true, encoding: .utf8)
+
+        do {
+            _ = try await store.exportJSONL(to: destination)
+            XCTFail("a commit onto an un-replaceable destination must throw")
+        } catch {
+            // Expected: the dashboard's error handler reports the failure.
+        }
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: sentinel.path),
+            "a failed commit must leave the destination untouched"
+        )
+        XCTAssertTrue(leftoverStagingFiles(in: directory).isEmpty, "a failed commit must clean up its staging file")
+    }
+
+    private func leftoverStagingFiles(in directory: URL) -> [String] {
+        (try? FileManager.default.contentsOfDirectory(atPath: directory.path))?
+            .filter { $0.contains("-export.tmp") } ?? []
     }
 
     // MARK: Change observation (the viewer listens instead of polling)

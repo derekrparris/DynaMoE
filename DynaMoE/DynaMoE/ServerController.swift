@@ -565,27 +565,37 @@ struct ServerAPIError: Error, HTTPResponseError, LocalizedError, Sendable {
     let status: HTTPResponse.Status
     let wireType: WireType
     let message: String
+    /// The log-safe rendering of this error for the persisted row and the
+    /// unified log. The client-facing `message` may echo request values back
+    /// to the client (an invalid role, a demanded tool name) so the client can
+    /// debug its own wire usage — content the request log must not persist
+    /// when body capture is off and must never print publicly — so errors
+    /// that reflect such values carry a log-safe variant here; every other
+    /// error is its own log-safe message.
+    let logSafeMessage: String?
+    /// What the request log and the unified log record for this error.
+    var recordableMessage: String { logSafeMessage ?? message }
 
     var errorDescription: String? { message }
 
-    static func badRequest(_ message: String) -> ServerAPIError {
-        ServerAPIError(status: .badRequest, wireType: .invalidRequest, message: message)
+    static func badRequest(_ message: String, logSafeMessage: String? = nil) -> ServerAPIError {
+        ServerAPIError(status: .badRequest, wireType: .invalidRequest, message: message, logSafeMessage: logSafeMessage)
     }
 
     static func unauthorized(_ message: String) -> ServerAPIError {
-        ServerAPIError(status: .unauthorized, wireType: .authentication, message: message)
+        ServerAPIError(status: .unauthorized, wireType: .authentication, message: message, logSafeMessage: nil)
     }
 
     static func requestTimeout(_ message: String) -> ServerAPIError {
-        ServerAPIError(status: .requestTimeout, wireType: .requestTimeout, message: message)
+        ServerAPIError(status: .requestTimeout, wireType: .requestTimeout, message: message, logSafeMessage: nil)
     }
 
     static func serviceUnavailable(_ message: String) -> ServerAPIError {
-        ServerAPIError(status: .serviceUnavailable, wireType: .overloaded, message: message)
+        ServerAPIError(status: .serviceUnavailable, wireType: .overloaded, message: message, logSafeMessage: nil)
     }
 
     static func internalError(_ message: String) -> ServerAPIError {
-        ServerAPIError(status: .internalServerError, wireType: .api, message: message)
+        ServerAPIError(status: .internalServerError, wireType: .api, message: message, logSafeMessage: nil)
     }
 
     func response(from request: Request, context: some RequestContext) throws -> Response {
@@ -1032,7 +1042,12 @@ final class ServerController: ObservableObject {
         do {
             promptTokenIds = try engine.tokenize(formattedPrompt)
         } catch {
-            throw ServerAPIError.badRequest("Tokenizer failed to encode the prompt: \(error.localizedDescription)")
+            throw ServerAPIError.badRequest(
+                "Tokenizer failed to encode the prompt: \(error.localizedDescription)",
+                // The cause can quote the offending prompt text (an unknown
+                // special token), so the row keeps the category only.
+                logSafeMessage: "Tokenizer failed to encode the prompt"
+            )
         }
         guard !promptTokenIds.isEmpty else {
             throw ServerAPIError.badRequest("Prompt tokenization produced 0 tokens.")
@@ -1234,6 +1249,9 @@ final class ServerController: ObservableObject {
                     for await event in launch.stream {
                         switch event {
                         case .failedTurn(let failure):
+                            // The throw unwinds before any success-path stamping, so the
+                            // tokens generated before the failure must reach the row here.
+                            Self.recordFailedTurnTokenCount(logBox: logBox, failure: failure)
                             if failure.cancelled { throw ServerAPIError.serviceUnavailable("Generation cancelled") }
                             throw ServerAPIError.internalError(failure.message)
                         case .finished(let result):
@@ -1317,6 +1335,18 @@ final class ServerController: ObservableObject {
         logBox?.modify { row in
             row.outputTokens = tokenCount
             row.responseBody = responseBody
+        }
+    }
+
+    /// Stamp a non-streaming turn failure's generated-token count onto the
+    /// log row. `recordTurnOutcome` runs only on success and `runTurn` throws
+    /// on `.failedTurn`, so without this a failure after output would leave
+    /// the persisted error row's output-token count nil — mirroring the
+    /// streaming paths' `recordStreamedPartialOutcome` minus the streamed
+    /// text, which the non-streaming pipeline does not retain per row.
+    nonisolated static func recordFailedTurnTokenCount(logBox: ServerRequestLogBox?, failure: TurnFailure) {
+        logBox?.modify { row in
+            row.outputTokens = failure.tokensGenerated
         }
     }
 
@@ -1539,7 +1569,9 @@ final class ServerController: ObservableObject {
                     try await ping(comment)
                 case .launchFailed(let apiError):
                     logTermination = .errorFrame
-                    logErrorMessage = apiError.message
+                    // The row records the log-safe rendering; the wire envelope
+                    // below keeps echoing the client's values back to the client.
+                    logErrorMessage = apiError.recordableMessage
                     let envelope = OpenAIErrorEnvelope(error: .init(message: apiError.message, type: apiError.wireType.rawValue, code: nil))
                     if let data = try? encoder.encode(envelope) {
                         try await sse(ByteBuffer(data: data))
@@ -1864,7 +1896,9 @@ final class ServerController: ObservableObject {
                     try await ping()
                 case .launchFailed(let apiError):
                     logTermination = .errorFrame
-                    logErrorMessage = apiError.message
+                    // The row records the log-safe rendering; the wire envelope
+                    // below keeps echoing the client's values back to the client.
+                    logErrorMessage = apiError.recordableMessage
                     try await ensureStart()
                     try await closeOpenBlocks()
                     try await errorEvent(apiError.message, type: apiError.wireType.rawValue)

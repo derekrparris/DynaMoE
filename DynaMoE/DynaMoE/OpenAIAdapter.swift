@@ -345,7 +345,10 @@ enum OpenAIAdapter {
         case .some(.required):
             throw ServerAPIError.badRequest("tool_choice \"required\" is not supported: this server cannot force a tool call. Use \"auto\" or \"none\".")
         case .some(.function(let name)):
-            throw ServerAPIError.badRequest("tool_choice for a specific function (\"\(name)\") is not supported: this server cannot force a tool call. Use \"auto\" or \"none\".")
+            throw ServerAPIError.badRequest(
+                "tool_choice for a specific function (\"\(name)\") is not supported: this server cannot force a tool call. Use \"auto\" or \"none\".",
+                logSafeMessage: "tool_choice for a specific function is not supported: this server cannot force a tool call. Use \"auto\" or \"none\"."
+            )
         }
     }
 
