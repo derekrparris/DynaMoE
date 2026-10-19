@@ -10,6 +10,7 @@
 //
 
 import XCTest
+import Hummingbird
 import SQLite3
 @testable import DynaMoE
 
@@ -177,6 +178,18 @@ final class ServerRequestLogLogicTests: XCTestCase {
         let message = ServerRequestLogRecorder.errorMessage(for: ServerAPIError.unauthorized("Invalid or missing API key"))
         XCTAssertEqual(message, "Invalid or missing API key")
         XCTAssertFalse(message.contains("Bearer"), "the presented credential must not flow into the row")
+    }
+
+    func testRecordedStatusReadsAnyHTTPResponseError() {
+        // The row's status must mirror what the client actually received:
+        // Hummingbird's own `HTTPError` renders its own status on the wire, so
+        // reading only `ServerAPIError` would record it as a misleading 500.
+        XCTAssertEqual(ServerController.recordedStatus(for: HTTPError(.tooManyRequests, message: "slow down")), 429)
+        XCTAssertEqual(ServerController.recordedStatus(for: ServerAPIError.requestTimeout("timed out waiting in queue")), 408,
+                       "ServerAPIError is itself an HTTPResponseError and keeps its status")
+        struct Opaque: Error {}
+        XCTAssertEqual(ServerController.recordedStatus(for: Opaque()), 500,
+                       "non-wire errors keep the 500 fallback")
     }
 
     func testReflectedRequestValuesStayOnTheWireAndOutOfRecordedErrors() throws {
@@ -1170,6 +1183,106 @@ final class ServerRequestLogLogicTests: XCTestCase {
         let cancelled = try XCTUnwrap(rows.first { $0.errorMessage == "Generation cancelled" })
         XCTAssertFalse(cancelled.isError, "a cancelled turn is a user action, not an error")
         XCTAssertEqual(cancelled.outputTokens, 7, "the partial generation must still be visible in the row")
+    }
+
+    func testAppleFoundationModelTurnRowsCoverTheFullLifecycle() async throws {
+        // `startAppleFoundationModelGeneration` stages and records its rows
+        // exactly this way — the same in-app contract as a weights turn.
+        // On-device specifics: approximate token counts (the macOS 26
+        // streaming API reports none), no separate reasoning channel, no
+        // tools, and a request body of the instructions + user message the
+        // framework actually sees.
+        UserDefaults.standard.set(true, forKey: ServerRequestLogRecorder.captureBodiesKey)
+        let store = ServerRequestLogStore.inMemory()
+        ServerRequestLogRecorder.shared.useOverrideStore(store)
+        defer { ServerRequestLogRecorder.shared.useOverrideStore(nil) }
+
+        func afmBox() -> ServerRequestLogBox {
+            ServerRequestLog.chatTurnLog(
+                model: AppleFoundationModelService.displayName,
+                inputTokens: AppleFoundationModelService.approximateTokenCount(for: "persona and history instructions")
+                    + AppleFoundationModelService.approximateTokenCount(for: "hello"),
+                isAgentTurn: false,
+                prompt: "persona and history instructions\n\nhello"
+            )
+        }
+
+        // Success: the final text and its approximate token count.
+        let finishedBox = afmBox()
+        finishedBox.noteFirstToken()
+        finishedBox.recordChatTurn(
+            status: 200,
+            errorMessage: nil,
+            outputTokens: AppleFoundationModelService.approximateTokenCount(for: "final on-device answer"),
+            finishReason: nil,
+            thinking: "",
+            response: "final on-device answer",
+            toolCalls: []
+        )
+
+        // Stop: informational (200) with the partial text, never an error row.
+        let stoppedBox = afmBox()
+        stoppedBox.noteFirstToken()
+        stoppedBox.recordChatTurn(
+            status: 200,
+            errorMessage: "⏹ Generation stopped by user.",
+            outputTokens: AppleFoundationModelService.approximateTokenCount(for: "partial answer"),
+            finishReason: nil,
+            thinking: "",
+            response: "partial answer",
+            toolCalls: []
+        )
+
+        // Failure before the first partial: the displayed error, no body.
+        let failedBox = afmBox()
+        failedBox.recordChatTurn(
+            status: 500,
+            errorMessage: "⚠️ Apple Foundation Model error: generation failed",
+            outputTokens: 0,
+            finishReason: nil,
+            thinking: "",
+            response: "",
+            toolCalls: []
+        )
+
+        let rows = await store.fetch()
+        XCTAssertEqual(rows.count, 3)
+        for row in rows {
+            XCTAssertEqual(row.source, .chatUI)
+            XCTAssertEqual(row.method, "TURN")
+            XCTAssertEqual(row.path, "chat", "on-device turns are plain chat turns")
+            XCTAssertEqual(row.model, AppleFoundationModelService.displayName)
+            XCTAssertEqual(
+                row.inputTokens,
+                AppleFoundationModelService.approximateTokenCount(for: "persona and history instructions")
+                    + AppleFoundationModelService.approximateTokenCount(for: "hello"),
+                "input tokens stay the framework-agnostic approximation"
+            )
+        }
+        XCTAssertEqual(
+            rows.map { $0.requestBody },
+            [String](repeating: "persona and history instructions\n\nhello", count: 3),
+            "the request body is what the framework actually saw: instructions plus the user message"
+        )
+
+        let finished = try XCTUnwrap(rows.first { $0.errorMessage == nil })
+        XCTAssertFalse(finished.isError)
+        XCTAssertEqual(finished.responseBody, "final on-device answer")
+        XCTAssertEqual(finished.outputTokens, AppleFoundationModelService.approximateTokenCount(for: "final on-device answer"))
+        XCTAssertEqual(finished.finishReason, nil, "the streaming API reports no stop reason")
+        XCTAssertNil(finished.toolCalls, "plain chat records no tool calls — not an empty list")
+        XCTAssertNotNil(finished.firstTokenMs, "the first partial must stamp the row")
+
+        let stopped = try XCTUnwrap(rows.first { $0.errorMessage == "⏹ Generation stopped by user." })
+        XCTAssertFalse(stopped.isError, "a stop is a user action, matching the weights path's cancelled contract")
+        XCTAssertEqual(stopped.responseBody, "partial answer")
+        XCTAssertEqual(stopped.outputTokens, AppleFoundationModelService.approximateTokenCount(for: "partial answer"))
+
+        let failed = try XCTUnwrap(rows.first { $0.errorMessage == "⚠️ Apple Foundation Model error: generation failed" })
+        XCTAssertEqual(failed.httpStatus, 500)
+        XCTAssertTrue(failed.isError, "a failed on-device turn is an error row")
+        XCTAssertNil(failed.responseBody, "a failure before the first partial has nothing to capture")
+        XCTAssertNil(failed.firstTokenMs)
     }
 
     /// Two parsed calls whose arguments are recognizable content: the capture

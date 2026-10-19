@@ -509,7 +509,7 @@ struct ServerWireLogMiddleware<Context: RequestContext>: RouterMiddleware {
             Self.finalize(box: box, path: request.uri.path, status: response.status.code, error: nil)
             return response
         } catch {
-            let status = (error as? ServerAPIError)?.status.code ?? 500
+            let status = ServerController.recordedStatus(for: error)
             Self.finalize(box: box, path: request.uri.path, status: status, error: error)
             throw error
         }
@@ -522,6 +522,17 @@ struct ServerWireLogMiddleware<Context: RequestContext>: RouterMiddleware {
         }
         guard !box.isClaimed else { return }
         ServerRequestLogRecorder.shared.record(box.composeFinal(status: status, error: error))
+    }
+}
+
+extension ServerController {
+    /// The wire status an error rendered to the client: every
+    /// `HTTPResponseError` — `ServerAPIError`, Hummingbird's own `HTTPError`,
+    /// any conformer the router meets — carries its status on itself, so the
+    /// row mirrors what the client actually received. Anything else still
+    /// records as 500, matching the fallback the router itself uses.
+    nonisolated static func recordedStatus(for error: any Error) -> Int {
+        (error as? any HTTPResponseError)?.status.code ?? 500
     }
 }
 
@@ -1630,6 +1641,14 @@ final class ServerController: ObservableObject {
                     try await sseRaw("[DONE]")
                     finishedCleanly = true
                 case .engine(.finished(let result)):
+                    // Capture the final facts before any fallible terminal
+                    // write: a write throwing after this point (a dropped
+                    // socket, say) still records the final token count,
+                    // response, and tool calls instead of falling back to the
+                    // last partial frame — or worse, recording none at all.
+                    // The `.completed` transition below still marks the
+                    // stream only after the terminal writes succeed.
+                    logFinish = result
                     // Tail text the throttle never emitted. The engine has
                     // already trimmed stop matches from the final text, so no
                     // hold-back applies here.
@@ -1669,7 +1688,6 @@ final class ServerController: ObservableObject {
                     }
                     try await sseRaw("[DONE]")
                     logTermination = .completed
-                    logFinish = result
                     finishedCleanly = true
                 }
                 if finishedCleanly { break }
@@ -1940,6 +1958,10 @@ final class ServerController: ObservableObject {
                     try await errorEvent(failure.cancelled ? "Generation cancelled" : failure.message)
                     finishedCleanly = true
                 case .engine(.finished(let result)):
+                    // Same ordering contract as the OpenAI writer: the row's
+                    // final facts are captured before the first fallible
+                    // write, `.completed` marks only a fully written stream.
+                    logFinish = result
                     try await ensureStart()
                     // Tail text the throttle never emitted; the engine has
                     // already trimmed stop matches, so no hold-back applies.
@@ -1974,7 +1996,6 @@ final class ServerController: ObservableObject {
                     ))
                     try await sse("message_stop", AnthropicMessageStopEvent())
                     logTermination = .completed
-                    logFinish = result
                     finishedCleanly = true
                 }
                 if finishedCleanly { break }

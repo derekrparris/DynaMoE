@@ -4197,6 +4197,23 @@ struct ContentView: View {
         if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }) {
             sessions[sIdx].cumulativeTokenCount = afmCumulativeBase
         }
+
+        // In-app turn log for the on-device path — the same row contract as
+        // a weights turn (see `startAutoregressiveGeneration`): success,
+        // failure, and stop each record exactly one row, bodies follow the
+        // Store Request Content toggle, and the streamed partials reach the
+        // row on a stop or failure. The availability pre-flight above stays
+        // unlogged like an engine launch failure: the chat surface owns that
+        // error display. The request-side analog of the weights path's
+        // rendered prompt is what the framework actually sees this turn:
+        // the assembled instructions plus the user message.
+        let turnLog = ServerRequestLog.chatTurnLog(
+            model: AppleFoundationModelService.displayName,
+            inputTokens: afmTurnInputTokens,
+            isAgentTurn: false,
+            prompt: instructionsText.isEmpty ? userPrompt : instructionsText + "\n\n" + userPrompt
+        )
+
         generationTask = Task(priority: .userInitiated) {
             var latestPartial = ""
             var sawFirstPartial = false
@@ -4224,6 +4241,10 @@ struct ContentView: View {
                     maximumResponseTokens: responseCeiling
                 ) { partialText in
                     latestPartial = partialText
+                    // The row's first-token stamp, mirroring the weights loop's
+                    // first frame (first caller wins; an empty snapshot still
+                    // proves the model began answering).
+                    turnLog.noteFirstToken()
                     // 60fps-throttled streaming UI updates, mirroring the weights path.
                     let now = CFAbsoluteTimeGetCurrent()
                     if now - lastUIUpdateTime < 0.016 { return }
@@ -4270,6 +4291,19 @@ struct ContentView: View {
                 // Stop-button cancellation throws out of the stream iteration;
                 // whatever partial text already streamed stays in the message.
                 if Task.isCancelled || !self.ownsGeneration(myGenerationId) {
+                    // Same cancelled-turn contract as the weights path: a user
+                    // stop is informational (200 with the stop message), never
+                    // an error; a stream closing some other way before a result
+                    // is exceptional, and still owes the row its partial text.
+                    turnLog.recordChatTurn(
+                        status: Task.isCancelled ? 200 : 500,
+                        errorMessage: Task.isCancelled ? "⏹ Generation stopped by user." : "Generation stream closed without a result",
+                        outputTokens: AppleFoundationModelService.approximateTokenCount(for: latestPartial),
+                        finishReason: nil,
+                        thinking: "",
+                        response: latestPartial,
+                        toolCalls: []
+                    )
                     return
                 }
                 let errText = "⚠️ Apple Foundation Model error: \(error.localizedDescription)"
@@ -4284,6 +4318,20 @@ struct ContentView: View {
                     self.sessions[sIdx].messages[mIdx].content = partialPrefix + errText
                     self.sessions[sIdx].messages[mIdx].isThinking = false
                 }
+                // The row keeps the failure shape the weights path uses: the
+                // error text the chat surface displays, plus the partial text
+                // generated before the failure (its approximate token count
+                // stands in for the engine's exact count — the macOS 26
+                // streaming API reports no token usage).
+                turnLog.recordChatTurn(
+                    status: 500,
+                    errorMessage: errText,
+                    outputTokens: AppleFoundationModelService.approximateTokenCount(for: latestPartial),
+                    finishReason: nil,
+                    thinking: "",
+                    response: latestPartial,
+                    toolCalls: []
+                )
                 // The turn failed, but queued prompts must not wait on a
                 // generation that will never complete: drain exactly like the
                 // success path does.
@@ -4297,6 +4345,15 @@ struct ContentView: View {
             // message and is intentionally preserved.
             if Task.isCancelled || !self.ownsGeneration(myGenerationId) {
                 commitOdometerTail()
+                turnLog.recordChatTurn(
+                    status: Task.isCancelled ? 200 : 500,
+                    errorMessage: Task.isCancelled ? "⏹ Generation stopped by user." : "Generation stream closed without a result",
+                    outputTokens: AppleFoundationModelService.approximateTokenCount(for: latestPartial),
+                    finishReason: nil,
+                    thinking: "",
+                    response: latestPartial,
+                    toolCalls: []
+                )
                 return
             }
 
@@ -4329,6 +4386,19 @@ struct ContentView: View {
                     self.sessions[sIdx].messages[mIdx].timeToFirstTokenSeconds = max(firstPartialAt - generationStartTime, 0.0)
                 }
             }
+            // Success: one 200 row with the turn's final text and its
+            // approximate token count. No finish reason and no thinking —
+            // plain chat is the only on-device mode, and the framework
+            // reports neither a stop reason nor token usage.
+            turnLog.recordChatTurn(
+                status: 200,
+                errorMessage: nil,
+                outputTokens: approxTokens,
+                finishReason: nil,
+                thinking: "",
+                response: finalText,
+                toolCalls: []
+            )
             self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)
         }
         return true
