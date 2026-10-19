@@ -2177,9 +2177,12 @@ struct SettingsSheetView: View {
                     serverRequestLogDetailLine("Source", log.source?.rawValue ?? "httpAPI (legacy)")
                     if log.wasStreaming {
                         serverRequestLogDetailLine("Streaming", log.streamTermination?.rawValue ?? "open")
-                        if let ttft = log.firstTokenMs {
-                            serverRequestLogDetailLine("First Token", String(format: "%.0f ms", ttft))
-                        }
+                    }
+                    // First-token timing is not an HTTP-streaming fact: in-app
+                    // turn rows stamp it too while leaving `wasStreaming` false,
+                    // so display it whenever it was recorded.
+                    if let ttft = log.firstTokenMs {
+                        serverRequestLogDetailLine("First Token", String(format: "%.0f ms", ttft))
                     }
                     serverRequestLogDetailLine("Duration", String(format: "%.0f ms", log.durationMs))
                     if let wait = log.queueWaitMs {

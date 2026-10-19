@@ -1213,7 +1213,7 @@ final class ServerRequestLogLogicTests: XCTestCase {
         finishedBox.recordChatTurn(
             status: 200,
             errorMessage: nil,
-            outputTokens: AppleFoundationModelService.approximateTokenCount(for: "final on-device answer"),
+            outputTokens: AppleFoundationModelService.recordedOutputTokenCount(for: "final on-device answer"),
             finishReason: nil,
             thinking: "",
             response: "final on-device answer",
@@ -1233,12 +1233,13 @@ final class ServerRequestLogLogicTests: XCTestCase {
             toolCalls: []
         )
 
-        // Failure before the first partial: the displayed error, no body.
+        // Failure before the first partial: the displayed error, no body, and a
+        // genuine zero token count (the empty-text guard, not the UI floor).
         let failedBox = afmBox()
         failedBox.recordChatTurn(
             status: 500,
             errorMessage: "⚠️ Apple Foundation Model error: generation failed",
-            outputTokens: 0,
+            outputTokens: AppleFoundationModelService.recordedOutputTokenCount(for: ""),
             finishReason: nil,
             thinking: "",
             response: "",
@@ -1281,6 +1282,7 @@ final class ServerRequestLogLogicTests: XCTestCase {
         let failed = try XCTUnwrap(rows.first { $0.errorMessage == "⚠️ Apple Foundation Model error: generation failed" })
         XCTAssertEqual(failed.httpStatus, 500)
         XCTAssertTrue(failed.isError, "a failed on-device turn is an error row")
+        XCTAssertEqual(failed.outputTokens, 0, "an empty response must not record a phantom output token")
         XCTAssertNil(failed.responseBody, "a failure before the first partial has nothing to capture")
         XCTAssertNil(failed.firstTokenMs)
     }

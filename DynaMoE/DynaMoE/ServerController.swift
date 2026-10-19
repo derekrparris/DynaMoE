@@ -1569,6 +1569,12 @@ final class ServerController: ObservableObject {
                             frame: frame,
                             tokenCount: logFailure?.tokensGenerated ?? frame.tokensGenerated
                         )
+                    } else if let failure = logFailure {
+                        // A prefill failure emits `.failedTurn` with no frame and
+                        // no response text; the failure still knows how many
+                        // tokens were generated, so the row keeps that count
+                        // instead of falling back to nil.
+                        recordFailedTurnTokenCount(logBox: logBox, failure: failure)
                     }
                     ServerRequestLogRecorder.shared.record(logBox.snapshot())
                 }
@@ -1903,6 +1909,10 @@ final class ServerController: ObservableObject {
                             frame: frame,
                             tokenCount: logFailure?.tokensGenerated ?? frame.tokensGenerated
                         )
+                    } else if let failure = logFailure {
+                        // Mirrors the OpenAI writer: a prefill failure with no
+                        // frame still knows its generated-token count.
+                        recordFailedTurnTokenCount(logBox: logBox, failure: failure)
                     }
                     ServerRequestLogRecorder.shared.record(logBox.snapshot())
                 }

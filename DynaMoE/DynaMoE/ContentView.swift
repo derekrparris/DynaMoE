@@ -4298,7 +4298,7 @@ struct ContentView: View {
                     turnLog.recordChatTurn(
                         status: Task.isCancelled ? 200 : 500,
                         errorMessage: Task.isCancelled ? "⏹ Generation stopped by user." : "Generation stream closed without a result",
-                        outputTokens: AppleFoundationModelService.approximateTokenCount(for: latestPartial),
+                        outputTokens: AppleFoundationModelService.recordedOutputTokenCount(for: latestPartial),
                         finishReason: nil,
                         thinking: "",
                         response: latestPartial,
@@ -4326,7 +4326,7 @@ struct ContentView: View {
                 turnLog.recordChatTurn(
                     status: 500,
                     errorMessage: errText,
-                    outputTokens: AppleFoundationModelService.approximateTokenCount(for: latestPartial),
+                    outputTokens: AppleFoundationModelService.recordedOutputTokenCount(for: latestPartial),
                     finishReason: nil,
                     thinking: "",
                     response: latestPartial,
@@ -4348,7 +4348,7 @@ struct ContentView: View {
                 turnLog.recordChatTurn(
                     status: Task.isCancelled ? 200 : 500,
                     errorMessage: Task.isCancelled ? "⏹ Generation stopped by user." : "Generation stream closed without a result",
-                    outputTokens: AppleFoundationModelService.approximateTokenCount(for: latestPartial),
+                    outputTokens: AppleFoundationModelService.recordedOutputTokenCount(for: latestPartial),
                     finishReason: nil,
                     thinking: "",
                     response: latestPartial,
@@ -4393,7 +4393,7 @@ struct ContentView: View {
             turnLog.recordChatTurn(
                 status: 200,
                 errorMessage: nil,
-                outputTokens: approxTokens,
+                outputTokens: AppleFoundationModelService.recordedOutputTokenCount(for: finalText),
                 finishReason: nil,
                 thinking: "",
                 response: finalText,
