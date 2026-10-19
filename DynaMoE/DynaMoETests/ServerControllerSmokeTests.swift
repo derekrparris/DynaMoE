@@ -405,6 +405,7 @@ final class ServerControllerSmokeTests: XCTestCase {
         XCTAssertTrue(row.isError)
         XCTAssertNotNil(row.errorMessage)
         XCTAssertEqual(row.proto, .openai)
+        XCTAssertNil(row.model, "no model is loaded, so the plan never resolved and the row carries no model rather than the client's alias label")
     }
 
     func testRequestLogNonStreaming503RowHasWithheldBodyMarker() async throws {

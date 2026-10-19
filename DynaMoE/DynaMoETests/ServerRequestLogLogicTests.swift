@@ -10,6 +10,7 @@
 //
 
 import XCTest
+import SQLite3
 @testable import DynaMoE
 
 final class ServerRequestLogLogicTests: XCTestCase {
@@ -512,6 +513,76 @@ final class ServerRequestLogLogicTests: XCTestCase {
         )
     }
 
+    func testSchemaRejectionNeverWritesToOrPrunesANewerDatabase() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dynamoe-log-schema-reject-tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let dbPath = directory.appendingPathComponent("requests.sqlite").path
+
+        // Seed the file as a newer build would have left it: a row this app
+        // has no business touching, stamped with a schema version beyond
+        // what it understands.
+        var newerDB: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(dbPath, &newerDB), SQLITE_OK)
+        var statement: OpaquePointer?
+        func rawExec(_ sql: String) {
+            XCTAssertEqual(sqlite3_exec(newerDB, sql, nil, nil, nil), SQLITE_OK, "raw exec failed: \(sql)")
+        }
+        rawExec("""
+            CREATE TABLE requests (
+                id TEXT PRIMARY KEY, ts_ms INTEGER NOT NULL, path TEXT NOT NULL,
+                http_status INTEGER NOT NULL, is_error INTEGER NOT NULL,
+                was_streaming INTEGER NOT NULL, model TEXT, payload TEXT NOT NULL
+            )
+            """)
+        rawExec("INSERT INTO requests VALUES ('seeded-by-newer-build', 1, '/v1/models', 200, 0, 0, NULL, '{}')")
+        rawExec("PRAGMA user_version = 2")
+
+        func rawRowCount() -> Int {
+            XCTAssertEqual(sqlite3_prepare_v2(newerDB, "SELECT COUNT(*) FROM requests", -1, &statement, nil), SQLITE_OK)
+            XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
+            let count = Int(sqlite3_column_int64(statement, 0))
+            sqlite3_finalize(statement)
+            statement = nil
+            return count
+        }
+        XCTAssertEqual(rawRowCount(), 1)
+
+        // Every operation against the rejected database must no-op: no
+        // appends, no reads, and — the dangerous one — no clear or retention
+        // pass may delete the newer build's rows.
+        let store = ServerRequestLogStore(path: dbPath)
+        var rejectedRow = ServerRequestLog()
+        rejectedRow.method = "POST"
+        rejectedRow.path = "/v1/chat/completions"
+        store.append(rejectedRow)
+        let fetched = await store.fetch(limit: 10)
+        XCTAssertTrue(fetched.isEmpty, "a rejected database must never serve rows to this build")
+        let visibleCount = await store.count()
+        XCTAssertEqual(visibleCount, 0)
+
+        await store.clear()
+        await store.pruneForTesting(now: Date().addingTimeInterval(400 * 86_400))
+        XCTAssertEqual(
+            rawRowCount(), 1,
+            "neither clear nor retention may delete rows out of a schema the store rejected"
+        )
+
+        // Export must fail loudly rather than report a 0-row success.
+        let exportURL = directory.appendingPathComponent("export.jsonl")
+        do {
+            _ = try await store.exportJSONL(to: exportURL)
+            XCTFail("export from a rejected database must throw, not report a 0-row success")
+        } catch {}
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: exportURL.path),
+            "a failed export must not leave a file behind"
+        )
+
+        sqlite3_close(newerDB)
+    }
+
     // MARK: JSONL export
 
     private func makeExportStore() throws -> (store: ServerRequestLogStore, directory: URL) {
@@ -610,6 +681,39 @@ final class ServerRequestLogLogicTests: XCTestCase {
             try decodedExportLines(url).first { $0.path == "/v1/chat/completions" }?.requestBody,
             "multi\nline content that must stay inside one JSON string",
             "bodies must survive the export byte-exact"
+        )
+    }
+
+    func testExportJSONLThrowsWhenTheDatabaseCannotOpen() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dynamoe-log-export-fail-tests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // The user's previous export must not silently read as "Exported 0
+        // rows": a failed export reports failure and leaves it untouched.
+        let previousExport = "the user's last good export must survive a failed one"
+        let url = directory.appendingPathComponent("requests.jsonl")
+        try previousExport.write(to: url, atomically: true, encoding: .utf8)
+
+        // The database's parent directory does not exist, so the store cannot
+        // open it.
+        let store = ServerRequestLogStore(
+            path: directory
+                .appendingPathComponent("missing-subdir")
+                .appendingPathComponent("requests.sqlite")
+                .path
+        )
+        do {
+            _ = try await store.exportJSONL(to: url)
+            XCTFail("an unopenable database must fail the export, not report a 0-row success")
+        } catch {
+            // Expected: the dashboard's error handler reports this path.
+        }
+        XCTAssertEqual(
+            try String(contentsOf: url, encoding: .utf8),
+            previousExport,
+            "a failed export must leave the previous export file untouched"
         )
     }
 

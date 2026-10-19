@@ -31,11 +31,6 @@ import ServiceLifecycle
 enum QueuedTurnEvent: @unchecked Sendable {
     /// Server-level comment ping (queue wait / prefill silence).
     case ping(comment: String?)
-    /// The FIFO slot opened for this turn: queue wait ended, generation
-    /// begins. Relayed exactly once, before any work event; the streaming
-    /// writers consume it to stamp the box's `queueWaitMs` and never
-    /// surface it on the wire.
-    case slotOpened
     case engine(CompletionEvent)
     /// Synchronous launch failure (model not loaded, engine busy, etc.).
     /// Carries the wire-shaped error so both protocol adapters render their
@@ -116,12 +111,17 @@ actor TurnExecutionQueue {
     /// `queueWaitTimeout` bounds how long the turn may sit behind earlier
     /// turns; when it expires the relay emits a launchFailed event instead of
     /// running the work — promptly, even if an earlier turn is stalled. Nil
-    /// (the default) waits indefinitely. Exactly one `.slotOpened` relay
-    /// event precedes the work, so consumers can split queue wait from
-    /// generation time.
+    /// (the default) waits indefinitely. `onSlotOpened` fires exactly once,
+    /// the instant the FIFO slot opens and immediately before the work runs
+    /// (never on the timeout or cancellation paths), mirroring `perform`: the
+    /// streaming writers stamp their box's `queueWaitMs` through the hook —
+    /// at the producer — because the relay can deliver an event late, so an
+    /// SSE writer blocked on an earlier heartbeat would otherwise stamp
+    /// generation time as queue wait.
     func streamTurn(
         _ work: @escaping @Sendable (_ emit: @escaping @Sendable (QueuedTurnEvent) -> Void) async -> Void,
-        queueWaitTimeout: TimeInterval? = nil
+        queueWaitTimeout: TimeInterval? = nil,
+        onSlotOpened: (@Sendable () -> Void)? = nil
     ) -> (AsyncStream<QueuedTurnEvent>, Task<Void, Never>) {
         let (stream, continuation) = AsyncStream.makeStream(of: QueuedTurnEvent.self, bufferingPolicy: .unbounded)
         let previous = tail
@@ -138,7 +138,7 @@ actor TurnExecutionQueue {
                 continuation.yield(.ping(comment: nil))
             }
         }
-        let task = Task<Void, Never> { [previous, heartbeat, deadline] in
+        let task = Task<Void, Never> { [previous, heartbeat, deadline, onSlotOpened] in
             defer {
                 // The heartbeat also serves the RUNNING turn: cancel it here, not
                 // right after the previous turn drains, so the SSE stream keeps
@@ -170,7 +170,7 @@ actor TurnExecutionQueue {
                 continuation.finish()
                 return
             }
-            continuation.yield(.slotOpened)
+            onSlotOpened?()
             await work { continuation.yield($0) }
             continuation.finish()
         }
@@ -1397,7 +1397,6 @@ final class ServerController: ObservableObject {
             assert(claimed, "the streaming writer must win its request-log box claim exactly once")
             logBox.modify { row in
                 row.wasStreaming = true
-                row.model = model
             }
         }
 
@@ -1459,10 +1458,18 @@ final class ServerController: ObservableObject {
                 let close = TurnTextSplitter.canonicalReasoningCloseTag
                 try await sse(chunkBuffer(.init(role: nil, content: close + "\n\n", reasoningContent: nil, toolCalls: nil), finishReason: nil))
             }
-            let (relay, task) = await queue.streamTurn(queueWaitTimeout: resolvedQueueWaitTimeout) { emit in
+            let (relay, task) = await queue.streamTurn({ emit in
                 do {
                     let plan = try ServerController.buildTurnPlan(apiRequest)
                     promptTokensBox.set(plan.promptTokenCount)
+                    logBox?.modify { row in
+                        // The row names the model that actually ran, not the
+                        // client's label: the plan resolves the loaded model
+                        // behind an alias (or a model switch while queued)
+                        // once the slot drains, mirroring the non-streaming
+                        // rows. A turn that never plans carries no model.
+                        row.model = plan.modelName
+                    }
                     try await ServerController.withTurnToolMask(plan.maskSchemas) {
                         let launch = try CompletionEngine.shared.launchTurn(plan.request)
                         if Task.isCancelled {
@@ -1483,7 +1490,7 @@ final class ServerController: ObservableObject {
                 } catch {
                     emit(.launchFailed(wireLaunchError(error)))
                 }
-            }
+            }, queueWaitTimeout: resolvedQueueWaitTimeout, onSlotOpened: { logBox?.noteSlotOpened() })
             defer { task.cancel() }
 
             // Request-log terminal state. `clientDisconnected` is the default:
@@ -1528,8 +1535,6 @@ final class ServerController: ObservableObject {
             var finishedCleanly = false
             for await event in relay {
                 switch event {
-                case .slotOpened:
-                    logBox?.noteSlotOpened()
                 case .ping(let comment):
                     try await ping(comment)
                 case .launchFailed(let apiError):
@@ -1705,7 +1710,6 @@ final class ServerController: ObservableObject {
             assert(claimed, "the streaming writer must win its request-log box claim exactly once")
             logBox.modify { row in
                 row.wasStreaming = true
-                row.model = model
             }
         }
 
@@ -1784,10 +1788,16 @@ final class ServerController: ObservableObject {
                 }
             }
 
-            let (relay, task) = await queue.streamTurn(queueWaitTimeout: resolvedQueueWaitTimeout) { emit in
+            let (relay, task) = await queue.streamTurn({ emit in
                 do {
                     let plan = try ServerController.buildTurnPlan(apiRequest)
                     promptTokensBox.set(plan.promptTokenCount)
+                    logBox?.modify { row in
+                        // Same contract as the OpenAI writer: the row names the
+                        // resolved model, and a turn that never plans carries
+                        // no model at all.
+                        row.model = plan.modelName
+                    }
                     try await ServerController.withTurnToolMask(plan.maskSchemas) {
                         let launch = try CompletionEngine.shared.launchTurn(plan.request)
                         if Task.isCancelled {
@@ -1808,7 +1818,7 @@ final class ServerController: ObservableObject {
                 } catch {
                     emit(.launchFailed(wireLaunchError(error)))
                 }
-            }
+            }, queueWaitTimeout: resolvedQueueWaitTimeout, onSlotOpened: { logBox?.noteSlotOpened() })
             defer { task.cancel() }
 
             // Request-log terminal state, mirroring the OpenAI writer: the
@@ -1850,8 +1860,6 @@ final class ServerController: ObservableObject {
             var finishedCleanly = false
             for await event in relay {
                 switch event {
-                case .slotOpened:
-                    logBox?.noteSlotOpened()
                 case .ping:
                     try await ping()
                 case .launchFailed(let apiError):

@@ -55,6 +55,11 @@ final class ServerRequestLogStore: @unchecked Sendable {
     private var db: OpaquePointer?
     private let databasePath: String?
     private var openFailureLogged = false
+    /// Sticky once the schema pass rejects the database (or itself fails): a
+    /// file this build cannot validate must never be written to or pruned
+    /// again this session. The store stays a silent no-op (open failures are
+    /// non-fatal by design) until the next launch retries the open.
+    private var schemaRejected = false
     private var appendCounter = 0
     /// Change observers (the dashboard's log viewer): one signal per append,
     /// clear, or retention prune, so the viewer never polls.
@@ -120,7 +125,7 @@ final class ServerRequestLogStore: @unchecked Sendable {
     /// Opens the database and runs the schema migration + initial retention
     /// pass. Runs on the store queue only. Idempotent.
     private func ensureOpen() {
-        guard db == nil else { return }
+        guard db == nil, !schemaRejected else { return }
         guard let path = databasePath else {
             // In-memory test store: register the shared in-memory database.
             if sqlite3_open(":memory:", &db) == SQLITE_OK {
@@ -152,6 +157,16 @@ final class ServerRequestLogStore: @unchecked Sendable {
                 openFailureLogged = true
                 DiagLog.error("server.store", "request log schema setup failed: \(error.localizedDescription)")
             }
+            // A rejected database (schema from a newer app, or a schema pass
+            // that failed outright) must not fall through to the pruning pass
+            // or serve later writes: the handle would stay open, skip
+            // validation on every later call, and let this build delete or
+            // overwrite rows in a database it cannot understand. Close the
+            // handle and leave it closed for the whole session.
+            sqlite3_close(db)
+            db = nil
+            schemaRejected = true
+            return
         }
         pruneLocked()
     }
@@ -424,15 +439,22 @@ final class ServerRequestLogStore: @unchecked Sendable {
         if !text.isEmpty {
             // The payload column is JSON, so the term matches only in its
             // stored form: displayed text `invalid "name"` persists as
-            // `invalid \"name\"`. Encode the term with the same encoder the
-            // rows were written with, then escape LIKE wildcards — the
-            // encoder's own backslashes first, so `\"` stays literal.
-            let encodedTerm = jsonEncodedSearchFragment(text)
-            let escaped = encodedTerm
-                .replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "%", with: "\\%")
-                .replacingOccurrences(of: "_", with: "\\_")
-            clauses.append("payload LIKE \(add(.text("%\(escaped)%"))) ESCAPE '\\'")
+            // `invalid \"name\"`. Captured API request bodies add one more
+            // JSON layer still — the request summary is itself serialized
+            // JSON embedded as a string value — so the same displayed text
+            // is escaped yet again there (backslashes doubled, quotes
+            // re-escaped). Match every encoding level the term can sit at
+            // (raw JSON structure, row-level string fields, embedded request
+            // summaries), then LIKE-escape each pattern — the encoder's own
+            // backslashes first, so `\"` stays literal.
+            let likePatterns = jsonEncodedSearchFragments(text).map { fragment in
+                let escaped = fragment
+                    .replacingOccurrences(of: "\\", with: "\\\\")
+                    .replacingOccurrences(of: "%", with: "\\%")
+                    .replacingOccurrences(of: "_", with: "\\_")
+                return "payload LIKE \(add(.text("%\(escaped)%"))) ESCAPE '\\'"
+            }
+            clauses.append(likePatterns.count == 1 ? likePatterns[0] : "(" + likePatterns.joined(separator: " OR ") + ")")
         }
 
         let whereSQL = clauses.isEmpty ? "" : " WHERE " + clauses.joined(separator: " AND ")
@@ -449,6 +471,25 @@ final class ServerRequestLogStore: @unchecked Sendable {
               quoted.hasPrefix("\""), quoted.hasSuffix("\""),
               quoted.count >= 2 else { return text }
         return String(quoted.dropFirst().dropLast())
+    }
+
+    /// The term at every JSON-encoding level it can occupy in a stored
+    /// payload: the raw term (JSON structure fragments such as `"role":`
+    /// appear unescaped in the payload), the term once-encoded (row-level
+    /// string fields), and twice-encoded (the request summaries embedded as
+    /// strings inside `requestBody`). Encoding stabilizes for plain terms,
+    /// collapsing to a single pattern; the ladder stops as soon as a level
+    /// repeats.
+    private func jsonEncodedSearchFragments(_ text: String) -> [String] {
+        var fragments: [String] = []
+        var current = text
+        for _ in 0..<3 {
+            if !fragments.contains(current) { fragments.append(current) }
+            let encoded = jsonEncodedSearchFragment(current)
+            if encoded == current { break }
+            current = encoded
+        }
+        return fragments
     }
 
     private func fetchLocked(filter: Filter, limit: Int, offset: Int, completion: ([ServerRequestLog]) -> Void) {
@@ -542,7 +583,7 @@ final class ServerRequestLogStore: @unchecked Sendable {
             queue.async { [weak self] in
                 do {
                     guard let self else {
-                        continuation.resume(returning: 0)
+                        continuation.resume(throwing: StoreError.exportFailed("request log store is unavailable"))
                         return
                     }
                     continuation.resume(returning: try self.exportJSONLLocked(filter: filter, to: url))
@@ -555,7 +596,9 @@ final class ServerRequestLogStore: @unchecked Sendable {
 
     private func exportJSONLLocked(filter: Filter, to url: URL) throws -> Int {
         ensureOpen()
-        guard db != nil else { return 0 }
+        guard db != nil else {
+            throw StoreError.exportFailed("request log database is unavailable")
+        }
         let (whereSQL, binds) = filterClauses(filter)
         let sql = "SELECT payload FROM requests\(whereSQL) ORDER BY ts_ms DESC, rowid DESC"
         var statement: OpaquePointer?
@@ -569,22 +612,50 @@ final class ServerRequestLogStore: @unchecked Sendable {
             }
         }
 
-        guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
-            throw StoreError.exportFailed("cannot create file at \(url.path)")
+        // Stage the export beside the destination so a failure never touches
+        // it: only a complete export moves onto `url`, a mid-write error
+        // leaves the previous file intact, and no empty or partial file is
+        // ever left standing in for a bug-report attachment.
+        let stagingURL = url.deletingLastPathComponent()
+            .appendingPathComponent(".\(UUID().uuidString)-export.tmp")
+        guard FileManager.default.createFile(atPath: stagingURL.path, contents: nil) else {
+            throw StoreError.exportFailed("cannot create staging file at \(stagingURL.path)")
         }
-        let handle = try FileHandle(forWritingTo: url)
-        defer { try? handle.close() }
         let encoder = encoder
         let decoder = decoder
         var exported = 0
-        while sqlite3_step(statement) == SQLITE_ROW {
-            guard let blob = sqlite3_column_blob(statement, 0) else { continue }
-            let payload = Data(bytes: blob, count: Int(sqlite3_column_bytes(statement, 0)))
-            // A row that cannot decode (schema drift from an older build) is
-            // skipped, matching fetch: the export succeeds with what is there.
-            guard let row = try? decoder.decode(ServerRequestLog.self, from: payload) else { continue }
-            try handle.write(contentsOf: encoder.encode(row) + Data("\n".utf8))
-            exported += 1
+        do {
+            let handle = try FileHandle(forWritingTo: stagingURL)
+            defer { try? handle.close() }
+            while true {
+                let result = sqlite3_step(statement)
+                if result == SQLITE_DONE { break }
+                guard result == SQLITE_ROW else {
+                    // Busy, I/O, and corruption errors are failures, not a
+                    // complete export: only SQLITE_DONE means every matching
+                    // row made it out.
+                    throw StoreError.exportFailed(String(cString: sqlite3_errmsg(db)))
+                }
+                guard let blob = sqlite3_column_blob(statement, 0) else { continue }
+                let payload = Data(bytes: blob, count: Int(sqlite3_column_bytes(statement, 0)))
+                // A row that cannot decode (schema drift from an older build) is
+                // skipped, matching fetch: the export succeeds with what is there.
+                guard let row = try? decoder.decode(ServerRequestLog.self, from: payload) else { continue }
+                try handle.write(contentsOf: encoder.encode(row) + Data("\n".utf8))
+                exported += 1
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: stagingURL)
+            throw error
+        }
+        do {
+            if FileManager.default.fileExists(atPath: url.path) {
+                _ = try FileManager.default.removeItem(at: url)
+            }
+            try FileManager.default.moveItem(at: stagingURL, to: url)
+        } catch {
+            try? FileManager.default.removeItem(at: stagingURL)
+            throw StoreError.exportFailed("cannot move export onto \(url.path): \(error.localizedDescription)")
         }
         return exported
     }

@@ -188,6 +188,55 @@ final class ServerRequestLogStoreTests: XCTestCase {
         XCTAssertEqual(plainFetched.first?.errorMessage, "plain failure")
     }
 
+    func testTextSearchMatchesPromptTextInsideCapturedRequestBodies() async throws {
+        // Captured API request bodies embed one more JSON layer inside the
+        // row's payload: `openAISummary`/`anthropicSummary` serialize the
+        // prompt itself, and the row encoder then embeds that serialized
+        // summary as a string value. Displayed prompt text such as
+        // `invalid "name"` persists double-escaped there, so the search must
+        // match its twice-encoded form to find those rows.
+        // Raw literals (`#"..."#`): the JSON itself must carry the backslash
+        // escapes, so `\"` in the fixture must reach the decoder literally.
+        let openAIJSON = #"""
+        {"model":"ling","messages":[{"role":"user","content":"error reads: invalid \"name\""}]}
+        """#
+        let openAIRequest = try JSONDecoder().decode(OpenAIChatRequest.self, from: Data(openAIJSON.utf8))
+        var openAIRow = row()
+        openAIRow.model = "openai-summary-row"
+        openAIRow.requestBody = try XCTUnwrap(ServerRequestLog.openAISummary(openAIRequest))
+
+        let anthropicJSON = #"""
+        {"model":"ling","max_tokens":64,"system":"verify nested escapes","messages":[{"role":"user","content":"also contains invalid \"name\""}]}
+        """#
+        let anthropicRequest = try JSONDecoder().decode(AnthropicMessagesRequest.self, from: Data(anthropicJSON.utf8))
+        var anthropicRow = row(path: "/v1/messages")
+        anthropicRow.model = "anthropic-summary-row"
+        anthropicRow.requestBody = try XCTUnwrap(ServerRequestLog.anthropicSummary(anthropicRequest))
+
+        store.append(openAIRow)
+        store.append(anthropicRow)
+        store.append(row(error: "unrelated single-encoded failure")) // decoy: similar words, no quotes
+
+        var filter = ServerRequestLogStore.Filter()
+        filter.text = "invalid \"name\""
+        var fetched = await store.fetch(filter: filter, limit: 10)
+        XCTAssertEqual(
+            Set(fetched.map(\.model)),
+            ["openai-summary-row", "anthropic-summary-row"],
+            "the term must match its doubly-JSON-encoded form inside both protocols' captured request bodies"
+        )
+
+        // The same clauses scope the JSONL export, so filtered exports cannot
+        // exclude matching request bodies either.
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dynamoe-log-nested-search-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("matches.jsonl")
+        let exported = try await store.exportJSONL(filter: filter, to: url)
+        XCTAssertEqual(exported, 2, "the search box must scope the export exactly as it scopes the viewer")
+    }
+
     // MARK: Clear + count
 
     func testClearRemovesEverything() async {
