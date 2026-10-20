@@ -125,6 +125,13 @@ struct DynaMoEApp: App {
            UserDefaults.standard.bool(forKey: ServerController.enabledKey) {
             ServerController.shared.start()
         }
+
+        // MCP servers (Phase 7): load mcp.json, watch it for edits, and connect
+        // whatever is enabled. Nothing here blocks launch: each server connects
+        // on its own task and reports into MCPManager's published state.
+        if !isTesting {
+            MCPManager.shared.bootstrap()
+        }
     }
 
     var sharedModelContainer: ModelContainer = {

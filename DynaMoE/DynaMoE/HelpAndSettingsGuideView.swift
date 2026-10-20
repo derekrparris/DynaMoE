@@ -490,6 +490,8 @@ struct HelpAndSettingsGuideView: View {
                 bulletPoint("Safety Limits", "Configure 'Max Tool Output Length' (to avoid blowing context limits) and 'Max Agent Steps' (to prevent runaway execution loops).")
                 bulletPoint("Headless Browser Web Search", "Zero-config, real-time web search powered by a local headless browser (Chrome, Chromium, Brave, or Edge) executing on your Mac with DOM extraction and JavaScript SPA rendering.")
                 bulletPoint("Brave Search API", "Optional remote search integration for structured JSON queries over local headless browser execution.")
+                bulletPoint("MCP Servers", "Connect Model Context Protocol servers declared in ~/Library/Application Support/DynaMoE/mcp.json, over stdio (local child processes) or Streamable HTTP. Their tools reach the model as mcp__<server>__<tool>. The file is authoritative: edit it here with the form or the raw JSON view, or by hand, and changes reload automatically.")
+                bulletPoint("MCP Safety & Loading", "Every MCP tool call asks for confirmation unless Turbo Mode is on, because a server can do anything and its read-only annotations are only claims. Secret env values and headers live in the Keychain, so mcp.json holds only a ${keychain:...} reference. Discovered tools stay out of the prompt until the model loads them with tools_discover / tools_load.")
             }
 
             infoBox(title: "Supported Local Tools", icon: "wrench.fill") {

@@ -1,0 +1,1458 @@
+//
+//  MCPClient.swift
+//  DynaMoE
+//
+//  Phase 7: Model Context Protocol client.
+//  JSON-RPC 2.0 over stdio and Streamable HTTP transports.
+//
+//  Two process models meet here. DynaMoE's existing tool runners are strictly
+//  one-shot: `ControlledProcessRunner` and `AgentHarness.runProcess` launch a
+//  command, wait for it to exit, and read its pipes only at termination. An MCP
+//  server is the opposite: a long-lived process whose stdout is a message
+//  stream and whose stdin must stay open. So this file owns the app's first
+//  persistent child process, and the rules that come with it:
+//
+//    - stdout is drained continuously by a readability handler and split into
+//      newline-delimited JSON frames;
+//    - stderr is drained continuously into a bounded ring buffer, because an
+//      unread stderr pipe blocks the child at 64 KB and the server would look
+//      like a hang rather than a failure;
+//    - a single frame larger than `maxMessageBytes` is refused instead of
+//      growing the buffer without bound.
+//
+
+import Foundation
+
+// MARK: - Errors
+
+public nonisolated enum MCPClientError: LocalizedError {
+    case launchFailed(command: String, reason: String)
+    case connectionClosed(String)
+    case timeout(method: String, seconds: Double)
+    case remote(code: Int, message: String)
+    case unsupportedTransport(String)
+    case unresolvedTokens([String])
+    case missingEndpoint
+    case httpStatus(code: Int, body: String)
+    case serverCapabilityMissing(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .launchFailed(let command, let reason):
+            return "Could not launch '\(command)': \(reason)"
+        case .connectionClosed(let detail):
+            return detail.isEmpty ? "The MCP server closed the connection." : "The MCP server closed the connection. \(detail)"
+        case .timeout(let method, let seconds):
+            return "MCP request '\(method)' timed out after \(Int(seconds))s."
+        case .remote(let code, let message):
+            return "MCP server error \(code): \(message)"
+        case .unsupportedTransport(let detail):
+            return "Unsupported MCP transport: \(detail)"
+        case .unresolvedTokens(let tokens):
+            return "Unresolved credential token(s) \(tokens.joined(separator: ", ")). Store the secret in the Keychain from Settings, or set the referenced environment variable."
+        case .missingEndpoint:
+            return "The MCP server config declares neither 'command' nor 'url'."
+        case .httpStatus(let code, let body):
+            let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty
+                ? "MCP endpoint returned HTTP \(code)."
+                : "MCP endpoint returned HTTP \(code): \(trimmed)"
+        case .serverCapabilityMissing(let capability):
+            return "The MCP server does not advertise the '\(capability)' capability."
+        }
+    }
+}
+
+// MARK: - JSON Value
+
+/// A Sendable, Equatable stand-in for decoded JSON. `[String: Any]` cannot
+/// cross an actor boundary, and MCP tool schemas are arbitrary JSON, so the
+/// wire layer decodes once into this and the bridge converts to `AnyCodable`
+/// at the `ToolDefinition` boundary.
+public nonisolated indirect enum MCPJSONValue: Sendable, Equatable {
+    case null
+    case bool(Bool)
+    case int(Int)
+    case double(Double)
+    case string(String)
+    case array([MCPJSONValue])
+    case object([String: MCPJSONValue])
+
+    public init(any value: Any) {
+        if value is NSNull {
+            self = .null
+            return
+        }
+        if let string = value as? String {
+            self = .string(string)
+            return
+        }
+        if let number = value as? NSNumber {
+            // JSONSerialization reports booleans as NSNumber, and `as? Bool`
+            // would also accept 1/0, so booleans are identified by CF type.
+            if CFGetTypeID(number) == CFBooleanGetTypeID() {
+                self = .bool(number.boolValue)
+                return
+            }
+            let doubleValue = number.doubleValue
+            if doubleValue == doubleValue.rounded(), abs(doubleValue) < 9_007_199_254_740_992 {
+                self = .int(number.intValue)
+            } else {
+                self = .double(doubleValue)
+            }
+            return
+        }
+        if let array = value as? [Any] {
+            self = .array(array.map { MCPJSONValue(any: $0) })
+            return
+        }
+        if let object = value as? [String: Any] {
+            self = .object(object.mapValues { MCPJSONValue(any: $0) })
+            return
+        }
+        self = .string(String(describing: value))
+    }
+
+    public init?(data: Data) {
+        guard let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) else {
+            return nil
+        }
+        self = MCPJSONValue(any: object)
+    }
+
+    public var anyValue: Any {
+        switch self {
+        case .null: return NSNull()
+        case .bool(let value): return value
+        case .int(let value): return value
+        case .double(let value): return value
+        case .string(let value): return value
+        case .array(let values): return values.map { $0.anyValue }
+        case .object(let values): return values.mapValues { $0.anyValue }
+        }
+    }
+
+    public subscript(key: String) -> MCPJSONValue? {
+        guard case .object(let values) = self else { return nil }
+        return values[key]
+    }
+
+    public var stringValue: String? {
+        if case .string(let value) = self { return value }
+        return nil
+    }
+
+    public var boolValue: Bool? {
+        if case .bool(let value) = self { return value }
+        return nil
+    }
+
+    public var intValue: Int? {
+        if case .int(let value) = self { return value }
+        return nil
+    }
+
+    public var arrayValue: [MCPJSONValue]? {
+        if case .array(let value) = self { return value }
+        return nil
+    }
+
+    public var objectValue: [String: MCPJSONValue]? {
+        if case .object(let value) = self { return value }
+        return nil
+    }
+
+    public var isNull: Bool {
+        if case .null = self { return true }
+        return false
+    }
+
+    public var prettyJSONString: String {
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: anyValue,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        ), let string = String(data: data, encoding: .utf8) else {
+            return String(describing: anyValue)
+        }
+        return string
+    }
+}
+
+// MARK: - Wire Format
+
+public nonisolated enum MCPWire {
+    /// Newest protocol revision this client asks for. Servers answer with the
+    /// revision they support and the client accepts whatever comes back.
+    public static let protocolVersion = "2025-06-18"
+    public static let supportedProtocolVersions = ["2025-06-18", "2025-03-26", "2024-11-05"]
+
+    public static var clientVersion: String {
+        (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "1.0"
+    }
+
+    public static func request(id: Int, method: String, params: [String: Any]?) throws -> Data {
+        var payload: [String: Any] = ["jsonrpc": "2.0", "id": id, "method": method]
+        if let params { payload["params"] = params }
+        return try encode(payload)
+    }
+
+    public static func notification(method: String, params: [String: Any]?) throws -> Data {
+        var payload: [String: Any] = ["jsonrpc": "2.0", "method": method]
+        if let params { payload["params"] = params }
+        return try encode(payload)
+    }
+
+    public static func successResponse(id: Int, result: [String: Any]) throws -> Data {
+        try encode(["jsonrpc": "2.0", "id": id, "result": result])
+    }
+
+    public static func errorResponse(id: Int, code: Int, message: String) throws -> Data {
+        try encode(["jsonrpc": "2.0", "id": id, "error": ["code": code, "message": message]])
+    }
+
+    public static func cancelledParams(requestId: Int, reason: String) -> [String: Any] {
+        ["requestId": requestId, "reason": reason]
+    }
+
+    private static func encode(_ payload: [String: Any]) throws -> Data {
+        try JSONSerialization.data(withJSONObject: payload, options: [.withoutEscapingSlashes])
+    }
+}
+
+/// One decoded frame arriving from a server: a response, a server-initiated
+/// request, or a notification.
+public nonisolated struct MCPIncomingMessage: Sendable {
+    public let id: Int?
+    public let method: String?
+    public let result: [String: MCPJSONValue]?
+    public let errorCode: Int?
+    public let errorMessage: String?
+
+    public init?(data: Data) {
+        guard let value = MCPJSONValue(data: data), case .object(let object) = value else { return nil }
+
+        if case .int(let numeric)? = object["id"] {
+            self.id = numeric
+        } else if case .string(let raw)? = object["id"], let numeric = Int(raw) {
+            self.id = numeric
+        } else {
+            self.id = nil
+        }
+
+        self.method = object["method"]?.stringValue
+
+        if case .object(let result)? = object["result"] {
+            self.result = result
+        } else {
+            self.result = nil
+        }
+
+        if case .object(let error)? = object["error"] {
+            if case .int(let code)? = error["code"] {
+                self.errorCode = code
+            } else {
+                self.errorCode = nil
+            }
+            self.errorMessage = error["message"]?.stringValue
+        } else {
+            self.errorCode = nil
+            self.errorMessage = nil
+        }
+    }
+}
+
+public nonisolated struct MCPResponseEnvelope: Sendable {
+    public let result: [String: MCPJSONValue]?
+    public let errorCode: Int?
+    public let errorMessage: String?
+}
+
+// MARK: - Message Framing
+
+/// Splits a byte stream into newline-delimited frames. MCP stdio frames are
+/// one JSON object per line, and SSE frames arrive as text lines, so both
+/// transports share this.
+nonisolated struct MCPLineBuffer {
+    private(set) var buffer = Data()
+    let limit: Int
+    private(set) var overflowed = false
+
+    init(limit: Int) {
+        self.limit = limit
+    }
+
+    /// Returns complete lines with the newline removed. A trailing `\r` is
+    /// stripped so `\r\n` framing works.
+    mutating func append(_ chunk: Data) -> [String] {
+        guard !overflowed else { return [] }
+        buffer.append(chunk)
+
+        var lines: [String] = []
+        while let newline = buffer.firstIndex(of: 0x0A) {
+            var lineData = Data(buffer[buffer.startIndex..<newline])
+            if lineData.last == 0x0D { lineData.removeLast() }
+            if let line = String(data: lineData, encoding: .utf8) {
+                lines.append(line)
+            }
+            buffer.removeSubrange(buffer.startIndex...newline)
+        }
+
+        if buffer.count > limit {
+            overflowed = true
+            buffer.removeAll()
+        }
+        return lines
+    }
+
+    /// Flushes any unterminated trailing line (a server that omits the final
+    /// newline still deserves its last frame).
+    mutating func flush() -> String? {
+        guard !overflowed, !buffer.isEmpty else { return nil }
+        var lineData = buffer
+        buffer.removeAll()
+        if lineData.last == 0x0D { lineData.removeLast() }
+        return String(data: lineData, encoding: .utf8)
+    }
+}
+
+/// Text/event-stream frame assembler: `data:` lines accumulate until a blank
+/// line dispatches the event.
+nonisolated struct MCPSSEFrameParser {
+    private var dataLines: [String] = []
+    private var eventName: String?
+
+    init() {}
+
+    mutating func consume(line: String) -> (event: String?, data: String)? {
+        if line.isEmpty {
+            return dispatch()
+        }
+        if line.hasPrefix(":") {
+            return nil
+        }
+        guard let separator = line.firstIndex(of: ":") else {
+            // A bare field name with no colon is legal and carries an empty value.
+            return nil
+        }
+        let field = String(line[line.startIndex..<separator])
+        var value = String(line[line.index(after: separator)...])
+        if value.hasPrefix(" ") { value.removeFirst() }
+
+        switch field {
+        case "data":
+            dataLines.append(value)
+        case "event":
+            eventName = value
+        default:
+            break
+        }
+        return nil
+    }
+
+    mutating func finish() -> (event: String?, data: String)? {
+        dispatch()
+    }
+
+    private mutating func dispatch() -> (event: String?, data: String)? {
+        defer {
+            dataLines.removeAll()
+            eventName = nil
+        }
+        guard !dataLines.isEmpty else { return nil }
+        return (eventName, dataLines.joined(separator: "\n"))
+    }
+}
+
+// MARK: - Transport
+
+public nonisolated protocol MCPTransport: AnyObject, Sendable {
+    func start() async throws
+    /// Writes one JSON-RPC frame. Must not await the matching response: the
+    /// client's read loop owns delivery.
+    func send(_ payload: Data) async throws
+    /// Whole JSON frames in arrival order. Finishing the stream means the
+    /// connection is gone; `closureReason` explains why.
+    var messages: AsyncStream<Data> { get }
+    var stderrTail: String { get }
+    var closureReason: String? { get }
+    func close()
+}
+
+// MARK: - stdio Transport
+
+public final class MCPStdioTransport: MCPTransport, @unchecked Sendable {
+    /// Refuses a single frame larger than this rather than growing without
+    /// bound. A 10 MB tool result belongs in a file, not a JSON-RPC frame.
+    public static let maxMessageBytes = 8 * 1024 * 1024
+    /// Enough stderr to explain a crash, bounded so a chatty server cannot
+    /// exhaust memory.
+    public static let maxStderrBytes = 16 * 1024
+
+    private let launchCommand: String
+    private let arguments: [String]
+    private let environment: [String: String]
+    private let workingDirectory: URL?
+    private let label: String
+
+    private let lock = NSLock()
+    private let writeLock = NSLock()
+    private var process: Process?
+    private var stdinHandle: FileHandle?
+    private var stdoutLines: MCPLineBuffer
+    private var stderrBuffer = Data()
+    private var didFinish = false
+    private var _closureReason: String?
+    private var _stderrTail = ""
+
+    private let stream: AsyncStream<Data>
+    private let continuation: AsyncStream<Data>.Continuation
+
+    public var messages: AsyncStream<Data> { stream }
+
+    public var stderrTail: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return _stderrTail
+    }
+
+    public var closureReason: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _closureReason
+    }
+
+    public init(
+        command: String,
+        arguments: [String],
+        environment: [String: String],
+        workingDirectory: URL?,
+        label: String
+    ) {
+        self.launchCommand = command
+        self.arguments = arguments
+        self.environment = environment
+        self.workingDirectory = workingDirectory
+        self.label = label
+        self.stdoutLines = MCPLineBuffer(limit: Self.maxMessageBytes)
+        let pair = AsyncStream<Data>.makeStream(bufferingPolicy: .bufferingNewest(256))
+        self.stream = pair.stream
+        self.continuation = pair.continuation
+    }
+
+    public func start() async throws {
+        // `/usr/bin/env` execs the target in place, so the child pid *is* the
+        // server and PATH from `toolEnvironment()` resolves `npx`, `uvx`, and
+        // `cargo` the same way `shell_run` does.
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = [launchCommand] + arguments
+
+        var env = ControlledProcessRunner.toolEnvironment()
+        for (key, value) in environment {
+            env[key] = value
+        }
+        process.environment = env
+        if let workingDirectory {
+            process.currentDirectoryURL = workingDirectory
+        }
+
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardInput = stdinPipe
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        install(process: process, stdinHandle: stdinPipe.fileHandleForWriting)
+
+        stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in            let chunk = handle.availableData
+            guard let self else { return }
+            if chunk.isEmpty {
+                handle.readabilityHandler = nil
+                self.finish(reason: "stdout closed")
+            } else {
+                self.ingestStdout(chunk)
+            }
+        }
+
+        stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let chunk = handle.availableData
+            guard let self else { return }
+            if chunk.isEmpty {
+                handle.readabilityHandler = nil
+            } else {
+                self.ingestStderr(chunk)
+            }
+        }
+
+        process.terminationHandler = { [weak self] finished in
+            self?.finish(reason: "server exited with status \(finished.terminationStatus)")
+        }
+
+        // A close() that landed between install and run must not orphan a child.
+        if hasFinished() {
+            finish(reason: "closed before launch")
+            throw MCPClientError.connectionClosed("The transport was closed before the server could start.")
+        }
+
+        do {
+            try process.run()
+        } catch {
+            finish(reason: "launch failed: \(error.localizedDescription)")
+            throw MCPClientError.launchFailed(command: launchCommand, reason: error.localizedDescription)
+        }
+
+        if hasFinished() {
+            let pid = process.processIdentifier
+            if pid > 0 {
+                kill(-pid, SIGTERM)
+                kill(pid, SIGTERM)
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) {
+                    if process.isRunning {
+                        kill(-pid, SIGKILL)
+                        kill(pid, SIGKILL)
+                    }
+                }
+            }
+            throw MCPClientError.connectionClosed("The transport was closed while the server was starting.")
+        }
+
+        DiagLog.info("mcp", "server=\(label) launched pid=\(process.processIdentifier)")
+    }
+
+    public func send(_ payload: Data) async throws {
+        let snapshot = writeState()
+        guard snapshot.isRunning, let handle = snapshot.handle else {
+            throw MCPClientError.connectionClosed(
+                Self.describeClosure(reason: snapshot.reason, tail: snapshot.tail)
+            )
+        }
+
+        var framed = payload
+        framed.append(0x0A)
+        do {
+            try writeFramed(framed, to: handle)
+        } catch {
+            throw MCPClientError.connectionClosed(
+                "Write to server stdin failed: \(error.localizedDescription)\n\(currentStderrTail())"
+            )
+        }
+    }
+
+    /// A separate write lock keeps two concurrent messages from interleaving on
+    /// the same stdin handle; the state lock is never held across a write.
+    private func writeFramed(_ framed: Data, to handle: FileHandle) throws {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        try handle.write(contentsOf: framed)
+    }
+
+    /// Locking is confined to this synchronous helper: `NSLock` is unavailable
+    /// from async contexts and becomes an error under the Swift 6 language mode.
+    private func install(process: Process, stdinHandle: FileHandle) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.process = process
+        self.stdinHandle = stdinHandle
+    }
+
+    private func hasFinished() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return didFinish
+    }
+
+    private func writeState() -> (handle: FileHandle?, isRunning: Bool, tail: String, reason: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (stdinHandle, process?.isRunning ?? false, _stderrTail, _closureReason)
+    }
+
+    private func currentStderrTail() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return _stderrTail
+    }
+
+    public func close() {
+        lock.lock()
+        let process = self.process
+        let handle = self.stdinHandle
+        self.stdinHandle = nil
+        self.process = nil
+        lock.unlock()
+
+        // EOF first: a well-behaved server shuts down on its own.
+        try? handle?.close()
+
+        guard let process, process.isRunning else {
+            finish(reason: "closed")
+            return
+        }
+        let pid = process.processIdentifier
+        if pid > 0 {
+            kill(-pid, SIGTERM)
+            kill(pid, SIGTERM)
+        }
+        process.terminate()
+
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            if process.isRunning {
+                if pid > 0 {
+                    kill(-pid, SIGKILL)
+                    kill(pid, SIGKILL)
+                }
+            }
+            self?.finish(reason: "closed")
+        }
+        finish(reason: "closed")
+    }
+
+    // MARK: Ingestion
+
+    private func ingestStdout(_ chunk: Data) {
+        lock.lock()
+        let lines = stdoutLines.append(chunk)
+        let overflowed = stdoutLines.overflowed
+        lock.unlock()
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { continue }
+            guard let data = line.data(using: .utf8) else { continue }
+            continuation.yield(data)
+        }
+
+        if overflowed {
+            finish(reason: "a single MCP frame exceeded \(Self.maxMessageBytes) bytes")
+        }
+    }
+
+    private func ingestStderr(_ chunk: Data) {
+        lock.lock()
+        stderrBuffer.append(chunk)
+        if stderrBuffer.count > Self.maxStderrBytes {
+            let excess = stderrBuffer.count - Self.maxStderrBytes
+            stderrBuffer.removeFirst(excess)
+        }
+        _stderrTail = String(decoding: stderrBuffer, as: UTF8.self)
+        lock.unlock()
+    }
+
+    private func finish(reason: String) {
+        lock.lock()
+        if didFinish {
+            lock.unlock()
+            return
+        }
+        didFinish = true
+        _closureReason = reason
+        let tail = _stderrTail
+        lock.unlock()
+
+        DiagLog.info("mcp", "server=\(label) closed: \(reason)\(tail.isEmpty ? "" : " stderr=\(tail.suffix(240))")")
+        continuation.finish()
+    }
+
+    static func describeClosure(reason: String?, tail: String) -> String {
+        var parts: [String] = []
+        if let reason, !reason.isEmpty { parts.append(reason) }
+        let trimmedTail = tail.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedTail.isEmpty { parts.append("stderr: \(trimmedTail.suffix(600))") }
+        return parts.joined(separator: "\n")
+    }
+}
+
+// MARK: - Streamable HTTP Transport
+
+public final class MCPHTTPTransport: MCPTransport, @unchecked Sendable {
+    public static let maxMessageBytes = 8 * 1024 * 1024
+
+    private let endpoint: URL
+    private let baseHeaders: [String: String]
+    private let session: URLSession
+    private let label: String
+
+    private let lock = NSLock()
+    private let writeLock = NSLock()
+    private var sessionId: String?
+    private var inFlight: [UUID: Task<Void, Never>] = [:]
+    private var didClose = false
+    private var _closureReason: String?
+
+    private let stream: AsyncStream<Data>
+    private let continuation: AsyncStream<Data>.Continuation
+
+    public var messages: AsyncStream<Data> { stream }
+    public var stderrTail: String { "" }
+
+    public var closureReason: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _closureReason
+    }
+
+    public init(
+        endpoint: URL,
+        headers: [String: String],
+        requestTimeout: TimeInterval,
+        label: String
+    ) {
+        self.endpoint = endpoint
+        self.baseHeaders = headers
+        self.label = label
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = requestTimeout
+        configuration.timeoutIntervalForResource = max(requestTimeout * 2, requestTimeout + 30)
+        configuration.waitsForConnectivity = false
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.httpShouldSetCookies = false
+        self.session = URLSession(configuration: configuration)
+
+        let pair = AsyncStream<Data>.makeStream(bufferingPolicy: .bufferingNewest(256))
+        self.stream = pair.stream
+        self.continuation = pair.continuation
+    }
+
+    public func start() async throws {
+        // No handshake happens at the transport layer: `initialize` is the first
+        // POST. Server-initiated notifications would need a long-lived GET SSE
+        // stream; this client discovers tools on connect and on `tools/list`
+        // refreshes instead, so it does not open one.
+        DiagLog.info("mcp", "server=\(label) using Streamable HTTP at \(endpoint.host ?? "?")")
+    }
+
+    public func send(_ payload: Data) async throws {
+        let snapshot = connectionState()
+        guard !snapshot.isClosed else {
+            throw MCPClientError.connectionClosed("The MCP session is closed.")
+        }
+        let sessionId = snapshot.sessionId
+
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.httpBody = payload
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue(MCPWire.protocolVersion, forHTTPHeaderField: "MCP-Protocol-Version")
+        for (key, value) in baseHeaders {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+        if let sessionId {
+            request.setValue(sessionId, forHTTPHeaderField: "Mcp-Session-Id")
+        }
+
+        let bytes: URLSession.AsyncBytes
+        let response: URLResponse
+        do {
+            (bytes, response) = try await session.bytes(for: request)
+        } catch {
+            throw MCPClientError.connectionClosed("HTTP request failed: \(error.localizedDescription)")
+        }
+
+        guard let http = response as? HTTPURLResponse else {
+            throw MCPClientError.connectionClosed("The MCP endpoint returned a non-HTTP response.")
+        }
+
+        if let newSession = http.value(forHTTPHeaderField: "Mcp-Session-Id") {
+            storeSessionId(newSession)
+        }
+
+        if http.statusCode == 202 {
+            return
+        }
+        if http.statusCode == 404, sessionId != nil {
+            storeSessionId(nil)
+            throw MCPClientError.connectionClosed("The MCP session expired (HTTP 404). Reconnect the server.")
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            let body = await Self.drain(bytes, limit: 4096)
+            throw MCPClientError.httpStatus(code: http.statusCode, body: Self.summarizeErrorBody(body))
+        }
+
+        let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? ""
+        let taskID = UUID()
+        let task = Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            if contentType.contains("text/event-stream") {
+                await self.consumeSSE(bytes)
+            } else {
+                await self.consumeJSON(bytes)
+            }
+            self.untrack(taskID)
+        }
+        track(task, id: taskID)
+    }
+
+    /// Synchronous lock helpers: `NSLock` is unavailable from async contexts and
+    /// is an error under the Swift 6 language mode.
+    private func connectionState() -> (isClosed: Bool, sessionId: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (didClose, sessionId)
+    }
+
+    private func storeSessionId(_ value: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        sessionId = value
+    }
+
+    private func track(_ task: Task<Void, Never>, id: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        inFlight[id] = task
+    }
+
+    private func untrack(_ id: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        inFlight.removeValue(forKey: id)
+    }
+
+    public func close() {
+        lock.lock()
+        didClose = true
+        _closureReason = "closed"
+        let sessionId = self.sessionId
+        let tasks = inFlight.values
+        inFlight.removeAll()
+        lock.unlock()
+
+        tasks.forEach { $0.cancel() }
+        continuation.finish()
+
+        if let sessionId {
+            var request = URLRequest(url: endpoint)
+            request.httpMethod = "DELETE"
+            request.setValue(sessionId, forHTTPHeaderField: "Mcp-Session-Id")
+            for (key, value) in baseHeaders {
+                request.setValue(value, forHTTPHeaderField: key)
+            }
+            // Uses the shared session: this transport's own session is about
+            // to be invalidated, and a cancelled DELETE would leave the server
+            // holding the session until it times out.
+            Task.detached {
+                _ = try? await URLSession.shared.data(for: request)
+            }
+        }
+        session.invalidateAndCancel()
+        DiagLog.info("mcp", "server=\(label) HTTP session closed")
+    }
+
+    // MARK: Body consumption
+
+    private func consumeJSON(_ bytes: URLSession.AsyncBytes) async {
+        var data = Data()
+        do {
+            for try await byte in bytes {
+                data.append(byte)
+                if data.count > Self.maxMessageBytes {
+                    DiagLog.error("mcp", "server=\(label) HTTP response exceeded \(Self.maxMessageBytes) bytes")
+                    return
+                }
+            }
+        } catch {
+            DiagLog.warning("mcp", "server=\(label) HTTP body error: \(error.localizedDescription)")
+            return
+        }
+        guard !data.isEmpty else { return }
+
+        // A response may be a single object or a batch array.
+        if let value = MCPJSONValue(data: data), case .array(let frames) = value {
+            for frame in frames {
+                if let encoded = try? JSONSerialization.data(withJSONObject: frame.anyValue) {
+                    continuation.yield(encoded)
+                }
+            }
+            return
+        }
+        continuation.yield(data)
+    }
+
+    private func consumeSSE(_ bytes: URLSession.AsyncBytes) async {
+        var lineBuffer = MCPLineBuffer(limit: Self.maxMessageBytes)
+        var frames = MCPSSEFrameParser()
+
+        func dispatch(_ event: (event: String?, data: String)?) {
+            guard let event else { return }
+            // `event: endpoint` frames carry an upload URL in old revisions;
+            // only JSON payloads can be JSON-RPC.
+            guard event.data.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("{")
+                || event.data.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("[") else { return }
+            guard let data = event.data.data(using: .utf8) else { return }
+            continuation.yield(data)
+        }
+
+        do {
+            for try await byte in bytes {
+                var single = Data()
+                single.append(byte)
+                for line in lineBuffer.append(single) {
+                    dispatch(frames.consume(line: line))
+                }
+                if lineBuffer.overflowed { break }
+            }
+            if let trailing = lineBuffer.flush() {
+                dispatch(frames.consume(line: trailing))
+            }
+            dispatch(frames.finish())
+        } catch {
+            DiagLog.warning("mcp", "server=\(label) SSE stream error: \(error.localizedDescription)")
+        }
+    }
+
+    /// Gateways answer a malformed request with a full HTML page. Showing that
+    /// page in a settings row buries the one useful word ("Bad Request") under
+    /// kilobytes of markup, so tags are stripped, whitespace collapsed, and the
+    /// result bounded.
+    static func summarizeErrorBody(_ body: String, limit: Int = 400) -> String {
+        var text = body
+        if text.contains("<") {
+            text = text.replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
+        }
+        text = text
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.isEmpty { return "" }
+        if text.count > limit {
+            text = String(text.prefix(limit)) + "..."
+        }
+        return text
+    }
+
+    private static func drain(_ bytes: URLSession.AsyncBytes, limit: Int) async -> String {
+        var data = Data()
+        do {
+            for try await byte in bytes {
+                data.append(byte)
+                if data.count >= limit { break }
+            }
+        } catch {
+            return ""
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+}
+
+// MARK: - Resolved Server
+
+/// A server config with every `${...}` token expanded, ready to become a
+/// transport. Built at connect time, never persisted.
+public nonisolated struct MCPResolvedServer: Sendable {
+    public let key: String
+    public let kind: MCPServerConfig.TransportKind
+    public let command: String?
+    public let arguments: [String]
+    public let environment: [String: String]
+    public let workingDirectory: URL?
+    public let endpoint: URL?
+    public let headers: [String: String]
+    public let startupTimeoutSec: Double
+    public let toolTimeoutSec: Double
+    public let rawConfig: MCPServerConfig
+}
+
+public nonisolated enum MCPConfigResolver {
+    /// Expands tokens and builds transport inputs. Returns validation errors
+    /// as values so the caller can surface them without throwing.
+    public static func resolve(
+        key: String,
+        config: MCPServerConfig,
+        workspacePath: String?
+    ) -> (server: MCPResolvedServer?, issues: [MCPConfigIssue]) {
+        var issues = MCPConfigValidator.validate(server: config, key: key)
+        guard !MCPConfigValidator.hasErrors(issues) else { return (nil, issues) }
+
+        var unresolved: [String] = []
+
+        let expandedArgs = MCPTokenExpander.expand(config.args ?? [], workspacePath: workspacePath)
+        unresolved.append(contentsOf: expandedArgs.unresolved)
+
+        let expandedEnv = MCPTokenExpander.expand(config.env ?? [:], workspacePath: workspacePath)
+        unresolved.append(contentsOf: expandedEnv.unresolved)
+
+        let expandedHeaders = MCPTokenExpander.expand(config.headers ?? [:], workspacePath: workspacePath)
+        unresolved.append(contentsOf: expandedHeaders.unresolved)
+
+        let expandedCWD: String? = {
+            guard let raw = config.cwd, !raw.isEmpty else { return nil }
+            let resolution = MCPTokenExpander.expand(raw, workspacePath: workspacePath)
+            unresolved.append(contentsOf: resolution.unresolved)
+            return resolution.value
+        }()
+
+        let expandedURL: URL? = {
+            guard let raw = config.url, !raw.isEmpty else { return nil }
+            let resolution = MCPTokenExpander.expand(raw, workspacePath: workspacePath)
+            unresolved.append(contentsOf: resolution.unresolved)
+            return URL(string: resolution.value)
+        }()
+
+        var expandedCommand: String?
+        if let raw = config.command, !raw.isEmpty {
+            let resolution = MCPTokenExpander.expand(raw, workspacePath: workspacePath)
+            unresolved.append(contentsOf: resolution.unresolved)
+            expandedCommand = resolution.value
+        }
+
+        if !unresolved.isEmpty {
+            issues.append(MCPConfigIssue(
+                severity: .error,
+                serverKey: key,
+                message: "Unresolved credential token(s): \(Set(unresolved).sorted().joined(separator: ", "))"
+            ))
+            return (nil, issues)
+        }
+
+        let kind = config.transportKind
+        guard let kind else {
+            issues.append(MCPConfigIssue(severity: .error, serverKey: key, message: "Missing transport endpoint."))
+            return (nil, issues)
+        }
+
+        if kind == .http, expandedURL == nil {
+            issues.append(MCPConfigIssue(severity: .error, serverKey: key, message: "'url' did not expand into a valid URL."))
+            return (nil, issues)
+        }
+
+        let resolved = MCPResolvedServer(
+            key: key,
+            kind: kind,
+            command: expandedCommand,
+            arguments: expandedArgs.values,
+            environment: expandedEnv.values,
+            workingDirectory: expandedCWD.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) },
+            endpoint: expandedURL,
+            headers: expandedHeaders.values,
+            startupTimeoutSec: config.resolvedStartupTimeoutSec,
+            toolTimeoutSec: config.resolvedToolTimeoutSec,
+            rawConfig: config
+        )
+        return (resolved, issues)
+    }
+}
+
+// MARK: - Discovered Tools
+
+public nonisolated struct MCPToolDescriptor: Sendable, Equatable {
+    public let name: String
+    public let description: String
+    public let inputSchema: MCPJSONValue
+    public let readOnlyHint: Bool
+    public let destructiveHint: Bool
+
+    public init?(json: MCPJSONValue) {
+        guard case .object(let object) = json,
+              let name = object["name"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !name.isEmpty else { return nil }
+
+        self.name = name
+
+        var summary = object["description"]?.stringValue ?? ""
+        if summary.isEmpty, let title = object["title"]?.stringValue {
+            summary = title
+        }
+        self.description = summary
+
+        self.inputSchema = object["inputSchema"] ?? .object([
+            "type": .string("object"),
+            "properties": .object([:])
+        ])
+
+        let annotations = object["annotations"]
+        self.readOnlyHint = annotations?["readOnlyHint"]?.boolValue ?? false
+        self.destructiveHint = annotations?["destructiveHint"]?.boolValue ?? false
+    }
+}
+
+public nonisolated struct MCPCallResult: Sendable, Equatable {
+    public let text: String
+    public let isError: Bool
+    public let contentBlockCount: Int
+    public let imageBlockCount: Int
+    public let structuredContent: MCPJSONValue?
+
+    public init(json: [String: MCPJSONValue]) {
+        var parts: [String] = []
+        var blocks = 0
+        var images = 0
+
+        if let content = json["content"]?.arrayValue {
+            for block in content {
+                blocks += 1
+                switch block["type"]?.stringValue {
+                case "text":
+                    if let text = block["text"]?.stringValue {
+                        parts.append(text)
+                    }
+                case "image":
+                    images += 1
+                    parts.append(Self.imagePlaceholder(block))
+                case "audio":
+                    parts.append("[audio \(block["mimeType"]?.stringValue ?? "unknown")]")
+                case "resource":
+                    if let resource = block["resource"] {
+                        parts.append(Self.resourceDescription(resource))
+                    } else {
+                        parts.append("[resource]")
+                    }
+                case "resource_link":
+                    parts.append("[resource_link \(block["uri"]?.stringValue ?? "")]")
+                case .some(let other):
+                    parts.append("[\(other) content block]")
+                case .none:
+                    parts.append("[content block]")
+                }
+            }
+        }
+
+        let structured = json["structuredContent"]
+        if parts.isEmpty, let structured, !structured.isNull {
+            // Servers that return only structuredContent would otherwise look
+            // like an empty result to the model.
+            parts.append(structured.prettyJSONString)
+        }
+
+        self.text = parts.joined(separator: "\n\n")
+        self.isError = json["isError"]?.boolValue ?? false
+        self.contentBlockCount = blocks
+        self.imageBlockCount = images
+        self.structuredContent = structured
+    }
+
+    static func imagePlaceholder(_ block: MCPJSONValue) -> String {
+        let mime = block["mimeType"]?.stringValue ?? "image/unknown"
+        // `data` is base64, so decoded size is 3/4 of the encoded length.
+        let base64Count = block["data"]?.stringValue?.count ?? 0
+        let decodedBytes = base64Count * 3 / 4
+        if decodedBytes > 0 {
+            return "[image \(mime) \(ByteCountFormatter.string(fromByteCount: Int64(decodedBytes), countStyle: .file))]"
+        }
+        return "[image \(mime)]"
+    }
+
+    static func resourceDescription(_ resource: MCPJSONValue) -> String {
+        let uri = resource["uri"]?.stringValue ?? ""
+        if let text = resource["text"]?.stringValue {
+            return "[resource \(uri)]\n\(text)"
+        }
+        if let mime = resource["mimeType"]?.stringValue {
+            return "[resource \(uri) \(mime)]"
+        }
+        return "[resource \(uri)]"
+    }
+}
+
+// MARK: - Client
+
+public actor MCPClient {
+    public nonisolated let serverKey: String
+    public nonisolated let config: MCPResolvedServer
+
+    private let transport: any MCPTransport
+    private let startupTimeout: Double
+    private let toolTimeout: Double
+    private let onToolsChanged: (@Sendable () -> Void)?
+    private let incoming: AsyncStream<Data>
+
+    private var readTask: Task<Void, Never>?
+    private var pending: [Int: CheckedContinuation<MCPResponseEnvelope, any Error>] = [:]
+    private var nextRequestID = 1
+    private var isClosed = false
+    private var didStart = false
+
+    public private(set) var negotiatedProtocolVersion: String?
+    public private(set) var serverName: String?
+    public private(set) var serverVersion: String?
+    public private(set) var serverInstructions: String?
+
+    public init(
+        config: MCPResolvedServer,
+        onToolsChanged: (@Sendable () -> Void)? = nil
+    ) throws {
+        switch config.kind {
+        case .stdio:
+            guard let command = config.command, !command.isEmpty else {
+                throw MCPClientError.missingEndpoint
+            }
+            self.init(
+                config: config,
+                transport: MCPStdioTransport(
+                    command: command,
+                    arguments: config.arguments,
+                    environment: config.environment,
+                    workingDirectory: config.workingDirectory,
+                    label: config.key
+                ),
+                onToolsChanged: onToolsChanged
+            )
+        case .http:
+            guard let endpoint = config.endpoint else {
+                throw MCPClientError.missingEndpoint
+            }
+            self.init(
+                config: config,
+                transport: MCPHTTPTransport(
+                    endpoint: endpoint,
+                    headers: config.headers,
+                    requestTimeout: max(config.toolTimeoutSec, 30),
+                    label: config.key
+                ),
+                onToolsChanged: onToolsChanged
+            )
+        }
+    }
+
+    /// Injects a transport instead of building one. Lets tests drive the full
+    /// JSON-RPC exchange against an in-memory server without spawning a process.
+    public init(
+        config: MCPResolvedServer,
+        transport: any MCPTransport,
+        onToolsChanged: (@Sendable () -> Void)? = nil
+    ) {
+        self.serverKey = config.key
+        self.config = config
+        self.startupTimeout = config.startupTimeoutSec
+        self.toolTimeout = config.toolTimeoutSec
+        self.onToolsChanged = onToolsChanged
+        self.transport = transport
+        self.incoming = transport.messages
+    }
+
+    public var stderrTail: String { transport.stderrTail }
+    public var closureReason: String? { transport.closureReason }
+    public var isConnectionClosed: Bool { isClosed }
+
+    // MARK: Lifecycle
+
+    public func start() async throws {
+        guard !didStart else { return }
+        guard !isClosed else {
+            throw MCPClientError.connectionClosed(MCPStdioTransport.describeClosure(reason: transport.closureReason, tail: transport.stderrTail))
+        }
+
+        let stream = incoming
+        readTask = Task.detached(priority: .userInitiated) { [weak self] in
+            for await frame in stream {
+                guard let self else { return }
+                await self.handle(frame)
+            }
+            await self?.handleStreamEnded()
+        }
+
+        try await transport.start()
+
+        let params: [String: Any] = [
+            "protocolVersion": MCPWire.protocolVersion,
+            "capabilities": [String: Any](),
+            "clientInfo": [
+                "name": "DynaMoE",
+                "version": MCPWire.clientVersion
+            ]
+        ]
+        let result = try await request("initialize", params: params, timeout: startupTimeout)
+
+        let protocolVersion = result["protocolVersion"]?.stringValue ?? ""
+        if !protocolVersion.isEmpty {
+            negotiatedProtocolVersion = protocolVersion
+            if !MCPWire.supportedProtocolVersions.contains(protocolVersion) {
+                DiagLog.warning("mcp", "server=\(serverKey) negotiated unknown protocol \(protocolVersion); continuing")
+            }
+        }
+        if case .object(let info)? = result["serverInfo"] {
+            serverName = info["name"]?.stringValue
+            serverVersion = info["version"]?.stringValue
+        }
+        serverInstructions = result["instructions"]?.stringValue
+
+        try await sendNotification("notifications/initialized", params: nil)
+        didStart = true
+
+        DiagLog.info(
+            "mcp",
+            "server=\(serverKey) initialized protocol=\(negotiatedProtocolVersion ?? "?") name=\(serverName ?? "?") version=\(serverVersion ?? "?")"
+        )
+    }
+
+    public func stop() async {
+        guard !isClosed else {
+            transport.close()
+            return
+        }
+        isClosed = true
+        transport.close()
+        readTask?.cancel()
+        readTask = nil
+        failAll(MCPClientError.connectionClosed("The MCP session was stopped."))
+    }
+
+    /// Closes the transport without awaiting actor isolation. Used on app
+    /// termination, where a detached task would not be guaranteed to run before
+    /// the process exits and the server would be orphaned. `transport` is an
+    /// immutable `Sendable` reference, so this is safe from any thread.
+    public nonisolated func forceCloseTransport() {
+        transport.close()
+    }
+
+    // MARK: Requests
+
+    public func listTools() async throws -> [MCPToolDescriptor] {
+        var descriptors: [MCPToolDescriptor] = []
+        var cursor: String?
+        var page = 0
+
+        repeat {
+            var params: [String: Any]?
+            if let cursor, !cursor.isEmpty {
+                params = ["cursor": cursor]
+            }
+            let result = try await request("tools/list", params: params, timeout: toolTimeout)
+
+            if let tools = result["tools"]?.arrayValue {
+                for tool in tools {
+                    if let descriptor = MCPToolDescriptor(json: tool) {
+                        descriptors.append(descriptor)
+                    }
+                }
+            }
+            cursor = result["nextCursor"]?.stringValue
+            page += 1
+            if descriptors.count >= MCPConfigValidator.maxToolsPerServer { break }
+        } while (cursor?.isEmpty == false) && page < 32
+
+        return descriptors
+    }
+
+    public func callTool(name: String, arguments: [String: Any]) async throws -> MCPCallResult {
+        let params: [String: Any] = [
+            "name": name,
+            "arguments": arguments
+        ]
+        let result = try await request("tools/call", params: params, timeout: toolTimeout)
+        return MCPCallResult(json: result)
+    }
+
+    /** Sends `notifications/cancelled` for a request that was abandoned. */
+    public func notifyCancelled(requestID: Int, reason: String = "cancelled by client") {
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            let payload = try? MCPWire.notification(
+                method: "notifications/cancelled",
+                params: MCPWire.cancelledParams(requestId: requestID, reason: reason)
+            )
+            if let payload {
+                try? await self.transport.send(payload)
+            }
+        }
+    }
+
+    private func sendNotification(_ method: String, params: [String: Any]?) async throws {
+        let payload = try MCPWire.notification(method: method, params: params)
+        try await transport.send(payload)
+    }
+
+    private func request(_ method: String, params: [String: Any]?, timeout: Double) async throws -> [String: MCPJSONValue] {
+        guard !isClosed else {
+            throw MCPClientError.connectionClosed(MCPStdioTransport.describeClosure(reason: transport.closureReason, tail: transport.stderrTail))
+        }
+
+        let id = nextRequestID
+        nextRequestID += 1
+        let payload = try MCPWire.request(id: id, method: method, params: params)
+
+        let envelope = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<MCPResponseEnvelope, any Error>) in
+                self.pending[id] = continuation
+
+                Task.detached(priority: .userInitiated) { [weak self] in
+                    guard let self else { return }
+                    do {
+                        try await self.transport.send(payload)
+                    } catch {
+                        await self.failPending(id: id, error: error)
+                    }
+                }
+
+                // Late deadlines are harmless: `failPending` is a no-op once the
+                // continuation has been consumed.
+                Task.detached(priority: .utility) { [weak self] in
+                    let nanoseconds = UInt64(max(timeout, 0.1) * 1_000_000_000)
+                    try? await Task.sleep(nanoseconds: nanoseconds)
+                    await self?.failPending(
+                        id: id,
+                        error: MCPClientError.timeout(method: method, seconds: timeout)
+                    )
+                }
+            }
+        } onCancel: {
+            Task.detached(priority: .utility) { [weak self] in
+                await self?.failPending(id: id, error: CancellationError())
+            }
+        }
+
+        if let code = envelope.errorCode {
+            throw MCPClientError.remote(code: code, message: envelope.errorMessage ?? "no message")
+        }
+        return envelope.result ?? [:]
+    }
+
+    private func failPending(id: Int, error: any Error) {
+        guard let continuation = pending.removeValue(forKey: id) else { return }
+        continuation.resume(throwing: error)
+    }
+
+    private func failAll(_ error: any Error) {
+        let continuations = pending
+        pending.removeAll()
+        for (_, continuation) in continuations {
+            continuation.resume(throwing: error)
+        }
+    }
+
+    // MARK: Inbound
+
+    private func handle(_ data: Data) async {
+        guard let message = MCPIncomingMessage(data: data) else {
+            DiagLog.warning("mcp", "server=\(serverKey) dropped a non-JSON-RPC frame")
+            return
+        }
+
+        if let method = message.method {
+            if let id = message.id {
+                // Server-initiated request. Only `ping` is meaningful to a
+                // client with no roots/sampling support; answer it, and tell
+                // the server plainly that everything else is unsupported.
+                let reply: Data?
+                if method == "ping" {
+                    reply = try? MCPWire.successResponse(id: id, result: [:])
+                } else {
+                    reply = try? MCPWire.errorResponse(id: id, code: -32601, message: "Method '\(method)' is not supported by this client.")
+                }
+                if let reply {
+                    try? await transport.send(reply)
+                }
+            } else if method == "notifications/tools/list_changed" {
+                onToolsChanged?()
+            }
+            return
+        }
+
+        guard let id = message.id,
+              let continuation = pending.removeValue(forKey: id) else { return }
+        continuation.resume(returning: MCPResponseEnvelope(
+            result: message.result,
+            errorCode: message.errorCode,
+            errorMessage: message.errorMessage
+        ))
+    }
+
+    private func handleStreamEnded() {
+        guard !isClosed else { return }
+        isClosed = true
+        let detail = MCPStdioTransport.describeClosure(reason: transport.closureReason, tail: transport.stderrTail)
+        DiagLog.info("mcp", "server=\(serverKey) connection ended: \(detail.isEmpty ? "no detail" : detail)")
+        failAll(MCPClientError.connectionClosed(detail))
+    }
+}

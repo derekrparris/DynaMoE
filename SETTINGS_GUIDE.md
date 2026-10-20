@@ -31,6 +31,7 @@ A comprehensive, practical guide to configuring, tuning, and operating DynaMoE o
    - [Safety Limits (Max Output & Max Steps)](#safety-limits)
    - [Search Integrations (Headless Chrome & Brave Search)](#search-integrations)
    - [Built-In Local Tools Reference](#built-in-local-tools-reference)
+   - [Model Context Protocol (MCP) Servers](#model-context-protocol-mcp-servers)
 7. [Local Inference Server](#7-local-inference-server)
    - [Enabling the Server](#enabling-the-server)
    - [Live Status](#live-status)
@@ -368,6 +369,79 @@ DynaMoE equips models with the following native tools:
 9. `lint_diagnostics(file_path)`: Native compiler error detection and self-healing diagnostics.
 10. `web_search(query)`: Live web search via local Headless Chrome browser automation (with Brave fallback).
 11. `web_fetch(url)`: Fetches web pages with client-side JavaScript execution via Headless Chrome DOM dumping and markdown extraction.
+
+### Model Context Protocol (MCP) Servers
+MCP lets DynaMoE use tools that ship as separate programs or remote services instead of compiled-in Swift. Servers are declared in one JSON file; the **MCP Servers** card in this section shows their live status and lets you add, edit, enable, restart, and remove them.
+
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│  MCP Servers                                                           │
+│  Enable MCP Servers: [ON]                                              │
+│  ~/Library/Application Support/DynaMoE/mcp.json                        │
+│  [Open Config File] [Reveal] [Reload] [Edit as JSON]                   │
+│                                                                        │
+│  Configured Servers (2)                                                │
+│  ● filesystem   [Ready · 11]        stdio   [ON]                       │
+│      npx -y @modelcontextprotocol/server-filesystem ${workspace}       │
+│      ▸ 11 tools discovered                                             │
+│  ● linear       [Failed]            http    [ON]                       │
+│      https://mcp.linear.app/mcp                                        │
+│      HTTP 401: unauthorized                                            │
+│  [+ Add Server…]  [Restart All]                                        │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Configuration File
+
+The file at `~/Library/Application Support/DynaMoE/mcp.json` is the single source of truth. Editing it by hand is fully supported: a watcher picks up the change and reconciles live connections (an edit that lands mid-generation waits for the turn to end, so a running tool call is never killed).
+
+```json
+{
+  "version": 1,
+  "mcpServers": {
+    "filesystem": {
+      "enabled": true,
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "${workspace}"],
+      "env": { "LOG_LEVEL": "warn" },
+      "cwd": "${workspace}",
+      "startupTimeoutSec": 30,
+      "toolTimeoutSec": 120
+    },
+    "linear": {
+      "enabled": true,
+      "url": "https://mcp.linear.app/mcp",
+      "headers": { "Authorization": "${keychain:dynamoe.mcp.linear.Authorization}" }
+    }
+  }
+}
+```
+
+- **Transport is inferred**: a `command` means **stdio** (DynaMoE launches the program as a child process and speaks JSON-RPC over its stdin/stdout); a `url` means **Streamable HTTP**. Declare exactly one of the two.
+- **`enabled`** defaults to `true` when omitted, so a config pasted from another client works as-is.
+- **Server names** may contain letters, digits, `-` and `_`. They may not contain `__`, because tool names are built as `mcp__<server>__<tool>`.
+- **Secrets**: any env value or header may be a `${keychain:...}` token instead of plaintext. The Settings form has a per-field **Keychain** checkbox that stores the value in the login Keychain and writes only the token to disk.
+- **Other tokens**: `${env:NAME}` reads an environment variable; `${workspace}` is the agent working directory. Tokens are expanded when a server connects and are never written back.
+
+#### Tool Discovery & Loading
+
+Discovered tools are added to the tool catalog as `mcp__<server>__<tool>` but are **not loaded into the prompt**. This is deliberate: loaded schemas cost prefill tokens on every turn, and DynaMoE's agent keeps only a small core set loaded. The model calls `tools_discover` (filter by category `mcp`), then `tools_load` with the tools a task needs.
+
+Each server's row has a disclosure listing its tools with a **Load** button, which does the same thing without spending a model turn.
+
+#### Safety Model
+
+- **Every MCP tool call requires confirmation**, even for tools a server marks read-only, unless **Turbo Mode** is on. A remote server can do anything, including writing files and spending money, and its annotations are claims rather than guarantees.
+- **MCP servers are unsandboxed local programs or network endpoints.** They run with the same privileges as `shell_run`. Only add servers you trust.
+- Removing a server from Settings stops it and deletes its Keychain entries. Editing it out of the JSON by hand stops it but leaves the secrets, so a transient edit cannot lose a credential.
+- Failures are terminal: a server that cannot start stays `Failed` with its error (and the tail of its stderr) shown until you press **Restart** or change its config. Nothing retries in a loop.
+
+#### Troubleshooting
+
+- **`Failed` with `env: npx: No such file or directory`**: the command is not on the app's PATH. DynaMoE injects `/opt/homebrew/bin`, `/usr/local/bin`, `~/.cargo/bin` and `~/.local/bin`, so installing via Homebrew is usually enough. Otherwise use an absolute path.
+- **First start is slow**: `npx -y` downloads the package on first use. Raise `startupTimeoutSec` if the default 30 s is not enough.
+- **`HTTP 404` after it worked before**: the HTTP session expired. Press **Restart**.
+- **Tools exist but the model never calls them**: MCP tools are lazily loaded by design. Ask the model to discover tools, or press **Load** on the tool in this card.
 
 ---
 
