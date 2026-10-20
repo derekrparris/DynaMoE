@@ -51,9 +51,7 @@ On macOS 26 or later with Apple Intelligence enabled, Apple's built-in **on-devi
 
 ---
 
-<img width="2048" height="2048" alt="DynaMoE_T_H" src="https://github.com/user-attachments/assets/7b31de51-4a73-426f-83f3-24cd421784ec" />
-
-
+<img width="2048" height="2048" alt="D-T-H" src="https://github.com/user-attachments/assets/b7c1be50-608e-4c6d-a9eb-dcc7c42553a2" />
 
 ---
 
