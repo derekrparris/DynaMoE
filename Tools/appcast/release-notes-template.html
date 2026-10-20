@@ -287,7 +287,7 @@
   <div>
     <h1>DynaMoE</h1>
     <div class="meta-line">
-      <span class="ver-chip">v26.5</span>            <!-- EDIT: version -->
+      <span class="ver-chip">v26.6</span>            <!-- EDIT: version -->
     </div>
     <div class="tagline">High-Performance MoE Inference Engine for Apple Silicon</div>
   </div>
@@ -297,16 +297,18 @@
 <section>
   <h2>
     <span class="icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.5 14 5v6l-6 3.5L2 11V5l6-3.5Zm0 1.73L3.5 5.87v4.26L8 12.77l4.5-2.64V5.87L8 3.23Zm0 1.6 3.2 1.88v2.58L8 11.17 4.8 9.29V6.71L8 4.83Z"/></svg></span>
-    What's New in 26.5
+    What's New in 26.6
   </h2>
   <div class="card">
-    <h3>Conversation renaming:</h3> Rename any conversation inline from the sidebar or the active chat header. Titles you set are never overwritten by auto-generated ones, truncated auto-titles are marked with an ellipsis, and both survive /compact and relaunches.
+    <h3>Local inference server:</h3> The loaded model is now served on <code>127.0.0.1</code> through both OpenAI-compatible (<code>/v1/chat/completions</code>) and Anthropic-compatible (<code>/v1/messages</code>) APIs, so local coding agents and other tools can use DynaMoE with no external service involved. A new Server settings tab manages live status, port, API key, and a copyable endpoint; turns queue behind the engine with SSE streaming, heartbeats while queued, and protocol-correct errors; and stopping or restarting the server never interrupts an in-app response.
   </br></br>
-    <h3>Session token odometer:</h3> The chat header now tracks a live, cumulative token count for the whole conversation: prompt tokens plus everything the model generates, ticking during decoding, persisted with each chat, and reset by /compact. Conversations from before this feature pick the counter up automatically on their next full prompt.
-  </br></br>  
-    <h3>Inline agent activity:</h3> A pulsing "Working..." indicator now appears in the message stream while the model streams a tool call's arguments or the agent executes it, across all three supported tool-calling dialects, so long tool turns read as live work instead of a frozen transcript.
+    <h3>Multi-turn prefix reuse:</h3> Follow-up API requests extend the previous turn's pinned KV prefix instead of re-prefilling the whole conversation. The server remembers each completed turn, reasoning included, and splices it back in only when the client's history matches the conversation that produced it; the prompt's date is pinned per session so the cached prefix stays valid; and reasoning round-trips for clients: Anthropic thinking blocks are signed so SDKs keep them, and the new "Reasoning in Content" setting folds reasoning into content for OpenAI-compatible clients that ignore the reasoning field. Agent loops that re-prefilled the entire prompt at every step now prefill seconds' worth of tokens.
   </br></br>
-    <h3>Chrome polish:</h3> A single centered app name in the window title bar replaces the duplicated sidebar branding, and the redundant header breadcrumb, sidebar toggle, and thumbs up/down feedback buttons are gone.
+    <h3>Client-defined tools:</h3> API requests that carry their own tool schemas now work: each turn teaches the engine the client's tool vocabulary and restores the previous registry afterwards, tool calls keep their ids and JSON nulls through the round trip, and forced tool choices the engine cannot enforce are rejected with a clear 400 instead of silently degrading.
+  </br></br>
+    <h3>Request log:</h3> Every API request and every in-app chat, agent, and Apple Foundation Model turn now leaves a trace: metadata-only lines in Console.app plus a persisted request log browsable from the Server tab, with search, error filtering, a detail inspector, JSONL export, and a queue-wait vs. generation-time split. Bodies are opt-in behind the "Store Request Content" toggle, rows read as withheld when it is off, credentials are never logged, and the log prunes itself to 30 days / 20,000 rows.
+  </br></br>
+    <h3>Persistent memory settings:</h3> The in-app memory mode and budget now persist across relaunches, and server turns honor them, so picking Unrestricted with an FP8 KV cache actually raises the server's KV capacity instead of being silently ignored.
   </div>
 </section>
 
@@ -317,17 +319,17 @@
     Fixes
   </h2>
   <ul class="changes">
-    <li><strong>Chat actions:</strong> Copy and speaker buttons no longer appear on thinking-only or tool-call-only turns; read-aloud is restricted to assistant replies and speaks only the visible text, never hidden tool markup</li>
-    <li><strong>Tool-stream rendering:</strong> Raw Qwen and Llama tool-call markup no longer leaks into the transcript mid-stream or reappears after a call parses, and tool-only turns keep their time-to-first-token, throughput, and token stats</li>
-    <li><strong>Title persistence:</strong> A conversation renamed before the startup history load finishes is no longer reverted to its previous title</li>
-    <li><strong>Token counting:</strong> Stopped, cancelled, and failed turns now commit their final token counts so the odometer never loses the tail; empty on-device responses no longer add a phantom token</li>
-    <li><strong>Keyboard focus:</strong> No stray focus ring lights up a header button at launch, the rename button no longer steals focus on first open, and Full Keyboard Access users keep their focus indicators with no hidden tab stop</li>
-    <li><strong>Model guidance:</strong> The 16 GB settings profile now recommends native Ornith weights, agreeing with the README's preference for native weights over MLX quantizations</li>
+    <li><strong>Memory accounting:</strong> Duplicated backbone buffers are no longer allocated once per model load (three resident copies were together holding 15.25 GB on a 16 GB Mac), the user-facing memory figure reports what the process actually holds (footprint plus cached weight pages) instead of resident pages that collapsed under swap pressure, and KV provisioning is clamped to the machine's RAM budget</li>
+    <li><strong>OpenAI tool calls:</strong> Responses and stream deltas now encode tool calls under the wire format's <code>tool_calls</code> key; the previous camelCase key made them invisible to every OpenAI client, and client-defined tools were taught a call shape the engine's parser only recognized for built-in tool names</li>
+    <li><strong>SSE streaming:</strong> Anthropic stream frames keep their <code>data:</code> prefix (standard parsers silently discarded the payloads), streaming deltas withhold suffixes that could still grow into a configured stop sequence, and a repaired snapshot is never re-sent where a client cannot replace it</li>
+    <li><strong>Oversized prompts:</strong> A prompt that cannot fit the machine's KV cache allocation is rejected (or its <code>max_tokens</code> ratcheted) in milliseconds instead of overrunning the cache and grinding for the better part of an hour; SSE heartbeats now run for the full turn instead of going silent during prefill, and Metal allocation failures now print where they happened</li>
+    <li><strong>Queue and lifecycle correctness:</strong> A queue-wait timeout fires at its deadline even when an earlier turn is stalled, cancelling a request cancels its queued work instead of launching against an abandoned connection, the server toggle and Restart reconcile to the persisted setting once a shutdown drains, and Restart applies a freshly typed port</li>
+    <li><strong>Under the hood:</strong> Rust dependencies upgraded (uniffi 0.28 to 0.32, safetensors 0.4 to 0.8, tokenizers 0.20 to 0.23) and Sparkle 2.9.6 to 2.10.0, the regenerated Swift bindings gain Sendable conformances, and a bindgen change that could hang every Xcode 27 build is fixed</li>
   </ul>
 </section>
 
 <footer>
-  <a class="btn" href="https://github.com/derekrparris/DynaMoE/releases/tag/v26.5">   <!-- EDIT: release URL -->
+  <a class="btn" href="https://github.com/derekrparris/DynaMoE/releases/tag/v26.6">   <!-- EDIT: release URL -->
     <svg viewBox="0 0 16 16" fill="currentColor"><path d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l1.66-1.66a2 2 0 0 0 0-2.83l-.94-.94a2 2 0 0 0-2.83 0L3.51 6.01a2 2 0 0 0 0 2.83l.94.94a.75.75 0 0 0 1.06-1.06l-.94-.94a.5.5 0 0 1 0-.71l2.35-2.35a.5.5 0 0 1 .71 0l.94.94a.5.5 0 0 1 0 .71L6.22 8.72Zm3.56-1.44a.75.75 0 0 0-1.06-1.06L7.06 7.88a2 2 0 0 0 0 2.83l.94.94a2 2 0 0 0 2.83 0l2.35-2.35a2 2 0 0 0 0-2.83l-.94-.94a.75.75 0 0 0-1.06 1.06l.94.94a.5.5 0 0 1 0 .71L9.77 9.59a.5.5 0 0 1-.71 0l-.94-.94a.5.5 0 0 1 0-.71l1.66-1.66Z"/></svg>
     GitHub Release
   </a>
