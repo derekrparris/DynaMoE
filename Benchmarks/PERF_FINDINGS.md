@@ -3406,3 +3406,99 @@ repeat-ask and an ask -> recordTurn -> ask cycle, fresh mint for a different
 session, invalidation reset, disabled-pinning freshness). All pure-logic
 suites re-run green (32 tests: PrefixAsOfDate 5, MemorySettings 3,
 ServerQueue 5, TurnFit 9, KVCacheProvisioning 10).
+
+---
+
+### QA #55 — the fit check priced a sliding-ring turn as all-linear and turned the agent floor into a veto, so tools-on turns died in-app
+
+Field report: the in-app chat on Gemma 4 26B (16 GB M1 Pro, FP8 KV) refused a
+plain prompt the moment tools were on, in ~0.01 s:
+
+`⚠️ Prompt too long: 3065 prompt tokens exceed the 2184-token KV capacity this
+turn can provision (KV budget 0.25 GB on a 16 GB machine; shorten the prompt,
+lower max_tokens, or raise the memory budget).`
+
+3,065 tokens did not exceed 2,184 because the prompt was long — the message was
+the wrong explanation for the right refusal. The same model had run a
+multi-step CSV analysis on the same machine before QA #52/#53 shipped.
+
+**Two defects in the QA #53 law, plus two ordering defects that fed it.**
+
+1. **The gate charged a uniform linear layout.** `turnFit` was called before
+   the Gemma sliding-ring derivation, with `slidingSlotFlags: nil,
+   slidingRingLen: 0`, so all 30 slots were priced as linear: 30 x 4,096 B =
+   122,880 B/row, and a 0.25 GB budget "afforded" 2,184 rows. The allocator
+   (`KVCacheManager.reset`, which does get the flags) holds 25 sliding slots at
+   `window + 512` rows = 1,536 regardless of sequence length and 5 global slots
+   at the sequence length: `(268,435,456 - 25*1,536*4,096) / (5*4,096)` =
+   **5,427 rows**. The gate demanded 2.5x the memory the allocation pays, and
+   the 3,065-token agent prompt was refused against a capacity that did not
+   exist. (The 2,184 in the message is the exact arithmetic of 0.25 GB over 30
+   uniform slots — that number identified the code path from the field report.)
+2. **The agent floor was a veto, not a preference.** `affordable (2,184) <
+   minSeq (8,192)` returned `.promptTooLong` before the prompt was compared to
+   the provision, so *every* tools-bearing turn on an under-floor machine was
+   rejected — a 200-token prompt included. Tools-off took the 2,048-row chat
+   floor, passed, and that is the entire tools-on/tools-off asymmetry the
+   report described.
+3. `turnFit` was passed the raw `dynamoe_memory_budget_mode` while the launch
+   clamp used the resolved mode (`.unrestricted` on Auto/Full RAM), so the gate
+   could be stricter than the allocator on a roomy machine.
+4. The Ling/Gemma fp8 -> fp16 precision overrides ran *after* the gate, so the
+   gate priced the requested precision and the allocation paid the fallback.
+
+Fix (CompletionEngine.swift, EngineRuntime.swift, ServerController.swift):
+
+- The ring layout (window, slack, per-slot flags, ring length) is derived
+  before the fit check and passed into `turnFit`, so the estimate and the
+  allocation price the same rows. The ring-intact prefix validation stays where
+  it was (it needs `prefixTokensReused`).
+- `KVCacheProvisioning.sessionFloor(isAgentSession:configured:)` resolves the
+  reserve (8,192 agent / 2,048 chat, overridable through
+  `dynamoe_agent_session_floor`), and `affordableFloor` caps it to
+  `affordableSeqLen`. A turn is refused only when the prompt itself (plus the
+  64-row slack) does not fit the provision; the budget is still never exceeded,
+  which is QA #53's actual invariant.
+- The launch-side re-gate now defends only the pinned prefix (the one hard
+  floor the relayout cannot drop) plus the same prompt guard, and both gates
+  share one message that reports budget, model footprint, precision and the
+  affordable rows instead of claiming the prompt is longer than the cache.
+- The gate uses the resolved budget mode and runs *after* the precision
+  overrides, so both sides of the launch see one budget and one precision.
+- The server maps this rejection onto `400` with
+  `"code": "context_length_exceeded"` (new `ServerAPIError.code`, previously a
+  hard-coded nil) so clients can classify it instead of pattern-matching prose.
+
+**Numbers on the field machine** (16 GB, Gemma 4 26B, FP8 KV, 0.25 GB budget,
+3,065-token in-app agent prompt): before the fix, rejected with
+`.promptTooLong(2,184)`; after it, provisioned at 5,427 rows and generation
+ratcheted to 1,850 tokens. Tools-off is unchanged (2,048-row chat floor). The
+honest ceiling on this box is ~5.4k rows: the model's `size_gb` (26 GB) exceeds
+physical RAM in every budget mode, so `budgetGB` sits at its 0.25 GB floor.
+Budgeting the *resident* streaming footprint instead of the on-disk size is the
+follow-up that would restore ~8k contexts, and it changes eviction pressure
+globally, so it is deliberately not part of this fix.
+
+Tests: `TurnFitLogicTests` reworked to the derived-floor law, plus
+`testAgentFloorIsCappedByTheBudgetForShortPrompts`,
+`testSessionFloorOverrideReplacesOnlyTheAgentReserve`, and the field pair
+`testUniformGeometryOverpricesGemmaSlidingRingTurn` (2,184 rows, rejected) /
+`testRingAwareGeometryServesTheFieldPrompt` (5,427 rows, 1,850-token cap);
+`KVCacheProvisioningLogicTests.testAffordableSeqLenPricesSlidingRingsAsFixedRows`
+pins ring vs uniform affordability and the ring byte layout.
+
+Review follow-ups (same change): the rejection text moved out of `launchTurn`
+into `KVCacheProvisioning.capacityMessage`, because a nested builder could not
+be tested and the server test could only assert against a literal it wrote
+itself. The message now names a reserve the budget capped ("agent sessions
+reserve 8192 rows, capped by the budget to 910") instead of implying the
+requested reserve is what was provisioned, and renders `Int.max` affordability
+(all-ring layouts) as "unbounded" rather than a 19-digit row count.
+`sessionFloor` also clamps `dynamoe_agent_session_floor` to the 32,768-row
+`maxProvisionedRows` ceiling, so the override can lower or raise the reserve
+inside the range the sequence cap allows but can no longer request a provision
+larger than any other path on the machine. New coverage:
+`testCapacityMessageBlamesTheBindNotThePromptLength`,
+`testCapacityMessageNamesACappedReserve`,
+`testCapacityMessageRendersUnboundedCapacityAndChatRemedy`, and the server test
+now builds its message through the real builder.

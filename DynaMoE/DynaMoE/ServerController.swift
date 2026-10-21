@@ -584,29 +584,40 @@ struct ServerAPIError: Error, HTTPResponseError, LocalizedError, Sendable {
     /// that reflect such values carry a log-safe variant here; every other
     /// error is its own log-safe message.
     let logSafeMessage: String?
+    /// Protocol-level error code (OpenAI's `error.code`). A client can classify
+    /// a rejection from this instead of pattern-matching prose; nil keeps the
+    /// previous envelope shape. The Anthropic envelope has no code field.
+    let code: String?
     /// What the request log and the unified log record for this error.
     var recordableMessage: String { logSafeMessage ?? message }
 
     var errorDescription: String? { message }
 
     static func badRequest(_ message: String, logSafeMessage: String? = nil) -> ServerAPIError {
-        ServerAPIError(status: .badRequest, wireType: .invalidRequest, message: message, logSafeMessage: logSafeMessage)
+        ServerAPIError(status: .badRequest, wireType: .invalidRequest, message: message, logSafeMessage: logSafeMessage, code: nil)
+    }
+
+    /// The turn could not be served at the context size it asked for: the KV
+    /// cache this machine can provision has no room for the prompt (or for the
+    /// prompt plus usable generation). OpenAI clients recognize this code.
+    static func contextLengthExceeded(_ message: String) -> ServerAPIError {
+        ServerAPIError(status: .badRequest, wireType: .invalidRequest, message: message, logSafeMessage: nil, code: "context_length_exceeded")
     }
 
     static func unauthorized(_ message: String) -> ServerAPIError {
-        ServerAPIError(status: .unauthorized, wireType: .authentication, message: message, logSafeMessage: nil)
+        ServerAPIError(status: .unauthorized, wireType: .authentication, message: message, logSafeMessage: nil, code: nil)
     }
 
     static func requestTimeout(_ message: String) -> ServerAPIError {
-        ServerAPIError(status: .requestTimeout, wireType: .requestTimeout, message: message, logSafeMessage: nil)
+        ServerAPIError(status: .requestTimeout, wireType: .requestTimeout, message: message, logSafeMessage: nil, code: nil)
     }
 
     static func serviceUnavailable(_ message: String) -> ServerAPIError {
-        ServerAPIError(status: .serviceUnavailable, wireType: .overloaded, message: message, logSafeMessage: nil)
+        ServerAPIError(status: .serviceUnavailable, wireType: .overloaded, message: message, logSafeMessage: nil, code: nil)
     }
 
     static func internalError(_ message: String) -> ServerAPIError {
-        ServerAPIError(status: .internalServerError, wireType: .api, message: message, logSafeMessage: nil)
+        ServerAPIError(status: .internalServerError, wireType: .api, message: message, logSafeMessage: nil, code: nil)
     }
 
     func response(from request: Request, context: some RequestContext) throws -> Response {
@@ -619,7 +630,7 @@ struct ServerAPIError: Error, HTTPResponseError, LocalizedError, Sendable {
             )
         } else {
             response = try context.responseEncoder.encode(
-                OpenAIErrorEnvelope(error: .init(message: message, type: wireType.rawValue, code: nil)),
+                OpenAIErrorEnvelope(error: .init(message: message, type: wireType.rawValue, code: code)),
                 from: request,
                 context: context
             )
@@ -942,10 +953,15 @@ final class ServerController: ObservableObject {
     /// Maps synchronous launch failures onto the protocol-correct error:
     /// request-shape problems (prompt too long for this machine's KV budget)
     /// are 4xx, engine state problems are 503.
-    nonisolated private static func wireLaunchError(_ error: Error) -> ServerAPIError {
+    nonisolated static func wireLaunchError(_ error: Error) -> ServerAPIError {
         if let apiError = error as? ServerAPIError { return apiError }
         if let launchError = error as? CompletionLaunchError {
             let message = launchError.errorDescription ?? error.localizedDescription
+            // A KV-capacity rejection is a context-length error, not a generic
+            // bad request: clients (Crush, opencode, Continue) act on the code.
+            if case .promptTooLong = launchError {
+                return ServerAPIError.contextLengthExceeded(message)
+            }
             return launchError.isClientError ? ServerAPIError.badRequest(message) : ServerAPIError.serviceUnavailable(message)
         }
         return ServerAPIError.internalError(error.localizedDescription)
@@ -1589,7 +1605,7 @@ final class ServerController: ObservableObject {
                     // The row records the log-safe rendering; the wire envelope
                     // below keeps echoing the client's values back to the client.
                     logErrorMessage = apiError.recordableMessage
-                    let envelope = OpenAIErrorEnvelope(error: .init(message: apiError.message, type: apiError.wireType.rawValue, code: nil))
+                    let envelope = OpenAIErrorEnvelope(error: .init(message: apiError.message, type: apiError.wireType.rawValue, code: apiError.code))
                     if let data = try? encoder.encode(envelope) {
                         try await sse(ByteBuffer(data: data))
                     }
