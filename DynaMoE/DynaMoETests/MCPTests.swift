@@ -2032,4 +2032,89 @@ final class MCPManagerAttemptOwnershipTests: XCTestCase {
         try await waitUntil("the restart to start a third attempt") { transports.count == 3 }
         XCTAssertTrue(transports[1].isClosed, "restart did not stop the live replacement")
     }
+
+    func testToolListRefreshUpdatesTheLiveConnection() async throws {
+        let manager = MCPManager.shared
+        let server = MutableToolMockServer(tools: [["name": "echo", "inputSchema": ["type": "object"]]])
+        manager.transportFactory = { _ in server.transport }
+
+        await manager.installDocumentForTesting(document(command: "first"))
+        try await waitUntil("the connection") { manager.servers.first?.status == .ready }
+        XCTAssertEqual(manager.servers.first?.remoteToolNames, ["echo"])
+
+        server.tools = [["name": "echo2", "inputSchema": ["type": "object"]]]
+        server.announceToolListChanged()
+
+        try await waitUntil("the refreshed tool list") { manager.servers.first?.remoteToolNames == ["echo2"] }
+        XCTAssertNotNil(AgentHarness.shared.tools["mcp__race__echo2"])
+        XCTAssertNil(AgentHarness.shared.tools["mcp__race__echo"])
+    }
+
+    func testToolListRefreshFromAReplacedClientIsDiscarded() async throws {
+        let manager = MCPManager.shared
+        let server = MutableToolMockServer(tools: [["name": "echo2", "inputSchema": ["type": "object"]]])
+        manager.transportFactory = { _ in server.transport }
+
+        await manager.installDocumentForTesting(document(command: "first"))
+        try await waitUntil("the connection") { manager.servers.first?.status == .ready }
+
+        // The client a restart already closed: it still answers `tools/list`,
+        // but it no longer owns the server's connection.
+        let replaced = MCPClient(config: resolvedServer(key: "race"), transport: MockMCPTransport())
+        let applied = manager.applyToolRefresh(
+            [makeDescriptor(name: "stale")],
+            from: replaced,
+            serverKey: "race"
+        )
+
+        XCTAssertFalse(applied, "a replaced client must not publish a tool list")
+        XCTAssertEqual(manager.servers.first?.remoteToolNames, ["echo2"])
+        XCTAssertNotNil(AgentHarness.shared.tools["mcp__race__echo2"])
+        XCTAssertNil(AgentHarness.shared.tools["mcp__race__stale"])
+    }
+}
+
+/// A mock MCP server whose tool list changes between refreshes.
+private final class MutableToolMockServer: @unchecked Sendable {
+    let transport = MockMCPTransport()
+    private let lock = NSLock()
+    private var currentTools: [[String: Any]]
+    private let serverName: String
+
+    init(tools: [[String: Any]], serverName: String = "mutable-server") {
+        self.currentTools = tools
+        self.serverName = serverName
+        transport.responder = { [weak self] request, transport in
+            guard let id = request["id"] else { return }
+            switch request["method"] as? String {
+            case "initialize":
+                transport.reply(id: id, result: [
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": ["tools": [:]],
+                    "serverInfo": ["name": self?.serverName ?? "mutable-server", "version": "1"]
+                ])
+            case "tools/list":
+                transport.reply(id: id, result: ["tools": self?.tools ?? []])
+            default:
+                transport.replyError(id: id, code: -32601, message: "unsupported")
+            }
+        }
+    }
+
+    var tools: [[String: Any]] {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return currentTools
+        }
+        set {
+            lock.lock()
+            currentTools = newValue
+            lock.unlock()
+        }
+    }
+
+    func announceToolListChanged() {
+        transport.pushNotification(method: "notifications/tools/list_changed")
+    }
 }

@@ -584,31 +584,48 @@ public final class MCPManager: ObservableObject {
         guard let connection = connections[serverKey] else { return }
         Task { [weak self] in
             guard let self else { return }
+            let descriptors: [MCPToolDescriptor]
             do {
-                let descriptors = try await connection.client.listTools()
-                guard self.connections[serverKey] != nil else { return }
-                let visible = Array(descriptors.prefix(MCPConfigValidator.maxToolsPerServer))
-                let bridges = visible.map {
-                    MCPToolBridge(serverKey: serverKey, descriptor: $0, client: connection.client)
-                }
-                AgentHarness.shared.unregisterTools(prefix: Self.toolPrefix(for: serverKey))
-                AgentHarness.shared.registerTools(bridges)
-                self.connections[serverKey] = MCPConnection(
-                    client: connection.client,
-                    config: connection.config,
-                    bridges: bridges
-                )
-                var state = self.runtime[serverKey] ?? ServerRuntime(status: .ready)
-                state.status = .ready
-                state.qualifiedToolNames = bridges.map { $0.definition.function.name }
-                state.remoteToolNames = visible.map(\.name)
-                self.runtime[serverKey] = state
-                self.publishStates()
-                DiagLog.info("mcp", "server=\(serverKey) tool list refreshed: \(bridges.count) tools")
+                descriptors = try await connection.client.listTools()
             } catch {
                 DiagLog.warning("mcp", "server=\(serverKey) tool refresh failed: \(error.localizedDescription)")
+                return
             }
+            self.applyToolRefresh(descriptors, from: connection.client, serverKey: serverKey)
         }
+    }
+
+    /// Publishes a refreshed tool list only while `client` is still the live
+    /// connection. A restart or config edit can install a replacement while the
+    /// refresh is awaiting `tools/list`; bridges built on the old client would
+    /// then overwrite the replacement with tools backed by a closed transport.
+    @discardableResult
+    func applyToolRefresh(
+        _ descriptors: [MCPToolDescriptor],
+        from client: MCPClient,
+        serverKey: String
+    ) -> Bool {
+        guard let connection = connections[serverKey], connection.client === client else {
+            DiagLog.info("mcp", "server=\(serverKey) tool refresh discarded: the connection was replaced")
+            return false
+        }
+        let visible = Array(descriptors.prefix(MCPConfigValidator.maxToolsPerServer))
+        let bridges = visible.map { MCPToolBridge(serverKey: serverKey, descriptor: $0, client: client) }
+        AgentHarness.shared.unregisterTools(prefix: Self.toolPrefix(for: serverKey))
+        AgentHarness.shared.registerTools(bridges)
+        connections[serverKey] = MCPConnection(
+            client: client,
+            config: connection.config,
+            bridges: bridges
+        )
+        var state = runtime[serverKey] ?? ServerRuntime(status: .ready)
+        state.status = .ready
+        state.qualifiedToolNames = bridges.map { $0.definition.function.name }
+        state.remoteToolNames = visible.map(\.name)
+        runtime[serverKey] = state
+        publishStates()
+        DiagLog.info("mcp", "server=\(serverKey) tool list refreshed: \(bridges.count) tools")
+        return true
     }
 
     /// A live server exited on its own. The client reports it, but the manager
