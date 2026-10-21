@@ -340,12 +340,21 @@ nonisolated struct MCPLineBuffer {
 /// Text/event-stream frame assembler: `data:` lines accumulate until a blank
 /// line dispatches the event.
 nonisolated struct MCPSSEFrameParser {
+    /// Largest event this parser will assemble. The line buffer bounds each
+    /// line, but a server can send any number of short `data:` lines before the
+    /// blank line that dispatches them, so the event itself needs a bound.
+    let limit: Int
+    private(set) var overflowed = false
     private var dataLines: [String] = []
+    private var dataBytes = 0
     private var eventName: String?
 
-    init() {}
+    init(limit: Int = MCPHTTPTransport.maxMessageBytes) {
+        self.limit = limit
+    }
 
     mutating func consume(line: String) -> (event: String?, data: String)? {
+        guard !overflowed else { return nil }
         if line.isEmpty {
             return dispatch()
         }
@@ -362,6 +371,14 @@ nonisolated struct MCPSSEFrameParser {
 
         switch field {
         case "data":
+            // +1 per line for the newline `dispatch` inserts between them.
+            dataBytes += value.utf8.count + 1
+            if dataBytes > limit {
+                overflowed = true
+                dataLines.removeAll()
+                eventName = nil
+                return nil
+            }
             dataLines.append(value)
         case "event":
             eventName = value
@@ -372,15 +389,17 @@ nonisolated struct MCPSSEFrameParser {
     }
 
     mutating func finish() -> (event: String?, data: String)? {
-        dispatch()
+        guard !overflowed else { return nil }
+        return dispatch()
     }
 
     private mutating func dispatch() -> (event: String?, data: String)? {
         defer {
             dataLines.removeAll()
+            dataBytes = 0
             eventName = nil
         }
-        guard !dataLines.isEmpty else { return nil }
+        guard !overflowed, !dataLines.isEmpty else { return nil }
         return (eventName, dataLines.joined(separator: "\n"))
     }
 }
@@ -914,14 +933,19 @@ public final class MCPHTTPTransport: MCPTransport, @unchecked Sendable {
                 for line in lineBuffer.append(single) {
                     dispatch(frames.consume(line: line))
                 }
-                if lineBuffer.overflowed { break }
+                if lineBuffer.overflowed || frames.overflowed { break }
             }
-            if let trailing = lineBuffer.flush() {
-                dispatch(frames.consume(line: trailing))
+            if !lineBuffer.overflowed && !frames.overflowed {
+                if let trailing = lineBuffer.flush() {
+                    dispatch(frames.consume(line: trailing))
+                }
+                dispatch(frames.finish())
             }
-            dispatch(frames.finish())
         } catch {
             DiagLog.warning("mcp", "server=\(label) SSE stream error: \(error.localizedDescription)")
+        }
+        if frames.overflowed {
+            DiagLog.error("mcp", "server=\(label) SSE event exceeded \(Self.maxMessageBytes) bytes")
         }
     }
 

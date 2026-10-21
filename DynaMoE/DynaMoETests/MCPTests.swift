@@ -692,6 +692,45 @@ final class MCPFramingTests: XCTestCase {
         let frame = parser.finish()
         XCTAssertEqual(frame?.data, "{\"x\":1}")
     }
+
+    func testSSEParserAcceptsEventAtItsLimit() {
+        var parser = MCPSSEFrameParser(limit: 11)
+        XCTAssertNil(parser.consume(line: "data: 1234567890"))
+        XCTAssertFalse(parser.overflowed)
+        XCTAssertEqual(parser.consume(line: "")?.data, "1234567890")
+    }
+
+    func testSSEParserRefusesEventOverItsLimit() {
+        var parser = MCPSSEFrameParser(limit: 11)
+        XCTAssertNil(parser.consume(line: "data: 1234567890"))
+        XCTAssertNil(parser.consume(line: "data: 1"))
+        XCTAssertTrue(parser.overflowed)
+        XCTAssertNil(parser.consume(line: ""), "an over-limit event must never be dispatched")
+        XCTAssertNil(parser.consume(line: "data: ok"), "an overflowed parser stays refused")
+        XCTAssertNil(parser.finish())
+    }
+
+    func testSSEParserCountsManyShortDataLines() {
+        // Every line is tiny and would pass a per-line check; together they are
+        // the unbounded event the SSE size limit exists to stop.
+        var parser = MCPSSEFrameParser(limit: 64)
+        for _ in 0..<32 { _ = parser.consume(line: "data: x") }
+        XCTAssertFalse(parser.overflowed, "32 two-byte data lines are exactly at the limit")
+        _ = parser.consume(line: "data: x")
+        XCTAssertTrue(parser.overflowed)
+        XCTAssertNil(parser.consume(line: ""))
+    }
+
+    func testSSEParserResetsItsBudgetBetweenEvents() {
+        var parser = MCPSSEFrameParser(limit: 11)
+        _ = parser.consume(line: "data: 1234567890")
+        XCTAssertEqual(parser.consume(line: "")?.data, "1234567890")
+        XCTAssertFalse(parser.overflowed)
+
+        _ = parser.consume(line: "data: 1234567890")
+        XCTAssertFalse(parser.overflowed, "each event gets its own budget")
+        XCTAssertEqual(parser.consume(line: "")?.data, "1234567890")
+    }
 }
 
 // MARK: - Wire Types
