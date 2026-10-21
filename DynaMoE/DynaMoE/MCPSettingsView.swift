@@ -471,7 +471,7 @@ struct MCPAddServerSheet: View {
     @State private var transport: Transport = .stdio
     @State private var enabled: Bool = true
     @State private var command: String = ""
-    @State private var argsText: String = ""
+    @State private var argsJSON: String = ""
     @State private var workingDirectory: String = ""
     @State private var url: String = ""
     @State private var startupTimeout: String = ""
@@ -524,7 +524,15 @@ struct MCPAddServerSheet: View {
 
                         if transport == .stdio {
                             labeledField("Command", text: $command, placeholder: "npx", isMonospaced: true)
-                            labeledMultiline("Arguments (one per line)", text: $argsText, placeholder: "-y\n@modelcontextprotocol/server-filesystem\n${workspace}")
+                            labeledMultiline(
+                                "Arguments (JSON array)",
+                                text: $argsJSON,
+                                placeholder: "[\"-y\", \"@modelcontextprotocol/server-filesystem\", \"${workspace}\"]"
+                            )
+                            Text("A JSON array of strings, for example [\"-y\", \"server\"]. Each element is passed as one argument, so spaces, empty strings and multi-line values survive an edit.")
+                                .font(.system(size: 9.5))
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
                             labeledField("Working directory (optional)", text: $workingDirectory, placeholder: "${workspace}", isMonospaced: true)
                             keyValueEditor(
                                 title: "Environment",
@@ -705,7 +713,7 @@ struct MCPAddServerSheet: View {
         enabled = config.enabled
         transport = config.transportKind == .http ? .http : .stdio
         command = config.command ?? ""
-        argsText = (config.args ?? []).joined(separator: "\n")
+        argsJSON = Self.argumentsJSON(config.args ?? [])
         workingDirectory = config.cwd ?? ""
         url = config.url ?? ""
         startupTimeout = config.startupTimeoutSec.map { Self.format($0) } ?? ""
@@ -726,6 +734,27 @@ struct MCPAddServerSheet: View {
 
     private static func format(_ value: Double) -> String {
         value == value.rounded() ? String(Int(value)) : String(value)
+    }
+
+    /// The editor's representation of `args`: JSON, so it is exactly
+    /// reversible. A line-per-argument editor cannot round-trip an argument
+    /// that is empty, padded with spaces, or contains a newline.
+    static func argumentsJSON(_ args: [String]) -> String {
+        guard !args.isEmpty else { return "" }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        guard let data = try? encoder.encode(args),
+              let text = String(data: data, encoding: .utf8) else { return "" }
+        return text
+    }
+
+    /// Reads the argument editor back. Nil means "not a JSON array of
+    /// strings"; an empty editor and an empty array both mean no arguments.
+    static func parseArguments(_ text: String) -> [String]? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        guard let data = trimmed.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode([String].self, from: data)
     }
 
     private func save() {
@@ -754,11 +783,12 @@ struct MCPAddServerSheet: View {
                 return
             }
             config.command = trimmedCommand
-            let args = argsText
-                .components(separatedBy: "\n")
-                .map { $0.trimmingCharacters(in: .whitespaces) }
-                .filter { !$0.isEmpty }
-            config.args = args.isEmpty ? nil : args
+            let rawArgs = argsJSON.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let parsedArgs = Self.parseArguments(rawArgs) else {
+                errorText = "Arguments must be a JSON array of strings, for example [\"-y\", \"server\"]."
+                return
+            }
+            config.args = parsedArgs.isEmpty ? nil : parsedArgs
             let cwd = workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
             config.cwd = cwd.isEmpty ? nil : cwd
             let env = resolve(rows: envRows, serverKey: key, fieldLabel: "env")

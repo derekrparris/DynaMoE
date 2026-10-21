@@ -261,6 +261,28 @@ final class MCPConfigModelTests: XCTestCase {
         XCTAssertEqual(server.resolvedToolTimeoutSec, MCPServerConfig.defaultToolTimeoutSec)
     }
 
+    func testArgumentEditorRoundTripsEveryArgumentShape() {
+        let args = ["-y", "", "  padded  ", "multi\nline", "${workspace}", "\"quoted\"", "a\tb"]
+        let text = MCPAddServerSheet.argumentsJSON(args)
+        XCTAssertEqual(
+            MCPAddServerSheet.parseArguments(text),
+            args,
+            "editing an unrelated field must not rewrite arguments"
+        )
+    }
+
+    func testArgumentEditorTreatsBlankInputAsNoArguments() {
+        XCTAssertEqual(MCPAddServerSheet.parseArguments(""), [] as [String])
+        XCTAssertEqual(MCPAddServerSheet.parseArguments("  \n "), [] as [String])
+        XCTAssertEqual(MCPAddServerSheet.argumentsJSON([]), "")
+    }
+
+    func testArgumentEditorRejectsNonArrayText() {
+        XCTAssertNil(MCPAddServerSheet.parseArguments("-y\nserver"))
+        XCTAssertNil(MCPAddServerSheet.parseArguments("[\"ok\", 1]"))
+        XCTAssertNil(MCPAddServerSheet.parseArguments("{\"args\":[]}"))
+    }
+
     func testDecodesServerUrlAlias() throws {
         let json = """
         { "mcpServers": { "remote": { "serverUrl": "https://mcp.example.com/mcp" } } }
