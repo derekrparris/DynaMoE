@@ -4165,6 +4165,11 @@ public final class AgentHarness {
 
     public func executeTool(call: ParsedToolCall, workingDirectory: URL? = nil, maxOutputLength: Int? = nil) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool) {
         let startTime = CFAbsoluteTimeGetCurrent()
+        // The engine is idle while a tool runs, but the agent operation is not
+        // over: subsystems that must not interrupt one (MCP config reloads)
+        // watch this counter.
+        AgentActivity.shared.begin(.toolCall)
+        defer { AgentActivity.shared.end(.toolCall) }
         let wd = workingDirectory ?? defaultWorkingDirectory
         let strArgs = call.arguments.mapValues { String(describing: $0) }
         // maxOutputLength (and maxToolOutputLength) is a TOKEN budget; tools work in

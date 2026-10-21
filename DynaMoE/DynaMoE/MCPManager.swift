@@ -759,13 +759,21 @@ public final class MCPManager: ObservableObject {
         watcherDescriptor = -1
     }
 
+    /// True while an agent operation that must not be interrupted is running.
+    /// `CompletionEngine.isActive` only covers decoding: approval waits and
+    /// tool calls run with the engine idle, and reloading then would close the
+    /// transport under a call the model already dispatched.
+    var isAgentOperationActive: Bool {
+        CompletionEngine.shared.isActive || AgentActivity.shared.isBusy
+    }
+
     private func handleDirectoryChange() {
         let token = MCPConfigStore.modificationToken()
         guard token != configToken else { return }
 
-        // Restarting a server mid-generation would kill an in-flight tool call,
-        // so an edit that lands during a turn waits for the turn to end.
-        if CompletionEngine.shared.isActive {
+        // Restarting a server mid-operation would kill an in-flight tool call,
+        // so an edit that lands while the agent is working waits for it to end.
+        if isAgentOperationActive {
             pendingReload = true
             scheduleDeferredReload()
             return
@@ -780,7 +788,7 @@ public final class MCPManager: ObservableObject {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 guard let self else { return }
                 guard self.pendingReload else { break }
-                if CompletionEngine.shared.isActive { continue }
+                if self.isAgentOperationActive { continue }
                 self.pendingReload = false
                 self.reloadFromDisk(reason: "external edit (deferred)")
                 break

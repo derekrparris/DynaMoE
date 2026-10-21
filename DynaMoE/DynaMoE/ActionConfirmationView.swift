@@ -21,7 +21,11 @@ public final class ActionApprovalManager: @unchecked Sendable {
     private init() {}
 
     public func waitForApproval(id: UUID) async -> Bool {
-        await withCheckedContinuation { continuation in
+        // A pending prompt is part of a running agent operation even though
+        // the engine is idle, so a config reload must wait for the decision.
+        AgentActivity.shared.begin(.approval)
+        defer { AgentActivity.shared.end(.approval) }
+        return await withCheckedContinuation { continuation in
             lock.lock()
             pendingContinuations[id] = continuation
             lock.unlock()
