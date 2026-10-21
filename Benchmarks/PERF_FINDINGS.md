@@ -3486,3 +3486,19 @@ Tests: `TurnFitLogicTests` reworked to the derived-floor law, plus
 `testRingAwareGeometryServesTheFieldPrompt` (5,427 rows, 1,850-token cap);
 `KVCacheProvisioningLogicTests.testAffordableSeqLenPricesSlidingRingsAsFixedRows`
 pins ring vs uniform affordability and the ring byte layout.
+
+Review follow-ups (same change): the rejection text moved out of `launchTurn`
+into `KVCacheProvisioning.capacityMessage`, because a nested builder could not
+be tested and the server test could only assert against a literal it wrote
+itself. The message now names a reserve the budget capped ("agent sessions
+reserve 8192 rows, capped by the budget to 910") instead of implying the
+requested reserve is what was provisioned, and renders `Int.max` affordability
+(all-ring layouts) as "unbounded" rather than a 19-digit row count.
+`sessionFloor` also clamps `dynamoe_agent_session_floor` to the 32,768-row
+`maxProvisionedRows` ceiling, so the override can lower or raise the reserve
+inside the range the sequence cap allows but can no longer request a provision
+larger than any other path on the machine. New coverage:
+`testCapacityMessageBlamesTheBindNotThePromptLength`,
+`testCapacityMessageNamesACappedReserve`,
+`testCapacityMessageRendersUnboundedCapacityAndChatRemedy`, and the server test
+now builds its message through the real builder.

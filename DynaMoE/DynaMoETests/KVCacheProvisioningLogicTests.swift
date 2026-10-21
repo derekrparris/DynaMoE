@@ -130,6 +130,74 @@ final class KVCacheProvisioningLogicTests: XCTestCase {
         )
     }
 
+    // MARK: - Rejection message
+
+    private func message(
+        promptTokens: Int = 200,
+        provisioned: Int = 910,
+        affordableRows: Int = 910,
+        precision: KVCachePrecision = .fp16,
+        isAgentSession: Bool = true,
+        sessionFloor: Int = 8_192,
+        budgetGB: Double = 0.25
+    ) -> String {
+        KVCacheProvisioning.capacityMessage(
+            promptTokens: promptTokens,
+            provisioned: provisioned,
+            affordableRows: affordableRows,
+            budgetGB: budgetGB,
+            precision: precision,
+            isAgentSession: isAgentSession,
+            sessionFloor: sessionFloor,
+            modelFootprintGB: 8.75,
+            physicalGB: 16
+        )
+    }
+
+    func testCapacityMessageBlamesTheBindNotThePromptLength() {
+        // The 200-token prompt fits the rows the budget affords; what it runs out
+        // of is generation room. The message must say that, and must report the
+        // numbers the gate used.
+        let tight = message(promptTokens: 200, provisioned: 910, affordableRows: 910, sessionFloor: 2_048)
+        XCTAssertTrue(tight.contains("Context does not fit"), tight)
+        XCTAssertFalse(tight.contains("Prompt too long"), tight)
+        XCTAssertTrue(tight.contains("200 prompt tokens"), tight)
+        XCTAssertTrue(tight.contains("910 provisioned KV rows"), tight)
+        XCTAssertTrue(tight.contains("FP16"), tight)
+        XCTAssertTrue(tight.contains("0.25 GB"), tight)
+        XCTAssertTrue(tight.contains("affords 910 rows"), tight)
+
+        // A prompt past the provision is reported against it, not as a mystery.
+        let oversized = message(promptTokens: 5_000, provisioned: 910)
+        XCTAssertTrue(oversized.contains("Prompt does not fit"), oversized)
+        XCTAssertTrue(oversized.contains("5000 prompt tokens against 910 provisioned KV rows"), oversized)
+    }
+
+    func testCapacityMessageNamesACappedReserve() {
+        // The agent floor asked for 8,192 rows and the budget capped it to 910;
+        // the message must not present 8,192 as what was provisioned.
+        let capped = message(affordableRows: 910, sessionFloor: 8_192)
+        XCTAssertTrue(capped.contains("agent sessions reserve 8192 rows, capped by the budget to 910"), capped)
+        XCTAssertTrue(capped.contains("dynamoe_agent_session_floor"), capped)
+
+        let roomy = message(provisioned: 9_000, affordableRows: 9_000, sessionFloor: 8_192)
+        XCTAssertTrue(roomy.contains("agent sessions reserve 8192 rows;"), roomy)
+        XCTAssertFalse(roomy.contains("capped by the budget"), roomy)
+    }
+
+    func testCapacityMessageRendersUnboundedCapacityAndChatRemedy() {
+        // All-ring layouts report Int.max affordability; the message must not
+        // print 9223372036854775807 at a user.
+        let unbounded = message(affordableRows: Int.max, sessionFloor: 2_048)
+        XCTAssertTrue(unbounded.contains("affords unbounded rows"), unbounded)
+        XCTAssertFalse(unbounded.contains("\(Int.max)"), unbounded)
+
+        let chat = message(provisioned: 910, affordableRows: 910, isAgentSession: false, sessionFloor: 2_048)
+        XCTAssertTrue(chat.contains("chat turns reserve 2048 rows"), chat)
+        XCTAssertTrue(chat.contains("Shorten the prompt"), chat)
+        XCTAssertFalse(chat.contains("dynamoe_agent_session_floor"), chat)
+    }
+
     // MARK: - Machine/model/mode budget
 
     func testBudgetReservesWeightsAndWorkingSet() {

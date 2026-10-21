@@ -190,6 +190,8 @@ final class TurnFitLogicTests: XCTestCase {
         XCTAssertEqual(KVCacheProvisioning.sessionFloor(isAgentSession: true, configured: nil), 8192)
         XCTAssertEqual(KVCacheProvisioning.sessionFloor(isAgentSession: true, configured: 0), 8192)
         XCTAssertEqual(KVCacheProvisioning.sessionFloor(isAgentSession: true, configured: 4_096), 4_096)
+        // The reserve cannot raise the provision past the sequence cap.
+        XCTAssertEqual(KVCacheProvisioning.sessionFloor(isAgentSession: true, configured: 40_000), 32_768)
         XCTAssertEqual(KVCacheProvisioning.sessionFloor(isAgentSession: false, configured: 4_096), 2048)
         XCTAssertEqual(KVCacheProvisioning.affordableFloor(sessionFloor: 8_192, affordableRows: 910), 910)
         XCTAssertEqual(KVCacheProvisioning.affordableFloor(sessionFloor: 2_048, affordableRows: 9_000), 2_048)
@@ -242,7 +244,7 @@ final class TurnFitLogicTests: XCTestCase {
         XCTAssertLessThanOrEqual(result.effectiveMaxTokens + 3_065, provisioned)
     }
 
-    func testPromptSlightlyAboveFloorIsRejected() {
+    func testPromptBeyondSequenceCapIsRejected() {
         // A 50,000-token prompt exceeds the 32,768-row cap and the affordable
         // provision, so it is rejected for its own length.
         let result = fit(

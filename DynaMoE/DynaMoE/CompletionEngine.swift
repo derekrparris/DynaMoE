@@ -1323,35 +1323,19 @@ public final class CompletionEngine: @unchecked Sendable {
         )
         // Both KV gates report the same numbers, and never claim the prompt is
         // longer than the cache when the bind is the budget or the reserve.
-        func kvCapacityMessage(promptTokens: Int, provisioned: Int, affordableRows: Int, budgetGB: Double) -> String {
-            let precisionName: String
-            switch kvPrec {
-            case .fp8: precisionName = "FP8"
-            case .fp16: precisionName = "FP16"
-            case .fp32: precisionName = "FP32"
-            }
-            let reserve = isAgentSession
-                ? "agent sessions reserve \(sessionFloor) rows"
-                : "chat turns reserve \(sessionFloor) rows"
-            let request: String
-            if promptTokens >= provisioned {
-                request = "Prompt does not fit: \(promptTokens) prompt tokens against \(provisioned) provisioned KV rows"
-            } else {
-                request = "Context does not fit: \(promptTokens) prompt tokens leave no generation room in \(provisioned) provisioned KV rows"
-            }
-            let remedy = isAgentSession
-                ? " Lower the reserve with `defaults write DRP.DynaMoE dynamoe_agent_session_floor -int <rows>`, reduce loaded tools or max_tokens, or run a smaller model."
-                : " Shorten the prompt or reduce max_tokens, or run a smaller model."
-            return "⚠️ \(request) (\(reserve); the KV budget is \(String(format: "%.2f", budgetGB)) GB at \(precisionName) on a \(String(format: "%.0f", fitPhysicalGB)) GB machine with a \(String(format: "%.1f", summary.sizeGb)) GB model, which affords \(affordableRows) rows).\(remedy)"
-        }
         switch fitCheck.outcome {
         case .promptTooLong(let provisioned):
             throw CompletionLaunchError.promptTooLong(
-                kvCapacityMessage(
+                KVCacheProvisioning.capacityMessage(
                     promptTokens: promptTokenIds.count,
                     provisioned: provisioned,
                     affordableRows: fitCheck.affordableRows,
-                    budgetGB: fitCheck.budgetGB
+                    budgetGB: fitCheck.budgetGB,
+                    precision: kvPrec,
+                    isAgentSession: isAgentSession,
+                    sessionFloor: sessionFloor,
+                    modelFootprintGB: summary.sizeGb,
+                    physicalGB: fitPhysicalGB
                 )
             )
         case .maxTokensReduced(let provisioned):
@@ -1519,11 +1503,16 @@ public final class CompletionEngine: @unchecked Sendable {
         )
         if clampedSeqLen < promptTokenIds.count + 64 {
             throw CompletionLaunchError.promptTooLong(
-                kvCapacityMessage(
+                KVCacheProvisioning.capacityMessage(
                     promptTokens: promptTokenIds.count,
                     provisioned: clampedSeqLen,
                     affordableRows: affordability,
-                    budgetGB: kvBudgetGB
+                    budgetGB: kvBudgetGB,
+                    precision: kvPrec,
+                    isAgentSession: isAgentSession,
+                    sessionFloor: sessionFloor,
+                    modelFootprintGB: summary.sizeGb,
+                    physicalGB: physicalGB
                 )
             )
         }

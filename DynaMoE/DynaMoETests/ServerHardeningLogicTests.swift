@@ -78,10 +78,22 @@ final class ServerHardeningLogicTests: XCTestCase {
 
     func testKVCapacityRejectionCarriesContextLengthCode() {
         // A prompt that cannot fit the KV cache is a context-length error, not a
-        // generic bad request: clients classify on the code. The wire envelope
-        // must carry it, and the message must never claim a prompt is longer
-        // than the capacity when the bind is the budget or the session reserve.
-        let error = ServerAPIError.contextLengthExceeded("⚠️ Prompt does not fit: 200 prompt tokens against 910 provisioned KV rows")
+        // generic bad request: clients classify on the code. The message comes
+        // from the real builder, so this also pins that a budget/reserve bind is
+        // never reported as prompt length. 2,000 tokens against the 910 rows the
+        // budget affords is that bind: the reserve was capped, not the prompt.
+        let message = KVCacheProvisioning.capacityMessage(
+            promptTokens: 2_000,
+            provisioned: 910,
+            affordableRows: 910,
+            budgetGB: 0.25,
+            precision: .fp16,
+            isAgentSession: true,
+            sessionFloor: 8_192,
+            modelFootprintGB: 8.75,
+            physicalGB: 16
+        )
+        let error = ServerAPIError.contextLengthExceeded(message)
         XCTAssertEqual(error.status, .badRequest)
         XCTAssertEqual(error.wireType, .invalidRequest)
         XCTAssertEqual(error.code, "context_length_exceeded")
@@ -91,14 +103,12 @@ final class ServerHardeningLogicTests: XCTestCase {
         ))
         let json = envelope.flatMap { String(data: $0, encoding: .utf8) } ?? ""
         XCTAssertTrue(json.contains("\"code\":\"context_length_exceeded\""), "envelope lost the code: \(json)")
-
-        let promptTokens = 200
-        let provisioned = 910
         XCTAssertFalse(
             error.message.contains("Prompt too long"),
             "the message must not blame prompt length for a budget/reserve bind"
         )
-        XCTAssertLessThan(promptTokens, provisioned)
+        XCTAssertTrue(error.message.contains("Prompt does not fit"), error.message)
+        XCTAssertTrue(error.message.contains("capped by the budget to 910"), error.message)
     }
 
     func testLaunchErrorMappingClassifiesKVCapacityRejections() {

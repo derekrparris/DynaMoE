@@ -722,12 +722,18 @@ enum KVCacheProvisioning {
     static let defaultAgentSessionFloorRows = 8192
     static let defaultChatSessionFloorRows = 2048
 
+    /// Hard ceiling on the KV rows a turn requests. A reserve can ask for
+    /// anything up to this and no further, so `dynamoe_agent_session_floor`
+    /// cannot become a way to provision past the sequence cap.
+    static let maxProvisionedRows = 32768
+
     /// The reserve this turn asks for. `configured` is the persisted
     /// `dynamoe_agent_session_floor` value (nil when unset) and only applies to
-    /// agent sessions.
+    /// agent sessions; it is clamped to `maxProvisionedRows`, so the key can
+    /// only move the reserve inside the range the provision cap allows.
     static func sessionFloor(isAgentSession: Bool, configured: Int?) -> Int {
         guard isAgentSession else { return defaultChatSessionFloorRows }
-        if let configured, configured > 0 { return configured }
+        if let configured, configured > 0 { return min(configured, maxProvisionedRows) }
         return defaultAgentSessionFloorRows
     }
 
@@ -739,7 +745,55 @@ enum KVCacheProvisioning {
     }
 
     static func neededSeqLen(sessionFloor: Int, promptTokens: Int, requestedMaxTokens: Int) -> Int {
-        max(sessionFloor, min(32768, promptTokens + max(1, requestedMaxTokens) + turnHeadroomRows))
+        max(sessionFloor, min(maxProvisionedRows, promptTokens + max(1, requestedMaxTokens) + turnHeadroomRows))
+    }
+
+    /// Short label for a KV precision in capacity messages.
+    static func precisionLabel(_ precision: KVCachePrecision) -> String {
+        switch precision {
+        case .fp8: return "FP8"
+        case .fp16: return "FP16"
+        case .fp32: return "FP32"
+        }
+    }
+
+    /// The single message both KV gates throw with. A rejection names what
+    /// actually binds — the provision against the prompt, the reserve, the
+    /// budget, the model footprint and the precision — so neither a client nor
+    /// an in-app reader sees prompt length blamed for a budget bind. A layout
+    /// with no linear slots (every slot a sliding ring) reports its capacity as
+    /// unbounded instead of printing `Int.max`.
+    static func capacityMessage(
+        promptTokens: Int,
+        provisioned: Int,
+        affordableRows: Int,
+        budgetGB: Double,
+        precision: KVCachePrecision,
+        isAgentSession: Bool,
+        sessionFloor: Int,
+        modelFootprintGB: Double,
+        physicalGB: Double
+    ) -> String {
+        let affordable = affordableRows == Int.max ? "unbounded" : "\(affordableRows)"
+        var reserve = isAgentSession
+            ? "agent sessions reserve \(sessionFloor) rows"
+            : "chat turns reserve \(sessionFloor) rows"
+        if affordableRows < sessionFloor {
+            reserve += ", capped by the budget to \(affordable)"
+        }
+        let request: String
+        if promptTokens >= provisioned {
+            request = "Prompt does not fit: \(promptTokens) prompt tokens against \(provisioned) provisioned KV rows"
+        } else {
+            request = "Context does not fit: \(promptTokens) prompt tokens leave no generation room in \(provisioned) provisioned KV rows"
+        }
+        let remedy = isAgentSession
+            ? " Lower the reserve with `defaults write DRP.DynaMoE dynamoe_agent_session_floor -int <rows>`, reduce loaded tools or max_tokens, or run a smaller model."
+            : " Shorten the prompt or reduce max_tokens, or run a smaller model."
+        let budget = String(format: "%.2f", budgetGB)
+        let physical = String(format: "%.0f", physicalGB)
+        let footprint = String(format: "%.1f", modelFootprintGB)
+        return "⚠️ \(request) (\(reserve); the KV budget is \(budget) GB at \(precisionLabel(precision)) on a \(physical) GB machine with a \(footprint) GB model, which affords \(affordable) rows).\(remedy)"
     }
 
     /// Launch-time capability check: the machine's KV budget clamps what a
