@@ -669,6 +669,25 @@ final class MCPFramingTests: XCTestCase {
         XCTAssertTrue(buffer.overflowed)
     }
 
+    func testLineBufferScansIncrementallyWhenFedByteByByte() {
+        // The SSE reader feeds `AsyncBytes` one byte at a time; the buffer must
+        // not rescan the whole partial line for a newline on every byte.
+        var buffer = MCPLineBuffer(limit: 4096)
+        let payload = String(repeating: "x", count: 2_000)
+        for byte in Data(payload.utf8) {
+            XCTAssertTrue(buffer.append(Data([byte])).isEmpty)
+        }
+        XCTAssertEqual(buffer.append(Data("\n".utf8)), [payload])
+        XCTAssertFalse(buffer.overflowed)
+    }
+
+    func testLineBufferResumesScanWithoutSkippingNewlines() {
+        var buffer = MCPLineBuffer(limit: 4096)
+        XCTAssertTrue(buffer.append(Data("ab".utf8)).isEmpty)
+        XCTAssertEqual(buffer.append(Data("c\nde\nfg".utf8)), ["abc", "de"])
+        XCTAssertEqual(buffer.flush(), "fg")
+    }
+
     func testSSEParserJoinsMultipleDataLines() {
         var parser = MCPSSEFrameParser()
         XCTAssertNil(parser.consume(line: "event: message"))

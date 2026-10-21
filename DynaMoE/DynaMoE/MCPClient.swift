@@ -288,6 +288,11 @@ nonisolated struct MCPLineBuffer {
     private(set) var buffer = Data()
     let limit: Int
     private(set) var overflowed = false
+    /// How many bytes of `buffer` are known to contain no newline. Appends
+    /// resume the search here, so feeding a long frame one byte at a time (the
+    /// SSE reader's `AsyncBytes` loop) stays linear instead of rescanning the
+    /// whole partial line on every byte.
+    private var scanOffset = 0
 
     init(limit: Int) {
         self.limit = limit
@@ -303,12 +308,18 @@ nonisolated struct MCPLineBuffer {
         buffer.append(chunk)
 
         var lines: [String] = []
-        while let newline = buffer.firstIndex(of: 0x0A) {
+        while true {
+            let resume = buffer.index(buffer.startIndex, offsetBy: scanOffset)
+            guard let newline = buffer[resume...].firstIndex(of: 0x0A) else {
+                scanOffset = buffer.count
+                break
+            }
             // The newline is consumed but a trailing `\r` is not, so the byte
             // distance includes it, matching the unterminated-tail check below.
             if buffer.distance(from: buffer.startIndex, to: newline) > limit {
                 overflowed = true
                 buffer.removeAll()
+                scanOffset = 0
                 return lines
             }
             var lineData = Data(buffer[buffer.startIndex..<newline])
@@ -317,11 +328,13 @@ nonisolated struct MCPLineBuffer {
                 lines.append(line)
             }
             buffer.removeSubrange(buffer.startIndex...newline)
+            scanOffset = 0
         }
 
         if buffer.count > limit {
             overflowed = true
             buffer.removeAll()
+            scanOffset = 0
         }
         return lines
     }
@@ -332,6 +345,7 @@ nonisolated struct MCPLineBuffer {
         guard !overflowed, !buffer.isEmpty else { return nil }
         var lineData = buffer
         buffer.removeAll()
+        scanOffset = 0
         if lineData.last == 0x0D { lineData.removeLast() }
         return String(data: lineData, encoding: .utf8)
     }
