@@ -19,6 +19,7 @@ private final class MockMCPTransport: MCPTransport, @unchecked Sendable {
     private let continuation: AsyncStream<Data>.Continuation
     private let lock = NSLock()
     private var recorded: [[String: Any]] = []
+    private var negotiatedVersions: [String] = []
     private var closed = false
 
     /// Called synchronously from `send` (off the main actor) for every frame
@@ -72,6 +73,19 @@ private final class MockMCPTransport: MCPTransport, @unchecked Sendable {
     }
 
     func start() async throws {}
+
+    func setNegotiatedProtocolVersion(_ version: String) {
+        lock.lock()
+        negotiatedVersions.append(version)
+        lock.unlock()
+    }
+
+    /// Revisions `initialize` negotiation handed back to the transport.
+    var recordedNegotiatedVersions: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return negotiatedVersions
+    }
 
     func send(_ payload: Data) async throws {
         guard let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any] else {
@@ -544,6 +558,46 @@ final class MCPHTTPErrorSummaryTests: XCTestCase {
         let summary = MCPHTTPTransport.summarizeErrorBody(String(repeating: "x", count: 5000), limit: 50)
         XCTAssertEqual(summary.count, 53)
         XCTAssertTrue(summary.hasSuffix("..."))
+    }
+}
+
+// MARK: - HTTP Transport
+
+final class MCPHTTPTransportTests: XCTestCase {
+
+    private func makeTransport() -> MCPHTTPTransport {
+        MCPHTTPTransport(
+            endpoint: URL(string: "https://example.com/mcp")!,
+            headers: ["Authorization": "Bearer test"],
+            requestTimeout: 30,
+            label: "test"
+        )
+    }
+
+    func testRequestAdvertisesTheNewestRevisionBeforeHandshake() {
+        let transport = makeTransport()
+        let request = transport.makeRequest(payload: Data("{}".utf8), sessionId: nil)
+        XCTAssertEqual(request.value(forHTTPHeaderField: "MCP-Protocol-Version"), MCPWire.protocolVersion)
+    }
+
+    func testRequestAdvertisesTheNegotiatedRevision() {
+        let transport = makeTransport()
+        transport.setNegotiatedProtocolVersion("2025-03-26")
+        let request = transport.makeRequest(payload: Data("{}".utf8), sessionId: "session-1")
+        XCTAssertEqual(
+            request.value(forHTTPHeaderField: "MCP-Protocol-Version"),
+            "2025-03-26",
+            "a server that negotiated an older revision must not receive a newer header on the next request"
+        )
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Mcp-Session-Id"), "session-1")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test")
+    }
+
+    func testBlankNegotiatedRevisionKeepsTheNewestRevision() {
+        let transport = makeTransport()
+        transport.setNegotiatedProtocolVersion("   ")
+        let request = transport.makeRequest(payload: Data("{}".utf8), sessionId: nil)
+        XCTAssertEqual(request.value(forHTTPHeaderField: "MCP-Protocol-Version"), MCPWire.protocolVersion)
     }
 }
 
@@ -1096,13 +1150,17 @@ final class MCPClientProtocolTests: XCTestCase {
         )
     }
 
-    private func installHandshake(_ transport: MockMCPTransport, tools: [[String: Any]]) {
+    private func installHandshake(
+        _ transport: MockMCPTransport,
+        tools: [[String: Any]],
+        protocolVersion: String = "2025-06-18"
+    ) {
         transport.responder = { request, transport in
             let id = request["id"] as Any
             switch request["method"] as? String {
             case "initialize":
                 transport.reply(id: id, result: [
-                    "protocolVersion": "2025-06-18",
+                    "protocolVersion": protocolVersion,
                     "capabilities": ["tools": [:]],
                     "serverInfo": ["name": "mock-server", "version": "0.1.0"],
                     "instructions": "Be brief."
@@ -1137,6 +1195,22 @@ final class MCPClientProtocolTests: XCTestCase {
         XCTAssertEqual(params["protocolVersion"] as? String, MCPWire.protocolVersion)
         let clientInfo = try XCTUnwrap(params["clientInfo"] as? [String: Any])
         XCTAssertEqual(clientInfo["name"] as? String, "DynaMoE")
+
+        await client.stop()
+    }
+
+    func testInitializeTellsTheTransportWhichRevisionToAdvertise() async throws {
+        let transport = MockMCPTransport()
+        installHandshake(transport, tools: [], protocolVersion: "2025-03-26")
+        let client = makeClient(transport: transport)
+
+        try await client.start()
+
+        XCTAssertEqual(
+            transport.recordedNegotiatedVersions,
+            ["2025-03-26"],
+            "the transport must be told the negotiated revision, not keep sending the newest one"
+        )
 
         await client.stop()
     }

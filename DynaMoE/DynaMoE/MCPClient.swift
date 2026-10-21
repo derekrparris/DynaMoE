@@ -431,6 +431,13 @@ public nonisolated protocol MCPTransport: AnyObject, Sendable {
     var stderrTail: String { get }
     var closureReason: String? { get }
     func close()
+    /// Records the revision `initialize` agreed on so later requests can
+    /// advertise it. Transports without a version header ignore it.
+    func setNegotiatedProtocolVersion(_ version: String)
+}
+
+public extension MCPTransport {
+    func setNegotiatedProtocolVersion(_ version: String) {}
 }
 
 // MARK: - stdio Transport
@@ -731,6 +738,10 @@ public final class MCPHTTPTransport: MCPTransport, @unchecked Sendable {
     private let lock = NSLock()
     private let writeLock = NSLock()
     private var sessionId: String?
+    /// Revision advertised on every request. Starts at the newest revision this
+    /// client asks for and switches to whatever `initialize` negotiated: a
+    /// server that picked `2025-03-26` may reject a `2025-06-18` header.
+    private var protocolVersion = MCPWire.protocolVersion
     private var inFlight: [UUID: Task<Void, Never>] = [:]
     private var didClose = false
     private var _closureReason: String?
@@ -783,20 +794,8 @@ public final class MCPHTTPTransport: MCPTransport, @unchecked Sendable {
         guard !snapshot.isClosed else {
             throw MCPClientError.connectionClosed("The MCP session is closed.")
         }
-        let sessionId = snapshot.sessionId
 
-        var request = URLRequest(url: endpoint)
-        request.httpMethod = "POST"
-        request.httpBody = payload
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
-        request.setValue(MCPWire.protocolVersion, forHTTPHeaderField: "MCP-Protocol-Version")
-        for (key, value) in baseHeaders {
-            request.setValue(value, forHTTPHeaderField: key)
-        }
-        if let sessionId {
-            request.setValue(sessionId, forHTTPHeaderField: "Mcp-Session-Id")
-        }
+        let request = makeRequest(payload: payload, sessionId: snapshot.sessionId)
 
         let bytes: URLSession.AsyncBytes
         let response: URLResponse
@@ -817,7 +816,7 @@ public final class MCPHTTPTransport: MCPTransport, @unchecked Sendable {
         if http.statusCode == 202 {
             return
         }
-        if http.statusCode == 404, sessionId != nil {
+        if http.statusCode == 404, snapshot.sessionId != nil {
             storeSessionId(nil)
             throw MCPClientError.connectionClosed("The MCP session expired (HTTP 404). Reconnect the server.")
         }
@@ -848,6 +847,38 @@ public final class MCPHTTPTransport: MCPTransport, @unchecked Sendable {
         return (didClose, sessionId)
     }
 
+    /// Builds the POST body this transport sends. Internal so a test can assert
+    /// the advertised revision without a live endpoint.
+    func makeRequest(payload: Data, sessionId: String?) -> URLRequest {
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.httpBody = payload
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json, text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue(advertisedProtocolVersion(), forHTTPHeaderField: "MCP-Protocol-Version")
+        for (key, value) in baseHeaders {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+        if let sessionId {
+            request.setValue(sessionId, forHTTPHeaderField: "Mcp-Session-Id")
+        }
+        return request
+    }
+
+    public func setNegotiatedProtocolVersion(_ version: String) {
+        let trimmed = version.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        lock.lock()
+        protocolVersion = trimmed
+        lock.unlock()
+    }
+
+    private func advertisedProtocolVersion() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return protocolVersion
+    }
+
     private func storeSessionId(_ value: String?) {
         lock.lock()
         defer { lock.unlock() }
@@ -871,6 +902,7 @@ public final class MCPHTTPTransport: MCPTransport, @unchecked Sendable {
         didClose = true
         _closureReason = "closed"
         let sessionId = self.sessionId
+        let version = protocolVersion
         let tasks = inFlight.values
         inFlight.removeAll()
         lock.unlock()
@@ -882,6 +914,7 @@ public final class MCPHTTPTransport: MCPTransport, @unchecked Sendable {
             var request = URLRequest(url: endpoint)
             request.httpMethod = "DELETE"
             request.setValue(sessionId, forHTTPHeaderField: "Mcp-Session-Id")
+            request.setValue(version, forHTTPHeaderField: "MCP-Protocol-Version")
             for (key, value) in baseHeaders {
                 request.setValue(value, forHTTPHeaderField: key)
             }
@@ -1337,6 +1370,8 @@ public actor MCPClient {
         let protocolVersion = result["protocolVersion"]?.stringValue ?? ""
         if !protocolVersion.isEmpty {
             negotiatedProtocolVersion = protocolVersion
+            // Every later request must advertise the revision the server chose.
+            transport.setNegotiatedProtocolVersion(protocolVersion)
             if !MCPWire.supportedProtocolVersions.contains(protocolVersion) {
                 DiagLog.warning("mcp", "server=\(serverKey) negotiated unknown protocol \(protocolVersion); continuing")
             }
