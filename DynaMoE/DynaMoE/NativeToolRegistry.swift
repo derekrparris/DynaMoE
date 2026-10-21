@@ -151,7 +151,7 @@ public final class ControlledProcessRunner {
     /// `which brew` fails while `which ls` works. Prepend the standard user
     /// tool locations to whatever PATH the app inherited, and force
     /// non-interactive behaviour (no pagers, no prompts, no auto-update).
-    public static func toolEnvironment() -> [String: String] {
+    nonisolated public static func toolEnvironment() -> [String: String] {
         var env = ProcessInfo.processInfo.environment
         let userHome = FileManager.default.homeDirectoryForCurrentUser.path
         let currentPath = env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"

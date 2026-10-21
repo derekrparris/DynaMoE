@@ -125,6 +125,9 @@ public extension AgentTool {
     }
 
     static func category(for name: String) -> String {
+        // MCP tools are namespaced `mcp__<server>__<tool>`; they are grouped
+        // separately so `tools_discover` can list them per integration.
+        if name.hasPrefix(MCPToolBridge.namePrefix) { return "mcp" }
         switch name {
         case "find_files", "grep_search", "codebase_search": return "search"
         case "find_symbol_definition", "find_references": return "analysis"
@@ -1762,7 +1765,7 @@ public final class ToolDiscoverTool: AgentTool {
             "properties": AnyCodable([
                 "category": [
                     "type": "string",
-                    "enum": ["search", "analysis", "web", "git", "subagents", "quality"],
+                    "enum": ["search", "analysis", "web", "git", "subagents", "quality", "mcp"],
                     "description": "Optional category filter; omit to list all groups."
                 ],
                 "query": [
@@ -1793,7 +1796,7 @@ public final class ToolDiscoverTool: AgentTool {
             ])
         }
 
-        let order = ["search", "analysis", "web", "git", "subagents", "quality", "core"]
+        let order = ["search", "analysis", "web", "git", "subagents", "quality", "mcp", "core"]
         var lines: [String] = []
         var total = 0
         for cat in order {
@@ -2877,7 +2880,9 @@ public final class AgentHarness {
     /// i.e. the call is an empty scaffold. Partially-filled calls pass through so
     /// each tool's own validation stays in charge.
     public static func hasEmptyRequiredArguments(toolName: String, arguments: [String: Any]) -> Bool {
-        guard let required = requiredValueArgumentKeys[toolName] else { return false }
+        let required = requiredValueArgumentKeys[toolName]
+            ?? AgentHarness.shared.requiredArgumentsFromSchema(toolName: toolName)
+        guard !required.isEmpty else { return false }
         for key in required {
             if let v = arguments[key] as? String {
                 if !v.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return false }
@@ -2886,6 +2891,18 @@ public final class AgentHarness {
             }
         }
         return true
+    }
+
+    /// Required argument names straight from an installed tool's JSON schema.
+    /// Dynamically registered tools (MCP) have no entry in the static table, so
+    /// without this an all-empty MCP call would burn a HITL approval prompt.
+    public func requiredArgumentsFromSchema(toolName: String) -> [String] {
+        guard let raw = tools[toolName]?.definition.function.parameters["required"]?.value else {
+            return []
+        }
+        if let array = raw as? [String] { return array }
+        if let array = raw as? [Any] { return array.compactMap { $0 as? String } }
+        return []
     }
 
     /// Normalizes the many shapes a model uses for a tool-name list into plain
@@ -3171,6 +3188,61 @@ public final class AgentHarness {
         syncGrammar()
     }
 
+    /// Batch registration. `syncGrammar()` rebuilds the sampler's whole name
+    /// trie, so registering N tools one at a time does N rebuilds; a server
+    /// that exposes dozens of tools must not pay that per tool.
+    public func registerTools(_ batch: [AgentTool]) {
+        guard !batch.isEmpty else { return }
+        for tool in batch {
+            tools[tool.definition.function.name] = tool
+            if loadedTools[tool.definition.function.name] != nil {
+                loadedTools[tool.definition.function.name] = tool
+            }
+        }
+        syncGrammar()
+    }
+
+    /// Removes an installed tool from both the catalog and the loaded set.
+    /// Needed by MCP teardown: a server that goes away must stop being offered
+    /// to the model immediately, mid-generation included.
+    @discardableResult
+    public func unregisterTool(named name: String) -> Bool {
+        let wasLoaded = loadedTools.removeValue(forKey: name) != nil
+        let wasInstalled = tools.removeValue(forKey: name) != nil
+        if wasInstalled || wasLoaded {
+            syncGrammar()
+        }
+        return wasInstalled || wasLoaded
+    }
+
+    /// Removes every tool whose name starts with `prefix`.
+    @discardableResult
+    public func unregisterTools(prefix: String) -> Int {
+        let matching = tools.keys.filter { $0.hasPrefix(prefix) }
+        guard !matching.isEmpty else { return 0 }
+        for name in matching {
+            tools.removeValue(forKey: name)
+            loadedTools.removeValue(forKey: name)
+        }
+        syncGrammar()
+        return matching.count
+    }
+
+    /// Removes exactly the named tools, leaving everything else installed and
+    /// loaded. A partial catalog refresh uses this: an MCP server announcing a
+    /// changed tool list must not unload the tools that survived it.
+    @discardableResult
+    public func unregisterTools(named names: [String]) -> Int {
+        var removed = 0
+        for name in names {
+            let wasLoaded = loadedTools.removeValue(forKey: name) != nil
+            let wasInstalled = tools.removeValue(forKey: name) != nil
+            if wasLoaded || wasInstalled { removed += 1 }
+        }
+        if removed > 0 { syncGrammar() }
+        return removed
+    }
+
     // MARK: - Tool Loading Lifecycle
 
     public enum ToolLoadError: LocalizedError {
@@ -3230,7 +3302,12 @@ public final class AgentHarness {
         GrammarConstrainedSampler.shared.registerTools(availableToolDefinitions)
     }
 
+    /// MCP tools are treated as state-changing unconditionally. A remote server
+    /// can do anything, including write files and spend money, and its own
+    /// read-only annotations are a claim rather than a guarantee, so every MCP
+    /// call gates on HITL approval (Turbo Mode still bypasses it).
     public static func isStateChanging(toolName: String) -> Bool {
+        if toolName.hasPrefix(MCPToolBridge.namePrefix) { return true }
         return toolName == "file_write" || toolName == "file_edit" || toolName == "shell_run" || toolName == "git_commit"
     }
 
@@ -4103,6 +4180,11 @@ public final class AgentHarness {
 
     public func executeTool(call: ParsedToolCall, workingDirectory: URL? = nil, maxOutputLength: Int? = nil) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool) {
         let startTime = CFAbsoluteTimeGetCurrent()
+        // The engine is idle while a tool runs, but the agent operation is not
+        // over: subsystems that must not interrupt one (MCP config reloads)
+        // watch this counter.
+        AgentActivity.shared.begin(.toolCall)
+        defer { AgentActivity.shared.end(.toolCall) }
         let wd = workingDirectory ?? defaultWorkingDirectory
         let strArgs = call.arguments.mapValues { String(describing: $0) }
         // maxOutputLength (and maxToolOutputLength) is a TOKEN budget; tools work in

@@ -10,5 +10,13 @@
 	<true/>
 	<key>SUAllowsAutomaticUpdates</key>
 	<true/>
+	<!-- MCP Streamable HTTP servers commonly listen on http://localhost or a
+	     loopback port. NSAllowsLocalNetworking permits exactly the loopback
+	     case while leaving App Transport Security enforced everywhere else. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 </dict>
 </plist>

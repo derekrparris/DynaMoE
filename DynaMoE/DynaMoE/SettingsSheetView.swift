@@ -42,7 +42,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .memory:
             return "Control memory execution, RAM budgets, KV-cache precision, SSD expert paging, and live diagnostics."
         case .agent:
-            return "Configure agent tools, workspace, safety limits, web search, codebase indexing, subagents, and developer tooling."
+            return "Configure agent tools, workspace, safety limits, web search, codebase indexing, subagents, MCP tool servers, and developer tooling."
         case .server:
             return "Serve the loaded model over a local OpenAI- and Anthropic-compatible API for clients like Crush; configure access and watch live activity."
         case .advanced:
@@ -75,7 +75,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .memory:
             return ["memory", "ram", "budget", "kv cache", "precision", "fp8", "fp16", "prefetch", "ssd", "paging", "diagnostics", "cache", "lookahead depth", "execution mode", "working set budget"]
         case .agent:
-            return ["agent", "tools", "turbo", "grammar", "workspace", "directory", "search", "brave", "chrome", "index", "rag", "subagent", "git", "lint", "dogfood", "benchmark", "max multi-step agent iterations", "max tool output", "working directory"]
+            return ["agent", "tools", "turbo", "grammar", "workspace", "directory", "search", "brave", "chrome", "index", "rag", "subagent", "git", "lint", "dogfood", "benchmark", "max multi-step agent iterations", "max tool output", "working directory", "mcp", "model context protocol", "keychain", "mcp.json", "stdio", "streamable http", "external tools"]
         case .server:
             return ["server", "api", "openai", "endpoint", "port", "api key", "completions", "local server", "crush", "http", "chat completions", "inference", "v1"]
         case .advanced:
@@ -1132,6 +1132,11 @@ struct SettingsSheetView: View {
                     Toggle("Enable Agent Tools by Default", isOn: $isAgentToolsGloballyEnabled)
                         .toggleStyle(.switch)
                         .labelsHidden()
+                        .onChange(of: isAgentToolsGloballyEnabled) { _, _ in
+                            // MCP tools are pointless without the agent, so the
+                            // servers are reconciled against this switch too.
+                            Task { await MCPManager.shared.apply() }
+                        }
                 }
 
                 SettingsRowDivider()
@@ -1472,6 +1477,9 @@ struct SettingsSheetView: View {
                         .foregroundColor(.secondary)
                 }
             }
+
+            // Model Context Protocol servers (external tool integrations)
+            MCPSettingsSection()
 
             // Deep Developer Tooling (Native Git & SourceKit-LSP) Card
             SettingsCard(header: "Developer Tooling", spacing: 10) {
