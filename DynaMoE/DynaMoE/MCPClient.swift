@@ -802,11 +802,21 @@ public final class MCPHTTPTransport: MCPTransport, @unchecked Sendable {
         do {
             (bytes, response) = try await session.bytes(for: request)
         } catch {
-            throw MCPClientError.connectionClosed("HTTP request failed: \(error.localizedDescription)")
+            let reason = "HTTP request failed: \(error.localizedDescription)"
+            // A cancellation belongs to an abandoned request and a timeout to a
+            // slow server; neither means the session is gone. An endpoint that
+            // cannot be reached or negotiated with is a terminal closure, and
+            // the stream ending is how the client and its manager find out.
+            if Self.isTerminalTransportError(error) {
+                finish(reason: reason)
+            }
+            throw MCPClientError.connectionClosed(reason)
         }
 
         guard let http = response as? HTTPURLResponse else {
-            throw MCPClientError.connectionClosed("The MCP endpoint returned a non-HTTP response.")
+            let reason = "The MCP endpoint returned a non-HTTP response."
+            finish(reason: reason)
+            throw MCPClientError.connectionClosed(reason)
         }
 
         if let newSession = http.value(forHTTPHeaderField: "Mcp-Session-Id") {
@@ -818,7 +828,9 @@ public final class MCPHTTPTransport: MCPTransport, @unchecked Sendable {
         }
         if http.statusCode == 404, snapshot.sessionId != nil {
             storeSessionId(nil)
-            throw MCPClientError.connectionClosed("The MCP session expired (HTTP 404). Reconnect the server.")
+            let reason = "The MCP session expired (HTTP 404). Reconnect the server."
+            finish(reason: reason)
+            throw MCPClientError.connectionClosed(reason)
         }
         guard (200..<300).contains(http.statusCode) else {
             let body = await Self.drain(bytes, limit: 4096)
@@ -830,9 +842,9 @@ public final class MCPHTTPTransport: MCPTransport, @unchecked Sendable {
         let task = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
             if contentType.contains("text/event-stream") {
-                await self.consumeSSE(bytes)
+                await self.consumeSSE(bytes, request: payload)
             } else {
-                await self.consumeJSON(bytes)
+                await self.consumeJSON(bytes, request: payload)
             }
             self.untrack(taskID)
         }
@@ -897,10 +909,43 @@ public final class MCPHTTPTransport: MCPTransport, @unchecked Sendable {
         inFlight.removeValue(forKey: id)
     }
 
+    /// Ends this transport's message stream because the session cannot be used
+    /// any more. The stream finishing is what makes `MCPClient` mark itself
+    /// closed, fail its pending requests, and report a terminal failure to the
+    /// manager, so a dead HTTP endpoint cannot keep a Ready row and its tools
+    /// alive. Idempotent, and a later `close()` keeps the useful reason.
+    private func finish(reason: String) {
+        lock.lock()
+        if didClose {
+            lock.unlock()
+            return
+        }
+        didClose = true
+        _closureReason = reason
+        lock.unlock()
+        DiagLog.error("mcp", "server=\(label) connection ended: \(reason)")
+        continuation.finish()
+    }
+
+    /// Whether a URLSession failure means the endpoint is gone rather than
+    /// slow or abandoned. A timeout or a cancellation leaves the session
+    /// usable, so those must not tear the connection down.
+    static func isTerminalTransportError(_ error: Error) -> Bool {
+        guard let urlError = error as? URLError else { return false }
+        switch urlError.code {
+        case .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed,
+             .networkConnectionLost, .badServerResponse, .secureConnectionFailed,
+             .serverCertificateUntrusted:
+            return true
+        default:
+            return false
+        }
+    }
+
     public func close() {
         lock.lock()
+        if !didClose { _closureReason = "closed" }
         didClose = true
-        _closureReason = "closed"
         let sessionId = self.sessionId
         let version = protocolVersion
         let tasks = inFlight.values
@@ -931,18 +976,28 @@ public final class MCPHTTPTransport: MCPTransport, @unchecked Sendable {
 
     // MARK: Body consumption
 
-    private func consumeJSON(_ bytes: URLSession.AsyncBytes) async {
+    private func consumeJSON(_ bytes: URLSession.AsyncBytes, request: Data) async {
         var data = Data()
         do {
             for try await byte in bytes {
                 data.append(byte)
                 if data.count > Self.maxMessageBytes {
                     DiagLog.error("mcp", "server=\(label) HTTP response exceeded \(Self.maxMessageBytes) bytes")
+                    deliverResponseError(
+                        for: request,
+                        message: "The MCP response exceeded \(Self.maxMessageBytes) bytes and was discarded."
+                    )
                     return
                 }
             }
         } catch {
             DiagLog.warning("mcp", "server=\(label) HTTP body error: \(error.localizedDescription)")
+            if !connectionState().isClosed {
+                deliverResponseError(
+                    for: request,
+                    message: "The MCP response could not be read: \(error.localizedDescription)"
+                )
+            }
             return
         }
         guard !data.isEmpty else { return }
@@ -959,7 +1014,7 @@ public final class MCPHTTPTransport: MCPTransport, @unchecked Sendable {
         continuation.yield(data)
     }
 
-    private func consumeSSE(_ bytes: URLSession.AsyncBytes) async {
+    private func consumeSSE(_ bytes: URLSession.AsyncBytes, request: Data) async {
         var lineBuffer = MCPLineBuffer(limit: Self.maxMessageBytes)
         var frames = MCPSSEFrameParser()
 
@@ -990,10 +1045,51 @@ public final class MCPHTTPTransport: MCPTransport, @unchecked Sendable {
             }
         } catch {
             DiagLog.warning("mcp", "server=\(label) SSE stream error: \(error.localizedDescription)")
+            if !connectionState().isClosed {
+                deliverResponseError(
+                    for: request,
+                    message: "The MCP response could not be read: \(error.localizedDescription)"
+                )
+            }
+            return
         }
-        if frames.overflowed {
+        if lineBuffer.overflowed || frames.overflowed {
+            // Failing the waiter now is the difference between a clear "too
+            // large" error and a call that sits out the whole tool deadline and
+            // then claims it timed out.
             DiagLog.error("mcp", "server=\(label) SSE event exceeded \(Self.maxMessageBytes) bytes")
+            deliverResponseError(
+                for: request,
+                message: "The MCP response exceeded \(Self.maxMessageBytes) bytes and was discarded."
+            )
         }
+    }
+
+    /// Hands the client a JSON-RPC error for the request whose response could
+    /// not be delivered. The transport cannot throw into a pending request, so
+    /// this frame is the only way to settle it without waiting for the deadline.
+    private func deliverResponseError(for request: Data, message: String) {
+        guard let frame = Self.responseErrorFrame(request: request, message: message) else { return }
+        continuation.yield(frame)
+    }
+
+    /// Builds that error frame for the request's own id. A notification has no
+    /// id and therefore no waiter to fail. Internal so a test can pin that the
+    /// id's type and value come back verbatim.
+    static func responseErrorFrame(request: Data, message: String) -> Data? {
+        guard let value = MCPJSONValue(data: request),
+              case .object(let object) = value,
+              let id = object["id"],
+              !id.isNull else { return nil }
+        let payload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": id.anyValue,
+            "error": [
+                "code": -32603,
+                "message": message
+            ]
+        ]
+        return try? JSONSerialization.data(withJSONObject: payload, options: [.withoutEscapingSlashes])
     }
 
     /// Gateways answer a malformed request with a full HTML page. Showing that
@@ -1268,6 +1364,9 @@ public actor MCPClient {
         let method: String
         let continuation: CheckedContinuation<MCPResponseEnvelope, any Error>
         let sendTask: Task<Void, Never>?
+        /// The deadline timer. Cancelled as soon as the request settles, so a
+        /// session of many calls does not leave one sleeper per call behind.
+        var deadlineTask: Task<Void, Never>?
         var dispatched = false
     }
 
@@ -1500,7 +1599,7 @@ public actor MCPClient {
 
                 // Late deadlines are harmless: `abandon` is a no-op once the
                 // request has completed or already been abandoned.
-                Task.detached(priority: .utility) { [weak self] in
+                let deadlineTask = Task.detached(priority: .utility) { [weak self] in
                     // A configured timeout is arbitrary JSON, so clamp it to
                     // the timer's range before the `UInt64` conversion traps.
                     let seconds = MCPServerConfig.timerSeconds(forTimeout: timeout)
@@ -1512,6 +1611,9 @@ public actor MCPClient {
                         reason: "client timed out waiting for the response"
                     )
                 }
+                // Settling the request cancels this timer, so completed calls
+                // leave no sleeper behind for the rest of the timeout.
+                self.pending[id]?.deadlineTask = deadlineTask
             }
         } onCancel: {
             Task.detached(priority: .utility) { [weak self] in
@@ -1541,6 +1643,7 @@ public actor MCPClient {
     /// left, so late abandons are ignored.
     private func abandon(id: Int, error: any Error, reason: String) {
         guard let entry = pending.removeValue(forKey: id) else { return }
+        entry.deadlineTask?.cancel()
         if entry.dispatched {
             if entry.method != "initialize", !isClosed {
                 notifyCancelled(requestID: id, reason: reason)
@@ -1553,6 +1656,7 @@ public actor MCPClient {
 
     private func failPending(id: Int, error: any Error) {
         guard let entry = pending.removeValue(forKey: id) else { return }
+        entry.deadlineTask?.cancel()
         entry.continuation.resume(throwing: error)
     }
 
@@ -1561,6 +1665,7 @@ public actor MCPClient {
         pending.removeAll()
         for (_, entry) in entries {
             entry.sendTask?.cancel()
+            entry.deadlineTask?.cancel()
             entry.continuation.resume(throwing: error)
         }
     }
@@ -1598,6 +1703,7 @@ public actor MCPClient {
 
         guard let id = message.id,
               let entry = pending.removeValue(forKey: id) else { return }
+        entry.deadlineTask?.cancel()
         entry.continuation.resume(returning: MCPResponseEnvelope(
             result: message.result,
             errorCode: message.errorCode,

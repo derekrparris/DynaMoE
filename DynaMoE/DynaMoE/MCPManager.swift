@@ -125,16 +125,25 @@ public final class MCPManager: ObservableObject {
     /// directory watcher alone misses that save style.
     private var fileWatcher: DispatchSourceFileSystemObject?
     private var fileWatcherDescriptor: Int32 = -1
+    /// False once `stopWatching()` has run. A cancellation does not discard
+    /// event handlers that are already queued on the main queue, and those
+    /// handlers reattach the file watcher, so without this a shut-down manager
+    /// could start watching (and reloading) again.
+    private var isWatching = false
     private var configToken: String?
     private var applyInFlight = false
     private var applyRequested = false
     private var pendingReload = false
-    /// Servers whose stored credential changed while an agent operation was
-    /// running. A credential is not part of the config file, so reconciliation
-    /// cannot see it; these keys are restarted once the agent is idle.
-    private var deferredCredentialRestarts: Set<String> = []
+    /// Servers whose stored credential changed, or whose `${workspace}`
+    /// expansion went stale, while an agent operation was running. Neither is
+    /// part of the config file, so reconciliation cannot see them; these keys
+    /// are restarted once the agent is idle.
+    private var deferredRestarts: Set<String> = []
     private var deferredReloadTask: Task<Void, Never>?
     private var terminationObserver: NSObjectProtocol?
+    /// Watches the workspace setting that `${workspace}` expands to.
+    private var workspaceObserver: NSObjectProtocol?
+    private var lastWorkspacePath: String?
 
     #if DEBUG
     /// Test seam: supplies the transport for a handshake instead of a real
@@ -164,8 +173,8 @@ public final class MCPManager: ObservableObject {
         return UserDefaults.standard.bool(forKey: agentToolsKey)
     }
 
-    /// True when the master switch, the agent-tools switch, and at least one
-    /// enabled server all agree that MCP should be live.
+    /// True when the master switch and the agent-tools switch both allow MCP.
+    /// Whether any server is enabled is per-entry and handled by `apply()`.
     public var isActive: Bool {
         Self.isEnabledRequested && Self.agentToolsEnabled
     }
@@ -185,6 +194,7 @@ public final class MCPManager: ObservableObject {
     /// Called once at app launch. Starts the config watcher and reconciles.
     public func bootstrap() {
         installTerminationObserver()
+        installWorkspaceObserver()
         startWatching()
         reloadFromDisk(reason: "launch")
     }
@@ -201,6 +211,30 @@ public final class MCPManager: ObservableObject {
             MainActor.assumeIsolated {
                 MCPManager.shared.emergencyShutdown()
             }
+        }
+    }
+
+    /// Watches the workspace setting `${workspace}` expands to. The value is
+    /// expanded at connect time and never written back, so reconciliation
+    /// cannot notice that a connected server is scoped to the old project.
+    private func installWorkspaceObserver() {
+        guard workspaceObserver == nil else { return }
+        lastWorkspacePath = Self.configuredWorkspacePath
+        workspaceObserver = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.handleWorkspaceChange()
+            }
+        }
+    }
+
+    private func removeWorkspaceObserver() {
+        if let workspaceObserver {
+            NotificationCenter.default.removeObserver(workspaceObserver)
+            self.workspaceObserver = nil
         }
     }
 
@@ -593,9 +627,7 @@ public final class MCPManager: ObservableObject {
             failedConfigs[key] = nil
             runtime[key] = ServerRuntime(
                 status: .ready,
-                error: descriptors.count > visible.count
-                    ? "Only the first \(visible.count) of \(descriptors.count) tools are exposed; the rest exceed the tool cap."
-                    : nil,
+                error: Self.toolCapMessage(exposed: visible.count, total: descriptors.count),
                 instructions: instructions,
                 qualifiedToolNames: bridges.map { $0.definition.function.name },
                 remoteToolNames: visible.map(\.name)
@@ -675,12 +707,21 @@ public final class MCPManager: ObservableObject {
         )
         var state = runtime[serverKey] ?? ServerRuntime(status: .ready)
         state.status = .ready
+        // A refresh can bring the list back under the cap, so the warning is
+        // recomputed rather than inherited.
+        state.error = Self.toolCapMessage(exposed: visible.count, total: descriptors.count)
         state.qualifiedToolNames = bridges.map { $0.definition.function.name }
         state.remoteToolNames = visible.map(\.name)
         runtime[serverKey] = state
         publishStates()
         DiagLog.info("mcp", "server=\(serverKey) tool list refreshed: \(bridges.count) tools")
         return true
+    }
+
+    private static func toolCapMessage(exposed: Int, total: Int) -> String? {
+        total > exposed
+            ? "Only the first \(exposed) of \(total) tools are exposed; the rest exceed the tool cap."
+            : nil
     }
 
     /// A live server exited on its own. The client reports it, but the manager
@@ -783,6 +824,7 @@ public final class MCPManager: ObservableObject {
 
     private func startWatching() {
         guard watcher == nil, let directory = MCPConfigStore.directoryURL else { return }
+        isWatching = true
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
         let descriptor = open(directory.path, O_EVTONLY)
@@ -870,6 +912,10 @@ public final class MCPManager: ObservableObject {
     }
 
     private func stopWatching() {
+        // Set before cancelling: an event handler already queued on the main
+        // queue still runs after `cancel()`, and it would reattach the file
+        // watcher, leaving a descriptor (and reloads) alive after shutdown.
+        isWatching = false
         watcher?.cancel()
         watcher = nil
         watcherDescriptor = -1
@@ -885,6 +931,7 @@ public final class MCPManager: ObservableObject {
     }
 
     private func handleDirectoryChange() {
+        guard isWatching else { return }
         // Reattach whatever triggered this: a replacement save unlinked the
         // inode the file watcher held, and its path now holds a new one.
         attachFileWatcher()
@@ -908,12 +955,12 @@ public final class MCPManager: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 guard let self else { return }
-                guard self.pendingReload || !self.deferredCredentialRestarts.isEmpty else { break }
+                guard self.pendingReload || !self.deferredRestarts.isEmpty else { break }
                 if self.isAgentOperationActive { continue }
                 let reload = self.pendingReload
-                let restarts = self.deferredCredentialRestarts
+                let restarts = self.deferredRestarts
                 self.pendingReload = false
-                self.deferredCredentialRestarts.removeAll()
+                self.deferredRestarts.removeAll()
                 for key in restarts {
                     self.restart(key: key)
                 }
@@ -936,8 +983,38 @@ public final class MCPManager: ObservableObject {
             restart(key: key)
             return
         }
-        deferredCredentialRestarts.insert(key)
+        deferredRestarts.insert(key)
         scheduleDeferredReload()
+    }
+
+    /// Reconnects the servers whose `${workspace}` expansion just went stale.
+    /// The value is expanded when the server connects and never written back,
+    /// so an edit to the workspace setting is invisible to `apply()`. It is a
+    /// scope change, not a cosmetic one: a filesystem server left pointing at
+    /// the previous project is the broader-than-intended access the token
+    /// exists to prevent.
+    func handleWorkspaceChange() {
+        let current = Self.configuredWorkspacePath
+        guard current != lastWorkspacePath else { return }
+        lastWorkspacePath = current
+        guard isActive else { return }
+
+        let keys = document.mcpServers
+            .filter { $1.enabled && $1.referencesWorkspaceToken }
+            .map(\.key)
+        guard !keys.isEmpty else { return }
+
+        if isAgentOperationActive {
+            deferredRestarts.formUnion(keys)
+            scheduleDeferredReload()
+            return
+        }
+        for key in keys {
+            // `restart` also clears a terminal failure: this server now has a
+            // different expansion than the one that failed.
+            restart(key: key)
+        }
+        DiagLog.info("mcp", "workspace changed; reconnected \(keys.count) workspace-scoped server(s)")
     }
 
     // MARK: Shutdown
@@ -948,7 +1025,8 @@ public final class MCPManager: ObservableObject {
         stopWatching()
         deferredReloadTask?.cancel()
         deferredReloadTask = nil
-        deferredCredentialRestarts.removeAll()
+        deferredRestarts.removeAll()
+        removeWorkspaceObserver()
         cancelAllAttempts(reason: "shutting down")
         for key in connections.keys {
             disconnectSynchronously(key: key, reason: "app terminating")
@@ -976,7 +1054,8 @@ public final class MCPManager: ObservableObject {
         connections.removeAll()
         runtime.removeAll()
         failedConfigs.removeAll()
-        deferredCredentialRestarts.removeAll()
+        deferredRestarts.removeAll()
+        removeWorkspaceObserver()
         for client in clients {
             await client.stop()
         }

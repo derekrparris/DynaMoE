@@ -271,6 +271,19 @@ final class MCPConfigModelTests: XCTestCase {
         )
     }
 
+    func testWorkspaceTokenDetectionCoversEveryConnectTimeField() {
+        XCTAssertTrue(MCPServerConfig(command: "npx", args: ["${workspace}/server.js"]).referencesWorkspaceToken)
+        XCTAssertTrue(MCPServerConfig(command: "npx", cwd: "${workspace}").referencesWorkspaceToken)
+        XCTAssertTrue(MCPServerConfig(url: "https://example.com/${workspace}").referencesWorkspaceToken)
+        XCTAssertTrue(MCPServerConfig(command: "npx", env: ["ROOT": "${workspace}"]).referencesWorkspaceToken)
+        XCTAssertTrue(MCPServerConfig(url: "https://example.com", headers: ["X-Root": "${workspace}"]).referencesWorkspaceToken)
+        XCTAssertFalse(
+            MCPServerConfig(command: "npx", args: ["${workspace_old}/server.js"]).referencesWorkspaceToken,
+            "a token whose body only starts with 'workspace' expands to nothing, so it is not a scope change"
+        )
+        XCTAssertFalse(MCPServerConfig(command: "npx", args: ["server.js"]).referencesWorkspaceToken)
+    }
+
     func testArgumentEditorTreatsBlankInputAsNoArguments() {
         XCTAssertEqual(MCPAddServerSheet.parseArguments(""), [] as [String])
         XCTAssertEqual(MCPAddServerSheet.parseArguments("  \n "), [] as [String])
@@ -620,6 +633,38 @@ final class MCPHTTPTransportTests: XCTestCase {
         transport.setNegotiatedProtocolVersion("   ")
         let request = transport.makeRequest(payload: Data("{}".utf8), sessionId: nil)
         XCTAssertEqual(request.value(forHTTPHeaderField: "MCP-Protocol-Version"), MCPWire.protocolVersion)
+    }
+
+    func testResponseErrorFrameEchoesTheRequestIDVerbatim() throws {
+        let payload = Data(#"{"jsonrpc":"2.0","id":"health-check","method":"tools/call"}"#.utf8)
+        let frame = try XCTUnwrap(
+            MCPHTTPTransport.responseErrorFrame(request: payload, message: "too large")
+        )
+        let value = try XCTUnwrap(MCPJSONValue(data: frame))
+        XCTAssertEqual(value["id"], .string("health-check"))
+        XCTAssertEqual(value["error"]?["code"], .int(-32603))
+        XCTAssertEqual(value["error"]?["message"], .string("too large"))
+    }
+
+    func testResponseErrorFrameIsSkippedForNotifications() {
+        let payload = Data(#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.utf8)
+        XCTAssertNil(
+            MCPHTTPTransport.responseErrorFrame(request: payload, message: "too large"),
+            "a notification has no waiter to fail"
+        )
+    }
+
+    func testTerminalTransportErrorsExcludeTimeoutsAndCancellations() {
+        XCTAssertTrue(MCPHTTPTransport.isTerminalTransportError(URLError(.cannotConnectToHost)))
+        XCTAssertTrue(MCPHTTPTransport.isTerminalTransportError(URLError(.networkConnectionLost)))
+        XCTAssertFalse(
+            MCPHTTPTransport.isTerminalTransportError(URLError(.timedOut)),
+            "a slow server is not a dead session"
+        )
+        XCTAssertFalse(
+            MCPHTTPTransport.isTerminalTransportError(URLError(.cancelled)),
+            "a cancelled send belongs to an abandoned request, not a closure"
+        )
     }
 }
 
@@ -2332,6 +2377,60 @@ final class MCPManagerAttemptOwnershipTests: XCTestCase {
             resolvedArguments,
             ["/tmp/dynamoe-mcp-workspace/server.js"],
             "${workspace} must be the project selected in Settings, not the home directory"
+        )
+    }
+
+    /// A workspace edit is a scope change: a filesystem server must not keep
+    /// serving the project it was expanded against, and a server that never
+    /// mentions the token must not be disturbed.
+    func testWorkspaceChangeReconnectsOnlyWorkspaceScopedServers() async throws {
+        let manager = MCPManager.shared
+        let key = MCPManager.workspaceKey
+        let saved = UserDefaults.standard.object(forKey: key)
+        defer {
+            if let saved {
+                UserDefaults.standard.set(saved, forKey: key)
+            } else {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+            // Re-sync the manager's remembered path without leaving an attempt
+            // running for the next test's teardown to cancel.
+            manager.handleWorkspaceChange()
+        }
+
+        UserDefaults.standard.set("/tmp/dynamoe-mcp-ws-one", forKey: key)
+        manager.handleWorkspaceChange()
+
+        var servers: [MutableToolMockServer] = []
+        var argumentsByKey: [String: [[String]]] = [:]
+        manager.transportFactory = { resolved in
+            let server = MutableToolMockServer(tools: [["name": "echo", "inputSchema": ["type": "object"]]])
+            servers.append(server)
+            argumentsByKey[resolved.key, default: []].append(resolved.arguments)
+            return server.transport
+        }
+
+        var document = MCPConfigDocument()
+        document["scoped"] = MCPServerConfig(command: "npx", args: ["${workspace}/server.js"])
+        document["plain"] = MCPServerConfig(command: "npx", args: ["server.js"])
+        await manager.installDocumentForTesting(document)
+        try await waitUntil("both servers to connect") {
+            manager.servers.count == 2 && manager.servers.allSatisfy { $0.status == .ready }
+        }
+        XCTAssertEqual(argumentsByKey["scoped"]?.first, ["/tmp/dynamoe-mcp-ws-one/server.js"])
+
+        UserDefaults.standard.set("/tmp/dynamoe-mcp-ws-two", forKey: key)
+        manager.handleWorkspaceChange()
+
+        try await waitUntil("the scoped server to reconnect") {
+            argumentsByKey["scoped"]?.count == 2
+                && manager.servers.first(where: { $0.key == "scoped" })?.status == .ready
+        }
+        XCTAssertEqual(argumentsByKey["scoped"]?.last, ["/tmp/dynamoe-mcp-ws-two/server.js"])
+        XCTAssertEqual(
+            argumentsByKey["plain"]?.count,
+            1,
+            "a server that does not use ${workspace} must not be restarted"
         )
     }
 

@@ -5166,7 +5166,15 @@ struct ContentView: View {
                     var anyCompleted = false
                     var ranCompleteTool = false
 
+                    // A call and the approval that authorizes it are one
+                    // operation. `executeTool` raises the same counter, but the
+                    // approval wait ends before it starts, and a deferred MCP
+                    // config reload landing in that gap would close the
+                    // transport the approved call is about to use.
                     for (idx, call) in actionableCalls.enumerated() {
+                        AgentActivity.shared.begin(.toolCall)
+                        defer { AgentActivity.shared.end(.toolCall) }
+
                         if Task.isCancelled {
                             await MainActor.run {
                                 guard self.ownsGeneration(myGenerationId) else { return }

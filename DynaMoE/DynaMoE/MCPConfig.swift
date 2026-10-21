@@ -110,6 +110,18 @@ public nonisolated struct MCPServerConfig: Codable, Equatable, Sendable {
         }
     }
 
+    /// True when any field that is expanded at connect time uses
+    /// `${workspace}`. The token's value is never stored, so reconciliation
+    /// cannot see a workspace change and these servers have to be restarted
+    /// explicitly when the setting moves.
+    public var referencesWorkspaceToken: Bool {
+        let fields = [command ?? "", cwd ?? "", url ?? ""]
+            + (args ?? [])
+            + Array((env ?? [:]).values)
+            + Array((headers ?? [:]).values)
+        return fields.contains { $0.contains(MCPTokenExpander.workspaceToken) }
+    }
+
     // MARK: Codable
 
     private enum CodingKeys: String, CodingKey {
@@ -575,6 +587,10 @@ public nonisolated enum MCPTokenExpander {
     public static func keychainToken(account: String) -> String {
         "${keychain:\(account)}"
     }
+
+    /// The token whose value is the agent's selected workspace. Expanding it is
+    /// what scopes a server to a project, so a change means reconnecting.
+    public static let workspaceToken = "${workspace}"
 
     public static func envToken(name: String) -> String {
         "${env:\(name)}"

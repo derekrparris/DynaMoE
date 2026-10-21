@@ -421,7 +421,7 @@ The file at `~/Library/Application Support/DynaMoE/mcp.json` is the single sourc
 - **`enabled`** defaults to `true` when omitted, so a config pasted from another client works as-is.
 - **Server names** may contain letters, digits, `-` and `_`. They may not contain `__` or end with `_`, because tool names are built as `mcp__<server>__<tool>`: a name ending in `_` would run into that separator and share tool names with the name without it.
 - **Secrets**: any env value or header may be a `${keychain:...}` token instead of plaintext. The Settings form has a per-field **Keychain** checkbox that stores the value in the login Keychain and writes only the token to disk.
-- **Other tokens**: `${env:NAME}` reads an environment variable; `${workspace}` is the agent working directory. Tokens are expanded when a server connects and are never written back.
+- **Other tokens**: `${env:NAME}` reads an environment variable; `${workspace}` is the agent working directory. Tokens are expanded when a server connects and are never written back, so changing the workspace reconnects every server that uses `${workspace}` instead of leaving it scoped to the previous project.
 
 #### Tool Discovery & Loading
 

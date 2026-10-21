@@ -918,7 +918,7 @@ struct MCPAddServerSheet: View {
         func rollback() {
             for entry in applied.reversed() {
                 if let previous = entry.previous {
-                    try? MCPSecretStore.set(previous, account: entry.account)
+                    _ = try? MCPSecretStore.set(previous, account: entry.account)
                 } else {
                     MCPSecretStore.delete(account: entry.account)
                 }
