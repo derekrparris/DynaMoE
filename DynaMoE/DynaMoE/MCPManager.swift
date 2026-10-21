@@ -129,6 +129,10 @@ public final class MCPManager: ObservableObject {
     private var applyInFlight = false
     private var applyRequested = false
     private var pendingReload = false
+    /// Servers whose stored credential changed while an agent operation was
+    /// running. A credential is not part of the config file, so reconciliation
+    /// cannot see it; these keys are restarted once the agent is idle.
+    private var deferredCredentialRestarts: Set<String> = []
     private var deferredReloadTask: Task<Void, Never>?
     private var terminationObserver: NSObjectProtocol?
 
@@ -904,14 +908,36 @@ public final class MCPManager: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 guard let self else { return }
-                guard self.pendingReload else { break }
+                guard self.pendingReload || !self.deferredCredentialRestarts.isEmpty else { break }
                 if self.isAgentOperationActive { continue }
+                let reload = self.pendingReload
+                let restarts = self.deferredCredentialRestarts
                 self.pendingReload = false
-                self.reloadFromDisk(reason: "external edit (deferred)")
+                self.deferredCredentialRestarts.removeAll()
+                for key in restarts {
+                    self.restart(key: key)
+                }
+                if reload {
+                    self.reloadFromDisk(reason: "external edit (deferred)")
+                }
                 break
             }
             self?.deferredReloadTask = nil
         }
+    }
+
+    /// Applies a credential change. A Keychain value is expanded at connect
+    /// time and never written to the config, so reconciling the file cannot
+    /// pick it up; the connection has to be replaced. Waits for an agent
+    /// operation to finish for the same reason a file edit does: restarting
+    /// mid-turn would close the transport under a live tool call.
+    public func reconnectAfterCredentialChange(key: String) {
+        guard isAgentOperationActive else {
+            restart(key: key)
+            return
+        }
+        deferredCredentialRestarts.insert(key)
+        scheduleDeferredReload()
     }
 
     // MARK: Shutdown
@@ -922,6 +948,7 @@ public final class MCPManager: ObservableObject {
         stopWatching()
         deferredReloadTask?.cancel()
         deferredReloadTask = nil
+        deferredCredentialRestarts.removeAll()
         cancelAllAttempts(reason: "shutting down")
         for key in connections.keys {
             disconnectSynchronously(key: key, reason: "app terminating")
@@ -949,6 +976,7 @@ public final class MCPManager: ObservableObject {
         connections.removeAll()
         runtime.removeAll()
         failedConfigs.removeAll()
+        deferredCredentialRestarts.removeAll()
         for client in clients {
             await client.stop()
         }

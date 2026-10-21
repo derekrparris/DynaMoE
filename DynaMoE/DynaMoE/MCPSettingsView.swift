@@ -759,6 +759,7 @@ struct MCPAddServerSheet: View {
 
     private func save() {
         errorText = nil
+        var secretWritten = false
         let key = existingKey ?? serverKey.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if key.isEmpty {
@@ -796,6 +797,7 @@ struct MCPAddServerSheet: View {
                 errorText = failure
                 return
             }
+            secretWritten = secretWritten || env.secretWritten
             config.env = env.values.isEmpty ? nil : env.values
         case .http:
             let trimmedURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -809,6 +811,7 @@ struct MCPAddServerSheet: View {
                 errorText = failure
                 return
             }
+            secretWritten = secretWritten || headers.secretWritten
             config.headers = headers.values.isEmpty ? nil : headers.values
         }
 
@@ -823,6 +826,12 @@ struct MCPAddServerSheet: View {
             errorText = manager.lastError ?? "Could not save the server."
             return
         }
+        // Only the Keychain value changed, so the config file is identical and
+        // reconciliation has nothing to act on. Reconnect explicitly or the
+        // ready server keeps sending the credential it expanded at connect time.
+        if secretWritten, isEditing {
+            manager.reconnectAfterCredentialChange(key: key)
+        }
         onSaved(key)
         dismiss()
     }
@@ -831,33 +840,35 @@ struct MCPAddServerSheet: View {
         rows: [MCPKeyValueDraft],
         serverKey: String,
         fieldLabel: String
-    ) -> (values: [String: String], error: String?) {
+    ) -> (values: [String: String], secretWritten: Bool, error: String?) {
         var values: [String: String] = [:]
+        var secretWritten = false
         for row in rows {
             let name = row.key.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !name.isEmpty else { continue }
 
             if row.isSecret {
                 guard !serverKey.isEmpty else {
-                    return (values, "Name the server before storing a \(fieldLabel) value in the Keychain.")
+                    return (values, secretWritten, "Name the server before storing a \(fieldLabel) value in the Keychain.")
                 }
                 let account = row.account ?? MCPSecretStore.account(serverKey: serverKey, field: name)
                 let newValue = row.value
                 if !newValue.isEmpty {
                     do {
                         try MCPSecretStore.set(newValue, account: account)
+                        secretWritten = true
                     } catch {
-                        return (values, "Keychain error for \(name): \(error.localizedDescription)")
+                        return (values, secretWritten, "Keychain error for \(name): \(error.localizedDescription)")
                     }
                 } else if !MCPSecretStore.exists(account: account) {
-                    return (values, "No Keychain secret stored for \(name). Type the value or untick Keychain.")
+                    return (values, secretWritten, "No Keychain secret stored for \(name). Type the value or untick Keychain.")
                 }
                 values[name] = MCPTokenExpander.keychainToken(account: account)
             } else {
                 values[name] = row.value
             }
         }
-        return (values, nil)
+        return (values, secretWritten, nil)
     }
 }
 

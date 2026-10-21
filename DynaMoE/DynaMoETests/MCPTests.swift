@@ -2351,6 +2351,9 @@ final class MCPManagerAttemptOwnershipTests: XCTestCase {
         try Data("{\"mcpServers\":{}}".utf8).write(to: file)
 
         let sawWrite = expectation(description: "in-place write reported")
+        // A write can raise more than one event (write plus attribute change);
+        // the reload path is idempotent, so extra callbacks are expected.
+        sawWrite.assertForOverFulfill = false
         let source = MCPManager.makeConfigFileWatcherForTesting(url: file) {
             sawWrite.fulfill()
         }
@@ -2361,6 +2364,54 @@ final class MCPManagerAttemptOwnershipTests: XCTestCase {
         try Data("{\"mcpServers\":{\"a\":{}}}".utf8).write(to: file)
 
         await fulfillment(of: [sawWrite], timeout: 5)
+    }
+
+    /// A healthy server that gets a brand-new transport for every attempt.
+    private func installReconnectingTransportFactory(into record: @escaping (MockMCPTransport) -> Void) {
+        MCPManager.shared.transportFactory = { _ in
+            let transport = MockMCPTransport()
+            transport.responder = { request, transport in
+                guard let id = request["id"] else { return }
+                switch request["method"] as? String {
+                case "initialize":
+                    transport.reply(id: id, result: [
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": ["tools": [:]],
+                        "serverInfo": ["name": "credential-server", "version": "1"]
+                    ])
+                case "tools/list":
+                    transport.reply(id: id, result: ["tools": [["name": "echo", "inputSchema": ["type": "object"]]]])
+                default:
+                    transport.replyError(id: id, code: -32601, message: "unsupported")
+                }
+            }
+            record(transport)
+            return transport
+        }
+    }
+
+    func testCredentialChangeHoldsItsReconnectUntilTheAgentIsIdle() async throws {
+        let manager = MCPManager.shared
+        var transports: [MockMCPTransport] = []
+        installReconnectingTransportFactory { transports.append($0) }
+
+        await manager.installDocumentForTesting(document(command: "first"))
+        try await waitUntil("the connection") { manager.servers.first?.status == .ready }
+        XCTAssertEqual(transports.count, 1)
+
+        // A tool call is in flight when the credential is saved.
+        AgentActivity.shared.begin(.toolCall)
+        manager.reconnectAfterCredentialChange(key: "race")
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(
+            transports.count,
+            1,
+            "restarting here would close the transport under the live call"
+        )
+        AgentActivity.shared.end(.toolCall)
+
+        try await waitUntil("the deferred reconnect", timeout: 6) { transports.count == 2 }
+        try await waitUntil("the replacement connection") { manager.servers.first?.status == .ready }
     }
 
     func testToolListRefreshUpdatesTheLiveConnection() async throws {
