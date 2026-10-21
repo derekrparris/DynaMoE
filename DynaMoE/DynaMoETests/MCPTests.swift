@@ -2319,6 +2319,28 @@ final class MCPManagerAttemptOwnershipTests: XCTestCase {
         try await waitUntil("the restarted attempt") { transports.count == 2 }
     }
 
+    func testInPlaceRewriteOfTheConfigFileTriggersAReloadSignal() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dynamoe-mcp-watch-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let file = directory.appendingPathComponent("mcp.json")
+        try Data("{\"mcpServers\":{}}".utf8).write(to: file)
+
+        let sawWrite = expectation(description: "in-place write reported")
+        let source = MCPManager.makeConfigFileWatcherForTesting(url: file) {
+            sawWrite.fulfill()
+        }
+        let watcher = try XCTUnwrap(source, "could not watch the temp file")
+        defer { watcher.cancel() }
+
+        // The save style a directory watcher misses: same inode, rewritten.
+        try Data("{\"mcpServers\":{\"a\":{}}}".utf8).write(to: file)
+
+        await fulfillment(of: [sawWrite], timeout: 5)
+    }
+
     func testToolListRefreshUpdatesTheLiveConnection() async throws {
         let manager = MCPManager.shared
         let server = MutableToolMockServer(tools: [["name": "echo", "inputSchema": ["type": "object"]]])

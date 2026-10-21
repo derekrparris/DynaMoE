@@ -120,6 +120,11 @@ public final class MCPManager: ObservableObject {
     private var failedConfigs: [String: MCPServerConfig] = [:]
     private var watcher: DispatchSourceFileSystemObject?
     private var watcherDescriptor: Int32 = -1
+    /// The config file itself, watched alongside its directory: an in-place
+    /// rewrite of the existing file produces no directory entry, so the
+    /// directory watcher alone misses that save style.
+    private var fileWatcher: DispatchSourceFileSystemObject?
+    private var fileWatcherDescriptor: Int32 = -1
     private var configToken: String?
     private var applyInFlight = false
     private var applyRequested = false
@@ -777,35 +782,94 @@ public final class MCPManager: ObservableObject {
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
         let descriptor = open(directory.path, O_EVTONLY)
-        guard descriptor >= 0 else {
+        if descriptor < 0 {
             DiagLog.warning("mcp", "could not watch the config directory; external edits need a manual reload")
-            return
-        }
-        watcherDescriptor = descriptor
+        } else {
+            watcherDescriptor = descriptor
 
-        // Watching the directory rather than the file catches atomic writes,
-        // which replace the inode and would silently detach a file watcher.
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: descriptor,
-            eventMask: [.write, .rename, .delete],
-            queue: .main
-        )
-        source.setEventHandler { [weak self] in
+            // The directory covers entry creation and replacement, which is how
+            // atomic saves land.
+            let source = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: descriptor,
+                eventMask: [.write, .rename, .delete],
+                queue: .main
+            )
+            source.setEventHandler { [weak self] in
+                MainActor.assumeIsolated {
+                    self?.handleDirectoryChange()
+                }
+            }
+            source.setCancelHandler {
+                close(descriptor)
+            }
+            source.resume()
+            watcher = source
+        }
+
+        attachFileWatcher()
+    }
+
+    /// Watches `mcp.json` itself for the save style a directory watcher cannot
+    /// see: truncating and rewriting the existing file changes no directory
+    /// entry. Detaches first so the atomic style, which replaces the inode,
+    /// re-attaches to the file now at the path instead of the unlinked one.
+    private func attachFileWatcher() {
+        detachFileWatcher()
+        guard let url = MCPConfigStore.defaultURL else { return }
+        guard let made = Self.makeFileWatcher(url: url, onChange: { [weak self] in
             MainActor.assumeIsolated {
                 self?.handleDirectoryChange()
             }
-        }
+        }) else { return }
+        fileWatcherDescriptor = made.descriptor
+        fileWatcher = made.source
+    }
+
+    /// The file watcher used for `mcp.json`. Built in one place so a test can
+    /// prove the production event mask and handler wiring rather than a copy.
+    private static func makeFileWatcher(
+        url: URL,
+        onChange: @escaping @Sendable () -> Void
+    ) -> (source: DispatchSourceFileSystemObject, descriptor: Int32)? {
+        let descriptor = open(url.path, O_EVTONLY)
+        guard descriptor >= 0 else { return nil }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: descriptor,
+            eventMask: [.write, .extend, .attrib, .delete, .rename, .revoke],
+            queue: .main
+        )
+        source.setEventHandler(handler: onChange)
         source.setCancelHandler {
             close(descriptor)
         }
         source.resume()
-        watcher = source
+        return (source, descriptor)
+    }
+
+    #if DEBUG
+    /// Test seam: the production config-file watcher aimed at a temporary file,
+    /// so a test can show that an in-place rewrite is reported.
+    static func makeConfigFileWatcherForTesting(
+        url: URL,
+        onChange: @escaping @MainActor () -> Void
+    ) -> DispatchSourceFileSystemObject? {
+        makeFileWatcher(url: url, onChange: {
+            MainActor.assumeIsolated { onChange() }
+        })?.source
+    }
+    #endif
+
+    private func detachFileWatcher() {
+        fileWatcher?.cancel()
+        fileWatcher = nil
+        fileWatcherDescriptor = -1
     }
 
     private func stopWatching() {
         watcher?.cancel()
         watcher = nil
         watcherDescriptor = -1
+        detachFileWatcher()
     }
 
     /// True while an agent operation that must not be interrupted is running.
@@ -817,6 +881,10 @@ public final class MCPManager: ObservableObject {
     }
 
     private func handleDirectoryChange() {
+        // Reattach whatever triggered this: a replacement save unlinked the
+        // inode the file watcher held, and its path now holds a new one.
+        attachFileWatcher()
+
         let token = MCPConfigStore.modificationToken()
         guard token != configToken else { return }
 
