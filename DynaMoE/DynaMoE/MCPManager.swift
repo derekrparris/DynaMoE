@@ -67,6 +67,9 @@ public final class MCPManager: ObservableObject {
     public nonisolated static let enabledKey = "dynamoe_mcp_enabled"
     /// Agent tools must be enabled for MCP tools to mean anything.
     public nonisolated static let agentToolsKey = "dynamoe_agent_tools_enabled"
+    /// The project folder the agent works in, selected in Settings. Same key
+    /// `ContentView` reads for agent turns.
+    public nonisolated static let workspaceKey = "dynamoe_agent_working_directory"
 
     @Published public private(set) var servers: [MCPServerState] = []
     @Published public private(set) var configIssues: [MCPConfigIssue] = []
@@ -151,6 +154,16 @@ public final class MCPManager: ObservableObject {
     /// enabled server all agree that MCP should be live.
     public var isActive: Bool {
         Self.isEnabledRequested && Self.agentToolsEnabled
+    }
+
+    /// What `${workspace}` stands for. Read from the same persisted setting
+    /// the agent's own turns use, so a filesystem server is scoped to the
+    /// selected project instead of whatever directory the app happened to
+    /// inherit.
+    public nonisolated static var configuredWorkspacePath: String? {
+        let raw = UserDefaults.standard.string(forKey: workspaceKey) ?? ""
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     // MARK: Bootstrap
@@ -354,7 +367,7 @@ public final class MCPManager: ObservableObject {
             return
         }
 
-        let workspacePath = AgentHarness.shared.defaultWorkingDirectory?.path
+        let workspacePath = Self.configuredWorkspacePath ?? AgentHarness.shared.defaultWorkingDirectory?.path
 
         // Tear down anything removed, disabled, or reconfigured.
         for (key, connection) in connections {

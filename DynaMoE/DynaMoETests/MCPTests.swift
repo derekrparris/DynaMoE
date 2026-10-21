@@ -2241,6 +2241,38 @@ final class MCPManagerAttemptOwnershipTests: XCTestCase {
         XCTAssertTrue(transports[1].isClosed, "restart did not stop the live replacement")
     }
 
+    func testWorkspaceTokenResolvesToTheSelectedAgentWorkspace() async throws {
+        let manager = MCPManager.shared
+        let key = MCPManager.workspaceKey
+        let saved = UserDefaults.standard.object(forKey: key)
+        defer {
+            if let saved {
+                UserDefaults.standard.set(saved, forKey: key)
+            } else {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
+        UserDefaults.standard.set("/tmp/dynamoe-mcp-workspace", forKey: key)
+
+        var resolvedArguments: [String] = []
+        let server = MutableToolMockServer(tools: [["name": "echo", "inputSchema": ["type": "object"]]])
+        manager.transportFactory = { resolved in
+            resolvedArguments = resolved.arguments
+            return server.transport
+        }
+
+        var document = MCPConfigDocument()
+        document["race"] = MCPServerConfig(command: "npx", args: ["${workspace}/server.js"])
+        await manager.installDocumentForTesting(document)
+        try await waitUntil("the connection") { manager.servers.first?.status == .ready }
+
+        XCTAssertEqual(
+            resolvedArguments,
+            ["/tmp/dynamoe-mcp-workspace/server.js"],
+            "${workspace} must be the project selected in Settings, not the home directory"
+        )
+    }
+
     func testToolListRefreshUpdatesTheLiveConnection() async throws {
         let manager = MCPManager.shared
         let server = MutableToolMockServer(tools: [["name": "echo", "inputSchema": ["type": "object"]]])
