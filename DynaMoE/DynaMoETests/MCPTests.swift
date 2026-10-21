@@ -56,7 +56,20 @@ private final class MockMCPTransport: MCPTransport, @unchecked Sendable {
     }
 
     var stderrTail: String { "" }
-    var closureReason: String? { nil }
+    private var recordedClosureReason: String?
+
+    var closureReason: String? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return recordedClosureReason
+        }
+        set {
+            lock.lock()
+            recordedClosureReason = newValue
+            lock.unlock()
+        }
+    }
 
     func start() async throws {}
 
@@ -124,6 +137,39 @@ private final class AtomicFlag: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return value
+    }
+}
+
+private final class CloseCallbackBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fired = false
+    private var closedClient: MCPClient?
+    private var detail = ""
+
+    func record(client: MCPClient, detail: String) {
+        lock.lock()
+        fired = true
+        closedClient = client
+        self.detail = detail
+        lock.unlock()
+    }
+
+    var hasFired: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return fired
+    }
+
+    var client: MCPClient? {
+        lock.lock()
+        defer { lock.unlock() }
+        return closedClient
+    }
+
+    var closureDetail: String {
+        lock.lock()
+        defer { lock.unlock() }
+        return detail
     }
 }
 
@@ -751,12 +797,14 @@ final class MCPClientProtocolTests: XCTestCase {
         transport: MockMCPTransport,
         startupTimeout: Double = 2,
         toolTimeout: Double = 2,
-        onToolsChanged: (@Sendable () -> Void)? = nil
+        onToolsChanged: (@Sendable () -> Void)? = nil,
+        onClosed: (@Sendable (MCPClient, String) -> Void)? = nil
     ) -> MCPClient {
         MCPClient(
             config: resolvedServer(startupTimeout: startupTimeout, toolTimeout: toolTimeout),
             transport: transport,
-            onToolsChanged: onToolsChanged
+            onToolsChanged: onToolsChanged,
+            onClosed: onClosed
         )
     }
 
@@ -1217,6 +1265,48 @@ final class MCPClientProtocolTests: XCTestCase {
             "abandoned initialization must not be reported cancelled"
         )
         await client.stop()
+    }
+
+    func testServerExitNotifiesCloseCallbackWithIdentityAndDetail() async throws {
+        let transport = MockMCPTransport()
+        installHandshake(transport, tools: [])
+        let box = CloseCallbackBox()
+        let client = makeClient(
+            transport: transport,
+            onClosed: { closedClient, detail in
+                box.record(client: closedClient, detail: detail)
+            }
+        )
+        try await client.start()
+
+        transport.closureReason = "server exited (exit code 1)"
+        transport.close()
+
+        var waited = 0
+        while !box.hasFired && waited < 40 {
+            try await Task.sleep(nanoseconds: 50_000_000)
+            waited += 1
+        }
+        XCTAssertTrue(box.hasFired, "the close callback never fired")
+        XCTAssertTrue(box.client === client, "the callback must identify the client that closed")
+        XCTAssertEqual(box.closureDetail, "server exited (exit code 1)")
+    }
+
+    func testDeliberateStopDoesNotNotifyCloseCallback() async throws {
+        let transport = MockMCPTransport()
+        installHandshake(transport, tools: [])
+        let box = CloseCallbackBox()
+        let client = makeClient(
+            transport: transport,
+            onClosed: { closedClient, detail in
+                box.record(client: closedClient, detail: detail)
+            }
+        )
+        try await client.start()
+
+        await client.stop()
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertFalse(box.hasFired, "an explicit stop must not be reported as a server exit")
     }
 }
 

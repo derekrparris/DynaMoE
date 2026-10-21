@@ -1167,6 +1167,9 @@ public actor MCPClient {
     private let startupTimeout: Double
     private let toolTimeout: Double
     private let onToolsChanged: (@Sendable () -> Void)?
+    /// Fired once when the transport's stream ends on its own. Deliberate
+    /// teardowns mark the client closed first and never reach it.
+    private let onClosed: (@Sendable (MCPClient, String) -> Void)?
     private let incoming: AsyncStream<Data>
 
     private var readTask: Task<Void, Never>?
@@ -1194,7 +1197,8 @@ public actor MCPClient {
 
     public init(
         config: MCPResolvedServer,
-        onToolsChanged: (@Sendable () -> Void)? = nil
+        onToolsChanged: (@Sendable () -> Void)? = nil,
+        onClosed: (@Sendable (MCPClient, String) -> Void)? = nil
     ) throws {
         switch config.kind {
         case .stdio:
@@ -1210,7 +1214,8 @@ public actor MCPClient {
                     workingDirectory: config.workingDirectory,
                     label: config.key
                 ),
-                onToolsChanged: onToolsChanged
+                onToolsChanged: onToolsChanged,
+                onClosed: onClosed
             )
         case .http:
             guard let endpoint = config.endpoint else {
@@ -1224,7 +1229,8 @@ public actor MCPClient {
                     requestTimeout: max(config.toolTimeoutSec, 30),
                     label: config.key
                 ),
-                onToolsChanged: onToolsChanged
+                onToolsChanged: onToolsChanged,
+                onClosed: onClosed
             )
         }
     }
@@ -1234,13 +1240,15 @@ public actor MCPClient {
     public init(
         config: MCPResolvedServer,
         transport: any MCPTransport,
-        onToolsChanged: (@Sendable () -> Void)? = nil
+        onToolsChanged: (@Sendable () -> Void)? = nil,
+        onClosed: (@Sendable (MCPClient, String) -> Void)? = nil
     ) {
         self.serverKey = config.key
         self.config = config
         self.startupTimeout = config.startupTimeoutSec
         self.toolTimeout = config.toolTimeoutSec
         self.onToolsChanged = onToolsChanged
+        self.onClosed = onClosed
         self.transport = transport
         self.incoming = transport.messages
     }
@@ -1517,5 +1525,10 @@ public actor MCPClient {
         let detail = MCPStdioTransport.describeClosure(reason: transport.closureReason, tail: transport.stderrTail)
         DiagLog.info("mcp", "server=\(serverKey) connection ended: \(detail.isEmpty ? "no detail" : detail)")
         failAll(MCPClientError.connectionClosed(detail))
+        // A server that exits on its own is a terminal failure: the manager
+        // owns the connection entry and the registered tools, so it has to
+        // learn about the closure or they outlive the process. An explicit
+        // `stop()` marks the client closed first and never gets here.
+        onClosed?(self, detail)
     }
 }

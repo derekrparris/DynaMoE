@@ -400,15 +400,23 @@ public final class MCPManager: ObservableObject {
         }
 
         do {
-            // The callback runs on the client's actor, so it hops to the main
-            // actor and reaches the singleton instead of capturing self (which
+            // The callbacks run on the client's actor, so they hop to the main
+            // actor and reach the singleton instead of capturing self (which
             // would form a retain cycle: manager -> connection -> client ->
             // closure -> manager).
-            let client = try MCPClient(config: resolved) { [key] in
-                Task { @MainActor in
-                    MCPManager.shared.handleToolsListChanged(serverKey: key)
+            let client = try MCPClient(
+                config: resolved,
+                onToolsChanged: { [key] in
+                    Task { @MainActor in
+                        MCPManager.shared.handleToolsListChanged(serverKey: key)
+                    }
+                },
+                onClosed: { [key] client, detail in
+                    Task { @MainActor in
+                        MCPManager.shared.handleClientClosed(serverKey: key, client: client, detail: detail)
+                    }
                 }
-            }
+            )
 
             try await client.start()
             let descriptors = try await client.listTools()
@@ -486,6 +494,24 @@ public final class MCPManager: ObservableObject {
                 DiagLog.warning("mcp", "server=\(serverKey) tool refresh failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    /// A live server exited on its own. The client reports it, but the manager
+    /// is what owns the connection entry, the Ready row, and the registered
+    /// tools, so it unregisters the tools, drops the dead connection, and
+    /// publishes a terminal failure with the closure reason instead of letting
+    /// the next call fail against a corpse. The client that closed must still
+    /// be the live one: a superseded client's late closure (a restart or config
+    /// change already installed a replacement) must not tear down the
+    /// replacement. A teardown this manager initiated has already removed the
+    /// entry, so it lands on the same guard.
+    private func handleClientClosed(serverKey: String, client: MCPClient, detail: String) {
+        guard let connection = connections[serverKey], connection.client === client else { return }
+        disconnectSynchronously(key: serverKey, reason: "server exited")
+        let reason = detail.isEmpty ? "The server closed the connection." : detail
+        runtime[serverKey] = ServerRuntime(status: .failed, error: reason)
+        publishStates()
+        DiagLog.error("mcp", "server=\(serverKey) exited: \(reason)")
     }
 
     // MARK: Disconnect
