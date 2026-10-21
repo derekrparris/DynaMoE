@@ -759,7 +759,6 @@ struct MCPAddServerSheet: View {
 
     private func save() {
         errorText = nil
-        var secretWritten = false
         let key = existingKey ?? serverKey.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if key.isEmpty {
@@ -775,6 +774,10 @@ struct MCPAddServerSheet: View {
         config.enabled = enabled
         config.startupTimeoutSec = Double(startupTimeout.trimmingCharacters(in: .whitespacesAndNewlines))
         config.toolTimeoutSec = Double(toolTimeout.trimmingCharacters(in: .whitespacesAndNewlines))
+
+        // Secrets are planned here and written only after every check passes, so
+        // a rejected or cancelled edit cannot leave a credential changed.
+        var pendingSecrets: [PendingSecret] = []
 
         switch transport {
         case .stdio:
@@ -792,13 +795,13 @@ struct MCPAddServerSheet: View {
             config.args = parsedArgs.isEmpty ? nil : parsedArgs
             let cwd = workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
             config.cwd = cwd.isEmpty ? nil : cwd
-            let env = resolve(rows: envRows, serverKey: key, fieldLabel: "env")
+            let env = plan(rows: envRows, serverKey: key, fieldLabel: "env")
             if let failure = env.error {
                 errorText = failure
                 return
             }
-            secretWritten = secretWritten || env.secretWritten
-            config.env = env.values.isEmpty ? nil : env.values
+            pendingSecrets += env.plan.writes
+            config.env = env.plan.values.isEmpty ? nil : env.plan.values
         case .http:
             let trimmedURL = url.trimmingCharacters(in: .whitespacesAndNewlines)
             guard URL(string: trimmedURL)?.host != nil else {
@@ -806,13 +809,13 @@ struct MCPAddServerSheet: View {
                 return
             }
             config.url = trimmedURL
-            let headers = resolve(rows: headerRows, serverKey: key, fieldLabel: "header")
+            let headers = plan(rows: headerRows, serverKey: key, fieldLabel: "header")
             if let failure = headers.error {
                 errorText = failure
                 return
             }
-            secretWritten = secretWritten || headers.secretWritten
-            config.headers = headers.values.isEmpty ? nil : headers.values
+            pendingSecrets += headers.plan.writes
+            config.headers = headers.plan.values.isEmpty ? nil : headers.plan.values
         }
 
         let issues = MCPConfigValidator.validate(server: config, key: key)
@@ -822,53 +825,105 @@ struct MCPAddServerSheet: View {
             return
         }
 
+        var commit = SecretCommit()
+        if let failure = commit.apply(pendingSecrets) {
+            errorText = failure
+            return
+        }
+
         guard manager.upsertServer(key: key, config: config) else {
+            // The config was refused, so the credentials it would have used go
+            // back to what they were.
+            commit.rollback()
             errorText = manager.lastError ?? "Could not save the server."
             return
         }
         // Only the Keychain value changed, so the config file is identical and
         // reconciliation has nothing to act on. Reconnect explicitly or the
         // ready server keeps sending the credential it expanded at connect time.
-        if secretWritten, isEditing {
+        if !pendingSecrets.isEmpty, isEditing {
             manager.reconnectAfterCredentialChange(key: key)
         }
         onSaved(key)
         dismiss()
     }
 
-    private func resolve(
+    /// One Keychain write held back until the whole form is valid.
+    struct PendingSecret {
+        let name: String
+        let account: String
+        let value: String
+    }
+
+    private struct SecretPlan {
+        var values: [String: String] = [:]
+        var writes: [PendingSecret] = []
+    }
+
+    /// Stages a key/value row set into config values, deferring Keychain writes.
+    private func plan(
         rows: [MCPKeyValueDraft],
         serverKey: String,
         fieldLabel: String
-    ) -> (values: [String: String], secretWritten: Bool, error: String?) {
-        var values: [String: String] = [:]
-        var secretWritten = false
+    ) -> (plan: SecretPlan, error: String?) {
+        var plan = SecretPlan()
         for row in rows {
             let name = row.key.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !name.isEmpty else { continue }
 
-            if row.isSecret {
-                guard !serverKey.isEmpty else {
-                    return (values, secretWritten, "Name the server before storing a \(fieldLabel) value in the Keychain.")
+            guard row.isSecret else {
+                plan.values[name] = row.value
+                continue
+            }
+            guard !serverKey.isEmpty else {
+                return (plan, "Name the server before storing a \(fieldLabel) value in the Keychain.")
+            }
+            let account = row.account ?? MCPSecretStore.account(serverKey: serverKey, field: name)
+            if row.value.isEmpty {
+                guard MCPSecretStore.exists(account: account) else {
+                    return (plan, "No Keychain secret stored for \(name). Type the value or untick Keychain.")
                 }
-                let account = row.account ?? MCPSecretStore.account(serverKey: serverKey, field: name)
-                let newValue = row.value
-                if !newValue.isEmpty {
-                    do {
-                        try MCPSecretStore.set(newValue, account: account)
-                        secretWritten = true
-                    } catch {
-                        return (values, secretWritten, "Keychain error for \(name): \(error.localizedDescription)")
-                    }
-                } else if !MCPSecretStore.exists(account: account) {
-                    return (values, secretWritten, "No Keychain secret stored for \(name). Type the value or untick Keychain.")
-                }
-                values[name] = MCPTokenExpander.keychainToken(account: account)
             } else {
-                values[name] = row.value
+                plan.writes.append(PendingSecret(name: name, account: account, value: row.value))
+            }
+            plan.values[name] = MCPTokenExpander.keychainToken(account: account)
+        }
+        return (plan, nil)
+    }
+
+    struct AppliedSecret {
+        let account: String
+        let previous: String?
+    }
+
+    /// Writes staged secrets and can put every one of them back, so a failed
+    /// commit never leaves a half-updated credential set.
+    struct SecretCommit {
+        private var applied: [AppliedSecret] = []
+
+        mutating func apply(_ writes: [PendingSecret]) -> String? {
+            for write in writes {
+                let previous = MCPSecretStore.get(account: write.account)
+                do {
+                    try MCPSecretStore.set(write.value, account: write.account)
+                    applied.append(AppliedSecret(account: write.account, previous: previous))
+                } catch {
+                    rollback()
+                    return "Keychain error for \(write.name): \(error.localizedDescription)"
+                }
+            }
+            return nil
+        }
+
+        func rollback() {
+            for entry in applied.reversed() {
+                if let previous = entry.previous {
+                    try? MCPSecretStore.set(previous, account: entry.account)
+                } else {
+                    MCPSecretStore.delete(account: entry.account)
+                }
             }
         }
-        return (values, secretWritten, nil)
     }
 }
 

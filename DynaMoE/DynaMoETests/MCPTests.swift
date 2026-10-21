@@ -1937,6 +1937,46 @@ final class MCPSecretStoreTests: XCTestCase {
     func testRefusesEmptySecret() {
         XCTAssertThrowsError(try MCPSecretStore.set("", account: "dynamoe.mcp.tests.empty"))
     }
+
+    func testRejectedSaveRestoresThePreviousCredential() throws {
+        let account = "dynamoe.mcp.tests.rollback-\(UUID().uuidString)"
+        defer { MCPSecretStore.delete(account: account) }
+        do {
+            try MCPSecretStore.set("original", account: account)
+        } catch {
+            throw XCTSkip("Keychain is not reachable from this test host: \(error.localizedDescription)")
+        }
+
+        var commit = MCPAddServerSheet.SecretCommit()
+        let failure = commit.apply([
+            MCPAddServerSheet.PendingSecret(name: "Authorization", account: account, value: "replacement")
+        ])
+        XCTAssertNil(failure)
+        XCTAssertEqual(MCPSecretStore.get(account: account), "replacement")
+
+        commit.rollback()
+        XCTAssertEqual(
+            MCPSecretStore.get(account: account),
+            "original",
+            "a config that is rejected after the credential was staged must not keep the new value"
+        )
+    }
+
+    func testRollbackRemovesACredentialThatDidNotExistBefore() throws {
+        let account = "dynamoe.mcp.tests.fresh-\(UUID().uuidString)"
+        defer { MCPSecretStore.delete(account: account) }
+
+        var commit = MCPAddServerSheet.SecretCommit()
+        if let failure = commit.apply([
+            MCPAddServerSheet.PendingSecret(name: "Authorization", account: account, value: "fresh")
+        ]) {
+            throw XCTSkip("Keychain is not reachable from this test host: \(failure)")
+        }
+        XCTAssertEqual(MCPSecretStore.get(account: account), "fresh")
+
+        commit.rollback()
+        XCTAssertNil(MCPSecretStore.get(account: account))
+    }
 }
 
 // MARK: - Agent Harness Integration
