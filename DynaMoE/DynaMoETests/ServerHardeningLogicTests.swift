@@ -66,6 +66,7 @@ final class ServerHardeningLogicTests: XCTestCase {
     func testServerAPIErrorFactoryStatuses() {
         XCTAssertEqual(ServerAPIError.badRequest("m").status, .badRequest)
         XCTAssertEqual(ServerAPIError.badRequest("m").wireType, .invalidRequest)
+        XCTAssertNil(ServerAPIError.badRequest("m").code)
         XCTAssertEqual(ServerAPIError.unauthorized("m").status, .unauthorized)
         XCTAssertEqual(ServerAPIError.unauthorized("m").wireType, .authentication)
         XCTAssertEqual(ServerAPIError.requestTimeout("m").status, .requestTimeout)
@@ -73,5 +74,43 @@ final class ServerHardeningLogicTests: XCTestCase {
         XCTAssertEqual(ServerAPIError.serviceUnavailable("m").wireType, .overloaded)
         XCTAssertEqual(ServerAPIError.internalError("m").status, .internalServerError)
         XCTAssertEqual(ServerAPIError.internalError("m").wireType, .api)
+    }
+
+    func testKVCapacityRejectionCarriesContextLengthCode() {
+        // A prompt that cannot fit the KV cache is a context-length error, not a
+        // generic bad request: clients classify on the code. The wire envelope
+        // must carry it, and the message must never claim a prompt is longer
+        // than the capacity when the bind is the budget or the session reserve.
+        let error = ServerAPIError.contextLengthExceeded("⚠️ Prompt does not fit: 200 prompt tokens against 910 provisioned KV rows")
+        XCTAssertEqual(error.status, .badRequest)
+        XCTAssertEqual(error.wireType, .invalidRequest)
+        XCTAssertEqual(error.code, "context_length_exceeded")
+
+        let envelope = try? JSONEncoder().encode(OpenAIErrorEnvelope(
+            error: .init(message: error.message, type: error.wireType.rawValue, code: error.code)
+        ))
+        let json = envelope.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        XCTAssertTrue(json.contains("\"code\":\"context_length_exceeded\""), "envelope lost the code: \(json)")
+
+        let promptTokens = 200
+        let provisioned = 910
+        XCTAssertFalse(
+            error.message.contains("Prompt too long"),
+            "the message must not blame prompt length for a budget/reserve bind"
+        )
+        XCTAssertLessThan(promptTokens, provisioned)
+    }
+
+    func testLaunchErrorMappingClassifiesKVCapacityRejections() {
+        let mapped = ServerController.wireLaunchError(CompletionLaunchError.promptTooLong("context does not fit"))
+        XCTAssertEqual(mapped.status, .badRequest)
+        XCTAssertEqual(mapped.wireType, .invalidRequest)
+        XCTAssertEqual(mapped.code, "context_length_exceeded")
+
+        // Engine-state failures stay 503: the client cannot fix them by editing
+        // the request.
+        let busy = ServerController.wireLaunchError(CompletionLaunchError.engineNotReady("busy"))
+        XCTAssertEqual(busy.status, .serviceUnavailable)
+        XCTAssertNil(busy.code)
     }
 }

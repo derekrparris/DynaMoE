@@ -357,6 +357,7 @@ The Server tab writes the enable toggle, port, API key, inline reasoning and con
 | `dynamoe_server_api_key` | *(empty)* | Required bearer / x-api-key value |
 | `dynamoe_server_queue_timeout` | `120` seconds | Requests waiting longer in the queue are rejected (408 / SSE error). `0` disables |
 | `dynamoe_server_max_prompt_tokens` | `262144` tokens | Longer prompts are rejected with 400 before prefill. `0` disables |
+| `dynamoe_agent_session_floor` | `8192` rows | KV rows an agent (tools-enabled) turn reserves for its tool loop, in-app and API alike. The budget still wins: the reserve is capped to what the machine affords, so it can never reject a prompt that fits. `0` keeps 8,192. Chat turns without tools reserve 2,048 |
 | `dynamoe_server_inline_reasoning` | `false` | OpenAI endpoint only: fold reasoning into `content` inside the model's reasoning tags instead of reporting it as `reasoning_content`, so clients that ignore that extension still display it (and echo it back) |
 | `dynamoe_server_log_store_bodies` | `false` | Persist request/response bodies (and tool arguments) in the request log, for API and in-app rows alike. Off keeps rows metadata-only (the Settings → Server "Store Request Content" toggle writes this) |
 
@@ -366,6 +367,8 @@ For example, to allow an unlimited queue wait and a 512k prompt ceiling:
 defaults write DRP.DynaMoE dynamoe_server_queue_timeout -int 0
 defaults write DRP.DynaMoE dynamoe_server_max_prompt_tokens -int 524288
 ```
+
+A `400` carrying `"code": "context_length_exceeded"` means the machine's KV budget (RAM minus the model footprint minus 2.5 GB of working reserve) could not provision the prompt plus usable generation at the configured KV precision. The message names the budget, the model footprint, the precision and the rows it affords; `dynamoe_agent_session_floor` lowers the agent reserve, and FP8 KV plus a smaller model footprint raise the ceiling.
 
 ---
 

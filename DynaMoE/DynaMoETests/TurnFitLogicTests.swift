@@ -2,11 +2,11 @@
 //  TurnFitLogicTests.swift
 //  DynaMoE
 //
-//  Pure-logic coverage for the launch-time KV fit check: the memory budget is
-//  the authority over the session floor — a prompt that the machine's KV
-//  budget cannot serve must be rejected (or have max_tokens ratcheted) before
-//  any multi-GB allocation runs, and a budget that cannot hold even the floor
-//  fails fast instead of over-provisioning it.
+//  Pure-logic coverage for the launch-time KV fit check. The memory budget is
+//  the authority over the provision (a turn is never allocated past it), but
+//  the session floor is a preference: an agent reserve the budget cannot afford
+//  is capped, not turned into a rejection of prompts it could have served. The
+//  check must also price the same sliding-ring layout the allocator uses.
 //
 
 import XCTest
@@ -16,6 +16,7 @@ final class TurnFitLogicTests: XCTestCase {
 
     private func fit(
         isAgentSession: Bool = false,
+        configuredFloor: Int? = nil,
         promptTokens: Int,
         requestedMaxTokens: Int,
         modelFootprintGB: Double,
@@ -24,10 +25,12 @@ final class TurnFitLogicTests: XCTestCase {
         totalSlots: Int = 36,
         kStride: Int = 1024,
         vStride: Int = 1024,
-        precision: KVCachePrecision = .fp16
+        precision: KVCachePrecision = .fp16,
+        slidingSlotFlags: [Bool]? = nil,
+        slidingRingLen: Int = 0
     ) -> KVCacheProvisioning.TurnFit {
         KVCacheProvisioning.turnFit(
-            isAgentSession: isAgentSession,
+            sessionFloor: KVCacheProvisioning.sessionFloor(isAgentSession: isAgentSession, configured: configuredFloor),
             promptTokens: promptTokens,
             requestedMaxTokens: requestedMaxTokens,
             config: nil,
@@ -36,12 +39,18 @@ final class TurnFitLogicTests: XCTestCase {
             numKvHeads: 4,
             headDim: 256,
             precision: precision,
-            slidingSlotFlags: nil,
-            slidingRingLen: 0,
+            slidingSlotFlags: slidingSlotFlags,
+            slidingRingLen: slidingRingLen,
             budgetMode: budgetMode,
             modelFootprintGB: modelFootprintGB,
             physicalGB: physicalGB
         )
+    }
+
+    /// 30 Gemma-4-shaped slots: the first 25 are sliding rings (window 1,024 +
+    /// the 512-row prefill chunk slack), the last 5 are global (linear).
+    private func gemmaSlidingFlags() -> [Bool] {
+        (0..<30).map { $0 < 25 }
     }
 
     func testAmpleBudgetAcceptsPromptAsRequested() {
@@ -54,7 +63,7 @@ final class TurnFitLogicTests: XCTestCase {
 
     func testPromptLongerThanClampedBudgetIsRejected() {
         // Streaming hybrid shape like the 16 GB repro: 0.25 GB KV budget floor,
-        // 40 uniform slots, 19,352-token prompt, 4-m-token request. The clamped
+        // 40 uniform slots, 19,352-token prompt, 4k-token request. The clamped
         // provision lands far below the prompt length, so the turn must fail
         // before prefill runs off the allocated rows.
         let result = fit(
@@ -64,21 +73,18 @@ final class TurnFitLogicTests: XCTestCase {
             modelFootprintGB: 8.75,
             totalSlots: 40
         )
-        if case .promptTooLong(let provisioned) = result.outcome {
-            XCTAssertLessThan(provisioned, 19_352)
-        } else {
-            XCTFail("expected promptTooLong, got \(result.outcome)")
+        guard case .promptTooLong(let provisioned) = result.outcome else {
+            return XCTFail("expected promptTooLong, got \(result.outcome)")
         }
+        XCTAssertEqual(provisioned, result.affordableRows)
+        XCTAssertLessThan(provisioned, 19_352)
         XCTAssertLessThanOrEqual(result.budgetGB, 0.25)
     }
 
-    func testBudgetBelowFloorRejectsEvenARecentPrompt() {
-        // 0.25 GB budget over 36 slots affords 910 rows, fewer than the
-        // non-agent 2,048-row floor. (The config-less geometry floors KV heads
-        // at 8, so a row costs (2,048+2,048) fp16 elements = 8,192 B here.)
-        // The floor must not win over the budget: the turn fails fast
-        // (promptTooLong) instead of provisioning 2,048 rows it cannot afford
-        // and thrashing mid-generation.
+    func testPromptLargerThanAffordableProvisionIsRejected() {
+        // 0.25 GB over 36 slots affords 910 rows at the config-less fp16 shape.
+        // A 1,700-token prompt cannot fit those rows, and the rejection reports
+        // the provision the budget actually affords.
         let result = fit(
             isAgentSession: false,
             promptTokens: 1_700,
@@ -89,6 +95,7 @@ final class TurnFitLogicTests: XCTestCase {
             return XCTFail("expected promptTooLong, got \(result.outcome) (provisioned \(result.provisionedSeqLen))")
         }
         XCTAssertEqual(provisioned, 910)
+        XCTAssertEqual(result.affordableRows, 910)
         XCTAssertTrue(result.clampedByBudget)
         XCTAssertEqual(result.effectiveMaxTokens, 0)
     }
@@ -159,27 +166,85 @@ final class TurnFitLogicTests: XCTestCase {
         XCTAssertGreaterThan(result.effectiveMaxTokens, 0)
     }
 
-    func testBudgetBelowAgentFloorFailsFastEvenForShortPrompts() {
-        // The 8,192-row agent floor must not resurrect over-budget
-        // provisions: a 0.25 GB budget affords 910 rows, so even a small
-        // 1,000-token agent prompt rejects in milliseconds instead of
-        // allocating a ~9x-over-budget floor and dying mid-generation.
+    func testAgentFloorIsCappedByTheBudgetForShortPrompts() {
+        // The field regression: a 0.25 GB budget affords 910 rows, fewer than
+        // the 8,192-row agent floor. The floor must not reject a prompt those
+        // rows can hold — it is capped to what the budget affords and the turn
+        // runs with a ratcheted generation budget.
         let result = fit(
             isAgentSession: true,
-            promptTokens: 1_000,
+            promptTokens: 500,
             requestedMaxTokens: 4_096,
             modelFootprintGB: 8.75
         )
-        guard case .promptTooLong(let provisioned) = result.outcome else {
-            return XCTFail("expected promptTooLong, got \(result.outcome) (provisioned \(result.provisionedSeqLen))")
+        if case .promptTooLong = result.outcome {
+            XCTFail("a 500-token agent prompt must fit the 910 rows the budget affords")
         }
-        XCTAssertEqual(provisioned, 910)
-        XCTAssertTrue(result.clampedByBudget)
+        XCTAssertEqual(result.provisionedSeqLen, 910)
+        XCTAssertEqual(result.affordableRows, 910)
+        XCTAssertEqual(result.sessionFloor, 8192)
+        XCTAssertGreaterThan(result.effectiveMaxTokens, 0)
+    }
+
+    func testSessionFloorOverrideReplacesOnlyTheAgentReserve() {
+        XCTAssertEqual(KVCacheProvisioning.sessionFloor(isAgentSession: true, configured: nil), 8192)
+        XCTAssertEqual(KVCacheProvisioning.sessionFloor(isAgentSession: true, configured: 0), 8192)
+        XCTAssertEqual(KVCacheProvisioning.sessionFloor(isAgentSession: true, configured: 4_096), 4_096)
+        XCTAssertEqual(KVCacheProvisioning.sessionFloor(isAgentSession: false, configured: 4_096), 2048)
+        XCTAssertEqual(KVCacheProvisioning.affordableFloor(sessionFloor: 8_192, affordableRows: 910), 910)
+        XCTAssertEqual(KVCacheProvisioning.affordableFloor(sessionFloor: 2_048, affordableRows: 9_000), 2_048)
+        XCTAssertEqual(KVCacheProvisioning.affordableFloor(sessionFloor: 8_192, affordableRows: 0), 1)
+    }
+
+    func testUniformGeometryOverpricesGemmaSlidingRingTurn() {
+        // The exact field error (16 GB Mac, 0.25 GB KV budget at fp8, 3,065
+        // prompt tokens from the in-app agent prompt): priced with 30 linear
+        // slots the budget "affords" 2,184 rows, which is below the prompt and
+        // rejects the turn. This is the shape the pre-fix fit check used.
+        let result = fit(
+            isAgentSession: true,
+            promptTokens: 3_065,
+            requestedMaxTokens: 8_192,
+            modelFootprintGB: 8.75,
+            totalSlots: 30,
+            precision: .fp8
+        )
+        guard case .promptTooLong(let provisioned) = result.outcome else {
+            return XCTFail("expected promptTooLong, got \(result.outcome)")
+        }
+        XCTAssertEqual(provisioned, 2_184)
+        XCTAssertEqual(result.affordableRows, 2_184)
+    }
+
+    func testRingAwareGeometryServesTheFieldPrompt() {
+        // Same machine, model, budget and prompt as the field error, priced with
+        // the layout the allocator uses: 25 ring slots hold window+slack rows
+        // regardless of the sequence length, so the budget affords 5,427 rows
+        // rather than 2,184 and the 3,065-token agent prompt runs with a
+        // ratcheted generation budget.
+        let result = fit(
+            isAgentSession: true,
+            promptTokens: 3_065,
+            requestedMaxTokens: 8_192,
+            modelFootprintGB: 8.75,
+            totalSlots: 30,
+            precision: .fp8,
+            slidingSlotFlags: gemmaSlidingFlags(),
+            slidingRingLen: 1_536
+        )
+        guard case .maxTokensReduced(let provisioned) = result.outcome else {
+            return XCTFail("expected maxTokensReduced, got \(result.outcome) (provisioned \(result.provisionedSeqLen))")
+        }
+        XCTAssertEqual(provisioned, 5_427)
+        XCTAssertEqual(result.affordableRows, 5_427)
+        XCTAssertEqual(result.effectiveMaxTokens, 1_850)
+        XCTAssertEqual(result.effectiveMaxTokens + 3_065, 4_915)
+        XCTAssertLessThanOrEqual(result.effectiveMaxTokens + 3_065, provisioned)
     }
 
     func testPromptSlightlyAboveFloorIsRejected() {
-        // minSeq 8192 < prompt 8300: the prompt no longer fits the floor'd
-        // allocation relative to the budget, and there is no headroom slack.
+        // A 50,000-token prompt exceeds the 32,768-row cap and the affordable
+        // provision, so it is rejected for its own length.
         let result = fit(
             isAgentSession: true,
             promptTokens: 50_000,
@@ -193,19 +258,19 @@ final class TurnFitLogicTests: XCTestCase {
 
     func testNeededSeqLenMatchesLaunchPathFormula() {
         XCTAssertEqual(
-            KVCacheProvisioning.neededSeqLen(isAgentSession: true, promptTokens: 100, requestedMaxTokens: 64),
+            KVCacheProvisioning.neededSeqLen(sessionFloor: 8192, promptTokens: 100, requestedMaxTokens: 64),
             8192
         )
         XCTAssertEqual(
-            KVCacheProvisioning.neededSeqLen(isAgentSession: false, promptTokens: 100, requestedMaxTokens: 64),
+            KVCacheProvisioning.neededSeqLen(sessionFloor: 2048, promptTokens: 100, requestedMaxTokens: 64),
             2048
         )
         XCTAssertEqual(
-            KVCacheProvisioning.neededSeqLen(isAgentSession: true, promptTokens: 20_000, requestedMaxTokens: 4_096),
+            KVCacheProvisioning.neededSeqLen(sessionFloor: 8192, promptTokens: 20_000, requestedMaxTokens: 4_096),
             24_608
         )
         XCTAssertEqual(
-            KVCacheProvisioning.neededSeqLen(isAgentSession: true, promptTokens: 40_000, requestedMaxTokens: 40_000),
+            KVCacheProvisioning.neededSeqLen(sessionFloor: 8192, promptTokens: 40_000, requestedMaxTokens: 40_000),
             32_768
         )
     }

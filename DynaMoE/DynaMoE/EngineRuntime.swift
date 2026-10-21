@@ -711,9 +711,35 @@ enum KVCacheProvisioning {
     /// generated tokens (logits/sampling scratch, tree slots).
     static let turnHeadroomRows = 512
 
-    static func neededSeqLen(isAgentSession: Bool, promptTokens: Int, requestedMaxTokens: Int) -> Int {
-        let minSeq = isAgentSession ? 8192 : 2048
-        return max(minSeq, min(32768, promptTokens + max(1, requestedMaxTokens) + turnHeadroomRows))
+    /// Persisted override for the agent-session reserve (`0` or absent keeps
+    /// `defaultAgentSessionFloorRows`). Read by the launch path so this math
+    /// stays pure and testable.
+    static let agentSessionFloorKey = "dynamoe_agent_session_floor"
+
+    /// Rows a turn reserves beyond its own prompt rows: a multi-step agent
+    /// session wants a usable tool loop, a plain chat turn only its own
+    /// generation.
+    static let defaultAgentSessionFloorRows = 8192
+    static let defaultChatSessionFloorRows = 2048
+
+    /// The reserve this turn asks for. `configured` is the persisted
+    /// `dynamoe_agent_session_floor` value (nil when unset) and only applies to
+    /// agent sessions.
+    static func sessionFloor(isAgentSession: Bool, configured: Int?) -> Int {
+        guard isAgentSession else { return defaultChatSessionFloorRows }
+        if let configured, configured > 0 { return configured }
+        return defaultAgentSessionFloorRows
+    }
+
+    /// The reserve the turn actually provisions: a floor is a preference, never
+    /// a demand the KV budget cannot meet, so it can no longer be the reason a
+    /// turn the machine could serve is refused.
+    static func affordableFloor(sessionFloor: Int, affordableRows: Int) -> Int {
+        max(1, min(sessionFloor, max(0, affordableRows)))
+    }
+
+    static func neededSeqLen(sessionFloor: Int, promptTokens: Int, requestedMaxTokens: Int) -> Int {
+        max(sessionFloor, min(32768, promptTokens + max(1, requestedMaxTokens) + turnHeadroomRows))
     }
 
     /// Launch-time capability check: the machine's KV budget clamps what a
@@ -721,16 +747,19 @@ enum KVCacheProvisioning {
     /// must be rejected before prefill drives attention and KV stores past
     /// the allocated rows (it would silently read/write adjacent slots).
     ///
-    /// The memory budget is the authority over the session floor: when the
-    /// budget cannot hold even the `minSeq` floor the turn is rejected outright
-    /// (`.promptTooLong`) rather than provisioned at the floor size, which
-    /// would thrash until the runtime row guards kill it mid-generation.
+    /// The budget remains the authority (QA #53: never provision past it — the
+    /// oversized floor thrashed until the runtime row guards killed the
+    /// generation), but the session floor is only a preference. Under the old
+    /// law an unaffordable floor — an 8,192-row agent reserve on a machine that
+    /// could afford far fewer rows — rejected every tools-bearing turn,
+    /// including a 3,000-token prompt the affordable provision could hold. The
+    /// floor is now capped by `affordableSeqLen`, and a turn is refused only
+    /// when the prompt itself (plus `minimumPromptSlack`) does not fit.
     ///
     /// `provisionedSeqLen` is the length the turn WILL provision after the
-    /// budget clamp (floored by `minSeq` exactly like `launchTurn` does — and
-    /// always at least `minSeq`, or the turn was rejected above). `fit` says
-    /// how the request maps onto it: fits as requested, needs the max-token
-    /// cap cut, or cannot accept the prompt at all.
+    /// budget clamp, floored by `affordableFloor` exactly like `launchTurn`
+    /// does. `fit` says how the request maps onto it: fits as requested, needs
+    /// the max-token cap cut, or cannot accept the prompt at all.
     struct TurnFit: Equatable {
         enum Outcome: Equatable {
             case ok
@@ -742,13 +771,18 @@ enum KVCacheProvisioning {
         var provisionedSeqLen: Int
         var clampedByBudget: Bool
         var budgetGB: Double
+        /// Rows the KV budget alone can hold — what a rejection message reports,
+        /// so it never blames a prompt the budget could not have served.
+        var affordableRows: Int
+        /// The reserve this turn asked for before the budget capped it.
+        var sessionFloor: Int
         var outcome: Outcome
         /// Cap the caller should apply to generated tokens for this turn.
         var effectiveMaxTokens: Int
     }
 
     static func turnFit(
-        isAgentSession: Bool,
+        sessionFloor: Int,
         promptTokens: Int,
         requestedMaxTokens: Int,
         config: ModelConfig?,
@@ -764,7 +798,7 @@ enum KVCacheProvisioning {
         physicalGB: Double
     ) -> TurnFit {
         let requested = neededSeqLen(
-            isAgentSession: isAgentSession,
+            sessionFloor: sessionFloor,
             promptTokens: promptTokens,
             requestedMaxTokens: requestedMaxTokens
         )
@@ -779,22 +813,10 @@ enum KVCacheProvisioning {
             slidingRingLen: slidingRingLen
         )
         let budget = budgetGB(physicalGB: physicalGB, modelFootprintGB: modelFootprintGB, budgetMode: budgetMode)
-        let minSeq = isAgentSession ? 8192 : 2048
         let affordable = affordableSeqLen(geometry: kvGeometry, budgetGB: budget)
-        if affordable < minSeq {
-            return TurnFit(
-                requestedSeqLen: requested,
-                provisionedSeqLen: affordable,
-                clampedByBudget: true,
-                budgetGB: budget,
-                outcome: .promptTooLong(provisioned: affordable),
-                effectiveMaxTokens: 0
-            )
-        }
-        let floorLen = max(minSeq, 1)  // prefix reuse can only raise the floor; treat min as the check floor
         let provisioned = clampedSeqLen(
             requested: requested,
-            floor: min(floorLen, max(1, requested)),
+            floor: affordableFloor(sessionFloor: sessionFloor, affordableRows: affordable),
             geometry: kvGeometry,
             budgetGB: budget
         )
@@ -810,6 +832,8 @@ enum KVCacheProvisioning {
                 provisionedSeqLen: provisioned,
                 clampedByBudget: clamped,
                 budgetGB: budget,
+                affordableRows: affordable,
+                sessionFloor: sessionFloor,
                 outcome: .promptTooLong(provisioned: provisioned),
                 effectiveMaxTokens: 0
             )
@@ -824,6 +848,8 @@ enum KVCacheProvisioning {
                 provisionedSeqLen: provisioned,
                 clampedByBudget: clamped,
                 budgetGB: budget,
+                affordableRows: affordable,
+                sessionFloor: sessionFloor,
                 outcome: .maxTokensReduced(provisioned: provisioned),
                 effectiveMaxTokens: flooredMaxTokens
             )
@@ -833,6 +859,8 @@ enum KVCacheProvisioning {
             provisionedSeqLen: provisioned,
             clampedByBudget: clamped,
             budgetGB: budget,
+            affordableRows: affordable,
+            sessionFloor: sessionFloor,
             outcome: .ok,
             effectiveMaxTokens: max(1, requestedMaxTokens)
         )

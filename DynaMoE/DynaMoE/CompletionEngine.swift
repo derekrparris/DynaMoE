@@ -1232,56 +1232,21 @@ public final class CompletionEngine: @unchecked Sendable {
         let budgetMode: MemoryBudgetMode = isFullRAM ? .unrestricted : memory.budgetMode
 
         let isAgentSession = request.agentToolsEnabled
-        let minSeq = isAgentSession ? 8192 : 2048
-        var neededSeqLen = max(minSeq, min(32768, promptTokenIds.count + maxTokens + 512))
-        var kvPrec = memory.kvPrecision
-
-        // Reject (or ratchet) turns whose prompt cannot fit the KV cache this
-        // machine can provision. Without this check the prefill kept running
-        // past a clamped allocation and the attention/KV kernels indexed rows
-        // that were never allocated — silently corrupting cache slots and, in
-        // the worst case, walking off the buffer. The check runs before the
-        // multi-GB scratch/KV allocations so a rejected turn costs nothing.
-        let fitPhysicalGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
-        let fitCheck = KVCacheProvisioning.turnFit(
+        let sessionFloor = KVCacheProvisioning.sessionFloor(
             isAgentSession: isAgentSession,
-            promptTokens: promptTokenIds.count,
-            requestedMaxTokens: maxTokens,
-            config: modelConfig,
-            actualLayers: actualLayers,
-            totalLoops: totalLoops,
-            numKvHeads: Int(numKvHeads),
-            headDim: Int(headDim),
-            precision: memory.kvPrecision,
-            slidingSlotFlags: nil,
-            slidingRingLen: 0,
-            budgetMode: memory.budgetMode,
-            modelFootprintGB: summary.sizeGb,
-            physicalGB: fitPhysicalGB
+            configured: UserDefaults.standard.object(forKey: KVCacheProvisioning.agentSessionFloorKey) as? Int
         )
-        switch fitCheck.outcome {
-        case .promptTooLong(let provisioned):
-            throw CompletionLaunchError.promptTooLong(
-                "⚠️ Prompt too long: \(promptTokenIds.count) prompt tokens exceed the \(provisioned)-token KV capacity this turn can provision " +
-                "(KV budget \(String(format: "%.2f", fitCheck.budgetGB)) GB on a \(String(format: "%.0f", fitPhysicalGB)) GB machine; " +
-                "shorten the prompt, lower max_tokens, or raise the memory budget)."
-            )
-        case .maxTokensReduced(let provisioned):
-            let capped = max(1, min(maxTokens, fitCheck.effectiveMaxTokens))
-            if capped < maxTokens {
-                print("⚠️ [KVCACHE] clamping max_tokens \(maxTokens) -> \(capped): \(promptTokenIds.count)-token prompt fits a \(provisioned)-token KV provision (budget \(String(format: "%.2f", fitCheck.budgetGB)) GB)")
-                maxTokens = capped
-                // Keep the rest of the launch consistent with the capped budget: the clamp below re-derives
-                // provisioned length from prompt + maxTokens, so mirror the cap there too.
-                neededSeqLen = KVCacheProvisioning.neededSeqLen(
-                    isAgentSession: isAgentSession,
-                    promptTokens: promptTokenIds.count,
-                    requestedMaxTokens: capped
-                )
-            }
-        case .ok:
-            break
-        }
+        var neededSeqLen = KVCacheProvisioning.neededSeqLen(
+            sessionFloor: sessionFloor,
+            promptTokens: promptTokenIds.count,
+            requestedMaxTokens: maxTokens
+        )
+        var kvPrec = memory.kvPrecision
+        // Resolve the effective KV precision BEFORE the fit check: the gate has
+        // to price the bytes the allocation below will pay for. Ling's MLA
+        // kernels are F16-only and Gemma 4's FP8 pair can be missing from a
+        // stale metallib, so pricing the requested precision let a turn pass the
+        // gate and then over-provision with the wider fallback cache.
         if modelConfig?.isLingModel == true && kvPrec != .fp16 {
             // Ling MLA KV store/decode kernels are F16-only and their byte-offset math
             // hardcodes MemoryLayout<UInt16>.stride (see the MLA branch in runTokenForward).
@@ -1296,6 +1261,114 @@ public final class CompletionEngine: @unchecked Sendable {
             // otherwise read the INT8 cache with the float kernels.
             print("⚠️ [KVCACHE] Gemma 4 FP8 KV kernels unavailable — overriding fp8 -> fp16")
             kvPrec = .fp16
+        }
+
+        // Gemma 4 sliding-window ring KV layout, derived before the fit check so
+        // the pre-launch estimate and `KVCacheManager.reset` price the same
+        // rows. A sliding slot holds `window + slack` rows however long the turn
+        // runs; charging it as linear (the old fit check) overpriced a Gemma turn
+        // by the ratio of its global to sliding slots and refused turns the
+        // allocation could hold.
+        let gemmaSlidingWindow = Int(modelConfig?.effectiveSlidingWindow ?? 0)
+        // Ring slack: must cover the largest batched prefill chunk (the chunk
+        // cap below) and the JetSpec tree scratch (maxNodes=8 node slots plus
+        // the root re-store) so in-flight batches never overwrite a live row.
+        let gemmaRingSlack = max(gemmaPrefillChunkCap, 16)
+        let isGemma4Ring = isGemma4 && gemmaSlidingWindow > 0
+        let gemmaSlidingRingLen = isGemma4Ring ? (gemmaSlidingWindow + gemmaRingSlack) : 0
+        // Per-slot ring flags in KVCacheManager slot order (loopIdx * actualLayers
+        // + fullAttnIndex; for Gemma every layer is full-attention, so this is
+        // just the layer order).
+        var gemmaSlidingSlotFlags: [Bool]? = nil
+        if isGemma4Ring {
+            var flags = [Bool](repeating: false, count: max(1, totalLoops) * actualLayers)
+            for loopIdx in 0..<max(1, totalLoops) {
+                for l in 0..<actualLayers {
+                    let layer = cachedLayers[l]
+                    if layer.attentionType == .fullAttention {
+                        let slot = (loopIdx * actualLayers) + layer.fullAttnIndex
+                        if slot < flags.count { flags[slot] = layer.isSlidingAttention }
+                    }
+                }
+            }
+            gemmaSlidingSlotFlags = flags
+        }
+
+        // Reject (or ratchet) turns whose prompt cannot fit the KV cache this
+        // machine can provision. Without this check the prefill kept running
+        // past a clamped allocation and the attention/KV kernels indexed rows
+        // that were never allocated — silently corrupting cache slots and, in
+        // the worst case, walking off the buffer. The check runs before the
+        // multi-GB scratch/KV allocations so a rejected turn costs nothing.
+        let fitPhysicalGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+        let fitCheck = KVCacheProvisioning.turnFit(
+            sessionFloor: sessionFloor,
+            promptTokens: promptTokenIds.count,
+            requestedMaxTokens: maxTokens,
+            config: modelConfig,
+            actualLayers: actualLayers,
+            totalLoops: totalLoops,
+            numKvHeads: Int(numKvHeads),
+            headDim: Int(headDim),
+            precision: kvPrec,
+            slidingSlotFlags: gemmaSlidingSlotFlags,
+            slidingRingLen: gemmaSlidingRingLen,
+            // The budget the allocation below actually resolves to (Auto and
+            // Full RAM widen it to 75% of physical RAM), not the raw persisted
+            // mode — a gate stricter than the allocator refuses turns the
+            // machine can serve.
+            budgetMode: budgetMode,
+            modelFootprintGB: summary.sizeGb,
+            physicalGB: fitPhysicalGB
+        )
+        // Both KV gates report the same numbers, and never claim the prompt is
+        // longer than the cache when the bind is the budget or the reserve.
+        func kvCapacityMessage(promptTokens: Int, provisioned: Int, affordableRows: Int, budgetGB: Double) -> String {
+            let precisionName: String
+            switch kvPrec {
+            case .fp8: precisionName = "FP8"
+            case .fp16: precisionName = "FP16"
+            case .fp32: precisionName = "FP32"
+            }
+            let reserve = isAgentSession
+                ? "agent sessions reserve \(sessionFloor) rows"
+                : "chat turns reserve \(sessionFloor) rows"
+            let request: String
+            if promptTokens >= provisioned {
+                request = "Prompt does not fit: \(promptTokens) prompt tokens against \(provisioned) provisioned KV rows"
+            } else {
+                request = "Context does not fit: \(promptTokens) prompt tokens leave no generation room in \(provisioned) provisioned KV rows"
+            }
+            let remedy = isAgentSession
+                ? " Lower the reserve with `defaults write DRP.DynaMoE dynamoe_agent_session_floor -int <rows>`, reduce loaded tools or max_tokens, or run a smaller model."
+                : " Shorten the prompt or reduce max_tokens, or run a smaller model."
+            return "⚠️ \(request) (\(reserve); the KV budget is \(String(format: "%.2f", budgetGB)) GB at \(precisionName) on a \(String(format: "%.0f", fitPhysicalGB)) GB machine with a \(String(format: "%.1f", summary.sizeGb)) GB model, which affords \(affordableRows) rows).\(remedy)"
+        }
+        switch fitCheck.outcome {
+        case .promptTooLong(let provisioned):
+            throw CompletionLaunchError.promptTooLong(
+                kvCapacityMessage(
+                    promptTokens: promptTokenIds.count,
+                    provisioned: provisioned,
+                    affordableRows: fitCheck.affordableRows,
+                    budgetGB: fitCheck.budgetGB
+                )
+            )
+        case .maxTokensReduced(let provisioned):
+            let capped = max(1, min(maxTokens, fitCheck.effectiveMaxTokens))
+            if capped < maxTokens {
+                print("⚠️ [KVCACHE] clamping max_tokens \(maxTokens) -> \(capped): \(promptTokenIds.count)-token prompt fits a \(provisioned)-token KV provision (budget \(String(format: "%.2f", fitCheck.budgetGB)) GB)")
+                maxTokens = capped
+                // Keep the rest of the launch consistent with the capped budget: the clamp below re-derives
+                // provisioned length from prompt + maxTokens, so mirror the cap there too.
+                neededSeqLen = KVCacheProvisioning.neededSeqLen(
+                    sessionFloor: sessionFloor,
+                    promptTokens: promptTokenIds.count,
+                    requestedMaxTokens: capped
+                )
+            }
+        case .ok:
+            break
         }
         let hasRecurrence = (modelConfig?.isLingModel == true || modelConfig?.hasLinearRecurrence == true || cachedLayers.contains { $0.attentionType == .linearAttention })
         // A pin minted under one KV precision cannot be restored under another: the
@@ -1343,34 +1416,10 @@ public final class CompletionEngine: @unchecked Sendable {
         // wrapped onto the reused window's rows. The ring bookkeeping knows
         // exactly, so validate before splicing; a clobbered window falls back
         // to a full re-prefill (same policy as the GDN "cannot rewind" path).
-        let gemmaSlidingWindow = Int(modelConfig?.effectiveSlidingWindow ?? 0)
-        // Ring slack: must cover the largest batched prefill chunk (the chunk
-        // cap below) and the JetSpec tree scratch (maxNodes=8 node slots plus
-        // the root re-store) so in-flight batches never overwrite a live row.
-        let gemmaRingSlack = max(gemmaPrefillChunkCap, 16)
-        let isGemma4Ring = isGemma4 && gemmaSlidingWindow > 0
-        let gemmaSlidingRingLen = isGemma4Ring ? (gemmaSlidingWindow + gemmaRingSlack) : 0
         if isGemma4Ring && prefixTokensReused > 0,
            !KVCacheManager.shared.ringPrefixRowsIntact(prefixCount: prefixTokensReused, window: gemmaSlidingWindow) {
             print("🔁 [PREFIX] Gemma sliding-ring window rows were overwritten past the pin (\(PrefixCacheManager.shared.currentPinnedCount) pinned, reusing \(prefixTokensReused)) — full re-prefill")
             prefixTokensReused = 0
-        }
-        // Per-slot ring flags in KVCacheManager slot order (loopIdx * actualLayers
-        // + fullAttnIndex; for Gemma every layer is full-attention, so this is
-        // just the layer order).
-        var gemmaSlidingSlotFlags: [Bool]? = nil
-        if isGemma4Ring {
-            var flags = [Bool](repeating: false, count: max(1, totalLoops) * actualLayers)
-            for loopIdx in 0..<max(1, totalLoops) {
-                for l in 0..<actualLayers {
-                    let layer = cachedLayers[l]
-                    if layer.attentionType == .fullAttention {
-                        let slot = (loopIdx * actualLayers) + layer.fullAttnIndex
-                        if slot < flags.count { flags[slot] = layer.isSlidingAttention }
-                    }
-                }
-            }
-            gemmaSlidingSlotFlags = flags
         }
 
         // Prompt-dump diagnostic for the tool-call spiral bisection
@@ -1444,20 +1493,22 @@ public final class CompletionEngine: @unchecked Sendable {
             slidingSlotFlags: gemmaSlidingSlotFlags,
             slidingRingLen: gemmaSlidingRingLen
         )
-        // The fit check ran before the Ling/Gemma precision overrides, so this
-        // launch-side re-derivation is the only one computed from the EFFECTIVE
-        // KV precision. Re-gate here: when the budget cannot hold the session
-        // floor or the pinned prefix, fail fast in milliseconds instead of
-        // over-provisioning the floor size past the budget and thrashing to
-        // death mid-generation (the 16 GB repro: a 8,798-token turn accepted,
-        // 4.3 s/layer, dead at token 913).
-        let preservedRows = max(minSeq, prefixTokensReused)
+        // The fit check and this clamp now price the same effective KV precision
+        // and the same sliding-ring layout, so this re-gate only has to defend
+        // the pinned prefix (a turn whose KV relayout would drop rows the cache
+        // must keep) — the session floor is a preference the budget has already
+        // capped, never a rejection cause on its own (the 16 GB repro: a
+        // 8,798-token turn accepted, 4.3 s/layer, dead at token 913).
         let affordability = KVCacheProvisioning.affordableSeqLen(geometry: kvGeometry, budgetGB: kvBudgetGB)
-        if affordability < preservedRows {
+        let preservedRows = max(
+            KVCacheProvisioning.affordableFloor(sessionFloor: sessionFloor, affordableRows: affordability),
+            prefixTokensReused
+        )
+        if affordability < prefixTokensReused {
             throw CompletionLaunchError.promptTooLong(
-                "⚠️ KV budget \(String(format: "%.2f", kvBudgetGB)) GB on a \(String(format: "%.0f", physicalGB)) GB machine cannot hold the \(preservedRows)-row floor this turn must provision " +
-                "(affords \(affordability) rows: pinned prefix \(prefixTokensReused), session floor \(minSeq), \(kvPrec) KV cache). " +
-                "Raise the memory budget mode or lower the KV cache precision."
+                "⚠️ KV budget \(String(format: "%.2f", kvBudgetGB)) GB on a \(String(format: "%.0f", physicalGB)) GB machine cannot hold this turn's \(prefixTokensReused)-row pinned prefix " +
+                "(it affords \(affordability) rows at \(kvPrec) KV cache). " +
+                "Raise the memory budget mode, lower the KV cache precision, or start a fresh conversation."
             )
         }
         let clampedSeqLen = KVCacheProvisioning.clampedSeqLen(
@@ -1468,9 +1519,12 @@ public final class CompletionEngine: @unchecked Sendable {
         )
         if clampedSeqLen < promptTokenIds.count + 64 {
             throw CompletionLaunchError.promptTooLong(
-                "⚠️ \(promptTokenIds.count) prompt tokens exceed the \(clampedSeqLen)-row KV provision the budget affords " +
-                "(KV budget \(String(format: "%.2f", kvBudgetGB)) GB on a \(String(format: "%.0f", physicalGB)) GB machine at \(kvPrec) KV cache; " +
-                "shorten the prompt, raise the memory budget mode, or lower the KV cache precision)."
+                kvCapacityMessage(
+                    promptTokens: promptTokenIds.count,
+                    provisioned: clampedSeqLen,
+                    affordableRows: affordability,
+                    budgetGB: kvBudgetGB
+                )
             )
         }
         if clampedSeqLen < neededSeqLen {

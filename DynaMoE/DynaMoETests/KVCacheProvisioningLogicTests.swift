@@ -98,6 +98,38 @@ final class KVCacheProvisioningLogicTests: XCTestCase {
         XCTAssertEqual(KVCacheProvisioning.affordableSeqLen(geometry: geometry, budgetGB: .infinity), Int.max)
     }
 
+    func testAffordableSeqLenPricesSlidingRingsAsFixedRows() {
+        // Gemma-4 shape: 30 slots, 25 of them sliding rings of 1,536 rows
+        // (window 1,024 + 512-row chunk slack), fp8 KV, 0.25 GB budget — the
+        // 16 GB field machine. The ring rows are a fixed cost; charging every
+        // slot as linear (the old fit check) under-reported the affordable rows
+        // by ~2.5x and rejected prompts the allocation could hold.
+        let flags: [Bool] = (0..<30).map { $0 < 25 }
+        let ringGeometry = KVCacheProvisioning.Geometry(
+            totalSlots: 30,
+            slidingSlotFlags: flags,
+            slidingRingLen: 1_536,
+            kStride: 2048,
+            vStride: 2048,
+            elementBytes: 1
+        )
+        let uniformGeometry = KVCacheProvisioning.Geometry(
+            totalSlots: 30,
+            slidingSlotFlags: nil,
+            slidingRingLen: 0,
+            kStride: 2048,
+            vStride: 2048,
+            elementBytes: 1
+        )
+        XCTAssertEqual(KVCacheProvisioning.affordableSeqLen(geometry: ringGeometry, budgetGB: 0.25), 5_427)
+        XCTAssertEqual(KVCacheProvisioning.affordableSeqLen(geometry: uniformGeometry, budgetGB: 0.25), 2_184)
+        XCTAssertEqual(
+            KVCacheProvisioning.requiredBytes(maxSeqLen: 8_192, geometry: ringGeometry),
+            (25 * 1_536 + 5 * 8_192) * 4_096,
+            "the ring layout must charge sliding slots their fixed rows and linear slots the sequence length"
+        )
+    }
+
     // MARK: - Machine/model/mode budget
 
     func testBudgetReservesWeightsAndWorkingSet() {
