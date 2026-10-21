@@ -94,10 +94,22 @@ public final class MCPManager: ObservableObject {
         var remoteToolNames: [String] = []
     }
 
+    /// One in-flight handshake. The identity is what makes reconciliation safe:
+    /// a restart or config edit replaces the entry (so a later `apply()` can
+    /// start the replacement immediately), and the old task compares its own
+    /// id against this entry before it cleans up, publishes state, or touches
+    /// the harness. Without it, a superseded attempt's `defer` cleared the
+    /// replacement's bookkeeping and its `catch` unregistered the
+    /// replacement's tools.
+    private struct ConnectAttempt {
+        let id: UUID
+        let config: MCPServerConfig
+        var task: Task<Void, Never>?
+    }
+
     private var connections: [String: MCPConnection] = [:]
     private var runtime: [String: ServerRuntime] = [:]
-    private var connecting: Set<String> = []
-    private var connectTasks: [String: Task<Void, Never>] = [:]
+    private var attempts: [String: ConnectAttempt] = [:]
     private var watcher: DispatchSourceFileSystemObject?
     private var watcherDescriptor: Int32 = -1
     private var configToken: String?
@@ -106,6 +118,20 @@ public final class MCPManager: ObservableObject {
     private var pendingReload = false
     private var deferredReloadTask: Task<Void, Never>?
     private var terminationObserver: NSObjectProtocol?
+
+    #if DEBUG
+    /// Test seam: supplies the transport for a handshake instead of a real
+    /// child process or HTTP session. Nil in the app.
+    var transportFactory: ((MCPResolvedServer) -> (any MCPTransport)?)?
+
+    /// Test seam: installs a document and reconciles without reading or
+    /// writing the user's `mcp.json`.
+    func installDocumentForTesting(_ updated: MCPConfigDocument) async {
+        document = updated
+        configIssues = MCPConfigValidator.validate(updated)
+        await apply()
+    }
+    #endif
 
     private init() {}
 
@@ -320,9 +346,7 @@ public final class MCPManager: ObservableObject {
 
         guard isActive else {
             for key in connections.keys { disconnectSynchronously(key: key, reason: "MCP disabled") }
-            connecting.removeAll()
-            for task in connectTasks.values { task.cancel() }
-            connectTasks.removeAll()
+            cancelAllAttempts(reason: "MCP disabled")
             for key in document.sortedServerKeys {
                 runtime[key] = ServerRuntime(status: document.mcpServers[key]?.enabled == true ? .stopped : .disabled)
             }
@@ -343,6 +367,19 @@ public final class MCPManager: ObservableObject {
             }
         }
 
+        // A handshake in flight for a config that no longer applies is
+        // abandoned here rather than when it finishes, so the current config
+        // can start a replacement in the same pass.
+        for (key, attempt) in attempts {
+            guard let config = document.mcpServers[key], config.enabled else {
+                cancelAttempt(key: key, reason: "removed or disabled")
+                continue
+            }
+            if attempt.config != config {
+                cancelAttempt(key: key, reason: "configuration changed")
+            }
+        }
+
         // Connect everything enabled that is not already live.
         for key in document.sortedServerKeys {
             guard let config = document.mcpServers[key] else { continue }
@@ -350,12 +387,9 @@ public final class MCPManager: ObservableObject {
                 runtime[key] = ServerRuntime(status: .disabled)
                 continue
             }
-            guard connections[key] == nil, !connecting.contains(key), connectTasks[key] == nil else { continue }
-            connecting.insert(key)
+            guard connections[key] == nil, attempts[key] == nil else { continue }
             runtime[key] = ServerRuntime(status: .connecting)
-            connectTasks[key] = Task { [weak self] in
-                await self?.connect(key: key, config: config, workspacePath: workspacePath)
-            }
+            startAttempt(key: key, config: config, workspacePath: workspacePath)
         }
 
         publishStates()
@@ -378,10 +412,61 @@ public final class MCPManager: ObservableObject {
 
     // MARK: Connect
 
-    private func connect(key: String, config: MCPServerConfig, workspacePath: String?) async {
+    private func startAttempt(key: String, config: MCPServerConfig, workspacePath: String?) {
+        let attemptID = UUID()
+        var attempt = ConnectAttempt(id: attemptID, config: config)
+        attempt.task = Task { [weak self] in
+            await self?.connect(key: key, config: config, attemptID: attemptID, workspacePath: workspacePath)
+        }
+        attempts[key] = attempt
+    }
+
+    /// True while `attemptID` still owns `key`. Everything a handshake does
+    /// after an `await` checks this first: the key may have been restarted,
+    /// reconfigured, disabled, or removed while the transport was starting.
+    private func isCurrentAttempt(_ attemptID: UUID, for key: String) -> Bool {
+        attempts[key]?.id == attemptID
+    }
+
+    /// Abandons an in-flight handshake and frees the key for a replacement.
+    /// Removing the entry first is what lets a restart connect immediately;
+    /// the cancelled task then sees that it no longer owns the key and keeps
+    /// its hands off the harness and the published state.
+    private func cancelAttempt(key: String, reason: String) {
+        guard let attempt = attempts.removeValue(forKey: key) else { return }
+        attempt.task?.cancel()
+        DiagLog.info("mcp", "server=\(key) connect attempt cancelled (\(reason))")
+    }
+
+    private func cancelAllAttempts(reason: String) {
+        for key in attempts.keys { attempts[key]?.task?.cancel() }
+        attempts.removeAll()
+        DiagLog.info("mcp", "all connect attempts cancelled (\(reason))")
+    }
+
+    /// Retires an attempt that gave up on its own. Only the attempt that still
+    /// owns the key may publish, and only then must the latest config be
+    /// reconciled: `apply()` skipped this key while the handshake was in
+    /// flight, so nothing else would ever start the config that replaced it.
+    private func abandonAttempt(key: String, attemptID: UUID, detail: String) {
+        guard isCurrentAttempt(attemptID, for: key) else {
+            DiagLog.info("mcp", "server=\(key) superseded connect attempt finished: \(detail)")
+            return
+        }
+        runtime[key] = ServerRuntime(status: document.mcpServers[key]?.enabled == true ? .stopped : .disabled)
+        publishStates()
+        DiagLog.info("mcp", "server=\(key) connect abandoned: \(detail)")
+        if isActive { scheduleApply() }
+    }
+
+    private func connect(key: String, config: MCPServerConfig, attemptID: UUID, workspacePath: String?) async {
         defer {
-            connecting.remove(key)
-            connectTasks[key] = nil
+            // A replacement attempt may already own the key (restart, config
+            // edit); clearing its bookkeeping here would leave it uncancellable
+            // and would let a third attempt start on top of it.
+            if isCurrentAttempt(attemptID, for: key) {
+                attempts[key] = nil
+            }
         }
 
         let (resolved, issues) = MCPConfigResolver.resolve(key: key, config: config, workspacePath: workspacePath)
@@ -390,6 +475,7 @@ public final class MCPManager: ObservableObject {
                 .filter { $0.severity == .error }
                 .map(\.message)
                 .joined(separator: " ")
+            guard isCurrentAttempt(attemptID, for: key) else { return }
             runtime[key] = ServerRuntime(
                 status: .failed,
                 error: message.isEmpty ? "The server configuration is invalid." : message
@@ -399,35 +485,56 @@ public final class MCPManager: ObservableObject {
             return
         }
 
+        // Held outside the `do` so the failure path can close the transport
+        // this attempt opened: a client that never reaches `connections` is
+        // not reachable by restart, removal, or shutdown.
+        var startedClient: MCPClient?
         do {
             // The callbacks run on the client's actor, so they hop to the main
             // actor and reach the singleton instead of capturing self (which
             // would form a retain cycle: manager -> connection -> client ->
             // closure -> manager).
-            let client = try MCPClient(
-                config: resolved,
-                onToolsChanged: { [key] in
-                    Task { @MainActor in
-                        MCPManager.shared.handleToolsListChanged(serverKey: key)
-                    }
-                },
-                onClosed: { [key] client, detail in
-                    Task { @MainActor in
-                        MCPManager.shared.handleClientClosed(serverKey: key, client: client, detail: detail)
-                    }
+            let onToolsChanged: @Sendable () -> Void = { [key] in
+                Task { @MainActor in
+                    MCPManager.shared.handleToolsListChanged(serverKey: key)
                 }
-            )
+            }
+            let onClosed: @Sendable (MCPClient, String) -> Void = { [key] client, detail in
+                Task { @MainActor in
+                    MCPManager.shared.handleClientClosed(serverKey: key, client: client, detail: detail)
+                }
+            }
+            let client: MCPClient
+            #if DEBUG
+            if let transport = transportFactory?(resolved) {
+                client = MCPClient(
+                    config: resolved,
+                    transport: transport,
+                    onToolsChanged: onToolsChanged,
+                    onClosed: onClosed
+                )
+            } else {
+                client = try MCPClient(config: resolved, onToolsChanged: onToolsChanged, onClosed: onClosed)
+            }
+            #else
+            client = try MCPClient(config: resolved, onToolsChanged: onToolsChanged, onClosed: onClosed)
+            #endif
+            startedClient = client
 
             try await client.start()
             let descriptors = try await client.listTools()
+            // Read the last remote state *before* deciding, so that everything
+            // after the decision runs without an `await`: registration and
+            // publication cannot interleave with a restart that way.
+            let instructions = await client.serverInstructions
 
             // The config may have changed while we were handshaking.
-            guard isActive,
+            guard isCurrentAttempt(attemptID, for: key),
+                  isActive,
                   document.mcpServers[key]?.enabled == true,
                   document.mcpServers[key] == config else {
                 await client.stop()
-                runtime[key] = ServerRuntime(status: .stopped)
-                publishStates()
+                abandonAttempt(key: key, attemptID: attemptID, detail: "the configuration changed during the handshake")
                 return
             }
 
@@ -437,7 +544,6 @@ public final class MCPManager: ObservableObject {
             AgentHarness.shared.unregisterTools(prefix: Self.toolPrefix(for: key))
             AgentHarness.shared.registerTools(bridges)
 
-            let instructions = await client.serverInstructions
             connections[key] = MCPConnection(client: client, config: config, bridges: bridges)
             runtime[key] = ServerRuntime(
                 status: .ready,
@@ -449,20 +555,29 @@ public final class MCPManager: ObservableObject {
                 remoteToolNames: visible.map(\.name)
             )
             DiagLog.info("mcp", "server=\(key) ready with \(bridges.count) tools")
+            publishStates()
         } catch {
+            // Close this attempt's transport whoever owns the key now: the
+            // client never reached `connections`, so no other path can.
+            await startedClient?.stop()
+            // A superseded attempt must not touch the harness: a replacement
+            // may already have registered its own tools under the same prefix.
+            guard isCurrentAttempt(attemptID, for: key) else {
+                DiagLog.info("mcp", "server=\(key) superseded connect attempt failed: \(error.localizedDescription)")
+                return
+            }
             AgentHarness.shared.unregisterTools(prefix: Self.toolPrefix(for: key))
             // A cancelled connect is a deliberate teardown (disable, remove,
             // config change, app quit), not a failure: reporting it as one
             // would leave the row showing "Failed" after the user turned it off.
             if Task.isCancelled || !isActive || document.mcpServers[key]?.enabled != true || document.mcpServers[key] != config {
-                DiagLog.info("mcp", "server=\(key) connect abandoned: \(error.localizedDescription)")
+                abandonAttempt(key: key, attemptID: attemptID, detail: error.localizedDescription)
             } else {
                 runtime[key] = ServerRuntime(status: .failed, error: error.localizedDescription)
                 DiagLog.error("mcp", "server=\(key) connect failed: \(error.localizedDescription)")
+                publishStates()
             }
         }
-
-        publishStates()
     }
 
     private func handleToolsListChanged(serverKey: String) {
@@ -525,9 +640,7 @@ public final class MCPManager: ObservableObject {
     /// is signalled, so a generation that is mid-flight stops being offered a
     /// tool whose server is going away.
     private func disconnectSynchronously(key: String, reason: String) {
-        connectTasks[key]?.cancel()
-        connectTasks[key] = nil
-        connecting.remove(key)
+        cancelAttempt(key: key, reason: reason)
 
         AgentHarness.shared.unregisterTools(prefix: Self.toolPrefix(for: key))
 
@@ -667,8 +780,7 @@ public final class MCPManager: ObservableObject {
         stopWatching()
         deferredReloadTask?.cancel()
         deferredReloadTask = nil
-        for task in connectTasks.values { task.cancel() }
-        connectTasks.removeAll()
+        cancelAllAttempts(reason: "shutting down")
         for key in connections.keys {
             disconnectSynchronously(key: key, reason: "app terminating")
         }
@@ -687,8 +799,7 @@ public final class MCPManager: ObservableObject {
         stopWatching()
         deferredReloadTask?.cancel()
         deferredReloadTask = nil
-        for task in connectTasks.values { task.cancel() }
-        connectTasks.removeAll()
+        cancelAllAttempts(reason: "shutting down")
         let clients = connections.values.map(\.client)
         for key in connections.keys {
             AgentHarness.shared.unregisterTools(prefix: Self.toolPrefix(for: key))

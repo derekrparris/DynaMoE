@@ -105,6 +105,12 @@ private final class MockMCPTransport: MCPTransport, @unchecked Sendable {
         continuation.finish()
     }
 
+    var isClosed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return closed
+    }
+
     func reply(id: Any, result: [String: Any]) {
         push(["jsonrpc": "2.0", "id": id, "result": result])
     }
@@ -1817,5 +1823,213 @@ final class MCPManagerGatingTests: XCTestCase {
         let text = MCPManager.shared.rawJSONText()
         XCTAssertFalse(text.isEmpty)
         XCTAssertNotNil(try? JSONDecoder().decode(MCPConfigDocument.self, from: Data(text.utf8)))
+    }
+}
+
+// MARK: - Connection Attempt Ownership
+
+/// Parks the first handshake so a restart or config edit can land while the
+/// transport is still starting; the responses can be released afterwards to
+/// prove the obsolete attempt leaves the replacement alone.
+private final class ParkedMCPHandshake: @unchecked Sendable {
+    private let lock = NSLock()
+    private var parked: [(id: Any, transport: MockMCPTransport)] = []
+    let tools: [[String: Any]]
+
+    init(tools: [[String: Any]] = [["name": "echo", "inputSchema": ["type": "object"]]]) {
+        self.tools = tools
+    }
+
+    var parkedCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return parked.count
+    }
+
+    /// Keeps `initialize` unanswered and answers everything else the way a
+    /// healthy server would.
+    func attach(to transport: MockMCPTransport) {
+        let tools = self.tools
+        transport.responder = { [weak self] request, transport in
+            guard let id = request["id"] else { return }
+            switch request["method"] as? String {
+            case "initialize":
+                self?.park(id: id, transport: transport)
+            case "tools/list":
+                transport.reply(id: id, result: ["tools": tools])
+            default:
+                transport.replyError(id: id, code: -32601, message: "unsupported")
+            }
+        }
+    }
+
+    private func park(id: Any, transport: MockMCPTransport) {
+        lock.lock()
+        parked.append((id, transport))
+        lock.unlock()
+    }
+
+    func releaseParkedInitialize() {
+        lock.lock()
+        let requests = parked
+        parked = []
+        lock.unlock()
+        for request in requests {
+            request.transport.reply(id: request.id, result: [
+                "protocolVersion": "2025-06-18",
+                "capabilities": ["tools": [:]],
+                "serverInfo": ["name": "parked-server", "version": "1"]
+            ])
+        }
+    }
+}
+
+@MainActor
+final class MCPManagerAttemptOwnershipTests: XCTestCase {
+    private var savedEnabled: Any?
+    private var savedAgentTools: Any?
+
+    override func setUp() async throws {
+        savedEnabled = UserDefaults.standard.object(forKey: MCPManager.enabledKey)
+        savedAgentTools = UserDefaults.standard.object(forKey: MCPManager.agentToolsKey)
+        UserDefaults.standard.set(true, forKey: MCPManager.enabledKey)
+        UserDefaults.standard.set(true, forKey: MCPManager.agentToolsKey)
+    }
+
+    override func tearDown() async throws {
+        MCPManager.shared.transportFactory = nil
+        await MCPManager.shared.shutdown()
+        AgentHarness.shared.unregisterTools(prefix: "mcp__race__")
+        if let savedEnabled {
+            UserDefaults.standard.set(savedEnabled, forKey: MCPManager.enabledKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: MCPManager.enabledKey)
+        }
+        if let savedAgentTools {
+            UserDefaults.standard.set(savedAgentTools, forKey: MCPManager.agentToolsKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: MCPManager.agentToolsKey)
+        }
+    }
+
+    private func document(command: String) -> MCPConfigDocument {
+        var document = MCPConfigDocument()
+        document["race"] = MCPServerConfig(command: command)
+        return document
+    }
+
+    /// First attempt parks its `initialize`; every later attempt completes a
+    /// normal handshake so the test can observe the replacement.
+    private func installTransportFactory(
+        parking gate: ParkedMCPHandshake,
+        into record: @escaping (MockMCPTransport) -> Void
+    ) {
+        var attempts = 0
+        let tools = gate.tools
+        MCPManager.shared.transportFactory = { _ in
+            let transport = MockMCPTransport()
+            if attempts == 0 {
+                gate.attach(to: transport)
+            } else {
+                transport.responder = { request, transport in
+                    guard let id = request["id"] else { return }
+                    switch request["method"] as? String {
+                    case "initialize":
+                        transport.reply(id: id, result: [
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": ["tools": [:]],
+                            "serverInfo": ["name": "replacement-server", "version": "1"]
+                        ])
+                    case "tools/list":
+                        transport.reply(id: id, result: ["tools": tools])
+                    default:
+                        transport.replyError(id: id, code: -32601, message: "unsupported")
+                    }
+                }
+            }
+            attempts += 1
+            record(transport)
+            return transport
+        }
+    }
+
+    private func waitUntil(
+        _ description: String,
+        timeout: TimeInterval = 3,
+        _ condition: @MainActor () -> Bool,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(condition(), "timed out waiting for \(description)", file: file, line: line)
+    }
+
+    func testConfigEditDuringHandshakeStartsTheReplacement() async throws {
+        let manager = MCPManager.shared
+        let gate = ParkedMCPHandshake()
+        var transports: [MockMCPTransport] = []
+        installTransportFactory(parking: gate) { transports.append($0) }
+
+        await manager.installDocumentForTesting(document(command: "first"))
+        try await waitUntil("the first handshake to park") { gate.parkedCount == 1 }
+
+        // The config changes while the first server is still handshaking.
+        await manager.installDocumentForTesting(document(command: "second"))
+        try await waitUntil("the replacement connection") {
+            transports.count == 2 && manager.servers.first?.status == .ready
+        }
+        XCTAssertEqual(manager.servers.first?.remoteToolNames, ["echo"])
+        XCTAssertNotNil(AgentHarness.shared.tools["mcp__race__echo"])
+
+        // The abandoned handshake finishes late; it must not publish, and it
+        // must not unregister the replacement's tools.
+        gate.releaseParkedInitialize()
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(transports.count, 2, "the abandoned attempt must not start a third connection")
+        XCTAssertEqual(manager.servers.first?.status, .ready)
+        XCTAssertNotNil(
+            AgentHarness.shared.tools["mcp__race__echo"],
+            "the abandoned attempt unregistered the replacement's tools"
+        )
+        XCTAssertTrue(transports[0].isClosed, "the abandoned attempt leaked its transport")
+        XCTAssertNil(transports[0].closureReason, "a deliberate teardown must not read as a server exit")
+    }
+
+    func testRestartDuringHandshakeKeepsTheReplacementBinding() async throws {
+        let manager = MCPManager.shared
+        let gate = ParkedMCPHandshake()
+        var transports: [MockMCPTransport] = []
+        installTransportFactory(parking: gate) { transports.append($0) }
+
+        await manager.installDocumentForTesting(document(command: "first"))
+        try await waitUntil("the first handshake to park") { gate.parkedCount == 1 }
+
+        manager.restart(key: "race")
+        try await waitUntil("the replacement connection") {
+            transports.count == 2 && manager.servers.first?.status == .ready
+        }
+
+        // The restarted attempt unwinds after the replacement is live.
+        gate.releaseParkedInitialize()
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(manager.servers.first?.status, .ready)
+        XCTAssertNotNil(
+            AgentHarness.shared.tools["mcp__race__echo"],
+            "the superseded attempt unregistered the replacement's tools"
+        )
+
+        // A later restart must still be able to cancel the live attempt: the
+        // superseded task must not have cleared its bookkeeping. Here the live
+        // attempt is already connected, so restart closes its transport and
+        // starts a third one.
+        manager.restart(key: "race")
+        try await waitUntil("the restart to start a third attempt") { transports.count == 3 }
+        XCTAssertTrue(transports[1].isClosed, "restart did not stop the live replacement")
     }
 }
