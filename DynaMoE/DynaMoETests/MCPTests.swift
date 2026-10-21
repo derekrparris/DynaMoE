@@ -2336,6 +2336,30 @@ final class MCPManagerAttemptOwnershipTests: XCTestCase {
         XCTAssertNil(AgentHarness.shared.tools["mcp__race__echo"])
     }
 
+    func testToolListRefreshKeepsLoadedToolsThatSurviveIt() async throws {
+        let manager = MCPManager.shared
+        let server = MutableToolMockServer(tools: [
+            ["name": "echo", "inputSchema": ["type": "object"]],
+            ["name": "gone", "inputSchema": ["type": "object"]],
+        ])
+        manager.transportFactory = { _ in server.transport }
+
+        await manager.installDocumentForTesting(document(command: "first"))
+        try await waitUntil("the connection") { manager.servers.first?.status == .ready }
+        _ = try AgentHarness.shared.loadTool(named: "mcp__race__echo")
+        _ = try AgentHarness.shared.loadTool(named: "mcp__race__gone")
+
+        server.tools = [["name": "echo", "inputSchema": ["type": "object"]]]
+        server.announceToolListChanged()
+
+        try await waitUntil("the refreshed tool list") { manager.servers.first?.remoteToolNames == ["echo"] }
+        XCTAssertNotNil(
+            AgentHarness.shared.loadedTools["mcp__race__echo"],
+            "a refresh must not unload a tool that survived it"
+        )
+        XCTAssertNil(AgentHarness.shared.tools["mcp__race__gone"], "a removed tool must stop being offered")
+    }
+
     func testToolListRefreshFromAReplacedClientIsDiscarded() async throws {
         let manager = MCPManager.shared
         let server = MutableToolMockServer(tools: [["name": "echo2", "inputSchema": ["type": "object"]]])

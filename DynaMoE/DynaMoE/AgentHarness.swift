@@ -3228,6 +3228,21 @@ public final class AgentHarness {
         return matching.count
     }
 
+    /// Removes exactly the named tools, leaving everything else installed and
+    /// loaded. A partial catalog refresh uses this: an MCP server announcing a
+    /// changed tool list must not unload the tools that survived it.
+    @discardableResult
+    public func unregisterTools(named names: [String]) -> Int {
+        var removed = 0
+        for name in names {
+            let wasLoaded = loadedTools.removeValue(forKey: name) != nil
+            let wasInstalled = tools.removeValue(forKey: name) != nil
+            if wasLoaded || wasInstalled { removed += 1 }
+        }
+        if removed > 0 { syncGrammar() }
+        return removed
+    }
+
     // MARK: - Tool Loading Lifecycle
 
     public enum ToolLoadError: LocalizedError {

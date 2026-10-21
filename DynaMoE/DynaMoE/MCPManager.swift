@@ -649,7 +649,15 @@ public final class MCPManager: ObservableObject {
         }
         let visible = Array(descriptors.prefix(MCPConfigValidator.maxToolsPerServer))
         let bridges = visible.map { MCPToolBridge(serverKey: serverKey, descriptor: $0, client: client) }
-        AgentHarness.shared.unregisterTools(prefix: Self.toolPrefix(for: serverKey))
+        // Remove only the tools that vanished from the server's list. Clearing
+        // the whole prefix would also drop the `loadedTools` entries of tools
+        // that survived, and `registerTools` cannot restore them afterwards, so
+        // every list change would silently unload the model's working set.
+        let refreshedNames = Set(bridges.map { $0.definition.function.name })
+        let staleNames = connection.bridges
+            .map { $0.definition.function.name }
+            .filter { !refreshedNames.contains($0) }
+        AgentHarness.shared.unregisterTools(named: staleNames)
         AgentHarness.shared.registerTools(bridges)
         connections[serverKey] = MCPConnection(
             client: client,
