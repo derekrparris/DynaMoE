@@ -16,7 +16,8 @@ import Foundation
 
 public final class MCPToolBridge: AgentTool {
     /// `mcp__<server>__<tool>`, the Claude Code convention. Server keys may not
-    /// contain `__`, so the first separator always terminates the server key.
+    /// contain `__` or end with `_`, so the first separator always terminates
+    /// the server key and no two servers can share a tool-name prefix.
     public static let namePrefix = "mcp__"
     public static let separator = "__"
 

@@ -330,6 +330,39 @@ final class MCPConfigValidatorTests: XCTestCase {
         XCTAssertTrue(issues.contains { $0.severity == .error && $0.message.contains("cannot contain '__'") })
     }
 
+    func testRejectsTrailingUnderscoreInServerName() {
+        // `a` and `a_` both pass the character check, but `a_`'s tool `echo`
+        // and `a`'s tool `_echo` both become `mcp__a___echo`, and the prefix
+        // teardown for `a` would delete `a_`'s tools too.
+        for key in ["a_", "_", "filesystem_"] {
+            let issues = MCPConfigValidator.validate(server: MCPServerConfig(command: "npx"), key: key)
+            XCTAssertTrue(
+                issues.contains { $0.severity == .error && $0.message.contains("cannot end with '_'") },
+                "\(key): \(issues.map(\.message).joined(separator: " | "))"
+            )
+        }
+    }
+
+    func testAcceptsUnderscoresInsideServerName() {
+        for key in ["_a", "a_b", "a-b", "a1"] {
+            let issues = MCPConfigValidator.validate(server: MCPServerConfig(command: "npx"), key: key)
+            XCTAssertFalse(issues.contains { $0.severity == .error }, "\(key): \(issues.map(\.message).joined(separator: " | "))")
+        }
+    }
+
+    func testTrailingUnderscoreServerIsRefusedByTheRuntime() {
+        // Validation is the only gate between a hand-edited file and a live
+        // connection, so the resolver must refuse the key before it can
+        // register a colliding tool name.
+        let (resolved, issues) = MCPConfigResolver.resolve(
+            key: "a_",
+            config: MCPServerConfig(command: "npx"),
+            workspacePath: nil
+        )
+        XCTAssertNil(resolved)
+        XCTAssertTrue(issues.contains { $0.severity == .error && $0.message.contains("cannot end with '_'") })
+    }
+
     func testRejectsBothEndpoints() {
         let issues = MCPConfigValidator.validate(
             server: MCPServerConfig(command: "npx", url: "https://example.com/mcp"),
@@ -764,6 +797,21 @@ final class MCPToolBridgeTests: XCTestCase {
         XCTAssertNil(MCPToolBridge.parse(qualifiedName: "shell_run"))
         XCTAssertNil(MCPToolBridge.parse(qualifiedName: "mcp__onlyserver"))
         XCTAssertNil(MCPToolBridge.parse(qualifiedName: "mcp____tool"))
+    }
+
+    func testLeadingUnderscoreToolKeepsItsServerBoundary() {
+        // `mcp__a__` + `_echo` is the exact string a server key `a_` would
+        // produce for `echo`, which is why keys may not end with `_`.
+        let qualified = MCPToolBridge.qualifiedName(serverKey: "a", toolName: "_echo")
+        XCTAssertEqual(qualified, "mcp__a___echo")
+        XCTAssertEqual(
+            MCPToolBridge.qualifiedName(serverKey: "a_", toolName: "echo"),
+            qualified,
+            "the colliding shape the key rule prevents"
+        )
+        let parsed = MCPToolBridge.parse(qualifiedName: qualified)
+        XCTAssertEqual(parsed?.serverKey, "a")
+        XCTAssertEqual(parsed?.toolName, "_echo")
     }
 
     func testDefinitionCarriesServerPrefixAndSchema() {

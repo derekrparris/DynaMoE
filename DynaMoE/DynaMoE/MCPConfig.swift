@@ -404,8 +404,11 @@ public nonisolated enum MCPConfigValidator {
     public static let maxToolsPerServer = 120
     public static let maxTotalTools = 120
 
-    /// Server keys become part of `mcp__<key>__<tool>`, so `__` inside a key
-    /// would make that name ambiguous to split.
+    /// Server keys become part of `mcp__<key>__<tool>`, so a trailing `_`
+    /// would run into the separator: keys `a` and `a_` would both produce
+    /// `mcp__a__...` names, and the prefix teardown for `a` would delete the
+    /// other server's tools. `__` inside a key is ambiguous for the same
+    /// reason.
     public static let allowedKeyCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
 
     public static func validate(_ document: MCPConfigDocument) -> [MCPConfigIssue] {
@@ -459,6 +462,9 @@ public nonisolated enum MCPConfigValidator {
             }
             if key.contains("__") {
                 error("Server name cannot contain '__'; tool names are built as mcp__<server>__<tool>.")
+            }
+            if key.hasSuffix("_") {
+                error("Server name cannot end with '_'; it would run into the '__' separator, so 'a_' and 'a' would share tool names.")
             }
             if key.hasPrefix("mcp__") {
                 error("Server name cannot start with 'mcp__'.")
