@@ -2273,6 +2273,52 @@ final class MCPManagerAttemptOwnershipTests: XCTestCase {
         )
     }
 
+    /// A transport whose server rejects `initialize`, so a handshake always
+    /// fails.
+    private func installFailingTransportFactory(into record: @escaping (MockMCPTransport) -> Void) {
+        MCPManager.shared.transportFactory = { _ in
+            let transport = MockMCPTransport()
+            transport.responder = { request, transport in
+                guard let id = request["id"] else { return }
+                transport.replyError(id: id, code: -32000, message: "boom")
+            }
+            record(transport)
+            return transport
+        }
+    }
+
+    func testFailedServerIsNotRelaunchedByAnUnrelatedApply() async throws {
+        let manager = MCPManager.shared
+        var transports: [MockMCPTransport] = []
+        installFailingTransportFactory { transports.append($0) }
+
+        await manager.installDocumentForTesting(document(command: "broken"))
+        try await waitUntil("the failure") { manager.servers.first?.status == .failed }
+        XCTAssertEqual(transports.count, 1)
+
+        // Reconciling again with the same, unchanged config: Failed is terminal.
+        await manager.installDocumentForTesting(document(command: "broken"))
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(transports.count, 1, "a terminal failure must not be retried on every apply")
+        XCTAssertEqual(manager.servers.first?.status, .failed)
+
+        // A changed config is a fresh attempt.
+        await manager.installDocumentForTesting(document(command: "broken-v2"))
+        try await waitUntil("the attempt after a config change") { transports.count == 2 }
+    }
+
+    func testManualRestartClearsATerminalFailure() async throws {
+        let manager = MCPManager.shared
+        var transports: [MockMCPTransport] = []
+        installFailingTransportFactory { transports.append($0) }
+
+        await manager.installDocumentForTesting(document(command: "broken"))
+        try await waitUntil("the failure") { manager.servers.first?.status == .failed }
+
+        manager.restart(key: "race")
+        try await waitUntil("the restarted attempt") { transports.count == 2 }
+    }
+
     func testToolListRefreshUpdatesTheLiveConnection() async throws {
         let manager = MCPManager.shared
         let server = MutableToolMockServer(tools: [["name": "echo", "inputSchema": ["type": "object"]]])

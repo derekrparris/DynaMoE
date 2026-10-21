@@ -113,6 +113,11 @@ public final class MCPManager: ObservableObject {
     private var connections: [String: MCPConnection] = [:]
     private var runtime: [String: ServerRuntime] = [:]
     private var attempts: [String: ConnectAttempt] = [:]
+    /// The exact config that left a server in the terminal Failed state. A
+    /// failed server has no connection and no attempt, so without this every
+    /// later `apply()` would relaunch it, including ones triggered by another
+    /// server's edit. An explicit restart or a config change clears it.
+    private var failedConfigs: [String: MCPServerConfig] = [:]
     private var watcher: DispatchSourceFileSystemObject?
     private var watcherDescriptor: Int32 = -1
     private var configToken: String?
@@ -297,6 +302,7 @@ public final class MCPManager: ObservableObject {
         // hand-edited file does not, so a transient edit cannot lose a key.
         MCPSecretStore.deleteAll(serverKey: key)
         runtime[key] = ServerRuntime(status: .disabled)
+        failedConfigs[key] = nil
         disconnectSynchronously(key: key, reason: "removed")
         publishStates()
         return true
@@ -310,6 +316,8 @@ public final class MCPManager: ObservableObject {
         var updated = document
         updated[key] = config
         guard saveDocument(updated) else { return false }
+        // Toggling a server is an explicit request to try it again.
+        failedConfigs[key] = nil
         if !enabled {
             runtime[key] = ServerRuntime(status: .disabled)
             publishStates()
@@ -380,6 +388,12 @@ public final class MCPManager: ObservableObject {
             }
         }
 
+        // Failures recorded for a server that is gone or turned off are
+        // dropped, so re-adding the same config later is a fresh attempt.
+        failedConfigs = failedConfigs.filter { key, _ in
+            document.mcpServers[key]?.enabled == true
+        }
+
         // A handshake in flight for a config that no longer applies is
         // abandoned here rather than when it finishes, so the current config
         // can start a replacement in the same pass.
@@ -401,6 +415,10 @@ public final class MCPManager: ObservableObject {
                 continue
             }
             guard connections[key] == nil, attempts[key] == nil else { continue }
+            if failedConfigs[key] == config {
+                // Terminal until the config changes or the user restarts it.
+                continue
+            }
             runtime[key] = ServerRuntime(status: .connecting)
             startAttempt(key: key, config: config, workspacePath: workspacePath)
         }
@@ -409,6 +427,8 @@ public final class MCPManager: ObservableObject {
     }
 
     public func restart(key: String) {
+        // The user asking again overrides the terminal Failed state.
+        failedConfigs[key] = nil
         disconnectSynchronously(key: key, reason: "manual restart")
         runtime[key] = ServerRuntime(status: .stopped)
         publishStates()
@@ -416,6 +436,7 @@ public final class MCPManager: ObservableObject {
     }
 
     public func restartAll() {
+        failedConfigs.removeAll()
         for key in connections.keys {
             disconnectSynchronously(key: key, reason: "manual restart")
         }
@@ -426,6 +447,7 @@ public final class MCPManager: ObservableObject {
     // MARK: Connect
 
     private func startAttempt(key: String, config: MCPServerConfig, workspacePath: String?) {
+        failedConfigs[key] = nil
         let attemptID = UUID()
         var attempt = ConnectAttempt(id: attemptID, config: config)
         attempt.task = Task { [weak self] in
@@ -489,6 +511,7 @@ public final class MCPManager: ObservableObject {
                 .map(\.message)
                 .joined(separator: " ")
             guard isCurrentAttempt(attemptID, for: key) else { return }
+            failedConfigs[key] = config
             runtime[key] = ServerRuntime(
                 status: .failed,
                 error: message.isEmpty ? "The server configuration is invalid." : message
@@ -558,6 +581,7 @@ public final class MCPManager: ObservableObject {
             AgentHarness.shared.registerTools(bridges)
 
             connections[key] = MCPConnection(client: client, config: config, bridges: bridges)
+            failedConfigs[key] = nil
             runtime[key] = ServerRuntime(
                 status: .ready,
                 error: descriptors.count > visible.count
@@ -586,6 +610,7 @@ public final class MCPManager: ObservableObject {
             if Task.isCancelled || !isActive || document.mcpServers[key]?.enabled != true || document.mcpServers[key] != config {
                 abandonAttempt(key: key, attemptID: attemptID, detail: error.localizedDescription)
             } else {
+                failedConfigs[key] = config
                 runtime[key] = ServerRuntime(status: .failed, error: error.localizedDescription)
                 DiagLog.error("mcp", "server=\(key) connect failed: \(error.localizedDescription)")
                 publishStates()
@@ -652,6 +677,9 @@ public final class MCPManager: ObservableObject {
     /// entry, so it lands on the same guard.
     private func handleClientClosed(serverKey: String, client: MCPClient, detail: String) {
         guard let connection = connections[serverKey], connection.client === client else { return }
+        // Remember the config that died: relaunching it from an unrelated
+        // `apply()` would start a server the user has not asked for again.
+        failedConfigs[serverKey] = connection.config
         disconnectSynchronously(key: serverKey, reason: "server exited")
         let reason = detail.isEmpty ? "The server closed the connection." : detail
         runtime[serverKey] = ServerRuntime(status: .failed, error: reason)
@@ -844,6 +872,7 @@ public final class MCPManager: ObservableObject {
         }
         connections.removeAll()
         runtime.removeAll()
+        failedConfigs.removeAll()
         for client in clients {
             await client.stop()
         }
