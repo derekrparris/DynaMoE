@@ -202,12 +202,15 @@ public nonisolated enum MCPWire {
         return try encode(payload)
     }
 
-    public static func successResponse(id: Int, result: [String: Any]) throws -> Data {
-        try encode(["jsonrpc": "2.0", "id": id, "result": result])
+    /// `id` is the JSON value exactly as it arrived so a reply can echo the
+    /// original type and value: JSON-RPC ids may be strings, and a server that
+    /// sent `"health-check"` or `"007"` cannot correlate a numeric echo.
+    public static func successResponse(id: MCPJSONValue, result: [String: Any]) throws -> Data {
+        try encode(["jsonrpc": "2.0", "id": id.anyValue, "result": result])
     }
 
-    public static func errorResponse(id: Int, code: Int, message: String) throws -> Data {
-        try encode(["jsonrpc": "2.0", "id": id, "error": ["code": code, "message": message]])
+    public static func errorResponse(id: MCPJSONValue, code: Int, message: String) throws -> Data {
+        try encode(["jsonrpc": "2.0", "id": id.anyValue, "error": ["code": code, "message": message]])
     }
 
     public static func cancelledParams(requestId: Int, reason: String) -> [String: Any] {
@@ -222,7 +225,14 @@ public nonisolated enum MCPWire {
 /// One decoded frame arriving from a server: a response, a server-initiated
 /// request, or a notification.
 public nonisolated struct MCPIncomingMessage: Sendable {
+    /// Numeric view of the request id, used to match responses to this
+    /// client's own outbound requests (whose ids are always integers). A
+    /// string id that parses as an integer still matches, but `"007"` and
+    /// `"health-check"` are not interchangeable with a server's request id.
     public let id: Int?
+    /// The request id exactly as it arrived (integer, string, or any other
+    /// JSON value). Replies to server-initiated requests echo this verbatim.
+    public let rawID: MCPJSONValue?
     public let method: String?
     public let result: [String: MCPJSONValue]?
     public let errorCode: Int?
@@ -231,9 +241,11 @@ public nonisolated struct MCPIncomingMessage: Sendable {
     public init?(data: Data) {
         guard let value = MCPJSONValue(data: data), case .object(let object) = value else { return nil }
 
-        if case .int(let numeric)? = object["id"] {
+        let rawID = object["id"]
+        self.rawID = rawID
+        if case .int(let numeric)? = rawID {
             self.id = numeric
-        } else if case .string(let raw)? = object["id"], let numeric = Int(raw) {
+        } else if case .string(let raw)? = rawID, let numeric = Int(raw) {
             self.id = numeric
         } else {
             self.id = nil
@@ -1420,15 +1432,18 @@ public actor MCPClient {
         }
 
         if let method = message.method {
-            if let id = message.id {
-                // Server-initiated request. Only `ping` is meaningful to a
-                // client with no roots/sampling support; answer it, and tell
-                // the server plainly that everything else is unsupported.
+            // Server-initiated request. Only `ping` is meaningful to a
+            // client with no roots/sampling support; answer it, and tell
+            // the server plainly that everything else is unsupported.
+            // JSON-RPC request ids may be strings, so the reply echoes the
+            // raw id verbatim; an absent or null id cannot be correlated
+            // back, so it gets no reply (like a notification).
+            if let rawID = message.rawID, !rawID.isNull {
                 let reply: Data?
                 if method == "ping" {
-                    reply = try? MCPWire.successResponse(id: id, result: [:])
+                    reply = try? MCPWire.successResponse(id: rawID, result: [:])
                 } else {
-                    reply = try? MCPWire.errorResponse(id: id, code: -32601, message: "Method '\(method)' is not supported by this client.")
+                    reply = try? MCPWire.errorResponse(id: rawID, code: -32601, message: "Method '\(method)' is not supported by this client.")
                 }
                 if let reply {
                     try? await transport.send(reply)

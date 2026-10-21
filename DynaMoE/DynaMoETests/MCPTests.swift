@@ -509,7 +509,37 @@ final class MCPWireTests: XCTestCase {
         let data = Data("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}".utf8)
         let message = try XCTUnwrap(MCPIncomingMessage(data: data))
         XCTAssertNil(message.id)
+        XCTAssertNil(message.rawID)
         XCTAssertEqual(message.method, "notifications/tools/list_changed")
+    }
+
+    func testIncomingMessagePreservesNonNumericStringID() throws {
+        let data = Data("{\"jsonrpc\":\"2.0\",\"id\":\"health-check\",\"method\":\"ping\"}".utf8)
+        let message = try XCTUnwrap(MCPIncomingMessage(data: data))
+        XCTAssertEqual(message.rawID, .string("health-check"))
+        XCTAssertNil(message.id, "a non-numeric string id must not masquerade as a numeric one")
+        XCTAssertEqual(message.method, "ping")
+    }
+
+    func testIncomingMessagePreservesNumericStringIDVerbatim() throws {
+        let data = Data("{\"jsonrpc\":\"2.0\",\"id\":\"007\",\"method\":\"ping\"}".utf8)
+        let message = try XCTUnwrap(MCPIncomingMessage(data: data))
+        XCTAssertEqual(message.rawID, .string("007"), "the raw id keeps its original spelling")
+        XCTAssertEqual(message.id, 7, "permissive matching still sees the numeric value")
+    }
+
+    func testResponseBuildersEchoRawIDTypeAndValue() throws {
+        let success = try MCPWire.successResponse(id: .string("health-check"), result: [:])
+        let successObject = try XCTUnwrap(JSONSerialization.jsonObject(with: success) as? [String: Any])
+        XCTAssertEqual(successObject["id"] as? String, "health-check")
+
+        let failure = try MCPWire.errorResponse(id: .string("007"), code: -32601, message: "nope")
+        let failureObject = try XCTUnwrap(JSONSerialization.jsonObject(with: failure) as? [String: Any])
+        XCTAssertEqual(failureObject["id"] as? String, "007", "the id is not reinterpreted as a number")
+
+        let intEcho = try MCPWire.successResponse(id: .int(42), result: [:])
+        let intObject = try XCTUnwrap(JSONSerialization.jsonObject(with: intEcho) as? [String: Any])
+        XCTAssertEqual(intObject["id"] as? Int, 42)
     }
 
     func testIncomingMessageRejectsNonObject() {
@@ -948,6 +978,44 @@ final class MCPClientProtocolTests: XCTestCase {
         }
         let answered = transport.sentFrames.contains { ($0["id"] as? Int) == 777 && $0["result"] != nil }
         XCTAssertTrue(answered, "ping was not answered")
+        await client.stop()
+    }
+
+    func testStringIDServerRequestsAreAnsweredWithVerbatimEcho() async throws {
+        let transport = MockMCPTransport()
+        installHandshake(transport, tools: [])
+        let client = makeClient(transport: transport)
+        try await client.start()
+
+        transport.push(["jsonrpc": "2.0", "id": "health-check", "method": "ping"])
+        transport.push(["jsonrpc": "2.0", "id": "007", "method": "roots/list"])
+
+        func echoed(_ frame: [String: Any], id: String, needsResult: Bool) -> Bool {
+            guard (frame["id"] as? String) == id else { return false }
+            if needsResult { return frame["result"] != nil }
+            return (frame["error"] as? [String: Any])?["code"] as? Int == -32601
+        }
+
+        var waited = 0
+        while waited < 40 {
+            let pingAnswered = transport.sentFrames.contains { echoed($0, id: "health-check", needsResult: true) }
+            let unsupportedAnswered = transport.sentFrames.contains { echoed($0, id: "007", needsResult: false) }
+            if pingAnswered && unsupportedAnswered { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+            waited += 1
+        }
+        XCTAssertTrue(
+            transport.sentFrames.contains { echoed($0, id: "health-check", needsResult: true) },
+            "ping with a string id was not answered with the same string id"
+        )
+        XCTAssertTrue(
+            transport.sentFrames.contains { echoed($0, id: "007", needsResult: false) },
+            "unsupported method with a string id was not answered with the same string id"
+        )
+        XCTAssertFalse(
+            transport.sentFrames.contains { ($0["id"] as? Int) == 7 },
+            "the \"007\" id must not be reinterpreted as numeric 7 in the reply"
+        )
         await client.stop()
     }
 
