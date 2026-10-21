@@ -171,11 +171,11 @@ public final class MCPToolBridge: AgentTool {
             payload["original_characters"] = clipped.originalCount
             payload["truncation_note"] = "Result truncated to \(maxOutputLength) characters. Narrow the request (one item, a smaller range) to see the rest."
         }
-        if result.contentBlockCount == 0,
-           let structured = result.structuredContent,
-           !structured.isNull {
-            payload["structured_content"] = structured.anyValue
-        }
+        // `structuredContent` is deliberately not added a second time: for a
+        // response with no content blocks, `MCPCallResult.text` is already the
+        // serialized structured content that `clipped` just bounded, so echoing
+        // the object here would restore the unbounded payload the budget exists
+        // to cap.
 
         let json = AgentHarness.toolSuccessJSON(tool: qualified, data: payload)
         return (json, clipped.text, nil, false)

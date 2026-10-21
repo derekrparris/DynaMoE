@@ -881,6 +881,82 @@ final class MCPToolBridgeTests: XCTestCase {
         XCTAssertFalse(untouched.didClip)
         XCTAssertEqual(untouched.text, "short")
     }
+
+    /// A client whose server answers `tools/call` with `result`.
+    private func makeExecutingClient(replyingToCall result: [String: Any]) async throws -> MCPClient {
+        let transport = MockMCPTransport()
+        transport.responder = { request, transport in
+            guard let id = request["id"] else { return }
+            switch request["method"] as? String {
+            case "initialize":
+                transport.reply(id: id, result: [
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": ["tools": [:]],
+                    "serverInfo": ["name": "mock-server", "version": "1"]
+                ])
+            case "tools/list":
+                transport.reply(id: id, result: [
+                    "tools": [["name": "list", "inputSchema": ["type": "object"]]]
+                ])
+            case "tools/call":
+                transport.reply(id: id, result: result)
+            default:
+                transport.replyError(id: id, code: -32601, message: "unsupported")
+            }
+        }
+        let client = MCPClient(config: resolvedServer(), transport: transport)
+        try await client.start()
+        return client
+    }
+
+    func testStructuredOnlyResultStaysWithinTheCharacterBudget() async throws {
+        // `MCPCallResult.text` is already the serialized structured content for
+        // a content-less reply; appending the object again would restore the
+        // unbounded payload the character budget exists to cap.
+        let blob = String(repeating: "x", count: 5_000)
+        let client = try await makeExecutingClient(replyingToCall: [
+            "content": [],
+            "structuredContent": ["blob": blob]
+        ])
+        let bridge = MCPToolBridge(
+            serverKey: "filesystem",
+            descriptor: makeDescriptor(name: "list"),
+            client: client
+        )
+
+        let output = try await bridge.execute(arguments: [:], workingDirectory: nil, maxOutputLength: 400)
+
+        XCTAssertEqual(output.stdout?.count, 400)
+        XCTAssertLessThan(
+            output.resultJSON.count,
+            1_200,
+            "the tool result must stay near the 400-character budget, got \(output.resultJSON.count) characters"
+        )
+        XCTAssertFalse(output.resultJSON.contains("structured_content"))
+        XCTAssertTrue(output.resultJSON.contains("truncated"))
+
+        await client.stop()
+    }
+
+    func testStructuredOnlyResultReachesTheModelThroughText() async throws {
+        let client = try await makeExecutingClient(replyingToCall: [
+            "content": [],
+            "structuredContent": ["count": 3]
+        ])
+        let bridge = MCPToolBridge(
+            serverKey: "filesystem",
+            descriptor: makeDescriptor(name: "list"),
+            client: client
+        )
+
+        let output = try await bridge.execute(arguments: [:], workingDirectory: nil, maxOutputLength: 4_000)
+
+        XCTAssertTrue(output.stdout?.contains("\"count\"") ?? false, "got \(output.stdout ?? "nil")")
+        XCTAssertTrue(output.resultJSON.contains("count"))
+        XCTAssertFalse(output.resultJSON.contains("structured_content"))
+
+        await client.stop()
+    }
 }
 
 // MARK: - Call Result Mapping
