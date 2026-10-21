@@ -294,13 +294,23 @@ nonisolated struct MCPLineBuffer {
     }
 
     /// Returns complete lines with the newline removed. A trailing `\r` is
-    /// stripped so `\r\n` framing works.
+    /// stripped so `\r\n` framing works. A frame longer than `limit` is
+    /// refused whether it arrives unterminated or terminated by the current
+    /// chunk: the former would be caught by the tail check, the latter only by
+    /// checking each complete line before it is copied or decoded.
     mutating func append(_ chunk: Data) -> [String] {
         guard !overflowed else { return [] }
         buffer.append(chunk)
 
         var lines: [String] = []
         while let newline = buffer.firstIndex(of: 0x0A) {
+            // The newline is consumed but a trailing `\r` is not, so the byte
+            // distance includes it, matching the unterminated-tail check below.
+            if buffer.distance(from: buffer.startIndex, to: newline) > limit {
+                overflowed = true
+                buffer.removeAll()
+                return lines
+            }
             var lineData = Data(buffer[buffer.startIndex..<newline])
             if lineData.last == 0x0D { lineData.removeLast() }
             if let line = String(data: lineData, encoding: .utf8) {

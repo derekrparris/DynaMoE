@@ -530,6 +530,39 @@ final class MCPFramingTests: XCTestCase {
         XCTAssertTrue(buffer.append(Data("\n".utf8)).isEmpty)
     }
 
+    func testLineBufferRefusesOversizedCompleteFrame() {
+        var buffer = MCPLineBuffer(limit: 8)
+        XCTAssertTrue(
+            buffer.append(Data("123456789\n".utf8)).isEmpty,
+            "a nine-byte frame must not slip through just because it is newline-terminated"
+        )
+        XCTAssertTrue(buffer.overflowed)
+        XCTAssertTrue(buffer.append(Data("ok\n".utf8)).isEmpty, "an overflowed buffer stays refused")
+    }
+
+    func testLineBufferAcceptsFrameExactlyAtLimit() {
+        var buffer = MCPLineBuffer(limit: 8)
+        XCTAssertEqual(buffer.append(Data("12345678\n".utf8)), ["12345678"])
+        XCTAssertFalse(buffer.overflowed)
+    }
+
+    func testLineBufferOverflowKeepsEarlierLinesAndDropsTheRest() {
+        var buffer = MCPLineBuffer(limit: 8)
+        let lines = buffer.append(Data("ok\n123456789\nok2\n".utf8))
+        XCTAssertEqual(lines, ["ok"], "frames completed before the oversized one are still delivered")
+        XCTAssertTrue(buffer.overflowed)
+        XCTAssertFalse(lines.contains("ok2"), "frames after the oversized one are dropped")
+    }
+
+    func testLineBufferCountsCarriageReturnTowardLimit() {
+        var buffer = MCPLineBuffer(limit: 8)
+        XCTAssertTrue(
+            buffer.append(Data("12345678\r\n".utf8)).isEmpty,
+            "the CRLF pair must not buy an oversized frame an extra byte"
+        )
+        XCTAssertTrue(buffer.overflowed)
+    }
+
     func testSSEParserJoinsMultipleDataLines() {
         var parser = MCPSSEFrameParser()
         XCTAssertNil(parser.consume(line: "event: message"))
