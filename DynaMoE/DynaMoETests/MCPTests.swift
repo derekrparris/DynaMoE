@@ -25,6 +25,24 @@ private final class MockMCPTransport: MCPTransport, @unchecked Sendable {
     /// the client writes. The closure decides whether and how to answer.
     var responder: (([String: Any], MockMCPTransport) -> Void)?
 
+    private var parkedSendNanos: UInt64 = 0
+
+    /// When greater than zero, `send` parks this long before recording the
+    /// frame and aborts entirely if the sending task is cancelled while
+    /// parked, simulating a write that has not completed yet.
+    var sendParkNanos: UInt64 {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return parkedSendNanos
+        }
+        set {
+            lock.lock()
+            parkedSendNanos = newValue
+            lock.unlock()
+        }
+    }
+
     init() {
         let stream = AsyncStream<Data>.makeStream()
         self.messages = stream.stream
@@ -47,6 +65,13 @@ private final class MockMCPTransport: MCPTransport, @unchecked Sendable {
             XCTFail("client wrote a non-object frame")
             return
         }
+
+        let park = sendParkNanos
+        if park > 0 {
+            try? await Task.sleep(nanoseconds: park)
+            if Task.isCancelled { return }
+        }
+
         lock.lock()
         recorded.append(object)
         lock.unlock()
@@ -1034,6 +1059,164 @@ final class MCPClientProtocolTests: XCTestCase {
                 error.localizedDescription
             )
         }
+    }
+
+    func testCancellingDispatchedRequestNotifiesServer() async throws {
+        let transport = MockMCPTransport()
+        transport.responder = { request, transport in
+            guard request["id"] != nil else { return }
+            if (request["method"] as? String) == "initialize" {
+                transport.reply(id: request["id"] as Any, result: [
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": [:],
+                    "serverInfo": ["name": "m", "version": "1"]
+                ])
+            }
+            // tools/call is deliberately never answered.
+        }
+        let client = makeClient(transport: transport)
+        try await client.start()
+
+        let task = Task { try await client.callTool(name: "slow_tool", arguments: [:]) }
+
+        var requestID: Int?
+        var waited = 0
+        while waited < 40 {
+            if let frame = transport.sentFrames.first(where: { ($0["method"] as? String) == "tools/call" }) {
+                requestID = frame["id"] as? Int
+                break
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+            waited += 1
+        }
+        let dispatchedID = try XCTUnwrap(requestID, "the tools/call request never reached the server")
+
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("expected the call to be cancelled")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "expected a CancellationError, got \(error)")
+        }
+
+        var notified = false
+        waited = 0
+        while waited < 40 {
+            notified = transport.sentFrames.contains { frame in
+                (frame["method"] as? String) == "notifications/cancelled"
+                    && ((frame["params"] as? [String: Any])?["requestId"] as? Int) == dispatchedID
+            }
+            if notified { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+            waited += 1
+        }
+        XCTAssertTrue(notified, "cancelling a dispatched request never notified the server")
+        await client.stop()
+    }
+
+    func testTimedOutRequestNotifiesServerButCompletedOnesDoNot() async throws {
+        let transport = MockMCPTransport()
+        transport.responder = { request, transport in
+            guard let id = request["id"] else { return }
+            if (request["method"] as? String) == "initialize" {
+                transport.reply(id: id, result: [
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": [:],
+                    "serverInfo": ["name": "m", "version": "1"]
+                ])
+            }
+            // tools/call is deliberately never answered.
+        }
+        let client = makeClient(transport: transport, toolTimeout: 0.3)
+        try await client.start()
+
+        let initializeID = transport.sentFrames.first(where: { ($0["method"] as? String) == "initialize" })?["id"] as? Int
+
+        do {
+            _ = try await client.callTool(name: "slow_tool", arguments: [:])
+            XCTFail("expected a timeout")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("timed out"), error.localizedDescription)
+        }
+
+        var noticedID: Int?
+        var waited = 0
+        while waited < 40 {
+            if let frame = transport.sentFrames.first(where: { ($0["method"] as? String) == "notifications/cancelled" }) {
+                noticedID = (frame["params"] as? [String: Any])?["requestId"] as? Int
+                break
+            }
+            try await Task.sleep(nanoseconds: 50_000_000)
+            waited += 1
+        }
+        let notifiedID = try XCTUnwrap(noticedID, "the timed-out request never notified the server")
+
+        let timedOutID = transport.sentFrames.first(where: { ($0["method"] as? String) == "tools/call" })?["id"] as? Int
+        XCTAssertEqual(notifiedID, timedOutID, "the notice must name the abandoned request")
+        XCTAssertNotEqual(notifiedID, initializeID, "a completed request must not be reported cancelled")
+
+        let noticeCount = transport.sentFrames.filter { ($0["method"] as? String) == "notifications/cancelled" }.count
+        XCTAssertEqual(noticeCount, 1, "exactly one abandonment notice is expected")
+        await client.stop()
+    }
+
+    func testCancellingBeforeSendDispatchesStopsTheWrite() async throws {
+        let transport = MockMCPTransport()
+        installHandshake(transport, tools: [])
+        let client = makeClient(transport: transport)
+        try await client.start()
+
+        // Parks the tools/call write for 10 s: the send is queued, not
+        // dispatched, when the test cancels the call.
+        transport.sendParkNanos = 10_000_000_000
+
+        let task = Task { try await client.callTool(name: "queued_tool", arguments: [:]) }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("expected the call to be cancelled")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "expected a CancellationError, got \(error)")
+        }
+
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertFalse(
+            transport.sentFrames.contains { ($0["method"] as? String) == "tools/call" },
+            "a cancelled queued request must not be written after cancellation"
+        )
+        XCTAssertFalse(
+            transport.sentFrames.contains { ($0["method"] as? String) == "notifications/cancelled" },
+            "a request that never reached the server must not be reported cancelled"
+        )
+        await client.stop()
+    }
+
+    func testCancellingInitializeSendsNoCancellationNotice() async throws {
+        let transport = MockMCPTransport()
+        // No responder: initialize is dispatched but never answered.
+        let client = makeClient(transport: transport, startupTimeout: 5)
+        let task = Task { try await client.start() }
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        XCTAssertTrue(
+            transport.sentFrames.contains { ($0["method"] as? String) == "initialize" },
+            "the initialize request never reached the server"
+        )
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("expected the handshake to be cancelled")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "expected a CancellationError, got \(error)")
+        }
+
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertFalse(
+            transport.sentFrames.contains { ($0["method"] as? String) == "notifications/cancelled" },
+            "abandoned initialization must not be reported cancelled"
+        )
+        await client.stop()
     }
 }
 

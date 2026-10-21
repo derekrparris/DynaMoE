@@ -1170,10 +1170,22 @@ public actor MCPClient {
     private let incoming: AsyncStream<Data>
 
     private var readTask: Task<Void, Never>?
-    private var pending: [Int: CheckedContinuation<MCPResponseEnvelope, any Error>] = [:]
+    /// One entry per request whose response has not arrived yet. `dispatched`
+    /// is the seam between the two abandonment behaviors: a request the
+    /// server already received gets a best-effort `notifications/cancelled`,
+    /// while a request whose write never completed has its send task
+    /// cancelled so it cannot go out after abandonment.
+    private var pending: [Int: PendingRequest] = [:]
     private var nextRequestID = 1
     private var isClosed = false
     private var didStart = false
+
+    private struct PendingRequest {
+        let method: String
+        let continuation: CheckedContinuation<MCPResponseEnvelope, any Error>
+        let sendTask: Task<Void, Never>?
+        var dispatched = false
+    }
 
     public private(set) var negotiatedProtocolVersion: String?
     public private(set) var serverName: String?
@@ -1376,31 +1388,40 @@ public actor MCPClient {
 
         let envelope = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<MCPResponseEnvelope, any Error>) in
-                self.pending[id] = continuation
-
-                Task.detached(priority: .userInitiated) { [weak self] in
-                    guard let self else { return }
+                let sendTask = Task.detached(priority: .userInitiated) { [weak self] in
+                    // An abandoned queued send must not go out: cancellation is
+                    // observed before the write, and the transports' own awaits
+                    // observe it mid-write where they can.
+                    guard let self, !Task.isCancelled else { return }
                     do {
                         try await self.transport.send(payload)
+                        await self.markDispatched(id: id)
                     } catch {
                         await self.failPending(id: id, error: error)
                     }
                 }
 
-                // Late deadlines are harmless: `failPending` is a no-op once the
-                // continuation has been consumed.
+                self.pending[id] = PendingRequest(
+                    method: method,
+                    continuation: continuation,
+                    sendTask: sendTask
+                )
+
+                // Late deadlines are harmless: `abandon` is a no-op once the
+                // request has completed or already been abandoned.
                 Task.detached(priority: .utility) { [weak self] in
                     let nanoseconds = UInt64(max(timeout, 0.1) * 1_000_000_000)
                     try? await Task.sleep(nanoseconds: nanoseconds)
-                    await self?.failPending(
+                    await self?.abandon(
                         id: id,
-                        error: MCPClientError.timeout(method: method, seconds: timeout)
+                        error: MCPClientError.timeout(method: method, seconds: timeout),
+                        reason: "client timed out waiting for the response"
                     )
                 }
             }
         } onCancel: {
             Task.detached(priority: .utility) { [weak self] in
-                await self?.failPending(id: id, error: CancellationError())
+                await self?.abandon(id: id, error: CancellationError(), reason: "cancelled by client")
             }
         }
 
@@ -1410,16 +1431,43 @@ public actor MCPClient {
         return envelope.result ?? [:]
     }
 
+    /// Records that a request's write completed, so abandonment switches from
+    /// "stop the send" to "tell the server we gave up".
+    private func markDispatched(id: Int) {
+        pending[id]?.dispatched = true
+    }
+
+    /// Fails a request this client is giving up on: task cancellation or
+    /// deadline. Abandonment is the only failure path with side effects beyond
+    /// the waiter. A request the server already received gets a best-effort
+    /// `notifications/cancelled` so state-changing work can stop remotely —
+    /// except `initialize`, which carries no cancellable server work — and a
+    /// request whose write never completed has its send task cancelled so it
+    /// cannot be sent after abandonment. Completed requests have no entry
+    /// left, so late abandons are ignored.
+    private func abandon(id: Int, error: any Error, reason: String) {
+        guard let entry = pending.removeValue(forKey: id) else { return }
+        if entry.dispatched {
+            if entry.method != "initialize", !isClosed {
+                notifyCancelled(requestID: id, reason: reason)
+            }
+        } else {
+            entry.sendTask?.cancel()
+        }
+        entry.continuation.resume(throwing: error)
+    }
+
     private func failPending(id: Int, error: any Error) {
-        guard let continuation = pending.removeValue(forKey: id) else { return }
-        continuation.resume(throwing: error)
+        guard let entry = pending.removeValue(forKey: id) else { return }
+        entry.continuation.resume(throwing: error)
     }
 
     private func failAll(_ error: any Error) {
-        let continuations = pending
+        let entries = pending
         pending.removeAll()
-        for (_, continuation) in continuations {
-            continuation.resume(throwing: error)
+        for (_, entry) in entries {
+            entry.sendTask?.cancel()
+            entry.continuation.resume(throwing: error)
         }
     }
 
@@ -1455,8 +1503,8 @@ public actor MCPClient {
         }
 
         guard let id = message.id,
-              let continuation = pending.removeValue(forKey: id) else { return }
-        continuation.resume(returning: MCPResponseEnvelope(
+              let entry = pending.removeValue(forKey: id) else { return }
+        entry.continuation.resume(returning: MCPResponseEnvelope(
             result: message.result,
             errorCode: message.errorCode,
             errorMessage: message.errorMessage
