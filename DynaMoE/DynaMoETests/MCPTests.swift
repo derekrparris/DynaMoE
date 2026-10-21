@@ -282,6 +282,38 @@ final class MCPConfigModelTests: XCTestCase {
         let document = try JSONDecoder().decode(MCPConfigDocument.self, from: Data(json.utf8))
         XCTAssertNotNil(document.mcpServers["a"])
     }
+
+    func testOversizedTimeoutsDecodeButResolveToTimerRange() throws {
+        let json = """
+        {
+          "mcpServers": {
+            "huge": { "command": "npx", "startupTimeoutSec": 1e300, "toolTimeoutSec": 1e300 }
+          }
+        }
+        """
+        let document = try JSONDecoder().decode(MCPConfigDocument.self, from: Data(json.utf8))
+        let server = try XCTUnwrap(document.mcpServers["huge"])
+        XCTAssertEqual(server.startupTimeoutSec, 1e300)
+        XCTAssertEqual(server.resolvedStartupTimeoutSec, MCPServerConfig.maximumTimeoutSec)
+        XCTAssertEqual(server.resolvedToolTimeoutSec, MCPServerConfig.maximumTimeoutSec)
+        // The whole point of the clamp: this conversion must not trap.
+        XCTAssertLessThanOrEqual(server.resolvedToolTimeoutSec * 1_000_000_000, Double(UInt64.max))
+    }
+
+    func testUnusableTimeoutsFallBackToDefaults() {
+        for value in [Double.nan, .infinity, -1, 0] {
+            let server = MCPServerConfig(command: "npx", startupTimeoutSec: value, toolTimeoutSec: value)
+            XCTAssertEqual(server.resolvedStartupTimeoutSec, MCPServerConfig.defaultStartupTimeoutSec, "\(value)")
+            XCTAssertEqual(server.resolvedToolTimeoutSec, MCPServerConfig.defaultToolTimeoutSec, "\(value)")
+        }
+    }
+
+    func testTimerSecondsFloorsAndClamps() {
+        XCTAssertEqual(MCPServerConfig.timerSeconds(forTimeout: 2), 2)
+        XCTAssertEqual(MCPServerConfig.timerSeconds(forTimeout: 0), 0.1)
+        XCTAssertEqual(MCPServerConfig.timerSeconds(forTimeout: Double.nan), 0.1)
+        XCTAssertEqual(MCPServerConfig.timerSeconds(forTimeout: 1e300), MCPServerConfig.maximumTimeoutSec)
+    }
 }
 
 // MARK: - Validation
@@ -334,6 +366,41 @@ final class MCPConfigValidatorTests: XCTestCase {
             key: "timeouts"
         )
         XCTAssertEqual(issues.filter { $0.severity == .error }.count, 2)
+    }
+
+    func testRejectsTimeoutTooTallToConvert() {
+        // `1e300` is valid JSON, passes a `> 0` check, and then traps when the
+        // deadline converts it to `UInt64` nanoseconds.
+        let issues = MCPConfigValidator.validate(
+            server: MCPServerConfig(command: "npx", startupTimeoutSec: 1e300),
+            key: "timeouts"
+        )
+        XCTAssertTrue(
+            issues.contains { $0.severity == .error && $0.message.contains("out of range") },
+            issues.map(\.message).joined(separator: " | ")
+        )
+    }
+
+    func testRejectsNonFiniteTimeouts() {
+        for value in [Double.infinity, .nan] {
+            let issues = MCPConfigValidator.validate(
+                server: MCPServerConfig(command: "npx", startupTimeoutSec: value, toolTimeoutSec: value),
+                key: "timeouts"
+            )
+            XCTAssertEqual(
+                issues.filter { $0.severity == .error && $0.message.contains("finite") }.count,
+                2,
+                "\(value)"
+            )
+        }
+    }
+
+    func testAcceptsTimeoutAtTimerLimit() {
+        let issues = MCPConfigValidator.validate(
+            server: MCPServerConfig(command: "npx", startupTimeoutSec: MCPServerConfig.maximumTimeoutSec),
+            key: "timeouts"
+        )
+        XCTAssertFalse(issues.contains { $0.severity == .error }, issues.map(\.message).joined(separator: " | "))
     }
 
     func testValidServerHasNoIssues() {
@@ -883,6 +950,20 @@ final class MCPClientProtocolTests: XCTestCase {
         let clientInfo = try XCTUnwrap(params["clientInfo"] as? [String: Any])
         XCTAssertEqual(clientInfo["name"] as? String, "DynaMoE")
 
+        await client.stop()
+    }
+
+    func testOversizedConfiguredTimeoutsDoNotTrapTheDeadline() async throws {
+        // The deadline sleeps with `UInt64` nanoseconds; a config value like
+        // `1e300` used to trap here and crash the test host.
+        let transport = MockMCPTransport()
+        installHandshake(transport, tools: [])
+        let client = makeClient(transport: transport, startupTimeout: 1e300, toolTimeout: 1e300)
+
+        try await client.start()
+
+        let name = await client.serverName
+        XCTAssertEqual(name, "mock-server")
         await client.stop()
     }
 

@@ -70,14 +70,31 @@ public nonisolated struct MCPServerConfig: Codable, Equatable, Sendable {
         return hasCommand ? .stdio : .http
     }
 
+    /// Longest duration the request deadline can represent. The deadline is
+    /// slept with `Task.sleep(nanoseconds:)`, which takes a `UInt64`, and
+    /// converting a larger `Double` traps, so a config value like `1e300`
+    /// would crash the app on connect. Everything is clamped to this first.
+    public static let maximumTimeoutSec: Double = Double(UInt64.max / 1_000_000_000)
+
+    /// A usable duration in seconds, or `nil` when the configured value is
+    /// not something a timer can be given (NaN, infinite, zero or negative).
+    static func clampedTimeout(_ value: Double?) -> Double? {
+        guard let value, value.isFinite, value > 0 else { return nil }
+        return min(value, maximumTimeoutSec)
+    }
+
+    /// The duration a timer may be handed for `timeout`: clamped to the
+    /// representable range and floored so a request still waits at all.
+    static func timerSeconds(forTimeout timeout: Double) -> Double {
+        min(max(clampedTimeout(timeout) ?? 0.1, 0.1), maximumTimeoutSec)
+    }
+
     public var resolvedStartupTimeoutSec: Double {
-        guard let value = startupTimeoutSec, value > 0 else { return Self.defaultStartupTimeoutSec }
-        return value
+        Self.clampedTimeout(startupTimeoutSec) ?? Self.defaultStartupTimeoutSec
     }
 
     public var resolvedToolTimeoutSec: Double {
-        guard let value = toolTimeoutSec, value > 0 else { return Self.defaultToolTimeoutSec }
-        return value
+        Self.clampedTimeout(toolTimeoutSec) ?? Self.defaultToolTimeoutSec
     }
 
     /// Human-readable endpoint for the settings row.
@@ -423,6 +440,16 @@ public nonisolated enum MCPConfigValidator {
         func warning(_ message: String) {
             issues.append(MCPConfigIssue(severity: .warning, serverKey: key, message: message))
         }
+        func validateTimeout(_ raw: Double?, name: String) {
+            guard let raw else { return }
+            if !raw.isFinite {
+                error("'\(name)' must be a finite number of seconds.")
+            } else if raw <= 0 {
+                error("'\(name)' must be greater than 0.")
+            } else if raw > MCPServerConfig.maximumTimeoutSec {
+                error("'\(name)' is out of range; the maximum is \(Int(MCPServerConfig.maximumTimeoutSec)) seconds.")
+            }
+        }
 
         if key.isEmpty {
             error("Server name is empty.")
@@ -459,12 +486,10 @@ public nonisolated enum MCPConfigValidator {
             }
         }
 
-        if (server.startupTimeoutSec ?? 1) <= 0 {
-            error("'startupTimeoutSec' must be greater than 0.")
-        }
-        if (server.toolTimeoutSec ?? 1) <= 0 {
-            error("'toolTimeoutSec' must be greater than 0.")
-        }
+        // Non-finite values and values past the timer's range are as fatal as
+        // zero: both trap when the deadline converts them to nanoseconds.
+        validateTimeout(server.startupTimeoutSec, name: "startupTimeoutSec")
+        validateTimeout(server.toolTimeoutSec, name: "toolTimeoutSec")
 
         // Names, not just values. A header name containing a space or comma
         // makes the whole HTTP request unparseable, and the server answers with

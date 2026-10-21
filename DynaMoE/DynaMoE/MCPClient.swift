@@ -1236,7 +1236,7 @@ public actor MCPClient {
                 transport: MCPHTTPTransport(
                     endpoint: endpoint,
                     headers: config.headers,
-                    requestTimeout: max(config.toolTimeoutSec, 30),
+                    requestTimeout: min(max(config.toolTimeoutSec, 30), MCPServerConfig.maximumTimeoutSec),
                     label: config.key
                 ),
                 onToolsChanged: onToolsChanged,
@@ -1428,7 +1428,10 @@ public actor MCPClient {
                 // Late deadlines are harmless: `abandon` is a no-op once the
                 // request has completed or already been abandoned.
                 Task.detached(priority: .utility) { [weak self] in
-                    let nanoseconds = UInt64(max(timeout, 0.1) * 1_000_000_000)
+                    // A configured timeout is arbitrary JSON, so clamp it to
+                    // the timer's range before the `UInt64` conversion traps.
+                    let seconds = MCPServerConfig.timerSeconds(forTimeout: timeout)
+                    let nanoseconds = UInt64(seconds * 1_000_000_000)
                     try? await Task.sleep(nanoseconds: nanoseconds)
                     await self?.abandon(
                         id: id,
