@@ -257,7 +257,6 @@ DynaMoE/
 - [x] Support Apple Foundation Models
 - [x] Use Apple Foundation Model (AFM) to compact conversations
 - [x] Serve the loaded model over OpenAI- and Anthropic-compatible APIs, with streaming, tool calling, reasoning, and prefix reuse across stateless turns
-- [ ] Configurable YaRN RoPE scaling UI toggle for long-context execution up to 1M tokens.
 - [ ] UI/UX refinement
 
 ---
