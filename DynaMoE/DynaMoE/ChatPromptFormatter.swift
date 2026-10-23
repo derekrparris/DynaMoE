@@ -25,7 +25,8 @@ public enum ChatPromptFormatter {
         cleanSystem: String,
         thinkingEnabled: Bool,
         modelSupportsThinking: Bool,
-        modelConfig: ModelConfig?
+        modelConfig: ModelConfig?,
+        thinkingEffort: ThinkingEffort? = nil
     ) -> String {
         let thinkSuffix: String
         if thinkingEnabled {
@@ -48,16 +49,17 @@ public enum ChatPromptFormatter {
                 formattedPrompt = "<role>SYSTEM</role>\(sysPart)<|role_end|><role>HUMAN</role>\(prompt)<|role_end|><role>ASSISTANT</role>\(thinkTag)"
             }
         } else if modelConfig?.isSparkModel == true {
-            // Spark 2.5 DeepSeek-style dialect
+            // Spark 2.5 DeepSeek-style dialect; X2.6 adds the effort line to the
+            // System block (never when thinking is off, per the template).
             if prompt.contains("<|Bot|>") || prompt.contains("<|User|>") || prompt.contains("<|System|>") {
                 formattedPrompt = prompt
             } else {
-                var p = ""
-                if cleanSystem.isEmpty {
-                    p += "<｜start▁of▁sentence｜><|System|>\nYou are a helpful assistant.<｜end▁of▁sentence｜>"
-                } else {
-                    p += "<｜start▁of▁sentence｜><|System|>\n\(cleanSystem)<｜end▁of▁sentence｜>"
-                }
+                let systemBody = Self.sparkSystemBody(
+                    cleanSystem: cleanSystem,
+                    thinkingEnabled: thinkingEnabled,
+                    thinkingEffort: thinkingEffort
+                )
+                var p = "<｜start▁of▁sentence｜><|System|>\n" + systemBody + "<｜end▁of▁sentence｜>"
                 p += "<｜start▁of▁sentence｜><|User|>\(prompt)<｜end▁of▁sentence｜>"
                 let sparkThink = thinkingEnabled ? "<think>" : "<think></think>"
                 p += "<｜start▁of▁sentence｜><|Bot|>\(sparkThink)"
@@ -108,6 +110,45 @@ public enum ChatPromptFormatter {
     /// escapes so a renderer can never mangle the fullwidth bars / block
     /// underscores (AGENTS.md: "Reading files safely").
     public static let sparkEndOfSentence = "<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}>"
+
+    /// Spark X2.6's thinking-level instruction, appended to the System block
+    /// when the model's chat template exposes `reasoning_effort` (levels:
+    /// low/high; thinking off emits nothing, matching the template). Verbatim
+    /// from Spark-X2.6-4B's `chat_template.jinja` `reasoning_instructions`;
+    /// the leading newline separates it from the system base line.
+    public static func sparkThinkingEffortInstructions(level: ThinkingEffort) -> String {
+        "\n`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low` and `high`.\nNow the system is invoked with `thinking_effort=\(level.rawValue)`."
+    }
+
+    /// Renders Spark's System block body the way the model's own template
+    /// does: the default assistant sentence (with the effort instruction when
+    /// thinking is on), then any tools block, then the caller's system text.
+    /// Recognizes both the in-app `# Tools` section and the server's appended
+    /// tool declaration so the instruction never lands after the tools.
+    public static func sparkSystemBody(
+        cleanSystem: String,
+        thinkingEnabled: Bool,
+        thinkingEffort: ThinkingEffort?
+    ) -> String {
+        let defaultSentence = "you are a helpful assistant."
+        let effortLine = (thinkingEnabled ? thinkingEffort : nil)
+            .map { sparkThinkingEffortInstructions(level: $0) } ?? ""
+        let base = defaultSentence + effortLine
+        guard !cleanSystem.isEmpty else { return base }
+        // In-app agent prompt: [date/prefix]\n\n# Tools ... [client system].
+        if let range = cleanSystem.range(of: "\n\n# Tools") {
+            let prefix = String(cleanSystem[..<range.lowerBound])
+            let rest = String(cleanSystem[range.lowerBound...])
+            return base + (prefix.isEmpty ? "" : "\n\n" + prefix) + rest
+        }
+        // Server tool declaration: [client system]\n\nYou have access ...
+        if let range = cleanSystem.range(of: "\n\nYou have access to the following functions.") {
+            let client = String(cleanSystem[..<range.lowerBound])
+            let tools = String(cleanSystem[range.lowerBound...])
+            return base + tools + (client.isEmpty ? "" : "\n\n" + client)
+        }
+        return base + "\n\n" + cleanSystem
+    }
 
     /// Gemma 4's native reasoning channel markers. The model opens the channel
     /// itself after `<|turn>model` when thinking is on, so a completed turn's
@@ -221,7 +262,8 @@ public enum ChatPromptFormatter {
         cleanSystem: String,
         thinkingEnabled: Bool,
         modelSupportsThinking: Bool,
-        modelConfig: ModelConfig?
+        modelConfig: ModelConfig?,
+        thinkingEffort: ThinkingEffort? = nil
     ) -> String {
         guard !turns.isEmpty else { return "" }
 
@@ -248,7 +290,11 @@ public enum ChatPromptFormatter {
         }
 
         if modelConfig?.isSparkModel == true {
-            let sysLine = cleanSystem.isEmpty ? "You are a helpful assistant." : cleanSystem
+            let sysLine = Self.sparkSystemBody(
+                cleanSystem: cleanSystem,
+                thinkingEnabled: thinkingEnabled,
+                thinkingEffort: thinkingEffort
+            )
             let openPrefix = "<｜start▁of▁sentence｜><|Bot|>" + TurnTextSplitter.canonicalReasoningOpenTag
             let emptyPrefix = openPrefix + TurnTextSplitter.canonicalReasoningCloseTag
             var p = "<｜start▁of▁sentence｜><|System|>\n" + sysLine + "<｜end▁of▁sentence｜>"

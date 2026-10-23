@@ -438,6 +438,7 @@ struct ContentView: View {
     @State private var chatPromptText: String = ""
     @State private var systemPrompt: String = ModelConfig.getUserDefaultSystemPrompt()
     @AppStorage("dynamoe_thinking_enabled") private var defaultThinkingEnabled: Bool = true
+    @AppStorage("dynamoe_thinking_effort") private var defaultThinkingEffort: String = ThinkingEffort.high.rawValue
     @AppStorage("dynamoe_agent_tools_enabled") private var defaultAgentToolsEnabled: Bool = false
     @AppStorage("dynamoe_agent_working_directory") private var agentWorkingDirectory: String = ""
     @AppStorage("dynamoe_max_tool_output_length") private var maxToolOutputLength: Int = 4000
@@ -541,6 +542,29 @@ struct ContentView: View {
         return defaultThinkingEnabled
     }
 
+    /// Whether the active model's chat template exposes graded thinking levels
+    /// (Spark X2.6's `reasoning_effort`), for rendering the level menu.
+    var activeModelSupportsThinkingLevels: Bool {
+        if let loadedPath = activeLoadedModelPath,
+           supportsThinkingLevels(modelPath: loadedPath, modelId: nil) {
+            return true
+        }
+        let session = activeSessionBinding.wrappedValue
+        return supportsThinkingLevels(modelPath: session?.selectedModelPath, modelId: session?.selectedModelId)
+    }
+
+    /// Graded thinking level shown selected in the chat menu: the conversation's
+    /// choice or the clamped app default. Only meaningful for level-capable models.
+    var thinkingEffortForActiveSession: ThinkingEffort {
+        activeSessionBinding.wrappedValue?.thinkingEffort ?? defaultThinkingEffortLevel
+    }
+
+    /// The app-wide default level, clamped so a stale `dynamoe_thinking_effort`
+    /// value can never reach the prompt or render an unchecked menu item.
+    private var defaultThinkingEffortLevel: ThinkingEffort {
+        ThinkingEffort.clamped(defaultThinkingEffort)
+    }
+
     /// Display name for a specific conversation's model. An async send that
     /// resumed after the user switched chats must format with the model it is
     /// actually running on, not whatever is selected now.
@@ -576,6 +600,38 @@ struct ContentView: View {
     /// Thinking toggle for a specific conversation, defaulting to the app default.
     private func isThinkingEnabled(for session: ChatSession?) -> Bool {
         session?.isThinkingEnabled ?? defaultThinkingEnabled
+    }
+
+    /// Whether a specific conversation's model exposes graded thinking levels,
+    /// derived from that conversation rather than the current selection. The
+    /// scan's result is checked first; the file probe is memoized by path.
+    private func supportsThinkingLevels(for session: ChatSession?) -> Bool {
+        supportsThinkingLevels(
+            modelPath: session?.selectedModelPath ?? activeLoadedModelPath,
+            modelId: session?.selectedModelId
+        )
+    }
+
+    private func supportsThinkingLevels(modelPath: String?, modelId: String?) -> Bool {
+        if let model = discoveredModel(modelPath: modelPath, modelId: modelId) {
+            return model.supportsThinkingLevels
+        }
+        return ModelConfig.supportsThinkingLevels(modelPath: modelPath)
+    }
+
+    private func discoveredModel(modelPath: String?, modelId: String?) -> DiscoveredModel? {
+        if let modelId, !modelId.isEmpty,
+           let model = localModelManager.discoveredModels.first(where: { $0.id == modelId }) {
+            return model
+        }
+        guard let modelPath, !modelPath.isEmpty else { return nil }
+        return localModelManager.discoveredModels.first(where: { $0.snapshotPath == modelPath })
+    }
+
+    /// Graded thinking level for a specific conversation, defaulting to the app
+    /// default. Only consumed when the model is level-capable and thinking is on.
+    private func thinkingEffort(for session: ChatSession?) -> ThinkingEffort {
+        session?.thinkingEffort ?? defaultThinkingEffortLevel
     }
 
     var activeSessionBinding: Binding<ChatSession?> {
@@ -1070,7 +1126,8 @@ struct ContentView: View {
     }
 
     var body: some View {
-        ZStack {
+        let levelCapable = activeModelSupportsThinkingLevels
+        return ZStack {
             NavigationSplitView(columnVisibility: $columnVisibility) {
                 SidebarView(
                     // Route the binding through the computed `sessions` so sidebar
@@ -1140,6 +1197,8 @@ struct ContentView: View {
                     },
                     supportsThinking: activeModelSupportsThinking,
                     isThinkingEnabled: isThinkingEnabledForActiveSession,
+                    thinkingEffort: levelCapable ? thinkingEffortForActiveSession : nil,
+                    supportsThinkingLevels: levelCapable,
                     isAgentToolsEnabled: isAgentToolsEnabledForActiveSession,
                     isModelLoaded: (tokenizer != nil && summary != nil) || isAppleFoundationModelActive,
                     isAppleFoundationModelActive: isAppleFoundationModelActive,
@@ -1164,11 +1223,24 @@ struct ContentView: View {
                     onOpenSettings: {
                         openSettingsWindow()
                     },
-                    onToggleThinking: { enabled in
+                    onSetThinking: { enabled, effort in
+                        let resolvedEffort = enabled ? effort : nil
                         defaultThinkingEnabled = enabled
+                        if let effort {
+                            defaultThinkingEffort = effort.rawValue
+                        }
                         if let sid = selectedSessionId ?? sessions.first?.id,
                            let idx = sessions.firstIndex(where: { $0.id == sid }) {
+                            let changed = sessions[idx].isThinkingEnabled != enabled
+                                || sessions[idx].thinkingEffort != resolvedEffort
                             sessions[idx].isThinkingEnabled = enabled
+                            sessions[idx].thinkingEffort = resolvedEffort
+                            if changed {
+                                // The system line and the assistant prefix both
+                                // change from the next turn; drop the pin so the
+                                // engine never splices into a stale prefix.
+                                PrefixCacheManager.shared.invalidate(sessionId: sid)
+                            }
                         }
                     },
                     onToggleAgentTools: { enabled in
@@ -2036,6 +2108,9 @@ struct ContentView: View {
         let sessionModelName = modelDisplayName(for: sendSession)
         let modelSupportsThinking = supportsThinking(for: sendSession)
         let thinkingEnabled = isThinkingEnabled(for: sendSession) && modelSupportsThinking
+        // Graded thinking level (Spark X2.6's `reasoning_effort`): only when the
+        // conversation's model is level-capable and thinking is actually on.
+        let thinkingEffortLevel = (thinkingEnabled && supportsThinkingLevels(for: sendSession)) ? thinkingEffort(for: sendSession) : nil
 
         let assistantMsgId = UUID()
         let assistantMsg = ChatMessage(id: assistantMsgId, role: .assistant, content: "", thinkingContent: nil, isThinking: thinkingEnabled)
@@ -2172,11 +2247,14 @@ struct ContentView: View {
             // <｜start▁of▁sentence｜><|System|>\n...<｜end▁of▁sentence｜>
             // <｜start▁of▁sentence｜><|User|>...<｜end▁of▁sentence｜>
             // <｜start▁of▁sentence｜><|Bot|></think> / <think>
-            if effectiveSystem.isEmpty {
-                promptString += "<｜start▁of▁sentence｜><|System|>\nyou are a helpful assistant.<｜end▁of▁sentence｜>"
-            } else {
-                promptString += "<｜start▁of▁sentence｜><|System|>\n\(effectiveSystem)<｜end▁of▁sentence｜>"
-            }
+            // Spark X2.6 graded thinking: the effort instruction line rides the
+            // System block (never when thinking is off, per the chat template).
+            let sparkSystem = ChatPromptFormatter.sparkSystemBody(
+                cleanSystem: effectiveSystem,
+                thinkingEnabled: thinkingEnabled,
+                thinkingEffort: thinkingEffortLevel
+            )
+            promptString += "<｜start▁of▁sentence｜><|System|>\n" + sparkSystem + "<｜end▁of▁sentence｜>"
             for msg in sessions[sessionIdx].messages.dropLast() {
                 let cleanMsg = msg.content
                     .replacingOccurrences(of: "<｜end▁of▁sentence｜>", with: "")
@@ -4549,13 +4627,19 @@ struct ContentView: View {
 
         let modelSupportsThinking = supportsThinking(for: generationSession)
         let thinkingEnabled = isThinkingEnabled(for: generationSession) && modelSupportsThinking
+        // Agent follow-up turns rebuild the system block here; they must carry
+        // the same effort line as the first turn, or X2.6 renders two prompts.
+        let thinkingEffortLevel = (thinkingEnabled && supportsThinkingLevels(for: generationSession))
+            ? thinkingEffort(for: generationSession)
+            : nil
 
         let formattedPrompt = ChatPromptFormatter.formatPrompt(
             prompt: prompt,
             cleanSystem: cleanSystem,
             thinkingEnabled: thinkingEnabled,
             modelSupportsThinking: modelSupportsThinking,
-            modelConfig: modelConfig
+            modelConfig: modelConfig,
+            thinkingEffort: thinkingEffortLevel
         )
 
         // Expose the exact prompt text to the harness: the path-repair hint uses it

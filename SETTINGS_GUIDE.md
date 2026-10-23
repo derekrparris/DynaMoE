@@ -180,6 +180,10 @@ DynaMoE automatically defaults to and persists the official publisher-tuned prof
 4. Click **Save [Coder/Assistant] Profile** to persist these settings permanently to `UserDefaults`.
 5. In the chat interface, toggle between **[ 💻 Coder ▾ ]** and **[ 💬 Assistant ▾ ]** right next to the model selector with zero friction.
 
+#### Thinking Levels (per conversation)
+
+Next to the profile selector, the **[ 🧠 Thinking ▾ ]** dropdown controls reasoning per conversation. For models whose chat template only has the on/off switch (most models), it offers **Thinking On / Off**. For level-capable models whose chat template exposes a graded reasoning effort, such as Spark X2.6's `reasoning_effort`, it offers **High (full reasoning)**, **Low (brief reasoning)**, and **Off (direct response)** instead. The chosen level is stored per conversation and defaults to High. Changing it mid-conversation starts a fresh prompt prefix, so the next turn re-reads the conversation before generating. Level capability is detected from the model's Spark family config and chat template rather than its name, so repacked or quantized copies of a level-capable checkpoint stay detected, and plain on/off models are unaffected.
+
 ---
 
 ## 4. Generation & Sampling Hyperparameters

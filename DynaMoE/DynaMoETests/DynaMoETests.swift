@@ -16007,6 +16007,43 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertNil(decoded.cumulativeTokenCount)
     }
 
+    func testThinkingEffortSurvivesPersistenceRoundTrip() throws {
+        var session = ChatSession(title: "Levelled")
+        session.isThinkingEnabled = true
+        session.thinkingEffort = .low
+        let data = try JSONEncoder().encode(session)
+        let decoded = try JSONDecoder().decode(ChatSession.self, from: data)
+        XCTAssertEqual(decoded.isThinkingEnabled, true)
+        XCTAssertEqual(decoded.thinkingEffort, .low)
+    }
+
+    func testLegacySessionWithoutThinkingEffortDecodesAsNil() throws {
+        var session = ChatSession(title: "Legacy")
+        session.thinkingEffort = .high
+        let data = try JSONEncoder().encode(session)
+        var object = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        object.removeValue(forKey: "thinkingEffort")
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(ChatSession.self, from: legacyData)
+        XCTAssertNil(decoded.thinkingEffort)
+    }
+
+    func testInvalidStoredThinkingEffortClampsToHigh() throws {
+        // A hand-edited session file (or a stale value from another build) must
+        // never reach the formatter: an unsupported level clamps to the
+        // template's high default instead of rendering "thinking_effort=medium".
+        var session = ChatSession(title: "Stale effort")
+        session.thinkingEffort = .low
+        let data = try JSONEncoder().encode(session)
+        var object = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        object["thinkingEffort"] = "medium"
+        let staleData = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(ChatSession.self, from: staleData)
+        XCTAssertEqual(decoded.thinkingEffort, .high)
+        XCTAssertEqual(ThinkingEffort.clamped("medium"), .high)
+        XCTAssertNil(ThinkingEffort.parse("medium"))
+    }
+
     // MARK: - Cumulative token odometer (pure logic)
 
     func testUnmeteredSessionSeedsOdometerFromFullPrompt() {

@@ -123,4 +123,24 @@ final class ServerHardeningLogicTests: XCTestCase {
         XCTAssertEqual(busy.status, .serviceUnavailable)
         XCTAssertNil(busy.code)
     }
+
+    func testLevelCapableTurnsDefaultToHighWhenTheClientOmitsAnEffort() {
+        // The Spark X2.6 template defaults to high and always emits the
+        // instruction, so an API turn that omits the knob must not fall back to
+        // the no-instruction variant the in-app path used to render.
+        XCTAssertEqual(
+            ServerController.resolvedThinkingEffort(requested: nil, thinkingEnabled: true, levelCapable: true),
+            .high
+        )
+        XCTAssertEqual(
+            ServerController.resolvedThinkingEffort(requested: .low, thinkingEnabled: true, levelCapable: true),
+            .low
+        )
+        XCTAssertNil(
+            ServerController.resolvedThinkingEffort(requested: .low, thinkingEnabled: false, levelCapable: true)
+        )
+        XCTAssertNil(
+            ServerController.resolvedThinkingEffort(requested: .low, thinkingEnabled: true, levelCapable: false)
+        )
+    }
 }

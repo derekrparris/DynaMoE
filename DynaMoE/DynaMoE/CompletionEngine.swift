@@ -259,6 +259,7 @@ public final class CompletionEngine: @unchecked Sendable {
         public var displayName: String
         public var path: String?
         public var supportsThinking: Bool
+        public var supportsThinkingLevels: Bool
         public var weightsSizeGB: Double
     }
 
@@ -273,7 +274,8 @@ public final class CompletionEngine: @unchecked Sendable {
             modelName: modelName,
             modelPath: path
         )
-        return LoadedModelInfo(displayName: modelName, path: path, supportsThinking: supports, weightsSizeGB: summary?.sizeGb ?? 0)
+        let supportsLevels = ModelConfig.supportsThinkingLevels(modelPath: path)
+        return LoadedModelInfo(displayName: modelName, path: path, supportsThinking: supports, supportsThinkingLevels: supportsLevels, weightsSizeGB: summary?.sizeGb ?? 0)
     }
 
     /// Tokenizer bridge for API callers that build their own prompts

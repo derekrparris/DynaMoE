@@ -26,6 +26,10 @@ public struct DiscoveredModel: Identifiable, Hashable, Codable, Equatable {
     public var quantization: String?
     public var rawModelType: String?
     public var supportsThinking: Bool
+    /// Whether the model's chat template exposes graded thinking levels
+    /// (Spark X2.6's `reasoning_effort`: High, Low, or Off). `false` for
+    /// models that only have the plain on/off switch.
+    public var supportsThinkingLevels: Bool
 
     public init(
         id: String,
@@ -43,7 +47,8 @@ public struct DiscoveredModel: Identifiable, Hashable, Codable, Equatable {
         lastModified: Date = Date(),
         quantization: String? = nil,
         rawModelType: String? = nil,
-        supportsThinking: Bool = false
+        supportsThinking: Bool = false,
+        supportsThinkingLevels: Bool = false
     ) {
         self.id = id
         self.displayName = displayName
@@ -61,6 +66,7 @@ public struct DiscoveredModel: Identifiable, Hashable, Codable, Equatable {
         self.quantization = quantization
         self.rawModelType = rawModelType
         self.supportsThinking = supportsThinking
+        self.supportsThinkingLevels = supportsThinkingLevels
     }
 }
 
@@ -379,6 +385,10 @@ public class LocalModelManager: ObservableObject {
             }
         }
 
+        // Graded thinking levels (Spark X2.6 `reasoning_effort`): sniff the
+        // model's own chat template, on this background scanning thread.
+        let supportsThinkingLevels = ModelConfig.supportsThinkingLevels(modelPath: dirPath)
+
         return DiscoveredModel(
             id: repoId,
             displayName: displayName,
@@ -395,7 +405,8 @@ public class LocalModelManager: ObservableObject {
             lastModified: modDate,
             quantization: quantization,
             rawModelType: rawModelType,
-            supportsThinking: supportsThinking
+            supportsThinking: supportsThinking,
+            supportsThinkingLevels: supportsThinkingLevels
         )
     }
 

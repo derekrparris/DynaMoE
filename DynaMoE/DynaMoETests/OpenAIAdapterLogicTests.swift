@@ -297,4 +297,19 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         XCTAssertTrue(json.contains("\"default\":null"), "a null schema default must survive, not become \"\"")
         XCTAssertFalse(json.contains("\"default\":\"\""))
     }
+
+    // MARK: - Graded thinking levels
+
+    func testReasoningEffortAcceptsOnlySupportedLevels() throws {
+        XCTAssertNil(try OpenAIAdapter.thinkingEffort(from: nil, levelCapable: true, thinkingRequested: true))
+        XCTAssertEqual(try OpenAIAdapter.thinkingEffort(from: "low", levelCapable: true, thinkingRequested: true), .low)
+        XCTAssertEqual(try OpenAIAdapter.thinkingEffort(from: " HIGH ", levelCapable: true, thinkingRequested: true), .high)
+        XCTAssertThrowsError(try OpenAIAdapter.thinkingEffort(from: "medium", levelCapable: true, thinkingRequested: true))
+        XCTAssertThrowsError(try OpenAIAdapter.thinkingEffort(from: "low", levelCapable: false, thinkingRequested: true))
+    }
+
+    func testReasoningEffortIsMootWhenThinkingIsOff() throws {
+        XCTAssertNil(try OpenAIAdapter.thinkingEffort(from: "high", levelCapable: true, thinkingRequested: false))
+        XCTAssertNil(try OpenAIAdapter.thinkingEffort(from: "high", levelCapable: false, thinkingRequested: false))
+    }
 }

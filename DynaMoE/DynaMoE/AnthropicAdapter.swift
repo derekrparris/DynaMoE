@@ -479,6 +479,27 @@ enum AnthropicAdapter {
         }
     }
 
+    /// Maps Anthropic's `thinking` config onto a graded level. A token budget
+    /// is an upper bound rather than a level, so budgets below 4096 map to
+    /// low and larger budgets to high; omitting the budget keeps the
+    /// template's high default. Models without graded levels keep the plain
+    /// on/off switch and ignore the budget, because they have no level to send.
+    nonisolated static func thinkingEffort(
+        from thinking: AnthropicMessagesRequest.ThinkingConfig?,
+        levelCapable: Bool
+    ) throws -> ThinkingEffort? {
+        guard let thinking, thinking.type == "enabled" else { return nil }
+        guard let budget = thinking.budgetTokens else { return levelCapable ? .high : nil }
+        guard budget > 0 else {
+            throw ServerAPIError.badRequest(
+                "thinking.budget_tokens must be positive.",
+                logSafeMessage: "thinking.budget_tokens must be positive"
+            )
+        }
+        guard levelCapable else { return nil }
+        return budget < 4096 ? .low : .high
+    }
+
     /// Maps the engine's terminal reasons onto Anthropic stop_reason values.
     static func finishReasonString(_ reason: TurnFinishReason, hasToolCalls: Bool) -> String? {
         switch reason {

@@ -575,6 +575,12 @@ public struct ModelConfig: Codable {
     }
 
     public var isSparkModel: Bool {
+        Self.isSparkModel(modelType: modelType, architectures: architectures)
+    }
+
+    /// Family check shared by the decoded config and the file-only capability
+    /// probe, so both agree on what counts as Spark.
+    nonisolated public static func isSparkModel(modelType: String?, architectures: [String]?) -> Bool {
         let rawType = (modelType ?? "").lowercased()
         let archs = architectures?.map { $0.lowercased() } ?? []
         return rawType.contains("spark") || archs.contains(where: { $0.contains("spark") })
@@ -991,5 +997,52 @@ public struct ModelConfig: Codable {
             return true
         }
         return false
+    }
+
+    /// Whether a model exposes graded thinking levels on top of the on/off
+    /// switch. Only the Spark family's `reasoning_effort` dialect is
+    /// implemented, so detection requires a Spark `config.json` plus a chat
+    /// template that mentions `reasoning_effort`. `chat_template.jinja` is the
+    /// authoritative template when present; otherwise the copy embedded in
+    /// `tokenizer_config.json` is inspected. Results are memoized per path
+    /// because callers evaluate this while rendering.
+    nonisolated public static func supportsThinkingLevels(modelPath: String?) -> Bool {
+        guard let path = modelPath, !path.isEmpty else { return false }
+        let key = path as NSString
+        if let cached = thinkingLevelsCache.object(forKey: key) {
+            return cached.boolValue
+        }
+        let directory = URL(fileURLWithPath: path)
+        let supported = isSparkDirectory(directory)
+            && chatTemplateText(in: directory)?.contains("reasoning_effort") == true
+        thinkingLevelsCache.setObject(NSNumber(value: supported), forKey: key)
+        return supported
+    }
+
+    /// Scan-time detection runs off the main actor, so the shared cache must be
+    /// safe across threads; `NSCache` is.
+    nonisolated(unsafe) private static let thinkingLevelsCache = NSCache<NSString, NSNumber>()
+
+    private nonisolated static func isSparkDirectory(_ directory: URL) -> Bool {
+        let configUrl = directory.appendingPathComponent("config.json")
+        guard let data = try? Data(contentsOf: configUrl),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+        let modelType = json["model_type"] as? String
+        let architectures = json["architectures"] as? [String]
+        return isSparkModel(modelType: modelType, architectures: architectures)
+    }
+
+    /// `chat_template.jinja` wins when present: a stripped or repacked jinja
+    /// template must not be masked by the template embedded in
+    /// `tokenizer_config.json`.
+    private nonisolated static func chatTemplateText(in directory: URL) -> String? {
+        let jinja = directory.appendingPathComponent("chat_template.jinja")
+        if let text = try? String(contentsOf: jinja, encoding: .utf8) {
+            return text
+        }
+        let tokenizerConfig = directory.appendingPathComponent("tokenizer_config.json")
+        return try? String(contentsOf: tokenizerConfig, encoding: .utf8)
     }
 }

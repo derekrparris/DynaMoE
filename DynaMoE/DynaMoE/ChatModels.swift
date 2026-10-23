@@ -5,6 +5,27 @@
 
 import Foundation
 
+/// Graded reasoning effort for chat templates that expose a level (Spark
+/// X2.6's `reasoning_effort`). Thinking off is represented by `nil` at the
+/// call sites; models with only an on/off switch ignore the value entirely.
+nonisolated public enum ThinkingEffort: String, Codable, CaseIterable, Equatable, Sendable {
+    case low
+    case high
+
+    /// Parses arbitrary stored text case-insensitively. Returns nil when the
+    /// text is absent or not a supported level.
+    public static func parse(_ raw: String?) -> ThinkingEffort? {
+        guard let raw else { return nil }
+        return ThinkingEffort(rawValue: raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }
+
+    /// Clamps stale or hand-edited stored text to a supported level, falling
+    /// back to `.high` (the value Spark X2.6's template defaults to).
+    public static func clamped(_ raw: String?) -> ThinkingEffort {
+        parse(raw) ?? .high
+    }
+}
+
 nonisolated public enum MessageRole: String, Codable, Equatable, Sendable {
     case user
     case assistant
@@ -154,6 +175,12 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
     public var selectedModelName: String?
     public var selectedModelPath: String?
     public var isThinkingEnabled: Bool?
+    /// Graded thinking level for level-capable models (Spark X2.6's
+    /// `reasoning_effort`); meaningful only while `isThinkingEnabled` is true
+    /// and the selected model supports levels. nil = unset, so the app-wide
+    /// default applies. Back-compatible: older session files decode without
+    /// it, and an unsupported stored value clamps to `.high` on read.
+    public var thinkingEffort: ThinkingEffort?
     public var isAgentToolsEnabled: Bool?
     public var queuedPrompts: [QueuedPrompt]
     /// Rolling general summary of everything a manual /compact removed from
@@ -189,6 +216,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         selectedModelName: String? = nil,
         selectedModelPath: String? = nil,
         isThinkingEnabled: Bool? = nil,
+        thinkingEffort: ThinkingEffort? = nil,
         isAgentToolsEnabled: Bool? = nil,
         queuedPrompts: [QueuedPrompt] = [],
         rollingSummary: String? = nil,
@@ -205,6 +233,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         self.selectedModelName = selectedModelName
         self.selectedModelPath = selectedModelPath
         self.isThinkingEnabled = isThinkingEnabled
+        self.thinkingEffort = thinkingEffort
         self.isAgentToolsEnabled = isAgentToolsEnabled
         self.queuedPrompts = queuedPrompts
         self.rollingSummary = rollingSummary
@@ -216,7 +245,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
     enum CodingKeys: String, CodingKey {
         case id, title, messages, createdAt, updatedAt
         case selectedModelId, selectedModelName, selectedModelPath
-        case isThinkingEnabled, isAgentToolsEnabled
+        case isThinkingEnabled, thinkingEffort, isAgentToolsEnabled
         case queuedPrompts
         case rollingSummary, recentWorkDigest
         case titleOrigin
@@ -234,6 +263,11 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         self.selectedModelName = try container.decodeIfPresent(String.self, forKey: .selectedModelName)
         self.selectedModelPath = try container.decodeIfPresent(String.self, forKey: .selectedModelPath)
         self.isThinkingEnabled = try container.decodeIfPresent(Bool.self, forKey: .isThinkingEnabled)
+        if let storedEffort = try container.decodeIfPresent(String.self, forKey: .thinkingEffort) {
+            self.thinkingEffort = ThinkingEffort.parse(storedEffort) ?? .high
+        } else {
+            self.thinkingEffort = nil
+        }
         self.isAgentToolsEnabled = try container.decodeIfPresent(Bool.self, forKey: .isAgentToolsEnabled)
         self.queuedPrompts = try container.decodeIfPresent([QueuedPrompt].self, forKey: .queuedPrompts) ?? []
         self.rollingSummary = try container.decodeIfPresent(String.self, forKey: .rollingSummary)
@@ -253,6 +287,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         try container.encodeIfPresent(selectedModelName, forKey: .selectedModelName)
         try container.encodeIfPresent(selectedModelPath, forKey: .selectedModelPath)
         try container.encodeIfPresent(isThinkingEnabled, forKey: .isThinkingEnabled)
+        try container.encodeIfPresent(thinkingEffort?.rawValue, forKey: .thinkingEffort)
         try container.encodeIfPresent(isAgentToolsEnabled, forKey: .isAgentToolsEnabled)
         try container.encode(queuedPrompts, forKey: .queuedPrompts)
         try container.encodeIfPresent(rollingSummary, forKey: .rollingSummary)

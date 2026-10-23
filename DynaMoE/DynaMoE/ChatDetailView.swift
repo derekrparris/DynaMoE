@@ -34,6 +34,12 @@ struct ChatDetailView: View {
     var onSelectProfile: ((ModelProfileType) -> Void)? = nil
     var supportsThinking: Bool = false
     var isThinkingEnabled: Bool = true
+    /// Resolved graded thinking level shown as selected when
+    /// `supportsThinkingLevels`; nil renders the model default (High).
+    var thinkingEffort: ThinkingEffort? = nil
+    /// Whether the model's chat template exposes graded thinking levels
+    /// (Spark X2.6's `reasoning_effort`). When false, the plain On/Off menu shows.
+    var supportsThinkingLevels: Bool = false
     var isAgentToolsEnabled: Bool = true
     var isModelLoaded: Bool = true
     var isAppleFoundationModelActive: Bool = false
@@ -44,7 +50,9 @@ struct ChatDetailView: View {
     var onRemoveQueuedPrompt: ((UUID) -> Void)? = nil
     var onSelectDiscoveredModel: ((DiscoveredModel) -> Void)? = nil
     var onOpenSettings: (() -> Void)? = nil
-    var onToggleThinking: ((Bool) -> Void)? = nil
+    /// Sets the conversation's thinking mode: enabled flag plus the graded
+    /// effort (nil for plain on/off models or when disabling).
+    var onSetThinking: ((Bool, ThinkingEffort?) -> Void)? = nil
     var onToggleAgentTools: ((Bool) -> Void)? = nil
     var onRenameSession: ((String) -> Void)? = nil
 
@@ -176,6 +184,31 @@ struct ChatDetailView: View {
                 }
             }
         }
+    }
+
+    /// Shared chrome for the Thinking menu label, so the graded-level and
+    /// plain on/off menus cannot drift apart.
+    @ViewBuilder
+    private func thinkingMenuLabel(_ title: String, isOn: Bool) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: isOn ? "brain.head.profile" : "bolt.slash")
+                .font(.system(size: max(8.5, 10 * zoomManager.zoomScale)))
+                .foregroundColor(isOn ? .purple : .secondary)
+            Text(title)
+                .font(.system(size: max(9.5, 11.5 * zoomManager.zoomScale), weight: .medium))
+                .foregroundColor(isOn ? .primary : .secondary)
+            Image(systemName: "chevron.up.chevron.down")
+                .font(.system(size: max(6.5, 7.5 * zoomManager.zoomScale), weight: .semibold))
+                .foregroundColor(.secondary.opacity(0.7))
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4.5)
+        .background(isOn ? Color.purple.opacity(0.12) : Color.secondary.opacity(0.08))
+        .cornerRadius(10)
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(isOn ? Color.purple.opacity(0.3) : Color.clear, lineWidth: 1)
+        )
     }
 
     var body: some View {
@@ -699,11 +732,60 @@ struct ChatDetailView: View {
                         .fixedSize()
                         .help("Active generation profile: \(activeProfile.profileDisplayName(for: currentProfileModel)) (\(activeProfile.description(for: currentProfileModel)))")
 
-                        // Thinking On/Off Dropdown beside Model Selector (shown only if loaded model supports thinking)
-                        if supportsThinking {
+                        // Thinking dropdown beside Model Selector (shown only if the loaded
+                        // model supports thinking). Level-capable models (Spark X2.6's
+                        // `reasoning_effort`) get High/Low/Off instead of plain on/off.
+                        if supportsThinking && supportsThinkingLevels {
+                            let activeEffort: ThinkingEffort? = isThinkingEnabled ? (thinkingEffort ?? .high) : nil
                             Menu {
                                 Button(action: {
-                                    onToggleThinking?(true)
+                                    onSetThinking?(true, .high)
+                                }) {
+                                    HStack {
+                                        if activeEffort == .high {
+                                            Image(systemName: "checkmark")
+                                        }
+                                        Label("Thinking High (Full Reasoning)", systemImage: "brain.head.profile")
+                                    }
+                                }
+
+                                Button(action: {
+                                    onSetThinking?(true, .low)
+                                }) {
+                                    HStack {
+                                        if activeEffort == .low {
+                                            Image(systemName: "checkmark")
+                                        }
+                                        Label("Thinking Low (Brief Reasoning)", systemImage: "brain")
+                                    }
+                                }
+
+                                Button(action: {
+                                    onSetThinking?(false, nil)
+                                }) {
+                                    HStack {
+                                        if activeEffort == nil {
+                                            Image(systemName: "checkmark")
+                                        }
+                                        Label("Thinking Off (Direct Response)", systemImage: "bolt.slash")
+                                    }
+                                }
+                            } label: {
+                                thinkingMenuLabel(
+                                    isThinkingEnabled
+                                        ? "Thinking \(activeEffort?.rawValue.capitalized ?? "High")"
+                                        : "Thinking Off",
+                                    isOn: isThinkingEnabled
+                                )
+                            }
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                            .help(isThinkingEnabled ? "Graded thinking level: \(activeEffort?.rawValue ?? "high")" : "Direct response without thinking is enabled")
+                            .transition(.opacity.combined(with: .scale))
+                        } else if supportsThinking {
+                            Menu {
+                                Button(action: {
+                                    onSetThinking?(true, nil)
                                 }) {
                                     HStack {
                                         if isThinkingEnabled {
@@ -714,7 +796,7 @@ struct ChatDetailView: View {
                                 }
 
                                 Button(action: {
-                                    onToggleThinking?(false)
+                                    onSetThinking?(false, nil)
                                 }) {
                                     HStack {
                                         if !isThinkingEnabled {
@@ -724,24 +806,9 @@ struct ChatDetailView: View {
                                     }
                                 }
                             } label: {
-                                HStack(spacing: 5) {
-                                    Image(systemName: isThinkingEnabled ? "brain.head.profile" : "bolt.slash")
-                                        .font(.system(size: max(8.5, 10 * zoomManager.zoomScale)))
-                                        .foregroundColor(isThinkingEnabled ? .purple : .secondary)
-                                    Text(isThinkingEnabled ? "Thinking On" : "Thinking Off")
-                                        .font(.system(size: max(9.5, 11.5 * zoomManager.zoomScale), weight: .medium))
-                                        .foregroundColor(isThinkingEnabled ? .primary : .secondary)
-                                    Image(systemName: "chevron.up.chevron.down")
-                                        .font(.system(size: max(6.5, 7.5 * zoomManager.zoomScale), weight: .semibold))
-                                        .foregroundColor(.secondary.opacity(0.7))
-                                }
-                                .padding(.horizontal, 9)
-                                .padding(.vertical, 4.5)
-                                .background(isThinkingEnabled ? Color.purple.opacity(0.12) : Color.secondary.opacity(0.08))
-                                .cornerRadius(10)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 10)
-                                        .stroke(isThinkingEnabled ? Color.purple.opacity(0.3) : Color.clear, lineWidth: 1)
+                                thinkingMenuLabel(
+                                    isThinkingEnabled ? "Thinking On" : "Thinking Off",
+                                    isOn: isThinkingEnabled
                                 )
                             }
                             .menuStyle(.borderlessButton)

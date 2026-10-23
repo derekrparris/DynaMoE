@@ -39,21 +39,29 @@ final class ChatPromptFormatterConversationTests: XCTestCase {
         for (name, family) in try families() {
             for thinking in [true, false] {
                 for supports in [true, false] {
-                    let expected = ChatPromptFormatter.formatPrompt(
-                        prompt: "hello",
-                        cleanSystem: system,
-                        thinkingEnabled: thinking,
-                        modelSupportsThinking: supports,
-                        modelConfig: family
-                    )
-                    let actual = ChatPromptFormatter.formatConversation(
-                        turns: [.init(role: .user, text: "hello")],
-                        cleanSystem: system,
-                        thinkingEnabled: thinking,
-                        modelSupportsThinking: supports,
-                        modelConfig: family
-                    )
-                    XCTAssertEqual(actual, expected, "\(name) thinking=\(thinking) supports=\(supports)")
+                    for effort in [nil, .low, .high] as [ThinkingEffort?] {
+                        let expected = ChatPromptFormatter.formatPrompt(
+                            prompt: "hello",
+                            cleanSystem: system,
+                            thinkingEnabled: thinking,
+                            modelSupportsThinking: supports,
+                            modelConfig: family,
+                            thinkingEffort: effort
+                        )
+                        let actual = ChatPromptFormatter.formatConversation(
+                            turns: [.init(role: .user, text: "hello")],
+                            cleanSystem: system,
+                            thinkingEnabled: thinking,
+                            modelSupportsThinking: supports,
+                            modelConfig: family,
+                            thinkingEffort: effort
+                        )
+                        XCTAssertEqual(
+                            actual,
+                            expected,
+                            "\(name) thinking=\(thinking) supports=\(supports) effort=\(String(describing: effort))"
+                        )
+                    }
                 }
             }
         }
@@ -371,5 +379,151 @@ final class ChatPromptFormatterConversationTests: XCTestCase {
             modelConfig: spark
         )
         XCTAssertTrue(prompt.hasPrefix(turn1), "the prompt prefix must survive the added terminator")
+    }
+
+    // MARK: - Spark X2.6 graded thinking levels (reasoning_effort)
+
+    func testSparkEffortInstructionMatchesTheOfficialTemplate() {
+        // Golden string, verbatim from Spark-X2.6-4B's chat_template.jinja
+        // (reasoning_instructions). Pure ASCII with backticks; if a render
+        // ever strips them, dump codepoints instead of retyping.
+        let lead = "\n`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low` and `high`.\nNow the system is invoked with `thinking_effort="
+        XCTAssertEqual(ChatPromptFormatter.sparkThinkingEffortInstructions(level: .high), lead + "high`.")
+        XCTAssertEqual(ChatPromptFormatter.sparkThinkingEffortInstructions(level: .low), lead + "low`.")
+    }
+
+    func testSparkEffortLineRidesTheSystemBlockWhenThinkingIsOn() throws {
+        let spark = try config("spark")
+        for level in [ThinkingEffort.low, .high] {
+            let prompt = ChatPromptFormatter.formatPrompt(
+                prompt: "hello",
+                cleanSystem: system,
+                thinkingEnabled: true,
+                modelSupportsThinking: true,
+                modelConfig: spark,
+                thinkingEffort: level
+            )
+            XCTAssertTrue(
+                prompt.contains(
+                    "you are a helpful assistant."
+                        + ChatPromptFormatter.sparkThinkingEffortInstructions(level: level)
+                        + "\n\n"
+                        + system
+                ),
+                "\(level.rawValue): the effort line must sit in the default sentence, before the client system"
+            )
+            XCTAssertTrue(prompt.contains("`thinking_effort=\(level.rawValue)`"), "\(level.rawValue): the level must be spelled out")
+        }
+    }
+
+    func testSparkEffortLineOmittedWhenUnsetOrThinkingOff() throws {
+        let spark = try config("spark")
+        let unset = ChatPromptFormatter.formatPrompt(
+            prompt: "hello",
+            cleanSystem: system,
+            thinkingEnabled: true,
+            modelSupportsThinking: true,
+            modelConfig: spark
+        )
+        XCTAssertFalse(unset.contains("thinking_effort"), "no chosen level means no effort line")
+
+        let thinkingOff = ChatPromptFormatter.formatPrompt(
+            prompt: "hello",
+            cleanSystem: system,
+            thinkingEnabled: false,
+            modelSupportsThinking: true,
+            modelConfig: spark,
+            thinkingEffort: .high
+        )
+        XCTAssertFalse(thinkingOff.contains("thinking_effort"), "thinking off must never carry the effort line")
+    }
+
+    func testSparkEmptySystemWithEffortCarriesDefaultSentencePlusLine() throws {
+        // With no custom system, the System block must carry the default
+        // sentence followed by the effort instruction, matching what
+        // Spark-X2.6's chat template renders for the same kwargs.
+        let spark = try config("spark")
+        let prompt = ChatPromptFormatter.formatPrompt(
+            prompt: "hello",
+            cleanSystem: "",
+            thinkingEnabled: true,
+            modelSupportsThinking: true,
+            modelConfig: spark,
+            thinkingEffort: .high
+        )
+        XCTAssertTrue(
+            prompt.contains("you are a helpful assistant." + ChatPromptFormatter.sparkThinkingEffortInstructions(level: .high)),
+            "the empty-system render must carry the default sentence plus the effort line"
+        )
+    }
+
+    func testSparkEffortLinePrecedesTheToolsSection() throws {
+        // The template keeps the instruction with the default sentence, before
+        // any tools block. The in-app and server system texts append tools
+        // differently, so both shapes must keep the line ahead of them.
+        let spark = try config("spark")
+        let effort = ChatPromptFormatter.sparkThinkingEffortInstructions(level: .high)
+        for tools in ["\n\n# Tools\n<tools></tools>", "\n\nYou have access to the following functions."] {
+            let prompt = ChatPromptFormatter.formatPrompt(
+                prompt: "hello",
+                cleanSystem: "System" + tools,
+                thinkingEnabled: true,
+                modelSupportsThinking: true,
+                modelConfig: spark,
+                thinkingEffort: .high
+            )
+            let effortIndex = try XCTUnwrap(prompt.range(of: effort))
+            let toolsIndex = try XCTUnwrap(prompt.range(of: tools.trimmingCharacters(in: .whitespacesAndNewlines)))
+            XCTAssertLessThan(effortIndex.lowerBound, toolsIndex.lowerBound, "the effort line must precede tools")
+        }
+    }
+
+    func testNonSparkFamiliesIgnoreThinkingEffort() throws {
+        // The level is only consumed by the Spark branch. Emitting it for
+        // another family's template would make the menu lie.
+        for (name, family) in try families() where name != "spark" {
+            for thinking in [true, false] {
+                let plain = ChatPromptFormatter.formatPrompt(
+                    prompt: "hello",
+                    cleanSystem: system,
+                    thinkingEnabled: thinking,
+                    modelSupportsThinking: true,
+                    modelConfig: family
+                )
+                let withEffort = ChatPromptFormatter.formatPrompt(
+                    prompt: "hello",
+                    cleanSystem: system,
+                    thinkingEnabled: thinking,
+                    modelSupportsThinking: true,
+                    modelConfig: family,
+                    thinkingEffort: .high
+                )
+                XCTAssertEqual(withEffort, plain, "\(name) thinking=\(thinking)")
+                XCTAssertFalse(withEffort.contains("thinking_effort"), "\(name) must not emit a Spark effort line")
+            }
+        }
+    }
+
+    func testSingleTurnConversationWithEffortRendersLikeSingleTurnTemplate() throws {
+        // The single-turn/multi-turn equivalence invariant holds with an effort
+        // in play, so a stateless follow-up still extends the pinned prefix.
+        let spark = try config("spark")
+        let expected = ChatPromptFormatter.formatPrompt(
+            prompt: "hello",
+            cleanSystem: system,
+            thinkingEnabled: true,
+            modelSupportsThinking: true,
+            modelConfig: spark,
+            thinkingEffort: .low
+        )
+        let actual = ChatPromptFormatter.formatConversation(
+            turns: [.init(role: .user, text: "hello")],
+            cleanSystem: system,
+            thinkingEnabled: true,
+            modelSupportsThinking: true,
+            modelConfig: spark,
+            thinkingEffort: .low
+        )
+        XCTAssertEqual(actual, expected)
     }
 }

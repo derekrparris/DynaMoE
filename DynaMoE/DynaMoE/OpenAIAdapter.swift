@@ -352,6 +352,31 @@ enum OpenAIAdapter {
         }
     }
 
+    /// Maps the client's `reasoning_effort` onto a graded level. Returns nil
+    /// when the field is absent or thinking is explicitly off. A level the
+    /// loaded model cannot honor is rejected rather than silently dropped.
+    nonisolated static func thinkingEffort(
+        from raw: String?,
+        levelCapable: Bool,
+        thinkingRequested: Bool
+    ) throws -> ThinkingEffort? {
+        guard let raw, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        guard thinkingRequested else { return nil }
+        guard levelCapable else {
+            throw ServerAPIError.badRequest(
+                "reasoning_effort is not supported by the loaded model; use enable_thinking for on/off thinking.",
+                logSafeMessage: "reasoning_effort is not supported by the loaded model"
+            )
+        }
+        guard let effort = ThinkingEffort.parse(raw) else {
+            throw ServerAPIError.badRequest(
+                "Unsupported reasoning_effort value. Supported values are low and high.",
+                logSafeMessage: "Unsupported reasoning_effort value"
+            )
+        }
+        return effort
+    }
+
     /// Maps the engine's terminal reasons onto OpenAI finish_reason values.
     static func finishReasonString(_ reason: TurnFinishReason, hasToolCalls: Bool) -> String {
         switch reason {

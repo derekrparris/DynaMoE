@@ -336,4 +336,28 @@ final class AnthropicAdapterLogicTests: XCTestCase {
         XCTAssertTrue(json.contains("\"value\":null"), "a null tool input must survive, not become \"\"")
         XCTAssertFalse(json.contains("\"value\":\"\""))
     }
+
+    // MARK: - Graded thinking levels
+
+    func testThinkingBudgetMapsToGradedLevels() throws {
+        let low = AnthropicMessagesRequest.ThinkingConfig(type: "enabled", budgetTokens: 2048)
+        let high = AnthropicMessagesRequest.ThinkingConfig(type: "enabled", budgetTokens: 8192)
+        XCTAssertEqual(try AnthropicAdapter.thinkingEffort(from: low, levelCapable: true), .low)
+        XCTAssertEqual(try AnthropicAdapter.thinkingEffort(from: high, levelCapable: true), .high)
+        XCTAssertEqual(
+            try AnthropicAdapter.thinkingEffort(from: .init(type: "enabled", budgetTokens: nil), levelCapable: true),
+            .high,
+            "an omitted budget keeps the template's high default"
+        )
+        XCTAssertNil(
+            try AnthropicAdapter.thinkingEffort(from: low, levelCapable: false),
+            "a model without graded levels has no level to send"
+        )
+        XCTAssertNil(
+            try AnthropicAdapter.thinkingEffort(from: .init(type: "disabled", budgetTokens: 2048), levelCapable: true)
+        )
+        XCTAssertThrowsError(
+            try AnthropicAdapter.thinkingEffort(from: .init(type: "enabled", budgetTokens: 0), levelCapable: true)
+        )
+    }
 }

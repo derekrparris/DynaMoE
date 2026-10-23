@@ -214,7 +214,8 @@ struct HelpAndSettingsGuideView: View {
             VStack(alignment: .leading, spacing: 10) {
                 stepRow(1, "Select your Model", "Open Settings (⌘,) and select a model from your Hugging Face cache (~/.cache/huggingface/hub) or pick one from the chat dropdown.")
                 stepRow(2, "Choose your Profile", "Select either the 'Coder' or 'Assistant' profile from the toolbar menu to apply tuned sampling parameters for your task.")
-                stepRow(3, "Generate & Converse", "Enter your prompt. DynaMoE renders real-time collapsible thinking chains (<think>), formatted Markdown, and syntax-highlighted code.")
+                stepRow(3, "Choose Thinking", "Next to the profile selector, the Thinking dropdown controls reasoning per conversation. Level-capable models (Spark X2.6) offer High, Low, and Off; other models offer plain On/Off. Defaults to High. Changing it mid-conversation makes the next turn re-read the conversation before generating.")
+                stepRow(4, "Generate & Converse", "Enter your prompt. DynaMoE renders real-time collapsible thinking chains (<think>), formatted Markdown, and syntax-highlighted code.")
             }
         }
     }

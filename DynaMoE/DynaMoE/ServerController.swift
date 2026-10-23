@@ -986,10 +986,27 @@ final class ServerController: ObservableObject {
         var maxTokens: Int?
         var stopSequences: [String]
         var thinkingRequested: Bool
+        /// The client's requested graded level, already validated by the
+        /// adapter. Ignored for models without graded levels; the template's
+        /// high default is applied below when thinking is on.
+        var thinkingEffort: ThinkingEffort?
         var hasTools: Bool
         var toolDeclaration: String?
         var maskSchemas: [GrammarToolSchema]
         var sessionId: UUID
+    }
+
+    /// Resolves the level a turn renders. Level-capable models always render a
+    /// level while thinking is on: the template defaults to high, so an API
+    /// request that omitted the knob must not render the in-app variant's
+    /// other prompt.
+    nonisolated static func resolvedThinkingEffort(
+        requested: ThinkingEffort?,
+        thinkingEnabled: Bool,
+        levelCapable: Bool
+    ) -> ThinkingEffort? {
+        guard thinkingEnabled, levelCapable else { return nil }
+        return requested ?? .high
     }
 
     nonisolated private static func buildTurnPlan(_ inputs: TurnPlanInputs) throws -> TurnPlan {
@@ -1023,12 +1040,30 @@ final class ServerController: ObservableObject {
         }
 
         let thinkingEnabled = info.supportsThinking && inputs.thinkingRequested
+        let thinkingEffort = Self.resolvedThinkingEffort(
+            requested: inputs.thinkingEffort,
+            thinkingEnabled: thinkingEnabled,
+            levelCapable: info.supportsThinkingLevels
+        )
+        // The digest must cover the system text the model actually sees,
+        // including Spark's effort line: changing the level between turns has
+        // to invalidate a recorded raw turn, just as changing the system does.
+        let memorySystem: String
+        if engine.promptModelConfig?.isSparkModel == true {
+            memorySystem = ChatPromptFormatter.sparkSystemBody(
+                cleanSystem: cleanSystem,
+                thinkingEnabled: thinkingEnabled,
+                thinkingEffort: thinkingEffort
+            )
+        } else {
+            memorySystem = cleanSystem
+        }
         // What a follow-up request has to reproduce before its own raw turn can
         // be trusted: the leading history as the client sent it, plus the system
         // prompt it was rendered against. Computed before substitution so both
         // sides of the comparison see the same client-authored turns.
         let historyDigest = ServerTurnMemory.historyDigest(
-            systemPrompt: cleanSystem,
+            systemPrompt: memorySystem,
             turns: inputs.conversation[...]
         )
         // Splice in the raw generation recorded for this session (reasoning
@@ -1039,7 +1074,7 @@ final class ServerController: ObservableObject {
             sessionId: inputs.sessionId,
             modelName: info.displayName,
             modelConfig: engine.promptModelConfig,
-            systemPrompt: cleanSystem
+            systemPrompt: memorySystem
         )
         // A single plain user turn renders exactly as before (native template
         // with zero wrapper noise). A real history renders with the family's
@@ -1053,7 +1088,8 @@ final class ServerController: ObservableObject {
                 cleanSystem: cleanSystem,
                 thinkingEnabled: thinkingEnabled,
                 modelSupportsThinking: info.supportsThinking,
-                modelConfig: engine.promptModelConfig
+                modelConfig: engine.promptModelConfig,
+                thinkingEffort: thinkingEffort
             )
         } else {
             formattedPrompt = ChatPromptFormatter.formatConversation(
@@ -1061,7 +1097,8 @@ final class ServerController: ObservableObject {
                 cleanSystem: cleanSystem,
                 thinkingEnabled: thinkingEnabled,
                 modelSupportsThinking: info.supportsThinking,
-                modelConfig: engine.promptModelConfig
+                modelConfig: engine.promptModelConfig,
+                thinkingEffort: thinkingEffort
             )
         }
 
@@ -1152,6 +1189,12 @@ final class ServerController: ObservableObject {
         let info = try requireLoadedModel()
         let (systemPrompt, turns) = try OpenAIAdapter.splitMessages(apiRequest.messages)
         let hasTools = !(apiRequest.tools ?? []).isEmpty && toolsEnabled
+        let thinkingRequested = apiRequest.enableThinking ?? true
+        let thinkingEffort = try OpenAIAdapter.thinkingEffort(
+            from: apiRequest.reasoningEffort,
+            levelCapable: info.supportsThinkingLevels,
+            thinkingRequested: thinkingRequested
+        )
         return try buildTurnPlan(TurnPlanInputs(
             systemPrompt: systemPrompt,
             conversation: turns,
@@ -1163,7 +1206,8 @@ final class ServerController: ObservableObject {
             presencePenalty: apiRequest.presencePenalty,
             maxTokens: apiRequest.maxTokens,
             stopSequences: apiRequest.stop ?? [],
-            thinkingRequested: apiRequest.enableThinking ?? true,
+            thinkingRequested: thinkingRequested,
+            thinkingEffort: thinkingEffort,
             hasTools: hasTools,
             toolDeclaration: hasTools ? OpenAIAdapter.toolDeclarationText(apiRequest.tools ?? []) : nil,
             maskSchemas: hasTools ? (apiRequest.tools ?? []).filter { ($0.type ?? "function") == "function" }.map {
@@ -1183,6 +1227,11 @@ final class ServerController: ObservableObject {
         let info = try requireLoadedModel()
         let turns = try AnthropicAdapter.splitMessages(apiRequest.messages)
         let hasTools = !(apiRequest.tools ?? []).isEmpty && toolsEnabled
+        let thinkingRequested = apiRequest.thinking?.type == "enabled"
+        let thinkingEffort = try AnthropicAdapter.thinkingEffort(
+            from: apiRequest.thinking,
+            levelCapable: info.supportsThinkingLevels
+        )
         return try buildTurnPlan(TurnPlanInputs(
             systemPrompt: apiRequest.systemText ?? "",
             conversation: turns,
@@ -1194,7 +1243,8 @@ final class ServerController: ObservableObject {
             presencePenalty: nil,
             maxTokens: maxTokens,
             stopSequences: apiRequest.stopSequences ?? [],
-            thinkingRequested: apiRequest.thinking?.type == "enabled",
+            thinkingRequested: thinkingRequested,
+            thinkingEffort: thinkingEffort,
             hasTools: hasTools,
             toolDeclaration: hasTools ? AnthropicAdapter.toolDeclarationText(apiRequest.tools ?? []) : nil,
             maskSchemas: hasTools ? (apiRequest.tools ?? []).map {
