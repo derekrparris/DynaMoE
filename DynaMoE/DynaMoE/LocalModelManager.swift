@@ -9,7 +9,7 @@ import Foundation
 import SwiftUI
 import Combine
 
-public struct DiscoveredModel: Identifiable, Hashable, Codable, Equatable {
+public nonisolated struct DiscoveredModel: Identifiable, Hashable, Codable, Equatable, Sendable {
     public var id: String // Unique identifier (e.g. repoId or snapshot path)
     public var displayName: String // e.g. "Ornith 1.5 35B A3B FP8"
     public var author: String // e.g. "ornith-ai"
@@ -170,6 +170,12 @@ public class LocalModelManager: ObservableObject {
                 if AppleFoundationModelService.isOSCompatible {
                     finalModels.append(AppleFoundationModelService.makeDiscoveredModel())
                 }
+                // Connected cloud providers (Synthetic first) surface the same
+                // way: virtual entries appended after every local model, for
+                // the same reason — `discoveredModels.first` must stay a
+                // weights model. Registration comes from each provider's
+                // UserDefaults list; see `CloudModelRegistry`.
+                finalModels.append(contentsOf: CloudModelRegistry.makeDiscoveredModels())
                 self.discoveredModels = finalModels
                 self.isScanning = false
                 self.lastScanDate = Date()

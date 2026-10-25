@@ -39,10 +39,14 @@ A comprehensive, practical guide to configuring, tuning, and operating DynaMoE o
    - [Reasoning in Content](#reasoning-in-content)
    - [Queueing & Guardrails](#queueing--guardrails)
    - [Client Setup](#client-setup)
-8. [Advanced Diagnostics](#advanced-diagnostics)
+8. [Cloud Providers](#8-cloud-providers)
+   - [API Key & Connection Test](#api-key--connection-test)
+   - [Registering Cloud Models](#registering-cloud-models)
+   - [What a Cloud Turn Supports](#what-a-cloud-turn-supports)
+9. [Advanced Diagnostics](#advanced-diagnostics)
    - [SafeTensors Sharded Metadata & Search](#safetensors-sharded-metadata--search)
    - [Direct Metal Kernel Execution Harness](#direct-metal-kernel-execution-harness)
-9. [Hardware Profiles & Recommended Configurations](#9-hardware-profiles--recommended-configurations)
+10. [Hardware Profiles & Recommended Configurations](#10-hardware-profiles--recommended-configurations)
    - [16 GB Unified RAM (M1/M2/M3/M4)](#16-gb-unified-ram-m1m2m3m4)
    - [24 GB – 36 GB Unified RAM](#24-gb--36-gb-unified-ram)
    - [64 GB – 128 GB+ Unified RAM (M-Max / M-Ultra)](#64-gb--128-gb-unified-ram-m-max--m-ultra)
@@ -510,7 +514,56 @@ The **Local Inference Server** section turns DynaMoE into a local API server: th
 
 ---
 
-## 8. Advanced Diagnostics
+## 8. Cloud Providers
+
+The **Cloud Providers** section connects remote inference providers, with **Synthetic** as the first supported provider. A connected provider's models appear in the chat composer under **Cloud Models**, alongside local weights and the Apple on-device model. In agent mode a cloud turn uses the provider's native function calling, while DynaMoE's local engine, KV cache, grammar mask, JetSpec, and memory/SSD machinery stay out of the path.
+
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│  Cloud Providers Section                                               │
+│  Synthetic                                                             │
+│  API Key:          [••••••••••••]  [Save]  [Remove]                    │
+│  Connection:       [Test & Sync Models] Connected ✓ 14 registered      │
+│  Documentation:    [Open API Docs]                                     │
+│                                                                        │
+│  Models:           [Sync Models] [Clear]  14 registered                │
+│  Registered Cloud Models                                               │
+│  Synthetic:        DeepSeek-V4.1-Flash-1017 (Synthetic)  ·  …          │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### API Key & Connection Test
+- **API Key**: Paste a key from the provider's dashboard and press **Save**. It is written only to the login Keychain (service `DRP.DynaMoE.cloud`, account `dynamoe.cloud.<provider>.apikey`) — never to UserDefaults, logs, or a config file. The field never pre-fills an existing key; the placeholder says "Stored" and typing a new value replaces it. **Remove** deletes the Keychain item.
+- **Test & Sync Models**: Calls the provider's `GET /models` endpoint with the stored key. A good key validates the credential **and** registers the provider's current chat models, then rescans so the composer's **Cloud Models** section updates immediately. Embeddings, rerankers, speech, moderation, and image generators in the same catalog are skipped (falling back to the unfiltered list only if the filter would register nothing). A bad key returns `401`, a rate-limited endpoint `429`, and an unreachable endpoint a network error — all shown inline. The test spends no completion tokens.
+- **Documentation**: Opens the provider's API reference.
+
+### Registered Models
+- **Sync Models** re-runs the catalog fetch and replaces the registered list, which is how provider-side additions and retirements reach the picker. **Clear** unregisters the provider's list.
+- The **Registered Cloud Models** card lists what will appear in the composer, one provider per row. `hf:` models show their model tail (`DeepSeek-V4.1-Flash-1017 (Synthetic)`); provider aliases such as `syn:large:text` are humanized (`Syn Large Text (Synthetic)`).
+- The list persists in `dynamoe_cloud_<provider>_models`. Manual overrides still work when you want a narrower or pinned set:
+
+  ```bash
+  defaults write DRP.DynaMoE dynamoe_cloud_synthetic_models \
+    "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017; hf:moonshotai/Kimi-K2-Thinking"
+  ```
+
+  Entries are separated by `;`, `,`, or newlines and duplicates are dropped. A hand-written value may not reach an already-running app because of preference caching — quit and relaunch, or just press **Sync Models**.
+- A single-model development hook exists: `defaults write DRP.DynaMoE dynamoe_cloud_debug_model "hf:org/model"` registers one model when the main list is empty.
+
+### What a Cloud Turn Supports
+- **Streaming** SSE text and, when the model reports it, `reasoning_content` thinking deltas in the usual accordion. Token counts come from the provider's `usage` when reported and fall back to character estimation. The provider's optional `stream_options.include_usage` field is retried without it if the endpoint rejects it.
+- **Sampling**: `temperature`, `top_p`, `presence_penalty`, and `max_tokens` forward; Min-P, Top-K, and the repetition penalty have no remote equivalent and are ignored (the same documented gap as the on-device model). Stop sequences are not forwarded — the provider owns templating and its own end-of-turn marker.
+- **Agent tools**: with the toolbar switch on (the default for a cloud model), the request carries the loaded tool schemas and the provider's native `tool_calls` are executed through the same harness as a local agent turn — HITL approvals, Turbo Mode, empty-argument rejection, the repeated/failed-call loop guards, and the subagent report relay all apply. Tool results replay as a `tool` message per call. Turn the switch off for plain chat.
+- **Models without tool support**: list them under `dynamoe_cloud_<provider>_no_tools` (`;`/`,`/newline separated); that model then runs plain chat with a visible notice instead of failing mid-loop on an HTTP 400.
+- **Reasoning control**: the Thinking menu is hidden for cloud models because the OpenAI-compatible surface has no portable on/off switch — the provider's default applies, and reported reasoning still renders in the accordion.
+- **History**: the conversation is sent as a standard `messages` array, with the persona as the leading system message and UI notice messages skipped.
+- **Logging**: every cloud turn records a row in **Settings → Server → Request Log**, with the rendered prompt (system + messages) under the content-capture toggle. An agent run writes one row per step.
+- **Timeouts**: the idle (between-bytes) timeout is 120 s, so a large prompt or a reasoning model can take its time to first token; a connection that stops sending bytes for two minutes fails with "The request timed out."
+- **Not supported in this phase**: grammar masking, JetSpec, prefix pinning, and the memory budgets. Switching to a cloud model releases any resident local engine so the RAM budget is not held.
+
+---
+
+## 9. Advanced Diagnostics
 
 The **Advanced Diagnostics** section is an engineering inspection suite for validating Metal shaders, examining raw SafeTensors tensors, and testing layer forward execution independently of chat generation.
 
@@ -541,7 +594,7 @@ Test GPU compute pipelines in isolation without running full autoregressive gene
 
 ---
 
-## 9. Hardware Profiles & Recommended Configurations
+## 10. Hardware Profiles & Recommended Configurations
 
 ### 16 GB Unified RAM (M1/M2/M3/M4)
 - **Primary Model**: `ornith-ai/Ornith-1.5-9B` (Dense Hybrid GDN; BF16 weights stream from SSD).

@@ -43,6 +43,16 @@ struct ChatDetailView: View {
     var isAgentToolsEnabled: Bool = true
     var isModelLoaded: Bool = true
     var isAppleFoundationModelActive: Bool = false
+    /// True when the active backend is a connected cloud provider. Cloud turns
+    /// support tools through the provider's native function calling, so the
+    /// tool controls stay enabled.
+    var isCloudModelActive: Bool = false
+    /// The system on-device model is the only backend still restricted to
+    /// plain chat; cloud providers call tools through the API's function
+    /// interface and share the local agent controls.
+    private var isPlainChatOnlyBackend: Bool {
+        isAppleFoundationModelActive
+    }
     var onSendMessage: (String) -> Bool
     var onStopGeneration: () -> Void
     var onQueuePrompt: ((String) -> Bool)? = nil
@@ -123,7 +133,10 @@ struct ChatDetailView: View {
         return lineHeight + MacTextEditor.textContainerInsetHeight * 2
     }
 
-    private func modelIconName(for name: String?) -> String {
+    private func modelIconName(for name: String?, isCloud: Bool = false) -> String {
+        if isCloud {
+            return "cloud.fill"
+        }
         let lower = (name ?? "").lowercased()
         if lower.contains("apple foundation") {
             return "apple.logo"
@@ -181,6 +194,11 @@ struct ChatDetailView: View {
                     // Decorative branding glyph; the row title already says
                     // Apple, so keep it out of the VoiceOver reading.
                     Text("• 🍎").accessibilityHidden(true)
+                }
+                if dm.isCloudModel {
+                    // The display name already carries the provider in
+                    // parentheses; this is a decorative marker only.
+                    Text("• ☁️").accessibilityHidden(true)
                 }
             }
         }
@@ -248,7 +266,7 @@ struct ChatDetailView: View {
                     
                     if let model = modelName {
                         HStack(spacing: 6) {
-                            Image(systemName: modelIconName(for: model))
+                            Image(systemName: modelIconName(for: model, isCloud: isCloudModelActive))
                                 .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .semibold))
                                 .foregroundColor(isGenerating ? (isStreamingOffDisk ? Color.orange : Color.green) : Color.purple)
                             Text(model)
@@ -635,7 +653,10 @@ struct ChatDetailView: View {
                         // Antigravity-Style Model Selector Menu
                         Menu {
                             let systemModels = localModelManager.discoveredModels.filter { $0.isAppleFoundationModel }
-                            let weightsModels = localModelManager.discoveredModels.filter { !$0.isAppleFoundationModel }
+                            let cloudModels = localModelManager.discoveredModels.filter { $0.isCloudModel }
+                            let weightsModels = localModelManager.discoveredModels.filter {
+                                !$0.isAppleFoundationModel && !$0.isCloudModel
+                            }
                             if !systemModels.isEmpty {
                                 Section("System Models") {
                                     ForEach(systemModels) { dm in
@@ -643,7 +664,14 @@ struct ChatDetailView: View {
                                     }
                                 }
                             }
-                            if weightsModels.isEmpty && systemModels.isEmpty {
+                            if !cloudModels.isEmpty {
+                                Section("Cloud Models") {
+                                    ForEach(cloudModels) { dm in
+                                        discoveredModelMenuButton(dm)
+                                    }
+                                }
+                            }
+                            if weightsModels.isEmpty && systemModels.isEmpty && cloudModels.isEmpty {
                                 Text("No models found in ~/.cache/huggingface/hub")
                             }
                             if !weightsModels.isEmpty {
@@ -663,7 +691,7 @@ struct ChatDetailView: View {
                             }
                         } label: {
                             HStack(spacing: 5) {
-                                Image(systemName: modelIconName(for: session?.selectedModelName ?? modelName))
+                                Image(systemName: modelIconName(for: session?.selectedModelName ?? modelName, isCloud: isCloudModelActive))
                                     .font(.system(size: max(8.5, 10 * zoomManager.zoomScale)))
                                     .foregroundColor(.purple)
                                 Text(session?.selectedModelName ?? modelName ?? "Select Model")
@@ -735,7 +763,11 @@ struct ChatDetailView: View {
                         // Thinking dropdown beside Model Selector (shown only if the loaded
                         // model supports thinking). Level-capable models (Spark X2.6's
                         // `reasoning_effort`) get High/Low/Off instead of plain on/off.
-                        if supportsThinking && supportsThinkingLevels {
+                        // Cloud reasoning follows the provider's own default:
+                        // the OpenAI-compatible surface has no portable
+                        // on/off switch, so the control is hidden rather than
+                        // pretending to change anything.
+                        if supportsThinking && !isCloudModelActive && supportsThinkingLevels {
                             let activeEffort: ThinkingEffort? = isThinkingEnabled ? (thinkingEffort ?? .high) : nil
                             Menu {
                                 Button(action: {
@@ -782,7 +814,7 @@ struct ChatDetailView: View {
                             .fixedSize()
                             .help(isThinkingEnabled ? "Graded thinking level: \(activeEffort?.rawValue ?? "high")" : "Direct response without thinking is enabled")
                             .transition(.opacity.combined(with: .scale))
-                        } else if supportsThinking {
+                        } else if supportsThinking && !isCloudModelActive {
                             Menu {
                                 Button(action: {
                                     onSetThinking?(true, nil)
@@ -863,14 +895,18 @@ struct ChatDetailView: View {
                         }
                         .menuStyle(.borderlessButton)
                         .fixedSize()
-                        .disabled(isAppleFoundationModelActive)
+                        .disabled(isPlainChatOnlyBackend)
                         .help(isAppleFoundationModelActive
-                              ? "Agent tools require a local weights model — Apple Foundation Model runs in plain chat mode"
-                              : (isAgentToolsEnabled ? "Agent mode is enabled: Model can run shell commands, inspect, and edit files" : "Agent mode is disabled"))
+                              ? "Agent tools require a model with function calling — Apple Foundation Model runs in plain chat mode"
+                              : (isCloudModelActive
+                                 ? (isAgentToolsEnabled
+                                    ? "Agent mode is enabled: the provider's native function calling runs shell, file, and search tools"
+                                    : "Agent mode is disabled")
+                                 : (isAgentToolsEnabled ? "Agent mode is enabled: Model can run shell commands, inspect, and edit files" : "Agent mode is disabled")))
                         .transition(.opacity.combined(with: .scale))
 
                         // Turbo Mode (Auto-Approve) Toggle when tools are active
-                        if isAgentToolsEnabled && !isAppleFoundationModelActive {
+                        if isAgentToolsEnabled && !isPlainChatOnlyBackend {
                             Button(action: {
                                 isTurboModeEnabled.toggle()
                             }) {

@@ -13,6 +13,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     case generation = "Generation"
     case memory = "Memory & SSD"
     case agent = "Agent & Tools"
+    case cloud = "Cloud Providers"
     case server = "Server"
     case advanced = "Advanced Diagnostics"
 
@@ -25,6 +26,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .generation: return "slider.horizontal.3"
         case .memory: return "memorychip"
         case .agent: return "wrench.and.screwdriver.fill"
+        case .cloud: return "cloud.fill"
         case .server: return "server.rack"
         case .advanced: return "waveform.path.ecg"
         }
@@ -43,6 +45,8 @@ enum SettingsTab: String, CaseIterable, Identifiable {
             return "Control memory execution, RAM budgets, KV-cache precision, SSD expert paging, and live diagnostics."
         case .agent:
             return "Configure agent tools, workspace, safety limits, web search, codebase indexing, subagents, MCP tool servers, and developer tooling."
+        case .cloud:
+            return "Connect remote inference providers such as Synthetic: store API keys in the Keychain, verify the connection, and register cloud chat models."
         case .server:
             return "Serve the loaded model over a local OpenAI- and Anthropic-compatible API for clients like Crush; configure access and watch live activity."
         case .advanced:
@@ -58,6 +62,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .generation: return .purple
         case .memory: return .teal
         case .agent: return .orange
+        case .cloud: return .cyan
         case .server: return .blue
         case .advanced: return .pink
         }
@@ -76,6 +81,8 @@ enum SettingsTab: String, CaseIterable, Identifiable {
             return ["memory", "ram", "budget", "kv cache", "precision", "fp8", "fp16", "prefetch", "ssd", "paging", "diagnostics", "cache", "lookahead depth", "execution mode", "working set budget"]
         case .agent:
             return ["agent", "tools", "turbo", "grammar", "workspace", "directory", "search", "brave", "chrome", "index", "rag", "subagent", "git", "lint", "dogfood", "benchmark", "max multi-step agent iterations", "max tool output", "working directory", "mcp", "model context protocol", "keychain", "mcp.json", "stdio", "streamable http", "external tools"]
+        case .cloud:
+            return ["cloud", "provider", "synthetic", "synthetic.new", "remote", "api key", "connected provider", "deepseek", "cloud models", "keychain"]
         case .server:
             return ["server", "api", "openai", "endpoint", "port", "api key", "completions", "local server", "crush", "http", "chat completions", "inference", "v1"]
         case .advanced:
@@ -297,6 +304,8 @@ struct SettingsSheetView: View {
                     memorySettingsSection
                 case .agent:
                     agentSettingsSection
+                case .cloud:
+                    cloudSettingsSection
                 case .server:
                     serverSettingsSection
                 case .advanced:
@@ -309,6 +318,15 @@ struct SettingsSheetView: View {
             .frame(maxWidth: .infinity)
         }
         .background(Color.settingsPaneBackground)
+    }
+
+    // MARK: - Tab: Cloud Providers
+
+    /// Connected cloud providers. The section is self-contained (its own
+    /// Keychain reads and connection-test state) so this tab stays a one-line
+    /// embedding, mirroring how the MCP settings section is hosted.
+    private var cloudSettingsSection: some View {
+        CloudProvidersSettingsView()
     }
 
     // MARK: - Tab 0: General
@@ -405,6 +423,11 @@ struct SettingsSheetView: View {
 
     /// Single-line summary of a model's author, architecture, quantization, and size.
     private func modelMetadataLine(_ model: DiscoveredModel) -> String {
+        // Cloud entries have no weights, quant, or real architecture on disk:
+        // "synthetic • CloudRemoteModel • Cloud" reads like a broken local row.
+        if let cloud = model.cloudResolution {
+            return "\(cloud.provider.displayName)  •  Cloud model"
+        }
         var parts: [String] = [model.author, model.architectureName]
         if let quant = model.quantization, !quant.isEmpty {
             parts.append(quant)
@@ -501,7 +524,12 @@ struct SettingsSheetView: View {
                     ForEach(localModelManager.discoveredModels) { model in
                         let isDefault = localModelManager.defaultModelId == model.id || localModelManager.defaultModelId == model.repoId
                         let isCurrentActive = (activeModelPath != nil && (activeModelPath == model.snapshotPath || activeModelPath == model.weightsEntryPath || (summary != nil && (modelConfig?.modelType ?? "").localizedCaseInsensitiveContains(model.displayName))))
-                        let isFlashMoEPacked = ExpertRepacker.isPackedFormat(dir: URL(fileURLWithPath: model.snapshotPath))
+                        // Virtual (cloud / on-device) entries have no snapshot on
+                        // disk, so probing their sentinel path for packed experts
+                        // is meaningless and hits the filesystem every render.
+                        let isVirtualModel = model.isCloudModel || model.isAppleFoundationModel
+                        let isFlashMoEPacked = !isVirtualModel
+                            && ExpertRepacker.isPackedFormat(dir: URL(fileURLWithPath: model.snapshotPath))
 
                         VStack(alignment: .leading, spacing: 8) {
                             HStack(alignment: .center, spacing: 14) {
@@ -523,13 +551,16 @@ struct SettingsSheetView: View {
                                     .lineLimit(1)
                                     .truncationMode(.tail)
 
-                                if isDefault || isCurrentActive || (model.isMoE && isFlashMoEPacked) {
+                                if isDefault || isCurrentActive || (model.isMoE && isFlashMoEPacked) || model.isCloudModel {
                                     HStack(spacing: 6) {
                                         if isDefault {
                                             SettingsStatusBadge(text: "Default", tint: .purple)
                                         }
                                         if isCurrentActive {
                                             SettingsStatusBadge(text: "Active", tint: .green)
+                                        }
+                                        if model.isCloudModel {
+                                            SettingsStatusBadge(text: "Cloud", systemImage: "cloud.fill", tint: .cyan)
                                         }
                                         if model.isMoE && isFlashMoEPacked {
                                             SettingsStatusBadge(text: "FlashMoE", systemImage: "bolt.fill", tint: .orange)
@@ -561,29 +592,40 @@ struct SettingsSheetView: View {
                                     }
                                 } else {
                                     Menu {
-                                        Button {
-                                            if isDefault {
-                                                localModelManager.setDefaultModel(id: nil)
-                                            } else {
-                                                localModelManager.setDefaultModel(id: model.id)
+                                        // A cloud model cannot be the launch
+                                        // default: the next start would boot
+                                        // with no local weights loaded.
+                                        if !model.isCloudModel {
+                                            Button {
+                                                if isDefault {
+                                                    localModelManager.setDefaultModel(id: nil)
+                                                } else {
+                                                    localModelManager.setDefaultModel(id: model.id)
+                                                }
+                                            } label: {
+                                                Label(isDefault ? "Clear Default" : "Set as Default",
+                                                      systemImage: isDefault ? "star.slash" : "star")
                                             }
-                                        } label: {
-                                            Label(isDefault ? "Clear Default" : "Set as Default",
-                                                  systemImage: isDefault ? "star.slash" : "star")
                                         }
 
-                                        Button {
-                                            withAnimation(.easeInOut(duration: 0.2)) {
-                                                if selectedModelForProfiles == model.id {
-                                                    selectedModelForProfiles = nil
-                                                } else {
-                                                    selectedModelForProfiles = model.id
-                                                    loadProfileDraft(modelId: model.id, type: inspectingProfileType)
+                                        // Model profiles bundle local engine
+                                        // settings (JetSpec, expert caps) that
+                                        // a cloud turn ignores; cloud sampling
+                                        // stays editable in Generation.
+                                        if !model.isCloudModel {
+                                            Button {
+                                                withAnimation(.easeInOut(duration: 0.2)) {
+                                                    if selectedModelForProfiles == model.id {
+                                                        selectedModelForProfiles = nil
+                                                    } else {
+                                                        selectedModelForProfiles = model.id
+                                                        loadProfileDraft(modelId: model.id, type: inspectingProfileType)
+                                                    }
                                                 }
+                                            } label: {
+                                                Label(selectedModelForProfiles == model.id ? "Hide Profiles" : "Configure Profiles…",
+                                                      systemImage: "slider.horizontal.3")
                                             }
-                                        } label: {
-                                            Label(selectedModelForProfiles == model.id ? "Hide Profiles" : "Configure Profiles…",
-                                                  systemImage: "slider.horizontal.3")
                                         }
 
                                         if model.isMoE && !isFlashMoEPacked {
