@@ -835,12 +835,12 @@ struct SettingsSheetView: View {
                 // Max Output Tokens: slider, editable field, and quick presets.
                 SettingsRow(
                     title: "Max Output Tokens",
-                    subtitle: "Hard cap on tokens generated per response."
+                    subtitle: "Hard cap on tokens generated per response. The KV cache budget also caps it for a long prompt."
                 ) {
                     SettingsValueSlider(
                         label: "Max Output Tokens",
                         value: doubleBinding($maxNewTokens),
-                        range: 32...10000,
+                        range: 32...Double(KVCacheProvisioning.maxProvisionedRows),
                         step: 32,
                         fractionDigits: 0,
                         fieldWidth: 64
@@ -852,7 +852,7 @@ struct SettingsSheetView: View {
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
 
-                    ForEach([512, 1024, 2048, 4096, 8192, 10000], id: \.self) { preset in
+                    ForEach([1024, 4096, 8192, 16000, KVCacheProvisioning.maxProvisionedRows], id: \.self) { preset in
                         Button("\(preset)") {
                             maxNewTokens = preset
                         }
@@ -1311,8 +1311,15 @@ struct SettingsSheetView: View {
                     Slider(value: Binding(
                         get: { Double(maxAgentSteps) },
                         set: { maxAgentSteps = Int($0) }
-                    ), in: 1...30, step: 1)
+                    ), in: 1...100, step: 1)
                     .accessibilityLabel("Max Multi-Step Agent Iterations")
+
+                    if maxAgentSteps > 40 {
+                        Text("Past about 40 steps a local model usually runs out of KV budget first, so the run stops with a capacity error rather than the step limit.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 .padding(.vertical, 8)
             }
@@ -2751,14 +2758,14 @@ struct SettingsSheetView: View {
                     Slider(value: Binding(
                         get: { Float(editingDraft.maxNewTokens) },
                         set: { editingDraft.maxNewTokens = Int($0) }
-                    ), in: 32...10000, step: 32)
+                    ), in: 32...Float(KVCacheProvisioning.maxProvisionedRows), step: 32)
                     .accessibilityLabel("Max Output Tokens")
 
                     HStack(spacing: 5) {
                         Text("Presets:")
                             .font(.system(size: 9))
                             .foregroundColor(.secondary)
-                        ForEach([512, 1024, 2048, 4096, 8192, 10000], id: \.self) { preset in
+                        ForEach([1024, 4096, 8192, 16000, KVCacheProvisioning.maxProvisionedRows], id: \.self) { preset in
                             Button("\(preset)") {
                                 editingDraft.maxNewTokens = preset
                             }

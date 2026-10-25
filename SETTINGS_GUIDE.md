@@ -249,7 +249,7 @@ At the top of the Generation section, an active profile banner indicates which p
 - **Recommended Values**: $0.00$ for coding; $0.10\text{–}0.40$ for open conversation.
 
 #### 7. Max Tokens
-- **What it does**: Hard ceiling on the maximum number of new tokens generated per turn (64 to 32,768).
+- **What it does**: Hard ceiling on the maximum number of new tokens generated per turn (32 to 32,768, the KV cache provision ceiling). The KV cache budget can lower the effective ceiling further for a long prompt.
 - **Recommended Values**: $8192$ for Coder; $4096$ for Assistant.
 
 ---
@@ -358,7 +358,7 @@ The **Agent & Tools** section configures DynaMoE's autonomous agent engine, tool
 
 ### Safety Limits
 - **Max Tool Output Character Length**: Caps the maximum length of `stdout`/`stderr` returned by tools (1,000 to 16,000 characters). Prevents large file dumps from exhausting model context windows.
-- **Max Autonomous Steps**: Hard limit on sequential tool execution cycles (1 to 30 steps) per user prompt. Prevents infinite tool-calling loops.
+- **Max Autonomous Steps**: Hard limit on sequential tool execution cycles (1 to 100 steps) per user prompt. Prevents infinite tool-calling loops. Past about 40 steps a local model usually exhausts the KV budget first, so the run stops with a capacity error rather than the step limit.
 
 ### Search Integrations
 - **Headless Chrome Web Search (De Facto Built-In)**: Built-in, privacy-preserving web search executed via a local sandboxed browser instance (`--headless=new --dump-dom`). Automatically executes client-side JavaScript, renders complex web pages, and extracts structured titles, URLs, and real-time snippets with **zero API keys or external tracking**. Automatically detects Google Chrome, Chromium, Brave, or Microsoft Edge, with an optional user override for custom binary paths.

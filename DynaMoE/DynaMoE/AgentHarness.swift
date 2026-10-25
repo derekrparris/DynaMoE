@@ -2791,7 +2791,6 @@ public final class AgentHarness {
     /// Token budget for a single tool result (converted to characters conservatively
     /// via `charBudget(forTokenBudget:)` before tools truncate their output).
     public var maxToolOutputLength: Int = 4000
-    public var maxAgentSteps: Int = 15
     /// Session that owns the in-flight agent run; stamped onto spawned subagents.
     public var currentSessionId: UUID? = nil
 
