@@ -4882,9 +4882,11 @@ struct ContentView: View {
                 var stepToolCalls: [CloudToolCall] = []
 
                 func generatedTokenCount() -> Int {
-                    if let reported = reportedUsage?.completionTokens { return reported }
-                    let combined = latestText + latestThinking
-                    return combined.isEmpty ? 0 : AppleFoundationModelService.approximateTokenCount(for: combined)
+                    AppleFoundationModelService.generatedTokenCount(
+                        thinkingCharacters: latestThinking.count,
+                        contentCharacters: latestText.count,
+                        reportedCompletionTokens: reportedUsage?.completionTokens
+                    )
                 }
 
                 @MainActor func commitOdometerTail() {
@@ -4905,19 +4907,22 @@ struct ContentView: View {
                     }
                     guard self.ownsGeneration(myGenerationId) else { return }
                     let elapsed = max(now - generationStartTime, 0.001)
-                    let approxTokens = AppleFoundationModelService.approximateTokenCount(for: latestText)
-                    let tokPerSec = Double(approxTokens) / elapsed
+                    // Count reasoning + content, matching the finalizer, so the
+                    // header speed converges to the footer's final number and
+                    // reads real tok/s during a thinking block instead of 0.
+                    let generatedSoFar = generatedTokenCount()
+                    let tokPerSec = Double(generatedSoFar) / elapsed
                     let activelyThinking = !latestThinking.isEmpty && latestText.isEmpty
                     self.generatedStreamText = latestText
                     self.thinkingText = latestThinking
                     self.responseText = latestText
                     self.isThinking = activelyThinking
-                    self.generationTotalTokens = approxTokens
+                    self.generationTotalTokens = generatedSoFar
                     self.generationElapsedMs = elapsed * 1000.0
                     self.generationSpeedTokPerSec = tokPerSec
                     self.generationStatusText = activelyThinking
-                        ? "☁️ \(provider.displayName) — reasoning: ~\(approxTokens) tokens | \(String(format: "%.1f", tokPerSec)) tok/s"
-                        : "☁️ \(provider.displayName) — streaming: ~\(approxTokens) tokens | \(String(format: "%.1f", tokPerSec)) tok/s"
+                        ? "☁️ \(provider.displayName) — reasoning: ~\(generatedSoFar) tokens | \(String(format: "%.1f", tokPerSec)) tok/s"
+                        : "☁️ \(provider.displayName) — streaming: ~\(generatedSoFar) tokens | \(String(format: "%.1f", tokPerSec)) tok/s"
                     if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
                        let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == stepMessageId }) {
                         self.sessions[sIdx].messages[mIdx].prefillStatus = nil
@@ -4925,10 +4930,10 @@ struct ContentView: View {
                         self.sessions[sIdx].messages[mIdx].content = latestText
                         self.sessions[sIdx].messages[mIdx].timestamp = Date()
                         self.sessions[sIdx].messages[mIdx].isThinking = activelyThinking
-                        self.sessions[sIdx].messages[mIdx].tokenCount = approxTokens
+                        self.sessions[sIdx].messages[mIdx].tokenCount = generatedSoFar
                         self.sessions[sIdx].messages[mIdx].tokensPerSec = tokPerSec
                         self.sessions[sIdx].messages[mIdx].timeToFirstTokenSeconds = max(firstDeltaAt - generationStartTime, 0.0)
-                        self.sessions[sIdx].cumulativeTokenCount = cumulativeBase + (latestText.isEmpty ? 0 : approxTokens)
+                        self.sessions[sIdx].cumulativeTokenCount = cumulativeBase + generatedSoFar
                     }
                 }
 

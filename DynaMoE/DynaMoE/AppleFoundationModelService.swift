@@ -511,6 +511,22 @@ public enum AppleFoundationModelService {
         text.isEmpty ? 0 : approximateTokenCount(for: text)
     }
 
+    /// Generated-token count for a streaming turn's live stats, counting the
+    /// reasoning and content channels together (character counts, since the
+    /// streaming APIs report no per-chunk usage). A turn's speed covers every
+    /// token it emitted, so content-only counting reads zero during a thinking
+    /// block and stays diluted afterward. A provider-reported total, when one
+    /// arrives, wins over the estimate.
+    nonisolated public static func generatedTokenCount(
+        thinkingCharacters: Int,
+        contentCharacters: Int,
+        reportedCompletionTokens: Int? = nil
+    ) -> Int {
+        if let reported = reportedCompletionTokens { return reported }
+        let characters = thinkingCharacters + contentCharacters
+        return characters == 0 ? 0 : max(1, characters / 4)
+    }
+
     /// The send gate: a turn may start when either a weights engine (tokenizer
     /// AND summary) is installed, or the session runs on the system model,
     /// which needs neither. Expressed here — not inline in the view — because a
