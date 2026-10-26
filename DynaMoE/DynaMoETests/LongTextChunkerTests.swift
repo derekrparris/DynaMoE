@@ -165,7 +165,11 @@ final class LongTextChunkerTests: XCTestCase {
     }
 
     func testNonASCIIDigitDoesNotStartANumberedList() {
-        let blocks = parseMarkdownBlocks("². superscript item")
+        // U+0662 ARABIC-INDIC DIGIT TWO: a decimal digit that is not ASCII,
+        // which is what the parser's `isASCII` guard has to reject. A
+        // superscript like "²" is not a decimal digit at all, so it never
+        // reached the guard being tested.
+        let blocks = parseMarkdownBlocks("٢. arabic-indic item")
         XCTAssertFalse(blocks.contains {
             if case .listItem = $0 { return true }
             return false

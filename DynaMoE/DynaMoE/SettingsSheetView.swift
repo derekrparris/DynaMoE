@@ -7,6 +7,15 @@ import SwiftUI
 import Combine
 import Metal
 
+/// Quick-pick values for Max Output Tokens.
+///
+/// Deduplicated and sorted once: the buttons are keyed by value (`ForEach(_:id:
+/// \.self)`), so a duplicate — which a future `maxProvisionedRows` value could
+/// silently introduce — is a SwiftUI runtime crash rather than a cosmetic glitch.
+let maxTokenPresets: [Int] = Array(Set([
+    1024, 4096, 8192, 16000, KVCacheProvisioning.maxProvisionedRows
+])).sorted()
+
 enum SettingsTab: String, CaseIterable, Identifiable {
     case general = "General"
     case models = "Models"
@@ -852,7 +861,7 @@ struct SettingsSheetView: View {
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
 
-                    ForEach([1024, 4096, 8192, 16000, KVCacheProvisioning.maxProvisionedRows], id: \.self) { preset in
+                    ForEach(maxTokenPresets, id: \.self) { preset in
                         Button("\(preset)") {
                             maxNewTokens = preset
                         }
@@ -2765,7 +2774,7 @@ struct SettingsSheetView: View {
                         Text("Presets:")
                             .font(.system(size: 9))
                             .foregroundColor(.secondary)
-                        ForEach([1024, 4096, 8192, 16000, KVCacheProvisioning.maxProvisionedRows], id: \.self) { preset in
+                        ForEach(maxTokenPresets, id: \.self) { preset in
                             Button("\(preset)") {
                                 editingDraft.maxNewTokens = preset
                             }

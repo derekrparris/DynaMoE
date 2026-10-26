@@ -405,6 +405,34 @@ final class CloudToolCallFragmentTests: XCTestCase {
         XCTAssertEqual(calls[1].argumentsJSON, #"{"pattern":"foo"}"#)
     }
 
+    func testUnindexedFragmentWithoutAnIdContinuesThePreviousCall() throws {
+        var parser = CloudStreamParser()
+        _ = try parser.consume(dataPayload: callFragment(
+            index: nil, id: "call_1", name: "shell_run", arguments: #"{"comm"#
+        ))
+        _ = try parser.consume(dataPayload: callFragment(index: nil, arguments: #"and":"ls"}"#))
+
+        let calls = parser.result().toolCalls
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls.first?.argumentsJSON, #"{"command":"ls"}"#)
+    }
+
+    func testUnindexedFragmentWithAFreshIdStartsANewCall() throws {
+        var parser = CloudStreamParser()
+        _ = try parser.consume(dataPayload: callFragment(
+            index: nil, id: "call_a", name: "file_read", arguments: #"{"path":"/tmp/a"}"#
+        ))
+        _ = try parser.consume(dataPayload: callFragment(
+            index: nil, id: "call_b", name: "grep_search", arguments: #"{"pattern":"foo"}"#
+        ))
+
+        let calls = parser.result().toolCalls
+        XCTAssertEqual(calls.count, 2)
+        XCTAssertEqual(calls.map(\.id), ["call_a", "call_b"])
+        XCTAssertEqual(calls[0].argumentsJSON, #"{"path":"/tmp/a"}"#)
+        XCTAssertEqual(calls[1].argumentsJSON, #"{"pattern":"foo"}"#)
+    }
+
     func testSplitFunctionNameIsReassembled() throws {
         var parser = CloudStreamParser()
         _ = try parser.consume(dataPayload: callFragment(index: 0, id: "call_1", name: "file_", arguments: ""))

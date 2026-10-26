@@ -385,7 +385,10 @@ nonisolated struct CloudStreamParser {
     /// appends to `function.arguments`.
     private mutating func absorb(_ fragments: [CloudChatStreamChunk.Choice.Delta.ToolCall]) {
         for fragment in fragments {
-            let index = fragment.index ?? (toolCallOrder.last ?? -1)
+            let index = fragment.index ?? unindexedFragmentIndex(
+                fragment,
+                continuing: toolCallOrder.last ?? -1
+            )
             guard index >= 0 else { continue }
             if !toolCallOrder.contains(index) { toolCallOrder.append(index) }
             if let id = fragment.id, !id.isEmpty { toolCallIds[index] = id }
@@ -405,6 +408,31 @@ nonisolated struct CloudStreamParser {
             }
         }
         rebuildToolCalls()
+    }
+
+    /// Resolves the stream index for a fragment the provider sent without one.
+    ///
+    /// An index-less fragment normally continues the call before it (some
+    /// providers omit `index` on argument continuations). A non-empty `id` that
+    /// differs from the previous call's id is a NEW call starting in parallel
+    /// though: folding it into the previous accumulator would append one call's
+    /// arguments to another and overwrite its id, producing a call that cannot
+    /// be executed. A fresh index keeps both intact.
+    private func unindexedFragmentIndex(
+        _ fragment: CloudChatStreamChunk.Choice.Delta.ToolCall,
+        continuing previousIndex: Int
+    ) -> Int {
+        guard previousIndex >= 0 else { return 0 }
+        if let id = fragment.id,
+           !id.isEmpty,
+           let existing = toolCallIds[previousIndex],
+           !existing.isEmpty,
+           existing != id {
+            // Above every index seen so far, so it can never collide with one
+            // the provider does send explicitly.
+            return (toolCallOrder.max() ?? previousIndex) + 1
+        }
+        return previousIndex
     }
 
     private mutating func rebuildToolCalls() {

@@ -1346,6 +1346,11 @@ struct ChunkedText: View {
     /// boundary is indistinguishable from an ordinary line break.
     var lineSpacing: CGFloat = 0
 
+    /// Parse each chunk as inline markdown, matching the `Text(LocalizedStringKey:)`
+    /// the unbounded path uses. Only markdown blocks set this: a plain user
+    /// message or reasoning block must stay verbatim.
+    var parsesMarkdown = false
+
     private final class ChunksMemo {
         var text: String?
         var chunks: [String] = []
@@ -1361,17 +1366,30 @@ struct ChunkedText: View {
         return split
     }
 
+    /// One chunk's text. Without markdown parsing an oversized paragraph would
+    /// show literal `**bold**`, backticks, and raw link targets — exactly the
+    /// case this view exists for. A split inside an inline span can still leave
+    /// a marker unbalanced, but that beats dropping the styling entirely.
+    @ViewBuilder
+    private func chunkText(_ chunk: String) -> some View {
+        if parsesMarkdown {
+            Text(LocalizedStringKey(chunk))
+        } else {
+            Text(chunk)
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: lineSpacing) {
             if chunks.isEmpty {
                 // An empty string still drew one line box as a plain `Text`;
                 // a `VStack` with no children would collapse instead.
-                Text(text)
+                chunkText(text)
                     .lineSpacing(lineSpacing)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
                 ForEach(Array(chunks.enumerated()), id: \.offset) { _, chunk in
-                    Text(chunk)
+                    chunkText(chunk)
                         .lineSpacing(lineSpacing)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -2076,7 +2094,7 @@ struct MarkdownMessageView: View {
     @ViewBuilder
     private func paragraphText(_ text: String) -> some View {
         if LongTextChunker.isOversized(text) {
-            ChunkedText(text: text, lineSpacing: 4)
+            ChunkedText(text: text, lineSpacing: 4, parsesMarkdown: true)
         } else {
             Text(LocalizedStringKey(text))
         }
@@ -2116,7 +2134,7 @@ struct MarkdownMessageView: View {
     @ViewBuilder
     private func blockquoteText(_ text: String) -> some View {
         if LongTextChunker.isOversized(text) {
-            ChunkedText(text: text, lineSpacing: 3.5)
+            ChunkedText(text: text, lineSpacing: 3.5, parsesMarkdown: true)
         } else {
             Text(LocalizedStringKey(text))
         }
@@ -2169,7 +2187,7 @@ struct MarkdownMessageView: View {
     @ViewBuilder
     private func listItemText(_ text: String) -> some View {
         if LongTextChunker.isOversized(text) {
-            ChunkedText(text: text, lineSpacing: 3)
+            ChunkedText(text: text, lineSpacing: 3, parsesMarkdown: true)
         } else {
             Text(LocalizedStringKey(text))
         }

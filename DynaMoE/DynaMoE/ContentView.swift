@@ -1889,10 +1889,13 @@ struct ContentView: View {
         }
     }
 
-    /// Blocks until every running/pending subagent for the session reaches a terminal state
-    /// or the timeout elapses. Called off the main actor during agent-run teardown so the
-    /// coordinator's run can pick up results it would otherwise drop.
-    private func waitForSessionSubagents(sessionId: UUID?, timeout: TimeInterval) {
+    /// Waits until every running/pending subagent for the session reaches a terminal state
+    /// or the timeout elapses. Awaited at agent-run teardown so the coordinator's run can
+    /// pick up results it would otherwise drop.
+    ///
+    /// Suspends between polls instead of sleeping: the harness state it reads is main-actor
+    /// state, and the weights and cloud teardowns both reach this from a background turn.
+    private func awaitSessionSubagents(sessionId: UUID?, timeout: TimeInterval) async {
         guard let sessionId else { return }
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
@@ -1900,7 +1903,7 @@ struct ContentView: View {
                 $0.parentSessionId == sessionId && ($0.status == .running || $0.status == .pending)
             }
             if !stillRunning { return }
-            Thread.sleep(forTimeInterval: 0.25)
+            try? await Task.sleep(nanoseconds: 250_000_000)
         }
     }
 
@@ -4761,6 +4764,12 @@ struct ContentView: View {
         let myGenerationId = generationId
         isGeneratingText = true
         generatingSessionId = sessionId
+        // Ownership stamps the harness like the weights path does: a
+        // `spawn_subagent` issued by this turn is parented to THIS session.
+        // Without it the subagent inherits whatever local conversation ran
+        // last, so its report is relayed into the wrong transcript — or never
+        // relayed at all, because the relay filters on `parentSessionId`.
+        AgentHarness.shared.currentSessionId = sessionId
         generatedStreamText = ""
         thinkingText = ""
         responseText = ""
@@ -5168,6 +5177,15 @@ struct ContentView: View {
                 // conversation (the model spawned one and stopped without
                 // polling). Spend ONE tools-disabled turn so the coordinator
                 // presents them instead of dropping them.
+                //
+                // In-flight subagents land their reports later, so wait for them
+                // first — the weights path waits at the same point, and skipping
+                // it here would end the run while a report is still being
+                // written.
+                if toolsEnabled, !ranComplete, !ranSynthesisTurn,
+                   step + 1 < self.maxAgentSteps {
+                    await self.awaitSessionSubagents(sessionId: sessionId, timeout: 120)
+                }
                 if toolsEnabled, !ranComplete, !ranSynthesisTurn,
                    step + 1 < self.maxAgentSteps,
                    takeSubagentRelayDirective() {
@@ -5188,6 +5206,24 @@ struct ContentView: View {
                     continue
                 }
 
+                // A max-token cut ends the turn looking complete: the provider
+                // reports `finish_reason: "length"` (or `"max_tokens"`) and just
+                // stops. Park the notice in the transcript, because the status
+                // line is transient and `.system` rows are never replayed into
+                // the provider's history.
+                let truncatedAtLimit = finishReason == "length" || finishReason == "max_tokens"
+                if truncatedAtLimit {
+                    let notice = "⚠️ This answer stopped at the Max Output Tokens limit and may be truncated. Raise it in Settings ▸ Sampling for a longer reply."
+                    if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
+                        let insertAt = self.sessions[sIdx].messages.firstIndex(where: { $0.id == stepMessageId })
+                            .map { $0 + 1 } ?? self.sessions[sIdx].messages.count
+                        self.sessions[sIdx].messages.insert(
+                            ChatMessage(role: .system, content: notice),
+                            at: insertAt
+                        )
+                    }
+                }
+
                 self.isGeneratingText = false
                 self.generationTask = nil
                 self.generatedStreamText = latestText
@@ -5198,6 +5234,7 @@ struct ContentView: View {
                 self.generationElapsedMs = finalElapsed * 1000.0
                 self.generationSpeedTokPerSec = finalTokPerSec
                 self.generationStatusText = "☁️ \(provider.displayName) — generated ~\(generatedTokens) tokens in \(String(format: "%.2f", finalElapsed * 1000.0)) ms (\(String(format: "%.1f", finalTokPerSec)) tok/s)"
+                    + (truncatedAtLimit ? " — truncated at the Max Output Tokens limit." : "")
                 self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)
                 return
             }
@@ -6453,7 +6490,7 @@ struct ContentView: View {
                         // reports and run ONE tools-disabled turn so the coordinator presents
                         // them to the user instead of dropping them.
                         if !ranCompleteTool {
-                            self.waitForSessionSubagents(sessionId: sessionId, timeout: 120)
+                            await self.awaitSessionSubagents(sessionId: sessionId, timeout: 120)
                             let pendingRelay = await MainActor.run {
                                 let r = self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
                                 self.markSubagentSummariesRelayed(r)

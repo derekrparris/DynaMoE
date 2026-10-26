@@ -272,6 +272,16 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                             }
                         }
 
+                        // A stream left before EOF — `[DONE]`, a decode failure,
+                        // an oversized frame, or Stop — still owns a running data
+                        // task, which keeps the connection claimed until the
+                        // server closes by itself. Cancelling settles both
+                        // immediately; the bytes already parsed are unaffected.
+                        if Task.isCancelled || finishedBySentinel || sawFailure
+                            || lineBuffer.overflowed || frames.overflowed {
+                            bytes.task.cancel()
+                        }
+
                         if Task.isCancelled {
                             continuation.finish()
                             return
@@ -363,15 +373,30 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         }
     }
 
+    /// Reads an error body, keeping at most `limit` bytes.
+    ///
+    /// The sequence is consumed past the kept prefix instead of abandoned at
+    /// it: a partially-read response stays claimed by the shared session (its
+    /// data task alive, its connection unreusable) until the server closes on
+    /// its own. Error bodies are short, so reading to EOF costs nothing and
+    /// returns the connection to the pool. `hardCap` stops an endpoint that
+    /// answers with an endless body; hitting it cancels the underlying task so
+    /// nothing is left running.
     private static func drain(_ bytes: URLSession.AsyncBytes, limit: Int) async -> String {
+        let hardCap = max(limit, 256 * 1024)
         var data = Data()
+        var consumed = 0
         do {
             for try await byte in bytes {
-                data.append(byte)
-                if data.count >= limit { break }
+                consumed += 1
+                if data.count < limit { data.append(byte) }
+                if consumed >= hardCap {
+                    bytes.task.cancel()
+                    break
+                }
             }
         } catch {
-            return ""
+            return String(decoding: data, as: UTF8.self)
         }
         return String(decoding: data, as: UTF8.self)
     }
