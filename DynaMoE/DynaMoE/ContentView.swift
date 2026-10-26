@@ -511,6 +511,10 @@ struct ContentView: View {
     }
 
     var activeModelSupportsThinking: Bool {
+        // A cloud model's reasoning is the provider's own default: local name
+        // heuristics say nothing about it, and the toggle is hidden on that
+        // path. Streamed `reasoning_content` still renders when it arrives.
+        if isCloudModelActive { return false }
         // 1. Check loaded model config / summary / detected architecture
         if ModelConfig.supportsThinking(
             config: modelConfig,
@@ -576,6 +580,10 @@ struct ContentView: View {
     /// Whether a specific conversation's model supports thinking, derived from
     /// that conversation rather than the current selection.
     private func supportsThinking(for session: ChatSession?) -> Bool {
+        // Cloud reasoning is provider-controlled; the local name heuristics below
+        // would light the thinking spinner for names like "deepseek" even
+        // though the cloud path has no on/off switch to honor.
+        if let session, cloudModelResolution(for: session) != nil { return false }
         if ModelConfig.supportsThinking(
             config: modelConfig,
             summary: summary,
@@ -746,6 +754,9 @@ struct ContentView: View {
     /// load task so a caller can wait for that specific model to be ready.
     @discardableResult
     private func completeModelSwitch(to model: DiscoveredModel, sessionId targetSessionId: UUID?) -> Task<Void, Never> {
+        if model.isCloudModel {
+            return coordinateCloudModelActivation(of: model, sessionId: targetSessionId)
+        }
         if model.isAppleFoundationModel {
             return coordinateAppleFoundationModelActivation(of: model, sessionId: targetSessionId)
         }
@@ -783,13 +794,22 @@ struct ContentView: View {
               let session = sessions.first(where: { $0.id == sessionId }),
               let targetPath = session.selectedModelPath,
               !targetPath.isEmpty else { return true }
+        // Never hand an unresolved cloud sentinel to the weights loader: it has
+        // no safetensors to mmap, and the send path refuses this selection too.
+        if CloudModelAddress.selectionIsUnresolved(
+            modelId: session.selectedModelId,
+            modelPath: targetPath
+        ) {
+            generationStatusText = "⚠️ This conversation's cloud model could not be resolved. Reselect the model in the model picker."
+            return false
+        }
         if installedModelPath == targetPath {
             // The engine for this path may still be installing; wait for that
             // specific load rather than sending against the previous model.
             if isLoadingModel { await modelLoadTask?.value }
             return isEngineUsable(forPath: targetPath)
         }
-        if let model = localModelManager.getModel(byId: targetPath) ?? localModelManager.getModel(byId: session.selectedModelId ?? "") {
+        if let model = resolvedDiscoveredModel(forPath: targetPath, session: session) {
             await switchModel(to: model, sessionId: sessionId)?.value
         } else {
             PrefixCacheManager.shared.invalidate()
@@ -814,11 +834,33 @@ struct ContentView: View {
         if path == AppleFoundationModelService.modelPath {
             return installedModelPath == path && !isLoadingModel
         }
+        // A cloud provider entry has no local weights at all; like the system
+        // model it is usable the moment its sentinel path is installed.
+        if CloudModelAddress.isCloudPath(path) {
+            return installedModelPath == path && !isLoadingModel
+        }
         return installedModelPath == path
             && engine != nil
             && summary != nil
             && tokenizer != nil
             && !isLoadingModel
+    }
+
+    /// Resolves a conversation's model entry, rebuilding a virtual cloud entry
+    /// ad hoc when the session is pinned to a provider model that is no longer
+    /// in the registry (Clear, or a retired model). Without this the fallback
+    /// would hand a `cloud://` sentinel to the weights loader, which has no
+    /// safetensors to mmap.
+    private func resolvedDiscoveredModel(forPath path: String, session: ChatSession?) -> DiscoveredModel? {
+        if let model = localModelManager.getModel(byId: path) { return model }
+        if let id = session?.selectedModelId, let model = localModelManager.getModel(byId: id) { return model }
+        if let resolved = CloudModelAddress.parsePath(path) {
+            return CloudModelRegistry.adHocDiscoveredModel(
+                provider: resolved.provider,
+                providerModelId: resolved.providerModelId
+            )
+        }
+        return nil
     }
 
     /// Brings the process-wide engine back to the selected conversation's model
@@ -832,7 +874,11 @@ struct ContentView: View {
               let session = sessions.first(where: { $0.id == selectionId }),
               let targetPath = session.selectedModelPath, !targetPath.isEmpty,
               activeLoadedModelPath != targetPath else { return }
-        if let model = localModelManager.getModel(byId: targetPath) ?? localModelManager.getModel(byId: session.selectedModelId ?? "") {
+        if CloudModelAddress.selectionIsUnresolved(
+            modelId: session.selectedModelId,
+            modelPath: targetPath
+        ) { return }
+        if let model = resolvedDiscoveredModel(forPath: targetPath, session: session) {
             switchModel(to: model, sessionId: selectionId)
         } else {
             loadAndBridgeToMetal(filePath: targetPath)
@@ -930,6 +976,123 @@ struct ContentView: View {
             await self.awaitGenerationTeardown()
             guard self.modelLoadToken == token else { return }
             self.activateAppleFoundationModel(model, sessionId: targetSessionId)
+        }
+        modelLoadTask = activationTask
+        return activationTask
+    }
+
+    // MARK: - Connected Cloud Provider Backend
+
+    /// True when the active chat backend is a remote cloud provider rather
+    /// than local weights or the system on-device model. `installedModelPath`
+    /// carries the provider's `cloud://` sentinel while it is active; no Rust
+    /// engine, tokenizer, Metal buffers, or KV cache exist in that state.
+    var isCloudModelActive: Bool {
+        CloudModelAddress.isCloudPath(installedModelPath)
+    }
+
+    /// Resolves a conversation's backend to a cloud provider when it runs on
+    /// one. Like the weights and system-model paths, a session without
+    /// explicit model fields runs against whatever backend is active.
+    private func cloudModelResolution(for session: ChatSession) -> (provider: CloudProvider, providerModelId: String)? {
+        // A persisted cloud sentinel that no longer resolves (unknown provider,
+        // corrupted defaults) must NOT fall through to the installed backend:
+        // that would silently run the turn on a different model than the
+        // conversation names. `unresolvedCloudSelection` turns this into a
+        // refusal on the send path.
+        //
+        // An explicit cloud path wins first: sessions persist both fields, and
+        // path is the field the engine keyed on when the entry was installed.
+        if let path = session.selectedModelPath, CloudModelAddress.isCloudPath(path) {
+            return CloudModelAddress.parsePath(path)
+        }
+        if let id = session.selectedModelId, !id.isEmpty {
+            if let resolved = CloudModelAddress.parseModelId(id) { return resolved }
+            if CloudModelAddress.isCloudModelId(id) { return nil }
+            // A local registry id pins this conversation to local weights even
+            // when another backend is installed globally.
+            return nil
+        }
+        if let path = session.selectedModelPath, !path.isEmpty {
+            // Any remaining explicit path is a local snapshot.
+            return nil
+        }
+        guard let installedModelPath else { return nil }
+        return CloudModelAddress.parsePath(installedModelPath)
+    }
+
+    /// True when a conversation's persisted model fields claim a cloud provider
+    /// but can no longer be resolved. The send path refuses this instead of
+    /// running the turn on whatever weights happen to be installed.
+    private func unresolvedCloudSelection(for session: ChatSession) -> Bool {
+        CloudModelAddress.selectionIsUnresolved(
+            modelId: session.selectedModelId,
+            modelPath: session.selectedModelPath
+        )
+    }
+
+    /// Installs a cloud provider model as the active backend. Nothing loads
+    /// from disk, so any resident weights engine is released exactly like the
+    /// system-model activation releases it: the working-set budget must not
+    /// stay held by a backend that will never touch it.
+    private func activateCloudModel(_ model: DiscoveredModel, sessionId targetSessionId: UUID?) {
+        guard let resolved = model.cloudResolution else {
+            // Never leave the previous backend installed behind a selection
+            // that claims a cloud model: say why nothing happened.
+            let message = "⚠️ Could not resolve \(model.displayName) to a cloud provider — reselect the model in the model picker."
+            metalStatus = message
+            generationStatusText = message
+            return
+        }
+        PrefixCacheManager.shared.invalidate()
+        ExpertIOThreadPool.shared.closeAllLayerFDs()
+        WorkingSetManager.shared.releaseShardMappings()
+        CompletionEngine.shared.configure(summary: nil, modelConfig: nil, tokenizer: nil, shardBuffers: [:], activeLoadedModelPath: nil)
+        BackbonePinPool.shared.release()
+        engine = nil
+        tokenizer = nil
+        summary = nil
+        modelConfig = nil
+        shardBuffers = [:]
+        isLoadingModel = false
+        installedModelPath = model.snapshotPath
+        activeLoadedModelPath = model.snapshotPath
+        localModelManager.setLastUsedModel(id: model.id)
+        if let sid = targetSessionId,
+           let idx = sessions.firstIndex(where: { $0.id == sid }) {
+            sessions[idx].selectedModelId = model.id
+            sessions[idx].selectedModelName = model.displayName
+            sessions[idx].selectedModelPath = model.snapshotPath
+        }
+        let preferredProfile = ModelProfileManager.shared.getActiveProfile(for: model.id)
+        applyProfile(preferredProfile, for: model.id)
+        if CloudSecretStore.shared.exists(providerId: resolved.provider.id) {
+            metalStatus = "☁️ \(resolved.provider.displayName) ready — \(model.displayName)."
+            generationStatusText = "☁️ \(resolved.provider.displayName) active."
+        } else {
+            let message = "⚠️ \(resolved.provider.displayName): no API key stored — add one in Settings ▸ Cloud Providers."
+            metalStatus = message
+            generationStatusText = message
+        }
+    }
+
+    /// Serializes cloud activation against in-flight weights loads and
+    /// generations, mirroring `coordinateAppleFoundationModelActivation`: the
+    /// token makes a stale load skip its guarded installs, and draining the
+    /// previous load plus the generation teardown before releasing the engine
+    /// keeps unguarded side effects (expert pool setup, shard mappings) from
+    /// repopulating resources after this activation released them.
+    @discardableResult
+    private func coordinateCloudModelActivation(of model: DiscoveredModel, sessionId targetSessionId: UUID?) -> Task<Void, Never> {
+        modelLoadToken &+= 1
+        let token = modelLoadToken
+        let previousLoad = modelLoadTask
+        let activationTask = Task { @MainActor in
+            await previousLoad?.value
+            guard self.modelLoadToken == token else { return }
+            await self.awaitGenerationTeardown()
+            guard self.modelLoadToken == token else { return }
+            self.activateCloudModel(model, sessionId: targetSessionId)
         }
         modelLoadTask = activationTask
         return activationTask
@@ -1200,8 +1363,9 @@ struct ContentView: View {
                     thinkingEffort: levelCapable ? thinkingEffortForActiveSession : nil,
                     supportsThinkingLevels: levelCapable,
                     isAgentToolsEnabled: isAgentToolsEnabledForActiveSession,
-                    isModelLoaded: (tokenizer != nil && summary != nil) || isAppleFoundationModelActive,
+                    isModelLoaded: (tokenizer != nil && summary != nil) || isAppleFoundationModelActive || isCloudModelActive,
                     isAppleFoundationModelActive: isAppleFoundationModelActive,
+                    isCloudModelActive: isCloudModelActive,
                     onSendMessage: { prompt in
                         handleSendMessage(prompt)
                     },
@@ -1725,10 +1889,13 @@ struct ContentView: View {
         }
     }
 
-    /// Blocks until every running/pending subagent for the session reaches a terminal state
-    /// or the timeout elapses. Called off the main actor during agent-run teardown so the
-    /// coordinator's run can pick up results it would otherwise drop.
-    private func waitForSessionSubagents(sessionId: UUID?, timeout: TimeInterval) {
+    /// Waits until every running/pending subagent for the session reaches a terminal state
+    /// or the timeout elapses. Awaited at agent-run teardown so the coordinator's run can
+    /// pick up results it would otherwise drop.
+    ///
+    /// Suspends between polls instead of sleeping: the harness state it reads is main-actor
+    /// state, and the weights and cloud teardowns both reach this from a background turn.
+    private func awaitSessionSubagents(sessionId: UUID?, timeout: TimeInterval) async {
         guard let sessionId else { return }
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
@@ -1736,7 +1903,7 @@ struct ContentView: View {
                 $0.parentSessionId == sessionId && ($0.status == .running || $0.status == .pending)
             }
             if !stillRunning { return }
-            Thread.sleep(forTimeInterval: 0.25)
+            try? await Task.sleep(nanoseconds: 250_000_000)
         }
     }
 
@@ -2067,6 +2234,16 @@ struct ContentView: View {
         guard !isLoadingModel else { return false }
         guard let currentSessionId = explicitSessionId ?? selectedSessionId ?? sessions.first?.id else { return false }
         guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return false }
+        // A cloud selection that no longer resolves must refuse here, exactly
+        // like `activateCloudModel` does: falling through would run the turn on
+        // the installed weights while the conversation still claims a remote
+        // model, which is both surprising and a privacy problem.
+        if unresolvedCloudSelection(for: sessions[sessionIdx]) {
+            let err = "⚠️ This conversation's cloud model could not be resolved. Reselect the model in the model picker."
+            generationStatusText = err
+            gpuComputeOutput = err
+            return false
+        }
         // A running compaction rewrites this session's messages when its
         // summaries land; an interleaved send would be part of the rewrite.
         if isCompactingConversation {
@@ -2080,8 +2257,11 @@ struct ContentView: View {
         // backend has no tokenizer/summary at all, so its sessions must pass
         // this gate on the system-model exemption alone.
         let sendSessionUsesAFM = sessionUsesAppleFoundationModel(sessions[sessionIdx])
+        // A connected cloud provider is the third non-weights backend, so it
+        // passes the same gate exemption the system model does.
+        let sendSessionUsesCloud = cloudModelResolution(for: sessions[sessionIdx]) != nil
         let weightsEngineReady = tokenizer != nil && summary != nil
-        guard AppleFoundationModelService.sendGateAllowsSend(hasEngine: weightsEngineReady, sessionUsesSystemModel: sendSessionUsesAFM) else {
+        guard AppleFoundationModelService.sendGateAllowsSend(hasEngine: weightsEngineReady, sessionUsesSystemModel: sendSessionUsesAFM || sendSessionUsesCloud) else {
             let err = "⚠️ No model loaded — select a model in Settings (bottom left) before sending."
             generationStatusText = err
             gpuComputeOutput = err
@@ -2198,6 +2378,62 @@ struct ContentView: View {
                 userPrompt: text,
                 instructionsText: afmInstructions,
                 responseTokenCeiling: afmResponseTokens
+            )
+            return true
+        }
+
+        // === Connected cloud provider backend branch ===
+        // A remote provider is a complete third backend: no Rust engine,
+        // tokenizer, Metal buffers, or KV/prefix cache. The provider owns chat
+        // templating, so the turn is assembled as a messages array. Agent mode
+        // rides the provider's NATIVE function calling: schemas travel in the
+        // request's `tools`, so the local XML tool dialect prompt must not be
+        // injected — only the procedural guidance is.
+        if let cloud = cloudModelResolution(for: sendSession) {
+            var cloudSystemPrompt = ModelConfig.buildEffectiveSystemPrompt(
+                userPrompt: systemPrompt,
+                config: nil,
+                summary: nil,
+                modelName: sessionModelName,
+                modelPath: nil,
+                currentDate: sessions[sessionIdx].createdAt
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            if let compactedContext = sessions[sessionIdx].compactionContextBlock {
+                cloudSystemPrompt += "\n\n" + compactedContext
+            }
+            let agentToolsRequested = sessions[sessionIdx].isAgentToolsEnabled ?? defaultAgentToolsEnabled
+            let cloudSpec = CloudModelRegistry.registeredSpecs(for: cloud.provider)
+                .first { $0.providerModelId == cloud.providerModelId }
+            let cloudSupportsTools = cloudSpec?.supportsTools ?? true
+            let cloudAgentMode = agentToolsRequested && cloudSupportsTools
+            if agentToolsRequested && !cloudSupportsTools {
+                // Park the notice in the transcript: `generationStatusText` is
+                // immediately overwritten by the cloud path's own status line,
+                // so a status-only notice never became visible.
+                let notice = "⚠️ \(sessionModelName ?? cloud.providerModelId) is registered without tool support. Sending this turn as plain chat."
+                let alreadyNoted = sessions[sessionIdx].messages.contains {
+                    $0.role == .system && $0.content == notice
+                }
+                if !alreadyNoted,
+                   let assistantIndex = sessions[sessionIdx].messages.firstIndex(where: { $0.id == assistantMsgId }) {
+                    sessions[sessionIdx].messages.insert(
+                        ChatMessage(role: .system, content: notice),
+                        at: assistantIndex
+                    )
+                }
+            } else if cloudAgentMode {
+                AgentHarness.shared.beginAgentSearchGuard()
+                cloudSystemPrompt += "\n\n" + AgentHarness.shared.buildCloudToolGuidance()
+            }
+            startCloudGeneration(
+                sessionId: currentSessionId,
+                messageId: assistantMsgId,
+                provider: cloud.provider,
+                providerModelId: cloud.providerModelId,
+                modelDisplayName: sessionModelName
+                    ?? CloudModelRegistry.defaultDisplayName(provider: cloud.provider, providerModelId: cloud.providerModelId),
+                systemPrompt: cloudSystemPrompt,
+                isAgentTurn: cloudAgentMode
             )
             return true
         }
@@ -4482,6 +4718,682 @@ struct ContentView: View {
         return true
     }
 
+    // MARK: - Connected Cloud Provider Generation
+
+    /// One chat turn on a connected cloud provider.
+    ///
+    /// Mirrors the UI contract of `startAppleFoundationModelGeneration` —
+    /// generation identity (`ownsGeneration`), streaming message updates,
+    /// stop-button cancellation, and queued-prompt draining — without any
+    /// weights, Metal, or KV-cache machinery. The provider owns templating, so
+    /// history travels as a messages array and is re-assembled from the session
+    /// on every step, which is also what replays the tool exchange.
+    ///
+    /// With `isAgentTurn`, the turn runs the agent loop through the provider's
+    /// NATIVE function calling instead of a parsed XML dialect: loaded tool
+    /// schemas ride the request, streamed `tool_calls` are committed to the
+    /// assistant message, each call gates on the same HITL approval and
+    /// executes through `AgentHarness`, and the next step continues until the
+    /// model answers, calls `complete`, or exhausts `maxAgentSteps`. The whole
+    /// loop lives in ONE task, so Stop aborts streaming, approvals, and tool
+    /// execution together.
+    @discardableResult
+    private func startCloudGeneration(
+        sessionId: UUID,
+        messageId: UUID,
+        provider: CloudProvider,
+        providerModelId: String,
+        modelDisplayName: String,
+        systemPrompt: String,
+        isAgentTurn: Bool = false
+    ) -> Bool {
+        let displayName = modelDisplayName.isEmpty ? providerModelId : modelDisplayName
+        guard let client = CloudChatClient.makeStored(provider: provider) else {
+            let err = "⚠️ \(provider.displayName): no API key stored — add one in Settings ▸ Cloud Providers."
+            if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }),
+               let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }) {
+                sessions[sIdx].messages[mIdx].content = err
+                sessions[sIdx].messages[mIdx].isThinking = false
+            }
+            gpuComputeOutput = err
+            generationStatusText = err
+            return true
+        }
+
+        generationId &+= 1
+        let myGenerationId = generationId
+        isGeneratingText = true
+        generatingSessionId = sessionId
+        // Ownership stamps the harness like the weights path does: a
+        // `spawn_subagent` issued by this turn is parented to THIS session.
+        // Without it the subagent inherits whatever local conversation ran
+        // last, so its report is relayed into the wrong transcript — or never
+        // relayed at all, because the relay filters on `parentSessionId`.
+        AgentHarness.shared.currentSessionId = sessionId
+        generatedStreamText = ""
+        thinkingText = ""
+        responseText = ""
+        // Cloud reasoning is the provider's own default; the turn starts
+        // without a thinking spinner and only lights one when real
+        // `reasoning_content` deltas arrive.
+        isThinking = false
+        generationTotalTokens = 0
+        generationElapsedMs = 0.0
+        generationSpeedTokPerSec = 0.0
+        generationStatusText = "☁️ \(provider.displayName) — generating…"
+        if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }),
+           let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }) {
+            sessions[sIdx].messages[mIdx].prefillStatus = "☁️ \(provider.displayName) — contacting the model…"
+        }
+
+        let params = CloudChatGenerationParams(
+            temperature: Double(temperature),
+            topP: Double(topP),
+            presencePenalty: Double(presencePenalty),
+            maxTokens: maxNewTokens > 0 ? maxNewTokens : nil
+        )
+        // The persona rides as a leading system message; the provider's own
+        // templating consumes it verbatim.
+        let persona = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Loaded tools only, read fresh on each step so a `tools_load` issued
+        // inside the loop is visible to the next request. The full catalog stays
+        // discoverable through `tools_discover`; every schema sent costs prompt
+        // tokens on every request of the loop.
+        let toolsEnabled = isAgentTurn
+
+        let openingMessages = CloudMessageAssembler.assemble(
+            from: sessions.first(where: { $0.id == sessionId })?.messages ?? [],
+            excludingMessageIds: [messageId]
+        )
+        let turnInputTokens = CloudMessageAssembler.approximatePromptTokens(
+            system: persona,
+            messages: openingMessages
+        )
+        let sessionCumulativeStart = sessions.first(where: { $0.id == sessionId })?.cumulativeTokenCount ?? 0
+        if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }) {
+            sessions[sIdx].cumulativeTokenCount = sessionCumulativeStart + turnInputTokens
+        }
+
+        generationTask = Task(priority: .userInitiated) {
+            var currentMessageId = messageId
+            var step = 0
+            var cumulativeBase = sessionCumulativeStart + turnInputTokens
+            // Prompt-only coordinator directive carrying subagent reports that
+            // landed mid-run. Cloud history is re-assembled from the session on
+            // every step, so the reports ride the leading system message of the
+            // remaining steps instead of a stored message (which would render in
+            // the transcript as if the user sent them).
+            var relayDirective = ""
+            // At most one tools-disabled synthesis turn per run, mirroring the
+            // weights path's forced-synthesis pass. It also bounds the subagent
+            // result-delivery relay below.
+            var ranSynthesisTurn = false
+
+            @MainActor func takeSubagentRelayDirective() -> Bool {
+                let pending = self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
+                guard !pending.isEmpty else { return false }
+                self.markSubagentSummariesRelayed(pending)
+                relayDirective = CloudSubagentRelay.directive(reports: pending)
+                return true
+            }
+
+            while true {
+                // A superseded or stopped turn must not spend one more provider
+                // request: the loop issues a fresh call every iteration. Stop
+                // cancels the task without minting a new generation id, so both
+                // checks matter.
+                guard !Task.isCancelled, self.ownsGeneration(myGenerationId) else { return }
+                guard let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) else { return }
+                var outbound: [CloudChatMessage] = []
+                // A directive applies to exactly one step. Keeping it set while
+                // tool rounds continue told every later step to "write the final
+                // answer now" even though that answer was not due yet.
+                let stepDirective = relayDirective
+                relayDirective = ""
+                let stepPersona = stepDirective.isEmpty
+                    ? persona
+                    : [persona, stepDirective].filter { !$0.isEmpty }.joined(separator: "\n\n")
+                if !stepPersona.isEmpty {
+                    outbound.append(CloudChatMessage(role: "system", content: stepPersona))
+                }
+                outbound.append(contentsOf: CloudMessageAssembler.assemble(
+                    from: self.sessions[sIdx].messages,
+                    excludingMessageIds: [currentMessageId]
+                ))
+                // The relay/synthesis turn is a final-answer pass: the model must
+                // present the reports, not start another tool round.
+                let tools = CloudAgentStepPlan.offersTools(
+                    agentTurn: toolsEnabled,
+                    isSynthesisTurn: ranSynthesisTurn
+                ) ? AgentHarness.shared.availableToolDefinitions : []
+                let stepMessageId = currentMessageId
+                let generationStartTime = CFAbsoluteTimeGetCurrent()
+
+                // One row per agent step: each step is its own request and its own
+                // assistant message, and the box is one-shot.
+                let turnLog = ServerRequestLog.chatTurnLog(
+                    model: displayName,
+                    inputTokens: CloudMessageAssembler.approximatePromptTokens(system: nil, messages: outbound),
+                    isAgentTurn: isAgentTurn,
+                    prompt: CloudMessageAssembler.renderedPromptForLog(system: nil, messages: outbound)
+                )
+
+                var latestText = ""
+                var latestThinking = ""
+                var sawFirstDelta = false
+                var firstDeltaAt = 0.0
+                var lastUIUpdateTime = 0.0
+                var thinkingStartedAt: Double? = nil
+                var thinkingDuration: Double? = nil
+                var reportedUsage: CloudUsage? = nil
+                var finishReason: String? = nil
+                var serviceFailure: CloudTurnFailure? = nil
+                var stepToolCalls: [CloudToolCall] = []
+
+                func generatedTokenCount() -> Int {
+                    AppleFoundationModelService.generatedTokenCount(
+                        thinkingCharacters: latestThinking.count,
+                        contentCharacters: latestText.count,
+                        reportedCompletionTokens: reportedUsage?.completionTokens
+                    )
+                }
+
+                @MainActor func commitOdometerTail() {
+                    guard self.ownsGeneration(myGenerationId),
+                          let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) else { return }
+                    self.sessions[sIdx].cumulativeTokenCount = cumulativeBase + generatedTokenCount()
+                }
+
+                // 60fps-throttled streaming UI updates, mirroring the weights and
+                // on-device paths.
+                @MainActor func pushPartial() {
+                    let now = CFAbsoluteTimeGetCurrent()
+                    if now - lastUIUpdateTime < 0.016 { return }
+                    lastUIUpdateTime = now
+                    if !sawFirstDelta {
+                        sawFirstDelta = true
+                        firstDeltaAt = now
+                    }
+                    guard self.ownsGeneration(myGenerationId) else { return }
+                    let elapsed = max(now - generationStartTime, 0.001)
+                    // Count reasoning + content, matching the finalizer, so the
+                    // header speed converges to the footer's final number and
+                    // reads real tok/s during a thinking block instead of 0.
+                    let generatedSoFar = generatedTokenCount()
+                    let tokPerSec = Double(generatedSoFar) / elapsed
+                    let activelyThinking = !latestThinking.isEmpty && latestText.isEmpty
+                    self.generatedStreamText = latestText
+                    self.thinkingText = latestThinking
+                    self.responseText = latestText
+                    self.isThinking = activelyThinking
+                    self.generationTotalTokens = generatedSoFar
+                    self.generationElapsedMs = elapsed * 1000.0
+                    self.generationSpeedTokPerSec = tokPerSec
+                    self.generationStatusText = activelyThinking
+                        ? "☁️ \(provider.displayName) — reasoning: ~\(generatedSoFar) tokens | \(String(format: "%.1f", tokPerSec)) tok/s"
+                        : "☁️ \(provider.displayName) — streaming: ~\(generatedSoFar) tokens | \(String(format: "%.1f", tokPerSec)) tok/s"
+                    if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
+                       let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == stepMessageId }) {
+                        self.sessions[sIdx].messages[mIdx].prefillStatus = nil
+                        self.sessions[sIdx].messages[mIdx].thinkingContent = latestThinking.isEmpty ? nil : latestThinking
+                        self.sessions[sIdx].messages[mIdx].content = latestText
+                        self.sessions[sIdx].messages[mIdx].timestamp = Date()
+                        self.sessions[sIdx].messages[mIdx].isThinking = activelyThinking
+                        self.sessions[sIdx].messages[mIdx].tokenCount = generatedSoFar
+                        self.sessions[sIdx].messages[mIdx].tokensPerSec = tokPerSec
+                        self.sessions[sIdx].messages[mIdx].timeToFirstTokenSeconds = max(firstDeltaAt - generationStartTime, 0.0)
+                        self.sessions[sIdx].cumulativeTokenCount = cumulativeBase + generatedSoFar
+                    }
+                }
+
+                for await event in client.streamTurn(
+                    model: providerModelId,
+                    messages: outbound,
+                    params: params,
+                    tools: tools
+                ) {
+                    if Task.isCancelled { break }
+                    switch event {
+                    case .started:
+                        break
+                    case .thinkingDelta(let delta):
+                        if thinkingStartedAt == nil { thinkingStartedAt = CFAbsoluteTimeGetCurrent() }
+                        latestThinking += delta
+                        turnLog.noteFirstToken()
+                        pushPartial()
+                    case .contentDelta(let delta):
+                        if let started = thinkingStartedAt, thinkingDuration == nil {
+                            thinkingDuration = max(CFAbsoluteTimeGetCurrent() - started, 0.0)
+                        }
+                        latestText += delta
+                        turnLog.noteFirstToken()
+                        pushPartial()
+                    case .finished(let result):
+                        latestText = result.text
+                        latestThinking = result.thinking
+                        reportedUsage = result.usage
+                        finishReason = result.finishReason
+                        stepToolCalls = result.toolCalls
+                    case .failed(let failure):
+                        serviceFailure = failure
+                    }
+                }
+
+                // Stop-button cancellation and superseded turns bypass the
+                // success finalizer: the replacement generation owns the UI
+                // flags. Partials already streamed stay in the message, and the
+                // row keeps the stopped/aborted contract the weights path uses.
+                if Task.isCancelled || !self.ownsGeneration(myGenerationId) {
+                    commitOdometerTail()
+                    turnLog.recordChatTurn(
+                        status: Task.isCancelled ? 200 : 500,
+                        errorMessage: Task.isCancelled ? "⏹ Generation stopped by user." : "Generation stream closed without a result",
+                        outputTokens: AppleFoundationModelService.recordedOutputTokenCount(for: latestText),
+                        finishReason: nil,
+                        thinking: latestThinking,
+                        response: latestText,
+                        toolCalls: []
+                    )
+                    return
+                }
+
+                if let failure = serviceFailure {
+                    var errText = "⚠️ \(provider.displayName) error: \(failure.localizedDescription)"
+                    if isAgentTurn, case .httpStatus(let code, let summary) = failure, code == 400 || code == 422 {
+                        if CloudTurnFailure.indicatesContextOverflow(summary) {
+                            // A long agent run overflows the provider's context
+                            // window too; blaming tool schemas there sends the
+                            // user after the wrong setting.
+                            errText += " The conversation exceeded this model's context window — start a new chat, run /compact, or pick a model with a larger context."
+                        } else {
+                            errText += " Tool schemas may be unsupported for this model — turn Agent Tools off, or register the model under the provider's no-tools key (`dynamoe_cloud_\(provider.id)_no_tools`)."
+                        }
+                    }
+                    self.isGeneratingText = false
+                    self.generationTask = nil
+                    self.generationStatusText = errText
+                    self.gpuComputeOutput = errText
+                    if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
+                       let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == stepMessageId }) {
+                        let partialPrefix = latestText.isEmpty ? "" : latestText + "\n\n"
+                        self.sessions[sIdx].messages[mIdx].prefillStatus = nil
+                        self.sessions[sIdx].messages[mIdx].content = partialPrefix + errText
+                        self.sessions[sIdx].messages[mIdx].isThinking = false
+                    }
+                    turnLog.recordChatTurn(
+                        status: 500,
+                        errorMessage: errText,
+                        outputTokens: AppleFoundationModelService.recordedOutputTokenCount(for: latestText),
+                        finishReason: nil,
+                        thinking: latestThinking,
+                        response: latestText,
+                        toolCalls: []
+                    )
+                    self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)
+                    return
+                }
+
+                let finalElapsed = max(CFAbsoluteTimeGetCurrent() - generationStartTime, 0.001)
+                let generatedTokens = generatedTokenCount()
+                let finalTokPerSec = Double(generatedTokens) / finalElapsed
+
+                if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
+                   let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == stepMessageId }) {
+                    self.sessions[sIdx].messages[mIdx].prefillStatus = nil
+                    self.sessions[sIdx].messages[mIdx].content = latestText
+                    self.sessions[sIdx].messages[mIdx].thinkingContent = latestThinking.isEmpty ? nil : latestThinking
+                    self.sessions[sIdx].messages[mIdx].isThinking = false
+                    self.sessions[sIdx].messages[mIdx].timestamp = Date()
+                    self.sessions[sIdx].messages[mIdx].tokenCount = generatedTokens
+                    self.sessions[sIdx].messages[mIdx].tokensPerSec = finalTokPerSec
+                    self.sessions[sIdx].messages[mIdx].thinkingTimeSeconds = thinkingDuration
+                    if sawFirstDelta {
+                        self.sessions[sIdx].messages[mIdx].timeToFirstTokenSeconds = max(firstDeltaAt - generationStartTime, 0.0)
+                    }
+                    self.sessions[sIdx].cumulativeTokenCount = cumulativeBase + generatedTokens
+                }
+                cumulativeBase += generatedTokens
+                turnLog.recordChatTurn(
+                    status: 200,
+                    errorMessage: nil,
+                    outputTokens: generatedTokens,
+                    finishReason: finishReason,
+                    thinking: latestThinking,
+                    response: latestText,
+                    toolCalls: stepToolCalls.map { call in
+                        ParsedToolCall(
+                            name: call.name,
+                            arguments: call.decodedArguments ?? [:],
+                            rawArguments: call.argumentsJSON,
+                            rawText: call.argumentsJSON
+                        )
+                    }
+                )
+
+                // === Native function-calling agent step ===
+                var ranComplete = false
+                var failureLoop = false
+                if CloudAgentStepPlan.shouldExecuteToolCalls(
+                    offeredToolCount: tools.count,
+                    callCount: stepToolCalls.count
+                ) {
+                    self.generationStatusText = "⚙️ Executing \(stepToolCalls.count) tool call(s)..."
+                    let outcome = await self.executeCloudToolCalls(
+                        calls: stepToolCalls,
+                        sessionId: sessionId,
+                        messageId: stepMessageId,
+                        myGenerationId: myGenerationId
+                    )
+                    if outcome.cancelled {
+                        if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
+                           let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == stepMessageId }),
+                           var current = self.sessions[sIdx].messages[mIdx].toolCalls {
+                            for i in current.indices where current[i].status == .running {
+                                current[i].status = .error
+                                current[i].error = "Cancelled by user."
+                            }
+                            self.sessions[sIdx].messages[mIdx].toolCalls = current
+                        }
+                        if self.ownsGeneration(myGenerationId) {
+                            self.isGeneratingText = false
+                            self.generationTask = nil
+                            self.generationStatusText = "⏹ Tool execution stopped by user."
+                        }
+                        return
+                    }
+                    ranComplete = outcome.ranComplete
+                    failureLoop = outcome.failureLoop
+
+                    if CloudAgentLoopPolicy.shouldContinue(
+                        stepCallCount: stepToolCalls.count,
+                        step: step,
+                        maxSteps: self.maxAgentSteps,
+                        ranComplete: outcome.ranComplete,
+                        failureLoop: outcome.failureLoop,
+                        cancelled: outcome.cancelled
+                    ) {
+                        // Auto-relay: completed background subagents whose final
+                        // reports have not reached the conversation ride the next
+                        // step's system message so the coordinator can present
+                        // them instead of the run ending with the report dropped.
+                        _ = takeSubagentRelayDirective()
+                        let nextMessageId = UUID()
+                        if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
+                            self.sessions[sIdx].messages.append(ChatMessage(
+                                id: nextMessageId,
+                                role: .assistant,
+                                content: "",
+                                thinkingContent: nil,
+                                isThinking: false
+                            ))
+                        }
+                        currentMessageId = nextMessageId
+                        step += 1
+                        continue
+                    }
+                    if failureLoop {
+                        self.generationStatusText = "🛡️ Tool loop guard hit — ending the agent run."
+                    } else if ranComplete {
+                        self.generationStatusText = "✅ Task complete — \(provider.displayName)."
+                    }
+                }
+
+                // Forced-synthesis escalation: a guard-tripped or
+                // budget-exhausted run otherwise ends on an assistant turn whose
+                // content is empty beside its tool records, so the user gets no
+                // answer. Spend ONE tools-disabled turn, mirroring the weights
+                // path, and let the model present what it already learned.
+                let wantedAnotherToolRound = stepToolCalls.count > 0 && !ranComplete && !failureLoop
+                let budgetExhausted = wantedAnotherToolRound && step + 1 >= self.maxAgentSteps
+                if toolsEnabled,
+                   CloudAgentLoopPolicy.shouldForceSynthesis(
+                       failureLoop: failureLoop,
+                       budgetExhausted: budgetExhausted,
+                       ranComplete: ranComplete,
+                       alreadyForced: ranSynthesisTurn
+                   ) {
+                    ranSynthesisTurn = true
+                    relayDirective = CloudAgentSynthesis.directive
+                    let nextMessageId = UUID()
+                    if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
+                        self.sessions[sIdx].messages.append(ChatMessage(
+                            id: nextMessageId,
+                            role: .assistant,
+                            content: "",
+                            thinkingContent: nil,
+                            isThinking: false
+                        ))
+                    }
+                    currentMessageId = nextMessageId
+                    step += 1
+                    self.generationStatusText = failureLoop
+                        ? "🛡️ Tool loop guard hit; forcing final answer..."
+                        : "🛡️ Step budget exhausted; forcing final answer..."
+                    continue
+                }
+
+                // Result-delivery relay: the run is ending, but this session
+                // still has completed subagents whose reports never reached the
+                // conversation (the model spawned one and stopped without
+                // polling). Spend ONE tools-disabled turn so the coordinator
+                // presents them instead of dropping them.
+                //
+                // In-flight subagents land their reports later, so wait for them
+                // first — the weights path waits at the same point, and skipping
+                // it here would end the run while a report is still being
+                // written.
+                if toolsEnabled, !ranComplete, !ranSynthesisTurn,
+                   step + 1 < self.maxAgentSteps {
+                    await self.awaitSessionSubagents(sessionId: sessionId, timeout: 120)
+                }
+                if toolsEnabled, !ranComplete, !ranSynthesisTurn,
+                   step + 1 < self.maxAgentSteps,
+                   takeSubagentRelayDirective() {
+                    ranSynthesisTurn = true
+                    let nextMessageId = UUID()
+                    if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
+                        self.sessions[sIdx].messages.append(ChatMessage(
+                            id: nextMessageId,
+                            role: .assistant,
+                            content: "",
+                            thinkingContent: nil,
+                            isThinking: false
+                        ))
+                    }
+                    currentMessageId = nextMessageId
+                    step += 1
+                    self.generationStatusText = "📨 Subagent report ready — relaying results to user..."
+                    continue
+                }
+
+                // A max-token cut ends the turn looking complete: the provider
+                // reports `finish_reason: "length"` (or `"max_tokens"`) and just
+                // stops. Park the notice in the transcript, because the status
+                // line is transient and `.system` rows are never replayed into
+                // the provider's history.
+                let truncatedAtLimit = finishReason == "length" || finishReason == "max_tokens"
+                if truncatedAtLimit {
+                    let notice = "⚠️ This answer stopped at the Max Output Tokens limit and may be truncated. Raise it in Settings ▸ Sampling for a longer reply."
+                    if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
+                        let insertAt = self.sessions[sIdx].messages.firstIndex(where: { $0.id == stepMessageId })
+                            .map { $0 + 1 } ?? self.sessions[sIdx].messages.count
+                        self.sessions[sIdx].messages.insert(
+                            ChatMessage(role: .system, content: notice),
+                            at: insertAt
+                        )
+                    }
+                }
+
+                self.isGeneratingText = false
+                self.generationTask = nil
+                self.generatedStreamText = latestText
+                self.thinkingText = latestThinking
+                self.responseText = latestText
+                self.isThinking = false
+                self.generationTotalTokens = generatedTokens
+                self.generationElapsedMs = finalElapsed * 1000.0
+                self.generationSpeedTokPerSec = finalTokPerSec
+                self.generationStatusText = "☁️ \(provider.displayName) — generated ~\(generatedTokens) tokens in \(String(format: "%.2f", finalElapsed * 1000.0)) ms (\(String(format: "%.1f", finalTokPerSec)) tok/s)"
+                    + (truncatedAtLimit ? " — truncated at the Max Output Tokens limit." : "")
+                self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)
+                return
+            }
+        }
+        return true
+    }
+
+    /// Executes one step's provider-issued calls through the shared harness.
+    ///
+    /// A record per call is committed to the assistant message BEFORE any
+    /// execution, so the tool timeline and the reconstructed request agree even
+    /// when the run is interrupted. Each call then passes the same guards the
+    /// weights path applies: malformed or empty arguments are rejected without
+    /// spending an approval, state-changing tools gate on HITL unless Turbo
+    /// Mode is on, and outcomes feed the shared failure/repeat counters that
+    /// decide whether the loop must stop.
+    private func executeCloudToolCalls(
+        calls: [CloudToolCall],
+        sessionId: UUID,
+        messageId: UUID,
+        myGenerationId: UInt64
+    ) async -> (cancelled: Bool, ranComplete: Bool, failureLoop: Bool) {
+        let agent = AgentHarness.shared
+        var parsed: [ParsedToolCall?] = []
+        var records: [ToolCallRecord] = []
+
+        for call in calls {
+            if let arguments = call.decodedArguments {
+                parsed.append(ParsedToolCall(
+                    name: call.name,
+                    arguments: arguments,
+                    rawArguments: call.argumentsJSON,
+                    rawText: call.argumentsJSON
+                ))
+                records.append(ToolCallRecord(
+                    name: call.name,
+                    arguments: arguments.mapValues { "\($0)" },
+                    rawArguments: call.argumentsJSON,
+                    status: .running
+                ))
+            } else {
+                let error = "Malformed arguments JSON — this call was not executed."
+                parsed.append(nil)
+                records.append(ToolCallRecord(
+                    name: call.name,
+                    arguments: [:],
+                    rawArguments: call.argumentsJSON,
+                    status: .error,
+                    output: AgentHarness.renderToolResultForModel(
+                        AgentHarness.toolErrorJSON(tool: call.name, error: error)
+                    ),
+                    error: error
+                ))
+                agent.recordToolCallValidity(false)
+                agent.recordToolCallOutcome(toolName: call.name, succeeded: false)
+            }
+        }
+
+        if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }),
+           let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }) {
+            var current = sessions[sIdx].messages[mIdx].toolCalls ?? []
+            current.append(contentsOf: records)
+            sessions[sIdx].messages[mIdx].toolCalls = current
+        }
+
+        func updateRecord(_ id: UUID, _ mutate: (inout ToolCallRecord) -> Void) {
+            guard let sIdx = sessions.firstIndex(where: { $0.id == sessionId }),
+                  let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }),
+                  var current = sessions[sIdx].messages[mIdx].toolCalls,
+                  let idx = current.firstIndex(where: { $0.id == id }) else { return }
+            mutate(&current[idx])
+            sessions[sIdx].messages[mIdx].toolCalls = current
+        }
+
+        let baseWorkingDirectory = agentWorkingDirectory.isEmpty
+            ? nil
+            : URL(fileURLWithPath: agentWorkingDirectory)
+        var ranComplete = false
+
+        for (index, call) in calls.enumerated() {
+            AgentActivity.shared.begin(.toolCall)
+            defer { AgentActivity.shared.end(.toolCall) }
+
+            if Task.isCancelled || !ownsGeneration(myGenerationId) {
+                return (true, ranComplete, false)
+            }
+            let record = records[index]
+            guard let parsedCall = parsed[index] else { continue }
+
+            generationStatusText = "⚙️ Executing [\(index + 1)/\(calls.count)]: \(call.name)..."
+
+            // A call whose required arguments are all empty is a broken
+            // scaffold: reject it without executing and without a HITL prompt.
+            if AgentHarness.hasEmptyRequiredArguments(toolName: call.name, arguments: parsedCall.arguments) {
+                agent.recordToolCallValidity(false)
+                agent.recordToolCallOutcome(toolName: call.name, succeeded: false)
+                let emptyArgJSON = AgentHarness.toolErrorJSON(
+                    tool: call.name,
+                    error: "Empty arguments — this call carried no usable parameters and was not executed. Either provide real arguments, or stop calling tools and answer the user directly from what you already know."
+                )
+                updateRecord(record.id) { rec in
+                    rec.status = .error
+                    rec.error = "Rejected: required arguments were empty."
+                    rec.output = AgentHarness.renderToolResultForModel(emptyArgJSON)
+                }
+                continue
+            }
+            agent.recordToolCallValidity(true)
+
+            let isTurbo = UserDefaults.standard.bool(forKey: "dynamoe_agent_turbo_mode")
+            if AgentHarness.isStateChanging(toolName: call.name), !isTurbo {
+                updateRecord(record.id) { rec in rec.status = .awaitingApproval }
+                generationStatusText = "🛡️ Action requires confirmation: \(call.name)"
+                let approved = await ActionApprovalManager.shared.waitForApproval(id: record.id)
+                if !approved {
+                    let rejectJSON = AgentHarness.toolErrorJSON(tool: call.name, error: "Action rejected by user.")
+                    agent.recordToolCallOutcome(toolName: call.name, succeeded: false)
+                    updateRecord(record.id) { rec in
+                        rec.status = .rejected
+                        rec.error = "Action rejected by user."
+                        rec.output = AgentHarness.renderToolResultForModel(rejectJSON)
+                    }
+                    continue
+                }
+            }
+
+            if Task.isCancelled || !ownsGeneration(myGenerationId) {
+                return (true, ranComplete, false)
+            }
+
+            let execResult = await agent.executeTool(
+                call: parsedCall,
+                workingDirectory: baseWorkingDirectory,
+                maxOutputLength: maxToolOutputLength
+            )
+            agent.recordToolCallOutcome(
+                toolName: call.name,
+                succeeded: execResult.record.status == .success
+            )
+            agent.recordToolCallFingerprint(toolName: call.name, arguments: parsedCall.arguments)
+            // `isCompleted` covers every tool that ends the run (the harness's
+            // loop guards set it too), matching the weights path.
+            if execResult.isCompleted || call.name == "complete" { ranComplete = true }
+
+            updateRecord(record.id) { rec in
+                rec.status = execResult.record.status
+                rec.output = execResult.record.output
+                rec.error = execResult.record.error
+                rec.executionDurationSeconds = execResult.record.executionDurationSeconds
+            }
+        }
+
+        let failureLoop = agent.consecutiveFailedToolCalls >= agent.failedToolCallLimit
+            || agent.totalFailedToolCalls >= agent.failedToolCallTotalLimit
+            || agent.maxRepeatedToolCallCount >= agent.repeatedToolCallLimit
+
+        return (Task.isCancelled || !ownsGeneration(myGenerationId), ranComplete, failureLoop)
+    }
+
     /// Builds the raw-token prompt for an agent continuation turn: the previous
     /// turn's actual prompt+generated token ids plus the freshly tokenized turn
     /// suffix (end tag + tool-response/continuation text). Re-tokenizing the
@@ -5578,7 +6490,7 @@ struct ContentView: View {
                         // reports and run ONE tools-disabled turn so the coordinator presents
                         // them to the user instead of dropping them.
                         if !ranCompleteTool {
-                            self.waitForSessionSubagents(sessionId: sessionId, timeout: 120)
+                            await self.awaitSessionSubagents(sessionId: sessionId, timeout: 120)
                             let pendingRelay = await MainActor.run {
                                 let r = self.gatherCompletedSubagentRelayResponses(forSession: sessionId)
                                 self.markSubagentSummariesRelayed(r)
@@ -5869,6 +6781,17 @@ struct ContentView: View {
         // fake path: activate the on-device backend directly instead.
         if filePath == AppleFoundationModelService.modelPath {
             return coordinateAppleFoundationModelActivation(of: AppleFoundationModelService.makeDiscoveredModel(), sessionId: nil)
+        }
+        // Same rule for a cloud sentinel: a session restore racing the
+        // registry scan must activate the provider backend, never mmap a fake
+        // path. The entry is rebuilt ad hoc from the path when the registered
+        // list no longer holds it.
+        if let resolved = CloudModelAddress.parsePath(filePath) {
+            let entry = CloudModelRegistry.adHocDiscoveredModel(
+                provider: resolved.provider,
+                providerModelId: resolved.providerModelId
+            )
+            return coordinateCloudModelActivation(of: entry, sessionId: nil)
         }
         self.isLoadingModel = true
         self.metalStatus = "⏳ Loading model engine & zero-copy weights..."

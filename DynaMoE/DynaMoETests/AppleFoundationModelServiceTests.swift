@@ -160,6 +160,44 @@ final class AppleFoundationModelServiceTests: XCTestCase {
         XCTAssertEqual(AppleFoundationModelService.recordedOutputTokenCount(for: "abcdefgh"), 2)
     }
 
+    func testGeneratedTokenCountIncludesReasoningAndContent() {
+        // A streaming turn's speed covers every emitted token, so reasoning and
+        // content are counted together. Counting content alone read zero during
+        // a thinking block and stayed diluted afterward.
+        XCTAssertEqual(
+            AppleFoundationModelService.generatedTokenCount(thinkingCharacters: 400, contentCharacters: 0),
+            100
+        )
+        XCTAssertEqual(
+            AppleFoundationModelService.generatedTokenCount(thinkingCharacters: 400, contentCharacters: 800),
+            300
+        )
+        XCTAssertEqual(
+            AppleFoundationModelService.generatedTokenCount(thinkingCharacters: 0, contentCharacters: 800),
+            200
+        )
+    }
+
+    func testGeneratedTokenCountEmptyTurnIsZero() {
+        // Nothing emitted yet: zero tokens, not the UI one-token floor.
+        XCTAssertEqual(
+            AppleFoundationModelService.generatedTokenCount(thinkingCharacters: 0, contentCharacters: 0),
+            0
+        )
+    }
+
+    func testGeneratedTokenCountPrefersReportedUsage() {
+        // A provider-reported total wins over the character estimate.
+        XCTAssertEqual(
+            AppleFoundationModelService.generatedTokenCount(
+                thinkingCharacters: 400,
+                contentCharacters: 800,
+                reportedCompletionTokens: 1234
+            ),
+            1234
+        )
+    }
+
     func testSendGateAllowsSystemModelSessionsWithoutEngine() {
         // Regression: the gate previously parsed as `tokenizer != nil && (summary != nil || AFM)`,
         // so system-model sessions — which release the tokenizer on activation —

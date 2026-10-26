@@ -9,7 +9,7 @@ import Foundation
 import SwiftUI
 import Combine
 
-public struct DiscoveredModel: Identifiable, Hashable, Codable, Equatable {
+public nonisolated struct DiscoveredModel: Identifiable, Hashable, Codable, Equatable, Sendable {
     public var id: String // Unique identifier (e.g. repoId or snapshot path)
     public var displayName: String // e.g. "Ornith 1.5 35B A3B FP8"
     public var author: String // e.g. "ornith-ai"
@@ -155,6 +155,13 @@ public class LocalModelManager: ObservableObject {
                 $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
             }
 
+            // Cloud registry entries are resolved HERE, on the scan's own
+            // background queue, not inside the main-thread install block: each
+            // connected provider answers "is a key stored?" with a Keychain
+            // probe (`SecItemCopyMatching`), which is exactly the kind of call
+            // that must not run per rescan on the main thread.
+            let cloudModels = CloudModelRegistry.makeDiscoveredModels()
+
             DispatchQueue.main.async {
                 var finalModels = sortedModels
                 // Surface Apple's system on-device Foundation Model as a virtual
@@ -170,6 +177,12 @@ public class LocalModelManager: ObservableObject {
                 if AppleFoundationModelService.isOSCompatible {
                     finalModels.append(AppleFoundationModelService.makeDiscoveredModel())
                 }
+                // Connected cloud providers (Synthetic first) surface the same
+                // way: virtual entries appended after every local model, for
+                // the same reason — `discoveredModels.first` must stay a
+                // weights model. Registration comes from each provider's
+                // UserDefaults list; see `CloudModelRegistry`.
+                finalModels.append(contentsOf: cloudModels)
                 self.discoveredModels = finalModels
                 self.isScanning = false
                 self.lastScanDate = Date()

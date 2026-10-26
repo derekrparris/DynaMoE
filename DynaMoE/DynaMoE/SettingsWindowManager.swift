@@ -56,6 +56,17 @@ final class SettingsWindowManager: NSObject, NSWindowDelegate {
         newWindow.center()
         newWindow.setFrameAutosaveName("DynaMoESettingsWindowFrame")
         newWindow.contentViewController = hc
+        // macOS 26+ draws a separator under the unified toolbar and lets the
+        // toolbar's glass strip cover the top of the detail pane (clipping the
+        // section header icon as it scrolls). Run the pane full-height under a
+        // transparent titlebar instead: no chrome line, and scrolled content
+        // passes under the floating controls rather than being hidden behind an
+        // opaque bar. The SwiftUI toolbar-background/scroll-edge modifiers have
+        // no effect on this AppKit-hosted window, so the chrome is configured
+        // here, after the hosting controller is installed.
+        newWindow.titlebarSeparatorStyle = .none
+        newWindow.titlebarAppearsTransparent = true
+        newWindow.styleMask.insert(.fullSizeContentView)
         newWindow.isReleasedWhenClosed = false
         newWindow.tabbingMode = .disallowed
         newWindow.delegate = self

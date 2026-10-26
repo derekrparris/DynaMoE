@@ -11,7 +11,11 @@ import Foundation
 
 // MARK: - Tool Definitions & Schemas
 
-public struct ToolDefinition: Codable, Equatable {
+/// A tool schema in the OpenAI `{"type":"function","function":{…}}` shape.
+/// `parameters` is a JSON-object wrapper. `AnyCodable` carries the unchecked
+/// conformance (the wrapped graph is immutable JSON built once per tool at
+/// registration), so the schema itself is plainly `Sendable`.
+public struct ToolDefinition: Codable, Equatable, Sendable {
     public let type: String
     public let function: ToolFunction
 
@@ -38,7 +42,7 @@ public struct ParsedToolCall: Equatable {
     }
 }
 
-public struct AnyCodable: Codable, Equatable {
+public struct AnyCodable: Codable, Equatable, @unchecked Sendable {
     public let value: Any
 
     public init(_ value: Any) {
@@ -2787,7 +2791,6 @@ public final class AgentHarness {
     /// Token budget for a single tool result (converted to characters conservatively
     /// via `charBudget(forTokenBudget:)` before tools truncate their output).
     public var maxToolOutputLength: Int = 4000
-    public var maxAgentSteps: Int = 15
     /// Session that owns the in-flight agent run; stamped onto spawned subagents.
     public var currentSessionId: UUID? = nil
 
@@ -3360,6 +3363,41 @@ public final class AgentHarness {
 
             """
         }
+        return prompt
+    }
+
+    /// Agent-mode instructions for a remote provider that calls tools through
+    /// the API's native function-calling interface. Deliberately not
+    /// `buildSystemPrompt`: that prompt teaches the local `<tool_call>` /
+    /// `<parameter>` dialects, which would fight the wire format a cloud model
+    /// is actually constrained to. Only the procedural guidance is shared.
+    public func buildCloudToolGuidance() -> String {
+        let unloadedCount = tools.count - loadedTools.count
+        var prompt = """
+
+        # Tools
+
+        You can call tools. They are declared in this request's `tools` array using the provider's native function-calling interface — call them directly, never in XML or prose. Only the declared functions are callable.
+
+        - Do not narrate a call, promise to act, or describe what you would do: issue the call.
+        - Read tool results before deciding the next step. Never repeat an identical call hoping for a different result.
+        - Use absolute paths. For a file the user names, call the tool with that exact path.
+        - Tool results arrive as PLAIN TEXT: a `[tool_name] status` header, `key: value` metadata lines, then `--- field ---` sections. Read the `--- content ---` section as the actual file/page text; `<<<TRUNCATED: …>>>` markers are harness annotations, not file content.
+        """
+        if unloadedCount > 0 {
+            prompt += """
+
+            - \(unloadedCount) additional tool(s) are installed but not loaded. Call `tools_discover` to list them by category, then `tools_load` with a `names` array to add the schemas you need (one batched call) before using them.
+            """
+        }
+        prompt += """
+
+        # Ending Your Turn
+
+        - When the task is finished, answer the user in plain text with no further tool call. A plain-text reply completes the turn.
+        - Call `complete` only when the whole task is done and you are handing back the final result; never mid-task.
+        - Never emit placeholder or no-op calls (`shell_run` with `echo`, `true`, `:`, or similar). The harness discards them and ends the turn.
+        """
         return prompt
     }
 

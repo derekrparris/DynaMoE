@@ -373,6 +373,84 @@ A `400` carrying `"code": "context_length_exceeded"` means the machine's KV budg
 
 ---
 
+## ☁️ Connected Cloud Providers (Synthetic)
+
+DynaMoE runs local weights by default, but it can also connect to a remote inference provider and drive chat turns against it. **Synthetic** is the first supported provider; its models appear in the chat model picker under **Cloud Models**, next to the local and system-on-device entries.
+
+Cloud turns run through the provider's OpenAI-compatible chat-completions API. With **Agent Tools** on (the default), a turn uses the provider's **native function calling**: the loaded tool schemas ride each request, streamed `tool_calls` execute through the same harness as a local turn (HITL approvals, Turbo Mode, the repeated/failed-call loop guards, and the subagent report relay), and the run ends when the model answers, calls `complete`, or exhausts the agent step budget. With Agent Tools off, the same backend runs plain chat.
+
+Grammar masking, JetSpec, prefix caching, KV precision, and the memory/SSD controls do not apply to a cloud turn. Switching to a cloud model releases any resident weights engine (the same principle as the Apple on-device model), so the RAM budget is not held by a backend that will not use it.
+
+A model that rejects a `tools` array is handled without turning Agent Tools off globally: list it under the provider's no-tools key, and that model runs plain chat with a visible notice in the conversation instead.
+
+With Agent Tools on (the default for cloud models), the provider receives the conversation history plus verbatim tool output (file contents, search results, and command output). Only connect a provider whose data handling you accept for the workspace you open.
+
+```bash
+defaults write DRP.DynaMoE dynamoe_cloud_synthetic_no_tools \
+  "hf:some-org/some-model; hf:other-org/alias"
+```
+
+The Thinking toggle is hidden for cloud models: the OpenAI-compatible surface has no portable on/off switch, so the provider's own default applies. Provider-reported reasoning (`reasoning_content`) still streams into the usual thinking accordion.
+
+### Setup
+
+1. Open **Settings (⌘,) → Cloud Providers**.
+2. Paste a Synthetic API key and press **Save**. The key is stored in the login Keychain (`DRP.DynaMoE.cloud`), never in UserDefaults or on disk.
+3. Press **Test & Sync Models**. DynaMoE calls `GET /openai/v1/models`, which validates the key and registers the provider's live chat models in one pass — no model ids to type. A bad key fails with `401` before spending a completion.
+4. Pick a model from the composer's **Cloud Models** section. The same action re-runs whenever the provider adds or retires models.
+
+### Endpoints
+
+Synthetic offers both wire dialects. DynaMoE implements the OpenAI-compatible one end to end and keeps the Anthropic-compatible one behind the same client seam for a later release.
+
+| Flavor | Base URL | Status |
+| --- | --- | --- |
+| OpenAI-compatible | `https://api.synthetic.new/openai/v1` (`chat/completions`, `models`) | Implemented |
+| Anthropic-compatible | `https://api.synthetic.new/anthropic` (`/v1/messages`) | Stub — fails explicitly |
+
+Authentication is `Authorization: Bearer <key>`. Streaming uses SSE with `stream_options.include_usage`, so the turn's final row carries real token counts; a compatible endpoint that rejects that optional field is retried once without it (the turn then reports estimated counts). Reasoning arrives as `reasoning_content` deltas when the model supports it and is shown in the usual thinking accordion.
+
+### Registered models
+
+**Test & Sync Models** (or the **Sync Models** button on the Models row) replaces the provider's registered list with its current `/models` response, filtered to chat models — embeddings, rerankers, speech, moderation, and image generators are skipped so they cannot become pickable entries that fail on the first send. The list rescans immediately, so working with Synthetic is "connect once, see everything it serves". The registered names are listed in the Settings card and appear under **Cloud Models** in the composer, with the provider in parentheses (`DeepSeek-V4.1-Flash-1017 (Synthetic)`).
+
+The list is stored in `dynamoe_cloud_<provider>_models`. You can still set it by hand when you want a narrower or pinned set:
+
+```bash
+defaults write DRP.DynaMoE dynamoe_cloud_synthetic_models \
+  "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017; hf:moonshotai/Kimi-K2-Thinking"
+```
+
+* Entries are separated by `;`, `,`, or newlines; duplicates are dropped.
+* `hf:` ids use the model tail for their display name; provider aliases such as `syn:large:text` are humanized (`Syn Large Text (Synthetic)`).
+* An id containing `thinking` is marked reasoning-capable; anything else is treated as plain chat. This is a convenience heuristic, not provider truth. The Thinking control is hidden for cloud models regardless: reasoning follows the provider's default and its `reasoning_content` deltas are still shown.
+* Tool support defaults to on for every registered model. A model that rejects a `tools` array belongs in `dynamoe_cloud_<provider>_no_tools` (see above); it then runs plain chat with a notice instead of failing mid-loop.
+* A single-model smoke-test hook exists for development: `defaults write DRP.DynaMoE dynamoe_cloud_debug_model "hf:org/model"` registers one model when the main list is empty.
+* A hand-written value may not be visible to an already-running app (preference caches): quit and relaunch after `defaults write`, or just use **Sync Models** inside the app.
+
+Registered models are appended to the scan result after local models and the system model, so `discoveredModels.first` stays a weights model and a fresh install still defaults to local inference. A provider's models only appear once a key is stored for it: without a credential every send would fail, so those entries stay out of the composer.
+
+A cloud model whose persisted id no longer resolves (an unknown provider, a corrupted default) is never silently rerouted to local weights: the send is refused with a reselect message.
+
+### Turning a cloud turn into a request
+
+The chat composer's messages become a standard `messages` array (system persona first, then the conversation with speaker labels stripped, system-role UI notices skipped; tool turns replay as an assistant `tool_calls` message followed by one `tool` result per call). `temperature`, `top_p`, `presence_penalty`, and `max_tokens` are forwarded when set. Stop sequences are not: the provider owns chat templating, so its own end-of-turn marker is authoritative. Min-P, Top-K, and the repetition penalty have no remote equivalent and are ignored. The turn is recorded in **Settings → Server → Request Log** with the same row contract as local and on-device turns (one row per agent step).
+
+### Troubleshooting
+
+| Symptom | Cause / fix |
+| --- | --- |
+| "No API key is stored" when sending | Save a key in **Settings → Cloud Providers** |
+| Test & Sync Models says `401` | The key is wrong or revoked; paste a fresh one |
+| Test & Sync Models says `429` | The provider is rate limiting the models listing; retry shortly |
+| A model is missing from the picker | Press **Sync Models** in **Settings → Cloud Providers**, then open the composer's **Cloud Models** section |
+| A hand-written `defaults` value is not picked up | Preference caches: quit and relaunch, or use **Sync Models** |
+| "The Anthropic API flavor is not implemented yet" | Only the OpenAI-compatible flavor is implemented in this release |
+| HTTP 400/422 on an agent turn | Either the model rejects `tools` (add it to `dynamoe_cloud_<provider>_no_tools`) or the conversation overflowed the context window (start a new chat, `/compact`, or pick a longer-context model) — the chat message says which |
+| "The request timed out" | The provider sent no bytes for two minutes; a wedged connection is dropped at that point while long generations continue |
+
+---
+
 ## License
 
 Distributed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE) and [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) for details.

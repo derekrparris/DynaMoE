@@ -6,6 +6,13 @@
 import SwiftUI
 import AppKit
 
+// Memoization note: several views below keep parse, cleanup, or highlight
+// results in a `@State`-held reference type and refresh it in place from
+// `body`. That is deliberate: mutating a class property does not write
+// `@State`, so it cannot trigger "modifying state during view update", while a
+// struct would force a copy or an update per refresh. Do not "simplify" these
+// memo types into value types.
+
 struct ChatDetailView: View {
     @ObservedObject private var zoomManager = AppZoomManager.shared
     @Binding var session: ChatSession?
@@ -43,6 +50,16 @@ struct ChatDetailView: View {
     var isAgentToolsEnabled: Bool = true
     var isModelLoaded: Bool = true
     var isAppleFoundationModelActive: Bool = false
+    /// True when the active backend is a connected cloud provider. Cloud turns
+    /// support tools through the provider's native function calling, so the
+    /// tool controls stay enabled.
+    var isCloudModelActive: Bool = false
+    /// The system on-device model is the only backend still restricted to
+    /// plain chat; cloud providers call tools through the API's function
+    /// interface and share the local agent controls.
+    private var isPlainChatOnlyBackend: Bool {
+        isAppleFoundationModelActive
+    }
     var onSendMessage: (String) -> Bool
     var onStopGeneration: () -> Void
     var onQueuePrompt: ((String) -> Bool)? = nil
@@ -65,10 +82,12 @@ struct ChatDetailView: View {
     @State private var promptTokenCount: Int = 0
     @State private var tokenCountTask: Task<Void, Never>? = nil
     @State private var isPinnedToBottom: Bool = true
-    /// Changing identity of the invisible bottom marker. SwiftUI's scrollTo is a
-    /// no-op when the target view is already on screen, so during streaming the
-    /// marker's id is bumped every tick to force a real scroll to the bottom.
-    @State private var scrollAnchorTick: Int = 0
+    /// Identity of the invisible marker at the end of the transcript. It must
+    /// stay constant: bumping it per streamed chunk re-lays out the whole
+    /// transcript several times a frame, which SwiftUI flags as an invalid
+    /// configuration and which can leave a long conversation blank until a
+    /// manual scroll realizes its rows again.
+    private static let scrollBottomAnchorID = "chat-scroll-bottom-anchor"
 
     /// The draft currently in flight through the async immediate-send path.
     /// The send suspends while it waits out a generation teardown, so without
@@ -97,12 +116,41 @@ struct ChatDetailView: View {
     @AppStorage("dynamoe_agent_turbo_mode") private var isTurboModeEnabled: Bool = false
     @ObservedObject private var subagentManager = SubagentManager.shared
 
-    /// Ticks while the newest message streams (content or thinking grows — a
-    /// chat turn, or the /compact progress bubble typing out a summary), so the
-    /// scroll handlers can follow live output without diffing full strings.
-    private var streamingTick: Int {
+    /// Characters of streamed output that make up one follow-scroll bucket,
+    /// roughly one line. This is the knob that controls how often the
+    /// transcript scrolls while a turn streams: smaller follows more often.
+    private static let streamedFollowBucketCharacters = 120
+
+    /// Coarse progress marker for the newest message (content or thinking
+    /// grows — a chat turn, or the /compact progress bubble typing out a
+    /// summary). The follow handler keys off buckets of roughly a line of
+    /// output instead of the exact length: a per-token value made the handler
+    /// run several times per frame, and every run had to invalidate layout to
+    /// scroll, which a long transcript cannot absorb.
+    private var streamedContentBucket: Int {
         guard let last = session?.messages.last else { return 0 }
-        return last.content.count &* 31 &+ (last.thinkingContent?.count ?? 0)
+        return (last.content.count + (last.thinkingContent?.count ?? 0))
+            / Self.streamedFollowBucketCharacters
+    }
+
+    /// Scrolls the transcript to its newest line. Callers are throttled by
+    /// buckets, message counts, and turn boundaries, never by per-token
+    /// updates, and the jump is deferred so the frame carrying the growth is
+    /// laid out before the scroll target is resolved.
+    ///
+    /// Streaming follows jump, because an animation per bucket would queue
+    /// faster than it completes. Discrete transitions (a message landing, a
+    /// turn starting or ending) animate, as they did before the throttle.
+    private func followBottom(_ proxy: ScrollViewProxy, animated: Bool = false) {
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: 0.2)) {
+                    proxy.scrollTo(Self.scrollBottomAnchorID, anchor: .bottom)
+                }
+            } else {
+                proxy.scrollTo(Self.scrollBottomAnchorID, anchor: .bottom)
+            }
+        }
     }
 
     /// True while a /compact pass is streaming into its progress bubble.
@@ -123,7 +171,10 @@ struct ChatDetailView: View {
         return lineHeight + MacTextEditor.textContainerInsetHeight * 2
     }
 
-    private func modelIconName(for name: String?) -> String {
+    private func modelIconName(for name: String?, isCloud: Bool = false) -> String {
+        if isCloud {
+            return "cloud.fill"
+        }
         let lower = (name ?? "").lowercased()
         if lower.contains("apple foundation") {
             return "apple.logo"
@@ -181,6 +232,11 @@ struct ChatDetailView: View {
                     // Decorative branding glyph; the row title already says
                     // Apple, so keep it out of the VoiceOver reading.
                     Text("• 🍎").accessibilityHidden(true)
+                }
+                if dm.isCloudModel {
+                    // The display name already carries the provider in
+                    // parentheses; this is a decorative marker only.
+                    Text("• ☁️").accessibilityHidden(true)
                 }
             }
         }
@@ -248,7 +304,7 @@ struct ChatDetailView: View {
                     
                     if let model = modelName {
                         HStack(spacing: 6) {
-                            Image(systemName: modelIconName(for: model))
+                            Image(systemName: modelIconName(for: model, isCloud: isCloudModelActive))
                                 .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .semibold))
                                 .foregroundColor(isGenerating ? (isStreamingOffDisk ? Color.orange : Color.green) : Color.purple)
                             Text(model)
@@ -399,8 +455,8 @@ struct ChatDetailView: View {
                             .padding(.bottom, 32)
                         }
                         Color.clear
-                            .frame(height: 0)
-                            .id(scrollAnchorTick)
+                            .frame(height: 1)
+                            .id(Self.scrollBottomAnchorID)
                     }
                     .frame(maxWidth: max(600, 800 * zoomManager.zoomScale))
                     .padding(.horizontal, 24)
@@ -408,39 +464,24 @@ struct ChatDetailView: View {
                 }
                 .onChange(of: session?.id) { _ in
                     isPinnedToBottom = true
-                    scrollAnchorTick += 1
-                    DispatchQueue.main.async {
-                        proxy.scrollTo(scrollAnchorTick, anchor: .bottom)
-                    }
+                    followBottom(proxy)
                 }
                 .onChange(of: session?.messages.count) { _ in
                     guard isPinnedToBottom else { return }
-                    scrollAnchorTick += 1
-                    withAnimation(.easeOut(duration: 0.2)) {
-                        proxy.scrollTo(scrollAnchorTick, anchor: .bottom)
-                    }
+                    followBottom(proxy, animated: true)
                 }
-                .onChange(of: streamingTick) { _ in
+                .onChange(of: streamedContentBucket) { _ in
                     guard isPinnedToBottom, isGenerating || isCompactingConversation else { return }
-                    scrollAnchorTick += 1
-                    DispatchQueue.main.async {
-                        proxy.scrollTo(scrollAnchorTick, anchor: .bottom)
-                    }
+                    followBottom(proxy)
                 }
                 .onChange(of: isGenerating) { generating in
                     if generating {
                         // A new turn is starting (user sent or a queued prompt fired):
                         // re-pin and jump to the newest message.
                         isPinnedToBottom = true
-                        scrollAnchorTick += 1
-                        withAnimation(.easeOut(duration: 0.2)) {
-                            proxy.scrollTo(scrollAnchorTick, anchor: .bottom)
-                        }
+                        followBottom(proxy, animated: true)
                     } else if isPinnedToBottom {
-                        scrollAnchorTick += 1
-                        withAnimation(.easeOut(duration: 0.25)) {
-                            proxy.scrollTo(scrollAnchorTick, anchor: .bottom)
-                        }
+                        followBottom(proxy, animated: true)
                     }
                 }
                 .onScrollGeometryChange(for: ScrollSnapshot.self) { geometry in
@@ -452,12 +493,18 @@ struct ChatDetailView: View {
                 } action: { old, new in
                     if new.contentHeight != old.contentHeight && new.offset == old.offset {
                         // Content grew under us (streaming output) — not a user
-                        // scroll. Keep the current pin state; the tick handler
+                        // scroll. Keep the current pin state; the bucket handler
                         // will follow if pinned. Otherwise growing content would
                         // read as "scrolled away from bottom" and unpin itself.
                         return
                     }
-                    isPinnedToBottom = new.distanceFromBottom <= 48
+                    // Only write on a real change: this action runs on every
+                    // geometry update, and an unconditional write invalidated
+                    // the view several times per frame while a turn streamed.
+                    let pinned = new.distanceFromBottom <= 48
+                    if pinned != isPinnedToBottom {
+                        isPinnedToBottom = pinned
+                    }
                 }
             }
 
@@ -635,7 +682,10 @@ struct ChatDetailView: View {
                         // Antigravity-Style Model Selector Menu
                         Menu {
                             let systemModels = localModelManager.discoveredModels.filter { $0.isAppleFoundationModel }
-                            let weightsModels = localModelManager.discoveredModels.filter { !$0.isAppleFoundationModel }
+                            let cloudModels = localModelManager.discoveredModels.filter { $0.isCloudModel }
+                            let weightsModels = localModelManager.discoveredModels.filter {
+                                !$0.isAppleFoundationModel && !$0.isCloudModel
+                            }
                             if !systemModels.isEmpty {
                                 Section("System Models") {
                                     ForEach(systemModels) { dm in
@@ -643,7 +693,14 @@ struct ChatDetailView: View {
                                     }
                                 }
                             }
-                            if weightsModels.isEmpty && systemModels.isEmpty {
+                            if !cloudModels.isEmpty {
+                                Section("Cloud Models") {
+                                    ForEach(cloudModels) { dm in
+                                        discoveredModelMenuButton(dm)
+                                    }
+                                }
+                            }
+                            if weightsModels.isEmpty && systemModels.isEmpty && cloudModels.isEmpty {
                                 Text("No models found in ~/.cache/huggingface/hub")
                             }
                             if !weightsModels.isEmpty {
@@ -663,7 +720,7 @@ struct ChatDetailView: View {
                             }
                         } label: {
                             HStack(spacing: 5) {
-                                Image(systemName: modelIconName(for: session?.selectedModelName ?? modelName))
+                                Image(systemName: modelIconName(for: session?.selectedModelName ?? modelName, isCloud: isCloudModelActive))
                                     .font(.system(size: max(8.5, 10 * zoomManager.zoomScale)))
                                     .foregroundColor(.purple)
                                 Text(session?.selectedModelName ?? modelName ?? "Select Model")
@@ -735,7 +792,11 @@ struct ChatDetailView: View {
                         // Thinking dropdown beside Model Selector (shown only if the loaded
                         // model supports thinking). Level-capable models (Spark X2.6's
                         // `reasoning_effort`) get High/Low/Off instead of plain on/off.
-                        if supportsThinking && supportsThinkingLevels {
+                        // Cloud reasoning follows the provider's own default:
+                        // the OpenAI-compatible surface has no portable
+                        // on/off switch, so the control is hidden rather than
+                        // pretending to change anything.
+                        if supportsThinking && !isCloudModelActive && supportsThinkingLevels {
                             let activeEffort: ThinkingEffort? = isThinkingEnabled ? (thinkingEffort ?? .high) : nil
                             Menu {
                                 Button(action: {
@@ -782,7 +843,7 @@ struct ChatDetailView: View {
                             .fixedSize()
                             .help(isThinkingEnabled ? "Graded thinking level: \(activeEffort?.rawValue ?? "high")" : "Direct response without thinking is enabled")
                             .transition(.opacity.combined(with: .scale))
-                        } else if supportsThinking {
+                        } else if supportsThinking && !isCloudModelActive {
                             Menu {
                                 Button(action: {
                                     onSetThinking?(true, nil)
@@ -863,14 +924,18 @@ struct ChatDetailView: View {
                         }
                         .menuStyle(.borderlessButton)
                         .fixedSize()
-                        .disabled(isAppleFoundationModelActive)
+                        .disabled(isPlainChatOnlyBackend)
                         .help(isAppleFoundationModelActive
-                              ? "Agent tools require a local weights model — Apple Foundation Model runs in plain chat mode"
-                              : (isAgentToolsEnabled ? "Agent mode is enabled: Model can run shell commands, inspect, and edit files" : "Agent mode is disabled"))
+                              ? "Agent tools require a model with function calling — Apple Foundation Model runs in plain chat mode"
+                              : (isCloudModelActive
+                                 ? (isAgentToolsEnabled
+                                    ? "Agent mode is enabled: the provider's native function calling runs shell, file, and search tools"
+                                    : "Agent mode is disabled")
+                                 : (isAgentToolsEnabled ? "Agent mode is enabled: Model can run shell commands, inspect, and edit files" : "Agent mode is disabled")))
                         .transition(.opacity.combined(with: .scale))
 
                         // Turbo Mode (Auto-Approve) Toggle when tools are active
-                        if isAgentToolsEnabled && !isAppleFoundationModelActive {
+                        if isAgentToolsEnabled && !isPlainChatOnlyBackend {
                             Button(action: {
                                 isTurboModeEnabled.toggle()
                             }) {
@@ -1195,6 +1260,144 @@ struct MacTextEditor: NSViewRepresentable {
     }
 }
 
+// MARK: - Bounded-Height Text
+/// Splits long text into pieces small enough to draw.
+///
+/// An expanded reasoning block of ~13k tokens left the transcript blank until a
+/// manual scroll forced a repaint (the "whiteout"), and output can now run to
+/// tens of thousands of tokens. Long text is therefore drawn as a stack of
+/// bounded pieces, so no single text view is taller than a couple of thousand
+/// points and the transcript never depends on one oversized view painting
+/// correctly.
+enum LongTextChunker {
+    /// Groups lines so no chunk exceeds `maxLines` or `maxCharacters`. A single
+    /// line longer than `maxCharacters` (minified JSON, one long diff line) is
+    /// split on its own so it cannot produce an enormous text view either.
+    nonisolated static func chunks(
+        of text: String,
+        maxLines: Int = 120,
+        maxCharacters: Int = 8000
+    ) -> [String] {
+        guard !text.isEmpty else { return [] }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        guard lines.count > maxLines || text.count > maxCharacters else { return [text] }
+
+        var chunks: [String] = []
+        var current: [Substring] = []
+        var currentCharacters = 0
+
+        func flush() {
+            guard !current.isEmpty else { return }
+            chunks.append(current.joined(separator: "\n"))
+            current.removeAll(keepingCapacity: true)
+            currentCharacters = 0
+        }
+
+        for line in lines {
+            if line.count > maxCharacters {
+                flush()
+                chunks.append(contentsOf: hardSplit(String(line), maxCharacters: maxCharacters))
+                continue
+            }
+            if current.count >= maxLines || currentCharacters + line.count > maxCharacters {
+                flush()
+            }
+            current.append(line)
+            currentCharacters += line.count + 1
+        }
+        flush()
+        return chunks.isEmpty ? [text] : chunks
+    }
+
+    /// True when `chunks(of:)` would return more than one piece, i.e. when a
+    /// single text view would be too tall to paint reliably. Renderers use it
+    /// to choose `ChunkedText` without splitting the block itself.
+    nonisolated static func isOversized(
+        _ text: String,
+        maxLines: Int = 120,
+        maxCharacters: Int = 8000
+    ) -> Bool {
+        if text.count > maxCharacters { return true }
+        var newlines = 0
+        for byte in text.utf8 where byte == 0x0A {
+            newlines += 1
+            if newlines >= maxLines { return true }
+        }
+        return false
+    }
+
+    private nonisolated static func hardSplit(_ text: String, maxCharacters: Int) -> [String] {
+        var pieces: [String] = []
+        var start = text.startIndex
+        while start < text.endIndex {
+            let end = text.index(start, offsetBy: maxCharacters, limitedBy: text.endIndex) ?? text.endIndex
+            pieces.append(String(text[start..<end]))
+            start = end
+        }
+        return pieces.isEmpty ? [text] : pieces
+    }
+}
+
+/// A long string drawn as several `Text` views of bounded height. Inherits
+/// font, color, and selection from its parent like a single `Text` would.
+struct ChunkedText: View {
+    let text: String
+    /// Extra leading applied inside each chunk and between chunks, so a chunk
+    /// boundary is indistinguishable from an ordinary line break.
+    var lineSpacing: CGFloat = 0
+
+    /// Parse each chunk as inline markdown, matching the `Text(LocalizedStringKey:)`
+    /// the unbounded path uses. Only markdown blocks set this: a plain user
+    /// message or reasoning block must stay verbatim.
+    var parsesMarkdown = false
+
+    private final class ChunksMemo {
+        var text: String?
+        var chunks: [String] = []
+    }
+
+    @State private var memo = ChunksMemo()
+
+    private var chunks: [String] {
+        if memo.text == text { return memo.chunks }
+        let split = LongTextChunker.chunks(of: text)
+        memo.text = text
+        memo.chunks = split
+        return split
+    }
+
+    /// One chunk's text. Without markdown parsing an oversized paragraph would
+    /// show literal `**bold**`, backticks, and raw link targets — exactly the
+    /// case this view exists for. A split inside an inline span can still leave
+    /// a marker unbalanced, but that beats dropping the styling entirely.
+    @ViewBuilder
+    private func chunkText(_ chunk: String) -> some View {
+        if parsesMarkdown {
+            Text(LocalizedStringKey(chunk))
+        } else {
+            Text(chunk)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: lineSpacing) {
+            if chunks.isEmpty {
+                // An empty string still drew one line box as a plain `Text`;
+                // a `VStack` with no children would collapse instead.
+                chunkText(text)
+                    .lineSpacing(lineSpacing)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                ForEach(Array(chunks.enumerated()), id: \.offset) { _, chunk in
+                    chunkText(chunk)
+                        .lineSpacing(lineSpacing)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Single Message Bubble View
 struct ChatMessageView: View {
     @EnvironmentObject private var zoomManager: AppZoomManager
@@ -1207,6 +1410,31 @@ struct ChatMessageView: View {
     var isGemmaDialect: Bool = false
     @Binding var isExpanded: Bool
     @State private var isCopied = false
+    @State private var isThinkingCopied = false
+
+    /// Memoizes the display-cleanup pass for this message. It strips tool-call
+    /// markup with two regex scans plus three opener searches, and the
+    /// transcript re-renders on every streamed chunk; without the memo every
+    /// visible message repeated that work per frame. Reference type so the body
+    /// can refresh it in place without scheduling another update.
+    private final class DisplayMemo {
+        var content: String?
+        var gemmaDialect = false
+        var display = ""
+    }
+
+    @State private var displayMemo = DisplayMemo()
+
+    private var displayContent: String {
+        if displayMemo.content == message.content, displayMemo.gemmaDialect == isGemmaDialect {
+            return displayMemo.display
+        }
+        let cleaned = Self.responseDisplayContent(message.content, isGemmaDialect: isGemmaDialect)
+        displayMemo.content = message.content
+        displayMemo.gemmaDialect = isGemmaDialect
+        displayMemo.display = cleaned
+        return cleaned
+    }
 
     /// True when the footer has any telemetry to show. Kept separate from the
     /// display-content check so tool-only assistant turns (which clean down to
@@ -1320,9 +1548,8 @@ struct ChatMessageView: View {
                 if message.role == .user {
                     HStack {
                         Spacer(minLength: 40)
-                        Text(message.content)
+                        ChunkedText(text: message.content, lineSpacing: 3)
                             .font(.system(size: max(9, 14 * zoomManager.zoomScale)))
-                            .lineSpacing(3)
                             .padding(.horizontal, 16)
                             .padding(.vertical, 10)
                             .background(Color.purple.opacity(0.18))
@@ -1337,65 +1564,96 @@ struct ChatMessageView: View {
                     if (message.isThinking && isGenerating) || hasThinkingContent {
                         let thinking = message.thinkingContent ?? ""
                         VStack(alignment: .leading, spacing: 8) {
-                            Button(action: {
-                                withAnimation(.easeInOut(duration: 0.2)) {
-                                    isExpanded.toggle()
-                                }
-                            }) {
-                                HStack(spacing: 8) {
-                                    Image(systemName: "brain.head.profile")
-                                        .font(.system(size: 12, weight: .semibold))
-                                        .foregroundStyle(
-                                            LinearGradient(
-                                                colors: [.purple, .indigo],
-                                                startPoint: .topLeading,
-                                                endPoint: .bottomTrailing
-                                            )
-                                        )
-
-                                    if message.isThinking && isGenerating {
-                                        if message.prefillStatus != nil {
-                                            Text("Ingesting Prompt...")
-                                                .font(.system(size: 12, weight: .medium))
-                                                .foregroundColor(.primary)
-                                        } else {
-                                            Text("Thinking...")
-                                                .font(.system(size: 12, weight: .medium))
-                                                .foregroundColor(.primary)
-                                        }
-                                        StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
-                                    } else if let tTime = message.thinkingTimeSeconds {
-                                        Text(String(format: "Thought for %.1fs", tTime))
-                                            .font(.system(size: 12, weight: .medium))
-                                            .foregroundColor(.secondary)
-                                    } else {
-                                        Text("Thought Process")
-                                            .font(.system(size: 12, weight: .medium))
-                                            .foregroundColor(.secondary)
+                            HStack(spacing: 6) {
+                                Button(action: {
+                                    withAnimation(.easeInOut(duration: 0.2)) {
+                                        isExpanded.toggle()
                                     }
+                                }) {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: "brain.head.profile")
+                                            .font(.system(size: 12, weight: .semibold))
+                                            .foregroundStyle(
+                                                LinearGradient(
+                                                    colors: [.purple, .indigo],
+                                                    startPoint: .topLeading,
+                                                    endPoint: .bottomTrailing
+                                                )
+                                            )
 
-                                    Spacer()
+                                        if message.isThinking && isGenerating {
+                                            if message.prefillStatus != nil {
+                                                Text("Ingesting Prompt...")
+                                                    .font(.system(size: 12, weight: .medium))
+                                                    .foregroundColor(.primary)
+                                            } else {
+                                                Text("Thinking...")
+                                                    .font(.system(size: 12, weight: .medium))
+                                                    .foregroundColor(.primary)
+                                            }
+                                            StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
+                                        } else if let tTime = message.thinkingTimeSeconds {
+                                            Text(String(format: "Thought for %.1fs", tTime))
+                                                .font(.system(size: 12, weight: .medium))
+                                                .foregroundColor(.secondary)
+                                        } else {
+                                            Text("Thought Process")
+                                                .font(.system(size: 12, weight: .medium))
+                                                .foregroundColor(.secondary)
+                                        }
 
-                                    let charCount = thinking.count
-                                    let charCountStr = charCount >= 1000 ? String(format: "%.1fk chars", Double(charCount) / 1000.0) : "\(charCount) chars"
-                                    Text(charCountStr)
-                                        .font(.system(size: 11, design: .monospaced))
-                                        .foregroundColor(.secondary.opacity(0.7))
+                                        Spacer()
 
-                                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                                        .font(.system(size: 10, weight: .bold))
-                                        .foregroundColor(.secondary.opacity(0.8))
+                                        let charCount = thinking.count
+                                        let charCountStr = charCount >= 1000 ? String(format: "%.1fk chars", Double(charCount) / 1000.0) : "\(charCount) chars"
+                                        Text(charCountStr)
+                                            .font(.system(size: 11, design: .monospaced))
+                                            .foregroundColor(.secondary.opacity(0.7))
+
+                                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                                            .font(.system(size: 10, weight: .bold))
+                                            .foregroundColor(.secondary.opacity(0.8))
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 7)
+                                    .background(Color(NSColor.controlBackgroundColor).opacity(0.7))
+                                    .cornerRadius(8)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 8)
+                                            .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+                                    )
                                 }
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 7)
-                                .background(Color(NSColor.controlBackgroundColor).opacity(0.7))
-                                .cornerRadius(8)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 8)
-                                        .stroke(Color.primary.opacity(0.06), lineWidth: 1)
-                                )
+                                .buttonStyle(.plain)
+
+                                // Chunked reasoning cannot be selected as one run
+                                // across sibling Text views, so the whole thought
+                                // process is offered in one gesture here instead.
+                                if !thinking.isEmpty {
+                                    Button(action: {
+                                        NSPasteboard.general.clearContents()
+                                        NSPasteboard.general.setString(thinking, forType: .string)
+                                        isThinkingCopied = true
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                                            isThinkingCopied = false
+                                        }
+                                    }) {
+                                        Image(systemName: isThinkingCopied ? "checkmark" : "doc.on.doc")
+                                            .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
+                                            .foregroundColor(isThinkingCopied ? .green : .secondary)
+                                            .padding(.horizontal, 8)
+                                            .padding(.vertical, 8)
+                                            .background(Color(NSColor.controlBackgroundColor).opacity(0.7))
+                                            .cornerRadius(8)
+                                            .overlay(
+                                                RoundedRectangle(cornerRadius: 8)
+                                                    .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+                                            )
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("Copy thought process")
+                                }
                             }
-                            .buttonStyle(.plain)
 
                             if isExpanded {
                                 VStack(alignment: .leading, spacing: 6) {
@@ -1415,10 +1673,13 @@ struct ChatMessageView: View {
                                     }
 
                                     if !thinking.isEmpty {
-                                        Text(thinking)
+                                        // Reasoning can run to tens of thousands of
+                                        // tokens; one Text of that height is
+                                        // never painted (the whiteout), so it is
+                                        // drawn as bounded chunks instead.
+                                        ChunkedText(text: thinking, lineSpacing: 3)
                                             .font(.system(size: max(8, 12 * zoomManager.zoomScale), design: .monospaced))
                                             .foregroundColor(.secondary)
-                                            .lineSpacing(3)
                                             .padding(.horizontal, 14)
                                             .padding(.vertical, 10)
                                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -1472,7 +1733,6 @@ struct ChatMessageView: View {
                     // Main Response Text rendered via Rich Markdown Engine.
                     // Raw call markup is suppressed for tool-only turns, both while
                     // streaming and after the call has parsed.
-                    let displayContent = Self.responseDisplayContent(message.content, isGemmaDialect: isGemmaDialect)
                     if !displayContent.isEmpty {
                         MarkdownMessageView(
                             content: displayContent,
@@ -1721,8 +1981,37 @@ struct MarkdownMessageView: View {
     var isStreaming: Bool = false
     var isStreamingOffDisk: Bool = false
 
+    /// Memoizes this message's block parse. Parsing runs ~20 regex passes over
+    /// the whole text (measured at ~30 ms per 40 KB and ~85 ms per 120 KB), and
+    /// a streaming turn re-renders the transcript on every chunk; re-parsing
+    /// every message each frame saturates the main thread once a conversation
+    /// gets long, which leaves the transcript unpainted until a manual scroll.
+    /// Only the message whose text actually changed re-parses. A reference type
+    /// lets the body refresh the memo in place without scheduling an update.
+    private final class BlockMemo {
+        var content: String?
+        var repairs = true
+        var blocks: [MarkdownBlock] = []
+    }
+
+    @State private var memo = BlockMemo()
+
+    private var parsedBlocks: [MarkdownBlock] {
+        // While the answer streams, skip the malformed-markdown repair passes:
+        // they cost more than the rest of the parse together and the growing
+        // text is re-parsed on every UI update. The settled message re-parses
+        // once with them enabled, so its rendering is unaffected.
+        let wantsRepairs = !isStreaming
+        if memo.content == content, memo.repairs == wantsRepairs { return memo.blocks }
+        let parsed = parseMarkdownBlocks(content, repairs: wantsRepairs)
+        memo.content = content
+        memo.repairs = wantsRepairs
+        memo.blocks = parsed
+        return parsed
+    }
+
     private var identifiableBlocks: [IdentifiableMarkdownBlock] {
-        let rawBlocks = parseMarkdownBlocks(content)
+        let rawBlocks = parsedBlocks
         return rawBlocks.enumerated().map { index, block in
             let isLast = isStreaming && (index == rawBlocks.count - 1)
             let blockId: String
@@ -1798,10 +2087,24 @@ struct MarkdownMessageView: View {
         }
     }
 
+    /// Paragraph text, drawn as bounded chunks only once a single text view
+    /// would be too tall to paint. The split happens inside the block rather
+    /// than by emitting sibling blocks, so a paragraph keeps its own spacing
+    /// and does not gain an inter-block gap at each boundary.
+    @ViewBuilder
+    private func paragraphText(_ text: String) -> some View {
+        if LongTextChunker.isOversized(text) {
+            ChunkedText(text: text, lineSpacing: 4, parsesMarkdown: true)
+        } else {
+            Text(LocalizedStringKey(text))
+        }
+    }
+
     @ViewBuilder
     private func renderParagraph(text: String, isLast: Bool) -> some View {
         let fontSize = max(9, 14 * zoomManager.zoomScale)
-        if isLast {
+        let oversized = LongTextChunker.isOversized(text)
+        if isLast && !oversized {
             (Text(LocalizedStringKey(text)) + Text(" ") + Text(Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")).foregroundColor(isStreamingOffDisk ? .orange : .purple).font(.system(size: max(8, 11 * zoomManager.zoomScale), weight: .bold)))
                 .font(.system(size: fontSize))
                 .lineSpacing(4)
@@ -1810,19 +2113,37 @@ struct MarkdownMessageView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else {
+            VStack(alignment: .leading, spacing: 2) {
+                paragraphText(text)
+                if isLast {
+                    StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
+                }
+            }
+            .font(.system(size: fontSize))
+            .lineSpacing(4)
+            .foregroundColor(.primary)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    /// Blockquote text, bounded the same way as a paragraph: splitting inside
+    /// the block keeps one bar and one background instead of a stack of quote
+    /// boxes.
+    @ViewBuilder
+    private func blockquoteText(_ text: String) -> some View {
+        if LongTextChunker.isOversized(text) {
+            ChunkedText(text: text, lineSpacing: 3.5, parsesMarkdown: true)
+        } else {
             Text(LocalizedStringKey(text))
-                .font(.system(size: fontSize))
-                .lineSpacing(4)
-                .foregroundColor(.primary)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
     @ViewBuilder
     private func renderBlockquote(text: String, isLast: Bool) -> some View {
         let fontSize = max(8.5, 13.5 * zoomManager.zoomScale)
+        let oversized = LongTextChunker.isOversized(text)
         HStack(alignment: .top, spacing: 10) {
             RoundedRectangle(cornerRadius: 1.5)
                 .fill(
@@ -1834,7 +2155,7 @@ struct MarkdownMessageView: View {
                 )
                 .frame(width: 3.5)
 
-            if isLast {
+            if isLast && !oversized {
                 (Text(LocalizedStringKey(text)) + Text(" ") + Text(Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")).foregroundColor(isStreamingOffDisk ? .orange : .purple).font(.system(size: max(8, 11 * zoomManager.zoomScale), weight: .bold)))
                     .font(.system(size: fontSize))
                     .italic()
@@ -1843,13 +2164,18 @@ struct MarkdownMessageView: View {
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                Text(LocalizedStringKey(text))
-                    .font(.system(size: fontSize))
-                    .italic()
-                    .foregroundColor(.secondary)
-                    .lineSpacing(3.5)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 2) {
+                    blockquoteText(text)
+                    if isLast {
+                        StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
+                    }
+                }
+                .font(.system(size: fontSize))
+                .italic()
+                .foregroundColor(.secondary)
+                .lineSpacing(3.5)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(.vertical, 6)
@@ -1859,8 +2185,18 @@ struct MarkdownMessageView: View {
     }
 
     @ViewBuilder
+    private func listItemText(_ text: String) -> some View {
+        if LongTextChunker.isOversized(text) {
+            ChunkedText(text: text, lineSpacing: 3, parsesMarkdown: true)
+        } else {
+            Text(LocalizedStringKey(text))
+        }
+    }
+
+    @ViewBuilder
     private func renderListItem(number: Int?, text: String, isLast: Bool) -> some View {
         let fontSize = max(9, 14 * zoomManager.zoomScale)
+        let oversized = LongTextChunker.isOversized(text)
         HStack(alignment: .top, spacing: 8) {
             if let num = number {
                 Text("\(num).")
@@ -1874,7 +2210,7 @@ struct MarkdownMessageView: View {
                     .frame(width: 14, alignment: .center)
             }
 
-            if isLast {
+            if isLast && !oversized {
                 (Text(LocalizedStringKey(text)) + Text(" ") + Text(Image(systemName: isStreamingOffDisk ? "tortoise.fill" : "hare.fill")).foregroundColor(isStreamingOffDisk ? .orange : .purple).font(.system(size: max(8, 11 * zoomManager.zoomScale), weight: .bold)))
                     .font(.system(size: fontSize))
                     .lineSpacing(3)
@@ -1882,12 +2218,17 @@ struct MarkdownMessageView: View {
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                Text(LocalizedStringKey(text))
-                    .font(.system(size: fontSize))
-                    .lineSpacing(3)
-                    .foregroundColor(.primary)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: 2) {
+                    listItemText(text)
+                    if isLast {
+                        StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
+                    }
+                }
+                .font(.system(size: fontSize))
+                .lineSpacing(3)
+                .foregroundColor(.primary)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(.vertical, 1.5)
@@ -2125,7 +2466,55 @@ struct CodeBlockCard: View {
     var isStreaming: Bool = false
     var isStreamingOffDisk: Bool = false
     @State private var isCopied: Bool = false
-    @State private var highlighted: AttributedString? = nil
+
+    /// Highlights at most this many characters. The highlighter walks the code
+    /// line by line (measured ~23 ms per 11 KB), so a 90k-character block would
+    /// cost most of a second on the main thread; past this size plain
+    /// monospaced text is the better trade.
+    private static let highlightCharacterLimit = 40_000
+
+    /// Memoizes the chunk split and each chunk's highlighted form. Highlighting
+    /// ~11 KB costs ~23 ms, and the old cache was filled in `onAppear` after the
+    /// first body pass had already highlighted synchronously, so a block paid
+    /// that cost twice the first time it was realized. Reference type so the
+    /// body can refresh it in place without scheduling an update.
+    private final class HighlightMemo {
+        var language: String?
+        var code: String?
+        var chunks: [String] = []
+        var highlighted: [AttributedString?] = []
+    }
+
+    @State private var highlightMemo = HighlightMemo()
+
+    /// The block is drawn as bounded chunks: one giant text view is never
+    /// painted on macOS once it outgrows the compositor's maximum layer.
+    private var chunks: [String] {
+        if highlightMemo.language == language, highlightMemo.code == code {
+            return highlightMemo.chunks
+        }
+        let split = LongTextChunker.chunks(of: code)
+        highlightMemo.language = language
+        highlightMemo.code = code
+        highlightMemo.chunks = split
+        highlightMemo.highlighted = Array(repeating: nil, count: split.count)
+        return split
+    }
+
+    private func text(forChunk index: Int) -> AttributedString {
+        let split = chunks
+        // A stale index can only mean the split shrank under this body pass.
+        // Render nothing rather than the whole block, which would put an
+        // unbounded text view back in the slot this chunking exists to avoid.
+        guard split.indices.contains(index) else { return AttributedString() }
+        if isStreaming || code.count > Self.highlightCharacterLimit {
+            return AttributedString(split[index])
+        }
+        if let cached = highlightMemo.highlighted[index] { return cached }
+        let value = NativeSyntaxHighlighter.highlight(code: split[index], language: language)
+        highlightMemo.highlighted[index] = value
+        return value
+    }
 
     private var displayLanguage: String {
         let clean = language.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -2175,13 +2564,21 @@ struct CodeBlockCard: View {
             Divider()
 
             // Code Text Canvas with Native Syntax Highlighting (Cached)
+            // A block that is still growing renders as plain monospaced text:
+            // highlighting ~11 KB costs ~23 ms and used to rerun on every
+            // streamed chunk, which is most of a frame budget spent on a block
+            // whose tail is still changing. It highlights once it settles.
             ScrollView(.horizontal, showsIndicators: true) {
-                Text(highlighted ?? NativeSyntaxHighlighter.highlight(code: code, language: language))
-                    .font(.system(size: max(8.5, 12.5 * zoomManager.zoomScale), design: .monospaced))
-                    .lineSpacing(3)
-                    .textSelection(.enabled)
-                    .padding(12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(chunks.indices, id: \.self) { index in
+                        Text(text(forChunk: index))
+                            .lineSpacing(3)
+                    }
+                }
+                .font(.system(size: max(8.5, 12.5 * zoomManager.zoomScale), design: .monospaced))
+                .textSelection(.enabled)
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .background(Color(NSColor.textBackgroundColor))
         }
@@ -2191,12 +2588,6 @@ struct CodeBlockCard: View {
                 .stroke(Color.primary.opacity(0.08), lineWidth: 1)
         )
         .padding(.vertical, 4)
-        .onAppear {
-            highlighted = NativeSyntaxHighlighter.highlight(code: code, language: language)
-        }
-        .onChange(of: code) { newCode in
-            highlighted = NativeSyntaxHighlighter.highlight(code: newCode, language: language)
-        }
     }
 
     private func copyCode() {
@@ -2316,54 +2707,82 @@ private enum MarkdownRegexCache {
     static let multiNl = try? NSRegularExpression(pattern: #"\n{3,}"#, options: [])
 }
 
-public func normalizeMarkdownText(_ raw: String) -> String {
+/// Normalizes model-emitted markdown for block parsing.
+///
+/// `repairs` controls the "repair" passes that fix malformed formatting
+/// (a heading glued to a sentence, a bullet stuck to preceding text, and so
+/// on). They are six more whole-text regex scans, and while a turn streams the
+/// growing answer is re-normalized on every UI update: at 40 KB one parse
+/// measured ~25 ms, of which the repairs are the bulk. A streaming render
+/// passes `false` and still honours headings, lists, code fences, and tables
+/// that are already well formed; the settled message is parsed once with
+/// `true`, so the final rendering is identical.
+public func normalizeMarkdownText(_ raw: String, repairs: Bool = true) -> String {
+    normalizeMarkdownText(raw, repairs: repairs, triggerGuards: true)
+}
+
+/// `triggerGuards` exists for the guard-equivalence tests: `false` runs every
+/// regex pass unconditionally, so a test can assert that skipping a pass on a
+/// missing trigger character cannot change the output. Production only ever
+/// takes the guarded path.
+func normalizeMarkdownText(_ raw: String, repairs: Bool, triggerGuards: Bool) -> String {
+    let runAll = !triggerGuards
     var text = raw
     text = text.replacingOccurrences(of: "\r\n", with: "\n")
     text = text.replacingOccurrences(of: "\r", with: "\n")
     text = text.replacingOccurrences(of: "\\n", with: "\n")
 
-    // 1. Convert HTML Line breaks & Paragraphs to newlines
-    if let regexBr = MarkdownRegexCache.br {
-        text = regexBr.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n")
-    }
-    if let regexP = MarkdownRegexCache.p {
-        text = regexP.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n")
-    }
-    if let regexDiv = MarkdownRegexCache.div {
-        text = regexDiv.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n")
-    }
+    // Every repair below is a whole-text regex pass, and a streaming turn
+    // re-normalizes the growing answer on every UI update, so a long answer
+    // used to pay for ~24 full scans per frame (measured ~29 ms per 40 KB).
+    // Each pass is skipped when its trigger character cannot occur, which is
+    // behavior-preserving — the pattern cannot match without it — and drops
+    // typical model output to a handful of scans.
+    let mightContainHTML = runAll || text.contains("<")
+    if mightContainHTML {
+        // 1. Convert HTML Line breaks & Paragraphs to newlines
+        if let regexBr = MarkdownRegexCache.br {
+            text = regexBr.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n")
+        }
+        if let regexP = MarkdownRegexCache.p {
+            text = regexP.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n")
+        }
+        if let regexDiv = MarkdownRegexCache.div {
+            text = regexDiv.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n")
+        }
 
-    // 2. Convert HTML formatting tags to Markdown
-    if let regexB = MarkdownRegexCache.b {
-        text = regexB.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "**$1**")
-    }
-    if let regexI = MarkdownRegexCache.i {
-        text = regexI.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "*$1*")
-    }
-    if let regexCode = MarkdownRegexCache.code {
-        text = regexCode.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "`$1`")
-    }
+        // 2. Convert HTML formatting tags to Markdown
+        if let regexB = MarkdownRegexCache.b {
+            text = regexB.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "**$1**")
+        }
+        if let regexI = MarkdownRegexCache.i {
+            text = regexI.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "*$1*")
+        }
+        if let regexCode = MarkdownRegexCache.code {
+            text = regexCode.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "`$1`")
+        }
 
-    // 3. Convert HTML Lists
-    if let regexLi = MarkdownRegexCache.li {
-        text = regexLi.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n- $1\n")
-    }
-    if let regexUl = MarkdownRegexCache.ul {
-        text = regexUl.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n")
-    }
+        // 3. Convert HTML Lists
+        if let regexLi = MarkdownRegexCache.li {
+            text = regexLi.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n- $1\n")
+        }
+        if let regexUl = MarkdownRegexCache.ul {
+            text = regexUl.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n")
+        }
 
-    // 4. Strip span and convert sup/sub tags
-    if let regexSpan = MarkdownRegexCache.span {
-        text = regexSpan.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1")
-    }
-    if let regexSup = MarkdownRegexCache.sup {
-        text = regexSup.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "^($1)")
-    }
-    if let regexSub = MarkdownRegexCache.sub {
-        text = regexSub.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "_($1)")
-    }
-    if let regexStrayHtml = MarkdownRegexCache.strayHtml {
-        text = regexStrayHtml.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "")
+        // 4. Strip span and convert sup/sub tags
+        if let regexSpan = MarkdownRegexCache.span {
+            text = regexSpan.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1")
+        }
+        if let regexSup = MarkdownRegexCache.sup {
+            text = regexSup.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "^($1)")
+        }
+        if let regexSub = MarkdownRegexCache.sub {
+            text = regexSub.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "_($1)")
+        }
+        if let regexStrayHtml = MarkdownRegexCache.strayHtml {
+            text = regexStrayHtml.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "")
+        }
     }
 
     // 5. Clean double pipes || -> |
@@ -2371,63 +2790,66 @@ public func normalizeMarkdownText(_ raw: String) -> String {
         text = text.replacingOccurrences(of: "||", with: "|")
     }
 
-    // 6. Fix heading embedded in paragraph or missing space: "text. #### 1. Heading" -> "text.\n\n#### 1. Heading"
-    if let regexStuckHeading = MarkdownRegexCache.stuckHeading {
-        text = regexStuckHeading.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1\n\n$2")
-    }
+    if repairs {
+        // 6. Fix heading embedded in paragraph or missing space: "text. #### 1. Heading" -> "text.\n\n#### 1. Heading"
+        if (runAll || text.contains("#")), let regexStuckHeading = MarkdownRegexCache.stuckHeading {
+            text = regexStuckHeading.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1\n\n$2")
+        }
 
-    // 7. Fix heading title glued to paragraph text:
-    if let regexHeadingGlue = MarkdownRegexCache.headingGlue {
-        text = regexHeadingGlue.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1$2\n\n$3")
-    }
+        // 7. Fix heading title glued to paragraph text
+        if (runAll || text.contains("#")), let regexHeadingGlue = MarkdownRegexCache.headingGlue {
+            text = regexHeadingGlue.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1$2\n\n$3")
+        }
 
-    // 8. Fix inline list glued inside paragraph: "formats: - Total 16 bits" -> "formats:\n\n- Total 16 bits"
-    if let regexInlineList = MarkdownRegexCache.inlineList {
-        text = regexInlineList.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1\n\n- $2")
-    }
+        // 8. Fix inline list glued inside paragraph: "formats: - Total 16 bits" -> "formats:\n\n- Total 16 bits"
+        if runAll || text.contains("-") || text.contains("•") || text.contains("*"),
+           let regexInlineList = MarkdownRegexCache.inlineList {
+            text = regexInlineList.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1\n\n- $2")
+        }
 
-    // 9. Fix inline numbered list glued inside paragraph: "computing. 1. Technical" -> "computing.\n\n1. Technical"
-    if let regexInlineNumList = MarkdownRegexCache.inlineNumList {
-        text = regexInlineNumList.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1\n\n$2")
-    }
+        // 9. Fix inline numbered list glued inside paragraph: "computing. 1. Technical" -> "computing.\n\n1. Technical"
+        if (runAll || text.contains(".")), let regexInlineNumList = MarkdownRegexCache.inlineNumList {
+            text = regexInlineNumList.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1\n\n$2")
+        }
 
-    // 10. Fix sentence glued to next sentence without space: "quantization.This" -> "quantization. This"
-    if let regexSentenceGlue = MarkdownRegexCache.sentenceGlue {
-        text = regexSentenceGlue.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1. $2")
-    }
+        // 10. Fix sentence glued to next sentence without space: "quantization.This" -> "quantization. This"
+        if (runAll || text.contains(".")), let regexSentenceGlue = MarkdownRegexCache.sentenceGlue {
+            text = regexSentenceGlue.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1. $2")
+        }
 
-    // 11. Fix title stuck before table header on same line
-    if let regexTitleTable = MarkdownRegexCache.titleTable {
-        text = regexTitleTable.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n### $1\n| $2")
-    }
+        // 11. Fix title stuck before table header on same line
+        if (runAll || text.contains("|")), let regexTitleTable = MarkdownRegexCache.titleTable {
+            text = regexTitleTable.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n### $1\n| $2")
+        }
 
-    // 12. Fix unclosed table separator line (missing trailing pipe)
-    if let regexFixSepPipes = MarkdownRegexCache.fixSepPipes {
-        text = regexFixSepPipes.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n$1|")
-    }
+        // 12. Fix unclosed table separator line (missing trailing pipe)
+        if (runAll || text.contains("|")), let regexFixSepPipes = MarkdownRegexCache.fixSepPipes {
+            text = regexFixSepPipes.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n$1|")
+        }
 
-    // 13. Fix multiple table separator lines
-    if let regexMultiSep = MarkdownRegexCache.multiSep {
-        text = regexMultiSep.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1")
-    }
+        // 13. Fix multiple table separator lines
+        if (runAll || text.contains("|")), let regexMultiSep = MarkdownRegexCache.multiSep {
+            text = regexMultiSep.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1")
+        }
 
-    // 14. Fix table section headers like "-- Section Name -- |"
-    if let regexSectionHeader = MarkdownRegexCache.sectionHeader {
-        text = regexSectionHeader.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n#### $1\n")
-    }
+        // 14. Fix table section headers like "-- Section Name -- |"
+        if runAll || text.contains("|") || text.contains("--"), let regexSectionHeader = MarkdownRegexCache.sectionHeader {
+            text = regexSectionHeader.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n#### $1\n")
+        }
 
-    // 15. Fix concatenated horizontal rules + headers: "---##" -> "\n\n---\n\n## "
-    if let regexHrHeader = MarkdownRegexCache.hrHeader {
-        text = regexHrHeader.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n---\n\n$1")
-    }
+        // 15. Fix concatenated horizontal rules + headers: "---##" -> "\n\n---\n\n## "
+        if (runAll || text.contains("---")), let regexHrHeader = MarkdownRegexCache.hrHeader {
+            text = regexHrHeader.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n---\n\n$1")
+        }
 
-    // 16. Fix bullet points stuck to preceding text: "text• Bullet" -> "text\n• Bullet"
-    if let regexStuckBullet = MarkdownRegexCache.stuckBullet {
-        text = regexStuckBullet.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1\n$2")
+        // 16. Fix bullet points stuck to preceding text: "text• Bullet" -> "text\n• Bullet"
+        if (runAll || text.contains("•")), let regexStuckBullet = MarkdownRegexCache.stuckBullet {
+            text = regexStuckBullet.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "$1\n$2")
+        }
     }
 
     // 17. Collapse 3+ newlines to 2
-    if let regexMultiNl = MarkdownRegexCache.multiNl {
+    if (runAll || text.contains("\n\n\n")), let regexMultiNl = MarkdownRegexCache.multiNl {
         text = regexMultiNl.stringByReplacingMatches(in: text, options: [], range: NSRange(location: 0, length: text.utf16.count), withTemplate: "\n\n")
     }
 
@@ -2646,8 +3068,28 @@ public enum EmojiShortcodeResolver {
     }
 }
 
-public func parseMarkdownBlocks(_ raw: String) -> [MarkdownBlock] {
-    let normalized = normalizeMarkdownText(raw)
+/// Parses an `N. text` numbered-list line. Equivalent to the
+/// `^\d+\.\s+` regular expression it replaced, without compiling a
+/// pattern for every line of the message.
+private func numberedListItem(_ line: String) -> (number: Int?, text: String)? {
+    var index = line.startIndex
+    while index < line.endIndex, line[index].isASCII, line[index].isNumber {
+        index = line.index(after: index)
+    }
+    guard index > line.startIndex, index < line.endIndex, line[index] == "." else { return nil }
+    var rest = line.index(after: index)
+    guard rest < line.endIndex, line[rest].isWhitespace else { return nil }
+    while rest < line.endIndex, line[rest].isWhitespace {
+        rest = line.index(after: rest)
+    }
+    return (
+        number: Int(line[line.startIndex..<index]),
+        text: String(line[rest...]).trimmingCharacters(in: .whitespaces)
+    )
+}
+
+public func parseMarkdownBlocks(_ raw: String, repairs: Bool = true) -> [MarkdownBlock] {
+    let normalized = normalizeMarkdownText(raw, repairs: repairs)
     var blocks: [MarkdownBlock] = []
     let lines = normalized.components(separatedBy: "\n")
 
@@ -2757,12 +3199,15 @@ public func parseMarkdownBlocks(_ raw: String) -> [MarkdownBlock] {
             continue
         }
 
-        // 7. Numbered list item
-        if let match = trimmed.range(of: #"^\d+\.\s+"#, options: .regularExpression) {
+        // 7. Numbered list item. Parsed by hand: a regular expression compiled
+        // per line dominated this parser's cost on long messages, which mattered
+        // once a streamed answer could run to tens of thousands of tokens.
+        if let numbered = numberedListItem(trimmed) {
             flushParagraph()
-            let itemText = EmojiShortcodeResolver.resolve(String(trimmed[match.upperBound...]).trimmingCharacters(in: .whitespaces))
-            let numStr = String(trimmed[..<match.upperBound]).trimmingCharacters(in: .whitespaces.union(CharacterSet(charactersIn: ".")))
-            blocks.append(.listItem(number: Int(numStr), text: itemText))
+            blocks.append(.listItem(
+                number: numbered.number,
+                text: EmojiShortcodeResolver.resolve(numbered.text)
+            ))
             i += 1
             continue
         }
