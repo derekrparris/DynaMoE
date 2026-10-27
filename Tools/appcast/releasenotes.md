@@ -1,8 +1,3 @@
-# DynaMoE v26.7
-> High-Performance MoE Inference Engine for Apple Silicon
-
----
-
 ### 📦 What's New in 26.7
 * **External tool servers (MCP):** The agent can now use tools that ship as separate programs or remote services instead of Swift compiled into the app. Servers are declared in one editable `mcp.json` (stdio child processes or Streamable HTTP endpoints) and speak the Model Context Protocol, surfacing as ordinary agent tools under `mcp__<server>__<tool>`. A new Settings card shows live status and handles add, edit, enable, restart, and remove, with both a form and a raw JSON editor. The file stays the source of truth (external edits are picked up without a restart, and deferred while a turn is running), credentials live in the Keychain behind `${keychain:...}` tokens so they never touch disk, discovered tools cost zero prefill tokens until the model loads them, and every MCP call asks for approval unless Turbo Mode is on.
 * **Corrected KV capacity rules:** A tools-enabled turn is no longer refused before prefill just because the machine cannot afford the 8,192-row agent reserve. The pre-launch check now prices the model's real sliding-window ring layout and the effective KV precision the allocator uses, treats the agent reserve as a preference the RAM budget caps rather than a veto, and refuses a turn only when the prompt itself cannot fit, so a few-thousand-token prompt runs again on a memory-constrained Mac. Rejections say what actually binds (budget, model footprint, precision, affordable rows) and reach API clients as a `context_length_exceeded` error; the new `dynamoe_agent_session_floor` key lowers the reserve when you need to.
