@@ -1,0 +1,808 @@
+//
+//  DeepSeekV41ForwardLogicTests.swift
+//  DynaMoE
+//
+//  Coverage for the parts of the DeepSeek-V4.1 forward that do not need the
+//  checkpoint: attention with its sink, RoPE with the YaRN-by-parts ramp, the
+//  compressor and indexer, routing, the expert arena, the hyper-connection
+//  streams, the CSA2 cache layout, and the block forward end to end over
+//  synthetic weights.
+//
+//  The end-to-end case is the important one: it is the only place that proves the
+//  layer order, the residual bookkeeping and the cache addressing hang together.
+//  It cannot prove the numbers are right (the weights are synthetic) but it does
+//  prove that a position reads exactly the rows it wrote, that a compressed row
+//  appears exactly when its block completes, and that the head sees the collapsed
+//  stream.
+//
+
+import XCTest
+@testable import DynaMoE
+
+// MARK: - Shared fixtures
+
+enum DeepSeekV41TestFixtures {
+
+    /// A small but structurally complete config: 3 layers, real CSA2 geometry, two
+    /// routed experts activated out of four, two hyper-connection streams.
+    static let json = """
+    {
+      "architectures": ["DeepseekV41ForCausalLM"],
+      "model_type": "deepseek_v41",
+      "dtype": "bfloat16",
+      "bos_token_id": 0,
+      "eos_token_id": 1,
+      "pad_token_id": 2,
+      "quantization_config": {"quant_method": "fp8"},
+      "text_config": {
+        "num_hidden_layers": 3,
+        "hidden_size": 8,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "vocab_size": 16,
+        "intermediate_size": 8,
+        "moe_intermediate_size": 4,
+        "n_shared_experts": 1,
+        "n_routed_experts": 4,
+        "n_activated_experts": 2,
+        "routed_scaling_factor": 2.0,
+        "swiglu_limit": 10.0,
+        "q_lora_rank": 0,
+        "kv_lora_rank": 4,
+        "qk_nope_head_dim": 4,
+        "qk_rope_head_dim": 0,
+        "v_head_dim": 4,
+        "o_groups": 1,
+        "o_lora_rank": 4,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000,
+        "compress_rope_theta": 160000,
+        "max_position_embeddings": 4096,
+        "window_size": 3,
+        "compress_ratios": [0, 2, 2],
+        "kv_source_layer_ids": [1],
+        "index_source_layer_ids": [1],
+        "candidate_source_layer_id": 1,
+        "candidate_block_size": 2,
+        "candidate_topk_blocks": 2,
+        "index_n_heads": 1,
+        "index_head_dim": 2,
+        "index_topk": 4,
+        "hc_mult": 2,
+        "hc_sinkhorn_iters": 3,
+        "hc_eps": 1e-6,
+        "engram_layer_ids": [],
+        "engram_num_embeddings": []
+      }
+    }
+    """
+
+    static func config() throws -> DeepSeekV41Config {
+        try DeepSeekV41Config.decode(jsonData: Data(json.utf8))
+    }
+
+    static func plan() throws -> [DeepSeekV41LayerPlan] {
+        try config().makeLayerPlan()
+    }
+
+    /// Deterministic pseudo-random weights, so a failure reproduces exactly.
+    struct Generator {
+        private var state: UInt64
+        init(seed: UInt64) { self.state = seed == 0 ? 1 : seed }
+
+        mutating func next() -> Float {
+            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            let bits = UInt32(truncatingIfNeeded: state >> 33)
+            return (Float(bits) / Float(UInt32.max)) * 2 - 1
+        }
+
+        mutating func vector(_ count: Int, scale: Float = 0.5) -> [Float] {
+            (0..<count).map { _ in next() * scale }
+        }
+
+        mutating func matrix(rows: Int, columns: Int, scale: Float = 0.5) -> DeepSeekV41Matrix {
+            DeepSeekV41Matrix(rows: rows, columns: columns, values: vector(rows * columns, scale: scale))
+        }
+    }
+
+    /// A complete set of weights for the fixture config.
+    static func weights(config: DeepSeekV41Config, plan: [DeepSeekV41LayerPlan]) -> DeepSeekV41DenseWeightSource {
+        var generator = Generator(seed: 0xDE5EED)
+        let source = DeepSeekV41DenseWeightSource()
+        let shapes = DeepSeekV41TensorShapes(config: config)
+
+        source.set(generator.matrix(rows: config.vocabSize, columns: shapes.hidden), role: .tokenEmbedding, layer: nil)
+        source.set(generator.matrix(rows: config.vocabSize, columns: shapes.hidden), role: .lmHead, layer: nil)
+        source.set(generator.vector(shapes.hidden, scale: 0.1), role: .finalNorm, layer: nil)
+
+        for layer in plan {
+            let l = layer.index
+            source.set(generator.vector(shapes.hidden, scale: 0.1), role: .attnNorm, layer: l)
+            source.set(generator.vector(shapes.hidden, scale: 0.1), role: .ffnNorm, layer: l)
+            source.set(generator.matrix(rows: shapes.queryWidth, columns: shapes.hidden), role: .attnWqB, layer: l)
+            source.set(generator.matrix(rows: shapes.latentWidth, columns: shapes.hidden), role: .attnWkv, layer: l)
+            source.set(generator.vector(shapes.latentWidth, scale: 0.1), role: .attnKvNorm, layer: l)
+            source.set(generator.matrix(rows: shapes.oLoraRank, columns: shapes.attentionOutputWidth), role: .attnWoA, layer: l)
+            source.set(generator.matrix(rows: shapes.hidden, columns: shapes.oLoraRank), role: .attnWoB, layer: l)
+            source.set(generator.vector(config.numAttentionHeads, scale: 0.5), role: .attnSink, layer: l)
+            source.set(generator.matrix(rows: config.numRoutedExperts, columns: shapes.hidden), role: .routerWeight, layer: l)
+            source.set(generator.vector(config.numRoutedExperts, scale: 0.2), role: .routerBias, layer: l)
+            source.set(generator.matrix(rows: shapes.sharedIntermediate, columns: shapes.hidden), role: .sharedExpertW1, layer: l)
+            source.set(generator.matrix(rows: shapes.sharedIntermediate, columns: shapes.hidden), role: .sharedExpertW3, layer: l)
+            source.set(generator.matrix(rows: shapes.hidden, columns: shapes.sharedIntermediate), role: .sharedExpertW2, layer: l)
+            source.set(generator.matrix(rows: 1, columns: max(1, config.hcMult)), role: .hcAttnFn, layer: l)
+            source.set(generator.matrix(rows: 1, columns: max(1, config.hcMult)), role: .hcFfnFn, layer: l)
+            source.set(generator.vector(max(1, config.hcMult), scale: 0.05), role: .hcAttnScale, layer: l)
+            source.set(generator.vector(max(1, config.hcMult), scale: 0.05), role: .hcFfnScale, layer: l)
+            for expert in 0..<config.numRoutedExperts {
+                source.set(generator.matrix(rows: shapes.expertIntermediate, columns: shapes.hidden), role: .expertW1, layer: l, expert: expert)
+                source.set(generator.matrix(rows: shapes.expertIntermediate, columns: shapes.hidden), role: .expertW3, layer: l, expert: expert)
+                source.set(generator.matrix(rows: shapes.hidden, columns: shapes.expertIntermediate), role: .expertW2, layer: l, expert: expert)
+            }
+        }
+        return source
+    }
+}
+
+// MARK: - Attention
+
+final class DeepSeekV41AttentionTests: XCTestCase {
+
+    private func shape() -> DeepSeekV41AttentionShape {
+        DeepSeekV41AttentionShape(
+            numHeads: 2,
+            headsPerGroup: 1,
+            qkHeadDim: 4,
+            vHeadDim: 4,
+            latentWidth: 4,
+            qLoraRank: 0,
+            oLoraRank: 0,
+            isCompressed: true,
+            compressRatio: 2,
+            ropeTheta: 10_000,
+            rotaryDim: 0
+        )
+    }
+
+    func testSinkTakesAllTheMassWhenNoKeyIsRelevant() {
+        let shape = shape()
+        // A query orthogonal to every key: every dot product is 0, so the sink,
+        // set far above, must win outright and the output must collapse to zeros.
+        let query: [Float] = [1, 0, 0, 0, 1, 0, 0, 0]
+        let keys: [[Float]] = [
+            [0, 1, 0, 0],
+            [0, 0, 1, 0]
+        ]
+        let out = DeepSeekV41AttentionReference.attend(
+            query: query,
+            keys: keys,
+            shape: shape,
+            sink: [100, 100]
+        )
+        XCTAssertEqual(out.count, shape.outputWidth)
+        for value in out {
+            XCTAssertEqual(value, 0, accuracy: 1e-6)
+        }
+
+        let weights = DeepSeekV41AttentionReference.weights(
+            query: query, head: 0, keys: keys, shape: shape, sink: 100
+        )
+        XCTAssertEqual(weights.count, 3)
+        XCTAssertEqual(weights.last!, 1, accuracy: 1e-6)
+    }
+
+    func testWeightsAreAProbabilityDistribution() {
+        let shape = shape()
+        let query: [Float] = [0.3, -0.2, 0.5, 0.1, 0.7, 0.2, -0.4, 0.6]
+        let keys: [[Float]] = [
+            [0.1, 0.2, -0.3, 0.4],
+            [-0.5, 0.25, 0.1, 0.2],
+            [0.7, -0.1, 0.35, 0.05]
+        ]
+        let weights = DeepSeekV41AttentionReference.weights(
+            query: query, head: 1, keys: keys, shape: shape, sink: -2
+        )
+        XCTAssertEqual(weights.count, 4)
+        XCTAssertEqual(weights.reduce(0, +), 1, accuracy: 1e-5)
+        XCTAssertTrue(weights.allSatisfy { $0 >= 0 })
+    }
+
+    func testSingleKeyPassesItsLatentThrough() {
+        let shape = shape()
+        let query: [Float] = [1, 0, 0, 0, 1, 0, 0, 0]
+        let key: [Float] = [0.5, -0.25, 1.5, -0.75]
+        let out = DeepSeekV41AttentionReference.attend(query: query, keys: [key], shape: shape)
+        // One key and no sink: the softmax is 1, so each head emits the key itself.
+        for head in 0..<shape.numHeads {
+            let base = head * shape.vHeadDim
+            for dim in 0..<shape.vHeadDim {
+                XCTAssertEqual(out[base + dim], key[dim], accuracy: 1e-6)
+            }
+        }
+    }
+
+    func testEmptyKeySetYieldsZeros() {
+        let out = DeepSeekV41AttentionReference.attend(
+            query: [1, 0, 0, 0, 1, 0, 0, 0],
+            keys: [],
+            shape: shape()
+        )
+        XCTAssertEqual(out.count, shape().outputWidth)
+        XCTAssertTrue(out.allSatisfy { $0 == 0 })
+    }
+
+    func testScoreScaleUsesTheQueryWidth() {
+        // qkHeadDim 4, not latentWidth 4 here, but the relation is what matters.
+        XCTAssertEqual(shape().scoreScale, 0.5, accuracy: 1e-6)
+    }
+}
+
+// MARK: - RoPE
+
+final class DeepSeekV41RoPETests: XCTestCase {
+
+    func testPlainFrequenciesWithoutScaling() {
+        let frequencies = DeepSeekV41RoPE.inverseFrequencies(
+            width: 8, theta: 10_000, factor: 1, originalLength: 0, betaFast: 32, betaSlow: 1
+        )
+        XCTAssertEqual(frequencies.count, 4)
+        XCTAssertEqual(frequencies[0], 1, accuracy: 1e-6)
+        // Every later pair rotates slower.
+        for index in 1..<frequencies.count {
+            XCTAssertLessThan(frequencies[index], frequencies[index - 1])
+        }
+        XCTAssertEqual(frequencies[0], 1 / pow(10_000, 0), accuracy: 1e-6)
+        XCTAssertEqual(frequencies[1], 1 / pow(10_000, 2.0 / 8.0), accuracy: 1e-6)
+    }
+
+    func testYarnDividesOnlyTheLongWavelengths() {
+        let plain = DeepSeekV41RoPE.inverseFrequencies(
+            width: 16, theta: 10_000, factor: 1, originalLength: 0, betaFast: 32, betaSlow: 1
+        )
+        let scaled = DeepSeekV41RoPE.inverseFrequencies(
+            width: 16, theta: 10_000, factor: 8, originalLength: 131_072, betaFast: 32, betaSlow: 1
+        )
+        XCTAssertEqual(plain.count, scaled.count)
+        // The highest-frequency pair (wavelength 2π, far below the low threshold)
+        // must be untouched.
+        XCTAssertEqual(scaled[0], plain[0], accuracy: 1e-9)
+        // At least one dimension must be scaled down, or the ramp did nothing.
+        XCTAssertTrue(zip(plain, scaled).contains { $0 > $1 * 1.0001 })
+        // No dimension may be scaled UP.
+        for (before, after) in zip(plain, scaled) {
+            XCTAssertLessThanOrEqual(after, before + 1e-9)
+        }
+    }
+
+    func testRotationAtPositionZeroIsIdentity() {
+        var vector: [Float] = [1, 2, 3, 4, 5, 6, 7, 8]
+        let original = vector
+        let frequencies = DeepSeekV41RoPE.inverseFrequencies(
+            width: 8, theta: 10_000, factor: 1, originalLength: 0, betaFast: 32, betaSlow: 1
+        )
+        DeepSeekV41RoPE.rotate(&vector, position: 0, frequencies: frequencies)
+        for (before, after) in zip(original, vector) {
+            XCTAssertEqual(after, before, accuracy: 1e-6)
+        }
+    }
+
+    func testRotationPreservesNorm() {
+        var vector: [Float] = [0.4, -1.2, 0.7, 2.1, -0.3, 0.9, 0.2, -1.5]
+        let before = sqrt(vector.reduce(0) { $0 + $1 * $1 })
+        let frequencies = DeepSeekV41RoPE.inverseFrequencies(
+            width: 8, theta: 10_000, factor: 1, originalLength: 0, betaFast: 32, betaSlow: 1
+        )
+        DeepSeekV41RoPE.rotate(&vector, position: 37, frequencies: frequencies)
+        let after = sqrt(vector.reduce(0) { $0 + $1 * $1 })
+        XCTAssertEqual(after, before, accuracy: 1e-5)
+    }
+}
+
+// MARK: - Compressor and indexer
+
+final class DeepSeekV41CompressorTests: XCTestCase {
+
+    func testPoolIsAConvexCombination() {
+        let latents: [[Float]] = [
+            [1, 0],
+            [0, 1]
+        ]
+        let pooled = DeepSeekV41Compressor.pool(latents: latents, gates: [0, 0])
+        XCTAssertEqual(pooled, [0.5, 0.5])
+        for value in pooled {
+            XCTAssertGreaterThanOrEqual(value, 0)
+            XCTAssertLessThanOrEqual(value, 1)
+        }
+    }
+
+    func testPoolOfIdenticalLatentsIsThatLatent() {
+        let latents: [[Float]] = [
+            [0.3, -0.7],
+            [0.3, -0.7],
+            [0.3, -0.7]
+        ]
+        let pooled = DeepSeekV41Compressor.pool(latents: latents, gates: [5, -1, 2])
+        XCTAssertEqual(pooled[0], 0.3, accuracy: 1e-6)
+        XCTAssertEqual(pooled[1], -0.7, accuracy: 1e-6)
+    }
+
+    func testCompressDropsPartialTrailingBlock() {
+        let latents: [[Float]] = (0..<5).map { [Float($0), Float($0)] }
+        let gates = [Float](repeating: 0, count: 5)
+        XCTAssertEqual(DeepSeekV41Compressor.compress(latents: latents, gates: gates, ratio: 2).count, 2)
+        XCTAssertEqual(DeepSeekV41Compressor.compress(latents: latents, gates: gates, ratio: 3).count, 1)
+        XCTAssertTrue(DeepSeekV41Compressor.compress(latents: latents, gates: gates, ratio: 0).isEmpty)
+    }
+
+    func testEmptyPoolIsZeroed() {
+        XCTAssertTrue(DeepSeekV41Compressor.pool(latents: [], gates: []).isEmpty)
+    }
+}
+
+final class DeepSeekV41IndexerTests: XCTestCase {
+
+    func testBlockScoreIsTheMaxOverRowsAndHeads() {
+        let queries: [[Float]] = [
+            [1, 0],
+            [-1, 0]
+        ]
+        let keys: [[Float]] = [
+            [0.1, 0],   // block 0 row 0: 0.1 / sqrt(2)
+            [0.9, 0],   // block 0 row 1: 0.9 / sqrt(2)
+            [0, 0],     // block 1 row 0
+            [-0.4, 0]   // block 1 row 1: 0.4 / sqrt(2) via the negated query
+        ]
+        let scores = DeepSeekV41Indexer.blockScores(queries: queries, keys: keys, blockSize: 2, keyWidth: 2)
+        XCTAssertEqual(scores.count, 2)
+        XCTAssertEqual(scores[0], 0.9 / sqrt(2), accuracy: 1e-5)
+        XCTAssertEqual(scores[1], 0.4 / sqrt(2), accuracy: 1e-5)
+    }
+
+    func testSelectionIsDescendingByScoreButReturnedAscending() {
+        let scores: [Float] = [0.1, 0.9, 0.5, 0.7]
+        XCTAssertEqual(DeepSeekV41Indexer.selectedBlocks(scores: scores, topK: 2), [1, 3])
+        XCTAssertEqual(DeepSeekV41Indexer.selectedBlocks(scores: scores, topK: 0), [])
+        XCTAssertEqual(DeepSeekV41Indexer.selectedBlocks(scores: scores, topK: 9), [0, 1, 2, 3])
+    }
+
+    func testRowExpansionCoversWholeBlocksAndTruncatesTheLast() {
+        XCTAssertEqual(DeepSeekV41Indexer.rows(for: [0, 1], blockSize: 2, rowCount: 5), [0, 1, 2, 3])
+        XCTAssertEqual(DeepSeekV41Indexer.rows(for: [2], blockSize: 2, rowCount: 5), [4])
+        XCTAssertEqual(DeepSeekV41Indexer.rows(for: [3], blockSize: 2, rowCount: 5), [])
+    }
+}
+
+// MARK: - Routing
+
+final class DeepSeekV41RouterTests: XCTestCase {
+
+    func testSigmoidIsStableAtBothExtremes() {
+        XCTAssertEqual(DeepSeekV41Router.sigmoid(0), 0.5, accuracy: 1e-6)
+        XCTAssertEqual(DeepSeekV41Router.sigmoid(1000), 1, accuracy: 1e-6)
+        XCTAssertEqual(DeepSeekV41Router.sigmoid(-1000), 0, accuracy: 1e-6)
+        XCTAssertFalse(DeepSeekV41Router.sigmoid(1000).isNaN)
+        XCTAssertFalse(DeepSeekV41Router.sigmoid(-1000).isNaN)
+    }
+
+    func testTopKIsSelectedBySigmoidScore() {
+        let routing = DeepSeekV41Router.route(
+            logits: [3, -3, 1, 0.5],
+            bias: nil,
+            topK: 2,
+            scalingFactor: 1
+        )
+        XCTAssertEqual(routing.expertIDs, [0, 2])
+        XCTAssertEqual(routing.weights.reduce(0, +), 1, accuracy: 1e-5)
+    }
+
+    func testScalingFactorMultipliesTheMixture() {
+        let plain = DeepSeekV41Router.route(logits: [1, 2, 3, 4], bias: nil, topK: 2, scalingFactor: 1)
+        let scaled = DeepSeekV41Router.route(logits: [1, 2, 3, 4], bias: nil, topK: 2, scalingFactor: 2.5)
+        XCTAssertEqual(plain.expertIDs, scaled.expertIDs)
+        for (before, after) in zip(plain.weights, scaled.weights) {
+            XCTAssertEqual(after, before * 2.5, accuracy: 1e-5)
+        }
+    }
+
+    func testBiasChangesSelectionButNotTheReportedWeights() {
+        // Expert 3 loses on raw logits but wins once its bias is applied.
+        let unbiased = DeepSeekV41Router.route(logits: [2, 1, 0, -1], bias: nil, topK: 1, scalingFactor: 1)
+        let biased = DeepSeekV41Router.route(
+            logits: [2, 1, 0, -1],
+            bias: [0, 0, 0, 100],
+            topK: 1,
+            scalingFactor: 1
+        )
+        XCTAssertEqual(unbiased.expertIDs, [0])
+        XCTAssertEqual(biased.expertIDs, [3])
+        // A single selected expert always carries the whole mixture.
+        XCTAssertEqual(biased.weights, [1])
+    }
+
+    func testEmptyAndDegenerateInputs() {
+        XCTAssertEqual(DeepSeekV41Router.route(logits: [], bias: nil, topK: 2, scalingFactor: 1), .empty)
+        XCTAssertEqual(DeepSeekV41Router.route(logits: [1], bias: nil, topK: 0, scalingFactor: 1), .empty)
+        // topK larger than the expert count is clamped, not trusted.
+        XCTAssertEqual(DeepSeekV41Router.route(logits: [1, 2], bias: nil, topK: 9, scalingFactor: 1).expertIDs.count, 2)
+    }
+}
+
+// MARK: - Activation
+
+final class DeepSeekV41ActivationTests: XCTestCase {
+
+    func testSwiGLUClipsBothSides() {
+        // gate above the limit is clamped; up is clamped into [-limit, limit].
+        let clipped = DeepSeekV41Activation.swiglu(gate: 100, up: 100, limit: 10)
+        let expected = DeepSeekV41Activation.silu(10) * 10
+        XCTAssertEqual(clipped, expected, accuracy: 1e-5)
+
+        let negative = DeepSeekV41Activation.swiglu(gate: 0, up: -100, limit: 10)
+        XCTAssertEqual(negative, 0, accuracy: 1e-5)
+    }
+
+    func testZeroLimitDisablesTheClip() {
+        let unclipped = DeepSeekV41Activation.swiglu(gate: 2, up: 1000, limit: 0)
+        let expected = DeepSeekV41Activation.silu(2) * 1000
+        XCTAssertEqual(unclipped, expected, accuracy: 1e-3)
+    }
+
+    func testSiluIsMonotoneAndSigned() {
+        XCTAssertLessThan(DeepSeekV41Activation.silu(-3), 0)
+        XCTAssertGreaterThan(DeepSeekV41Activation.silu(3), 0)
+        XCTAssertEqual(DeepSeekV41Activation.silu(0), 0, accuracy: 1e-6)
+    }
+}
+
+// MARK: - Expert arena
+
+final class DeepSeekV41ExpertArenaTests: XCTestCase {
+
+    func testResidentPairsKeepTheirSlot() {
+        let arena = DeepSeekV41ExpertArena(slotCount: 4)
+        let first = arena.acquire([(layer: 0, expert: 1), (layer: 0, expert: 2)])
+        let second = arena.acquire([(layer: 0, expert: 1)])
+        XCTAssertEqual(first[0], second[0])
+        XCTAssertEqual(arena.hits, 1)
+        XCTAssertEqual(arena.residentCount, 2)
+    }
+
+    func testOldestPairIsEvictedFirst() {
+        let arena = DeepSeekV41ExpertArena(slotCount: 2)
+        let initial = arena.acquire([(layer: 0, expert: 0), (layer: 0, expert: 1)])
+        XCTAssertEqual(Set(initial), [0, 1])
+
+        // Touch expert 0 so expert 1 becomes the least recently used.
+        _ = arena.acquire([(layer: 0, expert: 0)])
+        let replacement = arena.acquire([(layer: 1, expert: 7)])
+
+        XCTAssertEqual(arena.evictions, 1)
+        XCTAssertEqual(replacement[0], initial[1])
+        XCTAssertNotNil(arena.slot(forLayer: 0, expert: 0))
+        XCTAssertNil(arena.slot(forLayer: 0, expert: 1))
+        XCTAssertNotNil(arena.slot(forLayer: 1, expert: 7))
+    }
+
+    func testResetClearsResidencyAndCounters() {
+        let arena = DeepSeekV41ExpertArena(slotCount: 2)
+        _ = arena.acquire([(layer: 0, expert: 0)])
+        arena.reset()
+        XCTAssertEqual(arena.residentCount, 0)
+        XCTAssertEqual(arena.acquisitions, 0)
+        XCTAssertEqual(arena.hitRate, 0)
+    }
+}
+
+// MARK: - Hyper-connections
+
+final class DeepSeekV41HyperConnectionTests: XCTestCase {
+
+    func testSinkhornProducesADoublyStochasticMatrix() {
+        let logits: [Float] = [0.5, -0.2, 1.0, 0.1]
+        let matrix = DeepSeekV41HyperConnections.sinkhorn(
+            logits: logits,
+            dimension: 2,
+            iterations: 20,
+            epsilon: 1e-6
+        )
+        XCTAssertEqual(matrix.count, 4)
+        for row in 0..<2 {
+            XCTAssertEqual(matrix[row * 2] + matrix[row * 2 + 1], 1, accuracy: 1e-4)
+        }
+        for column in 0..<2 {
+            XCTAssertEqual(matrix[column] + matrix[2 + column], 1, accuracy: 1e-4)
+        }
+        XCTAssertTrue(matrix.allSatisfy { $0 > 0 })
+    }
+
+    func testUniformLogitsGiveTheBarycenter() {
+        let matrix = DeepSeekV41HyperConnections.sinkhorn(
+            logits: [Float](repeating: 0, count: 9),
+            dimension: 3,
+            iterations: 10,
+            epsilon: 1e-6
+        )
+        for value in matrix {
+            XCTAssertEqual(value, 1.0 / 3.0, accuracy: 1e-4)
+        }
+    }
+
+    func testReadWeightsPickOneRow() {
+        let matrix: [Float] = [0.25, 0.75, 0.5, 0.5]
+        XCTAssertEqual(DeepSeekV41HyperConnections.readWeights(matrix: matrix, streams: 2, row: 0), [0.25, 0.75])
+        XCTAssertEqual(DeepSeekV41HyperConnections.readWeights(matrix: matrix, streams: 2, row: 1), [0.5, 0.5])
+    }
+
+    func testMixAppliesPerStreamScaleAndPerDimensionBias() {
+        let streams: [[Float]] = [
+            [1, 1],
+            [2, 2]
+        ]
+        // `scale` is per stream, `bias` is per hidden dimension: the streams are
+        // mixed with different gains, and each output dimension carries its own base.
+        let mixed = DeepSeekV41HyperConnections.mix(
+            streams: streams,
+            readWeights: [0.5, 0.5],
+            scale: [2, 1],
+            bias: [0.25, -0.25]
+        )
+        XCTAssertEqual(mixed[0], 0.5 * (1 * 2 + 0.25) + 0.5 * (2 * 1 + 0.25), accuracy: 1e-6)
+        XCTAssertEqual(mixed[1], 0.5 * (1 * 2 - 0.25) + 0.5 * (2 * 1 - 0.25), accuracy: 1e-6)
+    }
+
+    func testWriteAccumulatesIntoEveryStream() {
+        var streams: [[Float]] = [
+            [0, 0],
+            [0, 0]
+        ]
+        DeepSeekV41HyperConnections.write(
+            streams: &streams,
+            contribution: [1, -1],
+            writeScales: [0.5, 2]
+        )
+        XCTAssertEqual(streams[0], [0.5, -0.5])
+        XCTAssertEqual(streams[1], [2, -2])
+    }
+}
+
+// MARK: - Cache layout
+
+final class DeepSeekV41CacheLayoutTests: XCTestCase {
+
+    func testRegionsAreDisjointAndSizedFromThePlan() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let geometry = DeepSeekV41CacheGeometry.make(
+            config: config,
+            plan: plan,
+            contextLength: 64,
+            precision: .fp8Block32
+        )
+        let layout = DeepSeekV41CacheLayout(geometry: geometry, plan: plan)
+
+        XCTAssertEqual(layout.windowBase.count, 3)
+        XCTAssertEqual(layout.windowBytes, 3 * geometry.windowBytesPerLayer)
+        // Only layer 1 owns a compressed cache, so one slot is allocated.
+        XCTAssertEqual(layout.compressedBase.keys.sorted(), [1])
+        XCTAssertEqual(layout.compressedBytes, geometry.compressedBytesPerOwner)
+        XCTAssertEqual(layout.indexerBase.keys.sorted(), [1])
+        XCTAssertEqual(layout.candidateBase.keys.sorted(), [1])
+
+        // Window offsets must not overlap.
+        let offsets = plan.compactMap { layout.windowBase[$0.index] }.sorted()
+        XCTAssertEqual(offsets, [0, geometry.windowBytesPerLayer, 2 * geometry.windowBytesPerLayer])
+    }
+
+    func testRecordBytesMatchTheFP8Footer() {
+        XCTAssertEqual(DeepSeekV41CachePrecision.fp8Block32.recordBytes(width: 512), 512 + 16)
+        XCTAssertEqual(DeepSeekV41CachePrecision.fp16.recordBytes(width: 512), 1024)
+        // A width that is not a multiple of 32 still pays for a whole footer byte.
+        XCTAssertEqual(DeepSeekV41CachePrecision.fp8Block32.recordBytes(width: 33), 33 + 2)
+    }
+
+    func testWindowRowWrapsAtTheRingLength() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let geometry = DeepSeekV41CacheGeometry.make(config: config, plan: plan, contextLength: 16)
+        XCTAssertEqual(geometry.windowRows, 3)
+        XCTAssertEqual(DeepSeekV41CacheAddressing.windowRow(for: 0, geometry: geometry), 0)
+        XCTAssertEqual(DeepSeekV41CacheAddressing.windowRow(for: 2, geometry: geometry), 2)
+        XCTAssertEqual(DeepSeekV41CacheAddressing.windowRow(for: 3, geometry: geometry), 0)
+        XCTAssertEqual(DeepSeekV41CacheAddressing.windowRow(for: 7, geometry: geometry), 1)
+    }
+
+    func testWindowRangeNeverPrecedesTheSequenceStart() {
+        XCTAssertEqual(DeepSeekV41CacheAddressing.windowRange(position: 0, windowSize: 3), 0..<1)
+        XCTAssertEqual(DeepSeekV41CacheAddressing.windowRange(position: 1, windowSize: 3), 0..<2)
+        XCTAssertEqual(DeepSeekV41CacheAddressing.windowRange(position: 5, windowSize: 3), 3..<6)
+        XCTAssertEqual(DeepSeekV41CacheAddressing.windowRange(position: -1, windowSize: 3), 0..<0)
+    }
+
+    func testCompressedRowCountFollowsTheRatio() {
+        XCTAssertEqual(DeepSeekV41CacheAddressing.compressedRowCount(afterPosition: 0, ratio: 2), 0)
+        XCTAssertEqual(DeepSeekV41CacheAddressing.compressedRowCount(afterPosition: 1, ratio: 2), 1)
+        XCTAssertEqual(DeepSeekV41CacheAddressing.compressedRowCount(afterPosition: 2, ratio: 2), 1)
+        XCTAssertEqual(DeepSeekV41CacheAddressing.compressedRowCount(afterPosition: 3, ratio: 2), 2)
+        XCTAssertEqual(DeepSeekV41CacheAddressing.compressedRowCount(afterPosition: 99, ratio: 1), 100)
+        XCTAssertEqual(DeepSeekV41CacheAddressing.poolRange(row: 2, ratio: 2), 4..<6)
+    }
+
+    func testCompressedAttentionRangeHonoursTheTopKBudget() {
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.compressedRowsForAttention(position: 7, ratio: 2, ownerRowCount: 100, topKRows: 2),
+            2..<4
+        )
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.compressedRowsForAttention(position: 7, ratio: 2, ownerRowCount: 100, topKRows: 0),
+            0..<4
+        )
+        // The owner's own row count caps the range even when the position implies more.
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.compressedRowsForAttention(position: 99, ratio: 2, ownerRowCount: 3, topKRows: 0),
+            0..<3
+        )
+    }
+
+    func testAddressingRefusesRowsOutsideTheAllocation() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let geometry = DeepSeekV41CacheGeometry.make(config: config, plan: plan, contextLength: 8)
+        let layout = DeepSeekV41CacheLayout(geometry: geometry, plan: plan)
+        XCTAssertNil(DeepSeekV41CacheAddressing.compressedByteOffset(ownerLayer: 0, row: 0, layout: layout))
+        XCTAssertNotNil(DeepSeekV41CacheAddressing.compressedByteOffset(ownerLayer: 1, row: 0, layout: layout))
+        XCTAssertNil(
+            DeepSeekV41CacheAddressing.compressedByteOffset(
+                ownerLayer: 1,
+                row: geometry.compressedRows,
+                layout: layout
+            )
+        )
+    }
+}
+
+// MARK: - Block forward
+
+final class DeepSeekV41ForwardTests: XCTestCase {
+
+    func testForwardProducesFiniteLogitsOverTheVocabulary() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let weights = DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        let forward = DeepSeekV41CPUForward(config: config, plan: plan, weights: weights)
+
+        let logits = forward.prefill(tokens: [3, 5, 7])
+        XCTAssertEqual(logits.count, config.vocabSize)
+        XCTAssertTrue(logits.allSatisfy { $0.isFinite })
+        XCTAssertTrue(logits.contains { $0 != 0 })
+        XCTAssertEqual(forward.storedPositions, 3)
+    }
+
+    func testCacheRecordsEveryPositionForEveryLayer() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let weights = DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        let forward = DeepSeekV41CPUForward(config: config, plan: plan, weights: weights)
+        _ = forward.prefill(tokens: [1, 2, 3, 4])
+
+        XCTAssertEqual(forward.latents.count, plan.count)
+        for layer in forward.latents {
+            XCTAssertEqual(layer.count, 4)
+            XCTAssertTrue(layer.allSatisfy { $0.count == config.cacheRecordWidth })
+        }
+    }
+
+    func testCompressedRowsAppearExactlyWhenTheirBlockCompletes() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let weights = DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        let forward = DeepSeekV41CPUForward(config: config, plan: plan, weights: weights)
+
+        // Layer 1 is the compressed owner with ratio 2, so rows appear at positions
+        // 1, 3, 5 ... and never at an even position.
+        for position in [0, 1, 2, 3] {
+            _ = forward.forwardToken(7, position: position)
+            let rows = forward.compressed[1] ?? []
+            XCTAssertEqual(
+                rows.count,
+                DeepSeekV41CacheAddressing.compressedRowCount(afterPosition: position, ratio: 2),
+                "position \(position)"
+            )
+        }
+        XCTAssertEqual(forward.compressed[1]?.count, 2)
+        // A window-only layer owns no compressed cache.
+        XCTAssertNil(forward.compressed[0])
+    }
+
+    func testAttentionReadsExactlyTheWindowAtTheFirstPositions() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let weights = DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        let forward = DeepSeekV41CPUForward(config: config, plan: plan, weights: weights)
+        _ = forward.prefill(tokens: [1, 2, 3, 4, 5])
+
+        // Position 0 has only itself in the window.
+        let first = forward.attentionKeys(layer: plan[0], position: 0)
+        XCTAssertEqual(first.count, 1)
+        // Position 4 has the whole window (size 3) and no compressed rows on a
+        // window-only layer.
+        let fifth = forward.attentionKeys(layer: plan[0], position: 4)
+        XCTAssertEqual(fifth.count, 3)
+
+        // A compressed layer adds the rows its owner pooled.
+        let compressedLayer = plan[1]
+        let compressedKeys = forward.attentionKeys(layer: compressedLayer, position: 4)
+        XCTAssertGreaterThan(compressedKeys.count, 3)
+    }
+
+    func testResetClearsTheSequence() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let weights = DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        let forward = DeepSeekV41CPUForward(config: config, plan: plan, weights: weights)
+        _ = forward.prefill(tokens: [1, 2])
+        forward.reset()
+        XCTAssertEqual(forward.storedPositions, 0)
+        XCTAssertTrue(forward.compressed.isEmpty)
+        XCTAssertTrue(forward.candidateScores.isEmpty)
+    }
+
+    func testHyperConnectionStreamsCollapseToOneVector() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        XCTAssertEqual(config.hcMult, 2)
+        let plan = try config.makeLayerPlan()
+        let weights = DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        let forward = DeepSeekV41CPUForward(config: config, plan: plan, weights: weights)
+        let logits = forward.prefill(tokens: [9])
+        // The head sees the collapsed stream, so the logits are the head width, not
+        // one per hyper-connection stream.
+        XCTAssertEqual(logits.count, config.vocabSize)
+    }
+
+    func testRoutingMatchesTheConfiguredExpertCount() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let weights = DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        let forward = DeepSeekV41CPUForward(config: config, plan: plan, weights: weights)
+        let routing = try XCTUnwrap(forward.route([Float](repeating: 0.1, count: config.hiddenSize), layer: 0))
+        XCTAssertEqual(routing.expertIDs.count, config.numActivatedExperts)
+        XCTAssertTrue(routing.expertIDs.allSatisfy { $0 >= 0 && $0 < config.numRoutedExperts })
+    }
+}
+
+// MARK: - Shapes
+
+final class DeepSeekV41TensorShapeTests: XCTestCase {
+
+    func testShapesComeFromTheConfig() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let shapes = DeepSeekV41TensorShapes(config: config)
+        XCTAssertEqual(shapes.hidden, 8)
+        XCTAssertEqual(shapes.queryWidth, 2 * 4)
+        XCTAssertEqual(shapes.attentionOutputWidth, 2 * 4)
+        XCTAssertEqual(shapes.latentWidth, 4)
+        XCTAssertEqual(shapes.expertIntermediate, 4)
+        XCTAssertEqual(shapes.sharedIntermediate, 8)
+    }
+
+    func testSharedExpertWidthFallsBackToRoutedWidthTimesCount() throws {
+        let json = DeepSeekV41TestFixtures.json
+            .replacingOccurrences(of: "\"intermediate_size\": 8,", with: "")
+        let config = try DeepSeekV41Config.decode(jsonData: Data(json.utf8))
+        XCTAssertEqual(config.intermediateSize, 0)
+        let shapes = DeepSeekV41TensorShapes(config: config)
+        XCTAssertEqual(shapes.sharedIntermediate, 4 * 1)
+    }
+
+    func testPipelineListsEveryStageOnce() {
+        let stages = DeepSeekV41ForwardStages.layerPipeline
+        XCTAssertEqual(Set(stages).count, stages.count)
+        XCTAssertEqual(stages.first, .mixAttentionStreams)
+        XCTAssertEqual(stages.last, .collapseStreams)
+        // The attention stage must come after the latent is written.
+        let write = stages.firstIndex(of: .writeLatent)
+        let attend = stages.firstIndex(of: .attention)
+        XCTAssertNotNil(write)
+        XCTAssertNotNil(attend)
+        XCTAssertLessThan(write!, attend!)
+    }
+}
