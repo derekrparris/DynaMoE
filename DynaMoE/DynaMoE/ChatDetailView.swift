@@ -5,6 +5,8 @@
 
 import SwiftUI
 import AppKit
+import ImageIO
+import UniformTypeIdentifiers
 
 // Memoization note: several views below keep parse, cleanup, or highlight
 // results in a `@State`-held reference type and refresh it in place from
@@ -47,6 +49,11 @@ struct ChatDetailView: View {
     /// Whether the model's chat template exposes graded thinking levels
     /// (Spark X2.6's `reasoning_effort`). When false, the plain On/Off menu shows.
     var supportsThinkingLevels: Bool = false
+    /// Whether the active model can be sent images. Cloud models opt in per model
+    /// in Settings; local weights report false because the engine has no vision
+    /// tower, and the composer refuses an attachment rather than sending pixels
+    /// that would be silently dropped.
+    var supportsVision: Bool = false
     var isAgentToolsEnabled: Bool = true
     var isModelLoaded: Bool = true
     var isAppleFoundationModelActive: Bool = false
@@ -60,10 +67,10 @@ struct ChatDetailView: View {
     private var isPlainChatOnlyBackend: Bool {
         isAppleFoundationModelActive
     }
-    var onSendMessage: (String) -> Bool
+    var onSendMessage: (String, [PreparedImage]) -> Bool
     var onStopGeneration: () -> Void
-    var onQueuePrompt: ((String) -> Bool)? = nil
-    var onSendImmediate: ((String) async -> Bool)? = nil
+    var onQueuePrompt: ((String, [PreparedImage]) -> Bool)? = nil
+    var onSendImmediate: ((String, [PreparedImage]) async -> Bool)? = nil
     var onRemoveQueuedPrompt: ((UUID) -> Void)? = nil
     var onSelectDiscoveredModel: ((DiscoveredModel) -> Void)? = nil
     var onOpenSettings: (() -> Void)? = nil
@@ -102,6 +109,16 @@ struct ChatDetailView: View {
     /// Queued prompts with an in-flight "Send Now", so re-activating the same
     /// row cannot launch two tasks for it.
     @State private var sendingQueuedIds: Set<UUID> = []
+    /// Images staged in the composer, not yet persisted. They become
+    /// `ImageAttachmentRef`s only when a send is accepted, so a draft the user
+    /// abandons leaves nothing on disk.
+    @State private var pendingImages: [PreparedImage] = []
+    /// Why the last attachment attempt failed, shown under the chips.
+    @State private var attachmentError: String? = nil
+    /// True while an attachment is being decoded/downscaled, so the composer can
+    /// say so instead of appearing to ignore the drop.
+    @State private var isPreparingAttachment = false
+    @State private var isAttachmentDropTargeted = false
 
     /// Distance-from-bottom bookkeeping for the pin/detach logic.
     private struct ScrollSnapshot: Equatable {
@@ -534,12 +551,23 @@ struct ChatDetailView: View {
 
                         ForEach(queued) { item in
                             HStack(spacing: 8) {
-                                Text(item.text)
-                                    .font(.system(size: max(10, 12 * zoomManager.zoomScale)))
-                                    .foregroundColor(.primary)
-                                    .lineLimit(2)
-                                    .truncationMode(.tail)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(item.text)
+                                        .font(.system(size: max(10, 12 * zoomManager.zoomScale)))
+                                        .foregroundColor(.primary)
+                                        .lineLimit(2)
+                                        .truncationMode(.tail)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                    if let count = item.attachments?.count, count > 0 {
+                                        Label(
+                                            "\(count) image\(count == 1 ? "" : "s")",
+                                            systemImage: "photo"
+                                        )
+                                        .font(.system(size: max(8.5, 9.5 * zoomManager.zoomScale), weight: .medium))
+                                        .foregroundColor(.secondary)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
 
                                 HStack(spacing: 6) {
                                     Button(action: {
@@ -551,22 +579,31 @@ struct ChatDetailView: View {
                                         // be sent twice.
                                         guard !sendingQueuedIds.contains(item.id) else { return }
                                         sendingQueuedIds.insert(item.id)
+                                        let queuedRefs = item.attachments ?? []
                                         if let immediate = onSendImmediate {
                                             // Only drop the queued prompt once the
                                             // send actually lands, so a rejected
                                             // send (no model, still loading) does
                                             // not lose it.
                                             Task {
-                                                if await immediate(textToSend) {
+                                                let queuedImages = await Task.detached(priority: .userInitiated) {
+                                                    ImageAttachmentStore.shared.preparedImages(for: queuedRefs)
+                                                }.value
+                                                if await immediate(textToSend, queuedImages) {
                                                     onRemoveQueuedPrompt?(item.id)
                                                 }
                                                 sendingQueuedIds.remove(item.id)
                                             }
                                         } else {
-                                            if onSendMessage(textToSend) {
-                                                onRemoveQueuedPrompt?(item.id)
+                                            Task {
+                                                let queuedImages = await Task.detached(priority: .userInitiated) {
+                                                    ImageAttachmentStore.shared.preparedImages(for: queuedRefs)
+                                                }.value
+                                                if onSendMessage(textToSend, queuedImages) {
+                                                    onRemoveQueuedPrompt?(item.id)
+                                                }
+                                                sendingQueuedIds.remove(item.id)
                                             }
-                                            sendingQueuedIds.remove(item.id)
                                         }
                                     }) {
                                         HStack(spacing: 3) {
@@ -587,7 +624,18 @@ struct ChatDetailView: View {
 
                                     Button(action: {
                                         promptText = item.text
-                                        onRemoveQueuedPrompt?(item.id)
+                                        attachmentError = nil
+                                        // Read the bytes before dropping the queue
+                                        // entry: removal now deletes the assets, so
+                                        // pulling the prompt back must copy first.
+                                        let queuedRefs = item.attachments ?? []
+                                        Task {
+                                            let images = await Task.detached(priority: .userInitiated) {
+                                                ImageAttachmentStore.shared.preparedImages(for: queuedRefs)
+                                            }.value
+                                            pendingImages = images
+                                            onRemoveQueuedPrompt?(item.id)
+                                        }
                                     }) {
                                         Image(systemName: "pencil")
                                             .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
@@ -641,6 +689,9 @@ struct ChatDetailView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 6) {
+                    if !pendingImages.isEmpty || attachmentError != nil || isPreparingAttachment {
+                        attachmentChipsRow()
+                    }
                     // Multi-line Expanding Input
                     MacTextEditor(
                         text: $promptText,
@@ -648,18 +699,22 @@ struct ChatDetailView: View {
                         zoomScale: zoomManager.zoomScale,
                         onCommit: {
                             let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
-                            guard !trimmed.isEmpty else { return }
+                            guard !trimmed.isEmpty || !pendingImages.isEmpty else { return }
                             let accepted: Bool
                             if isGenerating {
-                                accepted = onQueuePrompt?(trimmed) ?? onSendMessage(trimmed)
+                                accepted = onQueuePrompt?(trimmed, pendingImages) ?? onSendMessage(trimmed, pendingImages)
                             } else {
-                                accepted = onSendMessage(trimmed)
+                                accepted = onSendMessage(trimmed, pendingImages)
                             }
-                            if accepted { promptText = "" }
+                            if accepted {
+                                promptText = ""
+                                clearAttachments()
+                            }
                         },
                         onCommitImmediate: {
                             submitImmediateDraft()
-                        }
+                        },
+                        onPasteImage: { handlePasteboardImage() }
                     )
                     .frame(minHeight: composerMinHeight, maxHeight: max(100, 140 * zoomManager.zoomScale))
                     .padding(.horizontal, 4)
@@ -667,17 +722,32 @@ struct ChatDetailView: View {
                     
                     // Bottom Controls Bar inside the floating card
                     HStack(spacing: 8) {
-                        // Attachment / Plus Button
-                        Button(action: {}) {
-                            Image(systemName: "plus")
+                        // Attachment menu
+                        Menu {
+                            Button(action: presentAttachmentPicker) {
+                                Label("Attach Image…", systemImage: "photo.badge.plus")
+                            }
+                            Button(action: { _ = handlePasteboardImage() }) {
+                                Label("Attach from Clipboard", systemImage: "doc.on.clipboard")
+                            }
+                            if !pendingImages.isEmpty {
+                                Divider()
+                                Button(role: .destructive, action: clearAttachments) {
+                                    Label("Remove All Attachments", systemImage: "trash")
+                                }
+                            }
+                        } label: {
+                            Image(systemName: pendingImages.isEmpty ? "plus" : "plus.circle.fill")
                                 .font(.system(size: max(10, 12 * zoomManager.zoomScale), weight: .medium))
-                                .foregroundColor(.secondary)
+                                .foregroundColor(supportsVision ? .secondary : .secondary.opacity(0.5))
                                 .frame(width: max(20, 24 * zoomManager.zoomScale), height: max(20, 24 * zoomManager.zoomScale))
                                 .background(Color.secondary.opacity(0.08))
                                 .clipShape(Circle())
                         }
-                        .buttonStyle(.plain)
-                        .help("Attach context or files")
+                        .menuStyle(.borderlessButton)
+                        .menuIndicator(.hidden)
+                        .fixedSize()
+                        .help(supportsVision ? "Attach images (or paste / drop them)" : "The selected model cannot see images")
 
                         // Antigravity-Style Model Selector Menu
                         Menu {
@@ -993,17 +1063,20 @@ struct ChatDetailView: View {
                         // Send / Stop / Queue Buttons
                         if isGenerating {
                             HStack(spacing: 8) {
-                                if !promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                if !promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pendingImages.isEmpty {
                                     Button(action: {
                                         let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
-                                        guard !trimmed.isEmpty else { return }
+                                        guard !trimmed.isEmpty || !pendingImages.isEmpty else { return }
                                         let accepted: Bool
                                         if let queueAction = onQueuePrompt {
-                                            accepted = queueAction(trimmed)
+                                            accepted = queueAction(trimmed, pendingImages)
                                         } else {
-                                            accepted = onSendMessage(trimmed)
+                                            accepted = onSendMessage(trimmed, pendingImages)
                                         }
-                                        if accepted { promptText = "" }
+                                        if accepted {
+                                            promptText = ""
+                                            clearAttachments()
+                                        }
                                     }) {
                                         Image(systemName: "tray.and.arrow.down.fill")
                                             .font(.system(size: max(11, 14 * zoomManager.zoomScale), weight: .semibold))
@@ -1043,8 +1116,11 @@ struct ChatDetailView: View {
                             let draftIsCommand = ChatCommand.parse(promptText) != nil
                             Button(action: {
                                 let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
-                                if !trimmed.isEmpty && (isModelLoaded || ChatCommand.parse(trimmed) != nil) {
-                                    if onSendMessage(trimmed) { promptText = "" }
+                                if (!trimmed.isEmpty || !pendingImages.isEmpty) && (isModelLoaded || ChatCommand.parse(trimmed) != nil) {
+                                    if onSendMessage(trimmed, pendingImages) {
+                                        promptText = ""
+                                        clearAttachments()
+                                    }
                                 }
                             }) {
                                 Image(systemName: "arrow.right.circle.fill")
@@ -1052,7 +1128,7 @@ struct ChatDetailView: View {
                                     .foregroundColor(promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (!isModelLoaded && !draftIsCommand) ? .secondary.opacity(0.3) : .purple)
                             }
                             .buttonStyle(.plain)
-                            .disabled(promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (!isModelLoaded && !draftIsCommand))
+                            .disabled((promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && pendingImages.isEmpty) || (!isModelLoaded && !draftIsCommand))
                             .help(isModelLoaded || draftIsCommand ? "Send Message" : "Load a model first")
                         }
                     }
@@ -1062,7 +1138,17 @@ struct ChatDetailView: View {
                 .cornerRadius(18)
                 .overlay(
                     RoundedRectangle(cornerRadius: 18)
-                        .stroke(Color.primary.opacity(0.09), lineWidth: 1)
+                        .stroke(
+                            isAttachmentDropTargeted && supportsVision
+                                ? Color.purple.opacity(0.65)
+                                : Color.primary.opacity(0.09),
+                            lineWidth: isAttachmentDropTargeted && supportsVision ? 2 : 1
+                        )
+                )
+                .onDrop(
+                    of: [UTType.fileURL, UTType.image],
+                    isTargeted: $isAttachmentDropTargeted,
+                    perform: handleAttachmentDrop
                 )
                 .shadow(color: Color.black.opacity(0.06), radius: 10, x: 0, y: 4)
                 .frame(maxWidth: max(600, 800 * zoomManager.zoomScale))
@@ -1090,6 +1176,7 @@ struct ChatDetailView: View {
         .onChange(of: promptText) { newText in
             draftRevision &+= 1
             updateTokenCount(for: newText)
+            detectTypedImagePaths(in: newText)
         }
         .onChange(of: tokenizer != nil) { _ in
             updateTokenCount(for: promptText)
@@ -1102,9 +1189,13 @@ struct ChatDetailView: View {
     /// without this guard the same draft would be queued twice.
     private func submitImmediateDraft() {
         let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, pendingImmediateSend == nil else { return }
+        guard (!trimmed.isEmpty || !pendingImages.isEmpty), pendingImmediateSend == nil else { return }
+        let imagesToSend = pendingImages
         guard let immediate = onSendImmediate else {
-            if onSendMessage(trimmed) { promptText = "" }
+            if onSendMessage(trimmed, imagesToSend) {
+                promptText = ""
+                clearAttachments()
+            }
             return
         }
         // Capture the submitted draft so a newer edit made while the send is in
@@ -1115,11 +1206,211 @@ struct ChatDetailView: View {
         let submittedRevision = draftRevision
         pendingImmediateSend = submitted
         Task {
-            if await immediate(trimmed), draftRevision == submittedRevision {
+            if await immediate(trimmed, imagesToSend), draftRevision == submittedRevision {
                 promptText = ""
+                clearAttachments()
             }
             if pendingImmediateSend == submitted {
                 pendingImmediateSend = nil
+            }
+        }
+    }
+
+    // MARK: - Image Attachments
+
+    /// Stages an image in the composer. Only a send persists it, so an abandoned
+    /// draft leaves nothing on disk.
+    private func stageAttachment(_ image: PreparedImage) {
+        guard supportsVision else {
+            attachmentError = "This model cannot see images. Switch to a vision-capable model to attach one."
+            return
+        }
+        guard pendingImages.count < ImageAttachmentPreparer.maxImagesPerMessage else {
+            attachmentError = ImageAttachmentError.tooManyImages(
+                limit: ImageAttachmentPreparer.maxImagesPerMessage
+            ).errorDescription
+            return
+        }
+        // The same picture dropped twice is one attachment, not two billed ones.
+        guard !pendingImages.contains(where: { $0.sha256 == image.sha256 }) else { return }
+        pendingImages.append(image)
+        attachmentError = nil
+    }
+
+    private func attachFile(at url: URL) async {
+        guard supportsVision else {
+            attachmentError = "This model cannot see images. Switch to a vision-capable model to attach one."
+            return
+        }
+        isPreparingAttachment = true
+        defer { isPreparingAttachment = false }
+        do {
+            let prepared = try await Task.detached(priority: .userInitiated) {
+                try ImageAttachmentPreparer.prepare(fileURL: url)
+            }.value
+            stageAttachment(prepared)
+        } catch {
+            attachmentError = error.localizedDescription
+        }
+    }
+
+    private func attachImageData(_ data: Data, fileName: String) async {
+        guard supportsVision else {
+            attachmentError = "This model cannot see images. Switch to a vision-capable model to attach one."
+            return
+        }
+        isPreparingAttachment = true
+        defer { isPreparingAttachment = false }
+        do {
+            let prepared = try await Task.detached(priority: .userInitiated) {
+                try ImageAttachmentPreparer.prepare(data: data, fileName: fileName)
+            }.value
+            stageAttachment(prepared)
+        } catch {
+            attachmentError = error.localizedDescription
+        }
+    }
+
+    /// Intercepts an image paste so raw TIFF/PNG bytes never land in the text
+    /// view. Returns true when the pasteboard held an image and was consumed.
+    private func handlePasteboardImage() -> Bool {
+        let pasteboard = NSPasteboard.general
+        if let data = pasteboard.data(forType: .png) ?? pasteboard.data(forType: .tiff) {
+            Task { await attachImageData(data, fileName: "Pasted image") }
+            return true
+        }
+        let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] ?? []
+        if let url = urls.first(where: { ImageAttachmentPreparer.isAttachableImageFile(atPath: $0.path) }) {
+            Task { await attachFile(at: url) }
+            return true
+        }
+        return false
+    }
+
+    private func handleAttachmentDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard supportsVision else {
+            attachmentError = "This model cannot see images. Switch to a vision-capable model to attach one."
+            return true
+        }
+        var claimed = false
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                claimed = true
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                    var url: URL?
+                    if let data = item as? Data {
+                        url = URL(dataRepresentation: data, relativeTo: nil)
+                    } else if let itemURL = item as? URL {
+                        url = itemURL
+                    }
+                    guard let url else { return }
+                    Task { @MainActor in
+                        await attachFile(at: url)
+                    }
+                }
+            } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                claimed = true
+                provider.loadDataRepresentation(forTypeIdentifier: UTType.image.identifier) { data, _ in
+                    guard let data else { return }
+                    Task { @MainActor in
+                        await attachImageData(data, fileName: "Dropped image")
+                    }
+                }
+            }
+        }
+        return claimed
+    }
+
+    private func presentAttachmentPicker() {
+        let panel = NSOpenPanel()
+        panel.title = "Attach Images"
+        panel.message = "Choose one or more images to send with this message."
+        panel.allowedContentTypes = [.png, .jpeg, .heic, .tiff, .gif, .webP, .bmp]
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK else { return }
+        for url in panel.urls {
+            Task { await attachFile(at: url) }
+        }
+    }
+
+    /// Converts a typed absolute path into an attachment. Typing the path is the
+    /// "provide a filepath" affordance: the app reads the file itself because the
+    /// model can never open one (the agent's file tool refuses binary).
+    private func detectTypedImagePaths(in text: String) {
+        guard supportsVision else { return }
+        let candidates = ImageAttachmentPreparer.imageFilePathCandidates(in: text)
+        guard let path = candidates.first(where: { ImageAttachmentPreparer.isAttachableImageFile(atPath: $0) }) else {
+            return
+        }
+        if let range = text.range(of: path) {
+            promptText = text.replacingCharacters(in: range, with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        Task { await attachFile(at: URL(fileURLWithPath: path)) }
+    }
+
+    private func clearAttachments() {
+        pendingImages.removeAll()
+        attachmentError = nil
+    }
+
+    private func attachmentChipsRow() -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(pendingImages.indices, id: \.self) { index in
+                        let image = pendingImages[index]
+                        HStack(spacing: 6) {
+                            AttachmentChipThumbnail(image: image)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(image.fileName)
+                                    .font(.system(size: max(9, 10.5 * zoomManager.zoomScale), weight: .semibold))
+                                    .lineLimit(1)
+                                Text("\(image.pixelWidth)×\(image.pixelHeight) · \(ByteCountFormatter.string(fromByteCount: Int64(image.byteCount), countStyle: .file))")
+                                    .font(.system(size: max(8, 9.5 * zoomManager.zoomScale), design: .monospaced))
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                            }
+                            Button {
+                                guard pendingImages.indices.contains(index) else { return }
+                                pendingImages.remove(at: index)
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
+                                    .foregroundColor(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Remove attachment")
+                        }
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 5)
+                        .background(Color.secondary.opacity(0.08))
+                        .cornerRadius(8)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(supportsVision ? Color.purple.opacity(0.25) : Color.orange.opacity(0.5), lineWidth: 1)
+                        )
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if !supportsVision {
+                Label("This model cannot see images.", systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: max(9, 10.5 * zoomManager.zoomScale), weight: .medium))
+                    .foregroundColor(.orange)
+            }
+            if isPreparingAttachment {
+                Text("Preparing image…")
+                    .font(.system(size: max(9, 10.5 * zoomManager.zoomScale)))
+                    .foregroundColor(.secondary)
+            }
+            if let attachmentError {
+                Text(attachmentError)
+                    .font(.system(size: max(9, 10.5 * zoomManager.zoomScale), weight: .medium))
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -1159,6 +1450,14 @@ struct ChatDetailView: View {
 final class ComposerTextView: NSTextView {
     var onCommit: (() -> Void)?
     var onCommitImmediate: (() -> Void)?
+    /// Consumes an image paste before the text view inserts anything. Returning
+    /// true means the pasteboard held an image and was handled.
+    var onPasteImage: (() -> Bool)?
+
+    override func paste(_ sender: Any?) {
+        if let onPasteImage, onPasteImage() { return }
+        super.paste(sender)
+    }
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 36 && !hasMarkedText() { // Return key
@@ -1193,6 +1492,7 @@ struct MacTextEditor: NSViewRepresentable {
     var zoomScale: CGFloat = 1.0
     var onCommit: () -> Void
     var onCommitImmediate: (() -> Void)? = nil
+    var onPasteImage: (() -> Bool)? = nil
 
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
@@ -1216,6 +1516,7 @@ struct MacTextEditor: NSViewRepresentable {
         textView.delegate = context.coordinator
         textView.onCommit = onCommit
         textView.onCommitImmediate = onCommitImmediate
+        textView.onPasteImage = onPasteImage
         textView.font = .systemFont(ofSize: max(10, 13.5 * zoomScale))
         textView.isRichText = false
         textView.drawsBackground = false
@@ -1237,6 +1538,7 @@ struct MacTextEditor: NSViewRepresentable {
         guard let textView = nsView.documentView as? ComposerTextView else { return }
         textView.onCommit = onCommit
         textView.onCommitImmediate = onCommitImmediate
+        textView.onPasteImage = onPasteImage
         if textView.string != text {
             textView.string = text
         }
@@ -1399,6 +1701,110 @@ struct ChunkedText: View {
 }
 
 // MARK: - Single Message Bubble View
+// MARK: - Attachment Thumbnails
+
+/// A composer chip's preview, decoded once per image rather than on every frame:
+/// the composer re-renders on every streamed chunk of the transcript.
+struct AttachmentChipThumbnail: View {
+    let image: PreparedImage
+    @State private var thumbnail: NSImage?
+
+    var body: some View {
+        Group {
+            if let thumbnail {
+                Image(nsImage: thumbnail)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(Color.secondary.opacity(0.15))
+                    .overlay(
+                        Image(systemName: "photo")
+                            .font(.system(size: 9))
+                            .foregroundColor(.secondary)
+                    )
+            }
+        }
+        .frame(width: 30, height: 30)
+        .clipShape(RoundedRectangle(cornerRadius: 5))
+        .task(id: image.sha256) {
+            if thumbnail == nil {
+                thumbnail = NSImage(data: image.data)
+            }
+        }
+    }
+}
+
+/// Thumbnails for a sent message's attachments. Bytes are read from the asset
+/// store once per message and downscaled for display; a ref whose file was
+/// pruned (retention, a removed asset folder) shows a photo placeholder instead
+/// of a broken view.
+struct TranscriptAttachmentStrip: View {
+    let attachments: [ImageAttachmentRef]
+    @State private var thumbnails: [UUID: NSImage] = [:]
+
+    private static func displayImage(from data: Data, maxPixelSize: CGFloat) -> NSImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            return nil
+        }
+        return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 6) {
+            ForEach(attachments) { ref in
+                Button {
+                    if let url = ImageAttachmentStore.shared.absoluteURL(for: ref) {
+                        NSWorkspace.shared.open(url)
+                    }
+                } label: {
+                    Group {
+                        if let image = thumbnails[ref.id] {
+                            Image(nsImage: image)
+                                .resizable()
+                                .scaledToFill()
+                        } else {
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(Color.secondary.opacity(0.12))
+                                .overlay(
+                                    Image(systemName: "photo")
+                                        .font(.system(size: 12))
+                                        .foregroundColor(.secondary)
+                                )
+                        }
+                    }
+                    .frame(width: 104, height: 78)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+                    )
+                }
+                .buttonStyle(.plain)
+                .help("\(ref.fileName) — \(ref.pixelWidth)×\(ref.pixelHeight), click to open")
+            }
+        }
+        .task(id: attachments.map(\.sha256).joined(separator: "|")) {
+            var loaded: [UUID: NSImage] = [:]
+            for ref in attachments {
+                let data = await Task.detached(priority: .utility) {
+                    ImageAttachmentStore.shared.data(for: ref)
+                }.value
+                if let data, let image = Self.displayImage(from: data, maxPixelSize: 208) {
+                    loaded[ref.id] = image
+                }
+            }
+            thumbnails = loaded
+        }
+    }
+}
+
 struct ChatMessageView: View {
     @EnvironmentObject private var zoomManager: AppZoomManager
     let message: ChatMessage
@@ -1548,15 +1954,25 @@ struct ChatMessageView: View {
                 if message.role == .user {
                     HStack {
                         Spacer(minLength: 40)
-                        ChunkedText(text: message.content, lineSpacing: 3)
-                            .font(.system(size: max(9, 14 * zoomManager.zoomScale)))
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 10)
-                            .background(Color.purple.opacity(0.18))
-                            .foregroundColor(.primary)
-                            .cornerRadius(14)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
+                        VStack(alignment: .trailing, spacing: 6) {
+                            if let attachments = message.attachments, !attachments.isEmpty {
+                                TranscriptAttachmentStrip(attachments: attachments)
+                            }
+                            // An image-only turn has no text bubble at all; an
+                            // empty padded bubble under the pictures reads as a
+                            // rendering bug.
+                            if !message.content.isEmpty {
+                                ChunkedText(text: message.content, lineSpacing: 3)
+                                    .font(.system(size: max(9, 14 * zoomManager.zoomScale)))
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 10)
+                                    .background(Color.purple.opacity(0.18))
+                                    .foregroundColor(.primary)
+                                    .cornerRadius(14)
+                                    .textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
                     }
                 } else {
                     // Assistant Thinking / Reasoning Accordion (Osaurus Style)

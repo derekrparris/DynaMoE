@@ -557,6 +557,90 @@ struct ContentView: View {
         return supportsThinkingLevels(modelPath: session?.selectedModelPath, modelId: session?.selectedModelId)
     }
 
+    /// Whether the active model can be sent images. Cloud providers opt in per
+    /// model in Settings; local weights always report false today because the
+    /// engine has no vision tower, and a false value makes the composer refuse
+    /// an attachment instead of sending pixels that would be silently dropped.
+    var activeModelSupportsVision: Bool {
+        supportsVision(for: activeSessionBinding.wrappedValue)
+    }
+
+    /// Vision capability for one conversation's model, resolved from that
+    /// conversation: an async send may resume after the user switched chats.
+    private func supportsVision(for session: ChatSession?) -> Bool {
+        guard let session else { return false }
+        let selectedId = session.selectedModelId ?? ""
+        let selectedPath = session.selectedModelPath ?? ""
+        if let model = localModelManager.discoveredModels.first(where: {
+            $0.id == selectedId || $0.snapshotPath == selectedPath
+        }) {
+            return model.supportsVision
+        }
+        // A restored cloud selection whose registry entry is absent still needs a
+        // verdict; resolve it from the persisted list so a re-registered model
+        // stays usable.
+        if let resolved = cloudModelResolution(for: session) {
+            return CloudModelRegistry.modelIdsWithVisionSupport(for: resolved.provider)
+                .contains(resolved.providerModelId)
+        }
+        return false
+    }
+
+    /// Mirrors a provider's own image rejection into the in-memory model list so
+    /// the composer's attachment gate flips immediately, without waiting for the
+    /// next scan.
+    private func applyVisionCapabilityChange(
+        provider: CloudProvider,
+        providerModelId: String,
+        supported: Bool
+    ) {
+        let id = CloudModelAddress.modelId(providerId: provider.id, providerModelId: providerModelId)
+        guard let idx = localModelManager.discoveredModels.firstIndex(where: { $0.id == id }) else { return }
+        localModelManager.discoveredModels[idx].supportsVision = supported
+    }
+
+    /// Whether a cloud model accepts images. The discovered entry mirrors the
+    /// registry, but a restored conversation can outlive a rescan, so the
+    /// persisted list is the fallback.
+    private func visionSupport(forProvider provider: CloudProvider, providerModelId: String) -> Bool {
+        let id = CloudModelAddress.modelId(providerId: provider.id, providerModelId: providerModelId)
+        if let model = localModelManager.discoveredModels.first(where: { $0.id == id }) {
+            return model.supportsVision
+        }
+        return CloudModelRegistry.modelIdsWithVisionSupport(for: provider).contains(providerModelId)
+    }
+
+    /// Local weights and the Apple Foundation Model have no vision tower, so a
+    /// historical user turn that carried images renders a metadata-only notice
+    /// instead of losing the picture silently. Mirrors the cloud assembler's
+    /// omission policy so switching a conversation to local weights is honest.
+    private static func localAttachmentNotice(for message: ChatMessage) -> String {
+        guard let count = message.attachments?.count, count > 0 else { return "" }
+        return "\n\n" + CloudMessageAssembler.omittedImagesNotice(
+            count: count,
+            reason: "model has no vision support"
+        )
+    }
+
+    /// Reads each attached image once and encodes it as an `image_url` data URL.
+    /// Runs off the main actor: a 4 MB PNG becomes ~5.3 MB of base64, and the
+    /// cloud loop re-assembles its message history on every agent step.
+    private nonisolated static func buildImageDataURLs(for messages: [ChatMessage]) -> [UUID: [String]] {
+        var payload: [UUID: [String]] = [:]
+        let store = ImageAttachmentStore.shared
+        for message in messages {
+            guard let refs = message.attachments, !refs.isEmpty else { continue }
+            let urls = refs.compactMap { ref -> String? in
+                guard let data = store.data(for: ref) else { return nil }
+                return PreparedImage.dataURL(mimeType: ref.mimeType, data: data)
+            }
+            if !urls.isEmpty {
+                payload[message.id] = urls
+            }
+        }
+        return payload
+    }
+
     /// Graded thinking level shown selected in the chat menu: the conversation's
     /// choice or the clamped app default. Only meaningful for level-capable models.
     var thinkingEffortForActiveSession: ThinkingEffort {
@@ -1186,14 +1270,44 @@ struct ContentView: View {
             limit: chatRetentionLimitOrNil,
             protectedIds: chatRetentionProtectedIds
         )
-        guard !plan.removed.isEmpty else { return }
-
-        let removedIds = plan.removed.map(\.id)
-        sessions = plan.kept
-        if let selected = selectedSessionId, removedIds.contains(selected) {
-            selectedSessionId = sessions.first?.id
+        if !plan.removed.isEmpty {
+            let removedIds = plan.removed.map(\.id)
+            sessions = plan.kept
+            if let selected = selectedSessionId, removedIds.contains(selected) {
+                selectedSessionId = sessions.first?.id
+            }
+            ChatSessionStore.shared.delete(sessionIds: removedIds)
+            ImageAttachmentStore.shared.delete(sessionIds: removedIds)
         }
-        ChatSessionStore.shared.delete(sessionIds: removedIds)
+        // Run the orphan pass on every retention sweep, not only when a
+        // conversation was evicted: deleting a message or a queued prompt by hand
+        // also orphans assets, and gating this on `plan.removed` let those bytes
+        // survive indefinitely. The pass reads only the live refs, so an empty
+        // plan still removes exactly what nothing references.
+        ImageAttachmentStore.shared.prune(
+            liveSessionIds: Set(sessions.map(\.id)),
+            liveRelativePaths: Self.attachmentRelativePaths(in: sessions)
+        )
+    }
+
+    /// Every asset path a live conversation still references, for the attachment
+    /// store's orphan pass. Queued prompts count: their images are already on
+    /// disk waiting for the turn that will send them.
+    private static func attachmentRelativePaths(in sessions: [ChatSession]) -> Set<String> {
+        var paths: Set<String> = []
+        for session in sessions {
+            for message in session.messages {
+                for ref in message.attachments ?? [] {
+                    paths.insert(ref.relativePath)
+                }
+            }
+            for prompt in session.queuedPrompts {
+                for ref in prompt.attachments ?? [] {
+                    paths.insert(ref.relativePath)
+                }
+            }
+        }
+        return paths
     }
 
     /// Sessions retention must never evict: the one the user is viewing and the
@@ -1323,6 +1437,11 @@ struct ContentView: View {
                     onDeleteSession: { id in
                         PrefixCacheManager.shared.invalidate(sessionId: id)
                         sessions.removeAll(where: { $0.id == id })
+                        // The conversation JSON is cleaned by the next save pass's
+                        // orphan sweep, but its asset directory is a separate tree.
+                        // Delete it here so a manual delete removes the image bytes
+                        // too, as the README promises.
+                        ImageAttachmentStore.shared.delete(sessionIds: [id])
                         if sessions.isEmpty {
                             let defModel = localModelManager.getDefaultOrFirstModel()
                             let newSession = ChatSession(
@@ -1362,21 +1481,22 @@ struct ContentView: View {
                     isThinkingEnabled: isThinkingEnabledForActiveSession,
                     thinkingEffort: levelCapable ? thinkingEffortForActiveSession : nil,
                     supportsThinkingLevels: levelCapable,
+                    supportsVision: activeModelSupportsVision,
                     isAgentToolsEnabled: isAgentToolsEnabledForActiveSession,
                     isModelLoaded: (tokenizer != nil && summary != nil) || isAppleFoundationModelActive || isCloudModelActive,
                     isAppleFoundationModelActive: isAppleFoundationModelActive,
                     isCloudModelActive: isCloudModelActive,
-                    onSendMessage: { prompt in
-                        handleSendMessage(prompt)
+                    onSendMessage: { prompt, images in
+                        handleSendMessage(prompt, preparedImages: images)
                     },
                     onStopGeneration: {
                         stopAutoregressiveGeneration()
                     },
-                    onQueuePrompt: { text in
-                        handleQueuePrompt(text)
+                    onQueuePrompt: { text, images in
+                        handleQueuePrompt(text, preparedImages: images)
                     },
-                    onSendImmediate: { text in
-                        await interruptAndSendMessage(text)
+                    onSendImmediate: { text, images in
+                        await interruptAndSendMessage(text, preparedImages: images)
                     },
                     onRemoveQueuedPrompt: { id in
                         handleRemoveQueuedPrompt(id: id)
@@ -1678,13 +1798,51 @@ struct ContentView: View {
         }
     }
 
-    private func handleQueuePrompt(_ text: String) -> Bool {
+    private func handleQueuePrompt(_ text: String, preparedImages: [PreparedImage] = []) -> Bool {
         guard hasAttemptedInitialLoad else { return false }
         guard let currentSessionId = selectedSessionId ?? sessions.first?.id else { return false }
         guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return false }
+        // Images are persisted with the queue entry so it stays self-contained
+        // across a model switch, and are refused when the current model cannot
+        // see them rather than silently queued as text only.
+        guard preparedImages.count <= ImageAttachmentPreparer.maxImagesPerMessage else {
+            let err = ImageAttachmentError.tooManyImages(limit: ImageAttachmentPreparer.maxImagesPerMessage)
+                .errorDescription ?? "Too many images."
+            generationStatusText = err
+            gpuComputeOutput = err
+            return false
+        }
+        if !preparedImages.isEmpty, !supportsVision(for: sessions[sessionIdx]) {
+            let err = "⚠️ \(modelDisplayName(for: sessions[sessionIdx]) ?? "This model") cannot see images. Switch to a vision-capable model, or remove the attachment."
+            generationStatusText = err
+            gpuComputeOutput = err
+            return false
+        }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return false }
-        sessions[sessionIdx].queuedPrompts.append(QueuedPrompt(text: trimmed))
+        // An image-only prompt is a real prompt: a queued screenshot must not be
+        // rejected for having no caption.
+        guard !trimmed.isEmpty || !preparedImages.isEmpty else { return false }
+        if !preparedImages.isEmpty, ChatCommand.parse(trimmed) != nil {
+            // A slash command is an app action with no message of its own, so its
+            // images would be persisted and then silently dropped when the command
+            // returns. Refuse before writing and leave the draft intact.
+            let err = Self.slashCommandWithImagesMessage
+            generationStatusText = err
+            gpuComputeOutput = err
+            return false
+        }
+        let refs = preparedImages.compactMap { ImageAttachmentStore.shared.write($0, sessionId: currentSessionId) }
+        guard refs.count == preparedImages.count else {
+            ImageAttachmentStore.shared.remove(refs)
+            let err = "⚠️ Could not save the attached image(s) — the prompt was kept in the composer."
+            generationStatusText = err
+            gpuComputeOutput = err
+            return false
+        }
+        sessions[sessionIdx].queuedPrompts.append(QueuedPrompt(
+            text: trimmed,
+            attachments: refs.isEmpty ? nil : refs
+        ))
         return true
     }
 
@@ -1692,8 +1850,15 @@ struct ContentView: View {
         // Resolve by identity across every conversation, not by the current
         // selection: an async "Send Now" removes the item after an await, during
         // which the user may have switched chats.
-        for idx in sessions.indices where sessions[idx].queuedPrompts.contains(where: { $0.id == id }) {
+        for idx in sessions.indices {
+            guard let prompt = sessions[idx].queuedPrompts.first(where: { $0.id == id }) else { continue }
             sessions[idx].queuedPrompts.removeAll(where: { $0.id == id })
+            // The queue entry owned the only reference to these bytes. A "Send
+            // Now"/Edit flow has already re-persisted its copy, so dropping the
+            // originals cannot break the message that was just sent.
+            if let attachments = prompt.attachments, !attachments.isEmpty {
+                ImageAttachmentStore.shared.remove(attachments)
+            }
         }
     }
 
@@ -1706,19 +1871,29 @@ struct ContentView: View {
     /// first is still waiting for its cancelled task chains onto the in-flight
     /// operation instead of starting its own replacement, which would reset the
     /// shared KV buffers the cancelled task may still be using.
-    private func interruptAndSendMessage(_ text: String) async -> Bool {
+    private func interruptAndSendMessage(_ text: String, preparedImages: [PreparedImage] = []) async -> Bool {
         guard hasAttemptedInitialLoad else { return false }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return false }
+        guard !trimmed.isEmpty || !preparedImages.isEmpty else { return false }
         // Capture the conversation before any suspension, so a send that waits
         // behind an earlier interrupt still lands in the chat that was active
         // when the user pressed send, not whatever is selected once it runs.
         let targetSessionId = selectedSessionId ?? sessions.first?.id
+        // Refuse a command that was staged with images *before* dispatching it:
+        // the command action has no message to carry them, so running it first
+        // would start the action and then leave the images behind.
+        if !preparedImages.isEmpty, ChatCommand.parse(trimmed) != nil {
+            generationStatusText = Self.slashCommandWithImagesMessage
+            gpuComputeOutput = Self.slashCommandWithImagesMessage
+            return false
+        }
         // Slash commands are app actions with their own backend, so they dispatch
         // before the interrupt/model-load lifecycle: Cmd-Return and a queued
         // item's "Send Now" reach /compact without loading weights or being
         // refused when an unrelated load fails.
-        if let handled = dispatchChatCommand(trimmed, sessionId: targetSessionId) { return handled }
+        if let handled = dispatchChatCommand(trimmed, sessionId: targetSessionId) {
+            return handled
+        }
 
         let prior = interruptSendTask
         let token = UUID()
@@ -1739,7 +1914,7 @@ struct ContentView: View {
                 }
             }
             _ = await prior?.value
-            let result = await self.performInterruptSend(trimmed, sessionId: targetSessionId)
+            let result = await self.performInterruptSend(trimmed, preparedImages: preparedImages, sessionId: targetSessionId)
             if self.interruptSendToken == token {
                 self.interruptSendTask = nil
                 self.interruptSendToken = nil
@@ -1752,7 +1927,11 @@ struct ContentView: View {
     }
 
     /// The body of an interrupt send, run only after any earlier one completes.
-    private func performInterruptSend(_ trimmed: String, sessionId targetSessionId: UUID?) async -> Bool {
+    private func performInterruptSend(
+        _ trimmed: String,
+        preparedImages: [PreparedImage] = [],
+        sessionId targetSessionId: UUID?
+    ) async -> Bool {
         guard isGeneratingText || generationTeardownTask != nil else {
             // Nothing to interrupt, but the target's model must still be the
             // loaded one (the user may have switched chats since the send was
@@ -1761,7 +1940,7 @@ struct ContentView: View {
             // engine.
             guard await ensureModelLoaded(forSession: targetSessionId) else { return false }
             guard !isGeneratingText else { return false }
-            return handleSendMessage(trimmed, sessionId: targetSessionId)
+            return handleSendMessage(trimmed, preparedImages: preparedImages, sessionId: targetSessionId)
         }
         print("⏹ [INT] interrupt requested — cancelling current generation and sending a fresh turn")
         let previous = generationTask
@@ -1800,7 +1979,7 @@ struct ContentView: View {
             if isGeneratingText || !modelReady {
                 accepted = false
             } else {
-                accepted = handleSendMessage(trimmed, sessionId: targetSessionId)
+                accepted = handleSendMessage(trimmed, preparedImages: preparedImages, sessionId: targetSessionId)
             }
         }
         if let targetSessionId {
@@ -1839,7 +2018,31 @@ struct ContentView: View {
                 // of running two generations against the shared KV buffers. A
                 // superseded switch means the model is not the target's, so requeue
                 // rather than run on the wrong engine.
-                if self.isGeneratingText || !modelReady || !self.handleSendMessage(next.text, sessionId: currentSessionId) {
+                let queuedAttachments = next.attachments ?? []
+                let targetSession = self.sessions.first(where: { $0.id == currentSessionId })
+                let attachmentsStillVisible = queuedAttachments.isEmpty || self.supportsVision(for: targetSession)
+                if !attachmentsStillVisible {
+                    // The queued prompt's pictures cannot ride this send, and the
+                    // queue entry is about to disappear; drop the bytes with it so
+                    // they are not orphaned on disk.
+                    ImageAttachmentStore.shared.remove(queuedAttachments)
+                }
+                // A prompt queued with images can outlive a model switch. Sending
+                // its text with a metadata-only notice is honest and terminates;
+                // requeueing would retry the same impossible send forever.
+                let text = attachmentsStillVisible
+                    ? next.text
+                    : ([next.text, CloudMessageAssembler.omittedImagesNotice(
+                        count: queuedAttachments.count,
+                        reason: "model has no vision support"
+                    )].filter { !$0.isEmpty }.joined(separator: "\n\n"))
+                let accepted = !self.isGeneratingText && modelReady
+                    && self.handleSendMessage(
+                        text,
+                        attachmentRefs: attachmentsStillVisible ? queuedAttachments : [],
+                        sessionId: currentSessionId
+                    )
+                if !accepted {
                     self.requeuePromptFront(next, sessionId: currentSessionId)
                 }
             }
@@ -2198,13 +2401,79 @@ struct ContentView: View {
         return handleChatCommand(command, sessionIndex: cmdSessionIdx, sessionId: cmdSessionId)
     }
 
+    /// Shared refusal for a slash command that was staged with images.
+    private static let slashCommandWithImagesMessage = "⚠️ Slash commands cannot carry images. Remove the attachment, or send the image as a normal message."
+
+    /// Composer entry point for image input: persists the prepared images and
+    /// hands the send its refs. Kept separate from the core send so a failed
+    /// store write keeps the draft instead of sending text whose picture the
+    /// user believes travelled with it.
+    private func handleSendMessage(
+        _ text: String,
+        preparedImages: [PreparedImage],
+        sessionId explicitSessionId: UUID? = nil
+    ) -> Bool {
+        guard !preparedImages.isEmpty else {
+            return handleSendMessage(text, sessionId: explicitSessionId)
+        }
+        guard preparedImages.count <= ImageAttachmentPreparer.maxImagesPerMessage else {
+            let err = ImageAttachmentError.tooManyImages(limit: ImageAttachmentPreparer.maxImagesPerMessage)
+                .errorDescription ?? "Too many images."
+            generationStatusText = err
+            gpuComputeOutput = err
+            return false
+        }
+        guard let targetId = explicitSessionId ?? selectedSessionId ?? sessions.first?.id,
+              let targetIdx = sessions.firstIndex(where: { $0.id == targetId }) else { return false }
+        // Checked here as well as in the interrupt/queue entry points because this
+        // wrapper is what actually writes bytes: a command must be refused before
+        // anything lands on disk, or the composer clears its chips on `accepted`
+        // and the picture disappears without a message.
+        if ChatCommand.parse(text) != nil {
+            let err = Self.slashCommandWithImagesMessage
+            generationStatusText = err
+            gpuComputeOutput = err
+            return false
+        }
+        guard supportsVision(for: sessions[targetIdx]) else {
+            let err = "⚠️ \(modelDisplayName(for: sessions[targetIdx]) ?? "This model") cannot see images. Switch to a vision-capable model, or remove the attachment."
+            generationStatusText = err
+            gpuComputeOutput = err
+            return false
+        }
+        let refs = preparedImages.compactMap { ImageAttachmentStore.shared.write($0, sessionId: targetId) }
+        guard refs.count == preparedImages.count else {
+            ImageAttachmentStore.shared.remove(refs)
+            let err = "⚠️ Could not save the attached image(s) — the draft was kept so nothing is lost."
+            generationStatusText = err
+            gpuComputeOutput = err
+            return false
+        }
+        let accepted = handleSendMessage(text, attachmentRefs: refs, sessionId: explicitSessionId)
+        if !accepted {
+            // A refused send (another turn running, model load in flight) wrote
+            // bytes that no message references; drop them rather than leave them
+            // for the next prune pass.
+            ImageAttachmentStore.shared.remove(refs)
+        }
+        return accepted
+    }
+
     /// Returns whether the prompt was accepted. A `false` result means nothing
     /// was sent, so the composer must keep the text instead of clearing it.
     ///
     /// `sessionId` lets an async caller pin the conversation it resolved before
     /// suspending, so a send started in chat A cannot land in chat B if the user
     /// switches selection while the caller is awaiting.
-    private func handleSendMessage(_ text: String, sessionId explicitSessionId: UUID? = nil) -> Bool {
+    ///
+    /// `attachmentRefs` are images already persisted to the asset store
+    /// (`ImageAttachmentStore`). The dequeued-prompt path uses this directly so a
+    /// queued prompt keeps its pictures across the queue round-trip.
+    private func handleSendMessage(
+        _ text: String,
+        attachmentRefs: [ImageAttachmentRef] = [],
+        sessionId explicitSessionId: UUID? = nil
+    ) -> Bool {
         // Wait for the first load attempt before touching chat state, or the turn
         // could land in the launch placeholder the merge then replaces. The load
         // need not have succeeded: with persistence down the user can still chat,
@@ -2234,6 +2503,15 @@ struct ContentView: View {
         guard !isLoadingModel else { return false }
         guard let currentSessionId = explicitSessionId ?? selectedSessionId ?? sessions.first?.id else { return false }
         guard let sessionIdx = sessions.firstIndex(where: { $0.id == currentSessionId }) else { return false }
+        // Attachments are refused, never dropped. A model without vision that
+        // silently receives a turn whose picture vanished answers about nothing;
+        // returning false keeps the composer's draft and chips intact.
+        if !attachmentRefs.isEmpty, !supportsVision(for: sessions[sessionIdx]) {
+            let err = "⚠️ \(modelDisplayName(for: sessions[sessionIdx]) ?? "This model") cannot see images. Switch to a vision-capable model, or remove the attachment."
+            generationStatusText = err
+            gpuComputeOutput = err
+            return false
+        }
         // A cloud selection that no longer resolves must refuse here, exactly
         // like `activateCloudModel` does: falling through would run the turn on
         // the installed weights while the conversation still claims a remote
@@ -2268,16 +2546,22 @@ struct ContentView: View {
             return false
         }
         
-        let userMsg = ChatMessage(role: .user, content: text)
+        let userMsg = ChatMessage(
+            role: .user,
+            content: text,
+            attachments: attachmentRefs.isEmpty ? nil : attachmentRefs
+        )
         sessions[sessionIdx].messages.append(userMsg)
         
         // Auto-title session if it's the first user message, unless the user
         // already named this conversation before sending (the rename controls
-        // are available on an empty chat), in which case their name wins.
+        // are available on an empty chat), in which case their name wins. An
+        // image-only turn has no text to title from, so it seeds "Image".
         if sessions[sessionIdx].messages.filter({ $0.role == .user }).count == 1 {
             if sessions[sessionIdx].titleOrigin != .user {
-                sessions[sessionIdx].title = ChatSession.autoTitle(forFirstMessage: text)
-                sessions[sessionIdx].titleOrigin = ChatSession.autoTitleOrigin(forFirstMessage: text)
+                let titleSeed = text.isEmpty && !attachmentRefs.isEmpty ? "Image" : text
+                sessions[sessionIdx].title = ChatSession.autoTitle(forFirstMessage: titleSeed)
+                sessions[sessionIdx].titleOrigin = ChatSession.autoTitleOrigin(forFirstMessage: titleSeed)
             }
             sessions[sessionIdx].createdAt = Date()
         }
@@ -2501,10 +2785,11 @@ struct ContentView: View {
                     .replacingOccurrences(of: "</think>", with: "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 let hasTools = (msg.toolCalls != nil && !msg.toolCalls!.isEmpty)
-                guard !cleanMsg.isEmpty || (msg.thinkingContent != nil && !msg.thinkingContent!.isEmpty) || hasTools else { continue }
+                let attachmentNotice = Self.localAttachmentNotice(for: msg)
+                guard !cleanMsg.isEmpty || (msg.thinkingContent != nil && !msg.thinkingContent!.isEmpty) || hasTools || !attachmentNotice.isEmpty else { continue }
 
                 if msg.role == .user {
-                    promptString += "<｜start▁of▁sentence｜><|User|>\(cleanMsg)<｜end▁of▁sentence｜>"
+                    promptString += "<｜start▁of▁sentence｜><|User|>\(cleanMsg)\(attachmentNotice)<｜end▁of▁sentence｜>"
                 } else if msg.role == .assistant {
                     var assistantBody = ""
                     if let think = msg.thinkingContent, !think.isEmpty {
@@ -2569,10 +2854,11 @@ struct ContentView: View {
                     .replacingOccurrences(of: "<channel|>", with: "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 let hasTools = (msg.toolCalls != nil && !msg.toolCalls!.isEmpty)
-                guard !cleanMsg.isEmpty || (msg.thinkingContent != nil && !msg.thinkingContent!.isEmpty) || hasTools else { continue }
+                let attachmentNotice = Self.localAttachmentNotice(for: msg)
+                guard !cleanMsg.isEmpty || (msg.thinkingContent != nil && !msg.thinkingContent!.isEmpty) || hasTools || !attachmentNotice.isEmpty else { continue }
 
                 if msg.role == .user {
-                    promptString += "<|turn>user\n\(cleanMsg)<turn|>\n"
+                    promptString += "<|turn>user\n\(cleanMsg)\(attachmentNotice)<turn|>\n"
                 } else if msg.role == .assistant {
                     var assistantBody = ""
                     if let think = msg.thinkingContent, !think.isEmpty {
@@ -2635,10 +2921,11 @@ struct ContentView: View {
                     .replacingOccurrences(of: "<|endoftext|>", with: "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 let hasTools = (msg.toolCalls != nil && !msg.toolCalls!.isEmpty)
-                guard !cleanMsg.isEmpty || (msg.thinkingContent != nil && !msg.thinkingContent!.isEmpty) || hasTools else { continue }
+                let attachmentNotice = Self.localAttachmentNotice(for: msg)
+                guard !cleanMsg.isEmpty || (msg.thinkingContent != nil && !msg.thinkingContent!.isEmpty) || hasTools || !attachmentNotice.isEmpty else { continue }
 
                 if msg.role == .user {
-                    promptString += "<role>HUMAN</role>\(cleanMsg)<|role_end|>"
+                    promptString += "<role>HUMAN</role>\(cleanMsg)\(attachmentNotice)<|role_end|>"
                 } else if msg.role == .assistant {
                     var assistantBody = ""
                     if let think = msg.thinkingContent, !think.isEmpty {
@@ -2699,10 +2986,11 @@ struct ContentView: View {
                     .replacingOccurrences(of: "<|endoftext|>", with: "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 let hasTools = (msg.toolCalls != nil && !msg.toolCalls!.isEmpty)
-                guard !cleanMsg.isEmpty || (msg.thinkingContent != nil && !msg.thinkingContent!.isEmpty) || hasTools else { continue }
+                let attachmentNotice = Self.localAttachmentNotice(for: msg)
+                guard !cleanMsg.isEmpty || (msg.thinkingContent != nil && !msg.thinkingContent!.isEmpty) || hasTools || !attachmentNotice.isEmpty else { continue }
 
                 if msg.role == .user {
-                    promptString += "<|im_start|>user\n\(cleanMsg)<|im_end|>\n"
+                    promptString += "<|im_start|>user\n\(cleanMsg)\(attachmentNotice)<|im_end|>\n"
                 } else if msg.role == .assistant {
                     var assistantBody = ""
                     if modelSupportsThinking {
@@ -4805,19 +5093,43 @@ struct ContentView: View {
             from: sessions.first(where: { $0.id == sessionId })?.messages ?? [],
             excludingMessageIds: [messageId]
         )
+        let sessionMessagesForImages = sessions.first(where: { $0.id == sessionId })?.messages ?? []
+        // Images are priced flat in the pre-turn estimate: the assembler is not
+        // given their bytes here (that happens off the main actor inside the
+        // turn), so count the refs directly.
+        let attachmentImageCount = sessionMessagesForImages.reduce(0) {
+            $0 + ($1.attachments?.count ?? 0)
+        }
         let turnInputTokens = CloudMessageAssembler.approximatePromptTokens(
             system: persona,
             messages: openingMessages
-        )
+        ) + attachmentImageCount * ImageAttachmentPreparer.estimatedTokensPerImage
         let sessionCumulativeStart = sessions.first(where: { $0.id == sessionId })?.cumulativeTokenCount ?? 0
         if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }) {
             sessions[sIdx].cumulativeTokenCount = sessionCumulativeStart + turnInputTokens
         }
 
+        let visionCapable = visionSupport(forProvider: provider, providerModelId: providerModelId)
         generationTask = Task(priority: .userInitiated) {
             var currentMessageId = messageId
             var step = 0
             var cumulativeBase = sessionCumulativeStart + turnInputTokens
+            // Image parts are built once per turn, off the main actor. History is
+            // re-assembled on every step, but the turn's pictures never change.
+            // Skipped entirely for a text-only model: encoding megabytes of base64
+            // only for the assembler to replace it with a notice is pure waste.
+            let imageDataURLs: [UUID: [String]]
+            if visionCapable {
+                imageDataURLs = await Task.detached(priority: .userInitiated) {
+                    Self.buildImageDataURLs(for: sessionMessagesForImages)
+                }.value
+            } else {
+                imageDataURLs = [:]
+            }
+            // Cleared for the rest of the run if the provider rejects an image:
+            // every later step then carries the metadata-only notice instead.
+            var imagesAllowed = visionCapable
+            var didRetryWithoutImages = false
             // Prompt-only coordinator directive carrying subagent reports that
             // landed mid-run. Cloud history is re-assembled from the session on
             // every step, so the reports ride the leading system message of the
@@ -4858,8 +5170,11 @@ struct ContentView: View {
                 }
                 outbound.append(contentsOf: CloudMessageAssembler.assemble(
                     from: self.sessions[sIdx].messages,
-                    excludingMessageIds: [currentMessageId]
+                    excludingMessageIds: [currentMessageId],
+                    imageDataURLs: imagesAllowed ? imageDataURLs : [:],
+                    imagesSupported: imagesAllowed
                 ))
+                let stepCarriesImages = outbound.contains { ($0.imageParts?.count ?? 0) > 0 }
                 // The relay/synthesis turn is a final-answer pass: the model must
                 // present the reports, not start another tool round.
                 let tools = CloudAgentStepPlan.offersTools(
@@ -4995,6 +5310,46 @@ struct ContentView: View {
                         toolCalls: []
                     )
                     return
+                }
+
+                // A model registered as vision-capable can still refuse an image
+                // part: no provider catalog publishes modalities, so that
+                // registration is an editorial guess. Un-mark it, say so once, and
+                // spend this same step again without pixels instead of failing a
+                // conversation that was working until the screenshot.
+                if imagesAllowed,
+                   stepCarriesImages,
+                   !didRetryWithoutImages,
+                   let failure = serviceFailure,
+                   case .httpStatus(let code, let summary) = failure,
+                   code == 400 || code == 422,
+                   CloudTurnFailure.indicatesImageRejection(summary) {
+                    didRetryWithoutImages = true
+                    imagesAllowed = false
+                    CloudModelRegistry.setVisionSupport(false, forModel: providerModelId, provider: provider)
+                    self.applyVisionCapabilityChange(
+                        provider: provider,
+                        providerModelId: providerModelId,
+                        supported: false
+                    )
+                    self.generationStatusText = "⚠️ \(provider.displayName) rejected the image for this model — marked it text-only and retrying without it."
+                    // The status line is overwritten by the next streamed partial,
+                    // so record the downgrade in the transcript too. Otherwise the
+                    // model silently stops accepting images with no later clue why.
+                    self.sessions[sIdx].messages.append(ChatMessage(
+                        role: .system,
+                        content: "⚠️ \(provider.displayName) rejected an image for \(CloudModelRegistry.defaultDisplayName(provider: provider, providerModelId: providerModelId)). The model is now marked text-only; re-enable it under Settings → Cloud Providers if that was wrong. Retrying this turn without the image."
+                    ))
+                    turnLog.recordChatTurn(
+                        status: 400,
+                        errorMessage: "Image content rejected by the provider; retrying without images.",
+                        outputTokens: 0,
+                        finishReason: nil,
+                        thinking: latestThinking,
+                        response: latestText,
+                        toolCalls: []
+                    )
+                    continue
                 }
 
                 if let failure = serviceFailure {

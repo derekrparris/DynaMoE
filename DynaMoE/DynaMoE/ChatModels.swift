@@ -80,6 +80,60 @@ nonisolated public struct ToolCallRecord: Identifiable, Codable, Equatable, Send
     }
 }
 
+/// One image a user attached to a message. The pixels live in the asset store
+/// (`~/Library/Application Support/DynaMoE/sessions/assets/`) and only this
+/// metadata rides in the session JSON: base64 in the conversation file would
+/// rewrite megabytes on every streaming save and defeat the store's digest
+/// write-skip. `relativePath` is self-describing (`<sessionId>/<id>.<ext>`) so
+/// resolving an attachment never needs the session it came from.
+nonisolated public struct ImageAttachmentRef: Identifiable, Codable, Equatable, Hashable, Sendable {
+    public var id: UUID
+    public var fileName: String
+    public var pixelWidth: Int
+    public var pixelHeight: Int
+    public var byteCount: Int
+    public var sha256: String
+    public var relativePath: String
+    /// Wire MIME type of the stored bytes ("image/png" or "image/jpeg").
+    public var mimeType: String
+
+    public init(
+        id: UUID = UUID(),
+        fileName: String,
+        pixelWidth: Int,
+        pixelHeight: Int,
+        byteCount: Int,
+        sha256: String,
+        relativePath: String,
+        mimeType: String
+    ) {
+        self.id = id
+        self.fileName = fileName
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
+        self.byteCount = byteCount
+        self.sha256 = sha256
+        self.relativePath = relativePath
+        self.mimeType = mimeType
+    }
+
+    /// Metadata-only rendering for prompts, request logs, and Console lines.
+    /// Image bytes must never reach a log row or a unified-log line.
+    public var logDescription: String {
+        "[image: \(fileName) \(pixelWidth)×\(pixelHeight) \(formattedByteCount)]"
+    }
+
+    public var formattedByteCount: String {
+        if byteCount >= 1_048_576 {
+            return String(format: "%.1f MB", Double(byteCount) / 1_048_576)
+        }
+        if byteCount >= 1_024 {
+            return String(format: "%.0f KB", Double(byteCount) / 1_024)
+        }
+        return "\(byteCount) B"
+    }
+}
+
 nonisolated public struct ChatMessage: Identifiable, Codable, Equatable, Sendable {
     public var id: UUID
     public var role: MessageRole
@@ -99,6 +153,9 @@ nonisolated public struct ChatMessage: Identifiable, Codable, Equatable, Sendabl
     /// message. `ChatSessionStore.normalizedForRestore` drops these on load.
     public var isTransient: Bool?
     public var toolCalls: [ToolCallRecord]?
+    /// Images the user attached to this message, in display order. Only user
+    /// turns carry them; nil for every turn that predates image input.
+    public var attachments: [ImageAttachmentRef]?
     public var jetSpecTau: Double?
     public var jetSpecDraftAccepted: Int?
 
@@ -116,6 +173,7 @@ nonisolated public struct ChatMessage: Identifiable, Codable, Equatable, Sendabl
         prefillStatus: String? = nil,
         isTransient: Bool? = nil,
         toolCalls: [ToolCallRecord]? = nil,
+        attachments: [ImageAttachmentRef]? = nil,
         jetSpecTau: Double? = nil,
         jetSpecDraftAccepted: Int? = nil
     ) {
@@ -132,6 +190,7 @@ nonisolated public struct ChatMessage: Identifiable, Codable, Equatable, Sendabl
         self.prefillStatus = prefillStatus
         self.isTransient = isTransient
         self.toolCalls = toolCalls
+        self.attachments = attachments
         self.jetSpecTau = jetSpecTau
         self.jetSpecDraftAccepted = jetSpecDraftAccepted
     }
@@ -141,15 +200,20 @@ nonisolated public struct QueuedPrompt: Identifiable, Codable, Equatable, Sendab
     public var id: UUID
     public var text: String
     public var timestamp: Date
+    /// Attachments already persisted to the asset store and waiting with the
+    /// prompt. A queued prompt that drops these would silently send text only.
+    public var attachments: [ImageAttachmentRef]?
 
     public init(
         id: UUID = UUID(),
         text: String,
-        timestamp: Date = Date()
+        timestamp: Date = Date(),
+        attachments: [ImageAttachmentRef]? = nil
     ) {
         self.id = id
         self.text = text
         self.timestamp = timestamp
+        self.attachments = attachments
     }
 }
 

@@ -42,6 +42,7 @@ A comprehensive, practical guide to configuring, tuning, and operating DynaMoE o
 8. [Cloud Providers](#8-cloud-providers)
    - [API Key & Connection Test](#api-key--connection-test)
    - [Registering Cloud Models](#registering-cloud-models)
+   - [Image Input (Vision-Capable Cloud Models)](#image-input-vision-capable-cloud-models)
    - [What a Cloud Turn Supports](#what-a-cloud-turn-supports)
 9. [Advanced Diagnostics](#advanced-diagnostics)
    - [SafeTensors Sharded Metadata & Search](#safetensors-sharded-metadata--search)
@@ -550,6 +551,25 @@ The **Cloud Providers** section connects remote inference providers, with **Synt
   Entries are separated by `;`, `,`, or newlines and duplicates are dropped. A hand-written value may not reach an already-running app because of preference caching — quit and relaunch, or just press **Sync Models**.
 - A single-model development hook exists: `defaults write DRP.DynaMoE dynamoe_cloud_debug_model "hf:org/model"` registers one model when the main list is empty.
 
+### Image Input (Vision-Capable Cloud Models)
+
+Each row in the **Registered Cloud Models** card carries a per-model **switch** that marks it as accepting images. Vision is opt-in because no provider catalog publishes modalities: a model left off the list is treated as text-only, and the composer refuses an attachment with a notice instead of sending pixels it would never receive. The list persists in `dynamoe_cloud_<provider>_vision` (`;`/`,`/newline separated):
+
+```bash
+# Mark DeepSeek V4.1 Flash 1017 as accepting images
+defaults write DRP.DynaMoE dynamoe_cloud_synthetic_vision "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017"
+```
+
+To attach an image to a turn: paste a screenshot (⌘V), drag an image file onto the composer, use **+ → Attach Image…**, or type an absolute path to an image file — the path is replaced by an attachment chip. The app reads the file itself because the model has no file system access (the agent's `file_read` tool refuses binary content).
+
+Preparation policy: EXIF orientation is baked into the pixels, metadata is stripped, the longest edge is downscaled to 1024 px, and the bytes are re-encoded as PNG for screenshots, including TIFF clipboard captures, so text stays legible, or JPEG for photos. Limits are 4 MB per image, 6 images per message, and 32 MB per source file; anything else is refused with a message. The same picture attached twice is stored once per message.
+
+On the wire an attached user turn becomes `content: [{"type":"text",…}, {"type":"image_url","image_url":{"url":"data:image/png;base64,…"}}]`. Text-only turns keep the bare-string `content` they always had. Images are re-sent with their original message on every later request (including each agent step), so the model keeps its visual context; each later turn therefore pays that image's tokens again, and the pre-turn estimate prices each image as a flat allowance until the provider reports real usage.
+
+A model marked capable that rejects the image part is un-marked automatically (the Settings switch turns off), the turn is retried once without the picture, and a system message records it in the transcript. Only error bodies that name the image part itself trigger this, so an unrelated `400` never disables a working model. Re-mark it only after confirming the model really accepts images. Attachment files live at `~/Library/Application Support/DynaMoE/sessions/assets/<session>/`; deleting a conversation or letting auto-deletion prune it removes its images too.
+
+Local weights and the Apple on-device model are text-only in this release, so attaching an image there is refused with a notice. The local inference server answers an `image_url` / `image` content part with `400` and `"code": "unsupported_content"` rather than silently stripping it.
+
 ### What a Cloud Turn Supports
 - **Streaming** SSE text and, when the model reports it, `reasoning_content` thinking deltas in the usual accordion. Token counts come from the provider's `usage` when reported and fall back to character estimation. The provider's optional `stream_options.include_usage` field is retried without it if the endpoint rejects it.
 - **Sampling**: `temperature`, `top_p`, `presence_penalty`, and `max_tokens` forward; Min-P, Top-K, and the repetition penalty have no remote equivalent and are ignored (the same documented gap as the on-device model). Stop sequences are not forwarded — the provider owns templating and its own end-of-turn marker.
@@ -557,6 +577,7 @@ The **Cloud Providers** section connects remote inference providers, with **Synt
 - **Models without tool support**: list them under `dynamoe_cloud_<provider>_no_tools` (`;`/`,`/newline separated); that model then runs plain chat with a visible notice instead of failing mid-loop on an HTTP 400.
 - **Reasoning control**: the Thinking menu is hidden for cloud models because the OpenAI-compatible surface has no portable on/off switch — the provider's default applies, and reported reasoning still renders in the accordion.
 - **History**: the conversation is sent as a standard `messages` array, with the persona as the leading system message and UI notice messages skipped.
+- **Images**: only when the model is marked vision-capable. The request carries a multi-part `content` array with `image_url` data URLs; earlier images are re-sent with their message on every step so the model keeps its visual context. A model that rejects an image is un-marked and the step retries once without it.
 - **Logging**: every cloud turn records a row in **Settings → Server → Request Log**, with the rendered prompt (system + messages) under the content-capture toggle. An agent run writes one row per step.
 - **Timeouts**: the idle (between-bytes) timeout is 120 s, so a large prompt or a reasoning model can take its time to first token; a connection that stops sending bytes for two minutes fails with "The request timed out."
 - **Not supported in this phase**: grammar masking, JetSpec, prefix pinning, and the memory budgets. Switching to a cloud model releases any resident local engine so the RAM budget is not held.

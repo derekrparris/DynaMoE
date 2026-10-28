@@ -26,6 +26,15 @@ struct OpenAIChatRequest: Decodable {
         /// String form, or the concatenated text parts when the client sends
         /// the multi-part content array. Nil for assistant tool-call turns.
         let contentText: String?
+        /// True when the client sent an image part (`image_url`, `input_image`).
+        /// The local engine has no vision tower, so the server refuses these
+        /// instead of silently stripping them and answering about a picture the
+        /// model never saw.
+        let hasImagePart: Bool
+        /// True when the client sent any non-text content part at all. The local
+        /// engine only understands text, so `file` and `input_audio` parts are
+        /// refused the same way images are, instead of being silently dropped.
+        let hasUnsupportedPart: Bool
         /// Reasoning a client echoed back (the `reasoning_content` extension
         /// this server emits). Clients that keep it let the next turn
         /// reproduce the pinned generation instead of only its visible tail.
@@ -50,11 +59,23 @@ struct OpenAIChatRequest: Decodable {
             self.reasoningContent = try container.decodeIfPresent(String.self, forKey: .reasoningContent)
             if let s = try? container.decode(String.self, forKey: .content) {
                 self.contentText = s
+                self.hasImagePart = false
+                self.hasUnsupportedPart = false
             } else if let parts = try? container.decode([ContentPart].self, forKey: .content) {
                 let joined = parts.compactMap(\.text).filter { !$0.isEmpty }.joined(separator: "\n")
                 self.contentText = joined.isEmpty ? nil : joined
+                self.hasImagePart = parts.contains { part in
+                    let type = (part.type ?? "").lowercased()
+                    return type == "image_url" || type == "input_image" || type == "image"
+                }
+                self.hasUnsupportedPart = parts.contains { part in
+                    let type = (part.type ?? "").lowercased()
+                    return !type.isEmpty && type != "text"
+                }
             } else {
                 self.contentText = nil
+                self.hasImagePart = false
+                self.hasUnsupportedPart = false
             }
         }
 
@@ -66,6 +87,8 @@ struct OpenAIChatRequest: Decodable {
             self.name = name
             self.toolCalls = toolCalls
             self.toolCallId = toolCallId
+            self.hasImagePart = false
+            self.hasUnsupportedPart = false
         }
     }
 
@@ -198,6 +221,20 @@ struct OpenAIChatRequest: Decodable {
         self.toolChoice = try container.decodeIfPresent(ToolChoice.self, forKey: .toolChoice)
         self.enableThinking = try container.decodeIfPresent(Bool.self, forKey: .enableThinking)
         self.reasoningEffort = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
+    }
+
+    /// True when any message carries an image content part. Refused by the
+    /// server rather than stripped: the loaded weights model has no vision tower,
+    /// and a silently text-only answer about a screenshot is worse than an error.
+    var hasImageContent: Bool {
+        messages.contains(where: { $0.hasImagePart })
+    }
+
+    /// True when any message carries a content part the text-only engine cannot
+    /// process (an image, a file attachment, or audio). Refused rather than
+    /// stripped, for the same reason as `hasImageContent`.
+    var hasUnsupportedContent: Bool {
+        messages.contains(where: { $0.hasUnsupportedPart })
     }
 }
 

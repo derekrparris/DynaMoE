@@ -486,9 +486,19 @@ public enum AppleFoundationModelService {
             guard message.role != .system else { continue }
             let content = stripLeadingSpeakerLabel(message.content)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !content.isEmpty else { continue }
+            // The system model cannot see images. A historical turn that carried
+            // one still renders a metadata-only notice, so switching a conversation
+            // to the AFM backend does not silently lose the picture.
+            let attachmentCount = message.attachments?.count ?? 0
+            let notice = attachmentCount > 0
+                ? "\n\n" + CloudMessageAssembler.omittedImagesNotice(
+                    count: attachmentCount,
+                    reason: "model has no vision support"
+                )
+                : ""
+            guard !content.isEmpty || !notice.isEmpty else { continue }
             let speaker = message.role == .user ? "User" : "Assistant"
-            let turn = "\(speaker): \(content)"
+            let turn = "\(speaker): \(content)\(notice)"
             if usedChars + turn.count + 2 > charBudget { break }
             keptTurns.append(turn)
             usedChars += turn.count + 2

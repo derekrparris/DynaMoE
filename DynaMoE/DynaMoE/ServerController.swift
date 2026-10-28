@@ -604,6 +604,19 @@ struct ServerAPIError: Error, HTTPResponseError, LocalizedError, Sendable {
         ServerAPIError(status: .badRequest, wireType: .invalidRequest, message: message, logSafeMessage: nil, code: "context_length_exceeded")
     }
 
+    /// The request carried content this server cannot process at all (image
+    /// parts against a local weights model with no vision tower). A distinct
+    /// code so clients can tell it apart from a malformed body.
+    static func unsupportedContent(_ message: String) -> ServerAPIError {
+        ServerAPIError(
+            status: .badRequest,
+            wireType: .invalidRequest,
+            message: message,
+            logSafeMessage: nil,
+            code: "unsupported_content"
+        )
+    }
+
     static func unauthorized(_ message: String) -> ServerAPIError {
         ServerAPIError(status: .unauthorized, wireType: .authentication, message: message, logSafeMessage: nil, code: nil)
     }
@@ -1183,6 +1196,15 @@ final class ServerController: ObservableObject {
     }
 
     nonisolated private static func buildTurnPlan(_ apiRequest: OpenAIChatRequest) throws -> TurnPlan {
+        // Refuse non-text parts before touching engine state. The loaded weights
+        // model has no vision tower, and silently dropping a picture, file, or
+        // audio part would let the model answer confidently about content it
+        // never received.
+        if apiRequest.hasUnsupportedContent {
+            throw ServerAPIError.unsupportedContent(
+                "This server is serving a local weights model, which understands text only, so image, file, and audio content parts cannot be processed. Send text only, or attach images to a vision-capable cloud model in the DynaMoE app."
+            )
+        }
         // Reject a forced tool choice before touching engine state, so the
         // client gets a clear error instead of a silently unconstrained turn.
         let toolsEnabled = try OpenAIAdapter.toolUseEnabled(apiRequest.toolChoice)
@@ -1220,6 +1242,14 @@ final class ServerController: ObservableObject {
     nonisolated private static func buildTurnPlan(_ apiRequest: AnthropicMessagesRequest) throws -> TurnPlan {
         guard let maxTokens = apiRequest.maxTokens else {
             throw ServerAPIError.badRequest("max_tokens is a required field")
+        }
+        // Same explicit refusal as the OpenAI surface: an image, document, or
+        // audio block would be discarded by the text-only prompt builder,
+        // producing an answer about nothing.
+        if apiRequest.hasUnsupportedContent {
+            throw ServerAPIError.unsupportedContent(
+                "This server is serving a local weights model, which understands text only, so image, document, and audio content blocks cannot be processed. Send text only, or attach images to a vision-capable cloud model in the DynaMoE app."
+            )
         }
         // Reject a forced tool choice before touching engine state, so the
         // client gets a clear error instead of a silently unconstrained turn.

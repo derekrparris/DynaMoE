@@ -180,19 +180,27 @@ public nonisolated struct CloudModelSpec: Equatable, Sendable {
     /// is marked false so a chat turn runs in plain mode instead of failing
     /// mid-loop with an unexplained HTTP 400.
     public let supportsTools: Bool
+    /// Whether this model accepts image content parts. The provider's `/models`
+    /// catalog does not publish modalities, so this is an explicit opt-in
+    /// registration fact (the vision equivalent of the no-tools list). A model
+    /// left off the vision list is treated as text-only: the composer disables
+    /// attachment and a rejected image turn retries once without it.
+    public let supportsVision: Bool
 
     public init(
         providerId: String,
         providerModelId: String,
         displayName: String,
         supportsThinking: Bool,
-        supportsTools: Bool = true
+        supportsTools: Bool = true,
+        supportsVision: Bool = false
     ) {
         self.providerId = providerId
         self.providerModelId = providerModelId
         self.displayName = displayName
         self.supportsThinking = supportsThinking
         self.supportsTools = supportsTools
+        self.supportsVision = supportsVision
     }
 }
 
@@ -225,6 +233,13 @@ public nonisolated enum CloudModelRegistry {
     /// failing mid-loop on an HTTP 400.
     public static func noToolsDefaultsKey(for providerId: String) -> String {
         "dynamoe_cloud_\(providerId)_no_tools"
+    }
+
+    /// Upstream model ids that accept image content parts. Opt-in per model:
+    /// the catalog publishes no modality information, and guessing wrong costs
+    /// a failed turn where the model answers as if no image was sent.
+    public static func visionDefaultsKey(for providerId: String) -> String {
+        "dynamoe_cloud_\(providerId)_vision"
     }
 
     /// The upstream model ids currently registered for one provider, in
@@ -265,7 +280,52 @@ public nonisolated enum CloudModelRegistry {
         for provider: CloudProvider,
         defaults: UserDefaults = .standard
     ) -> Set<String> {
-        let raw = defaults.string(forKey: noToolsDefaultsKey(for: provider.id)) ?? ""
+        parsedModelIdList(noToolsDefaultsKey(for: provider.id), defaults: defaults)
+    }
+
+    /// Upstream model ids registered as accepting image parts.
+    public static func modelIdsWithVisionSupport(
+        for provider: CloudProvider,
+        defaults: UserDefaults = .standard
+    ) -> Set<String> {
+        parsedModelIdList(visionDefaultsKey(for: provider.id), defaults: defaults)
+    }
+
+    /// Replaces the set of models marked vision-capable. Written by Settings when
+    /// the user marks a model, and by the chat path when a provider rejects an
+    /// image for a model we had marked capable (so a later turn does not fail
+    /// the same way).
+    public static func setModelIdsWithVisionSupport(
+        _ modelIds: Set<String>,
+        for provider: CloudProvider,
+        defaults: UserDefaults = .standard
+    ) {
+        let cleaned = modelIds
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .sorted()
+        defaults.set(cleaned.joined(separator: "; "), forKey: visionDefaultsKey(for: provider.id))
+    }
+
+    /// Marks or unmarks one model as vision-capable without disturbing the rest
+    /// of the list.
+    public static func setVisionSupport(
+        _ supported: Bool,
+        forModel providerModelId: String,
+        provider: CloudProvider,
+        defaults: UserDefaults = .standard
+    ) {
+        var ids = modelIdsWithVisionSupport(for: provider, defaults: defaults)
+        if supported {
+            ids.insert(providerModelId)
+        } else {
+            ids.remove(providerModelId)
+        }
+        setModelIdsWithVisionSupport(ids, for: provider, defaults: defaults)
+    }
+
+    private static func parsedModelIdList(_ key: String, defaults: UserDefaults) -> Set<String> {
+        let raw = defaults.string(forKey: key) ?? ""
         return Set(
             raw.split(whereSeparator: { $0 == ";" || $0 == "," || $0 == "\n" })
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -308,13 +368,15 @@ public nonisolated enum CloudModelRegistry {
             ids.append(debugId)
         }
         let withoutTools = modelIdsWithoutToolSupport(for: provider, defaults: defaults)
+        let withVision = modelIdsWithVisionSupport(for: provider, defaults: defaults)
         return ids.map { id in
             CloudModelSpec(
                 providerId: provider.id,
                 providerModelId: id,
                 displayName: defaultDisplayName(provider: provider, providerModelId: id),
                 supportsThinking: id.lowercased().contains("thinking"),
-                supportsTools: !withoutTools.contains(id)
+                supportsTools: !withoutTools.contains(id),
+                supportsVision: withVision.contains(id)
             )
         }
     }
@@ -364,7 +426,8 @@ public nonisolated enum CloudModelRegistry {
             lastModified: Date(timeIntervalSince1970: 0),
             quantization: nil,
             rawModelType: "cloud-\(spec.providerId)",
-            supportsThinking: spec.supportsThinking
+            supportsThinking: spec.supportsThinking,
+            supportsVision: spec.supportsVision
         )
     }
 
@@ -376,7 +439,8 @@ public nonisolated enum CloudModelRegistry {
             providerId: provider.id,
             providerModelId: providerModelId,
             displayName: defaultDisplayName(provider: provider, providerModelId: providerModelId),
-            supportsThinking: providerModelId.lowercased().contains("thinking")
+            supportsThinking: providerModelId.lowercased().contains("thinking"),
+            supportsVision: modelIdsWithVisionSupport(for: provider).contains(providerModelId)
         ))
     }
 

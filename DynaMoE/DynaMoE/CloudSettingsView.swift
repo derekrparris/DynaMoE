@@ -134,19 +134,59 @@ struct CloudProvidersSettingsView: View {
                     title: provider.displayName,
                     subtitle: specs.isEmpty
                         ? "Nothing registered yet. Press \"Test & Sync Models\" to register the provider's chat models (embedding, speech, rerank, and image models are skipped)."
-                        : specs.map(\.displayName).joined(separator: "  ·  "),
+                        : "Mark which models accept image input. No provider catalog publishes modalities, so this is opt-in; a model that rejects an image is un-marked automatically and the turn retries without it.",
                     icon: "cloud.fill",
                     iconTint: .cyan
                 ) {
-                    Text(specs.isEmpty ? "None" : "\(specs.count) registered")
-                        .font(.system(size: 11))
-                        .foregroundStyle(specs.isEmpty ? .secondary : .primary)
+                    VStack(alignment: .trailing, spacing: 6) {
+                        Text(specs.isEmpty ? "None" : "\(specs.count) registered")
+                            .font(.system(size: 11))
+                            .foregroundStyle(specs.isEmpty ? .secondary : .primary)
+                        // A provider can register dozens of models; without a bound
+                        // the settings row grows past the window and the toggles at
+                        // the bottom become unreachable.
+                        ScrollView {
+                            VStack(alignment: .trailing, spacing: 6) {
+                                ForEach(specs, id: \.providerModelId) { spec in
+                                    Toggle(isOn: visionBinding(for: spec, provider: provider)) {
+                                        Text(spec.displayName)
+                                            .font(.system(size: 10.5))
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                    }
+                                    .toggleStyle(.switch)
+                                    .controlSize(.mini)
+                                    .help("Let this model receive images")
+                                }
+                            }
+                        }
+                        .frame(maxHeight: 180)
+                    }
                 }
                 if index < CloudProviderRegistry.all.count - 1 {
                     SettingsRowDivider()
                 }
             }
         }
+    }
+
+    /// Vision is a per-model registration fact: persistence and immediate
+    /// composer refresh go through the same rescan the key actions use.
+    private func visionBinding(for spec: CloudModelSpec, provider: CloudProvider) -> Binding<Bool> {
+        Binding(
+            get: {
+                CloudModelRegistry.modelIdsWithVisionSupport(for: provider)
+                    .contains(spec.providerModelId)
+            },
+            set: { supported in
+                CloudModelRegistry.setVisionSupport(
+                    supported,
+                    forModel: spec.providerModelId,
+                    provider: provider
+                )
+                LocalModelManager.shared.scanLocalModels()
+            }
+        )
     }
 
     // MARK: - Bindings & State

@@ -35,6 +35,14 @@ struct AnthropicMessagesRequest: Decodable {
         let reasoningText: String?
         let toolUses: [ToolUseIn]?
         let toolResults: [ToolResultIn]?
+        /// True when the client sent an `image` block (or an image inside a
+        /// tool_result). The local engine has no vision tower, so the server
+        /// refuses these instead of silently dropping them.
+        let hasImageBlock: Bool
+        /// True when the client sent a block the text-only engine cannot process
+        /// (`document`, `audio`, or an unknown type). Refused like images rather
+        /// than silently dropped.
+        let hasUnsupportedBlock: Bool
 
         init(role: String, contentText: String?, toolUses: [ToolUseIn]? = nil, toolResults: [ToolResultIn]? = nil, reasoningText: String? = nil) {
             self.role = role
@@ -42,6 +50,8 @@ struct AnthropicMessagesRequest: Decodable {
             self.reasoningText = reasoningText
             self.toolUses = toolUses
             self.toolResults = toolResults
+            self.hasImageBlock = false
+            self.hasUnsupportedBlock = false
         }
 
         init(from decoder: Decoder) throws {
@@ -51,6 +61,8 @@ struct AnthropicMessagesRequest: Decodable {
             var reasoning: String?
             var toolUses: [ToolUseIn] = []
             var toolResults: [ToolResultIn] = []
+            var hasImage = false
+            var hasUnsupported = false
             if let s = try? container.decode(String.self, forKey: .content) {
                 text = s.isEmpty ? nil : s
             } else if let blocks = try? container.decode([ContentBlockIn].self, forKey: .content) {
@@ -60,11 +72,17 @@ struct AnthropicMessagesRequest: Decodable {
                 reasoning = thoughts.isEmpty ? nil : thoughts
                 toolUses = blocks.compactMap(\.toolUse)
                 toolResults = blocks.compactMap(\.toolResult)
+                hasImage = blocks.contains(where: \.isImage)
+                    || toolResults.contains(where: \.hasImageBlock)
+                hasUnsupported = blocks.contains(where: \.isUnsupported)
+                    || toolResults.contains(where: \.hasUnsupportedBlock)
             }
             self.contentText = text
             self.reasoningText = reasoning
             self.toolUses = toolUses.isEmpty ? nil : toolUses
             self.toolResults = toolResults.isEmpty ? nil : toolResults
+            self.hasImageBlock = hasImage
+            self.hasUnsupportedBlock = hasUnsupported
         }
 
         enum CodingKeys: String, CodingKey { case role, content }
@@ -75,10 +93,18 @@ struct AnthropicMessagesRequest: Decodable {
         let thinking: String?
         let toolUse: ToolUseIn?
         let toolResult: ToolResultIn?
+        /// An `image` block. It carries no text and no tool payload, but the
+        /// server must know it is there to refuse the turn explicitly.
+        let isImage: Bool
+        /// True for a block type the engine can neither read as text nor refuse
+        /// by name (an `image` block has its own flag).
+        let isUnsupported: Bool
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             let type = try container.decodeIfPresent(String.self, forKey: .type) ?? ""
+            self.isImage = type == "image"
+            self.isUnsupported = !["", "text", "thinking", "tool_use", "tool_result", "image"].contains(type)
             self.text = type == "text" ? try container.decodeIfPresent(String.self, forKey: .text) : nil
             self.thinking = type == "thinking" ? try container.decodeIfPresent(String.self, forKey: .thinking) : nil
             self.toolUse = type == "tool_use" ? try ToolUseIn(from: decoder) : nil
@@ -113,6 +139,11 @@ struct AnthropicMessagesRequest: Decodable {
         let toolUseId: String?
         /// String content, or the concatenated text blocks of the result.
         let content: String?
+        /// True when the result carried an `image` block. Anthropic allows images
+        /// inside tool results, so this path needs the same explicit refusal.
+        let hasImageBlock: Bool
+        /// True when the result carried a block the engine cannot process.
+        let hasUnsupportedBlock: Bool
 
         enum CodingKeys: String, CodingKey { case toolUseId = "tool_use_id", content }
 
@@ -121,11 +152,17 @@ struct AnthropicMessagesRequest: Decodable {
             self.toolUseId = try container.decodeIfPresent(String.self, forKey: .toolUseId)
             if let s = try? container.decode(String.self, forKey: .content) {
                 self.content = s.isEmpty ? nil : s
+                self.hasImageBlock = false
+                self.hasUnsupportedBlock = false
             } else if let blocks = try? container.decode([ContentBlockIn].self, forKey: .content) {
                 let joined = blocks.compactMap(\.text).filter { !$0.isEmpty }.joined(separator: "\n")
                 self.content = joined.isEmpty ? nil : joined
+                self.hasImageBlock = blocks.contains(where: \.isImage)
+                self.hasUnsupportedBlock = blocks.contains(where: \.isUnsupported)
             } else {
                 self.content = nil
+                self.hasImageBlock = false
+                self.hasUnsupportedBlock = false
             }
         }
     }
@@ -219,6 +256,18 @@ struct AnthropicMessagesRequest: Decodable {
     /// The `tool_choice.type` value, for callers (and tests) that only need the
     /// mode rather than the full choice.
     var toolChoiceType: String? { toolChoice?.type }
+
+    /// True when any message carries an image block. Refused by the server rather
+    /// than stripped: a text-only answer about a screenshot the model never saw
+    /// is worse than an explicit error.
+    var hasImageContent: Bool {
+        messages.contains(where: \.hasImageBlock)
+    }
+
+    /// True when any message carries a block the text-only engine cannot process.
+    var hasUnsupportedContent: Bool {
+        messages.contains(where: \.hasUnsupportedBlock)
+    }
 }
 
 // MARK: - Response types
