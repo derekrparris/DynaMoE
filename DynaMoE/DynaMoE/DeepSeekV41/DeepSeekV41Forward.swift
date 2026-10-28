@@ -1,0 +1,775 @@
+//
+//  DeepSeekV41Forward.swift
+//  DynaMoE
+//
+//  The block forward, written once against a backend so the same control flow runs
+//  on the GPU and on the CPU reference.
+//
+//  Why a CPU reference at all: every other architecture in this repo can be
+//  checked against a model that is already on disk, but DeepSeek-V4.1's checkpoint
+//  is 510 GB and normal work happens before it is downloaded. A CPU forward over
+//  synthetic weights is the only way to prove the parts that do not depend on the
+//  weights at all:
+//
+//    * the layer order and where each sub-layer writes its residual,
+//    * which cache rows a position reads and which it writes,
+//    * that the compressed-row set for a position is what the ratio says,
+//    * that routing, the expert mixture and the hyper-connection streams reshape
+//      the hidden state exactly once each,
+//    * that the final norm and head see the collapsed stream, not one of the
+//      intermediate ones.
+//
+//  Those are the bugs that a wrong port ships with, and none of them needs 510 GB
+//  of weights to catch. The GPU executor binds the same stages to the Metal kernels
+//  (`DeepSeekV41MetalForward`), so a disagreement between the two is a kernel bug
+//  rather than a re-derivation of the graph.
+//
+//  Layout conventions, all from the checkpoint:
+//    * matrices are `[out][in]` row-major, so `apply` is a dot product per row,
+//    * the latent record (key AND value) has `cacheRecordWidth` values,
+//    * every query head has `qkHeadDim` values and the whole query is rotated,
+//    * the residual is `hcMult` copies of the hidden vector.
+//
+
+import Foundation
+
+// MARK: - Matrix
+
+nonisolated public struct DeepSeekV41Matrix: Sendable, Equatable {
+    public let rows: Int
+    public let columns: Int
+    /// Row-major, `rows * columns` values.
+    public let values: [Float]
+
+    public init(rows: Int, columns: Int, values: [Float]) {
+        self.rows = rows
+        self.columns = columns
+        self.values = values
+    }
+
+    /// y = W x. A missing or mismatched matrix yields zeros so a plan-level bug
+    /// shows up as a zero block instead of an out-of-range read.
+    public func apply(_ x: [Float]) -> [Float] {
+        var out = [Float](repeating: 0, count: rows)
+        guard columns > 0, values.count >= rows * columns, x.count >= columns else { return out }
+        for row in 0..<rows {
+            let base = row * columns
+            var total: Float = 0
+            for column in 0..<columns {
+                total += values[base + column] * x[column]
+            }
+            out[row] = total
+        }
+        return out
+    }
+
+    /// Row `row` as a vector, for `[1][n]` matrices used as norms.
+    public func row(_ index: Int) -> [Float] {
+        guard index >= 0, index < rows else { return [] }
+        let base = index * columns
+        guard base + columns <= values.count else { return [] }
+        return Array(values[base..<(base + columns)])
+    }
+}
+
+// MARK: - Weight source
+
+/// Where the forward reads its matrices. The CPU implementation holds them in
+/// memory; the Metal one resolves them to `(shard buffer, byte offset)` and never
+/// materializes a `[Float]`.
+nonisolated public protocol DeepSeekV41WeightSource: AnyObject {
+    func matrix(_ role: DeepSeekV41TensorRole, layer: Int?, expert: Int?) -> DeepSeekV41Matrix?
+    func vector(_ role: DeepSeekV41TensorRole, layer: Int?) -> [Float]?
+    /// Activation rows for one Engram column, or nil when the checkpoint/layer has
+    /// no Engram. Separated from `matrix` because those rows are streamed from disk
+    /// and never live in a buffer.
+    func engramRow(layer: Int, column: Int, head: Int) -> [Float]?
+}
+
+public extension DeepSeekV41WeightSource {
+    /// Layer-level tensors, which are the overwhelming majority.
+    func matrix(_ role: DeepSeekV41TensorRole, layer: Int?) -> DeepSeekV41Matrix? {
+        matrix(role, layer: layer, expert: nil)
+    }
+}
+
+/// In-memory weight store, keyed by `role|layer|expert` exactly like the catalog.
+nonisolated public final class DeepSeekV41DenseWeightSource: DeepSeekV41WeightSource {
+    private var matrices: [String: DeepSeekV41Matrix] = [:]
+    private var vectors: [String: [Float]] = [:]
+    private var engram: [String: [Float]] = [:]
+
+    public init() {}
+
+    public static func key(_ role: DeepSeekV41TensorRole, layer: Int?, expert: Int? = nil) -> String {
+        "\(role.rawValue)|\(layer.map(String.init) ?? "-")|\(expert.map(String.init) ?? "-")"
+    }
+
+    public func set(_ matrix: DeepSeekV41Matrix, role: DeepSeekV41TensorRole, layer: Int?, expert: Int? = nil) {
+        matrices[Self.key(role, layer: layer, expert: expert)] = matrix
+    }
+
+    public func set(_ vector: [Float], role: DeepSeekV41TensorRole, layer: Int?) {
+        vectors[Self.key(role, layer: layer)] = vector
+    }
+
+    public func setEngramRow(_ row: [Float], layer: Int, column: Int) {
+        engram["\(layer)|\(column)"] = row
+    }
+
+    public func matrix(_ role: DeepSeekV41TensorRole, layer: Int?, expert: Int?) -> DeepSeekV41Matrix? {
+        matrices[Self.key(role, layer: layer, expert: expert)]
+    }
+
+    public func vector(_ role: DeepSeekV41TensorRole, layer: Int?) -> [Float]? {
+        vectors[Self.key(role, layer: layer)]
+    }
+
+    public func engramRow(layer: Int, column: Int, head: Int) -> [Float]? {
+        // Rows are stored per (layer, column); the head only selects which slice of
+        // the row the caller wants, and the runtime flattens columns x heads into
+        // the same row set, so the head index is not part of the key.
+        engram["\(layer)|\(column)"]
+    }
+}
+
+// MARK: - Forward state
+
+/// The buffers one forward pass owns. Sizes are derived from the config so the
+/// reference and the GPU path allocate identically.
+nonisolated public struct DeepSeekV41ForwardState: Sendable, Equatable {
+    public let hidden: Int
+    public let qWidth: Int
+    public let latentWidth: Int
+    public let outputWidth: Int
+    public let qLoraRank: Int
+    public let oLoraRank: Int
+    public let moeIntermediate: Int
+    public let sharedIntermediate: Int
+    public let heads: Int
+    public let hcMult: Int
+    public let vocab: Int
+
+    public init(config: DeepSeekV41Config) {
+        let shapes = DeepSeekV41TensorShapes(config: config)
+        self.hidden = config.hiddenSize
+        self.qWidth = shapes.queryWidth
+        self.latentWidth = config.cacheRecordWidth
+        self.outputWidth = shapes.attentionOutputWidth
+        self.qLoraRank = config.qLoraRank
+        self.oLoraRank = config.oLoraRank
+        self.moeIntermediate = shapes.expertIntermediate
+        self.sharedIntermediate = shapes.sharedIntermediate
+        self.heads = config.numAttentionHeads
+        self.hcMult = max(1, config.hcMult)
+        self.vocab = config.vocabSize
+    }
+}
+
+// MARK: - Derived shapes
+
+/// Every projection's `(in, out)` derived from the config.
+///
+/// The catalog is the authority on the checkpoint; this is what the graph expects.
+/// `DeepSeekV41WeightCatalog.validate` compares the two, and the difference is
+/// reported rather than silently absorbed by a transposed multiply.
+nonisolated public struct DeepSeekV41TensorShapes: Sendable, Equatable {
+    public let hidden: Int
+    public let queryWidth: Int
+    public let attentionOutputWidth: Int
+    public let latentWidth: Int
+    public let qLoraRank: Int
+    public let oLoraRank: Int
+    public let expertIntermediate: Int
+    public let sharedIntermediate: Int
+
+    public init(config: DeepSeekV41Config) {
+        self.hidden = config.hiddenSize
+        self.queryWidth = config.numAttentionHeads * config.qkHeadDim
+        self.attentionOutputWidth = config.numAttentionHeads * config.vHeadDim
+        self.latentWidth = config.cacheRecordWidth
+        self.qLoraRank = config.qLoraRank
+        self.oLoraRank = config.oLoraRank
+        self.expertIntermediate = max(1, config.moeIntermediateSize)
+        // The shared expert runs at `n_shared_experts` times the routed width when
+        // the checkpoint publishes only the routed width, which is how every
+        // DeepSeek checkpoint spells it.
+        self.sharedIntermediate = config.intermediateSize > 0
+            ? config.intermediateSize
+            : max(config.moeIntermediateSize, 1) * max(1, config.sharedExpertCount)
+    }
+}
+
+// MARK: - Stage list
+
+/// The ordered stages of one layer, shared by both backends.
+nonisolated public enum DeepSeekV41ForwardStages {
+
+    public enum Stage: String, Sendable, Equatable {
+        case mixAttentionStreams
+        case attnNorm
+        case queryDown
+        case queryUp
+        case queryNorm
+        case ropeQuery
+        case latentProject
+        case latentNorm
+        case ropeLatent
+        case writeLatent
+        case compressPool
+        case attention
+        case outputDown
+        case outputUp
+        case writeAttentionStreams
+        case mixFFNStreams
+        case ffnNorm
+        case engram
+        case router
+        case sharedExpert
+        case routedExperts
+        case writeFFNStreams
+        case collapseStreams
+    }
+
+    /// Every stage a layer runs, in order. A window-only layer skips the compressor
+    /// and reads no compressed rows but still runs the same attention stage over
+    /// just its window.
+    public static let layerPipeline: [Stage] = [
+        .mixAttentionStreams,
+        .attnNorm,
+        .queryDown,
+        .queryNorm,
+        .queryUp,
+        .ropeQuery,
+        .latentProject,
+        .latentNorm,
+        .ropeLatent,
+        .writeLatent,
+        .compressPool,
+        .attention,
+        .outputDown,
+        .outputUp,
+        .writeAttentionStreams,
+        .mixFFNStreams,
+        .ffnNorm,
+        .engram,
+        .router,
+        .sharedExpert,
+        .routedExperts,
+        .writeFFNStreams,
+        .collapseStreams
+    ]
+}
+
+// MARK: - Engram combination
+
+/// How retrieved Engram rows enter the layer.
+///
+/// The checkpoint ships `engram.q_weight` and `engram.k_weight` and no output
+/// projection, so the memory must be combined in the space it is retrieved in:
+/// `q_weight` forms a per-head query over the `headDim`-wide rows, the softmax of
+/// each head's column scores mixes that head's rows into one vector, and
+/// `k_weight` projects the gated result back to the hidden width.
+///
+/// Gated by `DeepSeekV41Conformance.engramCombination` until the reference
+/// implementation is read; a wrong combination reads the right rows and mixes them
+/// wrongly, which is the failure that looks like "the memory model does nothing".
+nonisolated public enum DeepSeekV41EngramCombination {
+
+    /// - Parameters:
+    ///   - hidden: the post-norm FFN input.
+    ///   - rows: one row per (n-gram column, head), flattened as
+    ///     `column * heads + head`.
+    ///   - queryWeight: `[heads * headDim][hidden]`, projecting the input to one
+    ///     query per head.
+    ///   - keyWeight: `[hidden][heads * headDim]`, projecting the memory back.
+    public static func contribution(
+        hidden: [Float],
+        rows: [[Float]],
+        heads: Int,
+        headDim: Int,
+        queryWeight: DeepSeekV41Matrix?,
+        keyWeight: DeepSeekV41Matrix?
+    ) -> [Float] {
+        guard !rows.isEmpty, heads > 0, headDim > 0 else { return [] }
+        let columns = rows.count / heads
+        guard columns > 0 else { return [] }
+
+        // Per-head query. Without a query projection the input itself is used, which
+        // is what a checkpoint with no `q_weight` would do.
+        let query = queryWeight?.apply(hidden) ?? hidden
+        var memory = [Float](repeating: 0, count: heads * headDim)
+        let scale = 1 / sqrt(Float(headDim))
+
+        for head in 0..<heads {
+            let queryBase = head * headDim
+            guard queryBase + headDim <= query.count else { continue }
+            var scores: [Float] = []
+            scores.reserveCapacity(columns)
+            for column in 0..<columns {
+                let row = rows[column * heads + head]
+                let width = min(headDim, row.count)
+                var dot: Float = 0
+                for dim in 0..<width {
+                    dot += query[queryBase + dim] * row[dim]
+                }
+                scores.append(dot * scale)
+            }
+            guard let maxScore = scores.max() else { continue }
+            var weights = scores.map { exp($0 - maxScore) }
+            let total = weights.reduce(0, +)
+            if total > 0 {
+                weights = weights.map { $0 / total }
+            } else {
+                weights = [Float](repeating: 1 / Float(columns), count: columns)
+            }
+            for column in 0..<columns {
+                let row = rows[column * heads + head]
+                let weight = weights[column]
+                let width = min(headDim, row.count)
+                for dim in 0..<width {
+                    memory[queryBase + dim] += weight * row[dim]
+                }
+            }
+        }
+
+        guard let keyWeight else { return memory }
+        return keyWeight.apply(memory)
+    }
+}
+
+// MARK: - Reference forward
+
+/// The CPU forward: the graph itself, with no Metal.
+///
+/// One instance per turn. `prefill` walks a prompt and leaves the cache holding
+/// every position; `forwardToken` appends one position and returns the logits.
+nonisolated public final class DeepSeekV41CPUForward {
+
+    public let config: DeepSeekV41Config
+    public let plan: [DeepSeekV41LayerPlan]
+    public let shapes: DeepSeekV41TensorShapes
+    /// The ring geometry the row plan addresses against. The reference keeps
+    /// every position it has ever written, so it never clamps a read, but the
+    /// ring width and record layout here are the ones the device cache uses.
+    public let geometry: DeepSeekV41CacheGeometry
+    private let weights: DeepSeekV41WeightSource
+    /// RoPE inverse frequencies per rope table, resolved once.
+    private let frequencyTable: [DeepSeekV41RopeTable: [Float]]
+    /// Written positions, in order. Mirrors the device cache so the reference can
+    /// read the same rows the kernels would.
+    public private(set) var latents: [[[Float]]] = []
+    /// Compressed rows per owner layer.
+    public private(set) var compressed: [Int: [[Float]]] = [:]
+    /// Candidate block scores from the candidate-source layer, per position.
+    /// Recorded rather than consumed: row selection goes through
+    /// `DeepSeekV41CacheAddressing.attentionRowPlan` so the number of rows a
+    /// position reads is known before any dispatch (see that type for why). These
+    /// stay because they are what a probe run compares against.
+    public private(set) var candidateScores: [[Float]] = []
+
+    public init(
+        config: DeepSeekV41Config,
+        plan: [DeepSeekV41LayerPlan],
+        weights: DeepSeekV41WeightSource
+    ) {
+        self.config = config
+        self.plan = plan
+        self.shapes = DeepSeekV41TensorShapes(config: config)
+        self.geometry = DeepSeekV41CacheGeometry.make(
+            config: config,
+            plan: plan,
+            contextLength: max(1, config.maxPositionEmbeddings),
+            precision: .fp16
+        )
+        self.weights = weights
+        var table: [DeepSeekV41RopeTable: [Float]] = [:]
+        for layer in plan {
+            guard table[layer.ropeTable] == nil else { continue }
+            let shape = DeepSeekV41AttentionShape.make(config: config, layer: layer)
+            table[layer.ropeTable] = DeepSeekV41RoPE.frequencies(for: shape, config: config)
+        }
+        self.frequencyTable = table
+    }
+
+    public var storedPositions: Int { latents.first?.count ?? 0 }
+
+    public func reset() {
+        latents = []
+        compressed = [:]
+        candidateScores = []
+    }
+
+    /// Embeds a token id, or zeros when the table is missing.
+    public func embed(_ token: Int) -> [Float] {
+        guard let matrix = weights.matrix(.tokenEmbedding, layer: nil, expert: nil) else {
+            return [Float](repeating: 0, count: shapes.hidden)
+        }
+        return matrix.row(token)
+    }
+
+    /// Runs a whole prompt and returns the logits after the last position.
+    public func prefill(tokens: [Int]) -> [Float] {
+        guard !tokens.isEmpty else { return [] }
+        guard storedPositions == 0 else { return [Float](repeating: 0, count: shapes.hidden) }
+        for (position, token) in tokens.enumerated() {
+            let logits = forwardToken(token, position: position)
+            if position == tokens.count - 1 { return logits }
+        }
+        return []
+    }
+
+    /// Appends one position and returns the output logits.
+    public func forwardToken(_ token: Int, position: Int) -> [Float] {
+        var hidden = embed(token)
+        let mult = max(1, config.hcMult)
+        var streams = Array(repeating: hidden, count: mult)
+
+        for layer in plan {
+            runLayer(layer, at: position, streams: &streams)
+        }
+
+        // The block's output is the collapsed stream, not an average of the streams.
+        hidden = collapse(streams)
+        hidden = rmsNorm(hidden, role: .finalNorm, layer: nil, epsilon: config.rmsNormEps)
+        // A tied checkpoint has no separate head: the embedding matrix is the head,
+        // transposed. The catalog reports the same tensor either way, so the tie flag
+        // from the config is what decides which multiply runs.
+        let head = weights.matrix(.lmHead, layer: nil, expert: nil)
+            ?? (config.tieWordEmbeddings ? weights.matrix(.tokenEmbedding, layer: nil, expert: nil) : nil)
+        guard let head else { return hidden }
+        return head.apply(hidden)
+    }
+
+    // MARK: One layer
+
+    private func runLayer(
+        _ layer: DeepSeekV41LayerPlan,
+        at position: Int,
+        streams: inout [[Float]]
+    ) {
+        let index = layer.index
+        let shape = DeepSeekV41AttentionShape.make(config: config, layer: layer)
+
+        // Attention sub-layer.
+        let attnInput = mixStreams(
+            streams,
+            readRole: .hcAttnFn,
+            scaleRole: .hcAttnScale,
+            baseRole: .hcAttnBase,
+            layer: index
+        )
+        let normed = rmsNorm(attnInput, role: .attnNorm, layer: index, epsilon: config.rmsNormEps)
+
+        var query = queryPath(normed, layer: index, shape: shape)
+        let frequencies = frequencyTable[layer.ropeTable] ?? []
+        DeepSeekV41RoPE.rotateHeads(
+            &query,
+            heads: shape.numHeads,
+            headDim: shape.qkHeadDim,
+            position: position,
+            frequencies: frequencies
+        )
+
+        var latent = latentPath(normed, layer: index)
+        DeepSeekV41RoPE.rotate(&latent, position: position, frequencies: frequencies)
+        appendLatent(layer: layer, position: position, latent: latent)
+        pooledLatent(layer: layer, position: position)
+
+        let keys = attentionKeys(layer: layer, position: position)
+        let sink = weights.vector(.attnSink, layer: index)
+        let attended = DeepSeekV41AttentionReference.attend(
+            query: query,
+            keys: keys,
+            shape: shape,
+            sink: sink
+        )
+        let attnOut = outputPath(attended, layer: index)
+        DeepSeekV41HyperConnections.write(
+            streams: &streams,
+            contribution: attnOut,
+            writeScales: weights.vector(.hcAttnScale, layer: index)
+        )
+
+        // Feed-forward sub-layer.
+        let ffnInput = mixStreams(
+            streams,
+            readRole: .hcFfnFn,
+            scaleRole: .hcFfnScale,
+            baseRole: .hcFfnBase,
+            layer: index
+        )
+        var ffnNormed = rmsNorm(ffnInput, role: .ffnNorm, layer: index, epsilon: config.rmsNormEps)
+        if let engramTable = layer.engramTable,
+           let engram = engramContribution(layer: index, table: engramTable, hidden: ffnNormed) {
+            for dim in 0..<min(ffnNormed.count, engram.count) {
+                ffnNormed[dim] += engram[dim]
+            }
+        }
+
+        let ffnOut = feedForward(ffnNormed, layer: index)
+        DeepSeekV41HyperConnections.write(
+            streams: &streams,
+            contribution: ffnOut,
+            writeScales: weights.vector(.hcFfnScale, layer: index)
+        )
+    }
+
+    // MARK: Attention pieces
+
+    private func queryPath(
+        _ normed: [Float],
+        layer: Int,
+        shape: DeepSeekV41AttentionShape
+    ) -> [Float] {
+        var reduced = normed
+        if let down = weights.matrix(.attnWqA, layer: layer, expert: nil) {
+            reduced = down.apply(normed)
+        }
+        if shape.qLoraRank > 0 {
+            reduced = rmsNorm(reduced, role: .attnWqANorm, layer: layer, epsilon: config.rmsNormEps)
+        }
+        guard let up = weights.matrix(.attnWqB, layer: layer, expert: nil) else {
+            return [Float](repeating: 0, count: shape.queryWidth)
+        }
+        return up.apply(reduced)
+    }
+
+    private func latentPath(_ normed: [Float], layer: Int) -> [Float] {
+        var latent = weights.matrix(.attnWkv, layer: layer, expert: nil)?.apply(normed)
+            ?? [Float](repeating: 0, count: shapes.latentWidth)
+        latent = rmsNorm(latent, role: .attnKvNorm, layer: layer, epsilon: config.rmsNormEps)
+        return latent
+    }
+
+    private func outputPath(_ attended: [Float], layer: Int) -> [Float] {
+        var reduced = attended
+        if let down = weights.matrix(.attnWoA, layer: layer, expert: nil) {
+            reduced = down.apply(attended)
+        }
+        guard let up = weights.matrix(.attnWoB, layer: layer, expert: nil) else {
+            return [Float](repeating: 0, count: shapes.hidden)
+        }
+        return up.apply(reduced)
+    }
+
+    /// Every key the attention stage reads for one position: the live window, then
+    /// the compressed rows the addressing rule selects.
+    func attentionKeys(layer: DeepSeekV41LayerPlan, position: Int) -> [[Float]] {
+        var keys: [[Float]] = []
+        let plan = DeepSeekV41CacheAddressing.attentionRowPlan(
+            layer: layer,
+            position: position,
+            config: config,
+            plan: self.plan,
+            geometry: geometry
+        )
+        for row in plan.windowPositions {
+            guard let written = latent(layer: layer.index, position: row) else { continue }
+            keys.append(written)
+        }
+        guard !plan.compressedRows.isEmpty else { return keys }
+        let rows = compressed[layer.compressedKVSource] ?? []
+        for row in plan.compressedRows where rows.indices.contains(row) {
+            keys.append(rows[row])
+        }
+        return keys
+    }
+
+    /// Records the latent for a position. The reference keeps every position (it is
+    /// the oracle, and a test wants to compare any of them); the device cache is the
+    /// one that rings.
+    private func appendLatent(layer: DeepSeekV41LayerPlan, position: Int, latent: [Float]) {
+        let index = layer.index
+        if latents.indices.contains(index) {
+            latents[index].append(latent)
+        } else {
+            while latents.count <= index { latents.append([]) }
+            latents[index] = [latent]
+        }
+    }
+
+    private func latent(layer: Int, position: Int) -> [Float]? {
+        guard latents.indices.contains(layer) else { return nil }
+        guard latents[layer].indices.contains(position) else { return nil }
+        return latents[layer][position]
+    }
+
+    /// Pools a completed block of latents into the owner's compressed row, and the
+    /// indexer's block scores at the candidate-source layer.
+    private func pooledLatent(layer: DeepSeekV41LayerPlan, position: Int) {
+        guard layer.flavor == .compressed, layer.ownsCompressedKV else {
+            // A non-owner still contributes candidate scores at the source layer.
+            if layer.isCandidateSource { recordCandidateScores(layer: layer, position: position) }
+            return
+        }
+        let ratio = max(1, layer.compressRatio)
+        // A compressed row is produced only when a whole block has been seen, i.e.
+        // exactly on the positions where `position + 1` is a multiple of the ratio.
+        // Pooling on every later position would append the same row again and let
+        // the cache grow with the context instead of with the context / ratio.
+        guard (position + 1) % ratio == 0 else { return }
+        let rows = DeepSeekV41CacheAddressing.compressedRowCount(afterPosition: position, ratio: ratio)
+        let completed = DeepSeekV41CacheAddressing.poolRange(row: rows - 1, ratio: ratio)
+        guard rows > 0, completed.upperBound <= position + 1 else { return }
+        var block: [[Float]] = []
+        var gates: [Float] = []
+        for row in completed {
+            guard let written = latent(layer: layer.index, position: row) else { return }
+            block.append(written)
+            gates.append(0)
+        }
+        let pooled = DeepSeekV41Compressor.pool(latents: block, gates: gates)
+        compressed[layer.index, default: []].append(pooled)
+        if layer.isCandidateSource { recordCandidateScores(layer: layer, position: position) }
+    }
+
+    private func recordCandidateScores(layer: DeepSeekV41LayerPlan, position: Int) {
+        let rows = compressed[layer.compressedKVSource] ?? []
+        guard !rows.isEmpty else { return }
+        let queries = [Array(rows[rows.count - 1].prefix(max(1, config.indexHeadDim)))]
+        let scores = DeepSeekV41Indexer.blockScores(
+            queries: queries,
+            keys: rows,
+            blockSize: max(1, config.candidateBlockSize),
+            keyWidth: max(1, config.indexHeadDim)
+        )
+        candidateScores.append(scores)
+    }
+
+    // MARK: FFN
+
+    private func feedForward(_ normed: [Float], layer: Int) -> [Float] {
+        let limit = config.swigluLimit ?? 0
+        var out = [Float](repeating: 0, count: shapes.hidden)
+
+        if let routing = route(normed, layer: layer) {
+            for (rank, expert) in routing.expertIDs.enumerated() {
+                guard let w1 = weights.matrix(.expertW1, layer: layer, expert: expert),
+                      let w3 = weights.matrix(.expertW3, layer: layer, expert: expert),
+                      let w2 = weights.matrix(.expertW2, layer: layer, expert: expert) else { continue }
+                let activated = DeepSeekV41Activation.swiglu(
+                    gates: w1.apply(normed),
+                    ups: w3.apply(normed),
+                    limit: limit
+                )
+                let projected = w2.apply(activated)
+                let weight = rank < routing.weights.count ? routing.weights[rank] : 0
+                for dim in 0..<min(out.count, projected.count) {
+                    out[dim] += weight * projected[dim]
+                }
+            }
+        }
+
+        // The shared expert runs for every token, unscaled.
+        if let s1 = weights.matrix(.sharedExpertW1, layer: layer),
+           let s3 = weights.matrix(.sharedExpertW3, layer: layer),
+           let s2 = weights.matrix(.sharedExpertW2, layer: layer) {
+            let activated = DeepSeekV41Activation.swiglu(
+                gates: s1.apply(normed),
+                ups: s3.apply(normed),
+                limit: limit
+            )
+            let projected = s2.apply(activated)
+            for dim in 0..<min(out.count, projected.count) {
+                out[dim] += projected[dim]
+            }
+        }
+        return out
+    }
+
+    func route(_ normed: [Float], layer: Int) -> DeepSeekV41Routing? {
+        guard let gate = weights.matrix(.routerWeight, layer: layer) else { return nil }
+        let logits = gate.apply(normed)
+        let bias = weights.vector(.routerBias, layer: layer)
+        return DeepSeekV41Router.route(
+            logits: logits,
+            bias: bias,
+            topK: config.numActivatedExperts,
+            scalingFactor: config.routedScalingFactor
+        )
+    }
+
+    private func engramContribution(layer: Int, table: Int, hidden: [Float]) -> [Float]? {
+        let spec = config.engramTables[table]
+        let columns = max(1, spec.maxNgramSize - 1) * spec.headCount
+        var rows: [[Float]] = []
+        rows.reserveCapacity(columns)
+        var sawAny = false
+        for column in 0..<columns {
+            for head in 0..<spec.headCount {
+                if let row = weights.engramRow(layer: layer, column: column, head: head) {
+                    rows.append(row)
+                    sawAny = true
+                } else {
+                    rows.append([Float](repeating: 0, count: spec.headDimension))
+                }
+            }
+        }
+        guard sawAny else { return nil }
+        let result = DeepSeekV41EngramCombination.contribution(
+            hidden: hidden,
+            rows: rows,
+            heads: spec.headCount,
+            headDim: spec.headDimension,
+            queryWeight: weights.matrix(.engramQuery, layer: layer),
+            keyWeight: weights.matrix(.engramKey, layer: layer)
+        )
+        return result.isEmpty ? nil : result
+    }
+
+    // MARK: Streams
+
+    private func mixStreams(
+        _ streams: [[Float]],
+        readRole: DeepSeekV41TensorRole,
+        scaleRole: DeepSeekV41TensorRole,
+        baseRole: DeepSeekV41TensorRole,
+        layer: Int
+    ) -> [Float] {
+        let mult = streams.count
+        let readRaw = weights.matrix(readRole, layer: layer)
+        let read = readRaw.map { resize($0.row(0), to: mult) }
+            ?? [Float](repeating: 1 / Float(max(1, mult)), count: mult)
+        let scale = weights.vector(scaleRole, layer: layer)
+        let bias = weights.vector(baseRole, layer: layer)
+        return DeepSeekV41HyperConnections.mix(
+            streams: streams,
+            readWeights: read,
+            scale: scale,
+            bias: bias
+        )
+    }
+
+    private func collapse(_ streams: [[Float]]) -> [Float] {
+        streams.first ?? []
+    }
+
+    private func resize(_ values: [Float], to count: Int) -> [Float] {
+        guard values.count != count else { return values }
+        if values.count > count { return Array(values.prefix(count)) }
+        return values + [Float](repeating: 0, count: count - values.count)
+    }
+
+    // MARK: Norm
+
+    /// RMSNorm with the checkpoint's per-channel gain.
+    func rmsNorm(
+        _ input: [Float],
+        role: DeepSeekV41TensorRole,
+        layer: Int?,
+        epsilon: Float
+    ) -> [Float] {
+        guard !input.isEmpty else { return [] }
+        var sumSquares: Float = 0
+        for value in input { sumSquares += value * value }
+        let rms = 1 / sqrt(sumSquares / Float(input.count) + epsilon)
+        let gain = weights.vector(role, layer: layer)
+        var out = [Float](repeating: 0, count: input.count)
+        for index in input.indices {
+            let scale = (gain?.count ?? 0) == input.count ? gain![index] : 1
+            out[index] = input[index] * rms * scale
+        }
+        return out
+    }
+}
