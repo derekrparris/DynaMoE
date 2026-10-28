@@ -557,7 +557,9 @@ final class DeepSeekV41MemoryPlanTests: XCTestCase {
             config: config, plan: plan, catalog: nil, contextLength: 1_048_576
         )
         XCTAssertEqual(memory.compressedCacheBytes, 2 * 288 * 1_048_576)
-        XCTAssertEqual(memory.windowRingBytes, 40 * 128 * config.fp8CacheRecordBytes)
+        // The rings are priced at the same record width as the compressed caches,
+        // which is the FP4 design width by default here.
+        XCTAssertEqual(memory.windowRingBytes, 40 * 128 * config.fp4CacheRecordBytes)
         // Main caches (576 MB) plus one index key per compressed row (two
         // owners x 128 FP16 values per row) stays well under 2 GB, which is
         // what makes a 1M-token context affordable on this machine.
@@ -732,5 +734,343 @@ final class DeepSeekV41EngramReaderTests: XCTestCase {
             byteOffset: spec.totalBytes, byteCount: spec.rowBytes
         )
         XCTAssertThrowsError(try reader.readRows([request], into: buffer))
+    }
+}
+
+// MARK: - Preflight shard sizes
+
+final class DeepSeekV41PreflightSizeTests: XCTestCase {
+
+    private func makeDirectory() throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dsv41-preflight-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// Writes a shard whose safetensors header declares more data than the file
+    /// carries, which is what a half-finished download looks like.
+    private func writeShard(at url: URL, declaredDataBytes: Int, actualDataBytes: Int) throws {
+        let header = "{\"w\":{\"dtype\":\"U8\",\"shape\":[\(declaredDataBytes)],"
+            + "\"data_offsets\":[0,\(declaredDataBytes)]}}"
+        var data = Data()
+        var length = UInt64(header.utf8.count).littleEndian
+        withUnsafeBytes(of: &length) { data.append(contentsOf: $0) }
+        data.append(contentsOf: header.utf8)
+        data.append(Data(repeating: 1, count: actualDataBytes))
+        try data.write(to: url)
+    }
+
+    func testShortShardIsReportedByItsOwnHeader() throws {
+        let dir = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let name = "model-00001-of-00001.safetensors"
+        try writeShard(at: dir.appendingPathComponent(name), declaredDataBytes: 1_000, actualDataBytes: 100)
+        try """
+        {"metadata": {"total_size": 1008}, "weight_map": {"a": "\(name)"}}
+        """.write(
+            to: dir.appendingPathComponent("model.safetensors.index.json"),
+            atomically: true, encoding: .utf8
+        )
+
+        let report = try XCTUnwrap(DeepSeekV41Preflight.inspect(snapshotDir: dir))
+        XCTAssertFalse(report.isComplete)
+        let issue = try XCTUnwrap(report.issues.first)
+        XCTAssertEqual(issue.name, name)
+        // The header declares 1_000 data bytes and only 100 were written.
+        let actual = try XCTUnwrap(issue.actualBytes)
+        let expected = try XCTUnwrap(issue.expectedBytes)
+        XCTAssertEqual(expected, actual + 900)
+        XCTAssertTrue(issue.humanDescription.contains("short"), issue.humanDescription)
+    }
+
+    func testShardMatchingItsHeaderIsComplete() throws {
+        let dir = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let name = "model-00001-of-00001.safetensors"
+        try writeShard(at: dir.appendingPathComponent(name), declaredDataBytes: 64, actualDataBytes: 64)
+        try """
+        {"weight_map": {"a": "\(name)"}}
+        """.write(
+            to: dir.appendingPathComponent("model.safetensors.index.json"),
+            atomically: true, encoding: .utf8
+        )
+        let report = try XCTUnwrap(DeepSeekV41Preflight.inspect(snapshotDir: dir))
+        XCTAssertTrue(report.isComplete, "\(report.issues)")
+        XCTAssertTrue(report.issues.isEmpty)
+    }
+
+    /// A 6 GB shard is past what an `Int32` byte count can hold. The file is
+    /// sparse, so the test costs no disk.
+    func testByteCountsAreNotTruncatedTo32Bits() throws {
+        let dir = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let name = "model-00001-of-00001.safetensors"
+        let url = dir.appendingPathComponent(name)
+        try Data(repeating: 0, count: 8).write(to: url)
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: 6_000_000_000)
+        try handle.close()
+        try """
+        {"metadata": {"total_size": 12000000000}, "weight_map": {"a": "\(name)"}}
+        """.write(
+            to: dir.appendingPathComponent("model.safetensors.index.json"),
+            atomically: true, encoding: .utf8
+        )
+
+        let report = try XCTUnwrap(DeepSeekV41Preflight.inspect(snapshotDir: dir))
+        XCTAssertEqual(report.bytesPresent, 6_000_000_000)
+        XCTAssertEqual(report.bytesExpected, 12_000_000_000)
+        XCTAssertTrue(report.humanSummary.contains("50%"), report.humanSummary)
+    }
+}
+
+// MARK: - Cache reuse
+
+final class DeepSeekV41CacheReuseTests: XCTestCase {
+
+    func testPrefixInsideTheWindowRingIsReusable() {
+        XCTAssertTrue(
+            DeepSeekV41CacheAddressing.prefixIsReusable(
+                prefixCount: 64, storedPositions: 100, windowRows: 128
+            )
+        )
+    }
+
+    func testPrefixPastTheWindowRingIsNotReusable() {
+        // The position count says every row exists, but the ring has overwritten the
+        // oldest window rows, so a hit would attend stale context.
+        XCTAssertFalse(
+            DeepSeekV41CacheAddressing.prefixIsReusable(
+                prefixCount: 200, storedPositions: 300, windowRows: 128
+            )
+        )
+    }
+
+    func testPrefixPastWhatIsStoredIsNotReusable() {
+        XCTAssertFalse(
+            DeepSeekV41CacheAddressing.prefixIsReusable(
+                prefixCount: 40, storedPositions: 20, windowRows: 128
+            )
+        )
+        XCTAssertTrue(
+            DeepSeekV41CacheAddressing.prefixIsReusable(
+                prefixCount: 0, storedPositions: 20, windowRows: 128
+            )
+        )
+    }
+
+    /// The window and the compressed rows cover the newest positions twice when the
+    /// ratio is no wider than the window. That overlap is the reference behavior, so
+    /// it is asserted here rather than left to be rediscovered.
+    func testWindowAndCompressedRowsOverlapForANarrowRatio() throws {
+        let config = try DeepSeekV41Config.decode(jsonData: Data(DeepSeekV41ConfigTests.wrapperJSON.utf8))
+        let plan = try config.makeLayerPlan()
+        let geometry = DeepSeekV41CacheGeometry.make(config: config, plan: plan, contextLength: 1_024)
+        let layer = try XCTUnwrap(plan.first { $0.flavor == .compressed && $0.index == 2 })
+        let rows = DeepSeekV41CacheAddressing.attentionRowPlan(
+            layer: layer, position: 9, config: config, plan: plan, geometry: geometry
+        )
+        // Position 9 pools into compressed row 4 (positions 8...9) and the window
+        // still holds positions 0...9, so those two positions are in both sets.
+        XCTAssertEqual(rows.compressedRows.last, 4)
+        XCTAssertTrue(rows.windowPositions.contains(8))
+        XCTAssertTrue(rows.windowPositions.contains(9))
+        XCTAssertEqual(rows.totalRows, rows.windowPositions.count + rows.compressedRows.count)
+    }
+}
+
+// MARK: - Dtype widths
+
+final class DeepSeekV41DtypeWidthTests: XCTestCase {
+
+    func testEightBitIntegersAreOneByte() {
+        XCTAssertEqual(DeepSeekV41DtypeWidth.bytesPerValue(dtype: "I8"), 1, accuracy: 1e-9)
+        XCTAssertEqual(DeepSeekV41DtypeWidth.bytesPerValue(dtype: "U8"), 1, accuracy: 1e-9)
+        XCTAssertEqual(DeepSeekV41DtypeWidth.bytesPerValue(dtype: "INT8"), 1, accuracy: 1e-9)
+    }
+
+    func testMXFP4IsNamedExplicitly() {
+        XCTAssertEqual(
+            DeepSeekV41DtypeWidth.bytesPerValue(dtype: "MXFP4"),
+            0.5 + 1.0 / 32.0,
+            accuracy: 1e-9
+        )
+        XCTAssertEqual(
+            DeepSeekV41DtypeWidth.bytesPerValue(dtype: "F4_E2M1"),
+            0.5 + 1.0 / 32.0,
+            accuracy: 1e-9
+        )
+    }
+
+    func testFloatWidths() {
+        XCTAssertEqual(DeepSeekV41DtypeWidth.bytesPerValue(dtype: "BF16"), 2, accuracy: 1e-9)
+        XCTAssertEqual(DeepSeekV41DtypeWidth.bytesPerValue(dtype: "F16"), 2, accuracy: 1e-9)
+        XCTAssertEqual(DeepSeekV41DtypeWidth.bytesPerValue(dtype: "F32"), 4, accuracy: 1e-9)
+        XCTAssertEqual(DeepSeekV41DtypeWidth.bytesPerValue(dtype: "F8_E4M3"), 1 + 1.0 / 32.0, accuracy: 1e-9)
+    }
+}
+
+// MARK: - Memory plan honesty
+
+final class DeepSeekV41MemoryPlanHonestyTests: XCTestCase {
+
+    private func memory(recordBytesOverride: Int? = nil) throws -> DeepSeekV41MemoryPlan {
+        let config = try DeepSeekV41Config.decode(jsonData: Data(DeepSeekV41ConfigTests.wrapperJSON.utf8))
+        let plan = try config.makeLayerPlan()
+        return DeepSeekV41MemoryPlan.make(
+            config: config,
+            plan: plan,
+            catalog: nil,
+            contextLength: 4_096,
+            recordBytesOverride: recordBytesOverride
+        )
+    }
+
+    func testRequiredBytesIncludesEngramStaging() throws {
+        let plan = try memory()
+        let expected = plan.cacheBytes
+            + plan.residentWeightBytes
+            + 8 * plan.bytesPerExpert
+            + plan.engramStagingBytes
+        XCTAssertEqual(plan.requiredBytes(expertSlots: 8), expected)
+    }
+
+    func testFP16OverridePricesTheWindowRingsToo() throws {
+        let fp16 = try memory(recordBytesOverride: 1_024)
+        let config = try DeepSeekV41Config.decode(jsonData: Data(DeepSeekV41ConfigTests.wrapperJSON.utf8))
+        XCTAssertEqual(fp16.compressedCacheBytes, 2 * 1_024 * 4_096)
+        XCTAssertEqual(fp16.windowRingBytes, 40 * config.windowSize * 1_024)
+    }
+}
+
+// MARK: - Encoding and catalog edges
+
+final class DeepSeekV41ConfigEdgeTests: XCTestCase {
+
+    private func decode(_ json: String) throws -> DeepSeekV41Config {
+        try DeepSeekV41Config.decode(jsonData: Data(json.utf8))
+    }
+
+    private static let minimalJSON = """
+    {"model_type": "deepseek_v41",
+     "num_hidden_layers": 2, "hidden_size": 256, "num_attention_heads": 4,
+     "num_key_value_heads": 1, "vocab_size": 1024,
+     "n_routed_experts": 8, "n_activated_experts": 2,
+     "qk_nope_head_dim": 64, "v_head_dim": 64, "o_groups": 1,
+     "window_size": 8, "compress_ratios": [0, 2],
+     "engram_layer_ids": [0], "engram_num_embeddings": [3000000000],
+     "engram_max_ngram_size": 2, "engram_vocab_size": 1000,
+     "engram_n_heads": 1, "engram_head_dim": 8,
+     "engram_compressed_vocab_size": 100, "engram_pad_token_id": 2}
+    """
+
+    /// A decoupled rope payload is refused instead of loading a checkpoint whose two
+    /// backends would rotate the latent differently.
+    func testDecoupledRopePayloadIsRefused() {
+        let json = Self.minimalJSON.replacingOccurrences(
+            of: "\"qk_nope_head_dim\": 64",
+            with: "\"qk_nope_head_dim\": 64, \"qk_rope_head_dim\": 64"
+        )
+        XCTAssertThrowsError(try decode(json)) { error in
+            guard case DeepSeekV41ConfigError.invalidField(let field, _)? = error as? DeepSeekV41ConfigError else {
+                return XCTFail("unexpected error \(error)")
+            }
+            XCTAssertEqual(field, "qk_rope_head_dim")
+        }
+    }
+
+    /// Engram row counts are ~4x10^8 and can exceed 32 bits, so the reader must not
+    /// truncate them.
+    func testLargeEngramRowCountsDecodeExactly() throws {
+        let config = try decode(Self.minimalJSON)
+        XCTAssertEqual(config.engramRowCounts, [3_000_000_000])
+        XCTAssertEqual(config.engramTables.first?.rowCount, 3_000_000_000)
+    }
+
+    func testOutOfRangePadTokenIsRefusedInsteadOfTrapping() {
+        XCTAssertThrowsError(
+            try DeepSeekV41EngramTokenMap(
+                vocabSize: 100, compressedVocabSize: 10, padTokenID: 100
+            )
+        )
+    }
+
+    func testTwoNamesForOneRoleAreReported() {
+        let catalog = DeepSeekV41WeightCatalog(
+            named: [
+                DeepSeekV41TensorRef(name: "layers.0.attn.kv_norm.weight", dtype: "BF16", shape: [64]),
+                DeepSeekV41TensorRef(name: "layers.0.attn.wkv_norm.weight", dtype: "BF16", shape: [64])
+            ],
+            layerCount: 1
+        )
+        XCTAssertEqual(catalog.duplicateRoles.count, 1, "\(catalog.duplicateRoles)")
+    }
+
+    func testNegativeIndicesAreNotTensorsOfALayer() {
+        let catalog = DeepSeekV41WeightCatalog(
+            named: [
+                DeepSeekV41TensorRef(name: "layers.-1.attn_norm.weight", dtype: "BF16", shape: [64]),
+                DeepSeekV41TensorRef(name: "layers.0.ffn.experts.-2.w1.weight", dtype: "BF16", shape: [64, 64])
+            ],
+            layerCount: 1
+        )
+        XCTAssertEqual(catalog.slots.count, 0)
+        XCTAssertEqual(catalog.unconsumed.count, 2)
+    }
+}
+
+// MARK: - Vision placeholder expansion
+
+final class DeepSeekV41VisionExpandTests: XCTestCase {
+
+    private let spec = DeepSeekV41VisionSpec(
+        patchSize: 16, downsampleRatio: 1, minPixels: 0, maxImageTokens: 0,
+        numHiddenLayers: 1, hiddenSize: 16, numAttentionHeads: 1,
+        intermediateSize: 16, imageTokenID: 7
+    )
+
+    func testEmptyMarkerDoesNotLoopForever() {
+        let markers = DeepSeekV41VisionMarkers(
+            imagePlaceholder: "", imageOpen: "<", imageClose: ">", imageToken: "x"
+        )
+        XCTAssertEqual(
+            DeepSeekV41VisionLayout.expand(text: "hi", images: [(32, 32)], spec: spec, markers: markers),
+            "hi"
+        )
+    }
+
+    func testExtraPlaceholderIsKeptVisibly() {
+        let markers = DeepSeekV41VisionMarkers(
+            imagePlaceholder: "<img>", imageOpen: "<", imageClose: ">", imageToken: "x"
+        )
+        let out = DeepSeekV41VisionLayout.expand(
+            text: "<img> and <img>", images: [(32, 32)], spec: spec, markers: markers
+        )
+        XCTAssertTrue(out.contains(" and <img>"), out)
+        XCTAssertFalse(out.contains("xx and"), out)
+    }
+
+    func testExtraImageIsReportedInsteadOfDroppedSilently() {
+        let markers = DeepSeekV41VisionMarkers(
+            imagePlaceholder: "<img>", imageOpen: "<", imageClose: ">", imageToken: "x"
+        )
+        let expansion = DeepSeekV41VisionLayout.expandReporting(
+            text: "<img>", images: [(32, 32), (32, 32)], spec: spec, markers: markers
+        )
+        XCTAssertEqual(expansion.text, "<xxxx>")
+        XCTAssertEqual(expansion.report.unusedImageCount, 1)
+        XCTAssertFalse(expansion.report.isBalanced)
+    }
+
+    func testExtraPlaceholderIsReported() {
+        let markers = DeepSeekV41VisionMarkers(
+            imagePlaceholder: "<img>", imageOpen: "<", imageClose: ">", imageToken: "x"
+        )
+        let expansion = DeepSeekV41VisionLayout.expandReporting(
+            text: "<img><img>", images: [(32, 32)], spec: spec, markers: markers
+        )
+        XCTAssertEqual(expansion.text, "<xxxx><img>")
+        XCTAssertEqual(expansion.report.unfilledPlaceholderCount, 1)
     }
 }

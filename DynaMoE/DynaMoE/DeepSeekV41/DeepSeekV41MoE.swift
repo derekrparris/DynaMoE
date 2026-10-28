@@ -20,9 +20,9 @@
 //    3. The routed experts are MXFP4 and there are 384 of them per layer, so the
 //       arena that decides which expert matrices are resident is not an
 //       optimization but the difference between running and not. Its policy is
-//       LRU over whole (layer, expert) pairs, with slots allocated per layer so an
-//       eviction can never strand a needed expert behind an unrelated layer's
-//       residency.
+//       LRU over whole (layer, expert) pairs: one global pool, and eviction picks
+//       the least recently used pair whatever layer it came from, so a slot never
+//       holds half an expert.
 //
 //  The activation function is the checkpoint's clipped SwiGLU: `silu(min(gate,
 //  limit)) * clamp(up, -limit, limit)`. The clip is part of the trained function,
@@ -39,7 +39,9 @@ nonisolated public struct DeepSeekV41Routing: Sendable, Equatable {
     /// The weight applied to each expert's output, already normalized and scaled.
     public let weights: [Float]
     /// The selection scores before normalization (sigmoid of logit + bias). Kept
-    /// so the tests can assert the ranking instead of inferring it.
+    /// so the tests can assert the ranking instead of inferring it. These are NOT
+    /// the values the mixture weights are normalized from; those are the unbiased
+    /// `sigmoid(logit)`.
     public let scores: [Float]
 
     public init(expertIDs: [Int], weights: [Float], scores: [Float]) {
@@ -64,12 +66,18 @@ nonisolated public enum DeepSeekV41Router {
 
     /// Routes one token.
     ///
+    /// The bias is a SELECTION aid only: the ranking uses
+    /// `sigmoid(logit + bias)`, while the mixture weight each selected expert
+    /// receives is its own unbiased `sigmoid(logit)`. Folding the bias into the
+    /// weight would change every token's mixture, which is exactly what the bias
+    /// is not allowed to do.
+    ///
     /// - Parameters:
     ///   - logits: router output, one per routed expert.
     ///   - bias: per-expert selection bias from `ffn.gate.bias`, or nil.
     ///   - topK: experts to activate.
     ///   - scalingFactor: `routed_scaling_factor`; 0 or negative disables it.
-    ///   - normalise: divide the selected scores by their sum. The checkpoint's
+    ///   - normalise: divide the selected weights by their sum. The checkpoint's
     ///     `norm_topk_prob` equivalent; when off the raw sigmoid scores are used.
     public static func route(
         logits: [Float],
@@ -81,6 +89,9 @@ nonisolated public enum DeepSeekV41Router {
         guard !logits.isEmpty, topK > 0 else { return .empty }
         let count = min(topK, logits.count)
 
+        // Unbiased mixture weights and biased selection scores, computed from the
+        // same logits so the two can never drift.
+        let weights = logits.map { sigmoid($0) }
         var scores = logits
         if let bias, bias.count == logits.count {
             for index in scores.indices { scores[index] += bias[index] }
@@ -93,7 +104,7 @@ nonisolated public enum DeepSeekV41Router {
             scores[lhs] == scores[rhs] ? lhs < rhs : scores[lhs] > scores[rhs]
         }
         let selected = Array(ranked.prefix(count))
-        var selectedScores = selected.map { scores[$0] }
+        var selectedScores = selected.map { weights[$0] }
 
         if normalise {
             let total = selectedScores.reduce(0, +)
@@ -257,14 +268,17 @@ nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
 /// The mHC residual streams.
 ///
 /// Instead of one residual vector, the block carries `hc_mult` copies. Each
-/// sub-layer produces a mixing matrix (from `hc_*_fn`, biased by `hc_*_base` and
-/// scaled by `hc_*_scale`), the matrix is Sinkhorn-normalized into a
-/// doubly-stochastic one, and the streams are mixed by it before the sub-layer
-/// runs. The block's "hidden state" for the next sub-layer is stream 0.
+/// sub-layer reads a mixing row (from `hc_*_fn`, biased by `hc_*_base` and scaled
+/// by `hc_*_scale`) and combines the streams with it; the sub-layer's output is
+/// added back into every stream with that stream's `hc_*_scale`. The block's
+/// "hidden state" for the next sub-layer is stream 0.
 ///
-/// Doubly-stochastic is the point: it makes the mix an average over the streams,
-/// so the residual norm cannot drift with depth the way an unnormalized linear mix
-/// does, and a mid-network NaN in one stream cannot dominate the others.
+/// The reference describes Sinkhorn normalization of the mixing matrix before it
+/// is used, and `sinkhorn` below implements it, but the reference's own forward is
+/// not verified to apply it and both backends currently read the matrix row as
+/// published. That makes `sinkhorn` dormant rather than wrong; it stays here (and
+/// as `dsv41_hc_sinkhorn`) so wiring it is a one-line change once a reference
+/// vector settles the question.
 nonisolated public enum DeepSeekV41HyperConnections {
 
     /// Sinkhorn normalization of a `dimension × dimension` matrix.
@@ -281,7 +295,10 @@ nonisolated public enum DeepSeekV41HyperConnections {
     ) -> [Float] {
         let n = dimension
         guard n > 0, logits.count >= n * n else { return [] }
-        var matrix = (0..<(n * n)).map { exp(logits[$0]) }
+        // Subtract the max first: a large logit would otherwise exponentiate to
+        // infinity and every later row/column sum would be `inf`.
+        let shift = logits.prefix(n * n).max() ?? 0
+        var matrix = (0..<(n * n)).map { exp(logits[$0] - shift) }
         let floor = max(epsilon, 1e-12)
         for _ in 0..<max(0, iterations) {
             for row in 0..<n {

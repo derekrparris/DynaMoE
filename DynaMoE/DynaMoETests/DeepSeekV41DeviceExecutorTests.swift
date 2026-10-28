@@ -346,3 +346,173 @@ final class DeepSeekV41QueryRopeTests: XCTestCase {
         XCTAssertEqual(vector, original)
     }
 }
+
+// MARK: - Norm dispatch
+
+import Metal
+
+final class DeepSeekV41NormDispatchTests: XCTestCase {
+
+    /// The kernel reads `threadgroup_position_in_grid` as the ROW index, so a row
+    /// must be exactly one threadgroup however wide it is.
+    func testARowIsOneThreadgroupAtEveryWidth() {
+        for width in [64, 256, 257, 512, 7_168] {
+            let grid = DeepSeekV41DevicePlan.normDispatch(width: width, lanes: 256)
+            XCTAssertEqual(grid.threadgroups.width, 1, "width \(width)")
+            XCTAssertEqual(grid.threadgroups.height, 1)
+            XCTAssertEqual(grid.threadsPerThreadgroup.width, 256)
+        }
+    }
+
+    /// Golden vector: the real kernel, dispatched the way the executor dispatches,
+    /// against the CPU definition. This is the case the planning tests cannot see,
+    /// because they never run a kernel.
+    func testKernelMatchesTheCPUDefinitionForAWideRow() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+        guard let library = device.makeDefaultLibrary(),
+              let function = library.makeFunction(name: DeepSeekV41Kernels.rmsNorm),
+              let pipeline = try? device.makeComputePipelineState(function: function),
+              let queue = device.makeCommandQueue() else {
+            XCTFail("Could not build the RMSNorm pipeline")
+            return
+        }
+
+        let width = 1_024
+        let epsilon: Float = 1e-6
+        let values = (0..<width).map { Float(($0 % 17) - 8) / 8 }
+        let gains = (0..<width).map { Float(1) + Float($0 % 5) * 0.1 }
+
+        guard let input = device.makeBuffer(
+                  bytes: values, length: width * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let gain = device.makeBuffer(
+                  bytes: gains, length: width * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let output = device.makeBuffer(
+                  length: 2 * width * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("Could not allocate the norm buffers")
+            return
+        }
+        // Poison the second row so a stray threadgroup writing past row 0 shows up.
+        let out = output.contents().assumingMemoryBound(to: Float.self)
+        for index in width..<(2 * width) { out[index] = 42 }
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(input, offset: 0, index: 0)
+        encoder.setBuffer(gain, offset: 0, index: 1)
+        encoder.setBuffer(output, offset: 0, index: 2)
+        var dim = UInt32(width)
+        var eps = epsilon
+        encoder.setBytes(&dim, length: 4, index: 3)
+        encoder.setBytes(&eps, length: 4, index: 4)
+        let lanes = 256
+        encoder.setThreadgroupMemoryLength((lanes / 32) * MemoryLayout<Float>.stride, index: 0)
+        let grid = DeepSeekV41DevicePlan.normDispatch(width: width, lanes: lanes)
+        encoder.dispatchThreadgroups(grid.threadgroups, threadsPerThreadgroup: grid.threadsPerThreadgroup)
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        let sumOfSquares = values.reduce(Float(0)) { $0 + $1 * $1 }
+        let inverse = 1 / (sumOfSquares / Float(width) + epsilon).squareRoot()
+        for index in 0..<width {
+            XCTAssertEqual(out[index], values[index] * inverse * gains[index], accuracy: 1e-4, "index \(index)")
+        }
+        for index in width..<(2 * width) {
+            XCTAssertEqual(out[index], 42, "row 1 was overwritten at \(index)")
+        }
+    }
+}
+
+// MARK: - Router kernel
+
+final class DeepSeekV41RouterKernelTests: XCTestCase {
+
+    /// The kernel is the GPU half of `DeepSeekV41Router.route`, so it is checked
+    /// against it on the same inputs: the bias ranks, and the weights are the
+    /// unbiased sigmoids. A CPU/GPU agreement on the wrong rule would pass a
+    /// self-consistency test, which is why the expected values come from the
+    /// documented rule and not from a second kernel run.
+    func testKernelMatchesTheReferenceRouting() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+        guard let library = device.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "dsv41_router_topk_sigmoid"),
+              let pipeline = try? device.makeComputePipelineState(function: function),
+              let queue = device.makeCommandQueue() else {
+            XCTFail("Could not build the router pipeline")
+            return
+        }
+
+        let logits: [Float] = [1.5, -0.5, 4.0, 0.25, -3.0, 2.0, 0.0, 1.0]
+        let bias: [Float] = [0.0, 0.0, 0.0, 0.0, 5.0, -1.0, 0.0, 0.0]
+        let topK = 3
+        let scaling: Float = 2.5
+
+        guard let logitsBuffer = device.makeBuffer(
+                  bytes: logits, length: logits.count * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let biasBuffer = device.makeBuffer(
+                  bytes: bias, length: bias.count * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let indexBuffer = device.makeBuffer(length: 64 * MemoryLayout<UInt32>.stride, options: .storageModeShared),
+              let weightBuffer = device.makeBuffer(length: 64 * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("Could not allocate the router buffers")
+            return
+        }
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(logitsBuffer, offset: 0, index: 0)
+        encoder.setBuffer(biasBuffer, offset: 0, index: 1)
+        encoder.setBuffer(indexBuffer, offset: 0, index: 2)
+        encoder.setBuffer(weightBuffer, offset: 0, index: 3)
+        var expertCount = UInt32(logits.count)
+        var top = UInt32(topK)
+        var scale = scaling
+        var normalise: UInt32 = 1
+        encoder.setBytes(&expertCount, length: 4, index: 4)
+        encoder.setBytes(&top, length: 4, index: 5)
+        encoder.setBytes(&scale, length: 4, index: 6)
+        encoder.setBytes(&normalise, length: 4, index: 7)
+        encoder.dispatchThreads(
+            MTLSize(width: 1, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        let indices = indexBuffer.contents().assumingMemoryBound(to: UInt32.self)
+        let weights = weightBuffer.contents().assumingMemoryBound(to: Float.self)
+        let reference = DeepSeekV41Router.route(
+            logits: logits, bias: bias, topK: topK, scalingFactor: scaling
+        )
+        XCTAssertEqual(reference.expertIDs, [2, 4, 0], "selection should follow sigmoid(logit + bias)")
+        for rank in 0..<topK {
+            XCTAssertEqual(Int(indices[rank]), reference.expertIDs[rank], "rank \(rank)")
+            XCTAssertEqual(weights[rank], reference.weights[rank], accuracy: 1e-5, "rank \(rank)")
+        }
+        // Expert 4 is selected only because of its bias, but its weight is its own
+        // unbiased sigmoid's share, not its biased score's.
+        let withoutBias = DeepSeekV41Router.route(
+            logits: logits, bias: nil, topK: topK, scalingFactor: scaling
+        )
+        XCTAssertFalse(withoutBias.expertIDs.contains(4))
+        let unbiased = logits.map { DeepSeekV41Router.sigmoid($0) }
+        let total = reference.expertIDs.map { unbiased[$0] }.reduce(0, +)
+        for (rank, expert) in reference.expertIDs.enumerated() {
+            XCTAssertEqual(weights[rank], unbiased[expert] / total * scaling, accuracy: 1e-4)
+        }
+        // Expert 4's biased score is sigmoid(2); weighting by it instead of by its
+        // unbiased sigmoid(-3) would move its share from ~0.06 to ~1.19.
+        let biasedShare = DeepSeekV41Router.sigmoid(2)
+        XCTAssertNotEqual(weights[1], biasedShare / total * scaling, accuracy: 0.1)
+    }
+}

@@ -419,6 +419,27 @@ final class DeepSeekV41RouterTests: XCTestCase {
         XCTAssertEqual(biased.weights, [1])
     }
 
+    /// The bias ranks experts but must not change the mixture of the ones that are
+    /// selected: each weight is the expert's own unbiased `sigmoid(logit)`,
+    /// normalized over the selection.
+    func testBiasDoesNotEnterTheMixtureWeights() {
+        let routing = DeepSeekV41Router.route(
+            logits: [2, 1],
+            bias: [100, 0],
+            topK: 2,
+            scalingFactor: 1
+        )
+        XCTAssertEqual(routing.expertIDs, [0, 1])
+        let first = DeepSeekV41Router.sigmoid(2)
+        let second = DeepSeekV41Router.sigmoid(1)
+        XCTAssertEqual(routing.weights[0], first / (first + second), accuracy: 1e-5)
+        XCTAssertEqual(routing.weights[1], second / (first + second), accuracy: 1e-5)
+        // The reported scores stay the biased selection values, so a test can assert
+        // the ranking without re-deriving it.
+        XCTAssertEqual(routing.scores[0], DeepSeekV41Router.sigmoid(102), accuracy: 1e-5)
+        XCTAssertEqual(routing.scores[1], DeepSeekV41Router.sigmoid(1), accuracy: 1e-5)
+    }
+
     func testEmptyAndDegenerateInputs() {
         XCTAssertEqual(DeepSeekV41Router.route(logits: [], bias: nil, topK: 2, scalingFactor: 1), .empty)
         XCTAssertEqual(DeepSeekV41Router.route(logits: [1], bias: nil, topK: 0, scalingFactor: 1), .empty)
@@ -525,6 +546,20 @@ final class DeepSeekV41HyperConnectionTests: XCTestCase {
         for value in matrix {
             XCTAssertEqual(value, 1.0 / 3.0, accuracy: 1e-4)
         }
+    }
+
+    /// A large logit must not exponentiate to infinity: the row and column sums
+    /// would be `inf` and the normalization would produce NaNs.
+    func testLargeLogitsDoNotOverflowTheExponentiation() {
+        let matrix = DeepSeekV41HyperConnections.sinkhorn(
+            logits: [1_000, 0, 0, 0],
+            dimension: 2,
+            iterations: 20,
+            epsilon: 1e-6
+        )
+        XCTAssertTrue(matrix.allSatisfy { $0.isFinite }, "\(matrix)")
+        XCTAssertEqual(matrix[0] + matrix[1], 1, accuracy: 1e-4)
+        XCTAssertTrue(matrix[0] > matrix[1])
     }
 
     func testReadWeightsPickOneRow() {

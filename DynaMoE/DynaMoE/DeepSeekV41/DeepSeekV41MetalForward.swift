@@ -174,6 +174,22 @@ nonisolated public enum DeepSeekV41DevicePlan {
         }
     }
 
+    /// Grid one RMSNorm row needs. `dsv41_rmsnorm_f32_gain` treats
+    /// `threadgroup_position_in_grid` as the row index, so exactly one threadgroup
+    /// may be dispatched per row: a grid of `width` threads would let Metal launch
+    /// several threadgroups for a wide row and the extras would read and write past
+    /// the row they were meant to normalize.
+    public static func normDispatch(
+        width: Int,
+        lanes: Int
+    ) -> (threadgroups: MTLSize, threadsPerThreadgroup: MTLSize) {
+        let laneCount = max(32, lanes)
+        return (
+            MTLSize(width: 1, height: 1, depth: 1),
+            MTLSize(width: laneCount, height: 1, depth: 1)
+        )
+    }
+
     /// Rows one position may gather: its window plus the compressed rows the
     /// addressing rule reads. `index_topk == 0` means "every compressed row",
     /// which grows with the context, so the candidate-block budget bounds it and a
@@ -234,6 +250,14 @@ nonisolated public enum DeepSeekV41DevicePlan {
         }
         if budget < max(1, config.windowSize) {
             problems.append("gather budget \(budget) cannot hold the window")
+        }
+        // The router kernel keeps its top-k in a 64-entry stack array and clears the
+        // readback buffers when it cannot, so a larger top-k would silently zero the
+        // mixture instead of routing.
+        if config.numActivatedExperts > 64 {
+            problems.append(
+                "n_activated_experts = \(config.numActivatedExperts) exceeds the router kernel's 64-way bound"
+            )
         }
         return problems
     }
@@ -414,6 +438,14 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
     private let shardBuffers: [UInt32: MTLBuffer]
     private let vectors: DeepSeekV41VectorBank
     private let frequencies: [DeepSeekV41RopeTable: MTLBuffer]
+    /// Substitutes for the optional kernel inputs, so an absent tensor is a bound
+    /// identity value rather than an unbound buffer. Metal leaves an unbound slot
+    /// undefined; the kernels test for `nullptr`, which an unbound buffer is not.
+    private let zeros: MTLBuffer?
+    /// `hc_*_scale` absent means a scale of 1, so its identity is ones, not zeros.
+    private let ones: MTLBuffer?
+    /// `attn_sink` absent means "no sink entry", which the kernel spells `-1e30`.
+    private let sinkDisabled: MTLBuffer?
     private let mult: Int
     private let recordElements: Int
     private let swigluLimit: Float
@@ -474,6 +506,30 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             if let buffer { tables[layer.ropeTable] = buffer }
         }
         self.frequencies = tables
+
+        // Identity buffers for the optional kernel slots, sized for every place one
+        // is substituted: router bias (one per expert), hc scale/base (one per
+        // stream or dimension), and the attention sink (one per head).
+        let zeroCount = max(
+            16,
+            max(
+                max(runtime.config.numRoutedExperts, runtime.config.hiddenSize),
+                max(max(1, runtime.config.hcMult), runtime.config.numAttentionHeads)
+            )
+        )
+        func fill(_ value: Float, count: Int) -> MTLBuffer? {
+            let values = [Float](repeating: value, count: max(1, count))
+            return values.withUnsafeBytes { raw in
+                runtime.device.makeBuffer(
+                    bytes: raw.baseAddress!,
+                    length: raw.count,
+                    options: .storageModeShared
+                )
+            }
+        }
+        self.zeros = fill(0, count: zeroCount)
+        self.ones = fill(1, count: max(1, runtime.config.hcMult))
+        self.sinkDisabled = fill(-1e30, count: max(1, runtime.config.numAttentionHeads))
 
         // The per-layer scalars and gains, resolved once.
         let bank = DeepSeekV41VectorBank(device: runtime.device, buffers: shardBuffers)
@@ -1084,9 +1140,15 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         encoder.setComputePipelineState(pipelines.attention)
         encoder.setBuffer(workspace.query, offset: 0, index: 0)
         encoder.setBuffer(workspace.gathered, offset: 0, index: 1)
-        if let sink = vectors.buffer(.attnSink, layer: layer.index),
-           sink.length >= shape.numHeads * MemoryLayout<Float>.stride {
+        // The slot is always bound: an absent sink becomes a buffer of `-1e30`, the
+        // kernel's own "disabled" spelling, instead of an undefined slot.
+        let sink = vectors.buffer(.attnSink, layer: layer.index)
+            .flatMap { $0.length >= shape.numHeads * MemoryLayout<Float>.stride ? $0 : nil }
+            ?? sinkDisabled
+        if let sink {
             encoder.setBuffer(sink, offset: 0, index: 2)
+        } else {
+            throw DeepSeekV41EngineError.allocationFailed("the attention sink placeholder")
         }
         encoder.setBuffer(workspace.attentionOut, offset: 0, index: 3)
         var rows = UInt32(rowCount)
@@ -1203,8 +1265,15 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
     ) throws {
         encoder.setComputePipelineState(pipelines.router)
         encoder.setBuffer(workspace.routerLogits, offset: 0, index: 0)
-        if let bias = vectors.buffer(.routerBias, layer: layer) {
+        // An absent bias is a bound zero vector, not an unbound slot: the kernel
+        // checks the pointer against `nullptr` and then dereferences it.
+        let bias = vectors.buffer(.routerBias, layer: layer)
+            .flatMap { $0.length >= config.numRoutedExperts * MemoryLayout<Float>.stride ? $0 : nil }
+            ?? zeros
+        if let bias {
             encoder.setBuffer(bias, offset: 0, index: 1)
+        } else {
+            throw DeepSeekV41EngineError.allocationFailed("the router bias placeholder")
         }
         encoder.setBuffer(workspace.expertIndices, offset: 0, index: 2)
         encoder.setBuffer(workspace.expertWeights, offset: 0, index: 3)
@@ -1308,9 +1377,13 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         encoder.setBytes(&epsilon, length: 4, index: 4)
         let lanes = max(32, min(256, pipelines.rmsNormGain.maxTotalThreadsPerThreadgroup))
         encoder.setThreadgroupMemoryLength((lanes / 32) * MemoryLayout<Float>.stride, index: 0)
-        encoder.dispatchThreads(
-            MTLSize(width: width, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+        // One threadgroup per row: `tgIdx` is the row index in the kernel, so a grid
+        // of `width` threads would let Metal split a wide row across threadgroups and
+        // every `tgIdx >= 1` would read and write outside the row it was given.
+        let grid = DeepSeekV41DevicePlan.normDispatch(width: width, lanes: lanes)
+        encoder.dispatchThreadgroups(
+            grid.threadgroups,
+            threadsPerThreadgroup: grid.threadsPerThreadgroup
         )
         encoder.memoryBarrier(scope: .buffers)
     }
@@ -1518,8 +1591,14 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         encoder.setComputePipelineState(pipelines.hcMix)
         encoder.setBuffer(workspace.streams, offset: 0, index: 0)
         encoder.setBuffer(readWeights, offset: 0, index: 1)
-        if let scale { encoder.setBuffer(scale, offset: 0, index: 2) }
-        if let bias { encoder.setBuffer(bias, offset: 0, index: 3) }
+        // Absent `hc_*_scale` means a scale of 1 and absent `hc_*_base` means a
+        // bias of 0, so each slot is bound to its own identity rather than left
+        // undefined for a kernel that dereferences it.
+        guard let scaleBuffer = scale ?? ones, let biasBuffer = bias ?? zeros else {
+            throw DeepSeekV41EngineError.allocationFailed("the hyper-connection identity vectors")
+        }
+        encoder.setBuffer(scaleBuffer, offset: 0, index: 2)
+        encoder.setBuffer(biasBuffer, offset: 0, index: 3)
         encoder.setBuffer(output, offset: 0, index: 4)
         var width = UInt32(shapes.hidden)
         var streams = UInt32(mult)
@@ -1540,7 +1619,10 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         encoder.setComputePipelineState(pipelines.hcWrite)
         encoder.setBuffer(workspace.streams, offset: 0, index: 0)
         encoder.setBuffer(contribution, offset: 0, index: 1)
-        if let writeScales { encoder.setBuffer(writeScales, offset: 0, index: 2) }
+        guard let scales = writeScales ?? ones else {
+            throw DeepSeekV41EngineError.allocationFailed("the hyper-connection identity vectors")
+        }
+        encoder.setBuffer(scales, offset: 0, index: 2)
         var width = UInt32(shapes.hidden)
         var streams = UInt32(mult)
         encoder.setBytes(&width, length: 4, index: 3)

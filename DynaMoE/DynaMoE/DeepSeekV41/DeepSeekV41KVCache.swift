@@ -284,6 +284,13 @@ nonisolated public enum DeepSeekV41CacheAddressing {
     /// `topKRows` is the indexer's selection when the layer runs an indexer, and
     /// 0 (meaning "all rows") when it does not. The caller resolves the selection
     /// into an explicit row list; this only bounds it.
+    ///
+    /// These rows can overlap the sliding window. A block of `ratio` positions is
+    /// pooled once complete, so when `ratio <= windowSize` the newest block covers
+    /// positions the window also reads, and the same latent is attended over twice
+    /// (once as a window row, once as part of a pooled row). That is the reference
+    /// behavior for this architecture, not an accounting bug: the scheduler keeps
+    /// the two kinds as separate rows and the softmax sees both.
     public static func compressedRowsForAttention(
         position: Int,
         ratio: Int,
@@ -302,6 +309,23 @@ nonisolated public enum DeepSeekV41CacheAddressing {
         guard position >= 0, windowSize > 0 else { return 0..<0 }
         let start = max(0, position - windowSize + 1)
         return start..<(position + 1)
+    }
+
+    /// Whether a cache holding `storedPositions` positions can serve a prefix of
+    /// `prefixCount` positions.
+    ///
+    /// Two bounds apply. The count must be stored at all, and it must fit inside the
+    /// window ring: past `windowRows` positions the oldest window rows have been
+    /// overwritten, so a prefix that "exists" by count would still attend stale
+    /// rows even though its compressed rows are intact.
+    public static func prefixIsReusable(
+        prefixCount: Int,
+        storedPositions: Int,
+        windowRows: Int
+    ) -> Bool {
+        guard prefixCount > 0 else { return true }
+        guard prefixCount <= storedPositions else { return false }
+        return prefixCount <= max(0, windowRows)
     }
 }
 
@@ -396,10 +420,19 @@ nonisolated public final class DeepSeekV41KVCache: @unchecked Sendable {
     public let indexerBuffer: MTLBuffer?
     public let candidateBuffer: MTLBuffer?
 
-    /// Highest position stored so far, or -1 when the cache is empty. Prefix
+    /// Number of positions stored so far, or 0 when the cache is empty. Prefix
     /// reuse reads it: a turn whose prompt matches the pinned prefix up to
-    /// `storedPositions` can start decoding at that position.
-    public private(set) var storedPositions: Int = 0
+    /// `storedPositions` can start decoding at that position. Guarded because the
+    /// class is `@unchecked Sendable` and the reset path can run off the turn's
+    /// thread.
+    public var storedPositions: Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return storedValue
+    }
+
+    private let stateLock = NSLock()
+    private var storedValue: Int = 0
 
     public init?(device: MTLDevice, layout: DeepSeekV41CacheLayout) {
         self.layout = layout
@@ -420,19 +453,29 @@ nonisolated public final class DeepSeekV41KVCache: @unchecked Sendable {
     /// Records that `positions` have been appended. A smaller value than what is
     /// already stored means the caller is starting a fresh sequence.
     public func noteStored(_ count: Int) {
-        storedPositions = max(0, count)
+        stateLock.lock()
+        storedValue = max(0, count)
+        stateLock.unlock()
     }
 
     public func reset() {
-        storedPositions = 0
+        stateLock.lock()
+        storedValue = 0
+        stateLock.unlock()
     }
 
-    /// Whether the cache holds every position up to `count` intact. A ring only
-    /// keeps the last `windowRows`, so a prompt longer than the ring can never be
-    /// fully reused: the answer is what the caller needs before claiming a prefix
-    /// hit.
+    /// Whether the cache still holds every position up to `prefixCount` intact.
+    ///
+    /// Two bounds apply, not one. The compressed rows survive for the whole
+    /// context, but the window rings keep only the newest `windowRows` positions:
+    /// once the sequence is longer than the ring, the oldest window rows have been
+    /// overwritten by later positions, so a "hit" there would attend stale rows
+    /// even though the position count says otherwise.
     public func canReuse(prefixCount: Int) -> Bool {
-        guard prefixCount > 0 else { return true }
-        return prefixCount <= storedPositions
+        DeepSeekV41CacheAddressing.prefixIsReusable(
+            prefixCount: prefixCount,
+            storedPositions: storedPositions,
+            windowRows: layout.geometry.windowRows
+        )
     }
 }

@@ -105,8 +105,8 @@ nonisolated private final class FailureBox: @unchecked Sendable {
     }
 }
 
-/// One table's reader. Synchronous and thread-safe: the pread calls take a
-/// shared file descriptor, which POSIX allows concurrently.
+/// One table's reader. Synchronous and thread-safe: one batch at a time holds the
+/// descriptor, so `closeNow()` cannot recycle the fd under an in-flight `pread`.
 nonisolated public final class DeepSeekV41EngramReader: @unchecked Sendable {
     public let spec: DeepSeekV41EngramSpec
     public let fileSize: Int
@@ -161,6 +161,12 @@ nonisolated public final class DeepSeekV41EngramReader: @unchecked Sendable {
     /// Reads are issued in parallel once there are enough of them for queue
     /// depth to matter; each request writes a disjoint destination slice, so
     /// the concurrent writes are safe.
+    ///
+    /// The lock is held for the whole batch rather than just around the
+    /// `isClosed` check: `closeNow()` closes the descriptor, and a descriptor
+    /// number recycled by an unrelated `open()` would turn a concurrent `pread`
+    /// into a silent read of another file's bytes. Holding the lock makes close
+    /// wait for the in-flight rows instead.
     @discardableResult
     public func readRows(
         _ requests: [DeepSeekV41EngramRowRequest],
@@ -168,12 +174,11 @@ nonisolated public final class DeepSeekV41EngramReader: @unchecked Sendable {
     ) throws -> Int {
         guard !requests.isEmpty else { return 0 }
         lock.lock()
-        let closed = isClosed
-        let fd = descriptor
-        lock.unlock()
-        if closed {
+        defer { lock.unlock() }
+        guard !isClosed else {
             throw DeepSeekV41EngramReadError.cannotOpen("table reader was closed")
         }
+        let fd = descriptor
 
         let rowBytes = spec.rowBytes
         for request in requests {

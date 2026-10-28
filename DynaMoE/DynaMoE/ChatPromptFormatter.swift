@@ -43,7 +43,7 @@ public enum ChatPromptFormatter {
         if modelConfig?.isDeepSeekV41Model == true {
             // DeepSeek V4.1: fullwidth-bar role markers, and an effort budget
             // rendered inside the system turn rather than a named thinking level.
-            if isAlreadyDeepSeekTemplated(prompt) {
+            if isAlreadyDeepSeekTemplated(prompt, markers: promptDialect.markers) {
                 formattedPrompt = prompt
             } else {
                 formattedPrompt = promptDialect.render(
@@ -409,8 +409,15 @@ public enum ChatPromptFormatter {
     /// from the agent harness (which renders tool continuations itself), so it is
     /// passed through verbatim. Mirrors the `<role>` / `<|Bot|>` / `<|turn>`
     /// passthrough probes the other families use.
-    static func isAlreadyDeepSeekTemplated(_ prompt: String) -> Bool {
-        let m = DeepSeekV41PromptMarkers.familyDefault
+    ///
+    /// The markers are the RESOLVED dialect's, not the family default: a checkpoint
+    /// whose template renames them would otherwise be probed for one spelling and
+    /// rendered in another, and every harness prompt would be wrapped twice.
+    static func isAlreadyDeepSeekTemplated(
+        _ prompt: String,
+        markers: DeepSeekV41PromptMarkers = .familyDefault
+    ) -> Bool {
+        let m = markers
         return prompt.contains(m.user)
             || prompt.contains(m.assistant)
             || prompt.contains(m.beginOfSentence)

@@ -395,9 +395,10 @@ public final class CompletionEngine: @unchecked Sendable {
             }
             let checkpoint = DeepSeekV41Preflight.inspect(snapshotDir: snapshotDir)
             let state = checkpoint.map { " (checkpoint: \($0.humanSummary))" } ?? ""
+            let detail = DeepSeekV41Runtime.lastInitializationError.map { "\nReason: \($0)" } ?? ""
             throw CompletionLaunchError.engineNotReady(
-                "⚠️ DeepSeek V4.1 Flash detected, but its runtime could not be built (Metal device, "
-                    + "library, cache or workspace allocation failed).\(state)"
+                "⚠️ DeepSeek V4.1 Flash detected, but its runtime could not be built "
+                    + "(Metal device, library, cache or workspace allocation failed).\(state)\(detail)"
             )
         }
         guard let device = MTLCreateSystemDefaultDevice(),

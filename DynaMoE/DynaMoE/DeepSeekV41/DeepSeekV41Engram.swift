@@ -24,7 +24,7 @@
 //  0x7feb352d / xor-shift), taken from the published tile-kernel oracle. The
 //  COMBINATION of the n-gram's token ids into that hash is marked unverified
 //  below: it must be confirmed against the checkpoint's own `inference/engram.py`
-//  by `Tools/dsv41_engram_probe.py`, which is why the runtime refuses Engram
+//  by `Tools/dsv41_probe.py`, which is why the runtime refuses Engram
 //  until `DeepSeekV41EngramHasher.conformance` says otherwise rather than
 //  silently reading the wrong rows.
 //
@@ -142,7 +142,7 @@ nonisolated public enum DeepSeekV41EngramHasher {
     /// Conformance gate for the token-id combination step below.
     ///
     /// Flipped to `.verifiedAgainstReference` only by a run of
-    /// `Tools/dsv41_engram_probe.py` that reproduces `inference/engram.py`'s
+    /// `Tools/dsv41_probe.py` that reproduces `inference/engram.py`'s
     /// hashes for the shipped `encoding/tests/*` fixtures, or by the equivalent
     /// XCTest with the reference vectors checked in.
     public static let conformance: DeepSeekV41EngramConformance = .unverified
@@ -211,6 +211,13 @@ nonisolated public struct DeepSeekV41EngramTokenMap: Sendable, Equatable {
             throw DeepSeekV41ConfigError.invalidField(
                 "engram_compressed_vocab_size",
                 "\(compressedVocabSize) exceeds the tokenizer vocabulary \(vocabSize)"
+            )
+        }
+        // The pad id is written into the table below, so a malformed one must be an
+        // error here rather than an index-out-of-range trap in the reference.
+        guard padTokenID >= 0, padTokenID < vocabSize else {
+            throw DeepSeekV41ConfigError.invalidField(
+                "engram_pad_token_id", "\(padTokenID) is outside 0..<\(vocabSize)"
             )
         }
         var table = [Int32](repeating: Int32(padTokenID), count: vocabSize)

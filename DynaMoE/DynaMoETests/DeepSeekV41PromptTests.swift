@@ -19,6 +19,41 @@ final class DeepSeekV41PromptMarkerTests: XCTestCase {
 
     private var markers: DeepSeekV41PromptMarkers { .familyDefault }
 
+    /// Pinned as raw codepoint values, not compared against `familyDefault`: a
+    /// wrong spelling in the constant would otherwise satisfy its own test. These
+    /// are the values `Tools/dsv41_probe.py encoding` dumps from the shipped
+    /// goldens.
+    func testFamilyMarkersMatchTheGoldenCodepoints() {
+        XCTAssertEqual(
+            marker("user").unicodeScalars.map(\.value),
+            [0x3C, 0xFF5C, 0x55, 0x73, 0x65, 0x72, 0xFF5C, 0x3E]
+        )
+        XCTAssertEqual(
+            marker("assistant").unicodeScalars.map(\.value),
+            [0x3C, 0xFF5C, 0x41, 0x73, 0x73, 0x69, 0x73, 0x74, 0x61, 0x6E, 0x74, 0xFF5C, 0x3E]
+        )
+        XCTAssertEqual(
+            marker("beginOfSentence").unicodeScalars.map(\.value),
+            [0x3C, 0xFF5C, 0x62, 0x65, 0x67, 0x69, 0x6E, 0x2581, 0x6F, 0x66, 0x2581,
+             0x73, 0x65, 0x6E, 0x74, 0x65, 0x6E, 0x63, 0x65, 0xFF5C, 0x3E]
+        )
+        XCTAssertEqual(
+            marker("endOfSentence").unicodeScalars.map(\.value),
+            [0x3C, 0xFF5C, 0x65, 0x6E, 0x64, 0x2581, 0x6F, 0x66, 0x2581,
+             0x73, 0x65, 0x6E, 0x74, 0x65, 0x6E, 0x63, 0x65, 0xFF5C, 0x3E]
+        )
+    }
+
+    private func marker(_ name: String) -> String {
+        switch name {
+        case "user": return markers.user
+        case "assistant": return markers.assistant
+        case "beginOfSentence": return markers.beginOfSentence
+        case "endOfSentence": return markers.endOfSentence
+        default: return ""
+        }
+    }
+
     func testMarkersUseFullwidthBarsAndBlockCharacters() {
         // Every role marker is `<` + U+FF5C ... U+FF5C + `>`.
         for marker in [markers.beginOfSentence, markers.endOfSentence, markers.user, markers.assistant] {
@@ -291,6 +326,31 @@ final class DeepSeekV41ChatPromptFormatterTests: XCTestCase {
         XCTAssertTrue(prompt.hasPrefix(markers.beginOfSentence))
         XCTAssertTrue(prompt.contains(markers.user + "hello"))
         XCTAssertTrue(prompt.hasSuffix(markers.assistant))
+    }
+
+    /// The passthrough probe has to look for the markers the renderer would emit.
+    /// Probing the family default while rendering a checkpoint dialect is how a
+    /// harness prompt gets wrapped twice.
+    func testPassthroughProbeUsesTheResolvedDialect() {
+        let custom = DeepSeekV41PromptMarkers(
+            beginOfSentence: "<bos>",
+            endOfSentence: "<eos>",
+            user: "<user>",
+            assistant: "<assistant>",
+            toolCallsBegin: "<tools>",
+            toolCallSeparator: "<sep>",
+            toolCallsEnd: "</tools>"
+        )
+        XCTAssertTrue(ChatPromptFormatter.isAlreadyDeepSeekTemplated("<user>hi", markers: custom))
+        XCTAssertFalse(
+            ChatPromptFormatter.isAlreadyDeepSeekTemplated("<user>hi", markers: .familyDefault)
+        )
+        XCTAssertTrue(
+            ChatPromptFormatter.isAlreadyDeepSeekTemplated(
+                "<" + "\u{FF5C}" + "User" + "\u{FF5C}" + ">hi",
+                markers: .familyDefault
+            )
+        )
     }
 
     func testFormatConversationSplitsReasoningOutOfTheAnswer() throws {

@@ -26,17 +26,24 @@ nonisolated public enum DeepSeekV41DtypeWidth {
     /// Bytes per stored value, including the scale payload:
     ///   E4M3 with one E8M0 per 32  -> 1 + 1/32,
     ///   E2M1 (MXFP4) packed two per byte with one E8M0 per 32 -> 0.5 + 1/32,
-    ///   BF16 / F16 -> 2, F32 -> 4.
+    ///   plain 8-bit integers -> 1,
+    ///   BF16 / F16 -> 2, F32 -> 4, F64 -> 8.
     public static func bytesPerValue(dtype: String) -> Double {
         let upper = dtype.uppercased()
+        if upper.contains("E2M1") || upper.contains("MXFP4") || upper == "FP4" || upper.hasPrefix("F4") {
+            return 0.5 + 1.0 / 32.0
+        }
         if upper.contains("F8_E4M3") || upper.contains("F8_E5M2") || upper == "FP8" {
             return 1.0 + 1.0 / 32.0
         }
         if upper.contains("F8_E8M0") {
             return 1.0
         }
-        if upper == "I8" || upper.contains("U8") || upper.contains("INT8") {
-            return 0.5 + 1.0 / 32.0
+        if upper == "I8" || upper.contains("U8") || upper.contains("INT8") || upper == "BOOL" {
+            return 1.0
+        }
+        if upper == "I64" || upper == "U64" || upper.contains("F64") {
+            return 8.0
         }
         if upper.contains("BF16") || upper.contains("F16") || upper.contains("FLOAT16") {
             return 2.0
@@ -74,10 +81,12 @@ nonisolated public struct DeepSeekV41MemoryPlan: Sendable, Equatable {
     /// Bytes the caches need at this context length.
     public var cacheBytes: Int { compressedCacheBytes + windowRingBytes + indexerBytes + candidateBytes }
 
-    /// Bytes needed with `expertSlots` resident experts per layer.
+    /// Bytes needed with `expertSlots` resident (layer, expert) pairs, in the one
+    /// global arena, plus the Engram staging block. `expertSlots` is a total, not
+    /// a per-layer count: the arena is a single LRU pool.
     public func requiredBytes(expertSlots: Int) -> Int {
         let slotCount = max(1, expertSlots)
-        return cacheBytes + residentWeightBytes + slotCount * bytesPerExpert
+        return cacheBytes + residentWeightBytes + slotCount * bytesPerExpert + engramStagingBytes
     }
 
     /// One-line load-log summary.
@@ -114,9 +123,11 @@ nonisolated public struct DeepSeekV41MemoryPlan: Sendable, Equatable {
         let compressed = owners * recordBytes * max(0, contextLength)
 
         // Window rings are per layer and bounded by window_size, so they do not
-        // grow with the context.
+        // grow with the context. Priced at `recordBytes`, the same width the
+        // compressed cache uses, so an FP16 runtime is not billed at the FP8
+        // design width.
         let ringRecords = max(0, config.windowSize)
-        let windowRings = plan.count * ringRecords * config.fp8CacheRecordBytes
+        let windowRings = plan.count * ringRecords * recordBytes
 
         // The indexer keeps one key per COMPRESSED row. Its width comes from
         // the checkpoint's own `attn.indexer.wk` shape when the catalog has it
@@ -137,8 +148,10 @@ nonisolated public struct DeepSeekV41MemoryPlan: Sendable, Equatable {
             : 0
 
         let expertValues = 3 * config.hiddenSize * max(1, config.moeIntermediateSize)
+        // The routed experts are MXFP4, named explicitly so a genuinely 8-bit
+        // resident tensor is not priced at the packed FP4 rate.
         let bytesPerExpert = Int(
-            (Double(expertValues) * DeepSeekV41DtypeWidth.bytesPerValue(dtype: "I8")).rounded(.up)
+            (Double(expertValues) * DeepSeekV41DtypeWidth.bytesPerValue(dtype: "MXFP4")).rounded(.up)
         )
 
         let engramRowBytes = config.engramTables.reduce(0) { $0 + $1.rowBytes }

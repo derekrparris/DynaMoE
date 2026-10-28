@@ -175,16 +175,28 @@ nonisolated public struct DeepSeekV41WeightCatalog: Sendable {
     public let slots: [DeepSeekV41TensorSlot]
     /// Names the catalog could not place. The load refuses when this is not empty.
     public let unconsumed: [String]
+    /// Two different tensors that resolve to the same role. The later name used to
+    /// win silently, which is how a checkpoint with both `attn.kv_norm` and
+    /// `attn.wkv_norm` would load one and ignore the other.
+    public let duplicateRoles: [String]
 
     private let index: [String: DeepSeekV41TensorSlot]
 
     public init(named tensors: [DeepSeekV41TensorRef], layerCount: Int) {
         var slots: [DeepSeekV41TensorSlot] = []
         var unconsumed: [String] = []
+        var duplicates: [String] = []
         var index: [String: DeepSeekV41TensorSlot] = [:]
         for tensor in tensors {
             guard let slot = Self.classify(name: tensor.name, ref: tensor) else {
                 unconsumed.append(tensor.name)
+                continue
+            }
+            if let existing = index[slot.key] {
+                duplicates.append(
+                    "\(existing.ref.name) and \(tensor.name) both resolve to \(slot.role.rawValue)\(slot.layer.map { " layer \($0)" } ?? "")"
+                )
+                slots.append(slot)
                 continue
             }
             slots.append(slot)
@@ -192,6 +204,7 @@ nonisolated public struct DeepSeekV41WeightCatalog: Sendable {
         }
         self.slots = slots
         self.unconsumed = unconsumed
+        self.duplicateRoles = duplicates
         self.index = index
     }
 
@@ -252,20 +265,20 @@ nonisolated public struct DeepSeekV41WeightCatalog: Sendable {
         // Draft block (`mtp.N.…`).
         if let rest = remainder(of: name, prefix: "mtp.") {
             let parts = rest.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
-            guard parts.count == 2, let block = Int(parts[0]) else { return nil }
+            guard parts.count == 2, let block = Int(parts[0]), block >= 0 else { return nil }
             return classifyDraft(String(parts[1]), block: block, ref: ref)
         }
 
         // Backbone layer.
         guard let rest = remainder(of: name, prefix: "layers.") else { return nil }
         let parts = rest.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
-        guard parts.count == 2, let layer = Int(parts[0]) else { return nil }
+        guard parts.count == 2, let layer = Int(parts[0]), layer >= 0 else { return nil }
         let body = String(parts[1])
         let (base, isScale) = splitScale(body)
 
         if let expertRest = remainder(of: base, prefix: "ffn.experts.") {
             let expertParts = expertRest.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
-            guard expertParts.count == 2, let expert = Int(expertParts[0]) else { return nil }
+            guard expertParts.count == 2, let expert = Int(expertParts[0]), expert >= 0 else { return nil }
             let role = expertRole(String(expertParts[1]))
             guard let role else { return nil }
             return slot(role, layer: layer, expert: expert, scale: isScale, ref)
@@ -301,7 +314,6 @@ nonisolated public struct DeepSeekV41WeightCatalog: Sendable {
             "hc_ffn_base": .hcFfnBase,
             "hc_ffn_scale": .hcFfnScale,
             "engram.wkv": .engramTable,
-            "engram.wkv.scale": .engramTable,
             "engram.q_weight": .engramQuery,
             "engram.k_weight": .engramKey
         ]
@@ -320,7 +332,7 @@ nonisolated public struct DeepSeekV41WeightCatalog: Sendable {
         let (base, isScale) = splitScale(body)
         if let expertRest = remainder(of: base, prefix: "ffn.experts.") {
             let expertParts = expertRest.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
-            guard expertParts.count == 2, let expert = Int(expertParts[0]) else { return nil }
+            guard expertParts.count == 2, let expert = Int(expertParts[0]), expert >= 0 else { return nil }
             guard let role = expertRole(String(expertParts[1])) else { return nil }
             let mapped: DeepSeekV41TensorRole
             switch role {
@@ -419,6 +431,10 @@ extension DeepSeekV41WeightCatalog {
         plan: [DeepSeekV41LayerPlan]
     ) -> [String] {
         var problems: [String] = []
+
+        for duplicate in duplicateRoles {
+            problems.append("two tensors claim one role: \(duplicate)")
+        }
 
         // Model-level.
         for (role, label) in [(DeepSeekV41TensorRole.tokenEmbedding, "embed.weight"),

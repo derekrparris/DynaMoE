@@ -10,9 +10,10 @@ the files themselves instead of from guesswork:
 
   engram    What does the checkpoint's own `inference/engram.py` hash, and how
             are its tables laid out? Dumps the module's public surface with
-            signatures plus the Engram tensor shapes, so the token-id
-            combination in `DeepSeekV41EngramHasher.seed` can be fixed and the
-            conformance flag flipped with evidence rather than a guess.
+            signatures plus the Engram tensor shapes. It does NOT run the
+            module, so it cannot verify a hash output by itself: the bucket
+            indices it prints as next steps are what a later run has to
+            reproduce before `conformance` moves off `.unverified`.
 
   encoding  What do the shipped prompt-encoding goldens look like? Dumps
             `encoding/tests/test_output_*.txt` with every non-ASCII codepoint
@@ -295,13 +296,21 @@ def cmd_engram(args) -> int:
 
 
 def escape(text: str) -> str:
+    """Escapes text into the body of a single Swift string literal.
+
+    Newlines, tabs and carriage returns become their short escapes and every other
+    non-ASCII codepoint becomes a unicode escape, so the emitted literal compiles
+    and a reader never has to trust a rendered glyph.
+    """
+    short = {"\n": "\\n", "\t": "\\t", "\r": "\\r", '"': '\\"', "\\": "\\\\"}
     out = []
     for char in text:
+        if char in short:
+            out.append(short[char])
+            continue
         code = ord(char)
-        if code < 128 and char not in ("\\", '"'):
+        if 0x20 <= code < 0x7F:
             out.append(char)
-        elif char in ("\\", '"'):
-            out.append("\\" + char)
         elif code <= 0xFFFF:
             out.append(f"\\u{{{code:04X}}}")
         else:

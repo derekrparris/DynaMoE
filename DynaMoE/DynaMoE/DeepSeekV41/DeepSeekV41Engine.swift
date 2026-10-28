@@ -50,7 +50,13 @@ nonisolated public struct DeepSeekV41DeviceTensor: Sendable, Equatable {
         return upper.contains("F8") || upper == "FP8" || upper.contains("E4M3") || upper.contains("E5M2")
     }
     public var isBF16: Bool { dtype.uppercased().contains("BF16") }
-    public var isF16: Bool { dtype.uppercased().contains("F16") && !isFP8 }
+    /// True only for IEEE half. `"BF16".contains("F16")` is true, so the bf16 check
+    /// has to come first or a bf16 tensor is dispatched as if it were fp16.
+    public var isF16: Bool {
+        guard !isFP8, !isBF16 else { return false }
+        let upper = dtype.uppercased()
+        return upper.contains("F16") || upper.contains("FLOAT16")
+    }
     public var isScaleCompanion: Bool {
         let upper = dtype.uppercased()
         return upper.contains("E8M0") || upper.contains("U8") || upper.contains("UINT8")
@@ -84,7 +90,7 @@ nonisolated public final class DeepSeekV41DeviceWeights: @unchecked Sendable {
     ) {
         let catalog = DeepSeekV41WeightCatalog.from(summary: summary, layerCount: config.numHiddenLayers)
         self.catalog = catalog
-        self.problems = catalog.validate(config: config, plan: plan)
+        var problems = catalog.validate(config: config, plan: plan)
 
         var tensors: [String: DeepSeekV41DeviceTensor] = [:]
         var scales: [String: DeepSeekV41DeviceTensor] = [:]
@@ -93,12 +99,33 @@ nonisolated public final class DeepSeekV41DeviceWeights: @unchecked Sendable {
         // exactly what the segmented buffers are keyed by.
         for tensor in summary.tensors {
             let shape = DeepSeekV41WeightCatalog.shape(from: tensor.shapeDisplay)
-            guard shape.count == 2 else { continue }
+            // Vectors are resolved as one row with `columns` 1 so a 1-D lookup
+            // (a norm, a bias) resolves instead of silently returning nil. A rank
+            // above 2 has no kernel at all, so it is reported rather than being
+            // flattened into a matrix that would be read at the wrong stride.
+            let rows: Int
+            let columns: Int
+            switch shape.count {
+            case 0:
+                rows = 1
+                columns = 1
+            case 1:
+                rows = shape[0]
+                columns = 1
+            case 2:
+                rows = shape[0]
+                columns = shape[1]
+            default:
+                problems.append(
+                    "\(tensor.name) is rank \(shape.count), which no DeepSeek V4.1 kernel reads"
+                )
+                continue
+            }
             let device = DeepSeekV41DeviceTensor(
                 shardIndex: tensor.shardIndex,
                 byteOffset: Int(tensor.offsetStart),
-                rows: shape[0],
-                columns: shape[1],
+                rows: rows,
+                columns: columns,
                 dtype: tensor.dtype
             )
             if tensor.name.contains("scale") || tensor.name.contains("scales") {
@@ -109,6 +136,7 @@ nonisolated public final class DeepSeekV41DeviceWeights: @unchecked Sendable {
         }
         self.tensors = tensors
         self.scales = scales
+        self.problems = problems
 
         // Engram tables are opened here so a truncated download fails at load rather
         // than mid-generation. They are never mapped: the reader preads single rows.
@@ -179,7 +207,6 @@ nonisolated public struct DeepSeekV41Pipelines {
     public let router: MTLComputePipelineState
     public let hcMix: MTLComputePipelineState
     public let hcWrite: MTLComputePipelineState
-    public let rmsNorm: MTLComputePipelineState
     public let clear: MTLComputePipelineState
     public let vectorAdd: MTLComputePipelineState
     /// Gain-vector RMSNorm the executor binds (the shard-offset `rmsnorm_bf16`
@@ -219,7 +246,6 @@ nonisolated public struct DeepSeekV41Pipelines {
         self.router = try make("dsv41_router_topk_sigmoid")
         self.hcMix = try make("dsv41_hc_mix_f32")
         self.hcWrite = try make("dsv41_hc_write_f32")
-        self.rmsNorm = try make("rmsnorm_bf16")
         self.clear = try make("clear_vector_f32")
         self.vectorAdd = try make("vector_add_f32")
         self.rmsNormGain = try make("dsv41_rmsnorm_f32_gain")
@@ -274,6 +300,26 @@ nonisolated public enum DeepSeekV41EngineError: Error, CustomStringConvertible {
 
 // MARK: - Runtime
 
+/// Last runtime-initialization failure, behind a lock so a raced load cannot tear
+/// the string.
+nonisolated private final class InitErrorBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: String?
+
+    var stored: String? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+        set {
+            lock.lock()
+            value = newValue
+            lock.unlock()
+        }
+    }
+}
+
 /// One loaded DeepSeek-V4.1 model plus its caches. Single-flight, like the rest of
 /// the engine: a turn owns it for its duration.
 nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
@@ -306,6 +352,17 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
     /// executor binds it directly rather than re-allocating per turn.
     public let workspace: DeepSeekV41Workspace
 
+    /// Why the last `init` returned nil. The initializer is failable and its caller
+    /// only sees "could not be built", so without this the difference between a
+    /// missing kernel, a missing Metal device and a failed allocation is lost.
+    public static var lastInitializationError: String? { initializationError.stored }
+
+    private static let initializationError = InitErrorBox()
+
+    static func record(_ reason: String) {
+        initializationError.stored = reason
+    }
+
     public init?(
         snapshotDir: URL?,
         summary: ModelSummary,
@@ -314,11 +371,27 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         contextLength: Int,
         cachePrecision: DeepSeekV41CachePrecision = .fp16
     ) {
-        guard let plan = try? config.makeLayerPlan() else { return nil }
-        guard let device = MTLCreateSystemDefaultDevice(),
-              let commandQueue = device.makeCommandQueue(),
-              let library = device.makeDefaultLibrary(),
-              let pipelines = try? DeepSeekV41Pipelines(library: library, device: device) else {
+        guard let plan = try? config.makeLayerPlan() else {
+            DeepSeekV41Runtime.record("the per-layer plan could not be built from config.json")
+            return nil
+        }
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            DeepSeekV41Runtime.record("no Metal device is available")
+            return nil
+        }
+        guard let commandQueue = device.makeCommandQueue() else {
+            DeepSeekV41Runtime.record("no Metal command queue could be created")
+            return nil
+        }
+        guard let library = device.makeDefaultLibrary() else {
+            DeepSeekV41Runtime.record("the app's default Metal library is missing")
+            return nil
+        }
+        let pipelines: DeepSeekV41Pipelines
+        do {
+            pipelines = try DeepSeekV41Pipelines(library: library, device: device)
+        } catch {
+            DeepSeekV41Runtime.record("\(error)")
             return nil
         }
 
@@ -336,10 +409,14 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         )
         let layout = DeepSeekV41CacheLayout(geometry: geometry, plan: plan)
         guard let cache = DeepSeekV41KVCache(device: device, layout: layout) else {
+            DeepSeekV41Runtime.record(
+                "the \(layout.totalBytes)-byte KV cache could not be allocated"
+            )
             return nil
         }
         let shapes = DeepSeekV41TensorShapes(config: config)
         guard let workspace = DeepSeekV41Workspace(device: device, shapes: shapes, config: config) else {
+            DeepSeekV41Runtime.record("the per-token workspace could not be allocated")
             return nil
         }
 

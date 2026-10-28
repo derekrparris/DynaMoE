@@ -159,10 +159,6 @@ nonisolated public enum DeepSeekV41VisionLayout {
             if spec.maxImageTokens > 0, columns * rows > spec.maxImageTokens {
                 columns = max(1, min(columns, spec.maxImageTokens))
                 rows = max(1, spec.maxImageTokens / columns)
-                if columns * rows > spec.maxImageTokens {
-                    columns = max(1, spec.maxImageTokens)
-                    rows = 1
-                }
             }
         }
 
@@ -188,29 +184,69 @@ nonisolated public enum DeepSeekV41VisionLayout {
         return marker.imageOpen + String(repeating: marker.imageToken, count: tokenCount) + marker.imageClose
     }
 
+    /// What an expansion could not place. Text with no marker is returned
+    /// untouched, so an image that has nowhere to go is reported here rather than
+    /// silently dropped or appended at the end of the prompt.
+    public struct ExpansionReport: Sendable, Equatable {
+        /// Images left over because the prompt had fewer placeholders than images.
+        public let unusedImageCount: Int
+        /// Placeholders left over because there were fewer images than markers. They
+        /// are passed through verbatim, so nothing is deleted from the prompt.
+        public let unfilledPlaceholderCount: Int
+
+        public var isBalanced: Bool { unusedImageCount == 0 && unfilledPlaceholderCount == 0 }
+    }
+
     /// Expands every image marker in `text` (one per attached image) into its
-    /// placeholder run. Text with no marker is returned untouched, so a text-only
-    /// turn pays nothing.
+    /// placeholder run, discarding the report.
     public static func expand(
         text: String,
         images: [(width: Int, height: Int)],
         spec: DeepSeekV41VisionSpec,
         markers: DeepSeekV41VisionMarkers = .familyDefault
     ) -> String {
-        guard !images.isEmpty else { return text }
+        expandReporting(text: text, images: images, spec: spec, markers: markers).text
+    }
+
+    /// Expands the markers and reports any image/marker mismatch.
+    ///
+    /// A marker with no image left is passed through verbatim rather than deleted.
+    /// An image with no marker is left out of the prompt (appending it would put an
+    /// image run where the caller never asked for one) but is counted in the report,
+    /// which is what keeps the mismatch from being silent.
+    public static func expandReporting(
+        text: String,
+        images: [(width: Int, height: Int)],
+        spec: DeepSeekV41VisionSpec,
+        markers: DeepSeekV41VisionMarkers = .familyDefault
+    ) -> (text: String, report: ExpansionReport) {
+        guard !images.isEmpty else {
+            return (text, ExpansionReport(unusedImageCount: 0, unfilledPlaceholderCount: 0))
+        }
+        // An empty needle matches at every position and never advances the
+        // remainder, so the loop below would never terminate.
+        guard !markers.imagePlaceholder.isEmpty else {
+            return (text, ExpansionReport(unusedImageCount: images.count, unfilledPlaceholderCount: 0))
+        }
         var iterator = images.makeIterator()
         var out = ""
         var remainder = Substring(text)
+        var unfilled = 0
         while let range = remainder.range(of: markers.imagePlaceholder) {
             out += remainder[remainder.startIndex..<range.lowerBound]
             if let image = iterator.next() {
                 let fitted = fit(width: image.width, height: image.height, spec: spec)
                 out += placeholder(tokenCount: fitted.tokens, marker: markers)
+            } else {
+                out += markers.imagePlaceholder
+                unfilled += 1
             }
             remainder = remainder[range.upperBound...]
         }
         out += remainder
-        return out
+        var unused = 0
+        while iterator.next() != nil { unused += 1 }
+        return (out, ExpansionReport(unusedImageCount: unused, unfilledPlaceholderCount: unfilled))
     }
 
     /// Pixel normalization: RGB bytes to the `[-1, 1]` range the tower expects.

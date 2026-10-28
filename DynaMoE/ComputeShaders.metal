@@ -8598,9 +8598,15 @@ kernel void dsv41_hc_sinkhorn(
     uint n = dimension;
     if (n == 0 || n > 16) return;
 
-    // Exponentiate once; Sinkhorn only rescales from here on.
+    // Exponentiate once; Sinkhorn only rescales from here on. The max is
+    // subtracted first so a large logit cannot overflow to infinity, which would
+    // make every later row/column sum `inf` and the normalization a no-op of NaNs.
+    float maxLogit = -1e30f;
     for (uint i = 0; i < n * n; ++i) {
-        outputMatrix[i] = exp(logits[i]);
+        maxLogit = max(maxLogit, logits[i]);
+    }
+    for (uint i = 0; i < n * n; ++i) {
+        outputMatrix[i] = exp(logits[i] - maxLogit);
     }
     for (uint iteration = 0; iteration < iterations; ++iteration) {
         for (uint r = 0; r < n; ++r) {
@@ -8846,7 +8852,8 @@ kernel void dsv41_indexer_scores_f32(
 /// MSL Kernel: sigmoid top-k routing with a per-expert selection bias.
 /// The bias is added for SELECTION only and never enters the weight, which keeps a
 /// starved expert from being starved forever without changing the mixture of the
-/// experts that are actually chosen.
+/// experts that are actually chosen. The ranking is `sigmoid(logit + bias)`; the
+/// weight of each selected expert is its own unbiased `sigmoid(logit)`.
 kernel void dsv41_router_topk_sigmoid(
     device const float* logits [[buffer(0)]],
     device const float* biasBuffer [[buffer(1)]],     // may be null
@@ -8860,19 +8867,32 @@ kernel void dsv41_router_topk_sigmoid(
 ) {
     if (tid != 0 || expertCount == 0 || topK == 0) return;
     uint32_t count = min(topK, expertCount);
-    if (count > 64u) return;
+    // Leaving here would keep the previous token's routing in the readback buffer,
+    // so an impossible top-k fails by being visibly wrong rather than silently
+    // stale. The published checkpoint's top-k is ~6.
+    if (count > 64u || expertCount > 65536u) {
+        for (uint32_t rank = 0; rank < count && rank < 64u; ++rank) {
+            expertIndices[rank] = 0u;
+            expertWeights[rank] = 0.0f;
+        }
+        return;
+    }
 
     // Selection is a bounded insertion sort: scan the experts once, keeping the
     // best `count` in descending order, ties broken by ascending expert id so the
     // selection is deterministic and a reused prefix routes identically.
     float topScore[64];
+    float topWeight[64];
     uint32_t topIndex[64];
     uint32_t filled = 0;
 
     for (uint32_t expert = 0; expert < expertCount; ++expert) {
-        float value = logits[expert] + ((biasBuffer != nullptr) ? biasBuffer[expert] : 0.0f);
+        float logit = logits[expert];
+        float value = logit + ((biasBuffer != nullptr) ? biasBuffer[expert] : 0.0f);
         float score = value >= 0.0f ? (1.0f / (1.0f + exp(-value)))
                                     : (exp(value) / (1.0f + exp(value)));
+        float weight = logit >= 0.0f ? (1.0f / (1.0f + exp(-logit)))
+                                     : (exp(logit) / (1.0f + exp(logit)));
 
         uint32_t position = filled;
         while (position > 0) {
@@ -8884,31 +8904,35 @@ kernel void dsv41_router_topk_sigmoid(
         if (filled < count) {
             for (uint32_t move = filled; move > position; --move) {
                 topScore[move] = topScore[move - 1];
+                topWeight[move] = topWeight[move - 1];
                 topIndex[move] = topIndex[move - 1];
             }
             topScore[position] = score;
+            topWeight[position] = weight;
             topIndex[position] = expert;
             filled++;
         } else if (position < count) {
             for (uint32_t move = count - 1; move > position; --move) {
                 topScore[move] = topScore[move - 1];
+                topWeight[move] = topWeight[move - 1];
                 topIndex[move] = topIndex[move - 1];
             }
             topScore[position] = score;
+            topWeight[position] = weight;
             topIndex[position] = expert;
         }
     }
 
     float total = 0.0f;
     if (normalise != 0u) {
-        for (uint32_t rank = 0; rank < filled; ++rank) total += topScore[rank];
+        for (uint32_t rank = 0; rank < filled; ++rank) total += topWeight[rank];
     }
     for (uint32_t rank = 0; rank < filled; ++rank) {
-        float weight = topScore[rank];
-        if (normalise != 0u && total > 0.0f) weight /= total;
-        if (scalingFactor > 0.0f) weight *= scalingFactor;
+        float mixWeight = topWeight[rank];
+        if (normalise != 0u && total > 0.0f) mixWeight /= total;
+        if (scalingFactor > 0.0f) mixWeight *= scalingFactor;
         expertIndices[rank] = topIndex[rank];
-        expertWeights[rank] = weight;
+        expertWeights[rank] = mixWeight;
     }
 }
 

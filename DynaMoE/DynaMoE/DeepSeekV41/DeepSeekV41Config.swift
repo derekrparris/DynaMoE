@@ -62,14 +62,29 @@ nonisolated private struct DSV41JSON {
 
     init(_ raw: [String: Any]) { self.raw = raw }
 
+    /// A JSON number or numeric string as an `Int`, refusing values an `Int`
+    /// cannot hold. The Engram row counts are in the 10^9 range, so a 32-bit read
+    /// would truncate them silently, and `Int(Double)` traps on overflow.
+    static func intValue(_ value: Any) -> Int? {
+        if let i = value as? Int { return i }
+        if let d = value as? Double {
+            guard d.isFinite, d >= Double(Int.min), d <= Double(Int.max) else { return nil }
+            return Int(d)
+        }
+        if let n = value as? NSNumber {
+            let wide = n.int64Value
+            guard wide >= Int64(Int.min), wide <= Int64(Int.max) else { return nil }
+            return Int(wide)
+        }
+        if let s = value as? String { return Int(s) }
+        return nil
+    }
+
     func int(_ keys: String?...) -> Int? { int(keys.compactMap { $0 }) }
     func int(_ keys: [String]) -> Int? {
         for key in keys {
             guard let value = raw[key] else { continue }
-            if let i = value as? Int { return i }
-            if let d = value as? Double { return Int(d) }
-            if let n = value as? NSNumber { return n.intValue }
-            if let s = value as? String, let i = Int(s) { return i }
+            if let parsed = DSV41JSON.intValue(value) { return parsed }
         }
         return nil
     }
@@ -117,8 +132,14 @@ nonisolated private struct DSV41JSON {
         for key in keys {
             guard let value = raw[key] else { continue }
             if let list = value as? [Int] { return list }
-            if let list = value as? [Double] { return list.map { Int($0) } }
-            if let list = value as? [NSNumber] { return list.map { $0.intValue } }
+            if let list = value as? [Double] {
+                let converted = list.compactMap { DSV41JSON.intValue($0) }
+                return converted.count == list.count ? converted : nil
+            }
+            if let list = value as? [NSNumber] {
+                let converted = list.compactMap { DSV41JSON.intValue($0) }
+                return converted.count == list.count ? converted : nil
+            }
         }
         return nil
     }
@@ -390,7 +411,22 @@ nonisolated public struct DeepSeekV41Config: Sendable, Equatable {
 
     /// Layers that own a compressed K/V cache (the only caches that grow with
     /// context; window rings are bounded by `windowSize`).
-    public var compressedKVOwnerLayerIndices: [Int] { makeLayerPlanOrEmpty().filter(\.ownsCompressedKV).map(\.index) }
+    ///
+    /// Derived from the same owner rule as `makeLayerPlan` but without building
+    /// the plan: swallowing a layout error into an empty plan would make this
+    /// report zero caches, and `cacheBytesPerToken` silently zero.
+    public var compressedKVOwnerLayerIndices: [Int] {
+        guard numHiddenLayers > 0 else { return [] }
+        var owners: [Int] = []
+        for layer in 0..<numHiddenLayers {
+            let ratio = layer < compressRatios.count ? compressRatios[layer] : 0
+            guard ratio > 0 else { continue }
+            if owner(in: kvSourceLayerIDs, at: layer, field: "kv_source_layer_ids") == layer {
+                owners.append(layer)
+            }
+        }
+        return owners
+    }
 
     /// Bytes per token across every compressed cache, at the given precision.
     public func cacheBytesPerToken(useFP4Main: Bool) -> Int {
@@ -513,11 +549,6 @@ nonisolated public struct DeepSeekV41Config: Sendable, Equatable {
     /// schema but that the forward pass does not model yet.
     public func warnings(layerPlan: [DeepSeekV41LayerPlan]) -> [String] {
         var out: [String] = []
-        if qkRopeHeadDim != 0 {
-            out.append(
-                "qk_rope_head_dim = \(qkRopeHeadDim): the CSA2 path rotates the whole \(qkHeadDim)-wide latent, with no decoupled rope payload"
-            )
-        }
         if numKeyValueHeads > 1 {
             out.append(
                 "num_key_value_heads = \(numKeyValueHeads): the latent cache holds one record per position"
@@ -545,10 +576,6 @@ nonisolated public struct DeepSeekV41Config: Sendable, Equatable {
             )
         }
         return out
-    }
-
-    private func makeLayerPlanOrEmpty() -> [DeepSeekV41LayerPlan] {
-        (try? makeLayerPlan()) ?? []
     }
 }
 
@@ -700,6 +727,17 @@ nonisolated public extension DeepSeekV41Config {
         }
         guard qkNopeHeadDim > 0 else {
             throw DeepSeekV41ConfigError.invalidField("qk_nope_head_dim", "must be positive")
+        }
+        // A decoupled rope payload is the one shape the two backends disagree on:
+        // the reference rotates the latent as a single vector, while the kernel
+        // rotates it per `rotaryDim` block. Refusing here is the only honest option
+        // until one rule is chosen, because the checkpoint would otherwise load and
+        // run silently different numerics on CPU and GPU.
+        guard qkRopeHeadDim == 0 else {
+            throw DeepSeekV41ConfigError.invalidField(
+                "qk_rope_head_dim",
+                "must be 0: the CSA2 path rotates the whole \(qkHeadDim)-wide latent, and a decoupled rope payload has no agreed rotation"
+            )
         }
         guard oGroups > 0 else {
             throw DeepSeekV41ConfigError.invalidField("o_groups", "must be positive")
