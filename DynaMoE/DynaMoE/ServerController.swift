@@ -1102,7 +1102,8 @@ final class ServerController: ObservableObject {
                 thinkingEnabled: thinkingEnabled,
                 modelSupportsThinking: info.supportsThinking,
                 modelConfig: engine.promptModelConfig,
-                thinkingEffort: thinkingEffort
+                thinkingEffort: thinkingEffort,
+                promptDialect: engine.promptDialect
             )
         } else {
             formattedPrompt = ChatPromptFormatter.formatConversation(
@@ -1111,7 +1112,8 @@ final class ServerController: ObservableObject {
                 thinkingEnabled: thinkingEnabled,
                 modelSupportsThinking: info.supportsThinking,
                 modelConfig: engine.promptModelConfig,
-                thinkingEffort: thinkingEffort
+                thinkingEffort: thinkingEffort,
+                promptDialect: engine.promptDialect
             )
         }
 
@@ -1325,7 +1327,10 @@ final class ServerController: ObservableObject {
         modelConfig: ModelConfig?,
         systemPrompt: String
     ) -> [ChatPromptFormatter.ConversationTurn] {
-        let closer = ChatPromptFormatter.assistantTurnCloseTag(modelConfig: modelConfig)
+        let closer = ChatPromptFormatter.assistantTurnCloseTag(
+            modelConfig: modelConfig,
+            promptDialect: CompletionEngine.shared.promptDialect
+        )
         guard let index = conversation.lastIndex(where: { $0.role == .assistant }),
               let recorded = ServerTurnMemory.shared.recordedRawTurn(
                   sessionId: sessionId,

@@ -13,6 +13,11 @@ public enum ModelArchitectureType: String, CaseIterable, Identifiable, Codable {
     case hybridSsmDense = "Hybrid SSM + Dense (Ornith 1.5 9B / Qwen 3.5 Dense)"
     case standardMoe = "Standard MoE (Qwen MoE / Mixtral)"
     case denseTransformer = "Dense Transformer (Qwen Dense / LLaMA / Mistral)"
+    /// DeepSeek-V4.1-Flash: a 40-layer causal encoder/decoder stack whose
+    /// attention is latent (MLA) with compressed sparse rows (CSA2), carrying
+    /// n-gram Engram memory on two layers and a DSpark draft head. Its forward
+    /// pass has its own runtime; see `DeepSeekV41/`.
+    case deepSeekV41Flash = "CED + CSA2 MoE (DeepSeek V4.1 Flash)"
 
     public var id: String { rawValue }
 
@@ -23,6 +28,7 @@ public enum ModelArchitectureType: String, CaseIterable, Identifiable, Codable {
         case .hybridSsmDense: return "Hybrid SSM + Dense"
         case .standardMoe: return "Standard MoE"
         case .denseTransformer: return "Dense Transformer"
+        case .deepSeekV41Flash: return "DeepSeek V4.1 Flash"
         }
     }
 
@@ -33,6 +39,7 @@ public enum ModelArchitectureType: String, CaseIterable, Identifiable, Codable {
         case .hybridSsmDense: return "cpu"
         case .standardMoe: return "square.grid.3x3.fill"
         case .denseTransformer: return "cube.fill"
+        case .deepSeekV41Flash: return "brain.head.profile"
         }
     }
 
@@ -42,6 +49,12 @@ public enum ModelArchitectureType: String, CaseIterable, Identifiable, Codable {
 
     public var isQwen38: Bool {
         return self == .qwen38FlashNext
+    }
+
+    /// True for the DeepSeek V4.1 family, whose forward pass is served by the
+    /// dedicated engine in `DeepSeekV41/` rather than the generic decode loop.
+    public var isDeepSeekV41: Bool {
+        return self == .deepSeekV41Flash
     }
 }
 
@@ -597,6 +610,18 @@ public struct ModelConfig: Codable {
                archs.contains(where: { $0.contains("gemma4") })
     }
 
+    /// DeepSeek V4.1 (CED + CSA2). Detected from the config's `model_type`
+    /// (`deepseek_v41`) or its architecture class, wherever the checkpoint puts
+    /// it: the multimodal wrapper nests the text tower under `text_config`.
+    public var isDeepSeekV41Model: Bool {
+        let rawType = (modelType ?? "").lowercased()
+        let textType = (textConfig?.modelType ?? "").lowercased()
+        let archs = architectures?.map { $0.lowercased() } ?? []
+        return rawType.contains("deepseek_v41") || rawType.contains("deepseek_v4.1")
+            || textType.contains("deepseek_v41")
+            || archs.contains(where: { $0.contains("deepseekv41") })
+    }
+
     /// Global-attention layers reuse the key projection as the value projection
     /// (`attention_k_eq_v`), and use `global_head_dim` with a reduced KV head count.
     public var effectiveAttentionKEqV: Bool {
@@ -718,6 +743,14 @@ public struct ModelConfig: Codable {
     public func resolveArchitectureType(summary: ModelSummary?) -> ModelArchitectureType {
         let rawType = (modelType ?? (textConfig != nil ? "qwen3_5_moe" : "")).lowercased()
         let archs = architectures?.map { $0.lowercased() } ?? []
+
+        // DeepSeek V4.1 is checked first: it must not fall through to the
+        // MoE topology rules below, which would classify 384 experts as
+        // Qwen 3.8 Flash Next (>= 512) or Standard MoE and run the wrong
+        // forward pass.
+        if isDeepSeekV41Model {
+            return .deepSeekV41Flash
+        }
 
         let isQwen38Model = rawType.contains("qwen3_8") || rawType.contains("qwen38") || rawType.contains("flash_next") || rawType.contains("qwen4") || archs.contains(where: { $0.contains("qwen3_8") || $0.contains("flash_next") || $0.contains("qwen4") }) || effectiveNumExperts >= 512 || (summary != nil && summary!.maxExpertId >= 500)
         if isQwen38Model {
@@ -1013,10 +1046,21 @@ public struct ModelConfig: Codable {
             return cached.boolValue
         }
         let directory = URL(fileURLWithPath: path)
-        let supported = isSparkDirectory(directory)
-            && chatTemplateText(in: directory)?.contains("reasoning_effort") == true
+        let supported = isDeepSeekV41Directory(directory)
+            || (isSparkDirectory(directory)
+                && chatTemplateText(in: directory)?.contains("reasoning_effort") == true)
         thinkingLevelsCache.setObject(NSNumber(value: supported), forKey: key)
         return supported
+    }
+
+    /// The continuous reasoning-effort range a model accepts, or nil when the
+    /// model has no graded effort. DeepSeek V4.1 renders an integer budget
+    /// (`Reasoning Effort: N`) over 1...100; the other graded family (Spark
+    /// X2.6) exposes discrete levels instead.
+    nonisolated public static func reasoningEffortBounds(modelPath: String?) -> ClosedRange<Int>? {
+        guard let path = modelPath, !path.isEmpty else { return nil }
+        guard isDeepSeekV41Directory(URL(fileURLWithPath: path)) else { return nil }
+        return 1...100
     }
 
     /// Scan-time detection runs off the main actor, so the shared cache must be
@@ -1032,6 +1076,17 @@ public struct ModelConfig: Codable {
         let modelType = json["model_type"] as? String
         let architectures = json["architectures"] as? [String]
         return isSparkModel(modelType: modelType, architectures: architectures)
+    }
+
+    /// Whether the model directory holds a DeepSeek V4.1 checkpoint. Uses the
+    /// same identity probe as the full decode so discovery and load agree.
+    nonisolated static func isDeepSeekV41Directory(_ directory: URL) -> Bool {
+        let configUrl = directory.appendingPathComponent("config.json")
+        guard let data = try? Data(contentsOf: configUrl),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+        return DeepSeekV41Config.identifies(json)
     }
 
     /// `chat_template.jinja` wins when present: a stripped or repacked jinja

@@ -321,7 +321,7 @@ public class LocalModelManager: ObservableObject {
             let textType = (textConfig?["model_type"] as? String) ?? ""
             let archLower = archString.lowercased()
 
-            if let numExperts = json["num_experts"] as? Int ?? json["n_routed_experts"] as? Int ?? json["num_local_experts"] as? Int ?? textConfig?["num_experts"] as? Int {
+            if let numExperts = json["num_experts"] as? Int ?? json["n_routed_experts"] as? Int ?? json["num_local_experts"] as? Int ?? textConfig?["num_experts"] as? Int ?? textConfig?["n_routed_experts"] as? Int {
                 isMoE = true
                 expertCount = numExperts
             }
@@ -331,7 +331,9 @@ public class LocalModelManager: ObservableObject {
             }
 
             let isGemma4 = archLower.contains("gemma4") || (rawModelType?.localizedCaseInsensitiveContains("gemma4") ?? false) || textType.localizedCaseInsensitiveContains("gemma4")
-            if isGemma4 {
+            if textType.localizedCaseInsensitiveContains("deepseek_v41") || archLower.contains("deepseekv41") || (rawModelType?.localizedCaseInsensitiveContains("deepseek_v41") ?? false) {
+                architectureName = "DeepSeek V4.1 Flash (CED / CSA2 MoE)"
+            } else if isGemma4 {
                 architectureName = isMoE ? "Gemma 4 Hybrid Attention MoE" : "Gemma 4 Hybrid Attention"
             } else if archString.localizedCaseInsensitiveContains("qwen3_5") || archString.localizedCaseInsensitiveContains("ornith") || (rawModelType?.localizedCaseInsensitiveContains("qwen3_5") ?? false) || (rawModelType?.localizedCaseInsensitiveContains("ornith") ?? false) {
                 architectureName = isMoE ? "Hybrid SSM-MoE" : "Hybrid SSM-Dense"
@@ -358,6 +360,16 @@ public class LocalModelManager: ObservableObject {
                 quantization = "MLX \(bits)-Bit (\(mode.capitalized))"
             } else if let dtype = json["torch_dtype"] as? String {
                 quantization = dtype
+            }
+
+            // DeepSeek V4.1 ships one FP8 recipe for the dense weights and a
+            // separate MXFP4 recipe for the routed experts; naming only the
+            // dense half would mislead anyone reading the model row.
+            if (textType.localizedCaseInsensitiveContains("deepseek_v41")
+                || archLower.contains("deepseekv41")
+                || (rawModelType?.localizedCaseInsensitiveContains("deepseek_v41") ?? false)),
+               let quant = quantization, quant.contains("FP8") {
+                quantization = "FP8 + MXFP4 experts"
             }
         }
 

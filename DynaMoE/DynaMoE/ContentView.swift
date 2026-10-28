@@ -5906,7 +5906,8 @@ struct ContentView: View {
             thinkingEnabled: thinkingEnabled,
             modelSupportsThinking: modelSupportsThinking,
             modelConfig: modelConfig,
-            thinkingEffort: thinkingEffortLevel
+            thinkingEffort: thinkingEffortLevel,
+            promptDialect: CompletionEngine.shared.promptDialect
         )
 
         // Expose the exact prompt text to the harness: the path-repair hint uses it
@@ -7315,6 +7316,28 @@ struct ContentView: View {
                     WorkingSetManager.shared.registerShardMappings(registryBuffers)
                     self.modelConfig = cfg
                     self.detectedArchitecture = arch
+                    // DeepSeek V4.1 is served by its own engine and cannot run on the
+                    // generic decode loop, so report what the checkpoint actually looks
+                    // like at load time: download completeness, tensor coverage, and
+                    // where the memory goes. A half-finished 510 GB download is the
+                    // normal state for hours, and this is the only place a user sees it.
+                    if arch == .deepSeekV41Flash {
+                        let configUrl = dirUrl.appendingPathComponent("config.json")
+                        if let dsConfig = try? DeepSeekV41Config.decode(contentsOf: configUrl) {
+                            let report = DeepSeekV41LoadDiagnostics.report(
+                                snapshotDir: dirUrl,
+                                config: dsConfig,
+                                summary: loadedSummary,
+                                contextLength: min(
+                                    dsConfig.maxPositionEmbeddings,
+                                    UserDefaults.standard.object(forKey: "dynamoe_max_tokens") as? Int ?? 8_192
+                                )
+                            )
+                            for line in report {
+                                print("🔎 [DeepSeekV41] \(line)")
+                            }
+                        }
+                    }
                     // Do NOT restore a system prompt captured before the load here.
                     // This completion runs asynchronously AFTER switchModel has already
                     // called applyProfile, so writing back the pre-load value clobbered
