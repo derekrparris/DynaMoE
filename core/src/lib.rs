@@ -256,7 +256,25 @@ fn parse_layer_and_expert(name: &str) -> (String, Option<u32>, Option<u32>) {
         }
     }
 
-    let category = if name.contains("embed_tokens") || name.contains("wte") || name.contains("word_embeddings") {
+    let category = if name.contains(".engram.") {
+        "Engram (n-gram memory)".to_string()
+    } else if name.contains("attn.compressor.") {
+        "CSA2 Compressor".to_string()
+    } else if name.contains("attn.indexer.") {
+        "CSA2 Indexer".to_string()
+    } else if name.contains("attn.wq_a") || name.contains("attn.wq_b") || name.contains("attn.wkv")
+        || name.contains("attn.wo_a") || name.contains("attn.wo_b") || name.contains("attn.kv_norm")
+        || name.contains("attn.attn_sink") {
+        "Multi-Head Latent Attention (MLA)".to_string()
+    } else if name.contains("hc_attn_") || name.contains("hc_ffn_") {
+        "Hyper-Connection Residual".to_string()
+    } else if name.starts_with("embed.") {
+        "Embedding".to_string()
+    } else if name.starts_with("head.") {
+        "LM Head".to_string()
+    } else if name.contains("ffn.gate") {
+        "MoE Router".to_string()
+    } else if name.contains("embed_tokens") || name.contains("wte") || name.contains("word_embeddings") {
         "Embedding".to_string()
     } else if name.contains("ngram_embedding") || name.contains(".ple.") || name.contains("ple_embedding") {
         "N-Gram Predictive Local Embedding".to_string()
@@ -2064,6 +2082,78 @@ mod tests {
         assert_eq!(cat_exp127, "Routed Expert #127");
         assert_eq!(l_e, Some(1));
         assert_eq!(e_id, Some(127));
+    }
+
+    /// DeepSeek V4.1 checkpoints have no `model.` root, so the layer path is
+    /// `layers.N.…`. Every family member has to be classified explicitly or the
+    /// generic rules funnel them into "Other", and the Engram tables have to be
+    /// marked streamed so they are never mapped into a Metal buffer.
+    #[test]
+    fn test_deepseek_v41_tensor_parsing() {
+        let (cat_embed, l_embed, _) = parse_layer_and_expert("embed.weight");
+        assert_eq!(cat_embed, "Embedding");
+        assert_eq!(l_embed, None);
+
+        let (cat_head, _, _) = parse_layer_and_expert("head.weight");
+        assert_eq!(cat_head, "LM Head");
+
+        let (cat_final_norm, _, _) = parse_layer_and_expert("norm.weight");
+        assert_eq!(cat_final_norm, "LayerNorm");
+
+        let (cat_wq_a, l_wq_a, _) = parse_layer_and_expert("layers.3.attn.wq_a.weight");
+        assert_eq!(cat_wq_a, "Multi-Head Latent Attention (MLA)");
+        assert_eq!(l_wq_a, Some(3));
+
+        let (cat_wkv, _, _) = parse_layer_and_expert("layers.3.attn.wkv.weight");
+        assert_eq!(cat_wkv, "Multi-Head Latent Attention (MLA)");
+
+        let (cat_sink, _, _) = parse_layer_and_expert("layers.3.attn.attn_sink");
+        assert_eq!(cat_sink, "Multi-Head Latent Attention (MLA)");
+
+        let (cat_indexer, l_idx, _) = parse_layer_and_expert("layers.20.attn.indexer.wk.weight");
+        assert_eq!(cat_indexer, "CSA2 Indexer");
+        assert_eq!(l_idx, Some(20));
+
+        let (cat_compressor, _, _) = parse_layer_and_expert("layers.20.attn.compressor.wgate.weight");
+        assert_eq!(cat_compressor, "CSA2 Compressor");
+
+        let (cat_hc, _, _) = parse_layer_and_expert("layers.0.hc_attn_fn");
+        assert_eq!(cat_hc, "Hyper-Connection Residual");
+
+        let (cat_gate_bias, _, _) = parse_layer_and_expert("layers.0.ffn.gate.bias");
+        assert_eq!(cat_gate_bias, "MoE Router");
+
+        let (cat_gate_vl, _, _) = parse_layer_and_expert("layers.0.ffn.gate.bias_vl");
+        assert_eq!(cat_gate_vl, "MoE Router");
+
+        let (cat_shared, _, _) = parse_layer_and_expert("layers.0.ffn.shared_experts.w1.weight");
+        assert_eq!(cat_shared, "Shared Expert");
+
+        let (cat_expert, l_exp, e_exp) = parse_layer_and_expert("layers.0.ffn.experts.383.w3.weight");
+        assert_eq!(cat_expert, "Routed Expert #383");
+        assert_eq!(l_exp, Some(0));
+        assert_eq!(e_exp, Some(383));
+
+        let (cat_expert_scale, _, e_scale) = parse_layer_and_expert("layers.0.ffn.experts.383.w3.weight_scale");
+        assert_eq!(cat_expert_scale, "Routed Expert #383");
+        assert_eq!(e_scale, Some(383));
+
+        // Engram tables: their own category, and streamed.
+        let (cat_engram, l_engram, _) = parse_layer_and_expert("layers.1.engram.wkv.weight");
+        assert_eq!(cat_engram, "Engram (n-gram memory)");
+        assert_eq!(l_engram, Some(1));
+        // The Swift side keys "never map this" off the category, not a flag.
+        let (cat_engram_scale, _, _) = parse_layer_and_expert("layers.14.engram.wkv.scale");
+        assert_eq!(cat_engram_scale, "Engram (n-gram memory)");
+
+        // The published checkpoint's Engram tensors are single ~100 GB blocks.
+        let row_bytes = 256 + 8;
+        let table_bytes = 384_006_168u64 * row_bytes;
+        assert!(table_bytes > 64 * 1024 * 1024 * 1024, "Engram table must exceed any Metal buffer");
+
+        // Draft blocks keep their own bucket.
+        let (cat_mtp, _, _) = parse_layer_and_expert("mtp.0.main_proj.weight");
+        assert_eq!(cat_mtp, "Multi-Token Prediction");
     }
 
     #[test]
