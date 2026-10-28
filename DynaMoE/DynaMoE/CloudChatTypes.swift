@@ -40,28 +40,102 @@ public nonisolated struct CloudChatToolCall: Codable, Equatable, Sendable {
 /// One Chat-Completions message. `content` is nil for an assistant turn that
 /// only issued tool calls, and `toolCalls`/`toolCallId` carry the OpenAI
 /// tool-exchange shape so a reloaded conversation replays faithfully.
+///
+/// Images ride as `imageParts` (data URLs) and change only the *shape* of
+/// `content` on the wire: with parts it is encoded as
+/// `[{"type":"text",…},{"type":"image_url","image_url":{"url":…}}]`, without
+/// them as a bare string, byte-identical to the pre-image request. That keeps
+/// every text-only turn (and every existing request-shape test) unchanged.
 public nonisolated struct CloudChatMessage: Codable, Equatable, Sendable {
     public let role: String
     public let content: String?
     public let toolCalls: [CloudChatToolCall]?
     public let toolCallId: String?
+    /// Data URLs for images attached to this message, in display order.
+    public let imageParts: [String]?
+    /// Metadata-only labels (`"[image: shot.png 1024×768 412 KB]"`) for prompt
+    /// renders and request logs. Deliberately **not** encoded onto the wire: the
+    /// provider gets the bytes, not our filenames.
+    public let imageDescriptions: [String]?
 
     public init(
         role: String,
         content: String?,
         toolCalls: [CloudChatToolCall]? = nil,
-        toolCallId: String? = nil
+        toolCallId: String? = nil,
+        imageParts: [String]? = nil,
+        imageDescriptions: [String]? = nil
     ) {
         self.role = role
         self.content = content
         self.toolCalls = toolCalls
         self.toolCallId = toolCallId
+        self.imageParts = imageParts
+        self.imageDescriptions = imageDescriptions
     }
 
     enum CodingKeys: String, CodingKey {
         case role, content
         case toolCalls = "tool_calls"
         case toolCallId = "tool_call_id"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.role = try container.decode(String.self, forKey: .role)
+        self.content = try container.decodeIfPresent(String.self, forKey: .content)
+        self.toolCalls = try container.decodeIfPresent([CloudChatToolCall].self, forKey: .toolCalls)
+        self.toolCallId = try container.decodeIfPresent(String.self, forKey: .toolCallId)
+        // Wire-only type: image bytes are rebuilt per turn from the session's
+        // attachment refs, so a decoded message carries none. `encode(to:)` also
+        // omits them on purpose. Persisting this type would need its own coder,
+        // not these keys, because the OpenAI request shape forbids extra fields.
+        self.imageParts = nil
+        self.imageDescriptions = nil
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(role, forKey: .role)
+        if let imageParts, !imageParts.isEmpty {
+            var parts = container.nestedUnkeyedContainer(forKey: .content)
+            if let content, !content.isEmpty {
+                try parts.encode(WireContentPart.text(content))
+            }
+            for url in imageParts {
+                try parts.encode(WireContentPart.image(url))
+            }
+        } else {
+            try container.encodeIfPresent(content, forKey: .content)
+        }
+        try container.encodeIfPresent(toolCalls, forKey: .toolCalls)
+        try container.encodeIfPresent(toolCallId, forKey: .toolCallId)
+    }
+}
+
+/// One entry in the multi-part `content` array. Optional fields are omitted by
+/// the synthesized encoder, so a text part carries no `image_url` and an image
+/// part carries no `text`.
+private nonisolated struct WireContentPart: Encodable {
+    struct ImageURL: Encodable {
+        let url: String
+    }
+
+    let type: String
+    let text: String?
+    let imageURL: ImageURL?
+
+    enum CodingKeys: String, CodingKey {
+        case type, text
+        case imageURL = "image_url"
+    }
+
+    static func text(_ text: String) -> WireContentPart {
+        WireContentPart(type: "text", text: text, imageURL: nil)
+    }
+
+    static func image(_ url: String) -> WireContentPart {
+        WireContentPart(type: "image_url", text: nil, imageURL: ImageURL(url: url))
     }
 }
 
@@ -200,6 +274,27 @@ public nonisolated enum CloudTurnFailure: Equatable, Sendable, LocalizedError {
             "context_length", "context length", "maximum context", "context window",
             "too many tokens", "token limit", "prompt is too long", "input is too long",
             "input too long", "exceeds the maximum", "reduce the length"
+        ]
+        return markers.contains { lower.contains($0) }
+    }
+
+    /// Whether a provider's 400/422 body is complaining about the image content
+    /// parts rather than about tools, schemas, or the context window. Registration
+    /// of vision capability is an editorial fact (no catalog publishes
+    /// modalities), so a model we marked capable can still refuse; the chat path
+    /// uses this to un-mark it and retry the turn once without the pixels instead
+    /// of failing the conversation.
+    public nonisolated static func indicatesImageRejection(_ summary: String) -> Bool {
+        let lower = summary.lowercased()
+        // Deliberately narrow: these phrases name the image content part itself.
+        // Broad words like "vision", "modality", or "content parts" also appear in
+        // unrelated 400 bodies, and a false match persists `supportsVision = false`
+        // for a working model, so they are not markers.
+        let markers = [
+            "image_url", "image url", "image input", "image content", "image part",
+            "images are not", "does not support image", "doesn't support image",
+            "unsupported image", "not support vision", "invalid image", "image format",
+            "no image"
         ]
         return markers.contains { lower.contains($0) }
     }
@@ -548,7 +643,9 @@ public nonisolated enum CloudAgentStepPlan {
 public nonisolated enum CloudMessageAssembler {
     public static func assemble(
         from messages: [ChatMessage],
-        excludingMessageIds: Set<UUID> = []
+        excludingMessageIds: Set<UUID> = [],
+        imageDataURLs: [UUID: [String]] = [:],
+        imagesSupported: Bool = true
     ) -> [CloudChatMessage] {
         var assembled: [CloudChatMessage] = []
         for message in messages {
@@ -560,13 +657,73 @@ public nonisolated enum CloudMessageAssembler {
                 assembled.append(contentsOf: toolExchange(content: content, records: records))
                 continue
             }
-            guard !content.isEmpty else { continue }
+            let attachments = message.role == .user ? (message.attachments ?? []) : []
+            let resolvedURLs = attachments.isEmpty ? [] : (imageDataURLs[message.id] ?? [])
+            let (text, parts, descriptions) = attachmentCarryingContent(
+                content: content,
+                attachments: attachments,
+                resolvedURLs: resolvedURLs,
+                imagesSupported: imagesSupported
+            )
+            // A user turn that carries only images is still a real turn: sending
+            // nothing for it would silently drop the picture from the history.
+            guard !text.isEmpty || !parts.isEmpty else { continue }
             assembled.append(CloudChatMessage(
                 role: message.role == .user ? "user" : "assistant",
-                content: content
+                content: text.isEmpty ? nil : text,
+                imageParts: parts.isEmpty ? nil : parts,
+                imageDescriptions: descriptions.isEmpty ? nil : descriptions
             ))
         }
         return assembled
+    }
+
+    /// Splits one user turn into the text the model reads and the image parts it
+    /// is sent. Attachments are re-sent with their original message on every
+    /// step (history is rebuilt per step), so an agent run keeps the model's
+    /// visual context instead of forgetting the picture after turn one.
+    ///
+    /// When the model cannot take images — or an asset is missing on disk — the
+    /// turn carries a metadata-only notice instead of silently losing the
+    /// picture: a model told "an image was attached" answers about it, while a
+    /// model that never hears about it invents an answer about nothing.
+    static func attachmentCarryingContent(
+        content: String,
+        attachments: [ImageAttachmentRef],
+        resolvedURLs: [String],
+        imagesSupported: Bool
+    ) -> (text: String, parts: [String], descriptions: [String]) {
+        guard !attachments.isEmpty else { return (content, [], []) }
+        let descriptions = attachments.map(\.logDescription)
+        guard imagesSupported else {
+            return (appendingNotice(
+                omittedImagesNotice(count: attachments.count, reason: "model has no vision support"),
+                to: content
+            ), [], descriptions)
+        }
+        // A partially resolved turn (one asset pruned while another survives)
+        // must say which pictures are missing rather than silently sending fewer
+        // images than the transcript shows.
+        if resolvedURLs.count < attachments.count {
+            return (appendingNotice(
+                omittedImagesNotice(
+                    count: attachments.count - resolvedURLs.count,
+                    reason: "image data unavailable"
+                ),
+                to: content
+            ), resolvedURLs, descriptions)
+        }
+        return (content, resolvedURLs, descriptions)
+    }
+
+    /// The text a turn carries in place of pixels it could not send.
+    public static func omittedImagesNotice(count: Int, reason: String) -> String {
+        let noun = count == 1 ? "image" : "images"
+        return "[\(count) \(noun) omitted: \(reason)]"
+    }
+
+    private static func appendingNotice(_ notice: String, to content: String) -> String {
+        content.isEmpty ? notice : content + "\n\n" + notice
     }
 
     /// One assistant turn that issued calls, followed by one `tool` message per
@@ -638,13 +795,18 @@ public nonisolated enum CloudMessageAssembler {
     }
 
     /// Character-based input estimate for the turn log (providers report real
-    /// usage only in the final streamed chunk, which may never arrive).
+    /// usage only in the final streamed chunk, which may never arrive). Images
+    /// contribute a flat allowance rather than their base64 length: a data URL
+    /// counted as text would report tens of thousands of phantom tokens.
     public static func approximatePromptTokens(system: String?, messages: [CloudChatMessage]) -> Int {
+        let imageTokens = messages.reduce(0) { total, message in
+            total + (message.imageParts?.count ?? 0) * ImageAttachmentPreparer.estimatedTokensPerImage
+        }
         let characters = (system ?? "").count + messages.reduce(0) { total, message in
             total + (message.content ?? "").count
                 + (message.toolCalls ?? []).reduce(0) { $0 + $1.function.name.count + $1.function.arguments.count }
         }
-        return max(1, characters / 4)
+        return max(1, characters / 4 + imageTokens)
     }
 
     /// The prompt as the provider sees it, for the Settings ▸ Server log's
@@ -659,7 +821,13 @@ public nonisolated enum CloudMessageAssembler {
                 blocks.append("Tool result: \(content)")
                 continue
             }
-            let content = (message.content ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawContent = (message.content ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            // Images are rendered as metadata only. A data URL here would put
+            // megabytes of base64 into the request log's SQLite row.
+            let imageLabels = message.imageDescriptions ?? []
+            let content = ([rawContent] + imageLabels)
+                .filter { !$0.isEmpty }
+                .joined(separator: "\n")
             let label: String
             switch message.role {
             case "assistant": label = "Assistant"

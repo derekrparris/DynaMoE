@@ -30,6 +30,12 @@ public nonisolated struct DiscoveredModel: Identifiable, Hashable, Codable, Equa
     /// (Spark X2.6's `reasoning_effort`: High, Low, or Off). `false` for
     /// models that only have the plain on/off switch.
     public var supportsThinkingLevels: Bool
+    /// Whether this model can see images. Populated from the cloud registry for
+    /// virtual provider entries and left `false` for local weights: running a
+    /// vision tower locally is a separate engine capability, and a false value
+    /// makes the composer refuse an attachment with a notice instead of sending
+    /// pixels the model would never receive.
+    public var supportsVision: Bool
 
     public init(
         id: String,
@@ -48,7 +54,8 @@ public nonisolated struct DiscoveredModel: Identifiable, Hashable, Codable, Equa
         quantization: String? = nil,
         rawModelType: String? = nil,
         supportsThinking: Bool = false,
-        supportsThinkingLevels: Bool = false
+        supportsThinkingLevels: Bool = false,
+        supportsVision: Bool = false
     ) {
         self.id = id
         self.displayName = displayName
@@ -67,6 +74,7 @@ public nonisolated struct DiscoveredModel: Identifiable, Hashable, Codable, Equa
         self.rawModelType = rawModelType
         self.supportsThinking = supportsThinking
         self.supportsThinkingLevels = supportsThinkingLevels
+        self.supportsVision = supportsVision
     }
 }
 

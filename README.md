@@ -425,6 +425,7 @@ defaults write DRP.DynaMoE dynamoe_cloud_synthetic_models \
 * `hf:` ids use the model tail for their display name; provider aliases such as `syn:large:text` are humanized (`Syn Large Text (Synthetic)`).
 * An id containing `thinking` is marked reasoning-capable; anything else is treated as plain chat. This is a convenience heuristic, not provider truth. The Thinking control is hidden for cloud models regardless: reasoning follows the provider's default and its `reasoning_content` deltas are still shown.
 * Tool support defaults to on for every registered model. A model that rejects a `tools` array belongs in `dynamoe_cloud_<provider>_no_tools` (see above); it then runs plain chat with a notice instead of failing mid-loop.
+* Image input is opt-in per model: no provider catalog publishes modalities, so mark the models that accept images in **Settings → Cloud Providers → Registered Cloud Models** (each row has a switch). The list is stored in `dynamoe_cloud_<provider>_vision`. A model marked capable that rejects an image is un-marked automatically and that turn is retried once without the picture. Only error bodies that name the image part itself trigger this (unrelated `400`s never change the flag), and the downgrade is recorded in the transcript so it cannot be missed.
 * A single-model smoke-test hook exists for development: `defaults write DRP.DynaMoE dynamoe_cloud_debug_model "hf:org/model"` registers one model when the main list is empty.
 * A hand-written value may not be visible to an already-running app (preference caches): quit and relaunch after `defaults write`, or just use **Sync Models** inside the app.
 
@@ -435,6 +436,25 @@ A cloud model whose persisted id no longer resolves (an unknown provider, a corr
 ### Turning a cloud turn into a request
 
 The chat composer's messages become a standard `messages` array (system persona first, then the conversation with speaker labels stripped, system-role UI notices skipped; tool turns replay as an assistant `tool_calls` message followed by one `tool` result per call). `temperature`, `top_p`, `presence_penalty`, and `max_tokens` are forwarded when set. Stop sequences are not: the provider owns chat templating, so its own end-of-turn marker is authoritative. Min-P, Top-K, and the repetition penalty have no remote equivalent and are ignored. The turn is recorded in **Settings → Server → Request Log** with the same row contract as local and on-device turns (one row per agent step).
+
+### Image input (vision-capable cloud models)
+
+A cloud model marked vision-capable accepts screenshots and photos. There are four ways to attach one:
+
+* **Paste** a screenshot from the clipboard into the composer (⌘V).
+* **Drag** an image file onto the composer card.
+* **Attach Image…** from the composer's **+** menu (a file picker).
+* **Type an absolute path** to an image; it becomes an attachment chip automatically. The app reads the file itself — the agent's `file_read` tool deliberately refuses binary, so the model can never open an image path on its own.
+
+Each image is oriented, stripped of metadata, downscaled so its longest edge is 1024 px, and re-encoded (PNG for screenshots, including TIFF clipboard captures, so text stays legible; JPEG for photos) before it leaves the machine. Limits are 4 MB per image and 6 images per message; a file that is not an image, or is over 32 MB on disk, is refused with a message instead of being silently skipped.
+
+On the wire, an attached user turn becomes a multi-part `content` array: `{"type":"text",…}` plus one `{"type":"image_url","image_url":{"url":"data:image/png;base64,…"}}` per image. Text-only turns still send `content` as a bare string, so nothing changes for models without vision.
+
+A slash command cannot carry images: the composer refuses the send and keeps the draft/chips, and removing a queued prompt deletes the images it staged. Images are re-sent with their original message on every later request, including each agent step, so the model keeps its visual context. That also means each later turn pays the image's prompt tokens again; the token estimate prices each image as a flat allowance until the provider reports real usage.
+
+Attachments live beside the conversation files in `~/Library/Application Support/DynaMoE/sessions/assets/<session>/`, never inside the session JSON (base64 there would rewrite megabytes on every streaming save). Deleting a conversation, auto-deletion, and the orphan pass all remove their images.
+
+The local weights engine and the on-device Apple Foundation Model are text-only in this release: attaching an image to one of them is refused with a notice rather than dropped, and a historical image renders a metadata-only notice in the local prompt. The local inference server likewise answers any non-text content part (an `image_url`, OpenAI `file`/`input_audio`, or an Anthropic `image`/`document` block) with `400` and `"code": "unsupported_content"` instead of stripping it.
 
 ### Troubleshooting
 
@@ -447,6 +467,8 @@ The chat composer's messages become a standard `messages` array (system persona 
 | A hand-written `defaults` value is not picked up | Preference caches: quit and relaunch, or use **Sync Models** |
 | "The Anthropic API flavor is not implemented yet" | Only the OpenAI-compatible flavor is implemented in this release |
 | HTTP 400/422 on an agent turn | Either the model rejects `tools` (add it to `dynamoe_cloud_<provider>_no_tools`) or the conversation overflowed the context window (start a new chat, `/compact`, or pick a longer-context model) — the chat message says which |
+| "This model cannot see images" | Mark the model vision-capable in **Settings → Cloud Providers → Registered Cloud Models**, or switch to one that is |
+| A screenshot turn is retried without the image | The provider rejected the image part; the model is un-marked as vision-capable, and you can re-mark it after confirming support |
 | "The request timed out" | The provider sent no bytes for two minutes; a wedged connection is dropped at that point while long generations continue |
 
 ---
