@@ -384,48 +384,72 @@ final class DeepSeekV41ConfigTests: XCTestCase {
 
 final class DeepSeekV41EngramTests: XCTestCase {
 
-    func publishedSpec(layer: Int = 1, rows: Int = 384_006_168) -> DeepSeekV41EngramSpec {
-        DeepSeekV41EngramSpec(
-            layer: layer,
-            rowCount: rows,
-            maxNgramSize: 4,
-            headCount: 8,
-            headDimension: 256,
-            padTokenID: 2,
-            compressedVocabSize: 99_092,
-            bucketStart: 16_000_000
-        )
-    }
-
-    /// Reference vector: the prime ranges must address exactly the published
-    /// `engram_num_embeddings[0]`, which is what proves the bucket arithmetic
-    /// (`cursor = prime + 1`, 24 columns) matches the checkpoint.
-    func testBucketLayoutReproducesPublishedRowCount() throws {
-        let layout = try DeepSeekV41EngramLayout(spec: publishedSpec())
-        XCTAssertEqual(layout.hashColumnCount, 24)
-        XCTAssertEqual(layout.addressedRows, 384_006_168)
-        XCTAssertEqual(layout.bucketSizes.first, 16_000_057)
-        XCTAssertTrue(layout.bucketSizes.allSatisfy(DeepSeekV41Primes.isPrime))
-    }
-
-    func testBucketRangesAreDisjointAndAscending() throws {
-        let layout = try DeepSeekV41EngramLayout(spec: publishedSpec())
-        XCTAssertEqual(layout.bucketOffsets.first, 0)
-        for index in 1..<layout.bucketOffsets.count {
-            let previousEnd = layout.bucketOffsets[index - 1] + layout.bucketSizes[index - 1]
-            XCTAssertGreaterThanOrEqual(layout.bucketOffsets[index], previousEnd)
+    /// The published checkpoint's own numbers: two Engram layers, `max_ngram_size`
+    /// 4, 8 heads, 256-wide heads, `engram_vocab_size` 16M. The row counts differ
+    /// because the prime sequence is shared across layers.
+    func publishedSpecs() -> [DeepSeekV41EngramSpec] {
+        [1, 14].map { layer in
+            DeepSeekV41EngramSpec(
+                layer: layer,
+                rowCount: layer == 1 ? 384_006_168 : 384_016_682,
+                maxNgramSize: 4,
+                headCount: 8,
+                headDimension: 256,
+                padTokenID: 2,
+                compressedVocabSize: 99_092,
+                bucketStart: 16_000_000
+            )
         }
     }
 
-    func testRowBytesAndTableBytes() throws {
-        let spec = publishedSpec()
-        XCTAssertEqual(spec.rowBytes, 256 + 8)
-        XCTAssertEqual(spec.totalBytes, 384_006_168 * 264)
+    func publishedLayouts() throws -> [Int: DeepSeekV41EngramLayout] {
+        try DeepSeekV41EngramLayout.make(specs: publishedSpecs())
     }
 
-    func testSecondTableFitsItsLargerRowBudget() throws {
-        let first = try DeepSeekV41EngramLayout(spec: publishedSpec(layer: 14, rows: 384_016_682))
-        XCTAssertLessThanOrEqual(first.addressedRows, 384_016_682)
+    /// Reference vector: the two prime ranges must address exactly the published
+    /// `engram_num_embeddings`, layer for layer. The second table's count is what
+    /// proves the prime sequence is drawn ONCE across layers: restarting per table
+    /// would land on 384_006_168 twice.
+    func testBucketLayoutReproducesPublishedRowCounts() throws {
+        let layouts = try publishedLayouts()
+        let first = try XCTUnwrap(layouts[1])
+        let second = try XCTUnwrap(layouts[14])
+        XCTAssertEqual(first.hashColumnCount, 24)
+        XCTAssertEqual(first.addressedRows, 384_006_168)
+        XCTAssertEqual(second.addressedRows, 384_016_682)
+        XCTAssertEqual(first.bucketSizes.first, 16_000_057)
+        XCTAssertEqual(
+            first.bucketSizes,
+            [16_000_057, 16_000_079, 16_000_081, 16_000_097, 16_000_121, 16_000_129,
+             16_000_133, 16_000_183, 16_000_189, 16_000_207, 16_000_211, 16_000_253,
+             16_000_277, 16_000_289, 16_000_307, 16_000_321, 16_000_339, 16_000_381,
+             16_000_393, 16_000_399, 16_000_403, 16_000_409, 16_000_447, 16_000_463]
+        )
+        // The second table continues the sequence rather than restarting it.
+        XCTAssertEqual(
+            Array(second.bucketSizes.prefix(3)), [16_000_477, 16_000_487, 16_000_499]
+        )
+        XCTAssertEqual(second.bucketSizes.last, 16_000_889)
+        let all = first.bucketSizes + second.bucketSizes
+        XCTAssertEqual(Set(all).count, all.count, "bucket ranges must not share a prime")
+        XCTAssertTrue(all.allSatisfy(DeepSeekV41Primes.isPrime))
+    }
+
+    func testBucketRangesAreDisjointAndAscending() throws {
+        let layouts = try publishedLayouts()
+        for layout in layouts.values {
+            XCTAssertEqual(layout.bucketOffsets.first, 0)
+            for index in 1..<layout.bucketOffsets.count {
+                let previousEnd = layout.bucketOffsets[index - 1] + layout.bucketSizes[index - 1]
+                XCTAssertGreaterThanOrEqual(layout.bucketOffsets[index], previousEnd)
+            }
+        }
+    }
+
+    func testRowBytesAndTableBytes() {
+        let spec = publishedSpecs()[0]
+        XCTAssertEqual(spec.rowBytes, 256 + 8)
+        XCTAssertEqual(spec.totalBytes, 384_006_168 * 264)
     }
 
     func testTableTooSmallForItsBucketsIsRejected() {
@@ -434,11 +458,11 @@ final class DeepSeekV41EngramTests: XCTestCase {
             headDimension: 256, padTokenID: 2, compressedVocabSize: 99_092,
             bucketStart: 16_000_000
         )
-        XCTAssertThrowsError(try DeepSeekV41EngramLayout(spec: spec))
+        XCTAssertThrowsError(try DeepSeekV41EngramLayout.make(specs: [spec]))
     }
 
     func testColumnAndByteAddressing() throws {
-        let layout = try DeepSeekV41EngramLayout(spec: publishedSpec())
+        let layout = try XCTUnwrap(try publishedLayouts()[1])
         XCTAssertEqual(layout.column(ngramSize: 2, head: 0), 0)
         XCTAssertEqual(layout.column(ngramSize: 2, head: 7), 7)
         XCTAssertEqual(layout.column(ngramSize: 4, head: 7), 23)
@@ -447,23 +471,15 @@ final class DeepSeekV41EngramTests: XCTestCase {
         XCTAssertEqual(layout.byteOffset(column: 0, bucket: 5), 5 * 264)
     }
 
-    func testHashFinalizerIsDeterministic() {
-        XCTAssertEqual(DeepSeekV41EngramHasher.mix(0), 0)
-        // Same input, same output; different input, different output.
-        XCTAssertEqual(DeepSeekV41EngramHasher.mix(12345), DeepSeekV41EngramHasher.mix(12345))
-        XCTAssertNotEqual(DeepSeekV41EngramHasher.mix(12345), DeepSeekV41EngramHasher.mix(12346))
-    }
-
-    /// Until a probe run confirms the token-id combination against the
-    /// checkpoint's own `inference/engram.py`, the runtime must not claim the
-    /// hash is verified. This test fails the day someone flips the flag without
-    /// the reference vectors behind it.
+    /// Until a probe run compares hash ids with the reference implementation, the
+    /// runtime must not claim the hash is verified. This test fails the day someone
+    /// flips the flag without the vectors behind it.
     func testHashConformanceIsDeclaredUnverified() {
         XCTAssertEqual(DeepSeekV41EngramHasher.conformance, .unverified)
     }
 
-    func testTokenMapCompression() throws {
-        let map = try DeepSeekV41EngramTokenMap(
+    func testSyntheticTokenMapCompression() throws {
+        let map = try DeepSeekV41EngramTokenMap.synthetic(
             vocabSize: 129_280, compressedVocabSize: 99_092, padTokenID: 2
         )
         XCTAssertEqual(map.compressedToken(2), 2)
@@ -472,9 +488,20 @@ final class DeepSeekV41EngramTests: XCTestCase {
         XCTAssertEqual(map.compressedToken(10_000_000), 2)
     }
 
+    /// A compiled map whose largest id disagrees with the size the tokenizer
+    /// reported would change every multiplier, so it is refused.
+    func testTokenMapRejectsASizeThatDisagreesWithItsLookup() {
+        XCTAssertThrowsError(
+            try DeepSeekV41EngramTokenMap(lookup: [0, 1, 2], compressedVocabSize: 5, padID: 0)
+        )
+        XCTAssertThrowsError(
+            try DeepSeekV41EngramTokenMap(lookup: [0, 1, 2], compressedVocabSize: 3, padID: 9)
+        )
+    }
+
     func testRowRequestsPerToken() throws {
-        let layout = try DeepSeekV41EngramLayout(spec: publishedSpec())
-        let map = try DeepSeekV41EngramTokenMap(
+        let layout = try XCTUnwrap(try publishedLayouts()[1])
+        let map = try DeepSeekV41EngramTokenMap.synthetic(
             vocabSize: 129_280, compressedVocabSize: 99_092, padTokenID: 2
         )
         let history = [Int32(11), Int32(22), Int32(33)]
@@ -483,10 +510,13 @@ final class DeepSeekV41EngramTests: XCTestCase {
         )
         // (max_ngram_size - 1) n-gram sizes x n_heads.
         XCTAssertEqual(requests.count, 24)
-        XCTAssertTrue(requests.allSatisfy { $0.bucket >= 0 && $0.bucket < layout.bucketSizes[$0.column] })
-        XCTAssertTrue(requests.allSatisfy { $0.byteCount == 264 })
-        XCTAssertTrue(requests.allSatisfy { $0.byteOffset + $0.byteCount <= layout.spec.totalBytes })
         XCTAssertEqual(requests.map(\.column), Array(0..<24))
+        for request in requests {
+            XCTAssertEqual(request.bucket, request.row - layout.bucketOffsets[request.column])
+            XCTAssertTrue(request.row >= 0 && request.row < layout.spec.rowCount)
+            XCTAssertEqual(request.byteOffset, request.row * layout.spec.rowBytes)
+            XCTAssertEqual(request.byteCount, 264)
+        }
         // Deterministic for the same token history, and sensitive to it.
         XCTAssertEqual(
             requests,
@@ -500,7 +530,93 @@ final class DeepSeekV41EngramTests: XCTestCase {
         )
         // A layer without this table issues no reads.
         XCTAssertTrue(
-            DeepSeekV41Engram.rowRequests(layer: 14, history: history, tokenMap: map, layout: layout).isEmpty
+            DeepSeekV41Engram.rowRequests(layer: 2, history: history, tokenMap: map, layout: layout).isEmpty
+        )
+    }
+
+    /// The hash is `XOR` of `token * multiplier` over the look-backs, reduced mod
+    /// the prime that owns (n-gram size, head), plus that column's row offset. The
+    /// vectors below are the checkpoint's own arithmetic on a two-column fixture:
+    /// multiplier 1 for the current token, 1 for the previous one, then buckets
+    /// `(7 ^ 5) % 11 = 10` for the 2-gram and `(7 ^ 5 ^ 3) % 13 = 5` for the 3-gram.
+    func testHashFollowsTheReferenceRule() throws {
+        let spec = DeepSeekV41EngramSpec(
+            layer: 1, rowCount: 64, maxNgramSize: 3, headCount: 1,
+            headDimension: 4, padTokenID: 0, compressedVocabSize: 2, bucketStart: 11
+        )
+        let layout = try XCTUnwrap(try DeepSeekV41EngramLayout.make(specs: [spec])[1])
+        XCTAssertEqual(layout.bucketSizes, [11, 13])
+        XCTAssertEqual(layout.bucketOffsets, [0, 11])
+
+        let map = try DeepSeekV41EngramTokenMap.synthetic(
+            vocabSize: 8, compressedVocabSize: 2, padTokenID: 0
+        )
+        // `id % 2` maps 3, 5 and 7 all onto 1, so every look-back contributes its
+        // own multiplier and nothing else.
+        let ids = DeepSeekV41EngramHasher.hashIDs(
+            history: [Int32(3), Int32(5), Int32(7)], dead: [], tokenMap: map, layout: layout
+        )
+        XCTAssertEqual(ids.count, 2)
+        let bigram = layout.multipliers[0] ^ layout.multipliers[1]
+        let trigram = bigram ^ layout.multipliers[2]
+        XCTAssertEqual(ids[0], Int(bigram % 11))
+        XCTAssertEqual(ids[1], 11 + Int(trigram % 13))
+    }
+
+    /// Every look-back shares the running value, so the 3-gram hash is not a hash
+    /// of its own window: it extends the 2-gram. Recomputing each size from a
+    /// separate window is the mistake this pins.
+    func testLongerNgramsExtendTheShorterOnes() throws {
+        let spec = DeepSeekV41EngramSpec(
+            layer: 1, rowCount: 64, maxNgramSize: 3, headCount: 1,
+            headDimension: 4, padTokenID: 0, compressedVocabSize: 8, bucketStart: 11
+        )
+        let layout = try XCTUnwrap(try DeepSeekV41EngramLayout.make(specs: [spec])[1])
+        let map = try DeepSeekV41EngramTokenMap.synthetic(
+            vocabSize: 8, compressedVocabSize: 8, padTokenID: 0
+        )
+        let ids = DeepSeekV41EngramHasher.hashIDs(
+            history: [Int32(2), Int32(4), Int32(6)], dead: [], tokenMap: map, layout: layout
+        )
+        // 2-gram: 6*m0 ^ 4*m1, the current token and the one before it.
+        let bigram = Int64(6) * layout.multipliers[0] ^ Int64(4) * layout.multipliers[1]
+        XCTAssertEqual(ids[0], Int(bigram % 11))
+        // 3-gram: that value XOR 2*m2, exactly as the reference folds it in.
+        let trigram = bigram ^ Int64(2) * layout.multipliers[2]
+        XCTAssertEqual(ids[1], 11 + Int(trigram % 13))
+    }
+
+    /// Past the start of the sequence, and past a dead token, every look-back hashes
+    /// as the pad token. A dead token therefore cannot be spanned by an n-gram.
+    func testLookBackStopsAtTheSequenceStartAndAtDeadTokens() throws {
+        let spec = DeepSeekV41EngramSpec(
+            layer: 1, rowCount: 64, maxNgramSize: 3, headCount: 1,
+            headDimension: 4, padTokenID: 0, compressedVocabSize: 8, bucketStart: 11
+        )
+        let layout = try XCTUnwrap(try DeepSeekV41EngramLayout.make(specs: [spec])[1])
+        let map = try DeepSeekV41EngramTokenMap.synthetic(
+            vocabSize: 8, compressedVocabSize: 8, padTokenID: 0
+        )
+        // One token of history: the 3-gram's second and third look-backs are pad (0).
+        let short = DeepSeekV41EngramHasher.hashIDs(
+            history: [Int32(6)], dead: [], tokenMap: map, layout: layout
+        )
+        XCTAssertEqual(short[0], Int((Int64(6) * layout.multipliers[0]) % 11))
+        XCTAssertEqual(short[1], 11 + Int((Int64(6) * layout.multipliers[0]) % 13))
+
+        // A dead token at the previous position blocks the 3-gram's second look-back,
+        // so only the 2-gram contributes a real token.
+        let blocked = DeepSeekV41EngramHasher.hashIDs(
+            history: [Int32(2), Int32(4), Int32(6)],
+            dead: [false, true, false],
+            tokenMap: map,
+            layout: layout
+        )
+        XCTAssertEqual(blocked[0], Int((Int64(6) * layout.multipliers[0]) % 11))
+        XCTAssertEqual(
+            blocked[1],
+            11 + Int((Int64(6) * layout.multipliers[0]) % 13),
+            "a dead look-back must hash as pad, not skip to the token behind it"
         )
     }
 }
@@ -951,11 +1067,11 @@ final class DeepSeekV41EngramReaderTests: XCTestCase {
 
     func testReadsTheRowsTheLayoutAddresses() throws {
         let spec = spec()
-        let layout = try DeepSeekV41EngramLayout(spec: spec)
+        let layout = try XCTUnwrap(try DeepSeekV41EngramLayout.make(specs: [spec])[1])
         let url = try makeTable(rows: spec.rowCount, rowBytes: spec.rowBytes)
         defer { try? FileManager.default.removeItem(at: url) }
 
-        let map = try DeepSeekV41EngramTokenMap(
+        let map = try DeepSeekV41EngramTokenMap.synthetic(
             vocabSize: 128, compressedVocabSize: 64, padTokenID: 2
         )
         let requests = DeepSeekV41Engram.rowRequests(
@@ -1008,7 +1124,7 @@ final class DeepSeekV41EngramReaderTests: XCTestCase {
         defer { buffer.deallocate() }
         let row = 3
         let request = DeepSeekV41EngramRowRequest(
-            layer: 1, column: 0, bucket: 0,
+            layer: 1, column: 0, bucket: 0, row: row,
             byteOffset: row * spec.rowBytes, byteCount: spec.rowBytes
         )
         _ = try reader.readRows([request], into: buffer)
@@ -1037,7 +1153,7 @@ final class DeepSeekV41EngramReaderTests: XCTestCase {
         let buffer = UnsafeMutableRawPointer.allocate(byteCount: spec.rowBytes, alignment: 8)
         defer { buffer.deallocate() }
         let request = DeepSeekV41EngramRowRequest(
-            layer: 14, column: 0, bucket: 0, byteOffset: 0, byteCount: spec.rowBytes
+            layer: 14, column: 0, bucket: 0, row: 0, byteOffset: 0, byteCount: spec.rowBytes
         )
         XCTAssertThrowsError(try reader.readRows([request], into: buffer)) { error in
             XCTAssertEqual(
@@ -1056,7 +1172,7 @@ final class DeepSeekV41EngramReaderTests: XCTestCase {
         let buffer = UnsafeMutableRawPointer.allocate(byteCount: spec.rowBytes, alignment: 8)
         defer { buffer.deallocate() }
         let request = DeepSeekV41EngramRowRequest(
-            layer: 1, column: 0, bucket: 0,
+            layer: 1, column: 0, bucket: 0, row: 0,
             byteOffset: spec.totalBytes, byteCount: spec.rowBytes
         )
         XCTAssertThrowsError(try reader.readRows([request], into: buffer))
@@ -1346,7 +1462,7 @@ final class DeepSeekV41ConfigEdgeTests: XCTestCase {
 
     func testOutOfRangePadTokenIsRefusedInsteadOfTrapping() {
         XCTAssertThrowsError(
-            try DeepSeekV41EngramTokenMap(
+            try DeepSeekV41EngramTokenMap.synthetic(
                 vocabSize: 100, compressedVocabSize: 10, padTokenID: 100
             )
         )

@@ -1089,15 +1089,15 @@ final class DeepSeekV41EngramForwardTests: XCTestCase {
         let plan = try config.makeLayerPlan()
         let layer = try XCTUnwrap(plan.first { $0.engramTable != nil }).index
 
+        // The in-memory store doubles as the lookup: rows a test pins stand in for
+        // the ones the streaming lookup would pread.
+        let empty = weights(config: config, plan: plan, withRows: false)
+        let populated = weights(config: config, plan: plan, withRows: true)
         let withoutRows = DeepSeekV41CPUForward(
-            config: config,
-            plan: plan,
-            weights: weights(config: config, plan: plan, withRows: false)
+            config: config, plan: plan, weights: empty, engramLookup: empty
         )
         let withRows = DeepSeekV41CPUForward(
-            config: config,
-            plan: plan,
-            weights: weights(config: config, plan: plan, withRows: true)
+            config: config, plan: plan, weights: populated, engramLookup: populated
         )
 
         _ = withoutRows.forwardToken(3, position: 0)

@@ -247,3 +247,103 @@ nonisolated public final class DeepSeekV41EngramReader: @unchecked Sendable {
         return requests.count * rowBytes
     }
 }
+
+// MARK: - Lookup
+
+/// Where the forward gets one position's Engram rows.
+///
+/// The forward owns the token history and therefore the hash inputs; a lookup only
+/// turns "this layer, this position's history" into rows. The streaming
+/// implementation below reads them off disk, and the in-memory weight store answers
+/// from rows a test pinned, which is why the parameter is a protocol rather than a
+/// reader.
+nonisolated public protocol DeepSeekV41EngramLookup: AnyObject {
+    /// One row of `engram_head_dim` values per hash column, in column order, or nil
+    /// when `layer` has no table. The array MAY be shorter than the layer's column
+    /// count, and a missing column is zero-filled by the caller: the projection
+    /// reads a positional concatenation, so a gap has to occupy its slot.
+    func engramRows(layer: Int, history: [Int32], dead: [Bool]) throws -> [[Float]]?
+}
+
+/// Resolves Engram rows for the reference forward by preading the rows the hashes
+/// address and dequantizing them.
+///
+/// 24 rows of 264 bytes per Engram layer per token is ~6 KB, which is why the read
+/// is a batch: the whole layer's rows go out at once and the reader services them
+/// with queue depth instead of one seek at a time. A reference forward is not the
+/// hot path, so the batch buffer is allocated per call rather than pooled.
+nonisolated public final class DeepSeekV41EngramStreamingLookup: DeepSeekV41EngramLookup {
+
+    public let readers: [Int: DeepSeekV41EngramReader]
+    public let layouts: [Int: DeepSeekV41EngramLayout]
+    public let tokenMap: DeepSeekV41EngramTokenMap
+
+    public init(
+        readers: [Int: DeepSeekV41EngramReader],
+        layouts: [Int: DeepSeekV41EngramLayout],
+        tokenMap: DeepSeekV41EngramTokenMap
+    ) {
+        self.readers = readers
+        self.layouts = layouts
+        self.tokenMap = tokenMap
+    }
+
+    /// Builds the compressed token map from the checkpoint's own tokenizer, so the
+    /// n-grams hash the vocabulary the model trained on.
+    ///
+    /// Throws rather than falling back to a stand-in map: the compressed vocabulary
+    /// size feeds the hash multipliers, so a wrong map reads the wrong rows and
+    /// still produces finite output.
+    public static func make(
+        snapshotDir: URL,
+        config: DeepSeekV41Config,
+        readers: [Int: DeepSeekV41EngramReader],
+        layouts: [Int: DeepSeekV41EngramLayout]
+    ) throws -> DeepSeekV41EngramStreamingLookup {
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: snapshotDir.appendingPathComponent("tokenizer.json").path
+        )
+        let compiled = try tokenizer.buildEngramTokenMap(
+            expectedCompressedVocabSize: UInt32(clamping: config.engramCompressedVocabSize),
+            padTokenId: UInt32(clamping: config.engramPadTokenID)
+        )
+        let tokenMap = try DeepSeekV41EngramTokenMap(
+            lookup: compiled.lookup,
+            compressedVocabSize: Int(compiled.compressedVocabSize),
+            padID: compiled.padId
+        )
+        return DeepSeekV41EngramStreamingLookup(
+            readers: readers, layouts: layouts, tokenMap: tokenMap
+        )
+    }
+
+    public func engramRows(
+        layer: Int,
+        history: [Int32],
+        dead: [Bool]
+    ) throws -> [[Float]]? {
+        guard let reader = readers[layer], let layout = layouts[layer] else { return nil }
+        let requests = DeepSeekV41Engram.rowRequests(
+            layer: layer,
+            history: history,
+            dead: dead,
+            tokenMap: tokenMap,
+            layout: layout
+        )
+        guard !requests.isEmpty else { return nil }
+        let rowBytes = layout.spec.rowBytes
+        var raw = [UInt8](repeating: 0, count: requests.count * rowBytes)
+        try raw.withUnsafeMutableBytes { buffer in
+            guard let base = buffer.baseAddress else { return }
+            try reader.readRows(requests, into: base)
+        }
+        let headDimension = layout.spec.headDimension
+        return requests.indices.map { index in
+            let start = index * rowBytes
+            return DeepSeekV41EngramRowDequantizer.row(
+                Array(raw[start..<(start + rowBytes)]),
+                headDimension: headDimension
+            )
+        }
+    }
+}

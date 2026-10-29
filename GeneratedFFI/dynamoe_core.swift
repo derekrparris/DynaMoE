@@ -743,6 +743,25 @@ public func FfiConverterTypeDynaMoeEngine_lower(_ value: DynaMoeEngine) -> UInt6
 
 public protocol DynaMoeTokenizerProtocol: AnyObject, Sendable {
     
+    /**
+     * Builds DeepSeek-V4.1's Engram compressed token map: every token id mapped
+     * onto a smaller id space where tokens that normalize alike collapse, so
+     * " The", "the" and "THE" hash the same n-gram.
+     *
+     * This is the checkpoint's `build_compressed_token_map`
+     * (`inference/engram.py`) and it lives in Rust rather than in Swift because
+     * the function runs the `tokenizers` crate's own normalizer chain.
+     * Reimplementing NFKC / NFD / StripAccents / Lowercase over Foundation would
+     * drift on the Unicode edge cases and silently rehash every n-gram.
+     *
+     * `expected_compressed_vocab_size` is the checkpoint's
+     * `engram_compressed_vocab_size`. The reference asserts the map collapses to
+     * exactly that, and so does this: every hash multiplier is derived from that
+     * size, so a mismatch reads the wrong memory rows without failing. Passing 0
+     * skips the comparison, which only the probe uses.
+     */
+    func buildEngramTokenMap(expectedCompressedVocabSize: UInt32, padTokenId: UInt32) throws  -> EngramTokenMap
+    
     func decode(ids: [UInt32]) throws  -> String
     
     func encode(text: String) throws  -> [UInt32]
@@ -809,6 +828,34 @@ public convenience init(tokenizerPath: String)throws  {
 
     
 
+    
+    /**
+     * Builds DeepSeek-V4.1's Engram compressed token map: every token id mapped
+     * onto a smaller id space where tokens that normalize alike collapse, so
+     * " The", "the" and "THE" hash the same n-gram.
+     *
+     * This is the checkpoint's `build_compressed_token_map`
+     * (`inference/engram.py`) and it lives in Rust rather than in Swift because
+     * the function runs the `tokenizers` crate's own normalizer chain.
+     * Reimplementing NFKC / NFD / StripAccents / Lowercase over Foundation would
+     * drift on the Unicode edge cases and silently rehash every n-gram.
+     *
+     * `expected_compressed_vocab_size` is the checkpoint's
+     * `engram_compressed_vocab_size`. The reference asserts the map collapses to
+     * exactly that, and so does this: every hash multiplier is derived from that
+     * size, so a mismatch reads the wrong memory rows without failing. Passing 0
+     * skips the comparison, which only the probe uses.
+     */
+open func buildEngramTokenMap(expectedCompressedVocabSize: UInt32, padTokenId: UInt32)throws  -> EngramTokenMap  {
+    return try  FfiConverterTypeEngramTokenMap_lift(try rustCallWithError(FfiConverterTypeEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_dynamoe_core_fn_method_dynamoetokenizer_build_engram_token_map(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt32.lower(expectedCompressedVocabSize),
+        FfiConverterUInt32.lower(padTokenId),uniffiCallStatus
+    )
+})
+}
     
 open func decode(ids: [UInt32])throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeEngineError_lift) {
@@ -945,6 +992,71 @@ public func FfiConverterTypeDraftCandidateNode_lift(_ buf: RustBuffer) throws ->
 #endif
 public func FfiConverterTypeDraftCandidateNode_lower(_ value: DraftCandidateNode) -> RustBuffer {
     return FfiConverterTypeDraftCandidateNode.lower(value)
+}
+
+
+/**
+ * DeepSeek-V4.1's Engram compressed token map, as built from the tokenizer.
+ *
+ * `lookup[i]` is the compressed id of token `i`, `compressed_vocab_size` is the
+ * number of distinct keys, and `pad_id` is the compressed id of the checkpoint's
+ * `engram_pad_id` (n-gram slots with no history hash as that, matching training).
+ */
+public struct EngramTokenMap: Equatable, Hashable {
+    public var lookup: [UInt32]
+    public var compressedVocabSize: UInt32
+    public var padId: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(lookup: [UInt32], compressedVocabSize: UInt32, padId: UInt32) {
+        self.lookup = lookup
+        self.compressedVocabSize = compressedVocabSize
+        self.padId = padId
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension EngramTokenMap: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEngramTokenMap: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EngramTokenMap {
+        return
+            try EngramTokenMap(
+                lookup: FfiConverterSequenceUInt32.read(from: &buf), 
+                compressedVocabSize: FfiConverterUInt32.read(from: &buf), 
+                padId: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: EngramTokenMap, into buf: inout [UInt8]) {
+        FfiConverterSequenceUInt32.write(value.lookup, into: &buf)
+        FfiConverterUInt32.write(value.compressedVocabSize, into: &buf)
+        FfiConverterUInt32.write(value.padId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEngramTokenMap_lift(_ buf: RustBuffer) throws -> EngramTokenMap {
+    return try FfiConverterTypeEngramTokenMap.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEngramTokenMap_lower(_ value: EngramTokenMap) -> RustBuffer {
+    return FfiConverterTypeEngramTokenMap.lower(value)
 }
 
 
@@ -1846,6 +1958,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_dynamoe_core_checksum_method_dynamoeengine_get_summary() != 27679) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_dynamoe_core_checksum_method_dynamoetokenizer_build_engram_token_map() != 36555) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_dynamoe_core_checksum_method_dynamoetokenizer_decode() != 18999) {

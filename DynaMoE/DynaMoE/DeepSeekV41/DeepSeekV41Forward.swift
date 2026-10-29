@@ -111,12 +111,6 @@ nonisolated public struct DeepSeekV41Matrix: Sendable, Equatable {
 nonisolated public protocol DeepSeekV41WeightSource: AnyObject {
     func matrix(_ role: DeepSeekV41TensorRole, layer: Int?, expert: Int?) -> DeepSeekV41Matrix?
     func vector(_ role: DeepSeekV41TensorRole, layer: Int?) -> [Float]?
-    /// The row one Engram hash column addresses, or nil when the checkpoint/layer
-    /// has no Engram. Separated from `matrix` because those rows are streamed from
-    /// disk and never live in a buffer. There is one row per (n-gram size, head)
-    /// column, `engram_head_dim` wide, and the combination concatenates them in
-    /// column order (`EngramLayout.hashColumnCount` of them).
-    func engramRow(layer: Int, column: Int) -> [Float]?
 }
 
 public extension DeepSeekV41WeightSource {
@@ -127,10 +121,18 @@ public extension DeepSeekV41WeightSource {
 }
 
 /// In-memory weight store, keyed by `role|layer|expert` exactly like the catalog.
-nonisolated public final class DeepSeekV41DenseWeightSource: DeepSeekV41WeightSource {
+///
+/// It also answers Engram lookups from rows a test pins with `setEngramRow`, which
+/// is how the reference forward is exercised without a 100 GB table on disk. The
+/// real path is `DeepSeekV41EngramStreamingLookup`.
+nonisolated public final class DeepSeekV41DenseWeightSource: DeepSeekV41WeightSource,
+                                                            DeepSeekV41EngramLookup {
     private var matrices: [String: DeepSeekV41Matrix] = [:]
     private var vectors: [String: [Float]] = [:]
     private var engram: [String: [Float]] = [:]
+    /// Highest column index pinned per layer, so the lookup can report the shape
+    /// the caller pinned rather than the shape the config declares.
+    private var engramColumns: [Int: Int] = [:]
 
     public init() {}
 
@@ -148,6 +150,7 @@ nonisolated public final class DeepSeekV41DenseWeightSource: DeepSeekV41WeightSo
 
     public func setEngramRow(_ row: [Float], layer: Int, column: Int) {
         engram["\(layer)|\(column)"] = row
+        engramColumns[layer] = max(engramColumns[layer] ?? 0, column + 1)
     }
 
     public func matrix(_ role: DeepSeekV41TensorRole, layer: Int?, expert: Int?) -> DeepSeekV41Matrix? {
@@ -158,8 +161,9 @@ nonisolated public final class DeepSeekV41DenseWeightSource: DeepSeekV41WeightSo
         vectors[Self.key(role, layer: layer)]
     }
 
-    public func engramRow(layer: Int, column: Int) -> [Float]? {
-        engram["\(layer)|\(column)"]
+    public func engramRows(layer: Int, history: [Int32], dead: [Bool]) throws -> [[Float]]? {
+        guard let columns = engramColumns[layer], columns > 0 else { return nil }
+        return (0..<columns).map { engram["\(layer)|\($0)"] ?? [] }
     }
 }
 
@@ -466,11 +470,22 @@ nonisolated public final class DeepSeekV41CPUForward {
     /// value is written into the residual at the top of the layer, before
     /// attention; keeping the gate is what a probe run compares against.
     public private(set) var engramGates: [Int: [[Float]]] = [:]
+    /// Where this forward gets Engram rows. Nil leaves Engram layers skipped, which
+    /// is what a config without tables does anyway.
+    private let engramLookup: DeepSeekV41EngramLookup?
+    /// Token ids seen so far, oldest first: the n-gram hashes are built from them.
+    public private(set) var tokenHistory: [Int32] = []
+    /// Positions that take no part in an n-gram (image spans). Parallel to
+    /// `tokenHistory`; a lookup stops a look-back at the first dead token.
+    public private(set) var deadTokens: [Bool] = []
+    /// Set by `markNextTokenDead`, consumed by the next `forwardToken`.
+    private var pendingDead = false
 
     public init(
         config: DeepSeekV41Config,
         plan: [DeepSeekV41LayerPlan],
-        weights: DeepSeekV41WeightSource
+        weights: DeepSeekV41WeightSource,
+        engramLookup: DeepSeekV41EngramLookup? = nil
     ) {
         self.config = config
         self.plan = plan
@@ -482,6 +497,7 @@ nonisolated public final class DeepSeekV41CPUForward {
             precision: .fp16
         )
         self.weights = weights
+        self.engramLookup = engramLookup
         var queries: [DeepSeekV41RopeTable: [Float]] = [:]
         var latents: [DeepSeekV41RopeTable: [Float]] = [:]
         for layer in plan {
@@ -502,6 +518,8 @@ nonisolated public final class DeepSeekV41CPUForward {
         compressed = [:]
         candidateScores = []
         engramGates = [:]
+        tokenHistory = []
+        deadTokens = []
     }
 
     /// Embeds a token id, or zeros when the table is missing.
@@ -523,8 +541,20 @@ nonisolated public final class DeepSeekV41CPUForward {
         return []
     }
 
+    /// Marks the next position as taking no part in an n-gram, so an Engram lookup
+    /// never spans it. An image span sets this for every token it expands to.
+    public func markNextTokenDead() {
+        pendingDead = true
+    }
+
     /// Appends one position and returns the output logits.
     public func forwardToken(_ token: Int, position: Int) -> [Float] {
+        // The hash inputs are the token stream itself, so the history is kept here
+        // rather than recomputed by each Engram layer.
+        tokenHistory.append(Int32(truncatingIfNeeded: token))
+        deadTokens.append(pendingDead)
+        pendingDead = false
+
         var hidden = embed(token)
         let mult = max(1, config.hcMult)
         var streams = Array(repeating: hidden, count: mult)
@@ -873,25 +903,25 @@ nonisolated public final class DeepSeekV41CPUForward {
 
     /// Writes one position's Engram lookup into `streams`.
     ///
-    /// A column with no row is zero-filled rather than skipped: the concatenation
-    /// the projection reads is positional, so a missing row is a zero row in its
-    /// own slot, and dropping it would shift every later column.
+    /// The lookup does the hashing and the row IO; this only assembles what the
+    /// projection reads. A column with no row is zero-filled rather than skipped:
+    /// the concatenation is positional, so a missing row is a zero row in its own
+    /// slot, and dropping it would shift every later column.
     private func writeEngram(layer: Int, table: Int, streams: inout [[Float]]) {
+        guard let engramLookup else { return }
         let spec = config.engramTables[table]
         // `(max_ngram_size - 1) * n_heads` hash columns, one row each.
         let columns = max(1, spec.maxNgramSize - 1) * spec.headCount
-        var rows: [[Float]] = []
-        rows.reserveCapacity(columns)
-        var sawAny = false
-        for column in 0..<columns {
-            if let row = weights.engramRow(layer: layer, column: column) {
-                rows.append(row)
-                sawAny = true
-            } else {
-                rows.append([Float](repeating: 0, count: spec.headDimension))
-            }
+        guard let retrieved = try? engramLookup.engramRows(
+            layer: layer, history: tokenHistory, dead: deadTokens
+        ), !retrieved.isEmpty else { return }
+        var rows = retrieved
+        if rows.count < columns {
+            rows.append(contentsOf: Array(
+                repeating: [Float](repeating: 0, count: spec.headDimension),
+                count: columns - rows.count
+            ))
         }
-        guard sawAny else { return }
         guard let contribution = DeepSeekV41EngramCombination.contribution(
             residual: streams,
             rows: rows,

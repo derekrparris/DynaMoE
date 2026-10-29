@@ -141,12 +141,11 @@ nonisolated public final class DeepSeekV41DeviceWeights: @unchecked Sendable {
         // Engram tables are opened here so a truncated download fails at load rather
         // than mid-generation. They are never mapped: the reader preads single rows.
         var readers: [Int: DeepSeekV41EngramReader] = [:]
-        var layouts: [Int: DeepSeekV41EngramLayout] = [:]
+        // The primes are drawn once across every Engram layer, so the layouts are
+        // built together; one table in isolation would address the wrong rows.
+        let layouts = (try? DeepSeekV41EngramLayout.make(specs: config.engramTables)) ?? [:]
         if let snapshotDir {
             for spec in config.engramTables {
-                if let layout = try? DeepSeekV41EngramLayout(spec: spec) {
-                    layouts[spec.layer] = layout
-                }
                 guard let slot = catalog.tensor(.engramTable, layer: spec.layer),
                       let tensor = summary.tensors.first(where: { $0.name == slot.name }) else {
                     continue
