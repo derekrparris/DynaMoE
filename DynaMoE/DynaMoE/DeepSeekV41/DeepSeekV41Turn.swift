@@ -18,6 +18,9 @@
 //  type stays `nonisolated` and can be tested without a model, a tokenizer or a GPU:
 //
 //    * `sample` draws one token from a position's logits,
+//    * `constrain` may rewrite a position's logits in place before `sample` draws
+//      from them, which is where a grammar mask belongs,
+//    * `shouldFreeze` ends the turn the moment its text completes a tool call,
 //    * `decode` turns ids into text (the UI re-decodes the whole sequence each step
 //      so a multi-byte character split across tokens is never frozen half-formed),
 //    * `onText` receives the accumulated text for a streaming frame,
@@ -25,8 +28,9 @@
 //
 //  Stop conditions are the ones that actually terminate a turn here: EOS, the
 //  per-turn token cap, the checkpoint's context limit, a caller-supplied stop
-//  sequence, and the degenerate-cycle guard. The chat UI's reasoning split and tool
-//  parsing happen in the caller, on the text this loop produces.
+//  sequence, the tool-call freeze, and the degenerate-cycle guard. The chat UI's
+//  reasoning split and the parsing of whatever tool call was frozen happen in the
+//  caller, on the text this loop produces.
 //
 
 import Foundation
@@ -157,6 +161,14 @@ nonisolated public enum DeepSeekV41TurnRunner {
     ///     position 0.
     ///   - settings: sampling and the turn's stop conditions.
     ///   - sample: draws one id from a position's logits.
+    ///   - constrain: rewrites a position's logits in place before `sample` sees
+    ///     them, along with the text decoded so far (the state a grammar mask is
+    ///     driven from). Masked tokens are set to `-inf`, so the rewrite is
+    ///     destructive: the loop hands over its own copy and never reads those
+    ///     logits again once a token is drawn.
+    ///   - shouldFreeze: `(text so far) -> the text completes a tool call`. Called
+    ///     after each appended token, so generation stops on the token that closes
+    ///     the call instead of running on into invented post-call prose.
     ///   - decode: decodes the whole generated sequence so far.
     ///   - onPrefill: `(positions done, positions total)`, once per position.
     ///   - onText: `(text so far, tokens generated, elapsed seconds)` at most once
@@ -168,6 +180,8 @@ nonisolated public enum DeepSeekV41TurnRunner {
         prefixTokens: Int = 0,
         settings: Settings,
         sample: ([Float], [UInt32]) -> UInt32,
+        constrain: (inout [Float], String) -> Void = { _, _ in },
+        shouldFreeze: (String) -> Bool = { _ in false },
         decode: ([UInt32]) -> String,
         onPrefill: (Int, Int) -> Void = { _, _ in },
         onText: (String, Int, Double) -> Void = { _, _, _ in },
@@ -235,6 +249,10 @@ nonisolated public enum DeepSeekV41TurnRunner {
                 cancelled = true
                 break
             }
+            // The mask is applied to the loop's own logits, immediately before the
+            // draw: a stale mask (a superseded generation) leaves them untouched,
+            // and no token is ever sampled from the pre-mask values.
+            constrain(&logits, text)
             let next = sample(logits, generated)
             if settings.eosTokenIds.contains(next) {
                 finishReason = .eos
@@ -254,6 +272,13 @@ nonisolated public enum DeepSeekV41TurnRunner {
             if let sequence = settings.stopSequences.first(where: { !$0.isEmpty && text.contains($0) }) {
                 finishReason = .stoppedBySequence
                 matchedStopSequence = sequence
+                break
+            }
+            // Pre-execution catching: the token that closes a tool call is the last
+            // one this turn needs. Stopping here is what keeps the model from
+            // inventing the result of a call that has not run yet.
+            if shouldFreeze(text) {
+                finishReason = .toolFreeze
                 break
             }
             if TurnTextSplitter.detectDegenerateCycle(

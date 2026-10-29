@@ -433,6 +433,11 @@ public final class CompletionEngine: @unchecked Sendable {
                     )
                 }
 
+                // Same ordering as the generic loop: KV reset (in the turn loop) ->
+                // grammar token -> turn id. A superseded turn still holds its old
+                // token, so its late mask writes are dropped instead of corrupting
+                // this turn's required-parameter gate.
+                let deepSeekGrammarToken = GrammarConstrainedSampler.shared.beginGeneration()
                 stateLock.lock()
                 generationCounter &+= 1
                 let myGenerationId = generationCounter
@@ -468,6 +473,19 @@ public final class CompletionEngine: @unchecked Sendable {
                 let dsSessionId = request.sessionId
                 let dsAsOfDate = request.asOfDate
                 let dsEosIDs = dsConfig.eosTokenIDs.map { UInt32(clamping: $0) }
+                // Agent turns get the same two guards the generic loop installs: a
+                // grammar mask that makes a malformed tool call unsamplable, and the
+                // mid-stream freeze that stops generation on the token which closes
+                // the call. Both are the app-wide, Qwen-shaped components, so they
+                // only act once this checkpoint's tool dialect is understood;
+                // installed and idle is the intended state until then, because a
+                // mask keyed on markers the model never emits cannot corrupt it.
+                let dsRunAgentTools = request.agentToolsEnabled && !request.forceSynthesis
+                let dsGrammarMaskActive = dsRunAgentTools
+                    && (UserDefaults.standard.object(forKey: "dynamoe_agent_grammar_masking") == nil
+                        ? true
+                        : UserDefaults.standard.bool(forKey: "dynamoe_agent_grammar_masking"))
+                    && !UserDefaults.standard.bool(forKey: "dynamoe_disable_grammar")
                 let (stream, continuation) = AsyncStream.makeStream(
                     of: CompletionEvent.self, bufferingPolicy: .unbounded
                 )
@@ -518,6 +536,28 @@ public final class CompletionEngine: @unchecked Sendable {
                                         eosTokenIds: dsEosIDs
                                     )
                                 }
+                            },
+                            constrain: { logits, emittedText in
+                                guard dsGrammarMaskActive else { return }
+                                logits.withUnsafeMutableBufferPointer { buffer in
+                                    guard let base = buffer.baseAddress else { return }
+                                    GrammarConstrainedSampler.shared.updateStateAndApplyLogitMask(
+                                        emittedText: emittedText,
+                                        logits: base,
+                                        vocabSize: buffer.count,
+                                        tokenDecoder: { try? dsTokenizer.decode(ids: [$0]) },
+                                        enforceStructuralTagContinuation: true,
+                                        token: deepSeekGrammarToken
+                                    )
+                                }
+                            },
+                            shouldFreeze: { text in
+                                guard dsRunAgentTools else { return false }
+                                return StreamingToolParser.shared.shouldFreezeGeneration(
+                                    accumulatedText: text,
+                                    deltaText: "",
+                                    format: ToolCallFormat.forModel(isGemma4: false)
+                                )
                             },
                             decode: { ids in
                                 (try? dsTokenizer.decode(ids: ids)) ?? ""

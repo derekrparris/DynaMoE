@@ -341,4 +341,89 @@ final class DeepSeekV41TurnLoopTests: XCTestCase {
         XCTAssertTrue(forward.resumedPrefixes.isEmpty)
         XCTAssertEqual(forward.forwardedPositions, [0, 1])
     }
+
+    // MARK: Agent constraints
+
+    /// The mask is driven from the text decoded so far, and it is applied before
+    /// each draw rather than once per turn: a grammar state machine advances one
+    /// token at a time, so a mask computed from stale text either withholds a legal
+    /// tag or offers an illegal one.
+    func testTheConstrainHookSeesTheTextBeforeEveryDraw() throws {
+        let forward = ScriptedForward(positionLimit: 64, scripted: [7])
+        var seen: [String] = []
+        let output = try DeepSeekV41TurnRunner.run(
+            forward: forward,
+            promptTokenIds: [10],
+            settings: settings(maxTokens: 3),
+            sample: { _, _ in 7 },
+            constrain: { _, text in seen.append(text) },
+            decode: { $0.map(String.init).joined(separator: " ") }
+        )
+        // Nothing was decoded before the first draw, and prefill draws nothing.
+        XCTAssertEqual(seen, ["", "7", "7 7"])
+        XCTAssertEqual(output.tokensGenerated, 3)
+    }
+
+    /// The rewrite lands where the sampler reads it. The fake answers `[0, 1, 2, 3]`
+    /// and the sampler takes the highest standing logit, so the drawn id follows
+    /// whatever the constraint masks — a copy the mask never reached would keep
+    /// drawing 3.
+    func testAConstraintDecidesTheDrawnToken() throws {
+        let forward = ScriptedForward(positionLimit: 64, scripted: [])
+        let output = try DeepSeekV41TurnRunner.run(
+            forward: forward,
+            promptTokenIds: [10],
+            settings: settings(maxTokens: 2, eos: []),
+            sample: { logits, _ in
+                var best: (index: UInt32, value: Float) = (0, -.infinity)
+                for (index, value) in logits.enumerated() where value > best.value {
+                    best = (UInt32(index), value)
+                }
+                return best.index
+            },
+            constrain: { logits, text in
+                if !text.isEmpty { logits[3] = -.infinity }
+            },
+            decode: { $0.map(String.init).joined(separator: " ") }
+        )
+        XCTAssertEqual(output.generatedTokenIds, [3, 2])
+    }
+
+    /// Pre-execution catching: the turn ends on the token that completes the call,
+    /// so the model never writes the result of a call that has not run.
+    func testAFrozenToolCallEndsTheTurn() throws {
+        let forward = ScriptedForward(positionLimit: 64, scripted: [5])
+        var frozenAt: [String] = []
+        let output = try DeepSeekV41TurnRunner.run(
+            forward: forward,
+            promptTokenIds: [10],
+            settings: settings(maxTokens: 16),
+            sample: { _, _ in 5 },
+            shouldFreeze: { text in
+                frozenAt.append(text)
+                return text == "5 5"
+            },
+            decode: { $0.map(String.init).joined(separator: " ") }
+        )
+        XCTAssertEqual(output.finishReason, .toolFreeze)
+        XCTAssertEqual(output.tokensGenerated, 2)
+        XCTAssertEqual(output.text, "5 5")
+        XCTAssertEqual(frozenAt, ["5", "5 5"])
+    }
+
+    /// A freeze and the token cap can land on the same token. The freeze is the
+    /// true reason and is what the caller acts on, so it wins.
+    func testAFreezeOnTheLastAllowedTokenIsReportedAsAFreeze() throws {
+        let forward = ScriptedForward(positionLimit: 64, scripted: [5])
+        let output = try DeepSeekV41TurnRunner.run(
+            forward: forward,
+            promptTokenIds: [10],
+            settings: settings(maxTokens: 1),
+            sample: { _, _ in 5 },
+            shouldFreeze: { !$0.isEmpty },
+            decode: { $0.map(String.init).joined(separator: " ") }
+        )
+        XCTAssertEqual(output.finishReason, .toolFreeze)
+        XCTAssertEqual(output.tokensGenerated, 1)
+    }
 }
