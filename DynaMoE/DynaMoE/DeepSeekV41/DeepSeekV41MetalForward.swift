@@ -38,6 +38,14 @@
 //      mixes them wrongly, which looks like "the memory model does nothing". It
 //      therefore reports rather than guesses.
 //
+//  Synchronization follows from that: the only point in a token where the CPU has
+//  to see device output is the routing readback, so a layer commits its back half
+//  and moves on. One command queue runs buffers in commit order, so the next
+//  layer's front half is ordered behind the previous layer's experts without a
+//  wait of its own; `settlePending` catches up, and surfaces any failure, at each
+//  readback and at the end of the token. Waiting on every buffer instead makes the
+//  host the bottleneck at two stalls per layer.
+//
 
 import Foundation
 import Metal
@@ -454,6 +462,9 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
     private let swigluLimit: Float
     private let gatherRows: Int
     private let contextLength: Int
+    /// Committed command buffers whose results the host has not needed yet. Drained
+    /// by `settlePending` at every readback and at the end of a token.
+    private var pending: [(buffer: MTLCommandBuffer, stage: String)] = []
 
     public init(runtime: DeepSeekV41Runtime, shardBuffers: [UInt32: MTLBuffer]) {
         self.config = runtime.config
@@ -649,6 +660,9 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             try runLayer(layer, at: position)
         }
         try finishBlock()
+        // Every buffer committed by this token, including the deferred experts
+        // halves and the output head, has to be complete before the logits are read.
+        try settlePending()
 
         var logits = [Float](repeating: 0, count: config.vocabSize)
         let count = min(config.vocabSize, workspace.logits.length / MemoryLayout<Float>.stride)
@@ -717,7 +731,9 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             writeScales: nil
         )
         encoder.endEncoding()
-        try commit(commandBuffer, stage: "embedding")
+        // Nothing reads the embedding on the host, so this does not wait: the first
+        // layer's front half is ordered behind it on the same queue.
+        try commit(commandBuffer, stage: "embedding", waiting: false)
     }
 
     /// The block's output: collapse the streams, final norm, head.
@@ -749,7 +765,8 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             output: workspace.logits
         )
         encoder.endEncoding()
-        try commit(commandBuffer, stage: "output head")
+        // The caller reads the logits, so this is where the token's queue catches up.
+        try commit(commandBuffer, stage: "output head", waiting: false)
     }
 
     // MARK: One layer
@@ -767,6 +784,7 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             )
         }
         encoder.endEncoding()
+        // The routing readback below needs this half finished on the host.
         try commit(commandBuffer, stage: "layer \(layer.index) attention")
 
         // The mixture binds per-expert byte offsets, which are host values.
@@ -784,7 +802,9 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             )
         }
         expertEncoder.endEncoding()
-        try commit(expertCommand, stage: "layer \(layer.index) experts")
+        // No readback of this half exists, so it is only ordered: the next layer's
+        // front half commits behind it on the same queue.
+        try commit(expertCommand, stage: "layer \(layer.index) experts", waiting: false)
     }
 
     /// Every stage the shared pipeline lists. Exhaustive on purpose: a stage added
@@ -1449,11 +1469,28 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         return encoder
     }
 
-    private func commit(_ commandBuffer: MTLCommandBuffer, stage: String) throws {
+    private func commit(_ commandBuffer: MTLCommandBuffer, stage: String, waiting: Bool = true) throws {
         commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        if let error = commandBuffer.error {
-            throw DeepSeekV41EngineError.commandFailed("\(stage): \(error)")
+        // Held until it completes: the queue keeps a committed buffer alive, but ARC
+        // would drop our reference and with it the error still to be reported.
+        pending.append((buffer: commandBuffer, stage: stage))
+        guard waiting else { return }
+        try settlePending()
+    }
+
+    /// Waits for every buffer committed so far and reports the first failure.
+    ///
+    /// The queue is in-order, so the last buffer completing means the earlier ones
+    /// did and their waits return immediately. Called wherever the host reads device
+    /// memory (routing, logits).
+    private func settlePending() throws {
+        let outstanding = pending
+        pending.removeAll(keepingCapacity: true)
+        for entry in outstanding {
+            entry.buffer.waitUntilCompleted()
+            if let error = entry.buffer.error {
+                throw DeepSeekV41EngineError.commandFailed("\(entry.stage): \(error)")
+            }
         }
     }
 
