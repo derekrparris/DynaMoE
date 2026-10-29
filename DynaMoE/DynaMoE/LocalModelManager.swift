@@ -280,8 +280,19 @@ public class LocalModelManager: ObservableObject {
 
         var weightsEntryPath: String? = nil
 
-        if fileManager.fileExists(atPath: flashMoeJson) {
+        // The packed form wins only when it is COMPLETE. A directory can hold both
+        // an untouched safetensors checkpoint and the leftovers of an interrupted
+        // repack; preferring the packed files there loads a model whose expert layer
+        // files are empty or truncated, which reads past the end of a mapping instead
+        // of failing. `isPackedFormat` checks the layer files, so that state falls
+        // back to the checkpoint.
+        let packedIsComplete = ExpertRepacker.isPackedFormat(dir: dirUrl)
+
+        if packedIsComplete {
             weightsEntryPath = flashMoeJson
+        } else if fileManager.fileExists(atPath: flashMoeJson) {
+            print("⚠️ [Discovery] Ignoring \(flashMoeJson): the packed expert files are missing or incomplete, so the safetensors checkpoint is used instead.")
+            weightsEntryPath = fileManager.fileExists(atPath: indexPath) ? indexPath : flashMoeBin
         } else if fileManager.fileExists(atPath: flashMoeBin) {
             weightsEntryPath = flashMoeBin
         } else if fileManager.fileExists(atPath: indexPath) {

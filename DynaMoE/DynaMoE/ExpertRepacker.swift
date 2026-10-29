@@ -81,7 +81,35 @@ public final class ExpertRepacker {
               !layout.components.isEmpty else {
             return false
         }
-        return true
+
+        // Completeness, because an interrupted repack is worse than no repack.
+        //
+        // The loader indexes every expert at `expert * expert_size` inside its
+        // layer file, so a zero-length or truncated layer is read at offsets the
+        // file does not have. That does not fail loudly: it either feeds the GPU
+        // weights from past the end of a mapping, or stalls the load while a
+        // multi-gigabyte file is faulted for nothing. Falling back to the
+        // safetensors index is always correct and merely slower, so an incomplete
+        // pack must not claim to be loadable. This is the exact shape of a real
+        // failure: a repack killed mid-layer left `layer_00.bin` at 0 bytes next to
+        // 111 GB of finished layers, and the app preferred the packed model over the
+        // untouched checkpoint.
+        let expectedLayerBytes = UInt64(max(0, layout.num_experts)) * layout.expert_size
+        let contents = (try? FileManager.default.contentsOfDirectory(atPath: packedDir.path)) ?? []
+        var layerFiles = 0
+        for name in contents where name.hasPrefix("layer_") && name.hasSuffix(".bin") {
+            guard let attrs = try? FileManager.default.attributesOfItem(
+                      atPath: packedDir.appendingPathComponent(name).path
+                  ),
+                  let size = attrs[.size] as? UInt64, size > 0 else {
+                return false
+            }
+            if expectedLayerBytes > 0, size < expectedLayerBytes {
+                return false
+            }
+            layerFiles += 1
+        }
+        return layerFiles > 0
     }
 
     /// Fast repacking of a Safetensors HuggingFace snapshot into FlashMoE packed binary format
