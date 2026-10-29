@@ -63,8 +63,26 @@ nonisolated public enum DeepSeekV41TurnError: Error, CustomStringConvertible {
 nonisolated public protocol DeepSeekV41PositionForward: AnyObject {
     /// Positions the cache was provisioned for.
     var positionLimit: Int { get }
+    /// Positions the sequence already holds, or 0 when the cache is empty.
+    var storedPositions: Int { get }
+    /// How much of `promptTokenIds` this executor can actually skip.
+    ///
+    /// The caller's `proposedPrefix` comes from the app-wide prefix pin, which knows
+    /// the conversation but not what this cache holds. Only the executor can answer:
+    /// the resident sequence may be shorter than the pin, or be a different
+    /// conversation's entirely, and resuming one of those mixes two sequences inside
+    /// an n-gram with no error anywhere. Zero means "prefill the prompt in full".
+    func reusablePrefix(proposedPrefix: Int, promptTokenIds: [Int]) -> Int
     /// Drops the sequence so the next forward starts at position 0.
     func reset()
+    /// Keeps the resident sequence and the token history that produced it, so the
+    /// next `forwardToken` may continue at `prefixTokenIds.count`.
+    ///
+    /// Refuses rather than rebuilds. The history an n-gram hashes over includes
+    /// flags a replay cannot invent (an image span takes no part in one), so the
+    /// executor is asked to keep the state it has: an idle cache or a history that
+    /// does not spell out these tokens is an error, not something to guess at.
+    func resume(prefixTokenIds: [Int]) throws
     /// Appends one position and returns its logits.
     func forwardToken(_ token: Int, position: Int) throws -> [Float]
 }
@@ -118,6 +136,9 @@ nonisolated public enum DeepSeekV41TurnRunner {
         var matchedStopSequence: String?
         var tokensGenerated: Int
         var promptTokens: Int
+        /// Prompt positions this turn did not have to run because the cache already
+        /// held them.
+        var prefixTokensReused: Int
         var prefillSeconds: Double
         var decodeSeconds: Double
         var tokensPerSecond: Double
@@ -128,9 +149,12 @@ nonisolated public enum DeepSeekV41TurnRunner {
     /// Runs one turn.
     ///
     /// - Parameters:
-    ///   - forward: the executor for the loaded checkpoint. Its cache is reset here,
-    ///     so a turn always starts at position 0.
+    ///   - forward: the executor for the loaded checkpoint. Its cache is reset here
+    ///     unless `prefixTokens` says part of this prompt is already resident.
     ///   - promptTokenIds: the rendered prompt, already tokenized.
+    ///   - prefixTokens: leading prompt positions the cache already holds, from
+    ///     `DeepSeekV41CacheAddressing.reusablePrefix`. Zero means a turn from
+    ///     position 0.
     ///   - settings: sampling and the turn's stop conditions.
     ///   - sample: draws one id from a position's logits.
     ///   - decode: decodes the whole generated sequence so far.
@@ -141,6 +165,7 @@ nonisolated public enum DeepSeekV41TurnRunner {
     static func run(
         forward: any DeepSeekV41PositionForward,
         promptTokenIds: [UInt32],
+        prefixTokens: Int = 0,
         settings: Settings,
         sample: ([Float], [UInt32]) -> UInt32,
         decode: ([UInt32]) -> String,
@@ -156,30 +181,39 @@ nonisolated public enum DeepSeekV41TurnRunner {
             )
         }
 
-        // A turn owns the cache from position 0. `reset` also drops any partial
-        // compressor group, which is what keeps a cancelled turn from leaking a
-        // half-filled block into the next one.
-        forward.reset()
+        // A turn starts at position 0 unless the caller says a prefix of this prompt
+        // is already resident. `reset` also drops any partial compressor group, which
+        // is what keeps a cancelled turn from leaking a half-filled block into the
+        // next one; a resumed turn must not reset, because the half-filled group is
+        // this sequence's own and the skip is what the cache was kept for.
+        let resumeFrom = max(0, min(prefixTokens, promptTokenIds.count - 1))
+        if resumeFrom > 0 {
+            try forward.resume(prefixTokenIds: promptTokenIds.prefix(resumeFrom).map { Int($0) })
+        } else {
+            forward.reset()
+        }
 
         // MARK: Prefill
         let prefillStart = CFAbsoluteTimeGetCurrent()
+        let newPositions = promptTokenIds.count - resumeFrom
         var logits: [Float] = []
-        for (offset, token) in promptTokenIds.enumerated() {
+        for offset in resumeFrom..<promptTokenIds.count {
             if isCancelled() {
                 return cancelledOutput(
                     generated: [], text: "", promptTokens: promptTokenIds.count,
+                    prefixTokensReused: resumeFrom,
                     prefillSeconds: CFAbsoluteTimeGetCurrent() - prefillStart,
                     decodeSeconds: 0, firstToken: nil
                 )
             }
             do {
-                logits = try forward.forwardToken(Int(token), position: offset)
+                logits = try forward.forwardToken(Int(promptTokenIds[offset]), position: offset)
             } catch {
                 throw DeepSeekV41TurnError.prefillFailed(
                     position: offset, underlying: "\(error)"
                 )
             }
-            onPrefill(offset + 1, promptTokenIds.count)
+            onPrefill(offset + 1 - resumeFrom, newPositions)
         }
         let prefillSeconds = CFAbsoluteTimeGetCurrent() - prefillStart
 
@@ -259,6 +293,7 @@ nonisolated public enum DeepSeekV41TurnRunner {
             matchedStopSequence: matchedStopSequence,
             tokensGenerated: generated.count,
             promptTokens: promptTokenIds.count,
+            prefixTokensReused: resumeFrom,
             prefillSeconds: prefillSeconds,
             decodeSeconds: decodeSeconds,
             tokensPerSecond: decodeSeconds > 0 ? Double(generated.count) / decodeSeconds : 0,
@@ -271,6 +306,7 @@ nonisolated public enum DeepSeekV41TurnRunner {
         generated: [UInt32],
         text: String,
         promptTokens: Int,
+        prefixTokensReused: Int,
         prefillSeconds: Double,
         decodeSeconds: Double,
         firstToken: Double?
@@ -282,6 +318,7 @@ nonisolated public enum DeepSeekV41TurnRunner {
             matchedStopSequence: nil,
             tokensGenerated: generated.count,
             promptTokens: promptTokens,
+            prefixTokensReused: prefixTokensReused,
             prefillSeconds: prefillSeconds,
             decodeSeconds: decodeSeconds,
             tokensPerSecond: 0,

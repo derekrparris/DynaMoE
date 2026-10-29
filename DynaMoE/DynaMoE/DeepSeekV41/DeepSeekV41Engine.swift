@@ -280,6 +280,8 @@ nonisolated public enum DeepSeekV41EngineError: Error, CustomStringConvertible {
     case unsupportedDtype(String, String)
     case contextTooLong(Int, Int)
     case outOfOrderPosition(Int, Int)
+    /// A resumed turn found resident state that is not this prompt's.
+    case prefixStateMismatch(position: Int)
     case unsupportedStage(String)
     case commandFailed(String)
 
@@ -301,6 +303,8 @@ nonisolated public enum DeepSeekV41EngineError: Error, CustomStringConvertible {
             return "DeepSeek V4.1 turn needs \(requested) positions but the cache was provisioned for \(maximum)"
         case let .outOfOrderPosition(requested, stored):
             return "DeepSeek V4.1 forward was asked for position \(requested) while the cache holds \(stored)"
+        case .prefixStateMismatch(let position):
+            return "DeepSeek V4.1 cannot continue the cached sequence: its token history diverges at position \(position)"
         case .unsupportedStage(let stage):
             return "DeepSeek V4.1 stage '\(stage)' has no device implementation"
         case .commandFailed(let detail):

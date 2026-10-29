@@ -25,6 +25,10 @@ private final class ScriptedForward: DeepSeekV41PositionForward, @unchecked Send
     private(set) var forwardedTokens: [Int] = []
     private(set) var forwardedPositions: [Int] = []
     private(set) var resetCount = 0
+    /// The sequence the fake claims is already resident. A resumed turn that names a
+    /// different one is refused, the way the device executor refuses it.
+    private(set) var residentTokens: [Int] = []
+    private(set) var resumedPrefixes: [[Int]] = []
     /// Setting this makes the fake fail at a chosen position, so the loop's error
     /// path is exercised without a GPU.
     var failAtPosition: Int?
@@ -32,13 +36,44 @@ private final class ScriptedForward: DeepSeekV41PositionForward, @unchecked Send
     /// (it ends the turn as length-capped), so the two are exercised separately.
     var failure: DeepSeekV41EngineError = .missingTensor("test")
 
-    init(positionLimit: Int, scripted: [UInt32]) {
+    init(positionLimit: Int, scripted: [UInt32], resident: [Int] = []) {
         self.positionLimit = positionLimit
         self.scripted = scripted
+        self.residentTokens = resident
+    }
+
+    var storedPositions: Int { residentTokens.count }
+
+    func reusablePrefix(proposedPrefix: Int, promptTokenIds: [Int]) -> Int {
+        let stored = residentTokens.count
+        guard stored > 0, stored <= promptTokenIds.count - 1 else { return 0 }
+        let cut = min(proposedPrefix, stored)
+        guard cut > 0 else { return 0 }
+        guard Array(promptTokenIds.prefix(cut)) == Array(residentTokens.prefix(cut)) else {
+            return 0
+        }
+        return cut
     }
 
     func reset() {
         resetCount += 1
+        forwardedTokens = []
+        forwardedPositions = []
+        residentTokens = []
+    }
+
+    func resume(prefixTokenIds: [Int]) throws {
+        guard prefixTokenIds.count == residentTokens.count else {
+            throw DeepSeekV41EngineError.outOfOrderPosition(
+                prefixTokenIds.count, residentTokens.count
+            )
+        }
+        if let divergence = zip(prefixTokenIds, residentTokens)
+            .enumerated()
+            .first(where: { $0.element.0 != $0.element.1 })?.offset {
+            throw DeepSeekV41EngineError.prefixStateMismatch(position: divergence)
+        }
+        resumedPrefixes.append(prefixTokenIds)
         forwardedTokens = []
         forwardedPositions = []
     }
@@ -49,6 +84,7 @@ private final class ScriptedForward: DeepSeekV41PositionForward, @unchecked Send
         }
         forwardedTokens.append(token)
         forwardedPositions.append(position)
+        residentTokens.append(token)
         // One logit per scripted token; the loop's sampler is the injectable, so the
         // values only need a length the caller can read.
         return [0, 1, 2, 3]
@@ -77,14 +113,17 @@ final class DeepSeekV41TurnLoopTests: XCTestCase {
     private func run(
         forward: ScriptedForward,
         prompt: [UInt32],
+        prefixTokens: Int = 0,
         settings: DeepSeekV41TurnRunner.Settings,
         decode: @escaping ([UInt32]) -> String = { $0.map(String.init).joined(separator: " ") },
+        prefill: @escaping (Int, Int) -> Void = { _, _ in },
         cancelled: @escaping () -> Bool = { false }
     ) throws -> DeepSeekV41TurnRunner.Output {
         var cursor = 0
         return try DeepSeekV41TurnRunner.run(
             forward: forward,
             promptTokenIds: prompt,
+            prefixTokens: prefixTokens,
             settings: settings,
             sample: { _, _ in
                 let value = forward.scripted[min(cursor, forward.scripted.count - 1)]
@@ -92,6 +131,7 @@ final class DeepSeekV41TurnLoopTests: XCTestCase {
                 return value
             },
             decode: decode,
+            onPrefill: prefill,
             isCancelled: cancelled
         )
     }
@@ -226,5 +266,79 @@ final class DeepSeekV41TurnLoopTests: XCTestCase {
             }
             XCTAssertEqual(position, 2)
         }
+    }
+
+    // MARK: Prefix reuse
+
+    /// A resident prefix is continued, not replayed: the turn forwards only the
+    /// prompt positions after it, and the cache is left alone.
+    func testAResidentPrefixIsSkippedRatherThanReplayed() throws {
+        let forward = ScriptedForward(
+            positionLimit: 64, scripted: [2], resident: [10, 11]
+        )
+        var progress: [(done: Int, total: Int)] = []
+        let output = try run(
+            forward: forward,
+            prompt: [10, 11, 12, 13],
+            prefixTokens: 2,
+            settings: settings(maxTokens: 4),
+            prefill: { progress.append(($0, $1)) }
+        )
+        XCTAssertEqual(forward.forwardedTokens, [12, 13])
+        XCTAssertEqual(forward.forwardedPositions, [2, 3])
+        XCTAssertEqual(forward.resumedPrefixes, [[10, 11]])
+        XCTAssertEqual(forward.resetCount, 0, "a resumed turn must not drop the cache")
+        XCTAssertEqual(output.prefixTokensReused, 2)
+        // Progress counts the positions this turn actually runs.
+        XCTAssertEqual(progress.map(\.total), [2, 2])
+        XCTAssertEqual(progress.map(\.done), [1, 2])
+        XCTAssertEqual(output.promptTokens, 4)
+    }
+
+    /// The last prompt token is never skipped: its logits are what the first sampled
+    /// token comes from, so a caller asking for more than the cache can give has the
+    /// request cut back rather than the logits invented.
+    func testAPrefixCannotCoverTheLastPromptToken() throws {
+        let forward = ScriptedForward(
+            positionLimit: 64, scripted: [2], resident: [10]
+        )
+        let output = try run(
+            forward: forward,
+            prompt: [10, 11],
+            prefixTokens: 9,
+            settings: settings(maxTokens: 4)
+        )
+        XCTAssertEqual(forward.forwardedTokens, [11])
+        XCTAssertEqual(forward.forwardedPositions, [1])
+        XCTAssertEqual(output.prefixTokensReused, 1)
+    }
+
+    /// The executor decides whether the state it holds really is this prompt's. The
+    /// loop asks and fails rather than decoding from another conversation's state.
+    func testAPrefixTheExecutorDoesNotHoldFailsTheTurn() {
+        let forward = ScriptedForward(
+            positionLimit: 64, scripted: [2], resident: [10, 99]
+        )
+        XCTAssertThrowsError(
+            try run(
+                forward: forward,
+                prompt: [10, 11, 12],
+                prefixTokens: 2,
+                settings: settings(maxTokens: 4)
+            )
+        ) { error in
+            guard case DeepSeekV41EngineError.prefixStateMismatch(let position) = error else {
+                return XCTFail("expected prefixStateMismatch, got \(error)")
+            }
+            XCTAssertEqual(position, 1)
+        }
+    }
+
+    func testNoPrefixResetsTheSequence() throws {
+        let forward = ScriptedForward(positionLimit: 64, scripted: [2], resident: [10])
+        _ = try run(forward: forward, prompt: [10, 11], settings: settings(maxTokens: 4))
+        XCTAssertEqual(forward.resetCount, 1)
+        XCTAssertTrue(forward.resumedPrefixes.isEmpty)
+        XCTAssertEqual(forward.forwardedPositions, [0, 1])
     }
 }

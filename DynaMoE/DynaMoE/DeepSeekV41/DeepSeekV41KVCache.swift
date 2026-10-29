@@ -383,19 +383,70 @@ nonisolated public enum DeepSeekV41CacheAddressing {
     /// Whether a cache holding `storedPositions` positions can serve a prefix of
     /// `prefixCount` positions.
     ///
-    /// Two bounds apply. The count must be stored at all, and it must fit inside the
-    /// window ring: past `windowRows` positions the oldest window rows have been
-    /// overwritten, so a prefix that "exists" by count would still attend stale
-    /// rows even though its compressed rows are intact.
+    /// The only bound is that those positions are stored at all. The sliding-window
+    /// ring deliberately does not enter into it, and it is worth saying why, because
+    /// it looks like it should: a resumed turn never replays the positions it skips,
+    /// so rows the ring has overwritten are rows nothing reads again. What a position
+    /// after the prefix reads is the trailing `windowSize` window rows, which the
+    /// ring always holds because they are the newest ones written, plus every
+    /// compressed row of every completed block, which are retained for the whole
+    /// context rather than ringed. A bound at `windowRows` would cap reuse at the
+    /// window size, i.e. at 128 of a prompt's positions here, and buy nothing.
     public static func prefixIsReusable(
         prefixCount: Int,
-        storedPositions: Int,
-        windowRows: Int
+        storedPositions: Int
     ) -> Bool {
         guard prefixCount > 0 else { return true }
-        guard storedPositions <= max(0, windowRows) else { return false }
-        guard prefixCount <= storedPositions else { return false }
-        return prefixCount <= max(0, windowRows)
+        return prefixCount <= storedPositions
+    }
+
+    /// The prefix a turn may actually skip: the pin's common prefix, cut to what the
+    /// cache holds.
+    ///
+    /// The cache has to hold exactly the positions being skipped. A resident
+    /// sequence longer than the common prefix means its rows past the point of
+    /// divergence belong to tokens this prompt does not contain, and resuming there
+    /// would keep compressed rows of blocks the new sequence never wrote. So a short
+    /// match is no reuse at all rather than a partial one, and the caller re-prefills
+    /// the prompt in full. The last prompt token is never skipped: its logits are
+    /// what the first sampled token comes from.
+    public static func reusablePrefix(
+        proposed: Int,
+        storedPositions: Int,
+        promptTokens: Int
+    ) -> Int {
+        guard proposed > 0, storedPositions > 0, promptTokens > 1 else { return 0 }
+        guard storedPositions <= proposed else { return 0 }
+        guard storedPositions <= promptTokens - 1 else { return 0 }
+        return storedPositions
+    }
+
+    /// The same decision, with the tokens checked.
+    ///
+    /// A length is not identity. The pin that proposes one belongs to the app rather
+    /// than to any cache, so its length can fit a sequence this cache never held: a
+    /// turn of another model, or an older turn of this one, leaves one behind.
+    /// Continuing such a sequence teaches the model that two different conversations
+    /// are one, and nothing downstream reports it, so the resident tokens are
+    /// compared and any divergence is a full prefill.
+    public static func reusablePrefix(
+        proposed: Int,
+        storedPositions: Int,
+        promptTokenIds: [Int],
+        residentTokens: [Int32]
+    ) -> Int {
+        guard storedPositions == residentTokens.count else { return 0 }
+        let cut = reusablePrefix(
+            proposed: proposed,
+            storedPositions: storedPositions,
+            promptTokens: promptTokenIds.count
+        )
+        guard cut > 0 else { return 0 }
+        for position in 0..<cut
+        where residentTokens[position] != Int32(truncatingIfNeeded: promptTokenIds[position]) {
+            return 0
+        }
+        return cut
     }
 }
 
@@ -536,16 +587,14 @@ nonisolated public final class DeepSeekV41KVCache: @unchecked Sendable {
 
     /// Whether the cache still holds every position up to `prefixCount` intact.
     ///
-    /// Two bounds apply, not one. The compressed rows survive for the whole
-    /// context, but the window rings keep only the newest `windowRows` positions:
-    /// once the sequence is longer than the ring, the oldest window rows have been
-    /// overwritten by later positions, so a "hit" there would attend stale rows
-    /// even though the position count says otherwise.
+    /// Only the position count matters. The window ring keeps the newest
+    /// `windowRows` positions, but the rows it overwrote belong to positions a
+    /// resumed turn skips and never replays, and the compressed rows survive for
+    /// the whole context. See `DeepSeekV41CacheAddressing.prefixIsReusable`.
     public func canReuse(prefixCount: Int) -> Bool {
         DeepSeekV41CacheAddressing.prefixIsReusable(
             prefixCount: prefixCount,
-            storedPositions: storedPositions,
-            windowRows: layout.geometry.windowRows
+            storedPositions: storedPositions
         )
     }
 }

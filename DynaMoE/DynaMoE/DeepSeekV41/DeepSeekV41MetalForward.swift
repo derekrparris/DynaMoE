@@ -802,11 +802,61 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// Drops the sequence so the next `forwardToken` starts at position 0.
     ///
     /// The token history goes with the cache: an n-gram must never span the seam
-    /// between two prompts.
+    /// between two prompts. A resumed turn skips this, which is why `resume` checks
+    /// that the history it keeps really is the prompt's.
     public func reset() {
         cache.reset()
         tokenHistory.removeAll(keepingCapacity: true)
         deadTokens.removeAll(keepingCapacity: true)
+        pendingDead = false
+    }
+
+    /// Positions the cache already holds.
+    public var storedPositions: Int { cache.storedPositions }
+
+    /// How much of `promptTokenIds` this cache can skip.
+    ///
+    /// The count arithmetic is `reusablePrefix`'s; what the count cannot say is
+    /// whether the resident positions are these tokens. The pin that proposed the
+    /// length belongs to the app, not to this cache: another model's turn, or an
+    /// older turn of this one, can leave a pin whose length happens to fit a sequence
+    /// this cache never saw. So the history is compared, and a mismatch is a full
+    /// prefill rather than a wrong one.
+    public func reusablePrefix(proposedPrefix: Int, promptTokenIds: [Int]) -> Int {
+        let stored = cache.storedPositions
+        guard deadTokens.count == stored else { return 0 }
+        return DeepSeekV41CacheAddressing.reusablePrefix(
+            proposed: proposedPrefix,
+            storedPositions: stored,
+            promptTokenIds: promptTokenIds,
+            residentTokens: tokenHistory
+        )
+    }
+
+    /// Keeps the resident sequence so the next `forwardToken` may continue it.
+    ///
+    /// Nothing is cleared: the window ring, the compressed rows, every owner's
+    /// half-filled compressor group and the token stream the Engram layers hash are
+    /// all addressed by position, so they describe exactly the sequence that produced
+    /// them. What this does is refuse to pretend: if the resident history is not this
+    /// prompt's tokens, continuing would mix two conversations inside an n-gram, and
+    /// an idle cache has nothing to continue from.
+    public func resume(prefixTokenIds: [Int]) throws {
+        let stored = cache.storedPositions
+        guard prefixTokenIds.count == stored else {
+            throw DeepSeekV41EngineError.outOfOrderPosition(prefixTokenIds.count, stored)
+        }
+        guard tokenHistory.count == stored, deadTokens.count == stored else {
+            throw DeepSeekV41EngineError.prefixStateMismatch(
+                position: min(tokenHistory.count, stored)
+            )
+        }
+        for (position, token) in prefixTokenIds.enumerated() {
+            guard tokenHistory[position] == Int32(truncatingIfNeeded: token) else {
+                throw DeepSeekV41EngineError.prefixStateMismatch(position: position)
+            }
+        }
+        // A dead marker the last turn left pending belongs to that turn.
         pendingDead = false
     }
 

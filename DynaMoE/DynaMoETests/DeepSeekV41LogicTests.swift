@@ -1496,27 +1496,26 @@ final class DeepSeekV41CompressorGroupTests: XCTestCase {
 
 final class DeepSeekV41CacheReuseTests: XCTestCase {
 
-    func testPrefixInsideTheWindowRingIsReusable() {
+    func testAStoredPrefixIsReusable() {
         XCTAssertTrue(
             DeepSeekV41CacheAddressing.prefixIsReusable(
-                prefixCount: 64, storedPositions: 100, windowRows: 128
+                prefixCount: 64, storedPositions: 100
             )
         )
     }
 
-    func testPrefixPastTheWindowRingIsNotReusable() {
-        // The position count says every row exists, but the ring has overwritten the
-        // oldest window rows, so a hit would attend stale context.
-        XCTAssertFalse(
+    /// The window ring is not a bound, because a resumed turn never replays what it
+    /// skips. Every window row a later position reads is one the ring still holds,
+    /// and the compressed rows are retained rather than ringed.
+    func testAPrefixPastTheWindowRingIsReusable() {
+        XCTAssertTrue(
             DeepSeekV41CacheAddressing.prefixIsReusable(
-                prefixCount: 200, storedPositions: 300, windowRows: 128
+                prefixCount: 200, storedPositions: 300
             )
         )
-        // The prefix itself fits in the ring, but the ring has already wrapped:
-        // rows 0...3 now hold positions 128...131, not the prefix's positions.
-        XCTAssertFalse(
+        XCTAssertTrue(
             DeepSeekV41CacheAddressing.prefixIsReusable(
-                prefixCount: 4, storedPositions: 300, windowRows: 128
+                prefixCount: 300, storedPositions: 300
             )
         )
     }
@@ -1524,13 +1523,88 @@ final class DeepSeekV41CacheReuseTests: XCTestCase {
     func testPrefixPastWhatIsStoredIsNotReusable() {
         XCTAssertFalse(
             DeepSeekV41CacheAddressing.prefixIsReusable(
-                prefixCount: 40, storedPositions: 20, windowRows: 128
+                prefixCount: 40, storedPositions: 20
             )
         )
         XCTAssertTrue(
             DeepSeekV41CacheAddressing.prefixIsReusable(
-                prefixCount: 0, storedPositions: 20, windowRows: 128
+                prefixCount: 0, storedPositions: 20
             )
+        )
+    }
+
+    /// The pin and the cache can disagree in both directions, and only exact
+    /// agreement is a skip.
+    func testTheReusablePrefixIsTheResidentSequenceExactly() {
+        // The pin leads the cache: a stop sequence ended the last turn on a token
+        // that never went through the block. The cache's own count wins.
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 500, storedPositions: 300, promptTokens: 1_000
+            ),
+            300
+        )
+        // The prompt diverged inside the resident sequence, so its rows past that
+        // point belong to tokens this prompt does not contain: no reuse, full prefill.
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 100, storedPositions: 300, promptTokens: 1_000
+            ),
+            0
+        )
+        // The last prompt token always runs: its logits are the first sample.
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 300, storedPositions: 300, promptTokens: 300
+            ),
+            0
+        )
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 0, storedPositions: 300, promptTokens: 1_000
+            ),
+            0
+        )
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 10, storedPositions: 0, promptTokens: 1_000
+            ),
+            0
+        )
+    }
+
+    /// A length is not identity: a pin left by another model's turn can propose a
+    /// prefix whose length fits a sequence this cache never held.
+    func testAResidentSequenceOfOtherTokensIsNotReused() {
+        let prompt: [Int] = [10, 11, 12, 13, 14]
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 3,
+                storedPositions: 3,
+                promptTokenIds: prompt,
+                residentTokens: [10, 11, 12]
+            ),
+            3
+        )
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 3,
+                storedPositions: 3,
+                promptTokenIds: prompt,
+                residentTokens: [10, 99, 12]
+            ),
+            0,
+            "a resident position holding a different token is not this prompt"
+        )
+        // The history has to describe every position the cache claims.
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 3,
+                storedPositions: 3,
+                promptTokenIds: prompt,
+                residentTokens: [10, 11]
+            ),
+            0
         )
     }
 

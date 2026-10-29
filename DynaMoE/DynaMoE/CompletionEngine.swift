@@ -439,10 +439,21 @@ public final class CompletionEngine: @unchecked Sendable {
                 currentGenerationId = myGenerationId
                 stateLock.unlock()
 
+                // The pin proposes how much of this prompt a previous turn may have
+                // left resident; the executor decides. It is the only thing that
+                // knows what its cache actually holds, and the pin is app-wide: a
+                // turn of a different model leaves one too, and its length can fit a
+                // sequence this cache never saw.
+                let reusablePrefix = forward.reusablePrefix(
+                    proposedPrefix: PrefixCacheManager.shared.findCommonPrefix(
+                        promptTokenIds: request.promptTokenIds,
+                        sessionId: request.sessionId
+                    ),
+                    promptTokenIds: request.promptTokenIds.map { Int($0) }
+                )
+
                 let prep = TurnPrepInfo(
-                    // No prefix pin yet: the DeepSeek cache is not registered with
-                    // `PrefixCacheManager`, so every turn prefills its whole prompt.
-                    prefixTokensReused: 0,
+                    prefixTokensReused: reusablePrefix,
                     promptTokenCount: request.promptTokenIds.count,
                     effectiveKVPrecision: runtime.cachePrecision == .fp16 ? .fp16 : .fp8,
                     provisionedSequenceLength: runtime.contextLength
@@ -454,6 +465,8 @@ public final class CompletionEngine: @unchecked Sendable {
                 let dsPromptIds = request.promptTokenIds
                 let dsFormattedPrompt = request.formattedPrompt
                 let dsStopSequences = request.stopSequences
+                let dsSessionId = request.sessionId
+                let dsAsOfDate = request.asOfDate
                 let dsEosIDs = dsConfig.eosTokenIDs.map { UInt32(clamping: $0) }
                 let (stream, continuation) = AsyncStream.makeStream(
                     of: CompletionEvent.self, bufferingPolicy: .unbounded
@@ -487,6 +500,7 @@ public final class CompletionEngine: @unchecked Sendable {
                         let output = try DeepSeekV41TurnRunner.run(
                             forward: forward,
                             promptTokenIds: dsPromptIds,
+                            prefixTokens: reusablePrefix,
                             settings: settings,
                             sample: { logits, generated in
                                 var scratch = logits
@@ -557,6 +571,20 @@ public final class CompletionEngine: @unchecked Sendable {
                         )
                         emit(.prefillProgress(status: nil, speed: nil, rssGB: nil))
 
+                        // The pin follows the cache: what this turn left resident is
+                        // what the next one may skip. Both are the prompt plus the
+                        // tokens that went through the block, so a stop sequence that
+                        // ended the turn on an unforwarded token leaves the pin one
+                        // longer than the cache, and the cut in `reusablePrefix` takes
+                        // the shorter of the two. Recorded before the cancel check as
+                        // well, because a stopped turn still leaves a sequence behind.
+                        PrefixCacheManager.shared.recordTurn(
+                            promptTokenIds: dsPromptIds,
+                            generatedTokenIds: output.generatedTokenIds,
+                            sessionId: dsSessionId,
+                            asOfDate: dsAsOfDate
+                        )
+
                         if output.cancelled || Task.isCancelled || !isCurrentGeneration(myGenerationId) {
                             emit(.failedTurn(TurnFailure(
                                 kind: .cancelled,
@@ -599,7 +627,7 @@ public final class CompletionEngine: @unchecked Sendable {
                             cacheHitRatePercent: runtime.arena.hitRate * 100,
                             prefetchEfficiencyPercent: 0,
                             pagingLatencyMs: 0,
-                            prefixTokensReused: 0,
+                            prefixTokensReused: output.prefixTokensReused,
                             parsedToolCalls: [],
                             actionableCallIndices: [],
                             gestureSkipNotices: [:],
