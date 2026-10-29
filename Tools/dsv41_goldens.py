@@ -37,17 +37,26 @@ Cases: `engram` (Engram.forward), `compressor` (Compressor.forward, one block),
 `compressor_state` (Compressor.forward over a decode sequence: which slot a
 position fills and when a row comes out), `chunk` (which window slots each query
 of a prefill chunk reads, `get_window_topk_idxs` for both of its branches, plus
-the chunk branch of `Compressor.forward` against its decode branch), `router`
-(Gate.forward, under both per-logit scorings), `dspark` (`DSparkBlock`'s
+the chunk branch of `Compressor.forward` against its decode branch), `hc`
+(`Block.hc_mixes` and the `hc_pre` / `hc_post` pair: the mHC coefficient split and
+the collapse it feeds), `router` (Gate.forward, under both per-logit scorings),
+`dspark` (`DSparkBlock`'s
 `forward_embed` seed plus its `forward_head` chain: the Markov bias, the
 per-step draw, and the confidence ordering), and `vision` (`ViT.forward` +
 `Aligner.forward` over a given patch grid, plus the spelling and id of the token
 that addresses an image span).
 
-Two gates deliberately have no case yet. `hyperConnections` needs
-`kernel.hc_split_sinkhorn`, the real Sinkhorn, which is a tilelang kernel and so
-is exactly the transcription this script exists to avoid repeating;
-`candidateSelection` needs live cache state.
+One gate deliberately has no case yet: `candidateSelection` needs live cache
+state.
+
+`hc` is the one case that transcribes a reference rule rather than executing it.
+`Block.hc_mixes`, `hc_pre` and `hc_post` run as the reference wrote them, against a
+duck-typed `self` so the block's attention and MoE (which need fused kernels) never
+run; but the split those methods call, `hc_split_sinkhorn`, is a tilelang kernel
+with no torch twin in `model.py`, so its body is transcribed from `kernel.py`. The
+transcription is 20 lines of elementwise arithmetic with an explicit order, and the
+port pins that order separately (one round leaves the columns exact and the rows
+only approximately so), which keeps the unverified surface to the schedule itself.
 
 `dspark` covers the half of the drafter that decides which tokens a chain
 contains. What it cannot cover, and what therefore keeps the gate open, is the
@@ -771,6 +780,144 @@ def chunk_case(torch, reference) -> dict:
     }
 
 
+def _hc_split_sinkhorn_for_goldens(torch, record):
+    """A torch transcription of `kernel.py`'s `hc_split_sinkhorn_kernel` body.
+
+    This is the one place in this script where the reference rule is transcribed
+    rather than executed. `hc_split_sinkhorn` is a tilelang kernel, so it cannot run
+    on CPU (the module's `kernel` import is refused above), and unlike `sparse_attn`
+    it has no readable torch twin in `model.py`. Its body is 40 lines of elementwise
+    arithmetic with an explicit order, so the transcription is checked against a
+    hand-computed one-round case in `DeepSeekV41HyperConnectionTests`; everything
+    AROUND the split — the projection of the flattened stack, the RMS scaling, the
+    sigmoid pre/post, the collapse and the expansion — is the reference's own code.
+
+    The split's arithmetic, from that kernel:
+
+      * `pre = sigmoid(mix * scale[0] + base) + eps`,
+      * `post = 2 * sigmoid(mix * scale[1] + base)`,
+      * `comb = mix * scale[2] + base`, then `softmax(comb, dim=-1)`, then `+eps`,
+        then ONE column normalization, then `sinkhorn_iters - 1` rounds of
+        row-then-column normalization, every divisor `+eps`.
+    """
+
+    def split(mixes, hc_scale, hc_base, hc_mult=4, sinkhorn_iters=20, eps=1e-6):
+        flat = mixes.reshape(-1, (2 + hc_mult) * hc_mult)
+        record.append(mixes.detach().clone())
+        pre = torch.empty(flat.size(0), hc_mult, dtype=torch.float32)
+        post = torch.empty(flat.size(0), hc_mult, dtype=torch.float32)
+        comb = []
+        for index in range(flat.size(0)):
+            row = flat[index]
+            pre[index] = torch.sigmoid(row[:hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + eps
+            post[index] = 2 * torch.sigmoid(
+                row[hc_mult : 2 * hc_mult] * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
+            )
+            tail = row[2 * hc_mult :].reshape(hc_mult, hc_mult)
+            bias = hc_base[2 * hc_mult :].reshape(hc_mult, hc_mult)
+            matrix = torch.softmax(tail * hc_scale[2] + bias, dim=-1) + eps
+            matrix = matrix / (matrix.sum(dim=0, keepdim=True) + eps)
+            for _ in range(sinkhorn_iters - 1):
+                matrix = matrix / (matrix.sum(dim=-1, keepdim=True) + eps)
+                matrix = matrix / (matrix.sum(dim=0, keepdim=True) + eps)
+            comb.append(matrix)
+        return pre, post, torch.stack(comb)
+
+    return split
+
+
+def hc_case(torch, reference) -> dict:
+    """`Block.hc_mixes` then `hc_pre` / `hc_post`: the mHC residual rule.
+
+    The block keeps `hc_mult` copies of the residual instead of one vector, and the
+    coefficients that decide how they mix are computed by projecting the WHOLE
+    flattened stack. `Block.hc_mixes`, `Block.hc_pre` and `Block.hc_post` are run
+    here as the reference wrote them, against a duck-typed `self` so the block's
+    attention and MoE — which need fused kernels — never run. Only the split itself
+    is transcribed (`_hc_split_sinkhorn_for_goldens`), because it is a tilelang
+    kernel.
+
+    Two positions with different mixes, so a collapse that ignores its mix is
+    visible in the numbers rather than only in a shape.
+    """
+    copies = 2
+    dim = 3
+    positions = 2
+    iterations = 3
+    norm_eps = 1e-6
+    eps = 1e-6
+    mix_count = (2 + copies) * copies
+
+    class _BlockSelf:
+        pass
+
+    block = _BlockSelf()
+    block.hc_mult = copies
+    block.hc_sinkhorn_iters = iterations
+    block.hc_eps = eps
+    block.norm_eps = norm_eps
+
+    generator = torch.Generator().manual_seed(20251017)
+    streams = (0.4 * torch.randn(1, positions, copies, dim, generator=generator)).float()
+    projection = (0.4 * torch.randn(mix_count, copies * dim, generator=generator)).float()
+    scale = torch.tensor([0.7, -0.3, 0.5], dtype=torch.float32)
+    base = (0.1 * torch.randn(mix_count, generator=generator)).float()
+    pre_mix = torch.tensor([[0.6, 0.4], [0.2, 0.8]], dtype=torch.float32).view(1, positions, copies)
+    sublayer = (0.5 * torch.randn(1, positions, dim, generator=generator)).float()
+
+    mixes_log: list = []
+    original = reference.hc_split_sinkhorn
+    reference.hc_split_sinkhorn = _hc_split_sinkhorn_for_goldens(torch, mixes_log)
+    try:
+        with torch.no_grad():
+            pre, post, comb = reference.Block.hc_mixes(block, streams, projection, scale, base)
+            collapse = reference.Block.hc_pre(block, streams, pre_mix)
+            expanded = reference.Block.hc_post(block, sublayer, streams, post, comb)
+    finally:
+        reference.hc_split_sinkhorn = original
+
+    return {
+        "gate": "hyperConnections",
+        "reference": (
+            "inference/model.py Block.hc_mixes, Block.hc_pre and Block.hc_post, with "
+            "hc_split_sinkhorn transcribed from inference/kernel.py "
+            f"({snapshot_note()})"
+        ),
+        "config": {
+            "hc_mult": copies,
+            "dim": dim,
+            "positions": positions,
+            "sinkhorn_iters": iterations,
+            "hc_eps": eps,
+            "norm_eps": norm_eps,
+            "mix_count": mix_count,
+        },
+        "input": {
+            "streams": rows_of(streams[0]),
+            "projection": rows_of(projection),
+            "scale": rows_of(scale),
+            "base": rows_of(base),
+            "pre_mix": rows_of(pre_mix[0]),
+            "sublayer_output": rows_of(sublayer[0]),
+        },
+        "expected": {
+            # [positions][mix_count]: the projection of the flattened stack, scaled by
+            # `rsqrt(mean(x^2) + norm_eps)`.
+            "mixes": rows_of(mixes_log[0][0]),
+            # [positions][hc_mult], both from the first `hc_mult` sections.
+            "pre": rows_of(pre),
+            "post": rows_of(post),
+            # [positions][hc_mult][hc_mult], the Sinkhorn-normalized mixing matrix.
+            "comb": rows_of(comb),
+            # [positions][dim]: the stack collapsed with `pre_mix`, not with one copy.
+            "collapse": rows_of(collapse[0]),
+            # [positions][hc_mult][dim]: the sub-layer output expanded back out and
+            # mixed with the residual through `comb`.
+            "expanded": rows_of(expanded[0]),
+        },
+    }
+
+
 def _vision_identifier(snapshot: str) -> dict:
     """What token an image span is spelled with, from the checkpoint's own files.
 
@@ -951,6 +1098,7 @@ CASES = {
     "compressor": compressor_case,
     "compressor_state": compressor_state_case,
     "chunk": chunk_case,
+    "hc": hc_case,
     "router": router_case,
     "dspark": dspark_case,
     "vision": vision_case,

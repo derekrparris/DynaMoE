@@ -1064,3 +1064,82 @@ final class DeepSeekV41EngramGateKernelTests: XCTestCase {
         }
     }
 }
+
+/// The GPU half of the mHC split. The host rule is
+/// `DeepSeekV41HyperConnections.sinkhorn`, pinned against the checkpoint's
+/// `hc_split_sinkhorn` by `DeepSeekV41HyperConnectionGoldenTests`; this suite runs
+/// the kernel on the same inputs and over the same schedule.
+final class DeepSeekV41SinkhornKernelTests: XCTestCase {
+
+    private func run(
+        logits: [Float],
+        dimension: Int,
+        iterations: Int,
+        epsilon: Float
+    ) throws -> [Float] {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        let library = try XCTUnwrap(device.makeDefaultLibrary())
+        let function = try XCTUnwrap(library.makeFunction(name: "dsv41_hc_sinkhorn"))
+        let pipeline = try device.makeComputePipelineState(function: function)
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+        let logitsBuffer = try XCTUnwrap(
+            device.makeBuffer(
+                bytes: logits, length: logits.count * MemoryLayout<Float>.stride,
+                options: .storageModeShared
+            )
+        )
+        let outputBuffer = try XCTUnwrap(
+            device.makeBuffer(
+                length: dimension * dimension * MemoryLayout<Float>.stride,
+                options: .storageModeShared
+            )
+        )
+        let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+        let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(logitsBuffer, offset: 0, index: 0)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 1)
+        var n = UInt32(dimension)
+        var rounds = UInt32(iterations)
+        var eps = epsilon
+        encoder.setBytes(&n, length: 4, index: 2)
+        encoder.setBytes(&rounds, length: 4, index: 3)
+        encoder.setBytes(&eps, length: 4, index: 4)
+        encoder.dispatchThreads(
+            MTLSize(width: 32, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+        let pointer = outputBuffer.contents().assumingMemoryBound(to: Float.self)
+        return (0..<(dimension * dimension)).map { pointer[$0] }
+    }
+
+    /// A single round leaves the COLUMNS exact and the rows off by the amount the
+    /// hand-computed [`[1, 0], [0.5, 0.5]`] case shows, so a kernel that normalizes
+    /// rows first cannot pass.
+    func testOneRoundNormalizesTheColumnsOnly() throws {
+        let matrix = try run(
+            logits: [1, 0, 0.5, 0.5], dimension: 2, iterations: 1, epsilon: 1e-6
+        )
+        XCTAssertEqual(matrix[0], 0.593845, accuracy: 1e-5)
+        XCTAssertEqual(matrix[1], 0.349755, accuracy: 1e-5)
+        XCTAssertEqual(matrix[2], 0.406155, accuracy: 1e-5)
+        XCTAssertEqual(matrix[3], 0.650245, accuracy: 1e-5)
+    }
+
+    func testConvergedRoundsMatchTheHostRule() throws {
+        let logits: [Float] = [0.5, -0.2, 0.1, 1.0, -0.7, 0.3, 0.9, 0.2, -0.4]
+        let kernel = try run(logits: logits, dimension: 3, iterations: 20, epsilon: 1e-6)
+        let host = DeepSeekV41HyperConnections.sinkhorn(
+            logits: logits, dimension: 3, iterations: 20, epsilon: 1e-6
+        )
+        for index in 0..<9 {
+            XCTAssertEqual(kernel[index], host[index], accuracy: 1e-6, "entry \(index)")
+        }
+    }
+}

@@ -8648,12 +8648,16 @@ kernel void dsv41_engram_gate_f32(
     }
 }
 
-/// MSL Kernel: Sinkhorn normalization for the mHC mixing matrix.
-/// `logits` is an n x n block; the kernel exponentiates it and alternates row
-/// and column normalization `iterations` times, leaving a doubly-stochastic
-/// matrix (rows and columns each sum to 1). One thread runs the whole block:
-/// n is at most `hc_mult` (4 on the published checkpoint), so the serial loop
-/// is cheaper than the coordination a parallel version would need.
+/// MSL Kernel: the Sinkhorn split of the mHC mixing matrix.
+///
+/// `logits` is an n x n block. The schedule is the reference's
+/// (`hc_split_sinkhorn_kernel`), not a symmetric normalization: one row softmax,
+/// `+eps`, ONE column normalization, then `iterations - 1` rounds of row-then-column,
+/// every divisor `(sum + eps)`. After a single round the columns are exact and the
+/// rows are only approximately so, which is what makes the schedule visible.
+/// One thread runs the whole block: n is at most `hc_mult` (4 on the published
+/// checkpoint), so the serial loop is cheaper than the coordination a parallel
+/// version would need.
 kernel void dsv41_hc_sinkhorn(
     device const float* logits [[buffer(0)]],
     device float* outputMatrix [[buffer(1)]],
@@ -8666,28 +8670,43 @@ kernel void dsv41_hc_sinkhorn(
     uint n = dimension;
     if (n == 0 || n > 16) return;
 
-    // Exponentiate once; Sinkhorn only rescales from here on. The max is
-    // subtracted first so a large logit cannot overflow to infinity, which would
-    // make every later row/column sum `inf` and the normalization a no-op of NaNs.
-    float maxLogit = -1e30f;
-    for (uint i = 0; i < n * n; ++i) {
-        maxLogit = max(maxLogit, logits[i]);
+    // Row softmax. The max is subtracted per ROW so a large logit cannot overflow
+    // to infinity (every later sum would be `inf` and the normalization a no-op of
+    // NaNs), and so a row orders of magnitude below the block's max does not
+    // underflow to a zero sum.
+    for (uint r = 0; r < n; ++r) {
+        float rowMax = -1e30f;
+        for (uint c = 0; c < n; ++c) rowMax = max(rowMax, logits[r * n + c]);
+        float sum = 0.0f;
+        for (uint c = 0; c < n; ++c) {
+            float value = exp(logits[r * n + c] - rowMax);
+            outputMatrix[r * n + c] = value;
+            sum += value;
+        }
+        float inverse = sum > 0.0f ? 1.0f / sum : 0.0f;
+        for (uint c = 0; c < n; ++c) outputMatrix[r * n + c] *= inverse;
     }
-    for (uint i = 0; i < n * n; ++i) {
-        outputMatrix[i] = exp(logits[i] - maxLogit);
+    for (uint i = 0; i < n * n; ++i) outputMatrix[i] += epsilon;
+
+    if (iterations == 0) return;
+    for (uint c = 0; c < n; ++c) {
+        float sum = 0.0f;
+        for (uint r = 0; r < n; ++r) sum += outputMatrix[r * n + c];
+        float inverse = 1.0f / (sum + epsilon);
+        for (uint r = 0; r < n; ++r) outputMatrix[r * n + c] *= inverse;
     }
-    for (uint iteration = 0; iteration < iterations; ++iteration) {
+    for (uint iteration = 1; iteration < iterations; ++iteration) {
         for (uint r = 0; r < n; ++r) {
-            float rowSum = 0.0f;
-            for (uint c = 0; c < n; ++c) rowSum += outputMatrix[r * n + c];
-            float inv = 1.0f / max(rowSum, epsilon);
-            for (uint c = 0; c < n; ++c) outputMatrix[r * n + c] *= inv;
+            float sum = 0.0f;
+            for (uint c = 0; c < n; ++c) sum += outputMatrix[r * n + c];
+            float inverse = 1.0f / (sum + epsilon);
+            for (uint c = 0; c < n; ++c) outputMatrix[r * n + c] *= inverse;
         }
         for (uint c = 0; c < n; ++c) {
-            float colSum = 0.0f;
-            for (uint r = 0; r < n; ++r) colSum += outputMatrix[r * n + c];
-            float inv = 1.0f / max(colSum, epsilon);
-            for (uint r = 0; r < n; ++r) outputMatrix[r * n + c] *= inv;
+            float sum = 0.0f;
+            for (uint r = 0; r < n; ++r) sum += outputMatrix[r * n + c];
+            float inverse = 1.0f / (sum + epsilon);
+            for (uint r = 0; r < n; ++r) outputMatrix[r * n + c] *= inverse;
         }
     }
 }

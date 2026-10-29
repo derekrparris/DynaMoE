@@ -16,8 +16,9 @@
 //    * that the compressed-row set for a position is what the ratio says,
 //    * that routing, the expert mixture and the hyper-connection streams reshape
 //      the hidden state exactly once each,
-//    * that the final norm and head see the collapsed stream, not one of the
-//      intermediate ones.
+//    * that the coefficients a sub-layer's `hc_*_fn` produces are consumed by the
+//      NEXT sub-layer, and that the final norm and head see the stack collapsed
+//      through the last one rather than one intermediate copy.
 //
 //  Those are the bugs that a wrong port ships with, and none of them needs 510 GB
 //  of weights to catch. The GPU executor binds the same stages to the Metal kernels
@@ -596,10 +597,19 @@ nonisolated public final class DeepSeekV41CPUForward {
         // still produce plausible numbers.
         let mult = max(1, config.hcMult)
         var streams: [[[Float]]] = [Array(repeating: embedding, count: mult)]
+        // Every forward call starts its stack from the identity mix
+        // (`make_identity_pre_mix`), so a decode step is not a continuation of the
+        // previous position's residual — the mixes live exactly as long as the call.
+        var preMix: [[Float]] = [DeepSeekV41HyperConnections.identityMix(copies: mult)]
         for layer in plan {
-            runChunkLayer(layer, positions: position..<(position + 1), streams: &streams)
+            runChunkLayer(
+                layer,
+                positions: position..<(position + 1),
+                streams: &streams,
+                preMix: &preMix
+            )
         }
-        return logits(streams[0])
+        return logits(streams[0], preMix: preMix[0])
     }
 
     /// Runs `tokens` from position 0 as ONE chunk, the shape the checkpoint's own
@@ -637,8 +647,11 @@ nonisolated public final class DeepSeekV41CPUForward {
         for token in tokens {
             streams.append(Array(repeating: embed(token), count: mult))
         }
+        var preMix: [[Float]] = tokens.map { _ in
+            DeepSeekV41HyperConnections.identityMix(copies: mult)
+        }
         for layer in plan {
-            runChunkLayer(layer, positions: 0..<tokens.count, streams: &streams)
+            runChunkLayer(layer, positions: 0..<tokens.count, streams: &streams, preMix: &preMix)
         }
 
         let keep = capture.filter { $0 >= 0 && $0 < tokens.count }
@@ -646,17 +659,19 @@ nonisolated public final class DeepSeekV41CPUForward {
         var last: [Float] = []
         for position in 0..<tokens.count
         where position == tokens.count - 1 || keep.contains(position) {
-            let output = logits(streams[position])
+            let output = logits(streams[position], preMix: preMix[position])
             if position == tokens.count - 1 { last = output }
             if keep.contains(position) { captured[position] = output }
         }
         return DeepSeekV41ChunkLogits(last: last, captured: captured)
     }
 
-    /// The block's output: the collapsed stream, the final norm, then the head.
-    private func logits(_ streams: [[Float]]) -> [Float] {
-        // The block's output is the collapsed stream, not an average of the streams.
-        var hidden = collapse(streams)
+    /// The block's output: the collapsed stack, the final norm, then the head.
+    private func logits(_ streams: [[Float]], preMix: [Float]) -> [Float] {
+        // `Transformer.forward` collapses the stack with the last block's `pre`
+        // (`layer.hc_pre(h, pre_mix)`), not with stream 0: reading one copy drops
+        // every weight the mixing matrix sent to the others.
+        var hidden = DeepSeekV41HyperConnections.pre(streams: streams, mix: preMix)
         hidden = rmsNorm(hidden, role: .finalNorm, layer: nil, epsilon: config.rmsNormEps)
         // A tied checkpoint has no separate head: the embedding matrix is the head,
         // transposed. The catalog reports the same tensor either way, so the tie flag
@@ -683,10 +698,16 @@ nonisolated public final class DeepSeekV41CPUForward {
     ///
     /// `streams` is indexed from `positions.lowerBound`, so a caller with one position
     /// passes a one-element array and a chunk passes one entry per position.
+    ///
+    /// `preMix` is the per-position collapse weight the PREVIOUS sub-layer produced.
+    /// It travels with the run because which copy a sub-layer reads is decided one
+    /// sub-layer earlier: `Block.forward` returns its own `ffn_pre` for the next
+    /// block, and the head finally collapses with the last one.
     private func runChunkLayer(
         _ layer: DeepSeekV41LayerPlan,
         positions: Range<Int>,
-        streams: inout [[[Float]]]
+        streams: inout [[[Float]]],
+        preMix: inout [[Float]]
     ) {
         let index = layer.index
         let shape = DeepSeekV41AttentionShape.make(config: config, layer: layer)
@@ -706,17 +727,23 @@ nonisolated public final class DeepSeekV41CPUForward {
             }
         }
 
-        // Attention sub-layer: the block input every position reads, then its query and
-        // its latent, which are the two rails the cache is written from.
+        // Attention sub-layer: the coefficients it derives from the block input, the
+        // residual `hc_post` mixes back in, and then its query and its latent, which
+        // are the two rails the cache is written from.
+        var coefficients: [DeepSeekV41HyperConnections.Coefficients] = []
+        coefficients.reserveCapacity(positions.count)
+        var residuals: [[[Float]]] = []
+        residuals.reserveCapacity(positions.count)
         var normedInputs: [[Float]] = []
         normedInputs.reserveCapacity(positions.count)
         for position in positions {
-            let attnInput = mixStreams(
-                streams[position - base],
-                readRole: .hcAttnFn,
-                scaleRole: .hcAttnScale,
-                baseRole: .hcAttnBase,
-                layer: index
+            let input = streams[position - base]
+            coefficients.append(
+                hyperConnectionCoefficients(layer: index, entry: .attention, streams: input)
+            )
+            residuals.append(input)
+            let attnInput = DeepSeekV41HyperConnections.pre(
+                streams: input, mix: preMix[position - base]
             )
             normedInputs.append(
                 rmsNorm(attnInput, role: .attnNorm, layer: index, epsilon: config.rmsNormEps)
@@ -784,32 +811,74 @@ nonisolated public final class DeepSeekV41CPUForward {
                 )
             }
             let attnOut = outputPath(attended, layer: index, shape: shape)
-            DeepSeekV41HyperConnections.write(
-                streams: &streams[position - base],
-                contribution: attnOut,
-                writeScales: weights.vector(.hcAttnScale, layer: index)
+            streams[position - base] = DeepSeekV41HyperConnections.post(
+                output: attnOut,
+                residual: residuals[offset],
+                gains: coefficients[offset].post,
+                comb: coefficients[offset].comb
             )
         }
 
-        // Feed-forward sub-layer.
-        for position in positions {
-            let ffnInput = mixStreams(
-                streams[position - base],
-                readRole: .hcFfnFn,
-                scaleRole: .hcFfnScale,
-                baseRole: .hcFfnBase,
-                layer: index
+        // Feed-forward sub-layer. Its own coefficients come from the post-attention
+        // stack, while the vector it reads is that stack collapsed with ATTENTION's
+        // `pre` — the mix the block input produced one sub-layer ago.
+        for (offset, position) in positions.enumerated() {
+            let input = streams[position - base]
+            let ffnCoefficients = hyperConnectionCoefficients(
+                layer: index, entry: .feedForward, streams: input
+            )
+            let ffnInput = DeepSeekV41HyperConnections.pre(
+                streams: input, mix: coefficients[offset].pre
             )
             let ffnNormed = rmsNorm(
                 ffnInput, role: .ffnNorm, layer: index, epsilon: config.rmsNormEps
             )
             let ffnOut = feedForward(ffnNormed, layer: index)
-            DeepSeekV41HyperConnections.write(
-                streams: &streams[position - base],
-                contribution: ffnOut,
-                writeScales: weights.vector(.hcFfnScale, layer: index)
+            streams[position - base] = DeepSeekV41HyperConnections.post(
+                output: ffnOut,
+                residual: input,
+                gains: ffnCoefficients.post,
+                comb: ffnCoefficients.comb
             )
+            // Whatever this feed-forward decided is what the NEXT layer's attention
+            // reads, and after the last layer it is what the head collapses with.
+            preMix[position - base] = ffnCoefficients.pre
         }
+    }
+
+    /// Which sub-layer's `hc_*` tensors a coefficient set comes from.
+    private enum HyperConnectionEntry {
+        case attention
+        case feedForward
+    }
+
+    private func hyperConnectionCoefficients(
+        layer: Int,
+        entry: HyperConnectionEntry,
+        streams: [[Float]]
+    ) -> DeepSeekV41HyperConnections.Coefficients {
+        let projection: DeepSeekV41TensorRole
+        let scale: DeepSeekV41TensorRole
+        let base: DeepSeekV41TensorRole
+        switch entry {
+        case .attention:
+            projection = .hcAttnFn
+            scale = .hcAttnScale
+            base = .hcAttnBase
+        case .feedForward:
+            projection = .hcFfnFn
+            scale = .hcFfnScale
+            base = .hcFfnBase
+        }
+        return DeepSeekV41HyperConnections.coefficients(
+            streams: streams,
+            projection: weights.matrix(projection, layer: layer, expert: nil),
+            scale: weights.vector(scale, layer: layer) ?? [],
+            base: weights.vector(base, layer: layer) ?? [],
+            normalizationEpsilon: config.rmsNormEps,
+            epsilon: config.hcEps,
+            iterations: config.hcSinkhornIterations
+        )
     }
 
     // MARK: Attention pieces
@@ -1099,39 +1168,6 @@ nonisolated public final class DeepSeekV41CPUForward {
         streams = contribution.streams
         if engramGates[layer] == nil { engramGates[layer] = [] }
         engramGates[layer]?.append(contribution.gates)
-    }
-
-    // MARK: Streams
-
-    private func mixStreams(
-        _ streams: [[Float]],
-        readRole: DeepSeekV41TensorRole,
-        scaleRole: DeepSeekV41TensorRole,
-        baseRole: DeepSeekV41TensorRole,
-        layer: Int
-    ) -> [Float] {
-        let mult = streams.count
-        let readRaw = weights.matrix(readRole, layer: layer)
-        let read = readRaw.map { resize($0.row(0), to: mult) }
-            ?? [Float](repeating: 1 / Float(max(1, mult)), count: mult)
-        let scale = weights.vector(scaleRole, layer: layer)
-        let bias = weights.vector(baseRole, layer: layer)
-        return DeepSeekV41HyperConnections.mix(
-            streams: streams,
-            readWeights: read,
-            scale: scale,
-            bias: bias
-        )
-    }
-
-    private func collapse(_ streams: [[Float]]) -> [Float] {
-        streams.first ?? []
-    }
-
-    private func resize(_ values: [Float], to count: Int) -> [Float] {
-        guard values.count != count else { return values }
-        if values.count > count { return Array(values.prefix(count)) }
-        return values + [Float](repeating: 0, count: count - values.count)
     }
 
     // MARK: Norm

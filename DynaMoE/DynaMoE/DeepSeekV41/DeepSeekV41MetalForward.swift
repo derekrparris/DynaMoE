@@ -2262,6 +2262,17 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         encoder.memoryBarrier(scope: .buffers)
     }
 
+    /// Collapses the streams with a per-stream weight vector.
+    ///
+    /// NOT the reference rule yet. `Block.hc_mixes` projects the FLATTENED stack
+    /// through `hc_*_fn` onto `(2 + mult) * mult` logits and splits those into
+    /// `pre` / `post` / `comb`, which is what `DeepSeekV41HyperConnections` does on
+    /// the host and what `DeepSeekV41Conformance.hyperConnections` is pinned
+    /// against. Until this stage grows that projection (a GEMV over the stream
+    /// buffer), the split kernel and carried `pre` mixes per sub-layer, it reads
+    /// `hc_*_fn` as if it were `pre` and drops `comb` entirely. The path is
+    /// unreachable today (`isRuntimeAvailable` is false and `launchTurn` refuses the
+    /// family), so this is a to-do rather than a live wrong answer.
     private func encodeStreamMix(
         _ encoder: MTLComputeCommandEncoder,
         readWeights: MTLBuffer?,

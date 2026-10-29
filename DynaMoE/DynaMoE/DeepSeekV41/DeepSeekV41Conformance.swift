@@ -151,8 +151,36 @@ nonisolated public enum DeepSeekV41Conformance {
     /// the CPU rule's inputs.
     public static let engramCombination: Gate = .verifiedAgainstReference
 
-    /// The mHC hyper-connection mixing rule.
-    public static let hyperConnections: Gate = .unverified
+    /// The mHC residual mixing rule.
+    ///
+    /// MATCHED AGAINST `Block.hc_mixes`, `Block.hc_pre` and `Block.hc_post` in the
+    /// checkpoint's `inference/model.py`. `hc_*_fn` projects the FLATTENED stack,
+    /// scaled by `rsqrt(mean(x^2) + norm_eps)`, onto `(2 + mult) * mult` logits; the
+    /// first `mult` become `pre = sigmoid(...) + eps`, the next `mult` become
+    /// `post = 2 * sigmoid(...)`, and the `mult × mult` tail becomes `comb` through
+    /// the Sinkhorn split. A sub-layer collapses the stack with the `pre` the
+    /// PREVIOUS sub-layer produced, expands its own output back out through `post`
+    /// and `comb`, and hands its own `pre` on; the head finally collapses the stack
+    /// with the last one. `Tools/dsv41_goldens.py hc` runs those three block methods
+    /// as written (two positions, two copies, a three-round split) and
+    /// `DeepSeekV41HyperConnectionGoldenTests` carries the vectors.
+    ///
+    /// What it does NOT cover, and the reason this gate took longer to close than the
+    /// rest: the split itself is a tilelang kernel (`hc_split_sinkhorn`), so the
+    /// goldens transcribe its body from `inference/kernel.py` instead of executing it.
+    /// Its schedule is pinned separately (a one-round case where the columns are exact
+    /// and the rows are not), and everything around it — the projection, the RMS
+    /// scaling, the sigmoid pre/post, the collapse and the expansion — is the
+    /// reference's own code. The softmax / `+eps` / column-normalize order is this
+    /// port's reading of that kernel, not a number the reference produced.
+    ///
+    /// The device path applies the same coefficients (`dsv41_hc_sinkhorn` plus the
+    /// projection and the two write kernels) but has never run against a checkpoint,
+    /// so its own arithmetic is kernel-tested rather than forward-tested. It also
+    /// still reads `hc_*_fn` as a per-stream vector instead of projecting the
+    /// flattened stack — see `DeepSeekV41MetalForward.encodeStreamMix`, which has to
+    /// grow that projection before the two backends compute the same rule.
+    public static let hyperConnections: Gate = .verifiedAgainstReference
 
     /// DSpark's draft-chain construction.
     ///

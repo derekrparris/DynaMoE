@@ -129,10 +129,18 @@ enum DeepSeekV41TestFixtures {
             source.set(generator.matrix(rows: shapes.sharedIntermediate, columns: shapes.hidden), role: .sharedExpertW1, layer: l)
             source.set(generator.matrix(rows: shapes.sharedIntermediate, columns: shapes.hidden), role: .sharedExpertW3, layer: l)
             source.set(generator.matrix(rows: shapes.hidden, columns: shapes.sharedIntermediate), role: .sharedExpertW2, layer: l)
-            source.set(generator.matrix(rows: 1, columns: max(1, config.hcMult)), role: .hcAttnFn, layer: l)
-            source.set(generator.matrix(rows: 1, columns: max(1, config.hcMult)), role: .hcFfnFn, layer: l)
-            source.set(generator.vector(max(1, config.hcMult), scale: 0.05), role: .hcAttnScale, layer: l)
-            source.set(generator.vector(max(1, config.hcMult), scale: 0.05), role: .hcFfnScale, layer: l)
+            // `hc_*_fn` projects the FLATTENED stack onto `(2 + mult) * mult`
+            // logits, and `hc_*_scale` is the three-element per-section scale, so
+            // these are the shapes `Block.hc_mixes` reads rather than per-stream
+            // vectors.
+            let copies = max(1, config.hcMult)
+            let mixCount = (2 + copies) * copies
+            source.set(generator.matrix(rows: mixCount, columns: copies * shapes.hidden), role: .hcAttnFn, layer: l)
+            source.set(generator.matrix(rows: mixCount, columns: copies * shapes.hidden), role: .hcFfnFn, layer: l)
+            source.set(generator.vector(3, scale: 0.05), role: .hcAttnScale, layer: l)
+            source.set(generator.vector(3, scale: 0.05), role: .hcFfnScale, layer: l)
+            source.set(generator.vector(mixCount, scale: 0.1), role: .hcAttnBase, layer: l)
+            source.set(generator.vector(mixCount, scale: 0.1), role: .hcFfnBase, layer: l)
             for expert in 0..<config.numRoutedExperts {
                 source.set(generator.matrix(rows: shapes.expertIntermediate, columns: shapes.hidden), role: .expertW1, layer: l, expert: expert)
                 source.set(generator.matrix(rows: shapes.expertIntermediate, columns: shapes.hidden), role: .expertW3, layer: l, expert: expert)
@@ -833,6 +841,28 @@ final class DeepSeekV41ExpertArenaTests: XCTestCase {
 
 final class DeepSeekV41HyperConnectionTests: XCTestCase {
 
+    /// `hc_*_fn` with row `r` one-hot at column `r % columns`, so the logits are the
+    /// flattened stack repeated and every coefficient is hand-checkable.
+    private func repeatingProjection(rows: Int, columns: Int) -> DeepSeekV41Matrix {
+        var values = [Float](repeating: 0, count: rows * columns)
+        for row in 0..<rows {
+            values[row * columns + row % columns] = 1
+        }
+        return DeepSeekV41Matrix(rows: rows, columns: columns, values: values)
+    }
+
+    private func columnSums(_ matrix: [Float], dimension: Int) -> [Float] {
+        (0..<dimension).map { column in
+            (0..<dimension).reduce(Float(0)) { $0 + matrix[$1 * dimension + column] }
+        }
+    }
+
+    private func rowSums(_ matrix: [Float], dimension: Int) -> [Float] {
+        (0..<dimension).map { row in
+            (0..<dimension).reduce(Float(0)) { $0 + matrix[row * dimension + $1] }
+        }
+    }
+
     func testSinkhornProducesADoublyStochasticMatrix() {
         let logits: [Float] = [0.5, -0.2, 1.0, 0.1]
         let matrix = DeepSeekV41HyperConnections.sinkhorn(
@@ -842,13 +872,32 @@ final class DeepSeekV41HyperConnectionTests: XCTestCase {
             epsilon: 1e-6
         )
         XCTAssertEqual(matrix.count, 4)
-        for row in 0..<2 {
-            XCTAssertEqual(matrix[row * 2] + matrix[row * 2 + 1], 1, accuracy: 1e-4)
+        for row in rowSums(matrix, dimension: 2) {
+            XCTAssertEqual(row, 1, accuracy: 1e-4)
         }
-        for column in 0..<2 {
-            XCTAssertEqual(matrix[column] + matrix[2 + column], 1, accuracy: 1e-4)
+        for column in columnSums(matrix, dimension: 2) {
+            XCTAssertEqual(column, 1, accuracy: 1e-4)
         }
         XCTAssertTrue(matrix.allSatisfy { $0 > 0 })
+    }
+
+    /// The reference's schedule is softmax, `+eps`, one COLUMN normalization, then
+    /// `iterations - 1` rounds of row-then-column. After a single iteration the
+    /// columns are exact and the rows are not, which is the asymmetry a symmetric
+    /// reimplementation normalizes away.
+    func testTheFirstRoundLeavesOnlyTheColumnsExact() {
+        let matrix = DeepSeekV41HyperConnections.sinkhorn(
+            logits: [1, 0, 0.5, 0.5],
+            dimension: 2,
+            iterations: 1,
+            epsilon: 1e-6
+        )
+        for column in columnSums(matrix, dimension: 2) {
+            XCTAssertEqual(column, 1, accuracy: 1e-5)
+        }
+        let rows = rowSums(matrix, dimension: 2)
+        XCTAssertEqual(rows[0], 0.943_601, accuracy: 1e-4)
+        XCTAssertEqual(rows[1], 1.056_399, accuracy: 1e-4)
     }
 
     func testUniformLogitsGiveTheBarycenter() {
@@ -873,45 +922,98 @@ final class DeepSeekV41HyperConnectionTests: XCTestCase {
             epsilon: 1e-6
         )
         XCTAssertTrue(matrix.allSatisfy { $0.isFinite }, "\(matrix)")
-        XCTAssertEqual(matrix[0] + matrix[1], 1, accuracy: 1e-4)
+        // The last round is a column normalization, so the columns are the ones
+        // that are exact; the `+eps` floor keeps the rows a little off the
+        // barycenter for a logit this extreme.
+        for column in columnSums(matrix, dimension: 2) {
+            XCTAssertEqual(column, 1, accuracy: 1e-4)
+        }
         XCTAssertTrue(matrix[0] > matrix[1])
     }
 
-    func testReadWeightsPickOneRow() {
-        let matrix: [Float] = [0.25, 0.75, 0.5, 0.5]
-        XCTAssertEqual(DeepSeekV41HyperConnections.readWeights(matrix: matrix, streams: 2, row: 0), [0.25, 0.75])
-        XCTAssertEqual(DeepSeekV41HyperConnections.readWeights(matrix: matrix, streams: 2, row: 1), [0.5, 0.5])
-    }
-
-    func testMixAppliesPerStreamScaleAndPerDimensionBias() {
-        let streams: [[Float]] = [
-            [1, 1],
-            [2, 2]
-        ]
-        // `scale` is per stream, `bias` is per hidden dimension: the streams are
-        // mixed with different gains, and each output dimension carries its own base.
-        let mixed = DeepSeekV41HyperConnections.mix(
+    /// One projection of the flattened stack splits into the three coefficient
+    /// sets: `pre` through a sigmoid floored at `eps`, `post` through twice a
+    /// sigmoid, and `comb` through the Sinkhorn normalization.
+    func testOneProjectionSplitsIntoTheThreeCoefficientSets() {
+        let streams: [[Float]] = [[1, 0], [0, 1]]
+        // `mean(x^2) = 0.5`, so every logit is scaled by `1 / sqrt(0.5 + 1e-6)`.
+        let rstd: Float = 1 / sqrt(0.5 + 1e-6)
+        let half: Float = rstd * 0.5
+        let pre0: Float = 1 / (1 + exp(-half)) + 1e-6
+        let post1: Float = 2 / (1 + exp(-half))
+        let coefficients = DeepSeekV41HyperConnections.coefficients(
             streams: streams,
-            readWeights: [0.5, 0.5],
-            scale: [2, 1],
-            bias: [0.25, -0.25]
+            projection: repeatingProjection(rows: 8, columns: 4),
+            scale: [0.5, 0.5, 0.5],
+            base: [Float](repeating: 0, count: 8),
+            normalizationEpsilon: 1e-6,
+            epsilon: 1e-6,
+            iterations: 20
         )
-        XCTAssertEqual(mixed[0], 0.5 * (1 * 2 + 0.25) + 0.5 * (2 * 1 + 0.25), accuracy: 1e-6)
-        XCTAssertEqual(mixed[1], 0.5 * (1 * 2 - 0.25) + 0.5 * (2 * 1 - 0.25), accuracy: 1e-6)
+        XCTAssertEqual(coefficients.logits.count, 8)
+        XCTAssertEqual(coefficients.logits[0], rstd, accuracy: 1e-5)
+        XCTAssertEqual(coefficients.logits[1], 0, accuracy: 1e-6)
+        XCTAssertEqual(coefficients.logits[3], rstd, accuracy: 1e-5)
+
+        XCTAssertEqual(coefficients.pre.count, 2)
+        XCTAssertEqual(coefficients.pre[0], pre0, accuracy: 1e-6)
+        XCTAssertEqual(coefficients.pre[1], 0.5 + 1e-6, accuracy: 1e-6)
+
+        XCTAssertEqual(coefficients.post.count, 2)
+        XCTAssertEqual(coefficients.post[0], 1, accuracy: 1e-6)
+        XCTAssertEqual(coefficients.post[1], post1, accuracy: 1e-5)
+
+        XCTAssertEqual(coefficients.comb.count, 4)
+        for column in columnSums(coefficients.comb, dimension: 2) {
+            XCTAssertEqual(column, 1, accuracy: 1e-4)
+        }
     }
 
-    func testWriteAccumulatesIntoEveryStream() {
-        var streams: [[Float]] = [
-            [0, 0],
-            [0, 0]
-        ]
-        DeepSeekV41HyperConnections.write(
-            streams: &streams,
-            contribution: [1, -1],
-            writeScales: [0.5, 2]
+    /// A checkpoint with no usable `hc_*` tensors degenerates to a single stream
+    /// rather than to a guess: copy 0 is what a sub-layer reads, and every copy
+    /// keeps its own residual.
+    func testAMissingProjectionCollapsesToCopyZero() {
+        let coefficients = DeepSeekV41HyperConnections.coefficients(
+            streams: [[1, 2], [3, 4]],
+            projection: nil,
+            scale: [1, 1, 1],
+            base: [Float](repeating: 0, count: 8),
+            normalizationEpsilon: 1e-6,
+            epsilon: 1e-6,
+            iterations: 4
         )
-        XCTAssertEqual(streams[0], [0.5, -0.5])
-        XCTAssertEqual(streams[1], [2, -2])
+        XCTAssertEqual(coefficients.pre, [1, 0])
+        XCTAssertEqual(coefficients.post, [1, 1])
+        XCTAssertEqual(coefficients.comb, [1, 0, 0, 1])
+    }
+
+    func testPreCollapsesTheCopiesWithTheMix() {
+        let streams: [[Float]] = [[1, 0], [0, 2]]
+        XCTAssertEqual(
+            DeepSeekV41HyperConnections.pre(streams: streams, mix: [0.25, 0.75]),
+            [0.25, 1.5]
+        )
+        XCTAssertEqual(
+            DeepSeekV41HyperConnections.pre(streams: streams, mix: [1, 0]),
+            [1, 0]
+        )
+    }
+
+    func testPostExpandsTheOutputAndMixesTheResidualThroughComb() {
+        // y[j] = post[j] * x + sum_k comb[j][k] * residual[k]
+        let residual: [[Float]] = [[1, 0], [0, 1]]
+        let streams = DeepSeekV41HyperConnections.post(
+            output: [2, 2],
+            residual: residual,
+            gains: [0.5, 0],
+            comb: [0.25, 0.75, 0, 1]
+        )
+        // copy 0: 0.5 * (2, 2) + 0.25 * (1, 0) + 0.75 * (0, 1)
+        XCTAssertEqual(streams[0][0], 1.25, accuracy: 1e-6)
+        XCTAssertEqual(streams[0][1], 1.75, accuracy: 1e-6)
+        // copy 1: 0 * output + 0 * (1, 0) + 1 * (0, 1)
+        XCTAssertEqual(streams[1][0], 0, accuracy: 1e-6)
+        XCTAssertEqual(streams[1][1], 1, accuracy: 1e-6)
     }
 }
 

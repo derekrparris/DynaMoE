@@ -1480,3 +1480,186 @@ final class DeepSeekV41ChunkGoldenTests: XCTestCase {
         }
     }
 }
+
+
+final class DeepSeekV41HyperConnectionGoldenTests: XCTestCase {
+
+    private let copies = 2
+    private let dim = 3
+    private let positions = 2
+    private let iterations = 3
+
+    /// `[position][copy][dim]`: the residual stack at the top of the block.
+    private static let streams: [Float] = [
+        0.18014799058437347, -0.11942204087972641, 0.5299286246299744, 0.28954431414604187, -0.1107989177107811, 0.1348971426486969,
+        0.043549370020627975, -0.45149096846580505, -0.5061163902282715, 0.15697887539863586, -0.012074127793312073, 0.1101410910487175,
+    ]
+
+    /// `hc_attn_fn`, `[(2 + copies) * copies][copies * dim]`: one projection of the
+    /// WHOLE flattened stack, not a per-copy vector.
+    private static let projection: [Float] = [
+        0.1629350483417511, -0.4309690594673157, 0.6675387024879456, 0.025111142545938492, -0.48288843035697937, -0.24020372331142426,
+        -0.4900953471660614, 0.23738384246826172, -0.2998884320259094, 0.28869399428367615, 0.6714898943901062, 0.325715035200119,
+        -0.08899243175983429, -0.4129675030708313, -0.554512619972229, -0.046110015362501144, -0.33848661184310913, -0.22264650464057922,
+        0.0944766029715538, 0.5926108956336975, 0.11484197527170181, -0.35544946789741516, -0.45380163192749023, -0.11209123581647873,
+        0.17245732247829437, -0.024085644632577896, -0.46992331743240356, 1.1053669452667236, -0.24652095139026642, 0.3422376811504364,
+        -0.4156411290168762, -0.40709254145622253, -0.2346792221069336, 0.0862426608800888, 0.25975489616394043, 0.4710273742675781,
+        -0.2076146900653839, -0.2593022286891937, 0.09019841998815536, -0.09467784315347672, 0.22736142575740814, 0.2274526208639145,
+        -0.2593507468700409, -0.30378925800323486, 0.028640717267990112, 0.0028031168039888144, 0.24722759425640106, -0.08646807074546814,
+    ]
+
+    private static let scale: [Float] = [
+        0.699999988079071, -0.30000001192092896, 0.5,
+    ]
+
+    private static let base: [Float] = [
+        -0.08331266790628433, 0.11355224996805191, -0.029691580682992935, -0.1408289074897766, -0.11981578916311264, 0.06274773925542831,
+        -0.16496394574642181, 0.14416995644569397,
+    ]
+
+    /// `[position][copy]`: the mix the previous sub-layer produced.
+    private static let preMix: [Float] = [
+        0.6000000238418579, 0.4000000059604645, 0.20000000298023224, 0.800000011920929,
+    ]
+
+    private static let sublayerOutput: [Float] = [
+        0.25925618410110474, -0.1643882393836975, -0.003046460449695587, -0.28630444407463074, 1.0272610187530518, 0.15330597758293152,
+    ]
+
+    /// `[position][(2 + copies) * copies]`: the projected logits before the split.
+    private static let mixes: [Float] = [
+        1.7059236764907837, -0.8196538686752319, -0.9818565249443054, -0.2234995812177658, 0.6575939655303955, -0.3349415063858032,
+        0.07164214551448822, -0.12348410487174988, -0.5301551222801208, 0.33414098620414734, 1.510572075843811, -1.3325930833816528,
+        1.6314783096313477, 1.2026119232177734, 0.24216513335704803, 0.3443896174430847,
+    ]
+
+    /// `[position][copy]`: `sigmoid(...) + eps`.
+    private static let pre: [Float] = [
+        0.7522855997085571, 0.38693809509277344, 0.38831108808517456, 0.5860003232955933,
+    ]
+
+    /// `[position][copy]`: `2 * sigmoid(...)`.
+    private static let post: [Float] = [
+        1.1316639184951782, 0.9631272554397583, 0.7631524801254272, 1.1287559270858765,
+    ]
+
+    /// `[position][copy][copy]`, row-major per position.
+    private static let comb: [Float] = [
+        0.5652833580970764, 0.434714674949646, 0.4347156584262848, 0.5652843117713928, 0.5488578081130981, 0.45114201307296753,
+        0.45114120841026306, 0.5488570928573608,
+    ]
+
+    /// `[position][dim]`: the stack collapsed with the carried mix.
+    private static let collapse: [Float] = [
+        0.2239065170288086, -0.11597278714179993, 0.3719160556793213, 0.13429297506809235, -0.09995750337839127, -0.013110406696796417,
+    ]
+
+    /// `[position][copy][dim]`: `hc_post` of the sub-layer output.
+    private static let expanded: [Float] = [
+        0.5210949778556824, -0.301705539226532, 0.35475417971611023, 0.49168455600738525, -0.2728741765022278, 0.3036888539791107,
+        -0.12377190589904785, 0.5307052731513977, -0.11110090464353561, -0.2173619121313095, 0.949213445186615, 0.005166366696357727,
+    ]
+
+    private func stack(_ position: Int) -> [[Float]] {
+        (0..<copies).map { copy in
+            (0..<dim).map { dimension in
+                Self.streams[(position * copies + copy) * dim + dimension]
+            }
+        }
+    }
+
+    private func coefficients(_ position: Int) -> DeepSeekV41HyperConnections.Coefficients {
+        DeepSeekV41HyperConnections.coefficients(
+            streams: stack(position),
+            projection: DeepSeekV41Matrix(
+                rows: (2 + copies) * copies, columns: copies * dim, values: Self.projection
+            ),
+            scale: Self.scale,
+            base: Self.base,
+            normalizationEpsilon: 1e-6,
+            epsilon: 1e-6,
+            iterations: iterations
+        )
+    }
+
+    /// The logits are `hc_*_fn` applied to the FLATTENED stack and scaled by
+    /// `rsqrt(mean(x^2) + norm_eps)`. A per-copy projection produces the wrong count
+    /// here, and one without the RMS scaling the wrong magnitude.
+    func testTheProjectionSplitsIntoTheReferencesCoefficients() {
+        let mixCount = (2 + copies) * copies
+        for position in 0..<positions {
+            let coefficients = coefficients(position)
+            XCTAssertEqual(coefficients.logits.count, mixCount)
+            for index in 0..<mixCount {
+                XCTAssertEqual(
+                    coefficients.logits[index],
+                    Self.mixes[position * mixCount + index],
+                    accuracy: 1e-5,
+                    "position \(position) logit \(index)"
+                )
+            }
+            for copy in 0..<copies {
+                XCTAssertEqual(
+                    coefficients.pre[copy],
+                    Self.pre[position * copies + copy],
+                    accuracy: 1e-6,
+                    "position \(position) pre \(copy)"
+                )
+                XCTAssertEqual(
+                    coefficients.post[copy],
+                    Self.post[position * copies + copy],
+                    accuracy: 1e-6,
+                    "position \(position) post \(copy)"
+                )
+            }
+            for index in 0..<(copies * copies) {
+                XCTAssertEqual(
+                    coefficients.comb[index],
+                    Self.comb[position * copies * copies + index],
+                    accuracy: 1e-6,
+                    "position \(position) comb \(index)"
+                )
+            }
+        }
+    }
+
+    /// The collapse is a weighted sum over the copies using the mix the PREVIOUS
+    /// sub-layer produced, and the expansion mixes the residual back through `comb`:
+    /// `y[j] = post[j] * x + sum_k comb[j][k] * residual[k]`.
+    func testTheCollapseAndTheExpansionMatch() {
+        for position in 0..<positions {
+            let streams = stack(position)
+            let mix = (0..<copies).map { Self.preMix[position * copies + $0] }
+            let collapsed = DeepSeekV41HyperConnections.pre(streams: streams, mix: mix)
+            for dimension in 0..<dim {
+                XCTAssertEqual(
+                    collapsed[dimension],
+                    Self.collapse[position * dim + dimension],
+                    accuracy: 1e-5,
+                    "position \(position) collapse \(dimension)"
+                )
+            }
+
+            let coefficients = coefficients(position)
+            let output = (0..<dim).map {
+                Self.sublayerOutput[position * dim + $0]
+            }
+            let expanded = DeepSeekV41HyperConnections.post(
+                output: output,
+                residual: streams,
+                gains: coefficients.post,
+                comb: coefficients.comb
+            )
+            for copy in 0..<copies {
+                for dimension in 0..<dim {
+                    XCTAssertEqual(
+                        expanded[copy][dimension],
+                        Self.expanded[(position * copies + copy) * dim + dimension],
+                        accuracy: 1e-5,
+                        "position \(position) copy \(copy) dim \(dimension)"
+                    )
+                }
+            }
+        }
+    }
+}
