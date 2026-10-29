@@ -761,6 +761,44 @@ final class DeepSeekV41WeightCatalogTests: XCTestCase {
         XCTAssertTrue(catalog.unconsumed.isEmpty)
     }
 
+    /// `hc_*_fn` is one projection of the FLATTENED stack, not a per-copy vector.
+    /// The published checkpoint publishes `layers.N.hc_attn_fn` as `F32`
+    /// `[24, 20480]` (hc_mult 4 over a 5120-wide hidden state), so a catalog
+    /// carrying the shape the port used to read has to fail at load rather than run
+    /// a graph with the wrong coefficients.
+    func testHyperConnectionTensorsMustCarryTheProjectionShape() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let copies = max(1, config.hcMult)
+        let mixCount = (2 + copies) * copies
+        let columns = copies * DeepSeekV41TensorShapes(config: config).hidden
+
+        func problems(fnShape: [Int]) -> [String] {
+            var named: [DeepSeekV41TensorRef] = []
+            for layer in plan {
+                let l = layer.index
+                named.append(contentsOf: [
+                    tensor("layers.\(l).hc_attn_fn", "F32", fnShape),
+                    tensor("layers.\(l).hc_attn_base", "F32", [mixCount]),
+                    tensor("layers.\(l).hc_attn_scale", "F32", [3]),
+                    tensor("layers.\(l).hc_ffn_fn", "F32", [mixCount, columns]),
+                    tensor("layers.\(l).hc_ffn_base", "F32", [mixCount]),
+                    tensor("layers.\(l).hc_ffn_scale", "F32", [3])
+                ])
+            }
+            let catalog = DeepSeekV41WeightCatalog(named: named, layerCount: plan.count)
+            return catalog.validate(config: config, plan: plan).filter { $0.contains("hc_") }
+        }
+
+        XCTAssertEqual(problems(fnShape: [mixCount, columns]), [])
+        let wrong = problems(fnShape: [1, copies])
+        XCTAssertEqual(wrong.count, plan.count, "\(wrong)")
+        XCTAssertTrue(
+            wrong.allSatisfy { $0.contains("hc_attn_fn is [1, \(copies)], expected [\(mixCount), \(columns)]") },
+            "\(wrong)"
+        )
+    }
+
     func testUnknownTensorIsReportedAsUnconsumed() {
         let catalog = DeepSeekV41WeightCatalog(
             named: [tensor("layers.0.ffn.surprise_gate.weight", "BF16", [8, 64])],

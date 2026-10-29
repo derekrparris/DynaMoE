@@ -719,6 +719,11 @@ extension DeepSeekV41WeightCatalog {
                     (.hcFfnFn, "hc_ffn_fn"),
                     (.hcFfnBase, "hc_ffn_base")
                 ])
+                problems.append(
+                    contentsOf: hyperConnectionProblems(
+                        config: config, scope: .backbone, layer: l
+                    )
+                )
             }
             // Only the four `kv_source_layer_ids` layers publish compressor
             // weights: the other compressed layers read the rows their source
@@ -798,6 +803,11 @@ extension DeepSeekV41WeightCatalog {
                     (.hcFfnFn, "hc_ffn_fn"),
                     (.hcFfnBase, "hc_ffn_base")
                 ])
+                problems.append(
+                    contentsOf: hyperConnectionProblems(
+                        config: config, scope: .draft, layer: block
+                    )
+                )
             }
             if block == 0 {
                 required.append(contentsOf: [
@@ -839,6 +849,55 @@ extension DeepSeekV41WeightCatalog {
         // reads is either a new architecture feature or a corrupted manifest.
         if !unconsumed.isEmpty {
             problems.append(contentsOf: unconsumed.map { "unconsumed tensor: \($0)" })
+        }
+        return problems
+    }
+
+    /// The `hc_*` shapes, checked because they are load-bearing.
+    ///
+    /// `Block.hc_mixes` projects the FLATTENED `hc_mult * hidden` stack onto
+    /// `(2 + mult) * mult` logits and splits them three ways, so `hc_*_fn` is
+    /// `[(2 + mult) * mult][mult * hidden]` (24 x 20480 on the published checkpoint,
+    /// F32), `hc_*_base` carries `(2 + mult) * mult` values and `hc_*_scale` three.
+    /// A checkpoint whose `hc_*_fn` is a per-copy vector — which is what this port
+    /// used to read — now fails at load instead of degenerating to the identity
+    /// coefficient set at run time.
+    private func hyperConnectionProblems(
+        config: DeepSeekV41Config,
+        scope: DeepSeekV41TensorScope = .backbone,
+        layer: Int
+    ) -> [String] {
+        let mult = max(1, config.hcMult)
+        let mixCount = (2 + mult) * mult
+        let columns = mult * config.hiddenSize
+        var problems: [String] = []
+
+        for (function, bias, scale) in [
+            (DeepSeekV41TensorRole.hcAttnFn, DeepSeekV41TensorRole.hcAttnBase,
+             DeepSeekV41TensorRole.hcAttnScale),
+            (DeepSeekV41TensorRole.hcFfnFn, DeepSeekV41TensorRole.hcFfnBase,
+             DeepSeekV41TensorRole.hcFfnScale)
+        ] {
+            let prefix = scope == .draft ? "mtp.\(layer)" : "layers.\(layer)"
+            if let ref = tensor(function, scope: scope, layer: layer),
+               ref.shape != [mixCount, columns] {
+                problems.append(
+                    "\(prefix): \(ref.name) is \(ref.shape), expected "
+                        + "[\(mixCount), \(columns)] for hc_mult \(mult)"
+                )
+            }
+            if let ref = tensor(bias, scope: scope, layer: layer), ref.shape != [mixCount] {
+                problems.append(
+                    "\(prefix): \(ref.name) is \(ref.shape), expected [\(mixCount)]"
+                )
+            }
+            // `hc_*_scale` classifies with the scale flag, so the plain lookup misses
+            // it and the scale slot has to be asked.
+            let scaleRef = tensor(scale, scope: scope, layer: layer)
+                ?? tensor(scale, scope: scope, layer: layer, scale: true)
+            if let scaleRef, scaleRef.shape != [3] {
+                problems.append("\(prefix): \(scaleRef.name) is \(scaleRef.shape), expected [3]")
+            }
         }
         return problems
     }
