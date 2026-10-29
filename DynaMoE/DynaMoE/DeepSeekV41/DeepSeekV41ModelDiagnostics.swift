@@ -63,8 +63,8 @@ public enum DeepSeekV41LoadDiagnostics {
         if let preflight = DeepSeekV41Preflight.inspect(snapshotDir: snapshotDir) {
             lines.append("checkpoint: \(preflight.humanSummary)")
             if !preflight.isComplete {
-                let names = preflight.issues.prefix(4).map(\.name).joined(separator: ", ")
-                lines.append("download incomplete: missing \(names)")
+                let described = preflight.issues.prefix(4).map(\.humanDescription).joined(separator: "; ")
+                lines.append("download incomplete: \(described)")
             }
         }
 
@@ -86,7 +86,7 @@ public enum DeepSeekV41LoadDiagnostics {
         let catalog = DeepSeekV41WeightCatalog.from(summary: summary, layerCount: config.numHiddenLayers)
         let problems = catalog.validate(config: config, plan: plan)
         if problems.isEmpty {
-            lines.append("tensor catalog: every required tensor present, nothing unread")
+            lines.append("tensor catalog: every required tensor present and placed")
         } else {
             lines.append("tensor catalog: \(problems.count) problem(s)")
             lines.append(contentsOf: problems.prefix(12).map { "  \($0)" })

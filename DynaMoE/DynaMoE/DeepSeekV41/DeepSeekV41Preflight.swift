@@ -29,11 +29,29 @@ nonisolated public struct DeepSeekV41Preflight: Sendable, Equatable {
         public let expectedBytes: Int?
         /// Bytes actually present; nil when the file does not exist.
         public let actualBytes: Int?
+        /// Whether the safetensors header could be read. A present file whose
+        /// header is unreadable or zero-length is exactly the half-written
+        /// download this preflight exists to catch, so it is an issue, not a
+        /// reason to skip the shard.
+        public let headerReadable: Bool
+
+        public init(
+            name: String,
+            expectedBytes: Int?,
+            actualBytes: Int?,
+            headerReadable: Bool = true
+        ) {
+            self.name = name
+            self.expectedBytes = expectedBytes
+            self.actualBytes = actualBytes
+            self.headerReadable = headerReadable
+        }
 
         public var isMissing: Bool { actualBytes == nil }
 
         public var humanDescription: String {
             guard let actualBytes else { return "\(name): missing" }
+            guard headerReadable else { return "\(name): header unreadable, \(actualBytes) bytes" }
             guard let expectedBytes else { return "\(name): \(actualBytes) bytes" }
             let state = actualBytes < expectedBytes ? "short" : "larger than its header"
             return "\(name): \(state), \(actualBytes) of \(expectedBytes) bytes"
@@ -93,7 +111,20 @@ nonisolated public struct DeepSeekV41Preflight: Sendable, Equatable {
             let actual = size.int64Value
             present += 1
             bytes += actual
-            if let expected = expectedShardBytes(at: url), Int64(expected) != actual {
+            guard let expected = expectedShardBytes(at: url) else {
+                // Present but unreadable/zero-length header: report it as an issue
+                // instead of pretending the shard is complete.
+                issues.append(
+                    ShardIssue(
+                        name: name,
+                        expectedBytes: nil,
+                        actualBytes: Int(clamping: actual),
+                        headerReadable: false
+                    )
+                )
+                continue
+            }
+            if Int64(expected) != actual {
                 issues.append(
                     ShardIssue(name: name, expectedBytes: expected, actualBytes: Int(clamping: actual))
                 )

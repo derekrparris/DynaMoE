@@ -962,6 +962,27 @@ final class DeepSeekV41PreflightSizeTests: XCTestCase {
         XCTAssertTrue(issue.humanDescription.contains("short"), issue.humanDescription)
     }
 
+    /// A zero-length (or header-less) shard is exactly the half-written file the
+    /// preflight exists to catch; it must not validate as complete just because
+    /// its size could not be compared to a header.
+    func testShardWithAnUnreadableHeaderIsReported() throws {
+        let dir = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let name = "model-00001-of-00001.safetensors"
+        try Data().write(to: dir.appendingPathComponent(name))
+        try """
+        {"weight_map": {"a": "\(name)"}}
+        """.write(
+            to: dir.appendingPathComponent("model.safetensors.index.json"),
+            atomically: true, encoding: .utf8
+        )
+        let report = try XCTUnwrap(DeepSeekV41Preflight.inspect(snapshotDir: dir))
+        XCTAssertFalse(report.isComplete)
+        let issue = try XCTUnwrap(report.issues.first)
+        XCTAssertFalse(issue.headerReadable)
+        XCTAssertTrue(issue.humanDescription.contains("header unreadable"), issue.humanDescription)
+    }
+
     func testShardMatchingItsHeaderIsComplete() throws {
         let dir = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
