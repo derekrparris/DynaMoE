@@ -8580,6 +8580,74 @@ kernel void dsv41_engram_dequant_rows(
     outputRows[(uint64_t)row * headDim + dim] = unpack_e4m3(rowPtr[dim]) * scale;
 }
 
+/// MSL Kernel: the Engram write, `Engram.forward`'s gate and residual add.
+///
+/// The retrieved rows have already become one key per hyper-connection copy
+/// followed by one shared value (`kv = wkv(rows.flatten(-2))`). Each copy of the
+/// residual stream is gated by how well it matches its OWN key and the gate
+/// multiplies the value every copy shares:
+///
+///   score = dot(stream, key * w) * rstd(stream) * rstd(key) * dim^-0.5
+///   gate  = sigmoid(copysign(sqrt(max(|score|, 1e-6)), score))
+///   stream += gate * value
+///
+/// The signed square root before the sigmoid is the training kernel's, not a
+/// plain sigmoid of the score: it compresses the magnitude and keeps the sign,
+/// so a stream that matches its key in the wrong direction is not gated in.
+///
+/// One threadgroup per copy, because the score is a reduction over `dim` before
+/// the write pass can run. `streamBuffer` is updated in place: the residual is
+/// the layer's, and nothing else reads the copy being written.
+kernel void dsv41_engram_gate_f32(
+    device float* streamBuffer [[buffer(0)]],           // [mult * dim], in place
+    device const float* kvBuffer [[buffer(1)]],        // [(mult + 1) * dim]
+    device const float* queryWeight [[buffer(2)]],     // [mult * dim] or null
+    device const float* keyWeight [[buffer(3)]],       // [mult * dim] or null
+    device float* gateBuffer [[buffer(4)]],            // [mult] or null
+    constant uint32_t& dim [[buffer(5)]],
+    constant uint32_t& mult [[buffer(6)]],
+    constant float& eps [[buffer(7)]],
+    threadgroup float* sharedWarpSums [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]],
+    uint copy [[threadgroup_position_in_grid]]
+) {
+    if (dim == 0 || mult == 0 || copy >= mult) return;
+
+    device float* stream = streamBuffer + (uint64_t)copy * (uint64_t)dim;
+    device const float* key = kvBuffer + (uint64_t)copy * (uint64_t)dim;
+    device const float* value = kvBuffer + (uint64_t)mult * (uint64_t)dim;
+    uint64_t weightBase = (uint64_t)copy * (uint64_t)dim;
+    bool hasWeight = queryWeight != nullptr && keyWeight != nullptr;
+
+    // Normalized per (token, copy) over `dim`, never jointly over the copies.
+    float localStream = 0.0f;
+    float localKey = 0.0f;
+    float localDot = 0.0f;
+    for (uint32_t i = tid; i < dim; i += tgSize) {
+        float hidden = stream[i];
+        float k = key[i];
+        float weight = hasWeight ? queryWeight[weightBase + i] * keyWeight[weightBase + i] : 1.0f;
+        localStream += hidden * hidden;
+        localKey += k * k;
+        localDot += hidden * weight * k;
+    }
+    float streamSquares = threadgroup_reduce_sum(localStream, sharedWarpSums, tid, tgSize);
+    float keySquares = threadgroup_reduce_sum(localKey, sharedWarpSums, tid, tgSize);
+    float dot = threadgroup_reduce_sum(localDot, sharedWarpSums, tid, tgSize);
+
+    float streamRstd = rsqrt(streamSquares / (float)dim + eps);
+    float keyRstd = rsqrt(keySquares / (float)dim + eps);
+    float score = dot * streamRstd * keyRstd * rsqrt((float)dim);
+    float magnitude = max(fabs(score), 1e-6f);
+    float gate = 1.0f / (1.0f + exp(-copysign(sqrt(magnitude), score)));
+    if (gateBuffer != nullptr) gateBuffer[copy] = gate;
+
+    for (uint32_t i = tid; i < dim; i += tgSize) {
+        stream[i] += gate * value[i];
+    }
+}
+
 /// MSL Kernel: Sinkhorn normalization for the mHC mixing matrix.
 /// `logits` is an n x n block; the kernel exponentiates it and alternates row
 /// and column normalization `iterations` times, leaving a doubly-stochastic

@@ -258,9 +258,23 @@ nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
     /// `pairs.count <= capacity` (top-k times one arena slot per layer is the
     /// intended use).
     public func acquire(_ pairs: [(layer: Int, expert: Int)]) -> [Int] {
+        acquireDetailed(pairs).map(\.slot)
+    }
+
+    /// The same placement as `acquire`, reporting whether each pair was already
+    /// resident.
+    ///
+    /// A caller that fills slots from disk needs the distinction: a hit means the
+    /// slot already holds this pair's bytes, and a miss means the slot has to be
+    /// written before any kernel reads it. Re-deriving it from
+    /// `slot(forLayer:expert:)` before the call would race the placement the arena
+    /// itself just made.
+    public func acquireDetailed(
+        _ pairs: [(layer: Int, expert: Int)]
+    ) -> [(slot: Int, isHit: Bool)] {
         lock.lock()
         defer { lock.unlock() }
-        var out: [Int] = []
+        var out: [(slot: Int, isHit: Bool)] = []
         out.reserveCapacity(pairs.count)
         for pair in pairs {
             acquisitions += 1
@@ -268,7 +282,7 @@ nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
                 hits += 1
                 counter += 1
                 slots[existing] = Slot(layer: pair.layer, expert: pair.expert, lastUsed: counter)
-                out.append(existing)
+                out.append((slot: existing, isHit: true))
                 continue
             }
             let free = slots.firstIndex(where: { $0 == nil })
@@ -278,7 +292,7 @@ nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
             } else {
                 // Evict the least recently used pair.
                 guard let lru = slots.indices.min(by: { (slots[$0]?.lastUsed ?? 0) < (slots[$1]?.lastUsed ?? 0) }) else {
-                    out.append(0)
+                    out.append((slot: 0, isHit: false))
                     continue
                 }
                 index = lru
@@ -286,9 +300,22 @@ nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
             }
             counter += 1
             slots[index] = Slot(layer: pair.layer, expert: pair.expert, lastUsed: counter)
-            out.append(index)
+            out.append((slot: index, isHit: false))
         }
         return out
+    }
+
+    /// Forgets what a slot holds, so the next `acquire` for that pair is a miss.
+    ///
+    /// Needed by the streaming path: a read that fails part way leaves a slot whose
+    /// identity claims bytes it does not have, and `acquire` would serve it as a hit
+    /// forever. The bytes are left alone; the identity is what decides whether they
+    /// are ever read.
+    public func vacate(slot: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard slot >= 0, slot < slots.count else { return }
+        slots[slot] = nil
     }
 
     /// Slot index currently holding a pair, or nil when it is not resident.

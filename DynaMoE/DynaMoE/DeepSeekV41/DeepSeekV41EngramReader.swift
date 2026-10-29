@@ -250,6 +250,33 @@ nonisolated public final class DeepSeekV41EngramReader: @unchecked Sendable {
 
 // MARK: - Lookup
 
+/// Builds the compressed token map both backends hash with.
+nonisolated public extension DeepSeekV41EngramTokenMap {
+
+    /// Reads the checkpoint's tokenizer and compiles the compressed vocabulary the
+    /// n-grams hash over.
+    ///
+    /// This is load work rather than per-turn work: the map is one entry per
+    /// vocabulary token and it decides every row the Engram layers read.
+    static func make(
+        snapshotDir: URL,
+        config: DeepSeekV41Config
+    ) throws -> DeepSeekV41EngramTokenMap {
+        let tokenizer = try DynaMoeTokenizer(
+            tokenizerPath: snapshotDir.appendingPathComponent("tokenizer.json").path
+        )
+        let compiled = try tokenizer.buildEngramTokenMap(
+            expectedCompressedVocabSize: UInt32(clamping: config.engramCompressedVocabSize),
+            padTokenId: UInt32(clamping: config.engramPadTokenID)
+        )
+        return try DeepSeekV41EngramTokenMap(
+            lookup: compiled.lookup,
+            compressedVocabSize: Int(compiled.compressedVocabSize),
+            padID: compiled.padId
+        )
+    }
+}
+
 /// Where the forward gets one position's Engram rows.
 ///
 /// The forward owns the token history and therefore the hash inputs; a lookup only
@@ -300,17 +327,8 @@ nonisolated public final class DeepSeekV41EngramStreamingLookup: DeepSeekV41Engr
         readers: [Int: DeepSeekV41EngramReader],
         layouts: [Int: DeepSeekV41EngramLayout]
     ) throws -> DeepSeekV41EngramStreamingLookup {
-        let tokenizer = try DynaMoeTokenizer(
-            tokenizerPath: snapshotDir.appendingPathComponent("tokenizer.json").path
-        )
-        let compiled = try tokenizer.buildEngramTokenMap(
-            expectedCompressedVocabSize: UInt32(clamping: config.engramCompressedVocabSize),
-            padTokenId: UInt32(clamping: config.engramPadTokenID)
-        )
-        let tokenMap = try DeepSeekV41EngramTokenMap(
-            lookup: compiled.lookup,
-            compressedVocabSize: Int(compiled.compressedVocabSize),
-            padID: compiled.padId
+        let tokenMap = try DeepSeekV41EngramTokenMap.make(
+            snapshotDir: snapshotDir, config: config
         )
         return DeepSeekV41EngramStreamingLookup(
             readers: readers, layouts: layouts, tokenMap: tokenMap

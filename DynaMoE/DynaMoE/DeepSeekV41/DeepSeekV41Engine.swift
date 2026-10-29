@@ -205,6 +205,8 @@ nonisolated public struct DeepSeekV41Pipelines {
     public let mxfp4SwiGLU: MTLComputePipelineState
     public let mxfp4DownAccumulate: MTLComputePipelineState
     public let engramDequantRows: MTLComputePipelineState
+    /// The Engram gate and residual add, one threadgroup per hyper-connection copy.
+    public let engramGate: MTLComputePipelineState
     public let hcSinkhorn: MTLComputePipelineState
     public let rope: MTLComputePipelineState
     public let storeLatent: MTLComputePipelineState
@@ -244,6 +246,7 @@ nonisolated public struct DeepSeekV41Pipelines {
         self.mxfp4SwiGLU = try make("dsv41_mxfp4_swiglu_gate_up")
         self.mxfp4DownAccumulate = try make("dsv41_mxfp4_down_accumulate")
         self.engramDequantRows = try make("dsv41_engram_dequant_rows")
+        self.engramGate = try make("dsv41_engram_gate_f32")
         self.hcSinkhorn = try make("dsv41_hc_sinkhorn")
         self.rope = try make("dsv41_rope_latent")
         self.storeLatent = try make("dsv41_store_latent_f16")
@@ -339,6 +342,13 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
     public let cache: DeepSeekV41KVCache
     public let memoryPlan: DeepSeekV41MemoryPlan
     public let arena: DeepSeekV41ExpertArena
+    /// Fills the arena slots from the shard files. Nil means the routed experts are
+    /// bound through the zero-copy shard mappings instead, which is correct and
+    /// several times slower: every expert matrix is a page-fault walk.
+    public let expertStreamer: DeepSeekV41ExpertStreamer?
+    /// Why there is no streamer, so the readiness line names a reason instead of
+    /// leaving "no streaming" to be read as "streaming is fine here".
+    public let expertStreamerProblem: String?
     public let dspark: DeepSeekV41DSparkPlan
     public let contextLength: Int
     /// The precision the KV cache is actually allocated at. The checkpoint's
@@ -347,13 +357,21 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
     public let cachePrecision: DeepSeekV41CachePrecision
 
     /// Debug-only: let the two Engram layers run with no memory read at all
-    /// instead of refusing the turn. The refusal is deliberate (a wrong
+    /// instead of reading their tables. The opt-out is deliberate (a wrong
     /// combination reads the right rows and mixes them wrongly, which looks like
     /// "the memory model does nothing"), so this is off unless the user opts in
     /// with `dynamoe_dsv41_engram_off`, and the load log and readiness report say
     /// so every time. It exists to exercise the other 38 layers on a machine that
     /// has already paid for the 510 GB download.
     public let allowEngramSkip: Bool
+
+    /// The compressed vocabulary the Engram hashes are drawn from, built from the
+    /// checkpoint's tokenizer at load. Nil when the checkpoint has no Engram table
+    /// or no tokenizer could be read, in which case `engramProblem` says why.
+    public let engramTokenMap: DeepSeekV41EngramTokenMap?
+    /// Why the token map is missing. The device executor turns it into a wiring
+    /// problem rather than reading rows through a stand-in map.
+    public let engramProblem: String?
 
     public let device: MTLDevice
     public let commandQueue: MTLCommandQueue
@@ -467,6 +485,34 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
             DeepSeekV41MemoryPlan.affordableExpertSlots(plan: memoryPlan, physicalGB: physicalGB),
             max(1, config.numRoutedExperts * max(1, config.numHiddenLayers))
         )
+        let arena = DeepSeekV41ExpertArena(slotCount: slotCount)
+
+        // The routed mixture is a working set this machine reads, not a weight it
+        // holds: 15,360 whole-expert pairs at ~19 MB each. Filling the arena from
+        // the shards with pread is what makes a token's expert traffic a linear read
+        // instead of one page fault per 16 KB, so the streamer is built here rather
+        // than lazily. It is optional on purpose: a checkpoint whose experts do not
+        // resolve to one slot layout still runs through the shard mappings, just
+        // slowly, and the readiness line says which path is in use.
+        var streamer: DeepSeekV41ExpertStreamer?
+        var streamerProblem: String?
+        if let snapshotDir {
+            do {
+                streamer = try DeepSeekV41ExpertStreamer(
+                    device: device,
+                    weights: weights,
+                    summary: summary,
+                    snapshotDir: snapshotDir,
+                    arena: arena,
+                    config: config,
+                    plan: plan
+                )
+            } catch {
+                streamerProblem = "\(error)"
+            }
+        } else {
+            streamerProblem = "the snapshot directory is unknown, so the expert shards cannot be read"
+        }
 
         self.config = config
         self.plan = plan
@@ -474,11 +520,36 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         self.weights = weights
         self.cache = cache
         self.memoryPlan = memoryPlan
-        self.arena = DeepSeekV41ExpertArena(slotCount: slotCount)
+        self.arena = arena
+        self.expertStreamer = streamer
+        self.expertStreamerProblem = streamerProblem
         self.dspark = DeepSeekV41DSparkPlan.make(config: config)
         self.contextLength = contextLength
         self.cachePrecision = cachePrecision
         self.allowEngramSkip = allowEngramSkip
+        // The Engram hash reads the checkpoint's compressed vocabulary, so the map
+        // is compiled from the shipped tokenizer once, at load. A checkpoint with no
+        // table needs neither the parse nor the map.
+        if !config.engramTables.isEmpty, !allowEngramSkip {
+            if let snapshotDir {
+                do {
+                    let map = try DeepSeekV41EngramTokenMap.make(
+                        snapshotDir: snapshotDir, config: config
+                    )
+                    self.engramTokenMap = map
+                    self.engramProblem = nil
+                } catch {
+                    self.engramTokenMap = nil
+                    self.engramProblem = "the Engram token map could not be built: \(error)"
+                }
+            } else {
+                self.engramTokenMap = nil
+                self.engramProblem = "the snapshot directory is unknown, so the Engram token map is unavailable"
+            }
+        } else {
+            self.engramTokenMap = nil
+            self.engramProblem = nil
+        }
         self.device = device
         self.commandQueue = commandQueue
         self.pipelines = pipelines
@@ -497,11 +568,30 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         return built
     }
 
+    /// Releases the descriptors and slot buffers this runtime owns.
+    ///
+    /// Called when a new runtime replaces it (a different checkpoint, or a turn that
+    /// needs more context). Without it the Engram tables and the 48 expert shards
+    /// stay open for the life of the process.
+    public func shutdown() {
+        cachedForward = nil
+        weights.close()
+        expertStreamer?.close()
+        arena.reset()
+    }
+
     /// One-line readiness report for the load log.
     public func describe() -> String {
         var lines: [String] = []
         lines.append("cache: \(cache.layout.describe()) at \(cachePrecision.rawValue)")
         lines.append("memory: \(memoryPlan.describe(expertSlots: arena.capacity))")
+        if let expertStreamer {
+            lines.append(expertStreamer.describe())
+        } else {
+            lines.append(
+                "experts: read through the shard mappings (\(expertStreamerProblem ?? "no streamer"))"
+            )
+        }
         lines.append(
             "dspark: " + (dspark.isEnabled
                 ? "block \(dspark.blockSize) over layers \(dspark.targetLayerIDs)"
@@ -515,6 +605,80 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
             lines.append("not runnable: \(DeepSeekV41EngineError.modelNotRunnable(weights.problems))")
         }
         return lines.joined(separator: "\n")
+    }
+}
+
+// MARK: - Engram staging
+
+/// Where one Engram table's rows are staged for the device path.
+///
+/// The table itself is never a buffer (~100 GB is past every `maxBufferLength`),
+/// so one position's rows are preaded into `engramRaw` and dequantized into
+/// `engramValues`. Both buffers carry one block PER TABLE rather than one shared
+/// block, which is the double buffering the memory plan prices: the two Engram
+/// layers are far apart in the stack, and giving each its own block means a
+/// read for one table can never land under a kernel still reading the other.
+nonisolated public struct DeepSeekV41EngramSlot: Sendable, Equatable {
+    /// Layer that owns the table.
+    public let layer: Int
+    /// Index into `config.engramTables`, which is what `layer.engramTable` holds.
+    public let table: Int
+    /// `(max_ngram_size - 1) * n_heads` rows: the hash columns of one position.
+    public let columns: Int
+    public let headDimension: Int
+    /// E4M3 values plus one E8M0 scale per 32.
+    public let rowBytes: Int
+    /// Byte offset of this table's raw row block in `engramRaw`.
+    public let rawByteOffset: Int
+    /// Element offset of this table's decoded rows in `engramValues`.
+    public let valueOffset: Int
+
+    public var rawByteCount: Int { columns * rowBytes }
+    public var valueCount: Int { columns * headDimension }
+    public var valueByteOffset: Int { valueOffset * MemoryLayout<Float>.stride }
+    /// Width of the concatenated rows the `wkv` projection reads.
+    public var flatWidth: Int { columns * headDimension }
+
+    /// One slot per Engram table, in `config.engramTables` order so the index is
+    /// `layer.engramTable`. A table with no hash columns gets an empty slot rather
+    /// than being dropped: the caller looks slots up by index, and shifting the
+    /// array would hand a layer its neighbour's rows.
+    public static func slots(config: DeepSeekV41Config) -> [DeepSeekV41EngramSlot] {
+        var rawCursor = 0
+        var valueCursor = 0
+        return config.engramTables.enumerated().map { table, spec in
+            let columns = max(1, spec.maxNgramSize - 1) * spec.headCount
+            let slot = DeepSeekV41EngramSlot(
+                layer: spec.layer,
+                table: table,
+                columns: columns,
+                headDimension: spec.headDimension,
+                rowBytes: spec.rowBytes,
+                rawByteOffset: rawCursor,
+                valueOffset: valueCursor
+            )
+            rawCursor += slot.rawByteCount
+            valueCursor += slot.valueCount
+            return slot
+        }
+    }
+
+    public init(
+        layer: Int,
+        table: Int,
+        columns: Int,
+        headDimension: Int,
+        rowBytes: Int,
+        rawByteOffset: Int,
+        valueOffset: Int
+    ) {
+        self.layer = layer
+        self.table = table
+        self.columns = columns
+        self.headDimension = headDimension
+        self.rowBytes = rowBytes
+        self.rawByteOffset = rawByteOffset
+        self.valueOffset = valueOffset
     }
 }
 
@@ -552,6 +716,17 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
     public let logits: MTLBuffer
     public let rowIndices: MTLBuffer
     public let tokenIDs: MTLBuffer
+    /// One staging block per Engram table: this position's raw rows, preaded.
+    public let engramRaw: MTLBuffer
+    /// The same rows dequantized to FP32, which is what the `wkv` projection reads.
+    public let engramValues: MTLBuffer
+    /// The `wkv` output for one Engram layer: one key per hyper-connection copy,
+    /// followed by the one value every copy shares.
+    public let engramKV: MTLBuffer
+    /// The gate each copy's residual was mixed with, kept for a probe readback.
+    public let engramGates: MTLBuffer
+    /// Where each Engram table's rows stage. Empty when the checkpoint has none.
+    public let engramSlots: [DeepSeekV41EngramSlot]
     /// Rows the gather allocates for one layer's attention: window + compressed.
     public let gatherRows: Int
 
@@ -564,6 +739,13 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
         // provisioned wider than this.
         let gather = DeepSeekV41DevicePlan.gatherRowBudget(config: config)
         let float4: (Int) -> Int = { $0 * MemoryLayout<Float>.stride }
+        // Engram staging is sized for exactly the rows one position reads, which is
+        // well under the 64-row block the memory plan prices, so the allocation can
+        // never outgrow the budget the load log reports.
+        let engramSlots = DeepSeekV41EngramSlot.slots(config: config)
+        let engramRawBytes = engramSlots.reduce(0) { $0 + $1.rawByteCount }
+        let engramValueCount = engramSlots.reduce(0) { $0 + $1.valueCount }
+        let engramKVCount = (mult + 1) * shapes.hidden
 
         func make(_ bytes: Int) -> MTLBuffer? {
             device.makeBuffer(length: max(bytes, 16), options: .storageModeShared)
@@ -588,7 +770,11 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
               let streams = make(float4(mult * shapes.hidden)),
               let logits = make(float4(config.vocabSize)),
               let rowIndices = make(4 * gather),
-              let tokenIDs = make(4) else {
+              let tokenIDs = make(4),
+              let engramRaw = make(engramRawBytes),
+              let engramValues = make(float4(engramValueCount)),
+              let engramKV = make(float4(engramKVCount)),
+              let engramGates = make(float4(mult)) else {
             return nil
         }
 
@@ -613,6 +799,11 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
         self.logits = logits
         self.rowIndices = rowIndices
         self.tokenIDs = tokenIDs
+        self.engramRaw = engramRaw
+        self.engramValues = engramValues
+        self.engramKV = engramKV
+        self.engramGates = engramGates
+        self.engramSlots = engramSlots
         self.gatherRows = gather
     }
 }

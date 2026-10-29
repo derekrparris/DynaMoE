@@ -280,7 +280,14 @@ nonisolated public enum DeepSeekV41ForwardStages {
     /// Every stage a layer runs, in order. A window-only layer skips the compressor
     /// and reads no compressed rows but still runs the same attention stage over
     /// just its window.
+    ///
+    /// `.engram` is FIRST on purpose: the retrieved memory is added to the residual
+    /// stream at the top of the layer, before the attention sub-layer reads it
+    /// (`Model.forward` calls `layer.engram(h, ...)` ahead of `layer(...)`). Running
+    /// it beside the router instead would put the memory through the FFN's weights
+    /// after the attention half had already read a residual without it.
     public static let layerPipeline: [Stage] = [
+        .engram,
         .mixAttentionStreams,
         .attnNorm,
         .queryDown,
@@ -299,7 +306,6 @@ nonisolated public enum DeepSeekV41ForwardStages {
         .writeAttentionStreams,
         .mixFFNStreams,
         .ffnNorm,
-        .engram,
         .router,
         .routedExperts,
         .sharedExpert,

@@ -264,7 +264,11 @@ final class DeepSeekV41DevicePlanTests: XCTestCase {
         )
     }
 
-    func testAnEngramLayerIsReportedRatherThanGuessed() throws {
+    /// An Engram layer is served rather than refused: the rows it reads are a host
+    /// batch, the `wkv` projection and the gate are kernels, and nothing about the
+    /// wiring is a guess. What the conformance gate still records is that the
+    /// combination rule has no numeric reference vector behind it yet.
+    func testAnEngramLayerIsServedRatherThanRefused() throws {
         let json = DeepSeekV41TestFixtures.json
             .replacingOccurrences(of: "\"engram_layer_ids\": []", with: "\"engram_layer_ids\": [1]")
             .replacingOccurrences(of: "\"engram_num_embeddings\": []", with:
@@ -274,16 +278,20 @@ final class DeepSeekV41DevicePlanTests: XCTestCase {
         let config = try DeepSeekV41Config.decode(jsonData: Data(json.utf8))
         let plan = try config.makeLayerPlan()
         let problems = DeepSeekV41DevicePlan.problems(config: config, plan: plan)
-        XCTAssertTrue(
-            problems.contains { $0.contains("Engram") && $0.contains("layers.1") },
-            "expected the Engram problem, got \(problems)"
+        XCTAssertFalse(
+            problems.contains { $0.contains("Engram") },
+            "an Engram layer must not be refused: \(problems)"
+        )
+        XCTAssertEqual(
+            plan[1].engramTable, 0,
+            "the plan must bind the table the config names"
         )
     }
 
-    /// The debug opt-out (`dynamoe_dsv41_engram_off`) removes only the Engram
-    /// refusal: every other wiring problem is still reported, so a checkpoint with
-    /// a real defect cannot be run by flipping it.
-    func testEngramSkipDropsOnlyTheEngramProblem() throws {
+    /// The rig can only be enabled from the device plan, so it has to be honest
+    /// about the wiring: a table index the config does not describe is reported
+    /// instead of being read from the wrong rows.
+    func testAnEngramTableIndexOutsideTheConfigIsReported() throws {
         let json = DeepSeekV41TestFixtures.json
             .replacingOccurrences(of: "\"engram_layer_ids\": []", with: "\"engram_layer_ids\": [1]")
             .replacingOccurrences(of: "\"engram_num_embeddings\": []", with:
@@ -291,12 +299,54 @@ final class DeepSeekV41DevicePlanTests: XCTestCase {
                     + "\"engram_vocab_size\": 512, \"engram_n_heads\": 2, \"engram_head_dim\": 4, "
                     + "\"engram_compressed_vocab_size\": 128")
         let config = try DeepSeekV41Config.decode(jsonData: Data(json.utf8))
-        let plan = try config.makeLayerPlan()
-        let strict = DeepSeekV41DevicePlan.problems(config: config, plan: plan)
-        let relaxed = DeepSeekV41DevicePlan.problems(config: config, plan: plan, allowEngramSkip: true)
-        XCTAssertEqual(relaxed.count, strict.count - 1, "only the Engram line may disappear: \(relaxed)")
-        XCTAssertFalse(relaxed.contains { $0.contains("Engram") })
-        XCTAssertTrue(strict.contains { $0.contains("Engram") })
+        var plan = try config.makeLayerPlan()
+        // A plan that names a table the config never published is the shape of a
+        // stale plan, and it must not fall back to table 0.
+        let original = plan[1]
+        plan[1] = DeepSeekV41LayerPlan(
+            index: original.index,
+            flavor: original.flavor,
+            compressRatio: original.compressRatio,
+            compressedKVSource: original.compressedKVSource,
+            compressedIndexSource: original.compressedIndexSource,
+            isCandidateSource: original.isCandidateSource,
+            engramTable: 7,
+            ropeTable: original.ropeTable
+        )
+        let problems = DeepSeekV41DevicePlan.problems(config: config, plan: plan)
+        XCTAssertTrue(
+            problems.contains { $0.contains("Engram table index 7") },
+            "expected the table-index problem, got \(problems)"
+        )
+    }
+
+    /// The staging slots are addressed by `layer.engramTable`, so their order has to
+    /// stay `config.engramTables` order: a reordered array hands a layer its
+    /// neighbour's rows and every numeric check still passes.
+    func testEngramSlotsAreLaidOutInTableOrder() throws {
+        let json = DeepSeekV41TestFixtures.json
+            .replacingOccurrences(of: "\"engram_layer_ids\": []", with: "\"engram_layer_ids\": [1, 2]")
+            .replacingOccurrences(of: "\"engram_num_embeddings\": []", with:
+                "\"engram_num_embeddings\": [4096, 4096], \"engram_max_ngram_size\": 3, "
+                    + "\"engram_vocab_size\": 512, \"engram_n_heads\": 2, \"engram_head_dim\": 4, "
+                    + "\"engram_compressed_vocab_size\": 128")
+        let config = try DeepSeekV41Config.decode(jsonData: Data(json.utf8))
+        let slots = DeepSeekV41EngramSlot.slots(config: config)
+        XCTAssertEqual(slots.count, 2)
+        XCTAssertEqual(slots.map(\.layer), [1, 2])
+        XCTAssertEqual(slots.map(\.table), [0, 1])
+        // Two hash columns per head (a 3-gram table has bigrams and trigrams) times
+        // two heads, and 4-wide heads with no scale block past the first 32.
+        XCTAssertEqual(slots[0].columns, 4)
+        XCTAssertEqual(slots[0].flatWidth, 16)
+        XCTAssertEqual(slots[0].rowBytes, 4 + 1)
+        // The blocks are disjoint and in order, in both the raw and the decoded
+        // buffer: sharing them would let one table's read land under the other's
+        // dequantize.
+        XCTAssertEqual(slots[0].rawByteOffset, 0)
+        XCTAssertEqual(slots[1].rawByteOffset, slots[0].rawByteCount)
+        XCTAssertEqual(slots[0].valueOffset, 0)
+        XCTAssertEqual(slots[1].valueOffset, slots[0].valueCount)
     }
 
     func testACompressedLayerWithoutASelectionBudgetIsReported() throws {
@@ -832,5 +882,185 @@ final class DeepSeekV41PoolKernelTests: XCTestCase {
         )
         XCTAssertEqual(out[0], reference[0], accuracy: 1e-4)
         XCTAssertEqual(out[1], reference[1], accuracy: 1e-4)
+    }
+}
+
+// MARK: - Engram gate kernel
+
+final class DeepSeekV41EngramGateKernelTests: XCTestCase {
+
+    /// The kernel is the GPU half of `DeepSeekV41EngramCombination.contribution`, so
+    /// its expected numbers are the literals that suite pins from the checkpoint's
+    /// `Engram.forward` — not a second run of the same arithmetic.
+    ///
+    /// `kv` here is what the identity projection `DeepSeekV41EngramCombinationTests`
+    /// builds produces from the rows `[[1, 0], [0, 1]]`: the flattened rows repeated
+    /// once per key and once for the value.
+    func testKernelMatchesTheCheckpointGate() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+        guard let library = device.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "dsv41_engram_gate_f32"),
+              let pipeline = try? device.makeComputePipelineState(function: function),
+              let queue = device.makeCommandQueue() else {
+            XCTFail("Could not build the Engram gate pipeline")
+            return
+        }
+
+        let dim = 4
+        let mult = 2
+        let streams: [Float] = [1, 2, 3, 4, 0, 1, 0, 1]
+        // key 0, key 1, then the value every copy shares.
+        let kv: [Float] = [1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1]
+        let weights = [Float](repeating: 1, count: mult * dim)
+
+        guard let streamBuffer = device.makeBuffer(
+                  bytes: streams, length: streams.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let kvBuffer = device.makeBuffer(
+                  bytes: kv, length: kv.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let weightBuffer = device.makeBuffer(
+                  bytes: weights, length: weights.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let gateBuffer = device.makeBuffer(
+                  length: mult * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("Could not allocate the Engram gate buffers")
+            return
+        }
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(streamBuffer, offset: 0, index: 0)
+        encoder.setBuffer(kvBuffer, offset: 0, index: 1)
+        encoder.setBuffer(weightBuffer, offset: 0, index: 2)
+        encoder.setBuffer(weightBuffer, offset: 0, index: 3)
+        encoder.setBuffer(gateBuffer, offset: 0, index: 4)
+        var width = UInt32(dim)
+        var copies = UInt32(mult)
+        var epsilon: Float = 1e-6
+        encoder.setBytes(&width, length: 4, index: 5)
+        encoder.setBytes(&copies, length: 4, index: 6)
+        encoder.setBytes(&epsilon, length: 4, index: 7)
+        let lanes = 64
+        encoder.setThreadgroupMemoryLength((lanes / 32) * MemoryLayout<Float>.stride, index: 0)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: mult, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        let gate = gateBuffer.contents().assumingMemoryBound(to: Float.self)
+        XCTAssertEqual(gate[0], 0.756985, accuracy: 1e-5)
+        XCTAssertEqual(gate[1], 0.731058, accuracy: 1e-5)
+
+        let out = streamBuffer.contents().assumingMemoryBound(to: Float.self)
+        XCTAssertEqual(out[0], 1.756985, accuracy: 1e-4)
+        XCTAssertEqual(out[1], 2, accuracy: 1e-5)
+        XCTAssertEqual(out[2], 3, accuracy: 1e-5)
+        XCTAssertEqual(out[3], 4.756985, accuracy: 1e-4)
+        XCTAssertEqual(out[4], 0.731058, accuracy: 1e-5)
+        XCTAssertEqual(out[5], 1, accuracy: 1e-5)
+        XCTAssertEqual(out[6], 0, accuracy: 1e-5)
+        XCTAssertEqual(out[7], 1.731058, accuracy: 1e-4)
+    }
+
+    /// `q_weight * k_weight` is the per-copy reweighting, and the checkpoint
+    /// publishes both. The kernel is checked against the reference rule on a
+    /// NON-ones pair, because ones cannot tell a reweighted dot from a plain one.
+    func testKernelAppliesThePerCopyWeightPair() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+        guard let library = device.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "dsv41_engram_gate_f32"),
+              let pipeline = try? device.makeComputePipelineState(function: function),
+              let queue = device.makeCommandQueue() else {
+            XCTFail("Could not build the Engram gate pipeline")
+            return
+        }
+
+        let dim = 4
+        let mult = 2
+        let residual: [[Float]] = [[1, 2, 3, 4], [0, 1, 0, 1]]
+        let streams = residual.flatMap { $0 }
+        // `[[1, 0], [0, 1]]` through an identity projection, as in the CPU suite.
+        let kv: [Float] = [1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1]
+        let query = [Float](repeating: 1, count: mult * dim)
+        let key: [Float] = [2, 2, 0.5, 1, 1, 4, 1, 1]
+
+        guard let streamBuffer = device.makeBuffer(
+                  bytes: streams, length: streams.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let kvBuffer = device.makeBuffer(
+                  bytes: kv, length: kv.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let queryBuffer = device.makeBuffer(
+                  bytes: query, length: query.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let keyBuffer = device.makeBuffer(
+                  bytes: key, length: key.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let gateBuffer = device.makeBuffer(
+                  length: mult * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("Could not allocate the Engram gate buffers")
+            return
+        }
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(streamBuffer, offset: 0, index: 0)
+        encoder.setBuffer(kvBuffer, offset: 0, index: 1)
+        encoder.setBuffer(queryBuffer, offset: 0, index: 2)
+        encoder.setBuffer(keyBuffer, offset: 0, index: 3)
+        encoder.setBuffer(gateBuffer, offset: 0, index: 4)
+        var width = UInt32(dim)
+        var copies = UInt32(mult)
+        var epsilon: Float = 1e-6
+        encoder.setBytes(&width, length: 4, index: 5)
+        encoder.setBytes(&copies, length: 4, index: 6)
+        encoder.setBytes(&epsilon, length: 4, index: 7)
+        let lanes = 64
+        encoder.setThreadgroupMemoryLength((lanes / 32) * MemoryLayout<Float>.stride, index: 0)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: mult, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        // One-hot rows, so `wkv` is reproducible here without pulling the CPU
+        // matrix helper in: every row reads one flattened value.
+        var values = [Float](repeating: 0, count: dim * (mult + 1) * dim)
+        for row in 0..<(dim * (mult + 1)) { values[row * dim + row % dim] = 1 }
+        let reference = try XCTUnwrap(
+            DeepSeekV41EngramCombination.contribution(
+                residual: residual,
+                rows: [[1, 0], [0, 1]],
+                wkv: DeepSeekV41Matrix(rows: dim * (mult + 1), columns: dim, values: values),
+                queryWeight: query,
+                keyWeight: key,
+                epsilon: epsilon
+            )
+        )
+
+        let gate = gateBuffer.contents().assumingMemoryBound(to: Float.self)
+        for copy in 0..<mult {
+            XCTAssertEqual(gate[copy], reference.gates[copy], accuracy: 1e-4, "gate \(copy)")
+        }
+        let out = streamBuffer.contents().assumingMemoryBound(to: Float.self)
+        for index in 0..<(mult * dim) {
+            XCTAssertEqual(out[index], reference.streams[index / dim][index % dim], accuracy: 1e-4)
+        }
     }
 }

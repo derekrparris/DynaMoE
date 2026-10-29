@@ -233,6 +233,16 @@ public final class CompletionEngine: @unchecked Sendable {
     private var shardBuffers: [UInt32: MTLBuffer] = [:]
     private var activeLoadedModelPath: String?
     private var cachedPromptDialect: DeepSeekV41PromptDialect?
+    /// The DeepSeek-V4.1 runtime, kept across turns.
+    ///
+    /// Building it is load work, not turn work: it indexes 96k tensors, opens the
+    /// two Engram tables and the 48 expert shards, and allocates the caches and the
+    /// expert arena. Rebuilding it per turn also threw away the whole arena, so every
+    /// turn began with 240 cold expert reads (~4.5 GB from disk). The turn loop
+    /// resets the cache at the start of each turn, which is all the isolation a turn
+    /// needs. Keyed by snapshot path and the context it was provisioned for, because
+    /// a longer turn needs a larger cache.
+    private var cachedDeepSeekRuntime: (path: String, contextLength: Int, runtime: DeepSeekV41Runtime)?
 
     private init() {}
 
@@ -363,23 +373,58 @@ public final class CompletionEngine: @unchecked Sendable {
                 1,
                 min(dsConfig.maxPositionEmbeddings, request.sampling.maxTokens + request.promptTokenIds.count)
             )
-            if let runtime = DeepSeekV41Runtime(
+            // Reuse the runtime a previous turn built when it was provisioned for at
+            // least this much context. The engine is single-flight (checked at the
+            // top), so no other turn can be holding it.
+            var reused = false
+            var built: DeepSeekV41Runtime?
+            stateLock.lock()
+            if let cached = cachedDeepSeekRuntime,
+               cached.path == snapshotDir.path,
+               cached.contextLength >= contextLength {
+                built = cached.runtime
+                reused = true
+            }
+            stateLock.unlock()
+
+            let runtime: DeepSeekV41Runtime? = built ?? DeepSeekV41Runtime(
                 snapshotDir: snapshotDir,
                 summary: loadedSummary,
                 config: dsConfig,
                 shardBuffers: loadedShards,
                 contextLength: contextLength,
                 allowEngramSkip: DeepSeekV41Runtime.engramSkipRequested
-            ) {
+            )
+            if let runtime {
+                if !reused {
+                    // Installing a new runtime retires the old one, whose descriptors
+                    // and screen-sized slot buffers have to go back.
+                    stateLock.lock()
+                    let retired = cachedDeepSeekRuntime
+                    cachedDeepSeekRuntime = (
+                        path: snapshotDir.path,
+                        contextLength: contextLength,
+                        runtime: runtime
+                    )
+                    stateLock.unlock()
+                    retired?.runtime.shutdown()
+                }
                 if !runtime.isRunnable {
                     throw CompletionLaunchError.engineNotReady(
                         "⚠️ DeepSeek V4.1 Flash checkpoint cannot be run yet:\n"
                             + runtime.describe()
                     )
                 }
-                // The block forward runs a position on device now, so the refusal
-                // reports what is actually left (the turn loop) instead of claiming
-                // the graph is missing.
+                guard !request.promptTokenIds.isEmpty else {
+                    throw CompletionLaunchError.engineNotReady(
+                        "⚠️ Prompt tokenization produced 0 tokens."
+                    )
+                }
+                // The block forward runs a position on device, and the turn loop that
+                // drives prefill, sampling and streamed frames lives in
+                // `DeepSeekV41TurnRunner`. What it needs from the app — the sampler,
+                // the tokenizer, the frame sink — is passed in, so the loop itself
+                // stays nonisolated and testable without a model.
                 let forward = runtime.forward()
                 guard forward.isRunnable else {
                     throw CompletionLaunchError.engineNotReady(
@@ -387,11 +432,201 @@ public final class CompletionEngine: @unchecked Sendable {
                             + runtime.describe()
                     )
                 }
-                throw CompletionLaunchError.engineNotReady(
-                    "⚠️ DeepSeek V4.1 Flash is loaded, its caches are provisioned and its per-position "
-                        + "block forward is wired to Metal, but the turn loop that drives prefill, "
-                        + "sampling and streamed frames is not, so a turn cannot run yet.\n"
-                        + runtime.describe()
+
+                stateLock.lock()
+                generationCounter &+= 1
+                let myGenerationId = generationCounter
+                currentGenerationId = myGenerationId
+                stateLock.unlock()
+
+                let prep = TurnPrepInfo(
+                    // No prefix pin yet: the DeepSeek cache is not registered with
+                    // `PrefixCacheManager`, so every turn prefills its whole prompt.
+                    prefixTokensReused: 0,
+                    promptTokenCount: request.promptTokenIds.count,
+                    effectiveKVPrecision: runtime.cachePrecision == .fp16 ? .fp16 : .fp8,
+                    provisionedSequenceLength: runtime.contextLength
+                )
+
+                let engineSelf = self
+                let dsTokenizer = tokenizer
+                let dsSampling = request.sampling
+                let dsPromptIds = request.promptTokenIds
+                let dsFormattedPrompt = request.formattedPrompt
+                let dsStopSequences = request.stopSequences
+                let dsEosIDs = dsConfig.eosTokenIDs.map { UInt32(clamping: $0) }
+                let (stream, continuation) = AsyncStream.makeStream(
+                    of: CompletionEvent.self, bufferingPolicy: .unbounded
+                )
+                let handleTask = Task.detached(priority: .userInitiated) {
+                    func emit(_ event: CompletionEvent) { continuation.yield(event) }
+                    let isCurrentGeneration = { (id: UInt64) in
+                        engineSelf.isCurrentGenerationUnchecked(id)
+                    }
+                    engineSelf.turnDidBegin(myGenerationId)
+                    defer {
+                        engineSelf.turnDidEnd(id: myGenerationId)
+                        continuation.finish()
+                    }
+                    emit(.started)
+
+                    let startTime = CFAbsoluteTimeGetCurrent()
+                    var lastFrameTime = 0.0
+                    let settings = DeepSeekV41TurnRunner.Settings(
+                        temperature: dsSampling.temperature,
+                        topP: dsSampling.topP,
+                        minP: dsSampling.minP,
+                        topK: dsSampling.topK,
+                        repetitionPenalty: dsSampling.repetitionPenalty,
+                        presencePenalty: dsSampling.presencePenalty,
+                        maxTokens: dsSampling.maxTokens,
+                        eosTokenIds: dsEosIDs,
+                        stopSequences: dsStopSequences
+                    )
+                    do {
+                        let output = try DeepSeekV41TurnRunner.run(
+                            forward: forward,
+                            promptTokenIds: dsPromptIds,
+                            settings: settings,
+                            sample: { logits, generated in
+                                var scratch = logits
+                                return scratch.withUnsafeMutableBufferPointer { buffer in
+                                    InferenceEngine.sampleNextToken(
+                                        logits: buffer.baseAddress!,
+                                        vocabSize: buffer.count,
+                                        contextTokens: dsPromptIds + generated,
+                                        temperature: dsSampling.temperature,
+                                        topP: dsSampling.topP,
+                                        minP: dsSampling.minP,
+                                        topK: dsSampling.topK,
+                                        repetitionPenalty: dsSampling.repetitionPenalty,
+                                        presencePenalty: dsSampling.presencePenalty,
+                                        eosTokenIds: dsEosIDs
+                                    )
+                                }
+                            },
+                            decode: { ids in
+                                (try? dsTokenizer.decode(ids: ids)) ?? ""
+                            },
+                            onPrefill: { done, total in
+                                guard done == total || done % 8 == 0 else { return }
+                                emit(.prefillProgress(
+                                    status: "Prefilling \(done)/\(total)…",
+                                    speed: nil,
+                                    rssGB: WorkingSetManager.shared.effectiveResidentMemoryGB
+                                ))
+                            },
+                            onText: { text, tokens, elapsed in
+                                let now = CFAbsoluteTimeGetCurrent()
+                                guard tokens == 1 || now - lastFrameTime >= 0.016 || tokens % 4 == 0
+                                else { return }
+                                lastFrameTime = now
+                                let split = TurnTextSplitter.splitThinkingAndResponse(
+                                    raw: text,
+                                    promptRequestsThinking: TurnTextSplitter.promptRequestsThinking(
+                                        dsFormattedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    )
+                                )
+                                let thinking = split.thinkClose || split.thinkOpen ? split.think : ""
+                                let response = split.resp
+                                emit(.frame(CompletionFrame(
+                                    rawText: text,
+                                    thinkingText: thinking,
+                                    responseText: response,
+                                    isActivelyThinking: split.thinkOpen && !split.thinkClose,
+                                    tokensGenerated: tokens,
+                                    elapsedMs: elapsed * 1000,
+                                    tokensPerSecond: elapsed > 0 ? Double(tokens) / elapsed : 0,
+                                    timeToFirstTokenSeconds: nil,
+                                    thinkingDurationSeconds: nil,
+                                    jetSpecActive: false,
+                                    jetSpecMeanTau: 0,
+                                    jetSpecDraftAccepted: 0,
+                                    jetSpecDraftProposed: 0,
+                                    residentMemoryGB: WorkingSetManager.shared.effectiveResidentMemoryGB,
+                                    residentExpertCount: runtime.arena.residentCount,
+                                    totalExpertCount: runtime.arena.capacity,
+                                    cacheHitRatePercent: runtime.arena.hitRate * 100,
+                                    prefetchEfficiencyPercent: 0,
+                                    pagingLatencyMs: 0
+                                )))
+                            },
+                            isCancelled: {
+                                Task.isCancelled || !isCurrentGeneration(myGenerationId)
+                            }
+                        )
+                        emit(.prefillProgress(status: nil, speed: nil, rssGB: nil))
+
+                        if output.cancelled || Task.isCancelled || !isCurrentGeneration(myGenerationId) {
+                            emit(.failedTurn(TurnFailure(
+                                kind: .cancelled,
+                                message: "⏹ Generation stopped by user.",
+                                cancelled: true,
+                                tokensGenerated: output.tokensGenerated,
+                                isTechnicalError: false,
+                                clearStreamingPlaceholders: false
+                            )))
+                            return
+                        }
+
+                        let split = TurnTextSplitter.splitThinkingAndResponse(
+                            raw: output.text,
+                            promptRequestsThinking: TurnTextSplitter.promptRequestsThinking(
+                                dsFormattedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+                            )
+                        )
+                        let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
+                        emit(.finished(TurnResult(
+                            finishReason: output.finishReason,
+                            formattedPrompt: dsFormattedPrompt,
+                            promptTokenIds: dsPromptIds,
+                            generatedTokenIds: output.generatedTokenIds,
+                            rawDecodedText: output.text,
+                            thinkingText: split.thinkClose || split.thinkOpen ? split.think : "",
+                            responseText: split.resp,
+                            tokensGenerated: output.tokensGenerated,
+                            elapsedMs: elapsedMs,
+                            tokensPerSecond: output.tokensPerSecond,
+                            timeToFirstTokenSeconds: output.timeToFirstTokenSeconds,
+                            thinkingDurationSeconds: nil,
+                            jetSpecActive: false,
+                            jetSpecMeanTau: 0,
+                            jetSpecDraftAccepted: 0,
+                            jetSpecDraftProposed: 0,
+                            residentMemoryGB: WorkingSetManager.shared.effectiveResidentMemoryGB,
+                            residentExpertCount: runtime.arena.residentCount,
+                            totalExpertCount: runtime.arena.capacity,
+                            cacheHitRatePercent: runtime.arena.hitRate * 100,
+                            prefetchEfficiencyPercent: 0,
+                            pagingLatencyMs: 0,
+                            prefixTokensReused: 0,
+                            parsedToolCalls: [],
+                            actionableCallIndices: [],
+                            gestureSkipNotices: [:],
+                            brokenFragments: [],
+                            matchedStopSequence: output.matchedStopSequence
+                        )))
+                    } catch {
+                        emit(.prefillProgress(status: nil, speed: nil, rssGB: nil))
+                        emit(.failedTurn(TurnFailure(
+                            kind: .forwardPassFailed,
+                            message: "❌ DeepSeek V4.1 turn failed: \(error)",
+                            cancelled: Task.isCancelled,
+                            tokensGenerated: 0
+                        )))
+                    }
+                }
+                // The engine is single-flight: register the turn so a second launch
+                // is refused and `cancelActiveTurn` reaches this task.
+                stateLock.lock()
+                if currentGenerationId == myGenerationId {
+                    currentGenerationTask = handleTask
+                }
+                stateLock.unlock()
+                return CompletionLaunch(
+                    prep: prep,
+                    handle: CompletionTurnHandle(generationId: myGenerationId, task: handleTask),
+                    stream: stream
                 )
             }
             let checkpoint = DeepSeekV41Preflight.inspect(snapshotDir: snapshotDir)
@@ -10470,13 +10705,18 @@ if layer.attnGateProjTensor != nil,
         activeLoadedModelPath: String?
     ) {
         stateLock.lock()
-        defer { stateLock.unlock() }
         self.summary = summary
         self.modelConfig = modelConfig
         self.tokenizer = tokenizer
         self.shardBuffers = shardBuffers
         self.activeLoadedModelPath = activeLoadedModelPath
         self.cachedPromptDialect = nil
+        // A model switch retires the DeepSeek runtime with the checkpoint it was
+        // built for; its mapped shards and open tables must not outlive the load.
+        let retired = cachedDeepSeekRuntime
+        cachedDeepSeekRuntime = nil
+        stateLock.unlock()
+        retired?.runtime.shutdown()
     }
 
     /// The prompt dialect for the loaded checkpoint, resolved once from its own

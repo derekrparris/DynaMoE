@@ -1,0 +1,230 @@
+//
+//  DeepSeekV41TurnTests.swift
+//  DynaMoE
+//
+//  The turn loop's decisions, against a scripted executor: which token ends the
+//  turn, how many tokens the cap allows, where each appended token is forwarded,
+//  and what a cancelled turn reports.
+//
+//  The loop owns the arithmetic that a wrong answer hides behind plausible text: a
+//  position that is off by one re-reads a cache row the previous token already
+//  wrote, and an EOS set that misses an id runs a turn to its cap. Both are cheap to
+//  assert here and very expensive to notice in a 510 GB run.
+//
+
+import XCTest
+@testable import DynaMoE
+
+/// Answers every position with a scripted token, and records what it was asked to
+/// forward.
+private final class ScriptedForward: DeepSeekV41PositionForward, @unchecked Sendable {
+    let positionLimit: Int
+    /// Tokens the sampler is scripted to produce, in order. Exhausted means the
+    /// fake keeps returning the last value.
+    var scripted: [UInt32]
+    private(set) var forwardedTokens: [Int] = []
+    private(set) var forwardedPositions: [Int] = []
+    private(set) var resetCount = 0
+    /// Setting this makes the fake fail at a chosen position, so the loop's error
+    /// path is exercised without a GPU.
+    var failAtPosition: Int?
+    /// The failure the fake raises. A context overrun is not an error to the loop
+    /// (it ends the turn as length-capped), so the two are exercised separately.
+    var failure: DeepSeekV41EngineError = .missingTensor("test")
+
+    init(positionLimit: Int, scripted: [UInt32]) {
+        self.positionLimit = positionLimit
+        self.scripted = scripted
+    }
+
+    func reset() {
+        resetCount += 1
+        forwardedTokens = []
+        forwardedPositions = []
+    }
+
+    func forwardToken(_ token: Int, position: Int) throws -> [Float] {
+        if let failAtPosition, position == failAtPosition {
+            throw failure
+        }
+        forwardedTokens.append(token)
+        forwardedPositions.append(position)
+        // One logit per scripted token; the loop's sampler is the injectable, so the
+        // values only need a length the caller can read.
+        return [0, 1, 2, 3]
+    }
+}
+
+final class DeepSeekV41TurnLoopTests: XCTestCase {
+
+    private func settings(
+        maxTokens: Int,
+        eos: [UInt32] = [2],
+        stops: [String] = []
+    ) -> DeepSeekV41TurnRunner.Settings {
+        DeepSeekV41TurnRunner.Settings(
+            temperature: 0,
+            topP: 1,
+            minP: 0,
+            topK: 1,
+            repetitionPenalty: 1,
+            maxTokens: maxTokens,
+            eosTokenIds: eos,
+            stopSequences: stops
+        )
+    }
+
+    private func run(
+        forward: ScriptedForward,
+        prompt: [UInt32],
+        settings: DeepSeekV41TurnRunner.Settings,
+        decode: @escaping ([UInt32]) -> String = { $0.map(String.init).joined(separator: " ") },
+        cancelled: @escaping () -> Bool = { false }
+    ) throws -> DeepSeekV41TurnRunner.Output {
+        var cursor = 0
+        return try DeepSeekV41TurnRunner.run(
+            forward: forward,
+            promptTokenIds: prompt,
+            settings: settings,
+            sample: { _, _ in
+                let value = forward.scripted[min(cursor, forward.scripted.count - 1)]
+                cursor += 1
+                return value
+            },
+            decode: decode,
+            isCancelled: cancelled
+        )
+    }
+
+    func testAnEOSDrawEndsTheTurnWithoutAppendingIt() throws {
+        let forward = ScriptedForward(positionLimit: 64, scripted: [2])
+        let output = try run(
+            forward: forward,
+            prompt: [10, 11, 12],
+            settings: settings(maxTokens: 16)
+        )
+        XCTAssertEqual(output.finishReason, .eos)
+        XCTAssertEqual(output.tokensGenerated, 0)
+        XCTAssertTrue(output.generatedTokenIds.isEmpty)
+        // The prompt was forwarded, and nothing else: the EOS draw never becomes a
+        // position of its own.
+        XCTAssertEqual(forward.forwardedPositions, [0, 1, 2])
+    }
+
+    func testTheCapBoundsTheTurnAndReportsLengthCapped() throws {
+        let forward = ScriptedForward(positionLimit: 64, scripted: [7])
+        let output = try run(
+            forward: forward,
+            prompt: [10],
+            settings: settings(maxTokens: 3)
+        )
+        XCTAssertEqual(output.finishReason, .lengthCapped)
+        XCTAssertEqual(output.tokensGenerated, 3)
+        XCTAssertEqual(output.generatedTokenIds, [7, 7, 7])
+    }
+
+    func testEachAppendedTokenIsForwardedAtTheNextPosition() throws {
+        let forward = ScriptedForward(positionLimit: 64, scripted: [7])
+        _ = try run(forward: forward, prompt: [10, 11], settings: settings(maxTokens: 3))
+        // Positions 0 and 1 are the prompt; the token drawn after position 1 becomes
+        // the input at position 2, and so on.
+        XCTAssertEqual(forward.forwardedPositions, [0, 1, 2, 3])
+        XCTAssertEqual(forward.forwardedTokens, [10, 11, 7, 7])
+        XCTAssertEqual(forward.resetCount, 1)
+    }
+
+    func testAStopSequenceEndsTheTurnAndIsReported() throws {
+        let forward = ScriptedForward(positionLimit: 64, scripted: [5])
+        let output = try run(
+            forward: forward,
+            prompt: [10],
+            settings: settings(maxTokens: 16, stops: ["5 5"]),
+            decode: { $0.map(String.init).joined(separator: " ") }
+        )
+        XCTAssertEqual(output.finishReason, .stoppedBySequence)
+        XCTAssertEqual(output.matchedStopSequence, "5 5")
+        XCTAssertEqual(output.tokensGenerated, 2)
+    }
+
+    func testTheCapIsClampedToTheRemainingContext() throws {
+        // A prompt that leaves two positions must not ask the cache for a third.
+        let forward = ScriptedForward(positionLimit: 5, scripted: [7])
+        let output = try run(
+            forward: forward,
+            prompt: [10, 11, 12],
+            settings: settings(maxTokens: 100)
+        )
+        XCTAssertEqual(output.finishReason, .lengthCapped)
+        XCTAssertEqual(output.tokensGenerated, 1)
+    }
+
+    func testAPromptThatDoesNotFitIsRefusedBeforeAnyWork() throws {
+        let forward = ScriptedForward(positionLimit: 4, scripted: [7])
+        XCTAssertThrowsError(
+            try run(forward: forward, prompt: [1, 2, 3, 4, 5], settings: settings(maxTokens: 4))
+        ) { error in
+            guard case DeepSeekV41TurnError.promptTooLong(let tokens, let limit) = error else {
+                return XCTFail("expected promptTooLong, got \(error)")
+            }
+            XCTAssertEqual(tokens, 5)
+            XCTAssertEqual(limit, 4)
+        }
+        XCTAssertEqual(forward.forwardedPositions, [])
+    }
+
+    func testCancellationKeepsWhatWasAlreadyGenerated() throws {
+        let forward = ScriptedForward(positionLimit: 64, scripted: [7])
+        var draws = 0
+        let output = try DeepSeekV41TurnRunner.run(
+            forward: forward,
+            promptTokenIds: [10],
+            settings: settings(maxTokens: 16),
+            sample: { _, _ in
+                draws += 1
+                return 7
+            },
+            decode: { $0.map(String.init).joined(separator: " ") },
+            isCancelled: { draws >= 2 }
+        )
+        XCTAssertTrue(output.cancelled)
+        XCTAssertEqual(output.tokensGenerated, 2)
+        XCTAssertEqual(output.text, "7 7")
+    }
+
+    func testAnIncompleteMultiByteCharacterIsHeldBackFromTheText() throws {
+        // A BPE boundary in the middle of a character decodes to U+FFFD; streaming it
+        // would flash a placeholder the next token then replaces.
+        let forward = ScriptedForward(positionLimit: 64, scripted: [7])
+        let output = try run(
+            forward: forward,
+            prompt: [10],
+            settings: settings(maxTokens: 1),
+            decode: { _ in "hello\u{FFFD}" }
+        )
+        XCTAssertEqual(output.text, "hello")
+    }
+
+    func testAContextOverrunEndsTheTurnAsLengthCapped() throws {
+        // The loop treats the cache's own refusal as the end of the turn rather than
+        // as a failure: the tokens generated so far are real.
+        let forward = ScriptedForward(positionLimit: 64, scripted: [7])
+        forward.failAtPosition = 2
+        forward.failure = .contextTooLong(3, 64)
+        let output = try run(forward: forward, prompt: [10], settings: settings(maxTokens: 8))
+        XCTAssertEqual(output.finishReason, .lengthCapped)
+        XCTAssertEqual(output.tokensGenerated, 2)
+    }
+
+    func testAFailedForwardIsReportedWithItsPosition() throws {
+        let forward = ScriptedForward(positionLimit: 64, scripted: [7])
+        forward.failAtPosition = 2
+        XCTAssertThrowsError(
+            try run(forward: forward, prompt: [10], settings: settings(maxTokens: 4))
+        ) { error in
+            guard case DeepSeekV41TurnError.prefillFailed(let position, _) = error else {
+                return XCTFail("expected prefillFailed, got \(error)")
+            }
+            XCTAssertEqual(position, 2)
+        }
+    }
+}
