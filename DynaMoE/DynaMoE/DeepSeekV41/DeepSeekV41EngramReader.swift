@@ -49,6 +49,9 @@ nonisolated public enum DeepSeekV41EngramReadError: Error, Equatable, CustomStri
 /// disjoint offsets, so sharing it across the concurrent reads is safe.
 nonisolated private struct ReadContext: @unchecked Sendable {
     let fd: Int32
+    /// Byte offset of the table tensor inside the shard file. Requests carry
+    /// table-relative offsets, so every pread adds this base.
+    let baseOffset: Int
     let rowBytes: Int
     let requests: [DeepSeekV41EngramRowRequest]
     let destination: UnsafeMutableRawPointer
@@ -63,12 +66,12 @@ nonisolated private struct ReadContext: @unchecked Sendable {
                 fd,
                 slice.advanced(by: total),
                 rowBytes - total,
-                off_t(request.byteOffset + total)
+                off_t(baseOffset + request.byteOffset + total)
             )
             if got < 0 {
                 if errno == EINTR { continue }
                 failures.record(.shortRead(
-                    offset: request.byteOffset + total,
+                    offset: baseOffset + request.byteOffset + total,
                     wanted: rowBytes - total,
                     got: Int(got)
                 ))
@@ -76,7 +79,7 @@ nonisolated private struct ReadContext: @unchecked Sendable {
             }
             if got == 0 {
                 failures.record(.shortRead(
-                    offset: request.byteOffset + total,
+                    offset: baseOffset + request.byteOffset + total,
                     wanted: rowBytes - total,
                     got: 0
                 ))
@@ -110,6 +113,8 @@ nonisolated private final class FailureBox: @unchecked Sendable {
 nonisolated public final class DeepSeekV41EngramReader: @unchecked Sendable {
     public let spec: DeepSeekV41EngramSpec
     public let fileSize: Int
+    /// Byte offset of this table tensor inside the shard file.
+    public let baseOffset: Int
 
     private let descriptor: Int32
     private let lock = NSLock()
@@ -117,7 +122,16 @@ nonisolated public final class DeepSeekV41EngramReader: @unchecked Sendable {
 
     /// Opens the table file and validates it against the spec, so a truncated
     /// or half-downloaded table fails at load rather than mid-generation.
-    public init(fileURL: URL, spec: DeepSeekV41EngramSpec) throws {
+    public init(
+        fileURL: URL,
+        spec: DeepSeekV41EngramSpec,
+        baseOffset: Int = 0
+    ) throws {
+        guard baseOffset >= 0 else {
+            throw DeepSeekV41EngramReadError.cannotOpen(
+                "\(fileURL.lastPathComponent): negative table offset \(baseOffset)"
+            )
+        }
         let fd = open(fileURL.path, O_RDONLY | O_CLOEXEC)
         guard fd >= 0 else {
             throw DeepSeekV41EngramReadError.cannotOpen(
@@ -132,15 +146,18 @@ nonisolated public final class DeepSeekV41EngramReader: @unchecked Sendable {
             )
         }
         let size = Int(status.st_size)
-        guard size >= spec.totalBytes else {
+        // The table starts at the tensor's own offset inside the shard; only the
+        // bytes after that offset belong to it.
+        guard baseOffset <= size, size - baseOffset >= spec.totalBytes else {
             close(fd)
             throw DeepSeekV41EngramReadError.tableTooSmall(
-                expected: spec.totalBytes, actual: size
+                expected: baseOffset + spec.totalBytes, actual: size
             )
         }
         self.descriptor = fd
         self.spec = spec
         self.fileSize = size
+        self.baseOffset = baseOffset
     }
 
     deinit {
@@ -195,9 +212,9 @@ nonisolated public final class DeepSeekV41EngramReader: @unchecked Sendable {
                 )
             }
             guard request.byteOffset >= 0,
-                  request.byteOffset + rowBytes <= fileSize else {
+                  baseOffset + request.byteOffset + rowBytes <= fileSize else {
                 throw DeepSeekV41EngramReadError.rowOutOfRange(
-                    offset: request.byteOffset,
+                    offset: baseOffset + request.byteOffset,
                     length: rowBytes,
                     fileSize: fileSize
                 )
@@ -209,6 +226,7 @@ nonisolated public final class DeepSeekV41EngramReader: @unchecked Sendable {
         let failures = FailureBox()
         let shared = ReadContext(
             fd: fd,
+            baseOffset: baseOffset,
             rowBytes: rowBytes,
             requests: requests,
             destination: destination,

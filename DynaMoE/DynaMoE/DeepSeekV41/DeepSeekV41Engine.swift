@@ -154,7 +154,13 @@ nonisolated public final class DeepSeekV41DeviceWeights: @unchecked Sendable {
                 let shardName = summary.shards.first(where: { $0.index == tensor.shardIndex })?.filename
                     ?? "model-\(tensor.shardIndex).safetensors"
                 let tableURL = snapshotDir.appendingPathComponent(shardName)
-                if let reader = try? DeepSeekV41EngramReader(fileURL: tableURL, spec: spec) {
+                // Requests are table-relative; the tensor's own offset inside the
+                // shard is the base the reader adds before every pread.
+                if let reader = try? DeepSeekV41EngramReader(
+                    fileURL: tableURL,
+                    spec: spec,
+                    baseOffset: Int(tensor.offsetStart)
+                ) {
                     readers[spec.layer] = reader
                 }
             }

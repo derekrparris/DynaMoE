@@ -701,6 +701,41 @@ final class DeepSeekV41EngramReaderTests: XCTestCase {
         }
     }
 
+    /// The table is one tensor inside a shard, so requests are table-relative
+    /// while `pread` is file-relative. Forgetting the tensor's offset reads the
+    /// shard's own header bytes as if they were memory rows.
+    func testReadsAreOffsetByTheTensorsPositionInTheShard() throws {
+        let spec = spec()
+        let plain = try makeTable(rows: spec.rowCount, rowBytes: spec.rowBytes)
+        defer { try? FileManager.default.removeItem(at: plain) }
+        let table = try Data(contentsOf: plain)
+        let base = 64
+        var shard = Data(repeating: 0xAB, count: base)
+        shard.append(table)
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dsv41-engram-shard-\(UUID().uuidString).bin")
+        try shard.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let reader = try DeepSeekV41EngramReader(fileURL: url, spec: spec, baseOffset: base)
+        defer { reader.closeNow() }
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: spec.rowBytes, alignment: 8)
+        defer { buffer.deallocate() }
+        let row = 3
+        let request = DeepSeekV41EngramRowRequest(
+            layer: 1, column: 0, bucket: 0,
+            byteOffset: row * spec.rowBytes, byteCount: spec.rowBytes
+        )
+        _ = try reader.readRows([request], into: buffer)
+        let slice = buffer.assumingMemoryBound(to: UInt8.self)
+        var encoded: UInt32 = 0
+        for byte in 0..<4 {
+            encoded |= UInt32(slice[byte]) << (8 * UInt32(byte))
+        }
+        XCTAssertEqual(Int(encoded), row)
+        XCTAssertNotEqual(slice[0], 0xAB)
+    }
+
     func testTruncatedTableIsRefused() throws {
         let spec = spec()
         let url = try makeTable(rows: 8, rowBytes: spec.rowBytes)
