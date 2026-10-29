@@ -75,12 +75,16 @@ nonisolated public enum DeepSeekV41Conformance {
 
     /// How retrieved Engram rows are combined into the layer's residual.
     ///
-    /// Still an INFERENCE and known to disagree with the reference in two places:
-    /// `Engram.forward` forms `kv = wkv(embed(hashes).flatten(-2))`, splits it into a
-    /// per-hc-copy key and one shared value, and gates the VALUE by a normalized
-    /// dot product against the residual stream; the port instead softmaxes the rows
-    /// per head and adds the result to the post-`ffn_norm` input. Rewiring it moves
-    /// where the contribution lands in the residual, so it is its own pass.
+    /// The RULE now matches `Engram.forward` in the checkpoint's
+    /// `inference/model.py`: `kv = wkv(embed(hashes).flatten(-2))` splits into a
+    /// per-hc-copy key and one shared value, the value is gated by
+    /// `sigmoid(copysign(sqrt(dot), dot))` over a normalized dot of the stream
+    /// against its key, and the result is written into the residual stream at the
+    /// top of the layer (before attention) rather than into the post-`ffn_norm`
+    /// input. What is still missing is a numeric vector produced by a reference
+    /// run, so the gate stays open, and the device forward keeps refusing an Engram
+    /// layer until it flips: reading the right rows and mixing them wrongly looks
+    /// like "the memory model does nothing".
     public static let engramCombination: Gate = .unverified
 
     /// The mHC hyper-connection mixing rule.

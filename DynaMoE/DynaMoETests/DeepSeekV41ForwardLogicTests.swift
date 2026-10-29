@@ -138,8 +138,41 @@ enum DeepSeekV41TestFixtures {
                 source.set(generator.matrix(rows: shapes.expertIntermediate, columns: shapes.hidden), role: .expertW3, layer: l, expert: expert)
                 source.set(generator.matrix(rows: shapes.hidden, columns: shapes.expertIntermediate), role: .expertW2, layer: l, expert: expert)
             }
+            if let table = layer.engramTable {
+                let spec = config.engramTables[table]
+                let columns = max(1, spec.maxNgramSize - 1) * spec.headCount
+                source.set(
+                    generator.matrix(
+                        rows: shapes.hidden * (max(1, config.hcMult) + 1),
+                        columns: columns * spec.headDimension
+                    ),
+                    role: .engramWkv,
+                    layer: l
+                )
+                source.set(generator.vector(shapes.hidden * max(1, config.hcMult), scale: 0.1), role: .engramQuery, layer: l)
+                source.set(generator.vector(shapes.hidden * max(1, config.hcMult), scale: 0.1), role: .engramKey, layer: l)
+            }
         }
         return source
+    }
+
+    /// The fixture above with one Engram table on layer 1: two n-gram sizes times
+    /// two heads, so four hash columns of two values each.
+    static func engramConfig() throws -> DeepSeekV41Config {
+        let json = Self.json
+            .replacingOccurrences(of: "\"engram_layer_ids\": []", with: "\"engram_layer_ids\": [1]")
+            .replacingOccurrences(
+                of: "\"engram_num_embeddings\": []",
+                with: """
+                "engram_num_embeddings": [100],
+                        "engram_max_ngram_size": 3,
+                        "engram_n_heads": 2,
+                        "engram_head_dim": 2,
+                        "engram_vocab_size": 8,
+                        "engram_compressed_vocab_size": 8
+                """
+            )
+        return try DeepSeekV41Config.decode(jsonData: Data(json.utf8))
     }
 }
 
@@ -879,6 +912,209 @@ final class DeepSeekV41HyperConnectionTests: XCTestCase {
         )
         XCTAssertEqual(streams[0], [0.5, -0.5])
         XCTAssertEqual(streams[1], [2, -2])
+    }
+}
+
+// MARK: - Engram combination
+
+final class DeepSeekV41EngramCombinationTests: XCTestCase {
+
+    /// A projection whose row `r` is one-hot at column `r % width`, so `kv` is the
+    /// flattened rows repeated: one key per copy, then the shared value.
+    private func identityProjection(copies: Int, dim: Int) -> DeepSeekV41Matrix {
+        let rows = dim * (copies + 1)
+        var values = [Float](repeating: 0, count: rows * dim)
+        for row in 0..<rows { values[row * dim + row % dim] = 1 }
+        return DeepSeekV41Matrix(rows: rows, columns: dim, values: values)
+    }
+
+    private func ones(_ count: Int) -> [Float] { [Float](repeating: 1, count: count) }
+
+    /// The literals come from the checkpoint's `Engram.forward`: `kv = wkv(rows)`,
+    /// a per-copy key plus one shared value, and
+    /// `sigmoid(copysign(sqrt(dot * rstd * dim**-0.5), dot))` as the gate.
+    func testGateAndValueFollowTheCheckpointRule() throws {
+        let result = try XCTUnwrap(
+            DeepSeekV41EngramCombination.contribution(
+                residual: [[1, 2, 3, 4], [0, 1, 0, 1]],
+                rows: [[1, 0], [0, 1]],
+                wkv: identityProjection(copies: 2, dim: 4),
+                queryWeight: ones(8),
+                keyWeight: ones(8),
+                epsilon: 1e-6
+            )
+        )
+        XCTAssertEqual(result.gates.count, 2)
+        XCTAssertEqual(result.gates[0], 0.756985, accuracy: 1e-5)
+        XCTAssertEqual(result.gates[1], 0.731058, accuracy: 1e-5)
+        XCTAssertEqual(result.streams[0][0], 1.756985, accuracy: 1e-5)
+        XCTAssertEqual(result.streams[0][1], 2, accuracy: 1e-6)
+        XCTAssertEqual(result.streams[0][2], 3, accuracy: 1e-6)
+        XCTAssertEqual(result.streams[0][3], 4.756985, accuracy: 1e-5)
+        XCTAssertEqual(result.streams[1][0], 0.731058, accuracy: 1e-5)
+        XCTAssertEqual(result.streams[1][1], 1, accuracy: 1e-6)
+        XCTAssertEqual(result.streams[1][2], 0, accuracy: 1e-6)
+        XCTAssertEqual(result.streams[1][3], 1.731058, accuracy: 1e-5)
+    }
+
+    /// The gate carries the sign of the dot through `copysign`, so a stream that
+    /// points away from its key lands below 0.5 rather than at 1 - nothing.
+    func testGateIsSignedByTheDot() throws {
+        let result = try XCTUnwrap(
+            DeepSeekV41EngramCombination.contribution(
+                residual: [[-1, -2, -3, -4]],
+                rows: [[1, 0], [0, 1]],
+                wkv: identityProjection(copies: 1, dim: 4),
+                queryWeight: ones(4),
+                keyWeight: ones(4),
+                epsilon: 1e-6
+            )
+        )
+        XCTAssertEqual(result.gates[0], 0.243015, accuracy: 1e-5)
+        XCTAssertEqual(result.streams[0][0], -0.756985, accuracy: 1e-5)
+    }
+
+    /// `value` is shared by every copy; the gate is not. So the two deltas are
+    /// the same vector at two different scales.
+    func testTheValueIsSharedButTheGateIsNot() throws {
+        let residual: [[Float]] = [[1, 2, 3, 4], [0, 1, 0, 1]]
+        let result = try XCTUnwrap(
+            DeepSeekV41EngramCombination.contribution(
+                residual: residual,
+                rows: [[1, 0], [0, 1]],
+                wkv: identityProjection(copies: 2, dim: 4),
+                queryWeight: ones(8),
+                keyWeight: ones(8),
+                epsilon: 1e-6
+            )
+        )
+        let first = zip(result.streams[0], residual[0]).map { $0 - $1 }
+        let second = zip(result.streams[1], residual[1]).map { $0 - $1 }
+        XCTAssertNotEqual(result.gates[0], result.gates[1])
+        // Both deltas are `gate * value` on the same value.
+        for dimension in 0..<4 where first[dimension] != 0 {
+            XCTAssertEqual(second[dimension] / first[dimension], result.gates[1] / result.gates[0], accuracy: 1e-4)
+        }
+    }
+
+    /// The rows concatenate in column order, not per head or reversed: only the
+    /// second row's first value feeds this key, so swapping the two rows must move
+    /// the gate.
+    func testRowsConcatenateInColumnOrder() throws {
+        var values = [Float](repeating: 0, count: 12 * 4)
+        // key 0 reads the flattened vector's third value, i.e. row 2's first.
+        values[0 * 4 + 2] = 1
+        values[1 * 4 + 1] = 1
+        let projection = DeepSeekV41Matrix(rows: 12, columns: 4, values: values)
+        let residual: [[Float]] = [[1, 2, 3, 4], [0, 1, 0, 1]]
+
+        func gate(_ rows: [[Float]]) -> Float {
+            DeepSeekV41EngramCombination.contribution(
+                residual: residual,
+                rows: rows,
+                wkv: projection,
+                queryWeight: ones(8),
+                keyWeight: ones(8),
+                epsilon: 1e-6
+            )?.gates.first ?? 0
+        }
+
+        XCTAssertEqual(gate([[1, 2], [3, 4]]), 0.698880, accuracy: 1e-5)
+        XCTAssertEqual(gate([[3, 4], [1, 2]]), 0.709463, accuracy: 1e-5)
+    }
+
+    func testMissingProjectionOrRowsYieldsNoContribution() {
+        XCTAssertNil(
+            DeepSeekV41EngramCombination.contribution(
+                residual: [[1, 2, 3, 4]],
+                rows: [[1, 0], [0, 1]],
+                wkv: nil,
+                queryWeight: nil,
+                keyWeight: nil,
+                epsilon: 1e-6
+            )
+        )
+        XCTAssertNil(
+            DeepSeekV41EngramCombination.contribution(
+                residual: [[1, 2, 3, 4]],
+                rows: [],
+                wkv: identityProjection(copies: 1, dim: 4),
+                queryWeight: nil,
+                keyWeight: nil,
+                epsilon: 1e-6
+            )
+        )
+        // Two keys plus a value do not fit a projection this narrow, so the split
+        // is refused rather than read past the end.
+        XCTAssertNil(
+            DeepSeekV41EngramCombination.contribution(
+                residual: [[1, 2, 3, 4]],
+                rows: [[1, 0], [0, 1]],
+                wkv: DeepSeekV41Matrix(rows: 4, columns: 4, values: [Float](repeating: 1, count: 16)),
+                queryWeight: nil,
+                keyWeight: nil,
+                epsilon: 1e-6
+            )
+        )
+    }
+}
+
+final class DeepSeekV41EngramForwardTests: XCTestCase {
+
+    /// Rows for every hash column of the fixture's table, so the lookup is
+    /// non-empty without a ~100 GB table on disk.
+    private func weights(
+        config: DeepSeekV41Config,
+        plan: [DeepSeekV41LayerPlan],
+        withRows: Bool
+    ) -> DeepSeekV41DenseWeightSource {
+        let source = DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        guard withRows, let table = plan.first(where: { $0.engramTable != nil })?.engramTable else {
+            return source
+        }
+        let spec = config.engramTables[table]
+        let columns = max(1, spec.maxNgramSize - 1) * spec.headCount
+        for column in 0..<columns {
+            let row = (0..<spec.headDimension).map { Float($0 + column + 1) * 0.25 }
+            source.setEngramRow(row, layer: spec.layer, column: column)
+        }
+        return source
+    }
+
+    /// The contribution lands in the RESIDUAL, before attention reads it. Had it
+    /// been added to the post-`ffn_norm` input, the attention input would be
+    /// identical with and without rows.
+    func testEngramChangesWhatAttentionReads() throws {
+        let config = try DeepSeekV41TestFixtures.engramConfig()
+        let plan = try config.makeLayerPlan()
+        let layer = try XCTUnwrap(plan.first { $0.engramTable != nil }).index
+
+        let withoutRows = DeepSeekV41CPUForward(
+            config: config,
+            plan: plan,
+            weights: weights(config: config, plan: plan, withRows: false)
+        )
+        let withRows = DeepSeekV41CPUForward(
+            config: config,
+            plan: plan,
+            weights: weights(config: config, plan: plan, withRows: true)
+        )
+
+        _ = withoutRows.forwardToken(3, position: 0)
+        _ = withRows.forwardToken(3, position: 0)
+
+        let plain = try XCTUnwrap(withoutRows.attentionInput(layer: layer, position: 0))
+        let engrammed = try XCTUnwrap(withRows.attentionInput(layer: layer, position: 0))
+        XCTAssertNotEqual(plain, engrammed)
+        XCTAssertNil(withoutRows.engramGates[layer])
+
+        // One gate per hyper-connection copy, recorded once per position.
+        let gates = try XCTUnwrap(withRows.engramGates[layer])
+        XCTAssertEqual(gates.count, 1)
+        XCTAssertEqual(gates[0].count, max(1, config.hcMult))
+        XCTAssertTrue(gates[0].allSatisfy { $0 > 0 && $0 < 1 })
+        // A layer with no table records nothing.
+        XCTAssertNil(withRows.engramGates[(layer + 1) % plan.count])
     }
 }
 

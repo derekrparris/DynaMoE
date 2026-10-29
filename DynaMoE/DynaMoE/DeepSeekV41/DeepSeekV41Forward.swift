@@ -111,10 +111,12 @@ nonisolated public struct DeepSeekV41Matrix: Sendable, Equatable {
 nonisolated public protocol DeepSeekV41WeightSource: AnyObject {
     func matrix(_ role: DeepSeekV41TensorRole, layer: Int?, expert: Int?) -> DeepSeekV41Matrix?
     func vector(_ role: DeepSeekV41TensorRole, layer: Int?) -> [Float]?
-    /// Activation rows for one Engram column, or nil when the checkpoint/layer has
-    /// no Engram. Separated from `matrix` because those rows are streamed from disk
-    /// and never live in a buffer.
-    func engramRow(layer: Int, column: Int, head: Int) -> [Float]?
+    /// The row one Engram hash column addresses, or nil when the checkpoint/layer
+    /// has no Engram. Separated from `matrix` because those rows are streamed from
+    /// disk and never live in a buffer. There is one row per (n-gram size, head)
+    /// column, `engram_head_dim` wide, and the combination concatenates them in
+    /// column order (`EngramLayout.hashColumnCount` of them).
+    func engramRow(layer: Int, column: Int) -> [Float]?
 }
 
 public extension DeepSeekV41WeightSource {
@@ -156,10 +158,7 @@ nonisolated public final class DeepSeekV41DenseWeightSource: DeepSeekV41WeightSo
         vectors[Self.key(role, layer: layer)]
     }
 
-    public func engramRow(layer: Int, column: Int, head: Int) -> [Float]? {
-        // Rows are stored per (layer, column); the head only selects which slice of
-        // the row the caller wants, and the runtime flattens columns x heads into
-        // the same row set, so the head index is not part of the key.
+    public func engramRow(layer: Int, column: Int) -> [Float]? {
         engram["\(layer)|\(column)"]
     }
 }
@@ -309,76 +308,120 @@ nonisolated public enum DeepSeekV41ForwardStages {
 
 /// How retrieved Engram rows enter the layer.
 ///
-/// The checkpoint ships `engram.q_weight` and `engram.k_weight` and no output
-/// projection, so the memory must be combined in the space it is retrieved in:
-/// `q_weight` forms a per-head query over the `headDim`-wide rows, the softmax of
-/// each head's column scores mixes that head's rows into one vector, and
-/// `k_weight` projects the gated result back to the hidden width.
+/// The checkpoint's `Engram.forward` forms `kv = wkv(embed(hashes).flatten(-2))`,
+/// splits it into one key per `hc_mult` copy plus a single shared value, and gates
+/// that value by a normalized dot of the stream against its own key. There is no
+/// output projection, so nothing is projected back to the hidden width: the value
+/// is already `dim` wide.
 ///
-/// Gated by `DeepSeekV41Conformance.engramCombination` until the reference
-/// implementation is read; a wrong combination reads the right rows and mixes them
-/// wrongly, which is the failure that looks like "the memory model does nothing".
+/// It writes into the RESIDUAL stream, at the top of the layer, before the block's
+/// attention sub-layer (`Model.forward` calls `layer.engram(h, ...)` ahead of
+/// `layer(...)`). Adding it to the post-norm FFN input instead would put the
+/// contribution through the FFN's weights, which is not what the checkpoint does.
+///
+/// Gated by `DeepSeekV41Conformance.engramCombination`: the rule matches the
+/// reference, but no reference vector has been checked in against it yet.
 nonisolated public enum DeepSeekV41EngramCombination {
 
+    /// What one position's lookup writes into the residual, plus the gate it used
+    /// so a probe run can compare against the reference tensor.
+    public struct Contribution: Sendable, Equatable {
+        /// `hc_mult` copies of the input stream, `dim` wide, with the memory added.
+        public let streams: [[Float]]
+        /// One gate per copy. The value is shared across copies, the gate is not.
+        public let gates: [Float]
+
+        public init(streams: [[Float]], gates: [Float]) {
+            self.streams = streams
+            self.gates = gates
+        }
+    }
+
+    /// `Engram.forward`: write the retrieved rows into the residual stream, gated
+    /// by how well each copy of that stream matches the retrieved key.
+    ///
     /// - Parameters:
-    ///   - hidden: the post-norm FFN input.
-    ///   - rows: one row per (n-gram column, head), flattened as
-    ///     `column * heads + head`.
-    ///   - queryWeight: `[heads * headDim][hidden]`, projecting the input to one
-    ///     query per head.
-    ///   - keyWeight: `[hidden][heads * headDim]`, projecting the memory back.
+    ///   - residual: the stream the layer is about to read, `hc_mult` copies of
+    ///     `dim` values.
+    ///   - rows: the rows the hash columns addressed, `engram_head_dim` each, in
+    ///     column order.
+    ///   - wkv: `[dim * (hc_mult + 1)][n_hash_cols * head_dim]`, which turns the
+    ///     concatenated rows into one key per copy followed by one shared value.
+    ///   - queryWeight: `[hc_mult * dim]`, a plain parameter that is only ever
+    ///     used multiplied by `keyWeight`.
+    ///   - keyWeight: `[hc_mult * dim]`, see `queryWeight`.
     public static func contribution(
-        hidden: [Float],
+        residual: [[Float]],
         rows: [[Float]],
-        heads: Int,
-        headDim: Int,
-        queryWeight: DeepSeekV41Matrix?,
-        keyWeight: DeepSeekV41Matrix?
-    ) -> [Float] {
-        guard !rows.isEmpty, heads > 0, headDim > 0 else { return [] }
-        let columns = rows.count / heads
-        guard columns > 0 else { return [] }
+        wkv: DeepSeekV41Matrix?,
+        queryWeight: [Float]?,
+        keyWeight: [Float]?,
+        epsilon: Float
+    ) -> Contribution? {
+        let copies = residual.count
+        guard copies > 0, let dim = residual.first?.count, dim > 0, !rows.isEmpty else { return nil }
+        guard let wkv else { return nil }
 
-        // Per-head query. Without a query projection the input itself is used, which
-        // is what a checkpoint with no `q_weight` would do.
-        let query = queryWeight?.apply(hidden) ?? hidden
-        var memory = [Float](repeating: 0, count: heads * headDim)
-        let scale = 1 / sqrt(Float(headDim))
+        // `embed(hashes).flatten(-2)`: the rows concatenate along one axis, so the
+        // projection reads them as a single `n_hash_cols * head_dim` vector.
+        var flat: [Float] = []
+        flat.reserveCapacity(rows.reduce(0) { $0 + $1.count })
+        for row in rows { flat.append(contentsOf: row) }
 
-        for head in 0..<heads {
-            let queryBase = head * headDim
-            guard queryBase + headDim <= query.count else { continue }
-            var scores: [Float] = []
-            scores.reserveCapacity(columns)
-            for column in 0..<columns {
-                let row = rows[column * heads + head]
-                let width = min(headDim, row.count)
-                var dot: Float = 0
-                for dim in 0..<width {
-                    dot += query[queryBase + dim] * row[dim]
-                }
-                scores.append(dot * scale)
-            }
-            guard let maxScore = scores.max() else { continue }
-            var weights = scores.map { exp($0 - maxScore) }
-            let total = weights.reduce(0, +)
-            if total > 0 {
-                weights = weights.map { $0 / total }
-            } else {
-                weights = [Float](repeating: 1 / Float(columns), count: columns)
-            }
-            for column in 0..<columns {
-                let row = rows[column * heads + head]
-                let weight = weights[column]
-                let width = min(headDim, row.count)
-                for dim in 0..<width {
-                    memory[queryBase + dim] += weight * row[dim]
-                }
+        // `kv.split([hc_mult * dim, dim])`: a key per copy, then one value shared
+        // by every copy.
+        let kv = wkv.apply(flat)
+        let keyWidth = copies * dim
+        guard kv.count >= keyWidth + dim else { return nil }
+        let value = Array(kv[keyWidth..<(keyWidth + dim)])
+
+        // `q_weight * k_weight`, elementwise per copy. Both are ones-initialized
+        // parameters, so a checkpoint that omits them means "no reweighting".
+        var weight = [Float](repeating: 1, count: keyWidth)
+        if let queryWeight, let keyWeight,
+           queryWeight.count >= keyWidth, keyWeight.count >= keyWidth {
+            for index in 0..<keyWidth {
+                weight[index] = queryWeight[index] * keyWeight[index]
             }
         }
 
-        guard let keyWeight else { return memory }
-        return keyWeight.apply(memory)
+        let inverseRootDim = 1 / sqrt(Float(dim))
+        var gates: [Float] = []
+        gates.reserveCapacity(copies)
+        var streams: [[Float]] = []
+        streams.reserveCapacity(copies)
+
+        for copy in 0..<copies {
+            var stream = residual[copy]
+            if stream.count < dim {
+                stream.append(contentsOf: [Float](repeating: 0, count: dim - stream.count))
+            }
+            let base = copy * dim
+            // Normalized per (token, copy) over `dim`, never jointly over the copies.
+            var streamSquares: Float = 0
+            var keySquares: Float = 0
+            var dot: Float = 0
+            for dimension in 0..<dim {
+                let hidden = stream[dimension]
+                let key = kv[base + dimension]
+                streamSquares += hidden * hidden
+                keySquares += key * key
+                dot += hidden * weight[base + dimension] * key
+            }
+            let streamRstd = 1 / sqrt(streamSquares / Float(dim) + epsilon)
+            let keyRstd = 1 / sqrt(keySquares / Float(dim) + epsilon)
+            // `dot * rstd * dim**-0.5`, then the signed square root before the
+            // sigmoid, matching the training kernel.
+            let score = dot * streamRstd * keyRstd * inverseRootDim
+            let magnitude = max(abs(score), 1e-6)
+            let gate = 1 / (1 + exp(-copysign(magnitude.squareRoot(), score)))
+            gates.append(gate)
+            for dimension in 0..<dim {
+                stream[dimension] += gate * value[dimension]
+            }
+            streams.append(stream)
+        }
+        return Contribution(streams: streams, gates: gates)
     }
 }
 
@@ -419,6 +462,10 @@ nonisolated public final class DeepSeekV41CPUForward {
     /// position reads is known before any dispatch (see that type for why). These
     /// stay because they are what a probe run compares against.
     public private(set) var candidateScores: [[Float]] = []
+    /// Engram gates per layer, one entry per position that carried a lookup. The
+    /// value is written into the residual at the top of the layer, before
+    /// attention; keeping the gate is what a probe run compares against.
+    public private(set) var engramGates: [Int: [[Float]]] = [:]
 
     public init(
         config: DeepSeekV41Config,
@@ -454,6 +501,7 @@ nonisolated public final class DeepSeekV41CPUForward {
         attentionInputs = []
         compressed = [:]
         candidateScores = []
+        engramGates = [:]
     }
 
     /// Embeds a token id, or zeros when the table is missing.
@@ -506,6 +554,13 @@ nonisolated public final class DeepSeekV41CPUForward {
     ) {
         let index = layer.index
         let shape = DeepSeekV41AttentionShape.make(config: config, layer: layer)
+
+        // Engram memory lands in the residual stream at the TOP of the layer, before
+        // the attention sub-layer reads it (`Model.forward` calls `layer.engram(h,
+        // ...)` ahead of `layer(...)`).
+        if let engramTable = layer.engramTable {
+            writeEngram(layer: index, table: engramTable, streams: &streams)
+        }
 
         // Attention sub-layer.
         let attnInput = mixStreams(
@@ -579,14 +634,7 @@ nonisolated public final class DeepSeekV41CPUForward {
             baseRole: .hcFfnBase,
             layer: index
         )
-        var ffnNormed = rmsNorm(ffnInput, role: .ffnNorm, layer: index, epsilon: config.rmsNormEps)
-        if let engramTable = layer.engramTable,
-           let engram = engramContribution(layer: index, table: engramTable, hidden: ffnNormed) {
-            for dim in 0..<min(ffnNormed.count, engram.count) {
-                ffnNormed[dim] += engram[dim]
-            }
-        }
-
+        let ffnNormed = rmsNorm(ffnInput, role: .ffnNorm, layer: index, epsilon: config.rmsNormEps)
         let ffnOut = feedForward(ffnNormed, layer: index)
         DeepSeekV41HyperConnections.write(
             streams: &streams,
@@ -823,32 +871,38 @@ nonisolated public final class DeepSeekV41CPUForward {
         )
     }
 
-    private func engramContribution(layer: Int, table: Int, hidden: [Float]) -> [Float]? {
+    /// Writes one position's Engram lookup into `streams`.
+    ///
+    /// A column with no row is zero-filled rather than skipped: the concatenation
+    /// the projection reads is positional, so a missing row is a zero row in its
+    /// own slot, and dropping it would shift every later column.
+    private func writeEngram(layer: Int, table: Int, streams: inout [[Float]]) {
         let spec = config.engramTables[table]
+        // `(max_ngram_size - 1) * n_heads` hash columns, one row each.
         let columns = max(1, spec.maxNgramSize - 1) * spec.headCount
         var rows: [[Float]] = []
         rows.reserveCapacity(columns)
         var sawAny = false
         for column in 0..<columns {
-            for head in 0..<spec.headCount {
-                if let row = weights.engramRow(layer: layer, column: column, head: head) {
-                    rows.append(row)
-                    sawAny = true
-                } else {
-                    rows.append([Float](repeating: 0, count: spec.headDimension))
-                }
+            if let row = weights.engramRow(layer: layer, column: column) {
+                rows.append(row)
+                sawAny = true
+            } else {
+                rows.append([Float](repeating: 0, count: spec.headDimension))
             }
         }
-        guard sawAny else { return nil }
-        let result = DeepSeekV41EngramCombination.contribution(
-            hidden: hidden,
+        guard sawAny else { return }
+        guard let contribution = DeepSeekV41EngramCombination.contribution(
+            residual: streams,
             rows: rows,
-            heads: spec.headCount,
-            headDim: spec.headDimension,
-            queryWeight: weights.matrix(.engramQuery, layer: layer),
-            keyWeight: weights.matrix(.engramKey, layer: layer)
-        )
-        return result.isEmpty ? nil : result
+            wkv: weights.matrix(.engramWkv, layer: layer),
+            queryWeight: weights.vector(.engramQuery, layer: layer),
+            keyWeight: weights.vector(.engramKey, layer: layer),
+            epsilon: config.rmsNormEps
+        ) else { return }
+        streams = contribution.streams
+        if engramGates[layer] == nil { engramGates[layer] = [] }
+        engramGates[layer]?.append(contribution.gates)
     }
 
     // MARK: Streams
