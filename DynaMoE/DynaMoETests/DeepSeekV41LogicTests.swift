@@ -500,11 +500,11 @@ final class DeepSeekV41EngramTests: XCTestCase {
     }
 
     /// The hash ids are pinned against the reference in
-    /// `DeepSeekV41EngramTokenMapTests`, which is what this gate records. The
-    /// combination rule next to it has no vectors, so it stays open.
+    /// `DeepSeekV41EngramTokenMapTests`, and the combination rule next to it in
+    /// `DeepSeekV41EngramGoldenTests`. Both are what these gates record.
     func testHashConformanceFollowsTheCheckedInVectors() {
         XCTAssertEqual(DeepSeekV41EngramHasher.conformance, .verifiedAgainstReference)
-        XCTAssertEqual(DeepSeekV41Conformance.engramCombination, .unverified)
+        XCTAssertEqual(DeepSeekV41Conformance.engramCombination, .verifiedAgainstReference)
     }
 
     func testSyntheticTokenMapCompression() throws {
@@ -920,18 +920,24 @@ final class DeepSeekV41WeightCatalogTests: XCTestCase {
 /// update would otherwise be invisible: the load log is the only place it shows.
 final class DeepSeekV41ConformanceGateTests: XCTestCase {
 
-    func testEveryNumericRuleIsStillUnverified() {
-        // Engram indexing is the one rule with checked-in reference vectors.
+    func testOnlyTheRulesWithReferenceVectorsAreVerified() {
+        // Checked-in vectors, from `Tools/dsv41_goldens.py` and its test suites:
+        // Engram indexing, the Engram combination, the compressor's pooling and the
+        // router's scoring.
         XCTAssertEqual(DeepSeekV41EngramHasher.conformance, .verifiedAgainstReference)
-        XCTAssertEqual(DeepSeekV41Conformance.compressorPooling, .unverified)
-        XCTAssertEqual(DeepSeekV41Conformance.routerScoring, .unverified)
+        XCTAssertEqual(DeepSeekV41Conformance.engramCombination, .verifiedAgainstReference)
+        XCTAssertEqual(DeepSeekV41Conformance.compressorPooling, .verifiedAgainstReference)
+        XCTAssertEqual(DeepSeekV41Conformance.routerScoring, .verifiedAgainstReference)
+        // Still transcribed-only: no golden has been generated for these yet.
         XCTAssertEqual(DeepSeekV41Conformance.candidateSelection, .unverified)
-        XCTAssertEqual(DeepSeekV41Conformance.engramCombination, .unverified)
         XCTAssertEqual(DeepSeekV41Conformance.hyperConnections, .unverified)
         XCTAssertEqual(DeepSeekV41Conformance.dsparkDrafting, .unverified)
         XCTAssertEqual(DeepSeekV41Conformance.visionPatching, .unverified)
-        XCTAssertEqual(DeepSeekV41Conformance.unverifiedSummary.count, 7)
+        XCTAssertEqual(DeepSeekV41Conformance.unverifiedSummary.count, 4)
         XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("Engram hashing"))
+        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("Engram combination"))
+        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("compressor pooling"))
+        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("router scoring"))
     }
 }
 

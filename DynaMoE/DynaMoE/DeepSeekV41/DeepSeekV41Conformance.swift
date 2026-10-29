@@ -16,9 +16,9 @@
 //  `Tools/dsv41_probe.py` dumps the checkpoint's own files (it does not compute
 //  reference outputs), and flipping a gate to `.verifiedAgainstReference` is a
 //  one-line change accompanied by a test that carries vectors produced by a real
-//  reference run. The gates are diagnostics rather than switches, with
-//  one deliberate exception: the device forward refuses an Engram layer while the
-//  hash combination is unverified, because reading the wrong rows is silent.
+//  reference run. The gates are diagnostics rather than switches: a stage the port
+//  has implemented runs whether or not its rule has been matched against a numeric
+//  reference, and the gate is how far to trust the numbers it produces.
 //
 
 import Foundation
@@ -44,22 +44,35 @@ nonisolated public enum DeepSeekV41Conformance {
 
     /// How a run of positions pools into one compressed row.
     ///
-    /// The RULE now matches `Compressor.forward` in the checkpoint's
-    /// `inference/model.py` (project the layer input through `wkv` and `wgate`,
-    /// softmax the gate over the group PER DIMENSION, `RMSNorm`, then rotate at the
-    /// group's first position), and both backends implement that one rule. What is
-    /// still missing is a numeric vector produced by a reference run, so the gate
-    /// stays open: reading the reference and agreeing with it is not the same as
-    /// having compared outputs.
-    public static let compressorPooling: Gate = .unverified
+    /// MATCHED AGAINST `Compressor.forward` in the checkpoint's
+    /// `inference/model.py`: project the layer input through `wkv` and `wgate`,
+    /// softmax the gate over the group PER DIMENSION, weight and sum, then
+    /// `RMSNorm`. `Tools/dsv41_goldens.py` instantiates that module at a tiny
+    /// config (dense FP32 weights, seeded parameters, four positions that
+    /// disagree about which one should dominate) and
+    /// `DeepSeekV41CompressorGoldenTests` carries the resulting vectors, so the
+    /// two backends are checked against the reference's numbers rather than
+    /// against each other.
+    ///
+    /// What it does NOT cover: the decode path's slot addressing
+    /// (`position % ratio`), which is host code and is pinned by its own tests,
+    /// and the fp8 storage width, which is exercised by the kernel tests.
+    public static let compressorPooling: Gate = .verifiedAgainstReference
 
     /// How a raw gate logit becomes a routing score (`scoring_func`) and how the
     /// selection bias is applied.
     ///
-    /// Matches `Gate.forward` (`score + bias` selects, `score` weights), but the
-    /// CPU reference and the kernel are only self-consistent until a real routing
-    /// vector is checked in.
-    public static let routerScoring: Gate = .unverified
+    /// MATCHED AGAINST `Gate.forward` in the checkpoint's `inference/model.py`,
+    /// for both per-logit scorings: `sqrtsoftplus` (the shipped one) and
+    /// `sigmoid`. `DeepSeekV41RouterGoldenTests` carries vectors from
+    /// `Tools/dsv41_goldens.py` for the same weights under both, which is what
+    /// makes the comparison worth something: they select DIFFERENT experts, so
+    /// picking the wrong map cannot pass. The temperature in those vectors is not
+    /// 1, because the reference divides the logits before the scoring function.
+    ///
+    /// The bias is confirmed to steer selection only (`scores + bias` ranks,
+    /// `scores` weights) and the renormalization to happen only for `topk > 1`.
+    public static let routerScoring: Gate = .verifiedAgainstReference
 
     /// How the compressed-row candidate blocks are scored and truncated.
     ///
@@ -75,17 +88,25 @@ nonisolated public enum DeepSeekV41Conformance {
 
     /// How retrieved Engram rows are combined into the layer's residual.
     ///
-    /// The RULE now matches `Engram.forward` in the checkpoint's
-    /// `inference/model.py`: `kv = wkv(embed(hashes).flatten(-2))` splits into a
-    /// per-hc-copy key and one shared value, the value is gated by
+    /// MATCHED AGAINST `Engram.forward` in the checkpoint's `inference/model.py`:
+    /// `kv = wkv(embed(hashes).flatten(-2))` splits into a per-hc-copy key and one
+    /// shared value, the value is gated by
     /// `sigmoid(copysign(sqrt(dot), dot))` over a normalized dot of the stream
     /// against its key, and the result is written into the residual stream at the
     /// top of the layer (before attention) rather than into the post-`ffn_norm`
-    /// input. What is still missing is a numeric vector produced by a reference
-    /// run, so the gate stays open, and the device forward keeps refusing an Engram
-    /// layer until it flips: reading the right rows and mixing them wrongly looks
-    /// like "the memory model does nothing".
-    public static let engramCombination: Gate = .unverified
+    /// input.
+    ///
+    /// `Tools/dsv41_goldens.py` instantiates that module at a tiny config and
+    /// `DeepSeekV41EngramGoldenTests` carries the vectors: two positions, two
+    /// hyper-connection copies, two hash columns of 32-wide rows. The comparison
+    /// covers the parts that are invisible in output, i.e. that the gate
+    /// normalizes per (token, copy) over `dim` and not jointly over the copies,
+    /// and that `kv` splits as `[hc_mult * dim, dim]` rather than interleaved.
+    ///
+    /// The device path is checked against the same rule by
+    /// `DeepSeekV41EngramGateKernelTests`, which runs `dsv41_engram_gate_f32` on
+    /// the CPU rule's inputs.
+    public static let engramCombination: Gate = .verifiedAgainstReference
 
     /// The mHC hyper-connection mixing rule.
     public static let hyperConnections: Gate = .unverified
