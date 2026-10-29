@@ -246,8 +246,10 @@ final class DeepSeekV41DevicePlanTests: XCTestCase {
     func testGatherBudgetCoversTheWindowAndTheCompressedSelection() throws {
         let config = try DeepSeekV41TestFixtures.config()
         let budget = DeepSeekV41DevicePlan.gatherRowBudget(config: config)
-        let compressed = max(config.indexTopK, config.candidateTopKBlocks * config.candidateBlockSize)
-        XCTAssertEqual(budget, config.windowSize + compressed)
+        // A layer with an indexer keeps `min(index_topk, produced)` compressed
+        // rows, so the buffer is the window plus that selection, not plus the
+        // candidate-block mask.
+        XCTAssertEqual(budget, config.windowSize + config.indexTopK)
     }
 
     func testAWiderCompressRatioThanTheRingIsReported() throws {
@@ -276,6 +278,25 @@ final class DeepSeekV41DevicePlanTests: XCTestCase {
             problems.contains { $0.contains("Engram") && $0.contains("layers.1") },
             "expected the Engram problem, got \(problems)"
         )
+    }
+
+    /// The debug opt-out (`dynamoe_dsv41_engram_off`) removes only the Engram
+    /// refusal: every other wiring problem is still reported, so a checkpoint with
+    /// a real defect cannot be run by flipping it.
+    func testEngramSkipDropsOnlyTheEngramProblem() throws {
+        let json = DeepSeekV41TestFixtures.json
+            .replacingOccurrences(of: "\"engram_layer_ids\": []", with: "\"engram_layer_ids\": [1]")
+            .replacingOccurrences(of: "\"engram_num_embeddings\": []", with:
+                "\"engram_num_embeddings\": [4096], \"engram_max_ngram_size\": 3, "
+                    + "\"engram_vocab_size\": 512, \"engram_n_heads\": 2, \"engram_head_dim\": 4, "
+                    + "\"engram_compressed_vocab_size\": 128")
+        let config = try DeepSeekV41Config.decode(jsonData: Data(json.utf8))
+        let plan = try config.makeLayerPlan()
+        let strict = DeepSeekV41DevicePlan.problems(config: config, plan: plan)
+        let relaxed = DeepSeekV41DevicePlan.problems(config: config, plan: plan, allowEngramSkip: true)
+        XCTAssertEqual(relaxed.count, strict.count - 1, "only the Engram line may disappear: \(relaxed)")
+        XCTAssertFalse(relaxed.contains { $0.contains("Engram") })
+        XCTAssertTrue(strict.contains { $0.contains("Engram") })
     }
 
     func testACompressedLayerWithoutASelectionBudgetIsReported() throws {

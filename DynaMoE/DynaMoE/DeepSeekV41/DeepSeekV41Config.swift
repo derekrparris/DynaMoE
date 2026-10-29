@@ -636,8 +636,8 @@ nonisolated public struct DeepSeekV41Config: Sendable, Equatable {
         if layerPlan.allSatisfy({ $0.flavor == .windowOnly }) {
             out.append("no layer declares compress_ratios > 0: the checkpoint is not a CSA2 model")
         }
-        if windowSize <= 0 {
-            out.append("window_size = \(windowSize): every layer would attend over the full context")
+        if windowSize <= 0 && compressRatios.isEmpty {
+            out.append("window_size = \(windowSize): no layer declares a sliding window")
         }
         if numNextNPredictLayers > 0 && dsparkTargetLayerIDs.count != numNextNPredictLayers {
             out.append(
@@ -742,7 +742,8 @@ nonisolated public extension DeepSeekV41Config {
             numKeyValueHeads: text.int("num_key_value_heads") ?? 1,
             vocabSize: try requireInt("vocab_size"),
             intermediateSize: text.int("intermediate_size") ?? 0,
-            moeIntermediateSize: text.int("moe_intermediate_size") ?? 0,
+            moeIntermediateSize: text.int("moe_intermediate_size", "moe_inter_dim")
+                ?? root.int("moe_intermediate_size", "moe_inter_dim") ?? 0,
             sharedExpertCount: text.int("n_shared_experts") ?? 0,
             maxPositionEmbeddings: text.int("max_position_embeddings", "context_length") ?? 1_048_576,
             rmsNormEps: text.float("rms_norm_eps", "norm_eps") ?? 1e-6,
@@ -760,10 +761,19 @@ nonisolated public extension DeepSeekV41Config {
             ropeOriginalLength: ropeScaling?.int("original_max_position_embeddings") ?? 0,
             ropeBetaFast: ropeScaling?.float("beta_fast") ?? 32,
             ropeBetaSlow: ropeScaling?.float("beta_slow") ?? 1,
-            windowSize: text.int("window_size") ?? 0,
+            // `sliding_window` is the multimodal wrapper's spelling; the flat
+            // `inference/config.json` calls the same field `window_size`. Reading
+            // only one of them leaves `windowSize == 0`, which zeroes every
+            // layer's window ring: a window-only layer would attend over no rows
+            // at all, and the gather budget would be priced off the candidate
+            // block count instead of the window.
+            windowSize: text.int("window_size", "sliding_window")
+                ?? root.int("window_size", "sliding_window") ?? 0,
             compressRatios: text.ints("compress_ratios") ?? root.ints("compress_ratios") ?? [],
-            kvSourceLayerIDs: text.ints("kv_source_layer_ids") ?? root.ints("kv_source_layer_ids") ?? [],
-            indexSourceLayerIDs: text.ints("index_source_layer_ids") ?? root.ints("index_source_layer_ids") ?? [],
+            kvSourceLayerIDs: text.ints("kv_source_layer_ids", "kv_source_layers")
+                ?? root.ints("kv_source_layer_ids", "kv_source_layers") ?? [],
+            indexSourceLayerIDs: text.ints("index_source_layer_ids", "index_source_layers")
+                ?? root.ints("index_source_layer_ids", "index_source_layers") ?? [],
             candidateSourceLayerID: text.int("candidate_source_layer_id", "candidate_source_layer") ?? -1,
             candidateBlockSize: text.int("candidate_block_size") ?? 0,
             candidateTopKBlocks: text.int("candidate_topk_blocks") ?? 0,
@@ -856,6 +866,20 @@ nonisolated public extension DeepSeekV41Config {
         }
         guard hcMult >= 1 else {
             throw DeepSeekV41ConfigError.invalidField("hc_mult", "must be at least 1")
+        }
+        // Every layer of this architecture keeps a window ring: the reference
+        // registers `window_kv_cache` with `window_size` rows on every layer,
+        // compressed ones included, and indexes it by `start_pos % window_size`.
+        // A zero window is therefore not a degenerate-but-runnable shape: the ring
+        // would hold one row, `windowRange` would return nothing, and a
+        // window-only layer would attend over an empty context. It is also how a
+        // config that spells the field `sliding_window` fails when only
+        // `window_size` is read, so the failure must be loud rather than a note.
+        if !compressRatios.isEmpty && windowSize <= 0 {
+            throw DeepSeekV41ConfigError.invalidField(
+                "window_size",
+                "must be positive: every layer of a CSA2 checkpoint attends over a sliding window"
+            )
         }
         guard gateTemp > 0, gateTemp.isFinite else {
             // `scores = logits / gate_temp` runs before the scoring function, so a

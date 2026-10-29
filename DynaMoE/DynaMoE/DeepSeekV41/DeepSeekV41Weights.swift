@@ -621,6 +621,44 @@ nonisolated public enum DeepSeekV41WeightError: Error, Equatable, CustomStringCo
 
 extension DeepSeekV41WeightCatalog {
 
+    /// Which indexer tensors a layer has to publish.
+    ///
+    /// The reference builds an `Indexer` only on an index-source layer
+    /// (`Attention.__init__`: `if self.is_index_source: self.indexer = Indexer(...)`),
+    /// and inside one only a layer that compresses its own KV can produce index
+    /// keys (`Indexer.owns_k = layer_id in kv_source_layers`). Every layer in
+    /// between reuses the source's `topk_idxs` (`_compress_topk_idxs` returns
+    /// `shared_attn.topk_idxs`) and publishes no indexer tensors at all.
+    ///
+    /// The rule lives here so it can be asserted without a checkpoint: demanding
+    /// the full set on every compressed layer rejects the real 384-expert
+    /// checkpoint, which publishes exactly this split (2/8/14/20 own the
+    /// compressed KV and the index keys, 24/28/32/36 own index keys only, every
+    /// other compressed layer owns neither).
+    static func requiredIndexerRoles(
+        layer: DeepSeekV41LayerPlan,
+        config: DeepSeekV41Config
+    ) -> [DeepSeekV41TensorRole] {
+        guard layer.ownsCompressedIndex else { return [] }
+        var roles: [DeepSeekV41TensorRole] = [.indexerWqB, .indexerWeights]
+        if config.kvSourceLayerIDs.contains(layer.index) {
+            // `Indexer.forward` normalises the projected key before rotating it.
+            roles.append(contentsOf: [.indexerWk, .indexerKNorm])
+        }
+        return roles
+    }
+
+    /// The checkpoint's spelling for an indexer role, for the missing-tensor line.
+    static func indexerLabel(_ role: DeepSeekV41TensorRole) -> String {
+        switch role {
+        case .indexerWqB: return "attn.indexer.wq_b.weight"
+        case .indexerWk: return "attn.indexer.wk.weight"
+        case .indexerWeights: return "attn.indexer.weights_proj.weight"
+        case .indexerKNorm: return "attn.indexer.k_norm.weight"
+        default: return role.rawValue
+        }
+    }
+
     /// Every requirement the plan imposes on the checkpoint, checked against the
     /// catalog. Returns human-readable problems; empty means the checkpoint can
     /// be run.
@@ -693,16 +731,8 @@ extension DeepSeekV41WeightCatalog {
                 }
                 required.append((.compressorNorm, "attn.compressor.norm.weight"))
             }
-            if layer.flavor == .compressed && (layer.ownsCompressedIndex || config.indexTopK > 0) {
-                required.append(contentsOf: [
-                    (.indexerWqB, "attn.indexer.wq_b.weight"),
-                    (.indexerWk, "attn.indexer.wk.weight"),
-                    (.indexerWeights, "attn.indexer.weights_proj.weight")
-                ])
-            }
-            if layer.ownsCompressedIndex {
-                // `Indexer.forward` normalises the projected key before rotating it.
-                required.append((.indexerKNorm, "attn.indexer.k_norm.weight"))
+            for role in Self.requiredIndexerRoles(layer: layer, config: config) {
+                required.append((role, Self.indexerLabel(role)))
             }
             if layer.engramTable != nil {
                 required.append(contentsOf: [

@@ -89,6 +89,27 @@ nonisolated public struct DeepSeekV41MemoryPlan: Sendable, Equatable {
         return cacheBytes + residentWeightBytes + slotCount * bytesPerExpert + engramStagingBytes
     }
 
+    /// Expert slots this machine can hold resident, with the plan's own resident
+    /// weights, caches and Engram staging taken out of `fraction` of RAM.
+    ///
+    /// Routed experts are streamed, so the arena is a cache rather than a
+    /// requirement: the number only decides how often a token pays the SSD for an
+    /// expert it has already read. A 128 GB machine affords thousands of pairs out
+    /// of the 15,360 a 384-expert, 40-layer checkpoint publishes, whereas sizing
+    /// the arena by `numActivatedExperts * 2` guaranteed a cold cache every layer.
+    public static func affordableExpertSlots(
+        plan: DeepSeekV41MemoryPlan,
+        physicalGB: Double,
+        fraction: Double = 0.6
+    ) -> Int {
+        guard plan.bytesPerExpert > 0, physicalGB > 0, fraction > 0 else { return 1 }
+        let budget = physicalGB * fraction * 1_073_741_824
+        let fixed = Double(plan.cacheBytes + plan.residentWeightBytes + plan.engramStagingBytes)
+        let slots = (budget - fixed) / Double(plan.bytesPerExpert)
+        guard slots.isFinite, slots >= 1 else { return 1 }
+        return Int(min(slots, 65_536))
+    }
+
     /// One-line load-log summary.
     public func describe(expertSlots: Int) -> String {
         func gb(_ bytes: Int) -> String {

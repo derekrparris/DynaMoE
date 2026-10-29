@@ -699,10 +699,23 @@ enum KVCacheProvisioning {
     /// come off the top of the process target; unrestricted modes fall back to
     /// 75% of physical RAM instead of having no ceiling at all — the mode that
     /// let a 16 GB Mac provision a 32k-token KV for a 4B model and thrash.
-    static func budgetGB(physicalGB: Double, modelFootprintGB: Double, budgetMode: MemoryBudgetMode) -> Double {
+    ///
+    /// `modelFootprintGB` is the model's on-disk size, which is only what the
+    /// process actually holds when every weight is resident. A streamed turn
+    /// passes `residentFootprintGB` (dense backbone + the experts the working set
+    /// keeps) so the streamed bytes are not charged to RAM: otherwise a 121 GB
+    /// checkpoint on a 128 GB Mac priced the KV budget down to its 0.25 GB floor
+    /// and every turn was refused as prompt-too-long, no matter the mode.
+    static func budgetGB(
+        physicalGB: Double,
+        modelFootprintGB: Double,
+        budgetMode: MemoryBudgetMode,
+        residentFootprintGB: Double? = nil
+    ) -> Double {
+        let chargedGB = min(modelFootprintGB, max(0, residentFootprintGB ?? modelFootprintGB))
         let processTargetGB = (budgetMode == .unrestricted) ? physicalGB * 0.75 : budgetMode.targetMaxRssGB
         let workingReserveGB = 2.5
-        return max(0.25, processTargetGB - modelFootprintGB - workingReserveGB)
+        return max(0.25, processTargetGB - chargedGB - workingReserveGB)
     }
 
     // MARK: Turn fit
@@ -849,7 +862,8 @@ enum KVCacheProvisioning {
         slidingRingLen: Int,
         budgetMode: MemoryBudgetMode,
         modelFootprintGB: Double,
-        physicalGB: Double
+        physicalGB: Double,
+        residentFootprintGB: Double? = nil
     ) -> TurnFit {
         let requested = neededSeqLen(
             sessionFloor: sessionFloor,
@@ -866,7 +880,12 @@ enum KVCacheProvisioning {
             slidingSlotFlags: slidingSlotFlags,
             slidingRingLen: slidingRingLen
         )
-        let budget = budgetGB(physicalGB: physicalGB, modelFootprintGB: modelFootprintGB, budgetMode: budgetMode)
+        let budget = budgetGB(
+            physicalGB: physicalGB,
+            modelFootprintGB: modelFootprintGB,
+            budgetMode: budgetMode,
+            residentFootprintGB: residentFootprintGB
+        )
         let affordable = affordableSeqLen(geometry: kvGeometry, budgetGB: budget)
         let provisioned = clampedSeqLen(
             requested: requested,
@@ -971,6 +990,29 @@ final class ExpertTransitionTracker {
     }
 }
 
+/// Model bytes a STREAMED turn is charged against RAM: the dense weights that stay
+/// resident (every tensor that is not a routed expert) plus the experts the working
+/// set currently holds.
+///
+/// `ModelSummary.sizeGb` is the whole checkpoint on disk — 121 GB for Qwen 3.8 Flash
+/// Next FP8, 510 GB for DeepSeek V4.1 — so charging it to the process target priced a
+/// streamed model as if it filled the machine: on 128 GB the KV budget collapsed to
+/// its 0.25 GB floor and every turn was refused as prompt-too-long, in every mode.
+nonisolated func streamedResidentFootprintGB(
+    summary: ModelSummary,
+    residentExpertBytes: UInt64
+) -> Double {
+    var denseBytes: UInt64 = 0
+    for tensor in summary.tensors where tensor.expertId == nil {
+        guard tensor.offsetEnd >= tensor.offsetStart else { continue }
+        denseBytes += tensor.offsetEnd - tensor.offsetStart
+    }
+    let total = denseBytes > UInt64.max - residentExpertBytes
+        ? UInt64.max
+        : denseBytes + residentExpertBytes
+    return Double(total) / 1_073_741_824
+}
+
 final class WorkingSetManager {
     static let shared = WorkingSetManager()
 
@@ -1008,6 +1050,13 @@ final class WorkingSetManager {
         lock.lock()
         defer { lock.unlock() }
         return residentExperts.count
+    }
+
+    /// Bytes of routed-expert weights the working set currently keeps resident.
+    var residentExpertBytesTotal: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return residentExpertBytes
     }
 
     var cacheHitRatePercent: Double {
@@ -1260,6 +1309,19 @@ final class WorkingSetManager {
     }
 
     func preFaultAll(shardBuffers: [UInt32: MTLBuffer], summary: ModelSummary) {
+        // A streamed checkpoint can be far larger than RAM (121 GB of Qwen 3.8
+        // Flash Next FP8 on a 128 GB Mac, 510 GB for DeepSeek V4.1). Touching every
+        // page of it is not "pre-faulting", it is an eviction storm: the kernel
+        // pages the earlier shards back out while the later ones fault in, and the
+        // load looks hung. Streaming is the only correct behavior above this line.
+        let physicalGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+        guard summary.sizeGb <= physicalGB * 0.8 else {
+            print(
+                "⚠️ [WorkingSet] Skipping pre-fault: \(String(format: "%.1f", summary.sizeGb)) GB of weights "
+                    + "on a \(String(format: "%.0f", physicalGB)) GB machine, streaming instead"
+            )
+            return
+        }
         lock.lock()
         for key in expertSlices.keys {
             residentExperts.insert(key)

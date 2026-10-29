@@ -346,6 +346,15 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
     /// pair is checked against the reference, and reports the difference.
     public let cachePrecision: DeepSeekV41CachePrecision
 
+    /// Debug-only: let the two Engram layers run with no memory read at all
+    /// instead of refusing the turn. The refusal is deliberate (a wrong
+    /// combination reads the right rows and mixes them wrongly, which looks like
+    /// "the memory model does nothing"), so this is off unless the user opts in
+    /// with `dynamoe_dsv41_engram_off`, and the load log and readiness report say
+    /// so every time. It exists to exercise the other 38 layers on a machine that
+    /// has already paid for the 510 GB download.
+    public let allowEngramSkip: Bool
+
     public let device: MTLDevice
     public let commandQueue: MTLCommandQueue
     public let pipelines: DeepSeekV41Pipelines
@@ -365,6 +374,18 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
     /// missing kernel, a missing Metal device and a failed allocation is lost.
     public static var lastInitializationError: String? { initializationError.stored }
 
+    /// `defaults write DRP.DynaMoE dynamoe_dsv41_engram_off -bool YES`
+    ///
+    /// Debug-only opt-out: run the Engram layers with no memory read instead of
+    /// refusing the turn. Off by default, and the readiness report names every
+    /// layer it applies to, because the whole point of the refusal is that a
+    /// missing or miscombined memory reads as "the model is fine, just worse".
+    public static let engramOffDefaultKey = "dynamoe_dsv41_engram_off"
+
+    public static var engramSkipRequested: Bool {
+        UserDefaults.standard.bool(forKey: engramOffDefaultKey)
+    }
+
     private static let initializationError = InitErrorBox()
 
     static func record(_ reason: String) {
@@ -377,7 +398,8 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         config: DeepSeekV41Config,
         shardBuffers: [UInt32: MTLBuffer],
         contextLength: Int,
-        cachePrecision: DeepSeekV41CachePrecision = .fp16
+        cachePrecision: DeepSeekV41CachePrecision = .fp16,
+        allowEngramSkip: Bool = false
     ) {
         guard let plan = try? config.makeLayerPlan() else {
             DeepSeekV41Runtime.record("the per-layer plan could not be built from config.json")
@@ -428,22 +450,35 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
             return nil
         }
 
-        self.config = config
-        self.plan = plan
-        self.catalog = weights.catalog
-        self.weights = weights
-        self.cache = cache
-        self.memoryPlan = DeepSeekV41MemoryPlan.make(
+        // One arena slot holds one whole `(layer, expert)` pair, so sizing it from
+        // RAM is what turns a cold cache on every token into a working set: an
+        // active expert is ~19 MB of MXFP4, and a 128 GB machine can hold a few
+        // thousand of the 15,360 pairs that exist. Twelve slots (top-k x 2) was a
+        // placeholder that guaranteed every expert was a miss.
+        let memoryPlan = DeepSeekV41MemoryPlan.make(
             config: config,
             plan: plan,
             catalog: weights.catalog,
             contextLength: contextLength,
             recordBytesOverride: cachePrecision.recordBytes(width: config.cacheRecordWidth)
         )
-        self.arena = DeepSeekV41ExpertArena(slotCount: max(1, config.numActivatedExperts * 2))
+        let physicalGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+        let slotCount = min(
+            DeepSeekV41MemoryPlan.affordableExpertSlots(plan: memoryPlan, physicalGB: physicalGB),
+            max(1, config.numRoutedExperts * max(1, config.numHiddenLayers))
+        )
+
+        self.config = config
+        self.plan = plan
+        self.catalog = weights.catalog
+        self.weights = weights
+        self.cache = cache
+        self.memoryPlan = memoryPlan
+        self.arena = DeepSeekV41ExpertArena(slotCount: slotCount)
         self.dspark = DeepSeekV41DSparkPlan.make(config: config)
         self.contextLength = contextLength
         self.cachePrecision = cachePrecision
+        self.allowEngramSkip = allowEngramSkip
         self.device = device
         self.commandQueue = commandQueue
         self.pipelines = pipelines

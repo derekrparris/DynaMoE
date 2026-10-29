@@ -115,6 +115,33 @@ final class DeepSeekV41ConfigTests: XCTestCase {
         XCTAssertEqual(config.engramRowCounts, [384_006_168, 384_016_682])
     }
 
+    /// The multimodal wrapper spells the sliding window `sliding_window`; the flat
+    /// `inference/config.json` spells it `window_size`. Reading only one of them
+    /// left every layer's ring zero rows wide, which reads as "no window" and
+    /// refused the checkpoint with a compress-ratio problem on every layer.
+    func testTheWrapperSlidingWindowDecodes() throws {
+        let json = Self.wrapperJSON.replacingOccurrences(
+            of: "\"window_size\": 128,",
+            with: "\"sliding_window\": 128,"
+        )
+        let config = try DeepSeekV41Config.decode(jsonData: Data(json.utf8))
+        XCTAssertEqual(config.windowSize, 128)
+        XCTAssertEqual(DeepSeekV41DevicePlan.gatherRowBudget(config: config), 128 + 512)
+    }
+
+    /// A CSA2 checkpoint always has a window ring, so a config that declares
+    /// `compress_ratios` with no window is broken rather than window-less. This is
+    /// the failure the alias above would otherwise hide as a note in the log.
+    func testACSA2ConfigWithoutAWindowIsRejected() {
+        let json = Self.wrapperJSON.replacingOccurrences(of: "\"window_size\": 128,", with: "")
+        XCTAssertThrowsError(try DeepSeekV41Config.decode(jsonData: Data(json.utf8))) { error in
+            guard case DeepSeekV41ConfigError.invalidField(let field, _)? = error as? DeepSeekV41ConfigError else {
+                return XCTFail("expected an invalid window field, got \(error)")
+            }
+            XCTAssertEqual(field, "window_size")
+        }
+    }
+
     /// The latent cache widths the reference documents: 512 E4M3 values plus
     /// one E8M0 scale per 32 is 528 bytes; the designed FP4 record is 288.
     func testCacheRecordWidths() throws {
@@ -168,6 +195,7 @@ final class DeepSeekV41ConfigTests: XCTestCase {
         {"model_type": "deepseek_v41", "n_layers": 40, "dim": 7168, "n_heads": 128,
          "vocab_size": 129280, "n_routed_experts": 384, "n_activated_experts": 6,
          "qk_nope_head_dim": 512, "v_head_dim": 512, "o_groups": 8,
+         "window_size": 128,
          "compress_ratios": [0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
          "engram_layer_ids": [1, 14], "engram_num_embeddings": [384006168, 384016682],
@@ -685,6 +713,35 @@ final class DeepSeekV41WeightCatalogTests: XCTestCase {
         }
     }
 
+    /// Indexer weights follow the reference's ownership split: only an index-source
+    /// layer publishes them, and inside one only a layer that compresses its own KV
+    /// owns the keys. Demanding the whole set on every compressed layer rejected the
+    /// real checkpoint, which publishes no indexer tensors on its 30 reader layers
+    /// and no `wk`/`k_norm` on the four index sources that are not KV sources.
+    func testIndexerRolesFollowTheSources() throws {
+        let json = DeepSeekV41ConfigTests.wrapperJSON
+            .replacingOccurrences(
+                of: "\"index_source_layer_ids\": [2, 20],",
+                with: "\"index_source_layer_ids\": [2, 20, 24],"
+            )
+        let config = try DeepSeekV41Config.decode(jsonData: Data(json.utf8))
+        let plan = try config.makeLayerPlan()
+        let byIndex = Dictionary(uniqueKeysWithValues: plan.map { ($0.index, $0) })
+
+        XCTAssertEqual(
+            DeepSeekV41WeightCatalog.requiredIndexerRoles(layer: byIndex[20]!, config: config),
+            [.indexerWqB, .indexerWeights, .indexerWk, .indexerKNorm]
+        )
+        XCTAssertEqual(
+            DeepSeekV41WeightCatalog.requiredIndexerRoles(layer: byIndex[24]!, config: config),
+            [.indexerWqB, .indexerWeights]
+        )
+        XCTAssertEqual(
+            DeepSeekV41WeightCatalog.requiredIndexerRoles(layer: byIndex[3]!, config: config),
+            []
+        )
+    }
+
     func testDraftBlockTensorsClassify() {
         let catalog = DeepSeekV41WeightCatalog(
             named: [
@@ -1019,6 +1076,26 @@ final class DeepSeekV41MemoryPlanTests: XCTestCase {
         XCTAssertEqual(memory.engramStagingBytes, 64 * (264 + 264) * 2)
     }
 
+    /// The arena is a cache, not a requirement: what matters is that a big machine
+    /// holds a working set rather than the `numActivatedExperts * 2` placeholder.
+    func testAffordableExpertSlotsScaleWithRam() throws {
+        let config = try wrapperConfig()
+        let plan = try config.makeLayerPlan()
+        let memory = DeepSeekV41MemoryPlan.make(
+            config: config, plan: plan, catalog: nil, contextLength: 4_096
+        )
+        let slots = DeepSeekV41MemoryPlan.affordableExpertSlots(plan: memory, physicalGB: 128)
+        // 0.6 * 128 GB over a ~23 MB expert is a few thousand pairs, and the
+        // checkpoint publishes 384 * 40 = 15,360 of them.
+        XCTAssertGreaterThan(slots, 1_000, "128 GB must hold a working set")
+        XCTAssertLessThan(slots, config.numRoutedExperts * config.numHiddenLayers)
+        XCTAssertLessThan(
+            DeepSeekV41MemoryPlan.affordableExpertSlots(plan: memory, physicalGB: 16),
+            slots
+        )
+        XCTAssertEqual(DeepSeekV41MemoryPlan.affordableExpertSlots(plan: memory, physicalGB: 0), 1)
+    }
+
     func testRequiredBytesGrowsWithResidentExperts() throws {
         let config = try wrapperConfig()
         let plan = try config.makeLayerPlan()
@@ -1269,6 +1346,33 @@ final class DeepSeekV41PreflightSizeTests: XCTestCase {
         let issue = try XCTUnwrap(report.issues.first)
         XCTAssertFalse(issue.headerReadable)
         XCTAssertTrue(issue.humanDescription.contains("header unreadable"), issue.humanDescription)
+    }
+
+    /// A Hugging Face snapshot is a directory of symlinks into `blobs/`. The
+    /// preflight used `attributesOfItem`, which does not follow the link, so a
+    /// complete 510 GB download reported "48/48 shards, 4 KB (0%)".
+    func testSymlinkedShardIsMeasuredThroughTheLink() throws {
+        let dir = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let name = "model-00001-of-00001.safetensors"
+        let blob = dir.appendingPathComponent("blob.safetensors")
+        try writeShard(at: blob, declaredDataBytes: 1_000, actualDataBytes: 1_000)
+        try FileManager.default.createSymbolicLink(
+            at: dir.appendingPathComponent(name),
+            withDestinationURL: blob
+        )
+        try """
+        {"metadata": {"total_size": 1008}, "weight_map": {"a": "\(name)"}}
+        """.write(
+            to: dir.appendingPathComponent("model.safetensors.index.json"),
+            atomically: true, encoding: .utf8
+        )
+
+        let report = try XCTUnwrap(DeepSeekV41Preflight.inspect(snapshotDir: dir))
+        XCTAssertTrue(report.isComplete, "a link to a complete blob is complete: \(report.issues)")
+        XCTAssertEqual(report.presentShardCount, 1)
+        // The link is 21ish bytes; the measurement must be the blob's own size.
+        XCTAssertGreaterThan(report.bytesPresent, 1_000, report.humanSummary)
     }
 
     func testShardMatchingItsHeaderIsComplete() throws {

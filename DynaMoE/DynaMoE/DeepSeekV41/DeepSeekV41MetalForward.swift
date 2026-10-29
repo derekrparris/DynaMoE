@@ -199,15 +199,20 @@ nonisolated public enum DeepSeekV41DevicePlan {
     }
 
     /// Rows one position may gather: its window plus the compressed rows the
-    /// addressing rule reads. `index_topk == 0` means "every compressed row",
-    /// which grows with the context, so the candidate-block budget bounds it and a
-    /// plan that provisions wider is reported instead of overflowing the buffer.
+    /// addressing rule reads.
+    ///
+    /// A layer that runs an indexer keeps `min(index_topk, produced)` compressed
+    /// rows, so `index_topk` is the bound there — it is not "0 means every row".
+    /// A compressed layer with no indexer (`index_topk == 0`) falls back to the
+    /// "all rows the candidate mask can expose" rule, which the block counts
+    /// bound; pricing the indexed case off those counts instead allocated ~25×
+    /// the buffer this checkpoint needs (16,512 rows for what is really 640) and
+    /// made the readiness line misleading.
     public static func gatherRowBudget(config: DeepSeekV41Config) -> Int {
-        let compressed = max(
-            config.indexTopK,
-            config.candidateTopKBlocks * max(1, config.candidateBlockSize)
-        )
-        return max(1, config.windowSize) + max(0, compressed)
+        let window = max(1, config.windowSize)
+        if config.indexTopK > 0 { return window + config.indexTopK }
+        let candidates = max(1, config.candidateTopKBlocks) * max(1, config.candidateBlockSize)
+        return window + candidates
     }
 
     /// Wiring problems the executor can see without touching a weight: a dimension
@@ -215,7 +220,8 @@ nonisolated public enum DeepSeekV41DevicePlan {
     /// stages only the reference implements.
     public static func problems(
         config: DeepSeekV41Config,
-        plan: [DeepSeekV41LayerPlan]
+        plan: [DeepSeekV41LayerPlan],
+        allowEngramSkip: Bool = false
     ) -> [String] {
         var problems: [String] = []
 
@@ -237,7 +243,7 @@ nonisolated public enum DeepSeekV41DevicePlan {
                 problems.append("layers.\(layer.index): compressed layer has no cache owner")
             }
         }
-        for layer in plan where layer.engramTable != nil {
+        for layer in plan where layer.engramTable != nil && !allowEngramSkip {
             problems.append(
                 "layers.\(layer.index): Engram memory is not served on device yet "
                     + "(its combination rule is \(DeepSeekV41Conformance.engramCombination.rawValue))"
@@ -462,6 +468,8 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
     private let swigluLimit: Float
     private let gatherRows: Int
     private let contextLength: Int
+    /// Debug opt-out: run an Engram layer with no memory read instead of refusing.
+    private let skipEngram: Bool
     /// Committed command buffers whose results the host has not needed yet. Drained
     /// by `settlePending` at every readback and at the end of a token.
     private var pending: [(buffer: MTLCommandBuffer, stage: String)] = []
@@ -487,8 +495,13 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         self.swigluLimit = runtime.config.swigluLimit ?? 0
         self.gatherRows = runtime.workspace.gatherRows
         self.contextLength = runtime.contextLength
+        self.skipEngram = runtime.allowEngramSkip
 
-        var problems = DeepSeekV41DevicePlan.problems(config: runtime.config, plan: runtime.plan)
+        var problems = DeepSeekV41DevicePlan.problems(
+            config: runtime.config,
+            plan: runtime.plan,
+            allowEngramSkip: runtime.allowEngramSkip
+        )
         if runtime.cachePrecision != .fp16 {
             problems.append(
                 "the cache is allocated at \(runtime.cachePrecision.rawValue), but the store/gather "
@@ -623,6 +636,15 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             "device forward: \(isRunnable ? "ready" : "not runnable") at "
                 + "\(DeepSeekV41DevicePlan.gatherRowBudget(config: config)) gathered rows/position"
         ]
+        if skipEngram {
+            let skipped = plan.filter { $0.engramTable != nil }.map(\.index)
+            if !skipped.isEmpty {
+                lines.append(
+                    "  ENGRAM SKIPPED on layers \(skipped.map(String.init).joined(separator: ", ")): "
+                        + "they run with no memory read at all (\(DeepSeekV41Runtime.engramOffDefaultKey))"
+                )
+            }
+        }
         lines.append(contentsOf: problems.map { "  \($0)" })
         return lines.joined(separator: "\n")
     }
@@ -1036,8 +1058,9 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
 
         case .engram:
             // Reported at load for any layer that carries a table, so reaching here
-            // with one configured means the plan was bypassed.
-            if layer.engramTable != nil {
+            // with one configured means either the debug opt-out is on or the plan
+            // was bypassed.
+            if layer.engramTable != nil && !skipEngram {
                 throw DeepSeekV41EngineError.unsupportedStage("engram")
             }
 

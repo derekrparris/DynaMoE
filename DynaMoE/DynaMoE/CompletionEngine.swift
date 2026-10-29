@@ -368,7 +368,8 @@ public final class CompletionEngine: @unchecked Sendable {
                 summary: loadedSummary,
                 config: dsConfig,
                 shardBuffers: loadedShards,
-                contextLength: contextLength
+                contextLength: contextLength,
+                allowEngramSkip: DeepSeekV41Runtime.engramSkipRequested
             ) {
                 if !runtime.isRunnable {
                     throw CompletionLaunchError.engineNotReady(
@@ -1381,6 +1382,18 @@ public final class CompletionEngine: @unchecked Sendable {
         // the worst case, walking off the buffer. The check runs before the
         // multi-GB scratch/KV allocations so a rejected turn costs nothing.
         let fitPhysicalGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+        // A streamed model is charged for what it holds, not for its file size:
+        // the dense backbone stays resident and the experts live in the working
+        // set, while the rest of the shards are SSD-resident only.
+        let streamedFootprintGB: Double? = effMode == .dynamicStreaming
+            ? min(
+                summary.sizeGb,
+                streamedResidentFootprintGB(
+                    summary: summary,
+                    residentExpertBytes: WorkingSetManager.shared.residentExpertBytesTotal
+                )
+            )
+            : nil
         let fitCheck = KVCacheProvisioning.turnFit(
             sessionFloor: sessionFloor,
             promptTokens: promptTokenIds.count,
@@ -1399,7 +1412,8 @@ public final class CompletionEngine: @unchecked Sendable {
             // machine can serve.
             budgetMode: budgetMode,
             modelFootprintGB: summary.sizeGb,
-            physicalGB: fitPhysicalGB
+            physicalGB: fitPhysicalGB,
+            residentFootprintGB: streamedFootprintGB
         )
         // Both KV gates report the same numbers, and never claim the prompt is
         // longer than the cache when the bind is the budget or the reserve.
@@ -1414,7 +1428,7 @@ public final class CompletionEngine: @unchecked Sendable {
                     precision: kvPrec,
                     isAgentSession: isAgentSession,
                     sessionFloor: sessionFloor,
-                    modelFootprintGB: summary.sizeGb,
+                    modelFootprintGB: streamedFootprintGB ?? summary.sizeGb,
                     physicalGB: fitPhysicalGB
                 )
             )
@@ -1546,7 +1560,12 @@ public final class CompletionEngine: @unchecked Sendable {
         // and drove the process past physical RAM. The pinned prefix is a hard
         // floor: the KV relayout preserves it.
         let physicalGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
-        let kvBudgetGB = KVCacheProvisioning.budgetGB(physicalGB: physicalGB, modelFootprintGB: summary.sizeGb, budgetMode: budgetMode)
+        let kvBudgetGB = KVCacheProvisioning.budgetGB(
+            physicalGB: physicalGB,
+            modelFootprintGB: summary.sizeGb,
+            budgetMode: budgetMode,
+            residentFootprintGB: streamedFootprintGB
+        )
         let kvGeometry = KVCacheProvisioning.geometry(
             config: modelConfig,
             actualLayers: actualLayers,
@@ -1591,7 +1610,7 @@ public final class CompletionEngine: @unchecked Sendable {
                     precision: kvPrec,
                     isAgentSession: isAgentSession,
                     sessionFloor: sessionFloor,
-                    modelFootprintGB: summary.sizeGb,
+                    modelFootprintGB: streamedFootprintGB ?? summary.sizeGb,
                     physicalGB: physicalGB
                 )
             )
