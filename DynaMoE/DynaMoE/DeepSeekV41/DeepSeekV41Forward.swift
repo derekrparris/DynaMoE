@@ -549,13 +549,30 @@ nonisolated public final class DeepSeekV41CPUForward {
 
     /// Appends one position and returns the output logits.
     public func forwardToken(_ token: Int, position: Int) -> [Float] {
+        forwardEmbedding(embed(token), token: token, position: position)
+    }
+
+    /// Appends one position whose embedding the caller supplies, which is how an
+    /// image span enters the residual stream: `Model.merge_image_embeddings`
+    /// overwrites the span's rows before the layers run, so those positions never
+    /// come from the token embedding table.
+    ///
+    /// `token` is still recorded in the history because the n-gram hashes are built
+    /// from token ids; mark the position dead (`markNextTokenDead`) so an Engram
+    /// lookup cannot span it and contributes nothing there.
+    @discardableResult
+    public func forwardEmbedding(
+        _ embedding: [Float],
+        token: Int,
+        position: Int
+    ) -> [Float] {
         // The hash inputs are the token stream itself, so the history is kept here
         // rather than recomputed by each Engram layer.
         tokenHistory.append(Int32(truncatingIfNeeded: token))
         deadTokens.append(pendingDead)
         pendingDead = false
 
-        var hidden = embed(token)
+        var hidden = embedding
         let mult = max(1, config.hcMult)
         var streams = Array(repeating: hidden, count: mult)
 
@@ -909,6 +926,10 @@ nonisolated public final class DeepSeekV41CPUForward {
     /// slot, and dropping it would shift every later column.
     private func writeEngram(layer: Int, table: Int, streams: inout [[Float]]) {
         guard let engramLookup else { return }
+        // `Engram.forward` zeroes the gate wherever `token_mask` is false, so a dead
+        // position (an image span) passes through untouched rather than reading pad
+        // rows into the stream.
+        guard deadTokens.last != true else { return }
         let spec = config.engramTables[table]
         // `(max_ngram_size - 1) * n_heads` hash columns, one row each.
         let columns = max(1, spec.maxNgramSize - 1) * spec.headCount

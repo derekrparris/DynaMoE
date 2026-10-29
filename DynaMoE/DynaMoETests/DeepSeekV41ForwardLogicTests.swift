@@ -1116,6 +1116,41 @@ final class DeepSeekV41EngramForwardTests: XCTestCase {
         // A layer with no table records nothing.
         XCTAssertNil(withRows.engramGates[(layer + 1) % plan.count])
     }
+
+    /// An image span enters the residual directly, and the positions it occupies
+    /// take no Engram contribution (`Engram.forward` zeroes the gate wherever the
+    /// token mask is false). Otherwise a picture would read pad rows into the
+    /// stream at every Engram layer.
+    func testImageSpanPositionsSkipEngram() throws {
+        let config = try DeepSeekV41TestFixtures.engramConfig()
+        let plan = try config.makeLayerPlan()
+        let layer = try XCTUnwrap(plan.first { $0.engramTable != nil }).index
+
+        let source = weights(config: config, plan: plan, withRows: true)
+        let spanForward = DeepSeekV41CPUForward(
+            config: config, plan: plan, weights: source, engramLookup: source
+        )
+        let plainForward = DeepSeekV41CPUForward(
+            config: config, plan: plan, weights: source, engramLookup: source
+        )
+
+        let spanRow = [Float](repeating: 0.75, count: config.hiddenSize)
+        spanForward.markNextTokenDead()
+        _ = spanForward.forwardEmbedding(spanRow, token: 3, position: 0)
+        _ = plainForward.forwardToken(3, position: 0)
+
+        XCTAssertTrue(spanForward.deadTokens == [true])
+        XCTAssertTrue(plainForward.deadTokens == [false])
+        // The supplied row is what the layer read, not the token embedding.
+        XCTAssertNotEqual(
+            spanForward.attentionInput(layer: layer, position: 0),
+            plainForward.attentionInput(layer: layer, position: 0)
+        )
+        XCTAssertEqual(spanForward.engramGates[layer], nil, "a dead position has no gate")
+        XCTAssertNotNil(plainForward.engramGates[layer])
+        // The history still carries the token id, because the hashes need it.
+        XCTAssertEqual(spanForward.tokenHistory, [3])
+    }
 }
 
 // MARK: - Cache layout
