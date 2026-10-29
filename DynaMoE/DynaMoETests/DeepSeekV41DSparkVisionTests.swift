@@ -330,10 +330,24 @@ final class DeepSeekV41VisionPlanTests: XCTestCase {
 
     func testTokenCountMatchesTheLayoutRule() {
         let plan = DeepSeekV41VisionTowerPlan(spec: spec(), projectorOutputWidth: 7168)
-        XCTAssertEqual(
-            plan.tokenCount(width: 480, height: 480),
-            DeepSeekV41VisionLayout.fit(width: 480, height: 480, spec: spec()).tokens
+        // 480 / 48 = 10 tokens on each side. Pinned as a literal: comparing
+        // against the helper under test would pass even if the helper were wrong.
+        XCTAssertEqual(plan.tokenCount(width: 480, height: 480), 100)
+        XCTAssertEqual(plan.tokenCount(width: 96, height: 144), 2 * 3)
+    }
+
+    /// A square image whose floor exceeds a very small cap must stay square.
+    /// Clamping only the column count produced 6x5 instead of 5x5.
+    func testSquareImageStaysSquareWhenTheFloorExceedsTheCap() {
+        let tight = DeepSeekV41VisionSpec(
+            patchSize: 8, downsampleRatio: 1, minPixels: 36 * 8 * 8, maxImageTokens: 25,
+            numHiddenLayers: 2, hiddenSize: 16, numAttentionHeads: 2,
+            intermediateSize: 32, imageTokenID: 1
         )
+        let fitted = DeepSeekV41VisionLayout.fit(width: 48, height: 48, spec: tight)
+        XCTAssertEqual(fitted.tokens, 25)
+        XCTAssertEqual(fitted.width, fitted.height)
+        XCTAssertEqual(fitted.width / tight.tokenStride, 5)
     }
 }
 

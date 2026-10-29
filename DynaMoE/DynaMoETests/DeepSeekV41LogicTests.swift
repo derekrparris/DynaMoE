@@ -1114,6 +1114,18 @@ final class DeepSeekV41VisionExpandTests: XCTestCase {
         XCTAssertFalse(expansion.report.isBalanced)
     }
 
+    func testPlaceholderWithoutImagesIsReported() {
+        let markers = DeepSeekV41VisionMarkers(
+            imagePlaceholder: "<img>", imageOpen: "<", imageClose: ">", imageToken: "x"
+        )
+        let expansion = DeepSeekV41VisionLayout.expandReporting(
+            text: "<img>lost", images: [], spec: spec, markers: markers
+        )
+        XCTAssertEqual(expansion.text, "<img>lost")
+        XCTAssertEqual(expansion.report.unfilledPlaceholderCount, 1)
+        XCTAssertFalse(expansion.report.isBalanced)
+    }
+
     func testExtraPlaceholderIsReported() {
         let markers = DeepSeekV41VisionMarkers(
             imagePlaceholder: "<img>", imageOpen: "<", imageClose: ">", imageToken: "x"

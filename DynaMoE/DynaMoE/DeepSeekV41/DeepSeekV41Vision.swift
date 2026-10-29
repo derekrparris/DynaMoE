@@ -130,12 +130,15 @@ nonisolated public enum DeepSeekV41VisionLayout {
         var columns = startColumns
         var rows = startRows
 
-        if spec.maxImageTokens > 0, columns * rows > spec.maxImageTokens {
+        // Shrink both sides proportionally, then trim the longer side one row at
+        // a time. Clamping only `columns` and recomputing `rows` turns a square
+        // 6x6 grid into 6x5, which is both a different aspect ratio and a
+        // different token count than the caller fitted for.
+        func shrinkToCap() {
+            guard spec.maxImageTokens > 0, columns * rows > spec.maxImageTokens else { return }
             let factor = (Double(spec.maxImageTokens) / Double(columns * rows)).squareRoot()
             columns = max(1, Int((Double(columns) * factor).rounded(.down)))
             rows = max(1, Int((Double(rows) * factor).rounded(.down)))
-            // Shrink the longer side until the product is inside the cap; the floor
-            // above can still leave the product one row over.
             while columns * rows > spec.maxImageTokens {
                 if columns >= rows {
                     columns -= 1
@@ -145,6 +148,8 @@ nonisolated public enum DeepSeekV41VisionLayout {
                 if columns < 1 || rows < 1 { break }
             }
         }
+
+        shrinkToCap()
 
         let minTokens = spec.minPixels > 0
             ? (spec.minPixels + stride * stride - 1) / (stride * stride)
@@ -156,10 +161,7 @@ nonisolated public enum DeepSeekV41VisionLayout {
             // Never exceed a cap that is smaller than the floor: the cap wins,
             // because a prompt that overflows the context is unusable while a
             // slightly small image is merely low resolution.
-            if spec.maxImageTokens > 0, columns * rows > spec.maxImageTokens {
-                columns = max(1, min(columns, spec.maxImageTokens))
-                rows = max(1, spec.maxImageTokens / columns)
-            }
+            shrinkToCap()
         }
 
         let tokens = columns * rows
@@ -221,7 +223,15 @@ nonisolated public enum DeepSeekV41VisionLayout {
         markers: DeepSeekV41VisionMarkers = .familyDefault
     ) -> (text: String, report: ExpansionReport) {
         guard !images.isEmpty else {
-            return (text, ExpansionReport(unusedImageCount: 0, unfilledPlaceholderCount: 0))
+            // A prompt with placeholders but no attached images leaves those
+            // placeholders in place; reporting zero would hide the mismatch.
+            let unfilled = markers.imagePlaceholder.isEmpty
+                ? 0
+                : text.components(separatedBy: markers.imagePlaceholder).count - 1
+            return (
+                text,
+                ExpansionReport(unusedImageCount: 0, unfilledPlaceholderCount: max(0, unfilled))
+            )
         }
         // An empty needle matches at every position and never advances the
         // remainder, so the loop below would never terminate.
