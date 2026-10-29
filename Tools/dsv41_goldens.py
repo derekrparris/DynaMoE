@@ -34,13 +34,20 @@ Usage:
     python3 Tools/dsv41_goldens.py all --snapshot <snapshot dir>
 
 Cases: `engram` (Engram.forward), `compressor` (Compressor.forward), `router`
-(Gate.forward, under both per-logit scorings).
+(Gate.forward, under both per-logit scorings), and `dspark` (`DSparkBlock`'s
+`forward_embed` seed plus its `forward_head` chain: the Markov bias, the per-step
+draw, and the confidence ordering).
 
-Three gates deliberately have no case yet. `hyperConnections` needs
+Two gates deliberately have no case yet. `hyperConnections` needs
 `kernel.hc_split_sinkhorn`, the real Sinkhorn, which is a tilelang kernel and so
 is exactly the transcription this script exists to avoid repeating;
-`candidateSelection` needs live cache state; `dsparkDrafting` needs a draft chain
-over a real prefix.
+`candidateSelection` needs live cache state.
+
+`dspark` covers the half of the drafter that decides which tokens a chain
+contains. What it cannot cover, and what therefore keeps the gate open, is the
+draft block's own attention and MoE: those run only through `forward_spec`, which
+nothing in the checkpoint's own generator calls, so there is no reference output
+for a draft block forward over a real prefix.
 
 torch and numpy are required. `brew install pytorch` puts the Python package
 inside the formula's venv rather than on `sys.path`, so point PYTHONPATH at it:
@@ -432,10 +439,146 @@ def router_case(torch, reference) -> dict:
     }
 
 
+def dspark_case(torch, reference) -> dict:
+    """`DSparkBlock`: the target-state projection, then the draft chain.
+
+    Two halves, because they fail differently. `forward_embed` turns the target
+    model's concatenated hidden states into the draft block's conditioning row and
+    seeds the chain's inputs with `[last token, noise, noise, ...]`. `forward_head`
+    then walks the block, adds the Markov head's FULL-VOCAB bias for the token
+    before each draft, draws one token per step, and scores each step's confidence.
+
+    The chain below is written out here rather than taken from `forward_head`'s
+    return value for one reason: `forward_head` draws with torch's global RNG, and
+    a vector pinned to that RNG cannot be replayed by any other implementation. So
+    the draws here come from a fixed uniform table that travels with the vectors,
+    using the same rule the reference's `sample` implements — `argmax(p / -log u)`,
+    i.e. Gumbel-max, since `-log(Exponential(1))` is Gumbel.
+    """
+    args = reference.ModelArgs(
+        dim=8,
+        head_dim=4,
+        norm_eps=1e-6,
+        hc_mult=2,
+        max_batch_size=1,
+        vocab_size=16,
+        n_layers=1,
+        n_mtp_layers=1,
+        n_heads=2,
+        rope_head_dim=2,
+        q_lora_rank=4,
+        o_lora_rank=4,
+        o_groups=2,
+        moe_inter_dim=16,
+        n_routed_experts=4,
+        n_activated_experts=2,
+        window_size=8,
+        compress_ratios=(0, 0),
+        dspark_block_size=3,
+        dspark_noise_token_id=1,
+        dspark_target_layer_ids=(0,),
+        dspark_markov_rank=4,
+        # The draft block's MoE is never run here, and an fp4 expert weight cannot
+        # be seeded by a generator, so the dense path is the only one that works.
+        expert_dtype=None,
+    )
+    block = fill(reference.DSparkBlock(args.n_layers, args), torch)
+    # A Transformer hands the stage the backbone's embedding and head; this case
+    # builds them itself so the vectors do not depend on a whole model.
+    block.embed = fill(reference.ParallelEmbedding(args.vocab_size, args.dim), torch, seed=7)
+    block.head = fill(
+        reference.ParallelHead(args.vocab_size, args.dim, args.norm_eps, args.hc_eps), torch, seed=8
+    )
+
+    vocab = args.vocab_size
+    block_size = args.dspark_block_size
+    seed_token = 11
+    uniforms = torch.rand(
+        (block_size, vocab), generator=torch.Generator().manual_seed(20251017), dtype=torch.float32
+    )
+
+    with torch.no_grad():
+        main_hidden = torch.arange(
+            1.0, 1.0 + args.dim * len(args.dspark_target_layer_ids)
+        ).view(1, 1, -1)
+        input_ids = torch.tensor([[seed_token]], dtype=torch.long)
+        draft_input_ids = input_ids.new_full([1, block_size], args.dspark_noise_token_id)
+        draft_input_ids[:, 0] = input_ids
+
+        x, main_x = block.forward_embed(main_hidden, input_ids)
+        collapsed = block.hc_pre(x, reference.make_identity_pre_mix(x, args.hc_mult))
+        # What the block's own head would produce per draft position, before the
+        # Markov bias: the chain's only dependence on the block forward.
+        base_logits = block.head(block.norm(collapsed), full_logits=True)
+
+        # The chain, with the draws driven by `uniforms` instead of torch's RNG.
+        markov_logits, markov_embeds = [], []
+        chosen = [seed_token]
+        for step in range(block_size):
+            # `output_ids[:, i]` is 1-D in the reference, which is what keeps the
+            # bias [b, vocab] and the embedding [b, markov_rank].
+            bias, embed = block.markov_head(torch.tensor([chosen[step]], dtype=torch.long))
+            markov_logits.append(bias[0])
+            markov_embeds.append(embed)
+            step_logits = base_logits[0, step] + bias[0]
+            probs = torch.softmax(step_logits / max(args.temperature, 1e-5), dim=-1, dtype=torch.float32)
+            chosen.append(int(torch.argmax(probs / -torch.log(uniforms[step]))))
+        confidence = block.confidence_head(
+            collapsed, torch.stack(markov_embeds, dim=1)
+        )
+
+        # The same chain with the reference's own `sample` at temperature 0
+        # (argmax), which is the shape a greedy port has to reproduce.
+        greedy = [seed_token]
+        for step in range(block_size):
+            bias, _ = block.markov_head(torch.tensor([greedy[step]], dtype=torch.long))
+            greedy.append(int(torch.argmax(base_logits[0, step] + bias[0])))
+
+    return {
+        "gate": "dsparkDrafting",
+        "reference": f"inference/model.py DSparkBlock.forward_embed/forward_head ({snapshot_note()})",
+        "config": {
+            "dim": args.dim,
+            "hc_mult": args.hc_mult,
+            "vocab_size": vocab,
+            "block_size": block_size,
+            "noise_token_id": args.dspark_noise_token_id,
+            "markov_rank": args.dspark_markov_rank,
+            "temperature": args.temperature,
+            "norm_eps": args.norm_eps,
+        },
+        "input": {
+            "main_hidden": rows_of(main_hidden),
+            "input_ids": seed_token,
+            "main_proj": rows_of(block.main_proj.weight),
+            "main_norm_gain": rows_of(block.main_norm.weight),
+            "markov_embed": rows_of(block.markov_head.embed.weight),
+            "markov_head": rows_of(block.markov_head.head.weight),
+            "confidence_proj": rows_of(block.confidence_head.proj.weight),
+            "uniforms": rows_of(uniforms),
+            # The chain's block half: per draft position, the head's logits before
+            # any Markov contribution.
+            "base_logits": rows_of(base_logits[0]),
+            "collapsed": rows_of(collapsed),
+        },
+        "expected": {
+            "main_x": rows_of(main_x[0, 0]),
+            "markov_logits": rows_of(torch.stack(markov_logits)),
+            "confidence": rows_of(confidence[0]),
+            "chained_ids": chosen,
+            "greedy_ids": greedy,
+            "mixed_logits": rows_of(
+                torch.stack([base_logits[0, step] + markov_logits[step] for step in range(block_size)])
+            ),
+        },
+    }
+
+
 CASES = {
     "engram": engram_case,
     "compressor": compressor_case,
     "router": router_case,
+    "dspark": dspark_case,
 }
 
 _SNAPSHOT = ""

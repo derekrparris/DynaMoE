@@ -540,3 +540,157 @@ final class DeepSeekV41RouterGoldenTests: XCTestCase {
         )
     }
 }
+
+// MARK: - DSpark draft chain
+
+/// `DSparkBlock.forward_head`: which token each draft step produces.
+///
+/// Three things are pinned here, in the order they can go wrong:
+///
+///  * the Markov head is a projection over the token BEFORE the draft, and its
+///    contribution is ADDED to the draft head's logits rather than mixed with
+///    them (`logits[:, i].add_(logits_bias)` in the reference);
+///  * at temperature 0 the draw is the argmax, and at temperature > 0 it is
+///    Gumbel-max — the two chains below disagree, so a port that only implements
+///    argmax cannot pass both;
+///  * the chain conditions each step on the token it drew itself. The reference run
+///    that produced these numbers drove its draws from the recorded uniform table
+///    rather than torch's RNG, which is what lets another implementation replay
+///    them at all.
+///
+/// What is NOT here: the block's own attention and MoE, which the reference only
+/// runs through `forward_spec` (nothing in its generator calls it), and
+/// `confidence_head`, whose output the runtime supplies per step. `main_proj` /
+/// `main_norm` are likewise device work; the vectors carry `main_x` so a device
+/// run has something to compare against later.
+final class DeepSeekV41DSparkGoldenTests: XCTestCase {
+
+    private let vocab = 16
+    private let rank = 4
+    private let blockSize = 3
+    private let seedToken = 11
+
+    /// [vocab][rank]: the Markov head's token embedding, row per token.
+    private static let markovEmbedding: [Float] = [
+        0.07505525648593903, 0.5770904421806335, 0.631659984588623, 0.23289524018764496,
+        -0.17175555229187012, -0.155463308095932, 0.10532516986131668, 0.35710904002189636,
+        0.03315494954586029, -0.1774834543466568, 0.321479469537735, 0.30349045991897583,
+        -0.05505961924791336, -0.19723433256149292, 0.17943722009658813, -0.3234536051750183,
+        0.2675934135913849, 0.3885294497013092, -1.0765175819396973, -0.49533677101135254,
+        -0.09841146320104599, 0.2594464123249054, 0.2513696551322937, -0.5796754360198975,
+        -0.47033461928367615, -0.4165085554122925, 0.6985601782798767, -0.029341954737901688,
+        -0.16901488602161407, 0.32388922572135925, 0.01331248227506876, 0.29472625255584717,
+        -0.3208908438682556, 0.04630168527364731, -0.16492392122745514, 0.16138005256652832,
+        0.39044371247291565, -0.6794939041137695, -0.3137754201889038, 0.5157357454299927,
+        -0.43117499351501465, -0.09568622708320618, 0.11263421177864075, 0.219187930226326,
+        -0.16053307056427002, 0.036844585090875626, -0.14470398426055908, 0.0007326057530008256,
+        -0.041383061558008194, -0.8174810409545898, 0.02507863938808441, 0.08514393866062164,
+        -0.13926191627979279, 0.08310973644256592, 0.3591311573982239, -0.1333162933588028,
+        -0.31108713150024414, -0.3775206506252289, 0.28429800271987915, 0.10626613348722458,
+        0.3292079269886017, 0.3280269503593445, -0.6205866932868958, -0.0453009270131588,
+    ]
+
+    /// [vocab][rank]: its projection; `head . embed(token)` is the bias.
+    private static let markovHead: [Float] = [
+        -0.0714821070432663, -0.03284405916929245, -0.36436423659324646, -0.4889819025993347,
+        0.5791834592819214, 0.0986863374710083, -0.7280771732330322, -0.1767807900905609,
+        -0.32828962802886963, -0.37107837200164795, 0.060093704611063004, 0.49513617157936096,
+        0.2007105052471161, 0.20014075934886932, -0.35356083512306213, -0.2683325409889221,
+        0.23195938766002655, 0.19742895662784576, -0.09040653705596924, -0.5378032922744751,
+        0.3651018440723419, 0.21690906584262848, -0.046431589871644974, 0.4027104675769806,
+        0.12352654337882996, 0.39240071177482605, 0.11447017639875412, -0.4101775586605072,
+        0.2807976305484772, 0.3295634984970093, -0.16886159777641296, -1.0469330549240112,
+        0.08604981005191803, -0.4421508014202118, -0.16329003870487213, -0.32508429884910583,
+        -0.7723405361175537, 0.15045534074306488, 0.25336962938308716, -0.37516409158706665,
+        -0.26499003171920776, 0.05513801798224449, -0.24391689896583557, -0.4973408877849579,
+        0.4574846029281616, 0.4462742209434509, 0.16472068428993225, -0.2315240353345871,
+        0.15492625534534454, 0.06782618910074234, -0.18883636593818665, 0.14738817512989044,
+        -0.5749186873435974, 0.5456117987632751, -0.18149057030677795, -0.24103355407714844,
+        -0.2728177607059479, -0.3427838087081909, -0.44508111476898193, -0.2958552837371826,
+        0.02405545674264431, 0.03627585619688034, -0.3278595805168152, 0.007056800648570061,
+    ]
+
+    /// [step][vocab]: the draft head's own logits, before any Markov bias.
+    private static let baseLogits: [Float] = [
+        1.0949606895446777, -0.9696973562240601, -0.8788833022117615, 1.5426067113876343, 0.41987770795822144, 0.6527422070503235, 1.8114542961120605, 1.3929872512817383, -1.0831714868545532, 1.3359276056289673, 0.5933427810668945, -0.2796241343021393, -1.1698253154754639, -0.7117562890052795, -0.7596293687820435, -0.7591647505760193,
+        -0.8828035593032837, 0.5205801725387573, -0.6335746645927429, -0.7400186061859131, 1.0432902574539185, -0.7478694915771484, 0.43544802069664, 1.422088861465454, -0.5719939470291138, -1.4613580703735352, 0.8612226247787476, -1.4631046056747437, 2.054617166519165, 1.6262545585632324, -1.3813928365707397, 0.47036799788475037,
+        -0.8828035593032837, 0.5205801725387573, -0.6335746645927429, -0.7400186061859131, 1.0432902574539185, -0.7478694915771484, 0.43544802069664, 1.422088861465454, -0.5719939470291138, -1.4613580703735352, 0.8612226247787476, -1.4631046056747437, 2.054617166519165, 1.6262545585632324, -1.3813928365707397, 0.47036799788475037,
+    ]
+
+    /// [step][vocab]: the recorded draw the reference chain used.
+    private static let uniforms: [Float] = [
+        0.7383538484573364, 0.9626431465148926, 0.5169785618782043, 0.6702953577041626, 0.8849483728408813, 0.5111140608787537, 0.46000510454177856, 0.710733950138092, 0.2949299216270447, 0.32864534854888916, 0.3863545060157776, 0.31693124771118164, 0.9706630110740662, 0.15488868951797485, 0.6842818856239319, 0.2981295585632324,
+        0.5565166473388672, 0.5571320652961731, 0.6980217099189758, 0.898026168346405, 0.7834221720695496, 0.7713313102722168, 0.004704773426055908, 0.6066763997077942, 0.30511075258255005, 0.568665087223053, 0.9392861127853394, 0.28359001874923706, 0.529255747795105, 0.5099509954452515, 0.8194040060043335, 0.1670163869857788,
+        0.8292112946510315, 0.40606385469436646, 0.1254696249961853, 0.23775410652160645, 0.5290055274963379, 0.6661540269851685, 0.6348021030426025, 0.9694656133651733, 0.3629986047744751, 0.1450597643852234, 0.5122637152671814, 0.992669403553009, 0.20636284351348877, 0.5327293872833252, 0.6937694549560547, 0.4271620512008667,
+    ]
+
+    /// [step][vocab]: the bias the reference added at that step, for the token the
+    /// chain was conditioning on.
+    private static let expectedMarkovBias: [Float] = [
+        0.06263183802366257, 0.015884114429354668, 0.03069605492055416, 0.026118511334061623, -0.017274776473641396, -0.04360513016581535, -0.02223704196512699, -0.009266716428101063, -0.0067141419276595116, 0.09259123355150223, 0.07950259000062943, -0.08100397139787674, 0.005061592441052198, 0.13848213851451874, 0.09535481035709381, 0.04492263123393059,
+        0.6025662422180176, 1.064682126045227, -0.5419740676879883, 0.6449987888336182, 0.5024957060813904, 0.03248153254389763, 0.2654609978199005, 0.9035516381263733, 0.1880485564470291, -0.23514120280742645, 0.45944520831108093, 0.23316819965839386, 0.1980886161327362, 0.37291237711906433, 0.41949981451034546, 0.36998245120048523,
+        -0.11425478756427765, -0.3799269497394562, 0.2923538386821747, -0.20433035492897034, -0.24696917831897736, -0.09513851255178452, -0.16782161593437195, -0.4011022746562958, -0.08444138616323471, 0.2649240493774414, -0.02750338427722454, -0.272152304649353, -0.062254078686237335, 0.12240933626890182, 0.035452619194984436, -0.049224648624658585,
+    ]
+
+    /// The reference's `markov_head(token)`: one dot per vocabulary row.
+    private func markovBias(for token: Int) -> [Float] {
+        (0..<vocab).map { row in
+            (0..<rank).reduce(Float(0)) { total, k in
+                total + Self.markovHead[row * rank + k] * Self.markovEmbedding[token * rank + k]
+            }
+        }
+    }
+
+    private func chain(temperature: Float) -> [Int] {
+        var cursor = 0
+        return DeepSeekV41DSpark.runChain(
+            steps: blockSize,
+            seedToken: seedToken,
+            temperature: temperature,
+            nextUniform: {
+                defer { cursor += 1 }
+                return Self.uniforms[cursor]
+            },
+            step: { index, previous in
+                (
+                    draftLogits: Array(
+                        Self.baseLogits[(index * vocab)..<((index + 1) * vocab)]
+                    ),
+                    markovBias: markovBias(for: previous),
+                    confidence: 0
+                )
+            }
+        ).tokens
+    }
+
+    func testTheMarkovBiasIsTheReferenceProjectionOfThePreviousToken() {
+        // The tokens the reference chain conditioned on: the seed, then its own
+        // first two draws.
+        for (step, token) in [11, 4, 10].enumerated() {
+            let bias = markovBias(for: token)
+            for entry in 0..<vocab {
+                XCTAssertEqual(
+                    bias[entry],
+                    Self.expectedMarkovBias[step * vocab + entry],
+                    accuracy: 1e-5,
+                    "step \(step) entry \(entry)"
+                )
+            }
+        }
+    }
+
+    func testTheGreedyChainMatchesTheReference() {
+        // The reference's `output_ids` is `[seed, draft0, draft1, draft2]`: a chain
+        // is the drawn tail, and the seed is not one of its tokens.
+        XCTAssertEqual(chain(temperature: 0), [6, 12, 12])
+    }
+
+    /// The reference draws at its configured temperature, and the recorded uniforms
+    /// make that chain reproducible. It disagrees with the greedy chain, so a port
+    /// that samples greedily cannot pass this and the case above at the same time.
+    func testTheSampledChainMatchesTheReference() {
+        let sampled = chain(temperature: 1)
+        XCTAssertEqual(sampled, [4, 10, 7])
+        XCTAssertNotEqual(sampled, chain(temperature: 0))
+    }
+}

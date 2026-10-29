@@ -112,6 +112,23 @@ nonisolated public enum DeepSeekV41Conformance {
     public static let hyperConnections: Gate = .unverified
 
     /// DSpark's draft-chain construction.
+    ///
+    /// The CHAIN is matched against `DSparkBlock.forward_head` in the checkpoint's
+    /// `inference/model.py`: the Markov head is a full-vocab bias projected from the
+    /// token before each draft and ADDED to the draft head's logits, the draw is
+    /// argmax at temperature 0 and Gumbel-max above it, and each step conditions on
+    /// the token it drew itself. `Tools/dsv41_goldens.py` runs that chain at a tiny
+    /// config with the draws driven by a recorded uniform table (torch's own RNG is
+    /// not replayable), and `DeepSeekV41DSparkGoldenTests` carries both the greedy
+    /// and the sampled chain; the two disagree, so a port that implements only one
+    /// of them cannot pass.
+    ///
+    /// What keeps this gate open is the draft BLOCK: `main_proj`/`main_norm`, its
+    /// window-cache attention, and the MoE under the DSpark expert counts. Those run
+    /// only through `forward_spec`, and nothing in the checkpoint's generator calls
+    /// it, so there is no reference output for a draft block forward over a real
+    /// prefix. The acceptance/emission rule and the confidence gate are this port's
+    /// too: the reference defines the drafter but ships no speculative loop.
     public static let dsparkDrafting: Gate = .unverified
 
     /// The vision tower's patch grid, image token layout, and the tower forward.
