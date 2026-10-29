@@ -1069,6 +1069,42 @@ final class DeepSeekV41ConfigEdgeTests: XCTestCase {
         XCTAssertEqual(catalog.slots.count, 0)
         XCTAssertEqual(catalog.unconsumed.count, 2)
     }
+
+    /// `Int(Double)` traps at 2^63, and `Double(Int.max)` is exactly 2^63, so
+    /// the old bound accepted the one value that traps.
+    func testAnIntegerPastIntMaxIsRejectedInsteadOfTrapping() {
+        let json = Self.minimalJSON.replacingOccurrences(
+            of: "\"vocab_size\": 1024",
+            with: "\"vocab_size\": 9223372036854775808"
+        )
+        XCTAssertThrowsError(try decode(json))
+    }
+
+    func testNegativeNextNPredictLayerCountIsRejected() throws {
+        let json = Self.minimalJSON.replacingOccurrences(
+            of: "\"window_size\": 8",
+            with: "\"window_size\": 8, \"num_nextn_predict_layers\": -1"
+        )
+        let config = try decode(json)
+        XCTAssertThrowsError(try config.makeLayerPlan()) { error in
+            guard case DeepSeekV41ConfigError.invalidField(let field, _)? = error as? DeepSeekV41ConfigError else {
+                return XCTFail("unexpected error \(error)")
+            }
+            XCTAssertEqual(field, "num_nextn_predict_layers")
+        }
+    }
+
+    /// `engramTables` used to `zip` the two arrays, silently pairing a short
+    /// row-count list with the first layers and dropping the rest.
+    func testMismatchedEngramArraysDoNotPairSilently() throws {
+        let json = Self.minimalJSON.replacingOccurrences(
+            of: "\"engram_layer_ids\": [0]",
+            with: "\"engram_layer_ids\": [0, 1]"
+        )
+        let config = try decode(json)
+        XCTAssertTrue(config.engramTables.isEmpty)
+        XCTAssertThrowsError(try config.makeLayerPlan())
+    }
 }
 
 // MARK: - Vision placeholder expansion

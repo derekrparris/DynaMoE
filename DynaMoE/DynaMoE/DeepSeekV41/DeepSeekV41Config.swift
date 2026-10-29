@@ -68,8 +68,10 @@ nonisolated private struct DSV41JSON {
     static func intValue(_ value: Any) -> Int? {
         if let i = value as? Int { return i }
         if let d = value as? Double {
-            guard d.isFinite, d >= Double(Int.min), d <= Double(Int.max) else { return nil }
-            return Int(d)
+            // `Int(d)` traps for d == 2^63, and `Double(Int.max)` rounds UP to
+            // exactly 2^63, so comparing against it is not a bound. `Int(exactly:)`
+            // is both non-trapping and rejects fractional config values.
+            return Int(exactly: d)
         }
         if let n = value as? NSNumber {
             let wide = n.int64Value
@@ -368,7 +370,12 @@ nonisolated public struct DeepSeekV41Config: Sendable, Equatable {
     // MARK: Derived
 
     public var engramTables: [DeepSeekV41EngramSpec] {
-        zip(engramLayerIDs, engramRowCounts).map { layer, rows in
+        // A mismatch is rejected by `makeLayerPlan`, but this property is also
+        // read before the plan exists (memory pricing, the device catalog). Pair
+        // by index only when the arrays agree, rather than silently truncating
+        // to the shorter one and pricing/wiring the wrong layer set.
+        guard engramLayerIDs.count == engramRowCounts.count else { return [] }
+        return zip(engramLayerIDs, engramRowCounts).map { layer, rows in
             DeepSeekV41EngramSpec(
                 layer: layer,
                 rowCount: rows,
@@ -457,6 +464,13 @@ nonisolated public struct DeepSeekV41Config: Sendable, Equatable {
     public func makeLayerPlan() throws -> [DeepSeekV41LayerPlan] {
         guard numHiddenLayers > 0 else {
             throw DeepSeekV41ConfigError.invalidField("num_hidden_layers", "must be positive")
+        }
+        guard numNextNPredictLayers >= 0 else {
+            // A negative count used to reach `0..<count` in the weights
+            // validator and trap before any diagnostic could be printed.
+            throw DeepSeekV41ConfigError.invalidField(
+                "num_nextn_predict_layers", "must not be negative"
+            )
         }
         if !compressRatios.isEmpty && compressRatios.count < numHiddenLayers {
             throw DeepSeekV41ConfigError.inconsistentLayout(
