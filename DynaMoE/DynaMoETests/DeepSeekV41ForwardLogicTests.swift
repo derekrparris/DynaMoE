@@ -48,9 +48,8 @@ enum DeepSeekV41TestFixtures {
         "routed_scaling_factor": 2.0,
         "swiglu_limit": 10.0,
         "q_lora_rank": 0,
-        "kv_lora_rank": 4,
-        "qk_nope_head_dim": 4,
-        "qk_rope_head_dim": 0,
+        "head_dim": 4,
+        "qk_rope_head_dim": 2,
         "v_head_dim": 4,
         "o_groups": 1,
         "o_lora_rank": 4,
@@ -255,6 +254,119 @@ final class DeepSeekV41RoPETests: XCTestCase {
         XCTAssertEqual(frequencies[1], 1 / pow(10_000, 2.0 / 8.0), accuracy: 1e-6)
     }
 
+    /// Query heads rotate their own rope slice, the latent rotates its own; when
+    /// those widths differ, one shared table is wrong for at least one rail, and
+    /// CPU/GPU parity cannot catch it because both read the same wrong table.
+    func testQueryAndLatentTablesUseTheirOwnWidths() throws {
+        let shape = DeepSeekV41AttentionShape(
+            numHeads: 2, headsPerGroup: 2, qkHeadDim: 8, vHeadDim: 8,
+            latentWidth: 4, qLoraRank: 0, oLoraRank: 4,
+            isCompressed: false, compressRatio: 0,
+            ropeTheta: 10_000, rotaryDim: 0
+        )
+        let query = DeepSeekV41RoPE.queryFrequencies(for: shape)
+        let latent = DeepSeekV41RoPE.latentFrequencies(for: shape)
+        XCTAssertEqual(query.count, 4)
+        XCTAssertEqual(latent.count, 2)
+        XCTAssertNotEqual(query[1], latent[1], accuracy: 1e-9)
+    }
+
+    /// The checkpoint's `apply_rotary_emb` takes ADJACENT values as one complex
+    /// number (`view_as_complex`), so a 4-wide vector pairs (0,1) and (2,3). Pairing
+    /// the halves instead, (0,2) and (1,3), is the other rope convention and produces
+    /// these different values for the same weights.
+    func testAdjacentValuesPairIntoOneRotation() {
+        var vector: [Float] = [1, 2, 3, 4]
+        DeepSeekV41RoPE.rotate(&vector, position: 2, frequencies: [0.5, 0.25])
+        XCTAssertEqual(vector[0], -1.142640, accuracy: 1e-5)
+        XCTAssertEqual(vector[1], 1.922076, accuracy: 1e-5)
+        XCTAssertEqual(vector[2], 0.715045, accuracy: 1e-5)
+        XCTAssertEqual(vector[3], 4.948607, accuracy: 1e-5)
+    }
+
+    /// A decoupled payload is the TRAILING slice: the non-rope prefix must come out
+    /// of the rotation untouched, or the two subspaces the checkpoint trained
+    /// separately get mixed.
+    func testDecoupledPayloadLeavesThePrefixAlone() {
+        var vector: [Float] = [1, 2, 3, 4, 5, 6, 7, 8]
+        let prefix = Array(vector[0..<4])
+        DeepSeekV41RoPE.rotateSlice(
+            &vector, start: 4, length: 4, position: 2, frequencies: [0.5, 0.25]
+        )
+        XCTAssertEqual(Array(vector[0..<4]), prefix)
+        // The rotated tail is the same rotation the whole-vector form gives it.
+        var tail: [Float] = [5, 6, 7, 8]
+        DeepSeekV41RoPE.rotate(&tail, position: 2, frequencies: [0.5, 0.25])
+        XCTAssertEqual(Array(vector[4..<8]), tail)
+    }
+
+    /// The attention output is de-rotated with the conjugate, so rotating then
+    /// inverting has to be the identity.
+    func testInverseRotationUndoesTheRotation() {
+        let original: [Float] = [0.4, -1.2, 0.7, 2.1, -0.3, 0.9]
+        var vector = original
+        let frequencies: [Float] = [0.5, 0.25, 0.125]
+        DeepSeekV41RoPE.rotate(&vector, position: 5, frequencies: frequencies)
+        DeepSeekV41RoPE.rotate(&vector, position: 5, frequencies: frequencies, inverse: true)
+        for (before, after) in zip(original, vector) {
+            XCTAssertEqual(after, before, accuracy: 1e-5)
+        }
+    }
+
+    /// A decoupled shape reports the trailing slice on every rail, and rotating per
+    /// head over that slice matches rotating each head's tail on its own.
+    func testDecoupledShapeRotatesOnlyItsTrailingSlice() {
+        let shape = DeepSeekV41AttentionShape(
+            numHeads: 2, headsPerGroup: 2, qkHeadDim: 8, vHeadDim: 8,
+            latentWidth: 8, qLoraRank: 0, oLoraRank: 4,
+            isCompressed: false, compressRatio: 0,
+            ropeTheta: 10_000, rotaryDim: 4
+        )
+        XCTAssertFalse(shape.rotatesWholeLatent)
+        XCTAssertEqual(shape.queryRopeStart, 4)
+        XCTAssertEqual(shape.queryRopeWidth, 4)
+        XCTAssertEqual(shape.latentRopeStart, 4)
+        XCTAssertEqual(shape.latentRopeWidth, 4)
+        XCTAssertEqual(shape.outputRopeStart, 4)
+        XCTAssertTrue(shape.outputCarriesRope)
+
+        var heads: [Float] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        DeepSeekV41RoPE.rotateHeads(
+            &heads,
+            heads: 2,
+            headDim: 8,
+            sliceStart: shape.queryRopeStart,
+            sliceLength: shape.queryRopeWidth,
+            position: 3,
+            frequencies: [0.5, 0.25]
+        )
+        // Heads are 8 values each and only values 4..<8 of each head move.
+        XCTAssertEqual(Array(heads[0..<4]), [1, 2, 3, 4])
+        XCTAssertEqual(Array(heads[8..<12]), [9, 10, 11, 12])
+        var firstTail: [Float] = [5, 6, 7, 8]
+        DeepSeekV41RoPE.rotate(&firstTail, position: 3, frequencies: [0.5, 0.25])
+        XCTAssertEqual(Array(heads[4..<8]), firstTail)
+    }
+
+    /// The real rope block (a 64-wide payload at `compress_rope_theta`, factor 16):
+    /// the ramp starts at the beta_fast dimension and is complete by the beta_slow
+    /// one. Pinned as ratios so the frequencies stay free to be retuned.
+    func testScaledRampStartsAtTheBetaFastDimension() {
+        let plain = DeepSeekV41RoPE.inverseFrequencies(
+            width: 64, theta: 160_000, factor: 1, originalLength: 0, betaFast: 32, betaSlow: 1
+        )
+        let scaled = DeepSeekV41RoPE.inverseFrequencies(
+            width: 64, theta: 160_000, factor: 16, originalLength: 65_536, betaFast: 32, betaSlow: 1
+        )
+        XCTAssertEqual(scaled.count, 32)
+        // Dimension 14 is below the beta_fast threshold (15): untouched.
+        XCTAssertEqual(scaled[14] / plain[14], 1, accuracy: 1e-6)
+        // Dimension 20 sits halfway up the 15...25 ramp, so half the factor applies.
+        XCTAssertEqual(scaled[20] / plain[20], 0.53125, accuracy: 1e-6)
+        // Past the beta_slow threshold (25) the factor applies in full.
+        XCTAssertEqual(scaled[25] / plain[25], 1 / 16, accuracy: 1e-6)
+    }
+
     func testYarnDividesOnlyTheLongWavelengths() {
         let plain = DeepSeekV41RoPE.inverseFrequencies(
             width: 16, theta: 10_000, factor: 1, originalLength: 0, betaFast: 32, betaSlow: 1
@@ -336,6 +448,109 @@ final class DeepSeekV41CompressorTests: XCTestCase {
 
     func testEmptyPoolIsZeroed() {
         XCTAssertTrue(DeepSeekV41Compressor.pool(latents: [], gates: []).isEmpty)
+        XCTAssertTrue(
+            DeepSeekV41Compressor.pooledLatent(inputs: [], kvWeight: nil, gateWeight: nil).isEmpty
+        )
+    }
+
+    /// `score.softmax(dim=2)` runs over the GROUP axis of a
+    /// `[batch, groups, ratio, head_dim]` tensor, so each of the `head_dim`
+    /// channels gets its own distribution over the group's positions. A single
+    /// weight per row would fail here: the two channels below disagree about which
+    /// position should dominate.
+    func testGateWeightsArePerDimensionNotPerPosition() {
+        // head_dim 2, hidden 2. Position 0 prefers channel 0, position 1 channel 1.
+        let kvWeight = DeepSeekV41Matrix(rows: 2, columns: 2, values: [
+            1, 0,
+            0, 1
+        ])
+        let gateWeight = DeepSeekV41Matrix(rows: 2, columns: 2, values: [
+            100, -100,
+            -100, 100
+        ])
+        // Stacked so the kv projection emits channel 0 = 4, channel 1 = 1 for the
+        // first position and channel 0 = 1, channel 1 = 8 for the second.
+        let inputs: [[Float]] = [[4, 1], [1, 8]]
+        let pooled = DeepSeekV41Compressor.pooledLatent(
+            inputs: inputs, kvWeight: kvWeight, gateWeight: gateWeight
+        )
+        // Channel 0: softmax([~0, ~0]) would be a mean only if the gate were shared.
+        // Here the gate says 100 for position 0, so channel 0 takes position 0's 4.
+        XCTAssertEqual(pooled[0], 4, accuracy: 1e-4)
+        // Channel 1 mirrors it and takes position 1's 8.
+        XCTAssertEqual(pooled[1], 8, accuracy: 1e-4)
+    }
+
+    /// A ratio of 1 publishes no `wgate`; the group is the single position and the
+    /// result is its plain projection.
+    func testRatioOneIsAPlainProjection() {
+        let kvWeight = DeepSeekV41Matrix(rows: 2, columns: 2, values: [
+            1, 1,
+            0, 2
+        ])
+        let pooled = DeepSeekV41Compressor.pooledLatent(
+            inputs: [[3, 4]], kvWeight: kvWeight, gateWeight: nil
+        )
+        XCTAssertEqual(pooled, [7, 8])
+    }
+}
+
+// MARK: - Block-diagonal output projection
+
+final class DeepSeekV41BlockDiagonalProjectionTests: XCTestCase {
+
+    /// `attn.wo_a` is `groups` dense blocks stacked along the rows. Reading it as
+    /// one dense matrix multiplies each group's rows into every other group's
+    /// heads, so the grouped result must equal two independent GEMVs.
+    func testGroupsReadOnlyTheirOwnColumns() {
+        // 2 groups, 2 rows per group, 2 columns per group.
+        let weight = DeepSeekV41Matrix(rows: 4, columns: 4, values: [
+            1, 2, 999, 999,
+            3, 4, 999, 999,
+            999, 999, 5, 6,
+            999, 999, 7, 8
+        ])
+        let input: [Float] = [1, 1, 2, 1]
+        let grouped = weight.applyBlockDiagonal(input, groups: 2)
+
+        let first = DeepSeekV41Matrix(rows: 2, columns: 2, values: [1, 2, 3, 4])
+            .apply([1, 1])
+        let second = DeepSeekV41Matrix(rows: 2, columns: 2, values: [5, 6, 7, 8])
+            .apply([2, 1])
+        XCTAssertEqual(grouped, first + second)
+
+        // And it must differ from the dense read, which is the bug being fixed.
+        let dense = weight.apply(input)
+        XCTAssertNotEqual(grouped, dense)
+    }
+
+    /// One group degenerates to the ordinary dense projection, which is what a
+    /// checkpoint with `o_groups = 1` publishes.
+    func testSingleGroupIsDense() {
+        let weight = DeepSeekV41Matrix(rows: 2, columns: 3, values: [
+            1, 0, -1,
+            0, 2, 0
+        ])
+        let input: [Float] = [1, 2, 3]
+        XCTAssertEqual(weight.applyBlockDiagonal(input, groups: 1), weight.apply(input))
+    }
+
+    /// A geometry that cannot be split is a zero block, matching `apply`'s
+    /// documented behaviour for a mismatched matrix, rather than a misread.
+    func testUnsplittableGeometryYieldsZeros() {
+        let weight = DeepSeekV41Matrix(rows: 3, columns: 4, values: (0..<12).map { Float($0) })
+        XCTAssertEqual(weight.applyBlockDiagonal([1, 1, 1, 1], groups: 2), [0, 0, 0])
+    }
+
+    /// The published `wo_a` is `[o_groups * o_lora_rank][heads * head_dim / o_groups]`
+    /// and `wo_b` reads the concatenated groups, so the rank-width scratch is
+    /// `o_groups * o_lora_rank`, not `o_lora_rank`.
+    func testShapesSizeTheReducedWidthByGroups() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let shapes = DeepSeekV41TensorShapes(config: config)
+        XCTAssertEqual(shapes.outputGroups, 1)
+        XCTAssertEqual(shapes.outputReducedWidth, shapes.oLoraRank * shapes.outputGroups)
+        XCTAssertEqual(shapes.attentionOutputWidth, config.numAttentionHeads * config.vHeadDim)
     }
 }
 
@@ -722,7 +937,10 @@ final class DeepSeekV41ForwardTests: XCTestCase {
         XCTAssertEqual(forward.latents.count, plan.count)
         for layer in forward.latents {
             XCTAssertEqual(layer.count, 4)
-            XCTAssertTrue(layer.allSatisfy { $0.count == config.cacheRecordWidth })
+            // head_dim = 4 with its rope payload inside it. Pinned rather
+            // than compared to `config.cacheRecordWidth`, which is the same
+            // helper the cache store uses.
+            XCTAssertTrue(layer.allSatisfy { $0.count == 4 })
         }
     }
 

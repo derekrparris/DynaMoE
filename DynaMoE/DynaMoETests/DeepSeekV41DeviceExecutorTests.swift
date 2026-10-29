@@ -449,6 +449,86 @@ final class DeepSeekV41NormDispatchTests: XCTestCase {
     }
 }
 
+// MARK: - Gather kernel
+
+final class DeepSeekV41GatherKernelTests: XCTestCase {
+
+    /// The compressed half of a gather lives after the window's rows in the same
+    /// index list. The kernel indexes `rowIndices[row]` from zero, so binding the
+    /// list at offset 0 re-reads window rows; this test pins the offset contract.
+    func testGatherReadsTheRowListFromTheBoundOffset() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+        guard let library = device.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "dsv41_gather_latents_f16"),
+              let pipeline = try? device.makeComputePipelineState(function: function),
+              let queue = device.makeCommandQueue() else {
+            XCTFail("Could not build the gather pipeline")
+            return
+        }
+
+        let width = 4
+        let cacheRows = 4
+        var cacheBits: [UInt16] = []
+        for row in 0..<cacheRows {
+            for dim in 0..<width {
+                cacheBits.append(Float16(Float(row * 10 + dim)).bitPattern)
+            }
+        }
+        // Two junk entries first, then the rows this gather should read.
+        let indices: [UInt32] = [77, 77, 3, 1]
+        let indexOffset = 2
+        guard let cache = device.makeBuffer(
+                  bytes: cacheBits,
+                  length: cacheBits.count * MemoryLayout<UInt16>.stride,
+                  options: .storageModeShared),
+              let indexBuffer = device.makeBuffer(
+                  bytes: indices,
+                  length: indices.count * MemoryLayout<UInt32>.stride,
+                  options: .storageModeShared),
+              let dense = device.makeBuffer(
+                  length: 2 * width * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("Could not allocate the gather buffers")
+            return
+        }
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(cache, offset: 0, index: 0)
+        encoder.setBuffer(
+            indexBuffer,
+            offset: indexOffset * MemoryLayout<UInt32>.stride,
+            index: 1
+        )
+        encoder.setBuffer(dense, offset: 0, index: 2)
+        var cacheOffset: UInt64 = 0
+        var dim = UInt32(width)
+        var rows: UInt32 = 2
+        var destination: UInt64 = 0
+        encoder.setBytes(&cacheOffset, length: 8, index: 3)
+        encoder.setBytes(&dim, length: 4, index: 4)
+        encoder.setBytes(&rows, length: 4, index: 5)
+        encoder.setBytes(&destination, length: 8, index: 6)
+        encoder.dispatchThreads(
+            MTLSize(width: width, height: 2, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        let out = dense.contents().assumingMemoryBound(to: Float.self)
+        // Bound at offset 0 this would read rows 77 and 77 (out of the buffer).
+        XCTAssertEqual(Array(UnsafeBufferPointer(start: out, count: 4)), [30, 31, 32, 33])
+        XCTAssertEqual(Array(UnsafeBufferPointer(start: out + 4, count: 4)), [10, 11, 12, 13])
+    }
+}
+
 // MARK: - Router kernel
 
 final class DeepSeekV41RouterKernelTests: XCTestCase {
@@ -531,9 +611,188 @@ final class DeepSeekV41RouterKernelTests: XCTestCase {
         for (rank, expert) in reference.expertIDs.enumerated() {
             XCTAssertEqual(weights[rank], unbiased[expert] / total * scaling, accuracy: 1e-4)
         }
-        // Expert 4's biased score is sigmoid(2); weighting by it instead of by its
-        // unbiased sigmoid(-3) would move its share from ~0.06 to ~1.19.
-        let biasedShare = DeepSeekV41Router.sigmoid(2)
-        XCTAssertNotEqual(weights[1], biasedShare / total * scaling, accuracy: 0.1)
+    }
+}
+
+// MARK: - Rope kernel
+
+final class DeepSeekV41RopeKernelTests: XCTestCase {
+
+    /// The kernel is the GPU half of `DeepSeekV41RoPE.rotateSlice`, and the two
+    /// properties that matter are ones a CPU/GPU parity check cannot see: the rotated
+    /// slice is the TRAILING one (the non-rope prefix must not move) and values pair
+    /// ADJACENTLY, the checkpoint's `view_as_complex` layout. The expected values are
+    /// pinned from that rule, not from a second kernel run.
+    func testKernelRotatesOnlyTheBoundSlice() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+        guard let library = device.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "dsv41_rope_latent"),
+              let pipeline = try? device.makeComputePipelineState(function: function),
+              let queue = device.makeCommandQueue() else {
+            XCTFail("Could not build the rope pipeline")
+            return
+        }
+
+        // A 8-wide record whose rope payload is the last 4 values.
+        let rowWidth = 8
+        let sliceStart = 4
+        let pairCount = 2
+        let values: [Float] = [1, 2, 3, 4, 5, 6, 7, 8]
+        let frequencies: [Float] = [0.5, 0.25]
+        guard let vector = device.makeBuffer(
+                  bytes: values, length: values.count * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let freqs = device.makeBuffer(
+                  bytes: frequencies,
+                  length: frequencies.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("Could not allocate the rope buffers")
+            return
+        }
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(vector, offset: 0, index: 0)
+        encoder.setBuffer(freqs, offset: 0, index: 1)
+        var width = UInt32(rowWidth)
+        var headDim: UInt32 = 0
+        var pairs = UInt32(pairCount)
+        var base: UInt32 = 2
+        var batch: UInt32 = 1
+        var offset = UInt32(sliceStart)
+        var inverse: UInt32 = 0
+        encoder.setBytes(&width, length: 4, index: 2)
+        encoder.setBytes(&headDim, length: 4, index: 3)
+        encoder.setBytes(&pairs, length: 4, index: 4)
+        encoder.setBytes(&base, length: 4, index: 5)
+        encoder.setBytes(&batch, length: 4, index: 6)
+        encoder.setBytes(&offset, length: 4, index: 7)
+        encoder.setBytes(&inverse, length: 4, index: 8)
+        encoder.dispatchThreads(
+            MTLSize(width: pairCount, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: pairCount, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        let out = vector.contents().assumingMemoryBound(to: Float.self)
+        let rotated = Array(UnsafeBufferPointer(start: out, count: values.count))
+        // The prefix is byte-identical: rotating from offset 0 would move it.
+        XCTAssertEqual(Array(rotated[0..<4]), [1, 2, 3, 4])
+        // Adjacent pairs of the tail (5,6) and (7,8), rotated at position 2.
+        XCTAssertEqual(rotated[4], -2.347315, accuracy: 1e-5)
+        XCTAssertEqual(rotated[5], 7.449169, accuracy: 1e-5)
+        XCTAssertEqual(rotated[6], 2.307674, accuracy: 1e-5)
+        XCTAssertEqual(rotated[7], 10.376639, accuracy: 1e-5)
+
+        // And the same dispatch in the conjugate direction restores the original,
+        // which is what the attention output's de-rotation relies on.
+        guard let restoreBuffer = queue.makeCommandBuffer(),
+              let restoreEncoder = restoreBuffer.makeComputeCommandEncoder() else {
+            XCTFail("Could not allocate the second command buffer")
+            return
+        }
+        inverse = 1
+        restoreEncoder.setComputePipelineState(pipeline)
+        restoreEncoder.setBuffer(vector, offset: 0, index: 0)
+        restoreEncoder.setBuffer(freqs, offset: 0, index: 1)
+        restoreEncoder.setBytes(&width, length: 4, index: 2)
+        restoreEncoder.setBytes(&headDim, length: 4, index: 3)
+        restoreEncoder.setBytes(&pairs, length: 4, index: 4)
+        restoreEncoder.setBytes(&base, length: 4, index: 5)
+        restoreEncoder.setBytes(&batch, length: 4, index: 6)
+        restoreEncoder.setBytes(&offset, length: 4, index: 7)
+        restoreEncoder.setBytes(&inverse, length: 4, index: 8)
+        restoreEncoder.dispatchThreads(
+            MTLSize(width: pairCount, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: pairCount, height: 1, depth: 1)
+        )
+        restoreEncoder.endEncoding()
+        restoreBuffer.commit()
+        restoreBuffer.waitUntilCompleted()
+        XCTAssertNil(restoreBuffer.error)
+        let restored = Array(UnsafeBufferPointer(start: out, count: values.count))
+        for (before, after) in zip(values, restored) {
+            XCTAssertEqual(after, before, accuracy: 1e-5)
+        }
+    }
+}
+
+// MARK: - Compressor pool kernel
+
+final class DeepSeekV41PoolKernelTests: XCTestCase {
+
+    /// `score.softmax(dim=2)` runs over the group axis of a
+    /// `[batch, groups, ratio, head_dim]` tensor, so each CHANNEL of the pooled row
+    /// gets its own distribution over the group's positions. A kernel that shared
+    /// one weight per row would produce the row mean here; the two channels below
+    /// disagree about which position should dominate, so the mean is distinguishable.
+    func testKernelSoftmaxesTheGatePerDimension() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+        guard let library = device.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "dsv41_pool_latents_f32"),
+              let pipeline = try? device.makeComputePipelineState(function: function),
+              let queue = device.makeCommandQueue() else {
+            XCTFail("Could not build the pool pipeline")
+            return
+        }
+
+        let width = 2
+        let blockSize = 2
+        // Channel 0 strongly prefers position 0, channel 1 strongly prefers
+        // position 1, so the per-dimension answer is [4, 8] and the mean is [2.5, 4.5].
+        let latents: [Float] = [4, 1, 1, 8]
+        let gates: [Float] = [100, -100, -100, 100]
+
+        guard let latentBuffer = device.makeBuffer(
+                  bytes: latents, length: latents.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let gateBuffer = device.makeBuffer(
+                  bytes: gates, length: gates.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let outBuffer = device.makeBuffer(
+                  length: width * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("Could not allocate the pool buffers")
+            return
+        }
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(latentBuffer, offset: 0, index: 0)
+        encoder.setBuffer(gateBuffer, offset: 0, index: 1)
+        encoder.setBuffer(outBuffer, offset: 0, index: 2)
+        var poolWidth = UInt32(width)
+        var block = UInt32(blockSize)
+        encoder.setBytes(&poolWidth, length: 4, index: 3)
+        encoder.setBytes(&block, length: 4, index: 4)
+        encoder.dispatchThreads(
+            MTLSize(width: width, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: max(1, width), height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        let out = outBuffer.contents().assumingMemoryBound(to: Float.self)
+        XCTAssertEqual(out[0], 4, accuracy: 1e-4)
+        XCTAssertEqual(out[1], 8, accuracy: 1e-4)
+
+        // And the CPU rule must agree, so the two backends cannot drift.
+        let reference = DeepSeekV41Compressor.pooledLatent(
+            inputs: [[4, 1], [1, 8]],
+            kvWeight: DeepSeekV41Matrix(rows: 2, columns: 2, values: [1, 0, 0, 1]),
+            gateWeight: DeepSeekV41Matrix(rows: 2, columns: 2, values: [100, -100, -100, 100])
+        )
+        XCTAssertEqual(out[0], reference[0], accuracy: 1e-4)
+        XCTAssertEqual(out[1], reference[1], accuracy: 1e-4)
     }
 }

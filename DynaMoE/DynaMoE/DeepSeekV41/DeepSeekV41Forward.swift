@@ -27,7 +27,8 @@
 //  Layout conventions, all from the checkpoint:
 //    * matrices are `[out][in]` row-major, so `apply` is a dot product per row,
 //    * the latent record (key AND value) has `cacheRecordWidth` values,
-//    * every query head has `qkHeadDim` values and the whole query is rotated,
+//    * every query head has `qkHeadDim` values, and only its trailing rope payload
+//      rotates (the whole head on the legacy non-decoupled shape),
 //    * the residual is `hcMult` copies of the hidden vector.
 //
 
@@ -69,6 +70,36 @@ nonisolated public struct DeepSeekV41Matrix: Sendable, Equatable {
         let base = index * columns
         guard base + columns <= values.count else { return [] }
         return Array(values[base..<(base + columns)])
+    }
+
+    /// y = W x where `W` is block-diagonal over `groups` head groups: the matrix
+    /// is `groups` dense blocks stacked along the rows, and block `g` reads only
+    /// columns `g * columns / groups ..< (g + 1) * columns / groups`.
+    ///
+    /// `attn.wo_a` is published this way ([o_groups * o_lora_rank] rows by
+    /// [heads * head_dim / o_groups] columns, 8192 x 4096 at 8 groups) and the
+    /// reference reads it with an einsum per group, not as one `Linear`. Applying
+    /// it dense would multiply each group's rows into every other group's heads.
+    public func applyBlockDiagonal(_ x: [Float], groups: Int) -> [Float] {
+        var out = [Float](repeating: 0, count: rows)
+        let g = max(1, groups)
+        guard values.count >= rows * columns, x.count >= columns else { return out }
+        guard rows % g == 0, columns % g == 0 else { return out }
+        let rowsPerGroup = rows / g
+        let columnsPerGroup = columns / g
+        for group in 0..<g {
+            let rowBase = group * rowsPerGroup
+            let columnBase = group * columnsPerGroup
+            for row in 0..<rowsPerGroup {
+                let offset = (rowBase + row) * columns + columnBase
+                var total: Float = 0
+                for column in 0..<columnsPerGroup {
+                    total += values[offset + column] * x[columnBase + column]
+                }
+                out[rowBase + row] = total
+            }
+        }
+        return out
     }
 }
 
@@ -180,6 +211,13 @@ nonisolated public struct DeepSeekV41TensorShapes: Sendable, Equatable {
     public let latentWidth: Int
     public let qLoraRank: Int
     public let oLoraRank: Int
+    /// Head groups `attn.wo_a` is block-diagonal over (`o_groups`).
+    public let outputGroups: Int
+    /// Width of the `wo_a` result: `o_groups * o_lora_rank`, NOT `o_lora_rank`.
+    /// Each group projects its own heads to `o_lora_rank` and the groups are
+    /// concatenated, which is `o.flatten(2)` in the reference; `attn.wo_b` then
+    /// reads all of them.
+    public let outputReducedWidth: Int
     public let expertIntermediate: Int
     public let sharedIntermediate: Int
 
@@ -190,6 +228,10 @@ nonisolated public struct DeepSeekV41TensorShapes: Sendable, Equatable {
         self.latentWidth = config.cacheRecordWidth
         self.qLoraRank = config.qLoraRank
         self.oLoraRank = config.oLoraRank
+        self.outputGroups = max(1, config.oGroups)
+        self.outputReducedWidth = config.oLoraRank > 0
+            ? max(1, config.oLoraRank) * max(1, config.oGroups)
+            : 0
         self.expertIntermediate = max(1, config.moeIntermediateSize)
         // The shared expert runs at `n_shared_experts` times the routed width when
         // the checkpoint publishes only the routed width, which is how every
@@ -218,6 +260,7 @@ nonisolated public enum DeepSeekV41ForwardStages {
         case writeLatent
         case compressPool
         case attention
+        case ropeOutput
         case outputDown
         case outputUp
         case writeAttentionStreams
@@ -247,6 +290,7 @@ nonisolated public enum DeepSeekV41ForwardStages {
         .writeLatent,
         .compressPool,
         .attention,
+        .ropeOutput,
         .outputDown,
         .outputUp,
         .writeAttentionStreams,
@@ -354,11 +398,19 @@ nonisolated public final class DeepSeekV41CPUForward {
     /// ring width and record layout here are the ones the device cache uses.
     public let geometry: DeepSeekV41CacheGeometry
     private let weights: DeepSeekV41WeightSource
-    /// RoPE inverse frequencies per rope table, resolved once.
-    private let frequencyTable: [DeepSeekV41RopeTable: [Float]]
+    /// RoPE inverse frequencies per rope table, resolved once. The query rail
+    /// rotates the trailing rope slice of each `qkHeadDim`-wide head and the latent
+    /// rail rotates the trailing slice of each cache record, so their tables are
+    /// built over those slice widths (they coincide when the payload is decoupled,
+    /// and differ on the legacy whole-record shape).
+    private let queryFrequencyTable: [DeepSeekV41RopeTable: [Float]]
+    private let latentFrequencyTable: [DeepSeekV41RopeTable: [Float]]
     /// Written positions, in order. Mirrors the device cache so the reference can
     /// read the same rows the kernels would.
     public private(set) var latents: [[[Float]]] = []
+    /// Post-`attn_norm` attention inputs per layer, in position order. The
+    /// compressor projects these, so they are kept beside the latents.
+    public private(set) var attentionInputs: [[[Float]]] = []
     /// Compressed rows per owner layer.
     public private(set) var compressed: [Int: [[Float]]] = [:]
     /// Candidate block scores from the candidate-source layer, per position.
@@ -383,19 +435,23 @@ nonisolated public final class DeepSeekV41CPUForward {
             precision: .fp16
         )
         self.weights = weights
-        var table: [DeepSeekV41RopeTable: [Float]] = [:]
+        var queries: [DeepSeekV41RopeTable: [Float]] = [:]
+        var latents: [DeepSeekV41RopeTable: [Float]] = [:]
         for layer in plan {
-            guard table[layer.ropeTable] == nil else { continue }
+            guard queries[layer.ropeTable] == nil else { continue }
             let shape = DeepSeekV41AttentionShape.make(config: config, layer: layer)
-            table[layer.ropeTable] = DeepSeekV41RoPE.frequencies(for: shape, config: config)
+            queries[layer.ropeTable] = DeepSeekV41RoPE.queryFrequencies(for: shape)
+            latents[layer.ropeTable] = DeepSeekV41RoPE.latentFrequencies(for: shape)
         }
-        self.frequencyTable = table
+        self.queryFrequencyTable = queries
+        self.latentFrequencyTable = latents
     }
 
     public var storedPositions: Int { latents.first?.count ?? 0 }
 
     public func reset() {
         latents = []
+        attentionInputs = []
         compressed = [:]
         candidateScores = []
     }
@@ -462,29 +518,53 @@ nonisolated public final class DeepSeekV41CPUForward {
         let normed = rmsNorm(attnInput, role: .attnNorm, layer: index, epsilon: config.rmsNormEps)
 
         var query = queryPath(normed, layer: index, shape: shape)
-        let frequencies = frequencyTable[layer.ropeTable] ?? []
         DeepSeekV41RoPE.rotateHeads(
             &query,
             heads: shape.numHeads,
             headDim: shape.qkHeadDim,
+            sliceStart: shape.queryRopeStart,
+            sliceLength: shape.queryRopeWidth,
             position: position,
-            frequencies: frequencies
+            frequencies: queryFrequencyTable[layer.ropeTable] ?? []
         )
 
         var latent = latentPath(normed, layer: index)
-        DeepSeekV41RoPE.rotate(&latent, position: position, frequencies: frequencies)
+        DeepSeekV41RoPE.rotateSlice(
+            &latent,
+            start: shape.latentRopeStart,
+            length: shape.latentRopeWidth,
+            position: position,
+            frequencies: latentFrequencyTable[layer.ropeTable] ?? []
+        )
         appendLatent(layer: layer, position: position, latent: latent)
-        pooledLatent(layer: layer, position: position)
+        appendAttentionInput(layer: index, position: position, input: normed)
+        pooledLatent(layer: layer, position: position, shape: shape)
 
         let keys = attentionKeys(layer: layer, position: position)
         let sink = weights.vector(.attnSink, layer: index)
-        let attended = DeepSeekV41AttentionReference.attend(
+        var attended = DeepSeekV41AttentionReference.attend(
             query: query,
             keys: keys,
             shape: shape,
             sink: sink
         )
-        let attnOut = outputPath(attended, layer: index)
+        // The keys stay stored rotated, so the output's rope payload has to come back
+        // out before the output projection. The reference conjugates the SAME slice it
+        // rotated into the keys (`apply_rotary_emb(o[..., -rd:], freqs_cis, True)`);
+        // leaving it in rotates every value the projection reads.
+        if shape.outputCarriesRope {
+            DeepSeekV41RoPE.rotateHeads(
+                &attended,
+                heads: shape.numHeads,
+                headDim: shape.vHeadDim,
+                sliceStart: shape.outputRopeStart,
+                sliceLength: shape.latentRopeWidth,
+                position: position,
+                frequencies: latentFrequencyTable[layer.ropeTable] ?? [],
+                inverse: true
+            )
+        }
+        let attnOut = outputPath(attended, layer: index, shape: shape)
         DeepSeekV41HyperConnections.write(
             streams: &streams,
             contribution: attnOut,
@@ -542,10 +622,17 @@ nonisolated public final class DeepSeekV41CPUForward {
         return latent
     }
 
-    private func outputPath(_ attended: [Float], layer: Int) -> [Float] {
+    /// `wo_a` is block-diagonal over the head groups, so it is read group by
+    /// group; `wo_b` is an ordinary dense projection over the concatenated
+    /// groups (`torch.einsum("bsgd,grd->bsgr")` then `o.flatten(2)`).
+    private func outputPath(
+        _ attended: [Float],
+        layer: Int,
+        shape: DeepSeekV41AttentionShape
+    ) -> [Float] {
         var reduced = attended
         if let down = weights.matrix(.attnWoA, layer: layer, expert: nil) {
-            reduced = down.apply(attended)
+            reduced = down.applyBlockDiagonal(attended, groups: shape.outputGroups)
         }
         guard let up = weights.matrix(.attnWoB, layer: layer, expert: nil) else {
             return [Float](repeating: 0, count: shapes.hidden)
@@ -589,6 +676,24 @@ nonisolated public final class DeepSeekV41CPUForward {
         }
     }
 
+    /// The post-`attn_norm` block input for a position. The compressor needs it:
+    /// `Compressor.forward(x)` projects the attention input, so pooling from the
+    /// written latents would feed it a different vector.
+    private func appendAttentionInput(layer: Int, position: Int, input: [Float]) {
+        if attentionInputs.indices.contains(layer) {
+            attentionInputs[layer].append(input)
+        } else {
+            while attentionInputs.count <= layer { attentionInputs.append([]) }
+            attentionInputs[layer] = [input]
+        }
+    }
+
+    func attentionInput(layer: Int, position: Int) -> [Float]? {
+        guard attentionInputs.indices.contains(layer) else { return nil }
+        guard attentionInputs[layer].indices.contains(position) else { return nil }
+        return attentionInputs[layer][position]
+    }
+
     private func latent(layer: Int, position: Int) -> [Float]? {
         guard latents.indices.contains(layer) else { return nil }
         guard latents[layer].indices.contains(position) else { return nil }
@@ -597,7 +702,11 @@ nonisolated public final class DeepSeekV41CPUForward {
 
     /// Pools a completed block of latents into the owner's compressed row, and the
     /// indexer's block scores at the candidate-source layer.
-    private func pooledLatent(layer: DeepSeekV41LayerPlan, position: Int) {
+    private func pooledLatent(
+        layer: DeepSeekV41LayerPlan,
+        position: Int,
+        shape: DeepSeekV41AttentionShape
+    ) {
         guard layer.flavor == .compressed, layer.ownsCompressedKV else {
             // A non-owner still contributes candidate scores at the source layer.
             if layer.isCandidateSource { recordCandidateScores(layer: layer, position: position) }
@@ -612,14 +721,33 @@ nonisolated public final class DeepSeekV41CPUForward {
         let rows = DeepSeekV41CacheAddressing.compressedRowCount(afterPosition: position, ratio: ratio)
         let completed = DeepSeekV41CacheAddressing.poolRange(row: rows - 1, ratio: ratio)
         guard rows > 0, completed.upperBound <= position + 1 else { return }
-        var block: [[Float]] = []
-        var gates: [Float] = []
+        // The compressor projects the layer's post-`attn_norm` input, not the
+        // latents already in the window ring: `Compressor.forward(x)` takes the
+        // attention input, and pooling the written records would re-use a vector
+        // that already carries this layer's own `wkv` + rope.
+        var inputs: [[Float]] = []
+        inputs.reserveCapacity(completed.count)
         for row in completed {
-            guard let written = latent(layer: layer.index, position: row) else { return }
-            block.append(written)
-            gates.append(0)
+            guard let input = attentionInput(layer: layer.index, position: row) else { return }
+            inputs.append(input)
         }
-        let pooled = DeepSeekV41Compressor.pool(latents: block, gates: gates)
+        var pooled = DeepSeekV41Compressor.pooledLatent(
+            inputs: inputs,
+            kvWeight: weights.matrix(.compressorWkv, layer: layer.index),
+            gateWeight: ratio > 1 ? weights.matrix(.compressorWgate, layer: layer.index) : nil
+        )
+        // `Compressor.forward` returns `norm(kv)`, pre-rope; `_compress_kv` rotates
+        // it afterwards, at the position of the FIRST token of its group.
+        pooled = rmsNorm(
+            pooled, role: .compressorNorm, layer: layer.index, epsilon: config.rmsNormEps
+        )
+        DeepSeekV41RoPE.rotateSlice(
+            &pooled,
+            start: shape.latentRopeStart,
+            length: shape.latentRopeWidth,
+            position: max(0, rows - 1) * ratio,
+            frequencies: latentFrequencyTable[layer.ropeTable] ?? []
+        )
         compressed[layer.index, default: []].append(pooled)
         if layer.isCandidateSource { recordCandidateScores(layer: layer, position: position) }
     }

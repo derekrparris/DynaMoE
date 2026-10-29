@@ -437,10 +437,11 @@ nonisolated public struct DeepSeekV41Config: Sendable, Equatable {
     public var qkHeadDim: Int { qkNopeHeadDim + qkRopeHeadDim }
 
     /// Values in one cached latent record: the compressed `kv_lora_rank` latent
-    /// plus any decoupled rope payload. This is the width the cache stores, which
+    /// plus the decoupled rope payload. This is the width the cache stores, which
     /// is the latent width rather than the query width (they coincide on the
-    /// published checkpoint, but a checkpoint with a decoupled rope payload would
-    /// diverge and this must not silently agree with `qkHeadDim`).
+    /// published checkpoint, whose `head_dim` already contains its rope payload,
+    /// but a checkpoint with a separate `kv_lora_rank` would diverge and this must
+    /// not silently agree with `qkHeadDim`).
     public var cacheRecordWidth: Int {
         kvLoraRank > 0 ? kvLoraRank + qkRopeHeadDim : qkHeadDim
     }
@@ -701,6 +702,29 @@ nonisolated public extension DeepSeekV41Config {
 
         let numHiddenLayers = try requireInt("num_hidden_layers", "n_layers")
         let ropeScaling = text.object("rope_scaling") ?? root.object("rope_scaling")
+
+        // The published checkpoint declares `head_dim` (512) and `qk_rope_head_dim` (64)
+        // and no `qk_nope_head_dim`: the rope payload is the TRAILING slice of the head,
+        // so the non-rope width is the difference. Reading `qk_nope_head_dim` out of
+        // `head_dim` instead makes every head 576 wide, which mismatches a cache record
+        // that is `head_dim` wide and shifts every score.
+        let ropeHeadDim = text.int("qk_rope_head_dim") ?? 0
+        let declaredHeadDim = text.int("head_dim")
+        let declaredNopeHeadDim = text.int("qk_nope_head_dim")
+        let nopeHeadDim: Int
+        if let declaredNopeHeadDim {
+            nopeHeadDim = declaredNopeHeadDim
+        } else if let declaredHeadDim {
+            nopeHeadDim = declaredHeadDim - ropeHeadDim
+        } else {
+            nopeHeadDim = 512
+        }
+        if let declaredHeadDim, nopeHeadDim + ropeHeadDim != declaredHeadDim {
+            throw DeepSeekV41ConfigError.invalidField(
+                "head_dim",
+                "must be qk_nope_head_dim + qk_rope_head_dim (\(nopeHeadDim) + \(ropeHeadDim)), not \(declaredHeadDim)"
+            )
+        }
         // Decoded before the config is built: the image token id can live in either
         // the root or the vision block, and a tower without a token id cannot be
         // prompted for.
@@ -725,8 +749,8 @@ nonisolated public extension DeepSeekV41Config {
             tieWordEmbeddings: text.bool("tie_word_embeddings") ?? false,
             qLoraRank: text.int("q_lora_rank") ?? 0,
             kvLoraRank: text.int("kv_lora_rank") ?? 0,
-            qkNopeHeadDim: text.int("qk_nope_head_dim") ?? text.int("head_dim") ?? 512,
-            qkRopeHeadDim: text.int("qk_rope_head_dim") ?? 0,
+            qkNopeHeadDim: nopeHeadDim,
+            qkRopeHeadDim: ropeHeadDim,
             vHeadDim: text.int("v_head_dim") ?? text.int("head_dim") ?? 512,
             oGroups: text.int("o_groups") ?? 1,
             oLoraRank: text.int("o_lora_rank") ?? 0,
@@ -803,15 +827,20 @@ nonisolated public extension DeepSeekV41Config {
         guard qkNopeHeadDim > 0 else {
             throw DeepSeekV41ConfigError.invalidField("qk_nope_head_dim", "must be positive")
         }
-        // A decoupled rope payload is the one shape the two backends disagree on:
-        // the reference rotates the latent as a single vector, while the kernel
-        // rotates it per `rotaryDim` block. Refusing here is the only honest option
-        // until one rule is chosen, because the checkpoint would otherwise load and
-        // run silently different numerics on CPU and GPU.
-        guard qkRopeHeadDim == 0 else {
+        // A decoupled rope payload is the trailing slice of the head and of the cache
+        // record, and it rotates value pairs, so it must be even and leave a non-rope
+        // prefix behind. Zero is the legacy single-vector shape, where the whole record
+        // is the rope payload; anything else rotates `cacheRecordWidth - qkRopeHeadDim`
+        // values untouched.
+        guard qkRopeHeadDim >= 0, qkRopeHeadDim % 2 == 0 else {
+            throw DeepSeekV41ConfigError.invalidField(
+                "qk_rope_head_dim", "must be a non-negative even count of values, not \(qkRopeHeadDim)"
+            )
+        }
+        guard qkRopeHeadDim == 0 || qkRopeHeadDim < qkHeadDim else {
             throw DeepSeekV41ConfigError.invalidField(
                 "qk_rope_head_dim",
-                "must be 0: the CSA2 path rotates the whole \(qkHeadDim)-wide latent, and a decoupled rope payload has no agreed rotation"
+                "must be narrower than the \(qkHeadDim)-wide head: no non-rope values would be left"
             )
         }
         guard oGroups > 0 else {

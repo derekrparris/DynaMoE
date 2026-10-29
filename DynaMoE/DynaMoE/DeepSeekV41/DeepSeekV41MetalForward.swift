@@ -278,6 +278,7 @@ nonisolated public enum DeepSeekV41DevicePlan {
         .writeLatent,
         .compressPool,
         .attention,
+        .ropeOutput,
         .outputDown,
         .outputUp,
         .writeAttentionStreams,
@@ -437,7 +438,9 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
     private let workspace: DeepSeekV41Workspace
     private let shardBuffers: [UInt32: MTLBuffer]
     private let vectors: DeepSeekV41VectorBank
-    private let frequencies: [DeepSeekV41RopeTable: MTLBuffer]
+    /// Query and latent rails have different widths, so their tables differ.
+    private let queryFrequencies: [DeepSeekV41RopeTable: MTLBuffer]
+    private let latentFrequencies: [DeepSeekV41RopeTable: MTLBuffer]
     /// Substitutes for the optional kernel inputs, so an absent tensor is a bound
     /// identity value rather than an unbound buffer. Metal leaves an unbound slot
     /// undefined; the kernels test for `nullptr`, which an unbound buffer is not.
@@ -488,24 +491,37 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             )
         }
 
-        // RoPE tables, one buffer per rail the plan uses.
-        var tables: [DeepSeekV41RopeTable: MTLBuffer] = [:]
+        // RoPE tables: the query and latent rails rotate over different widths,
+        // so each gets its own table per rail the plan uses.
+        var queries: [DeepSeekV41RopeTable: MTLBuffer] = [:]
+        var latents: [DeepSeekV41RopeTable: MTLBuffer] = [:]
         var seen = Set<DeepSeekV41RopeTable>()
         for layer in runtime.plan where !seen.contains(layer.ropeTable) {
             seen.insert(layer.ropeTable)
             let shape = DeepSeekV41AttentionShape.make(config: runtime.config, layer: layer)
-            let values = DeepSeekV41RoPE.frequencies(for: shape, config: runtime.config)
-            guard !values.isEmpty else { continue }
-            let buffer = values.withUnsafeBytes { raw in
-                runtime.device.makeBuffer(
-                    bytes: raw.baseAddress!,
-                    length: raw.count,
-                    options: .storageModeShared
-                )
+            func buffer(_ values: [Float]) -> MTLBuffer? {
+                guard !values.isEmpty else { return nil }
+                return values.withUnsafeBytes { raw in
+                    runtime.device.makeBuffer(
+                        bytes: raw.baseAddress!,
+                        length: raw.count,
+                        options: .storageModeShared
+                    )
+                }
             }
-            if let buffer { tables[layer.ropeTable] = buffer }
+            if let query = buffer(
+                DeepSeekV41RoPE.queryFrequencies(for: shape)
+            ) {
+                queries[layer.ropeTable] = query
+            }
+            if let latent = buffer(
+                DeepSeekV41RoPE.latentFrequencies(for: shape)
+            ) {
+                latents[layer.ropeTable] = latent
+            }
         }
-        self.frequencies = tables
+        self.queryFrequencies = queries
+        self.latentFrequencies = latents
 
         // Identity buffers for the optional kernel slots, sized for every place one
         // is substituted: router bias (one per expert), hc scale/base (one per
@@ -858,7 +874,10 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
                 vector: workspace.query,
                 rowWidth: shapes.queryWidth,
                 headDim: shape.qkHeadDim,
+                sliceStart: shape.queryRopeStart,
+                sliceLength: shape.queryRopeWidth,
                 table: layer.ropeTable,
+                latent: false,
                 position: position
             )
 
@@ -890,8 +909,11 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
                 encoder,
                 vector: workspace.latent,
                 rowWidth: shapes.latentWidth,
-                headDim: shape.rotaryDim,
+                headDim: 0,
+                sliceStart: shape.latentRopeStart,
+                sliceLength: shape.latentRopeWidth,
                 table: layer.ropeTable,
+                latent: true,
                 position: position
             )
 
@@ -909,17 +931,38 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             )
 
         case .compressPool:
-            try encodePoolIfComplete(layer: layer, position: position, encoder: encoder)
+            try encodePoolIfComplete(
+                layer: layer, position: position, encoder: encoder, shape: shape
+            )
 
         case .attention:
             try encodeAttention(layer: layer, position: position, encoder: encoder, shape: shape)
 
+        case .ropeOutput:
+            // The keys stay in the cache rotated, so the output's rope payload comes
+            // back out here, before the projection. Skipping this feeds rotated values
+            // into `attn.wo_a`, which is the shape of bug a parity test cannot see.
+            if shape.outputCarriesRope {
+                try encodeRope(
+                    encoder,
+                    vector: workspace.attentionOut,
+                    rowWidth: shapes.attentionOutputWidth,
+                    headDim: shape.vHeadDim,
+                    sliceStart: shape.outputRopeStart,
+                    sliceLength: shape.latentRopeWidth,
+                    table: layer.ropeTable,
+                    latent: true,
+                    position: position,
+                    inverse: true
+                )
+            }
         case .outputDown:
             if config.oLoraRank > 0, let down = weights.tensor(.attnWoA, layer: index) {
-                try encodeGemv(
+                try encodeBlockDiagonalProjection(
                     encoder,
                     weight: down,
                     scale: weights.scaleTensor(.attnWoA, layer: index),
+                    groups: shape.outputGroups,
                     inDim: shapes.attentionOutputWidth,
                     outDim: max(1, config.oLoraRank),
                     input: workspace.attentionOut,
@@ -932,11 +975,14 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
                 throw DeepSeekV41EngineError.missingTensor("attn.wo_b")
             }
             let hasDown = config.oLoraRank > 0 && weights.tensor(.attnWoA, layer: index) != nil
+            // `wo_b` reads the CONCATENATED groups, so its input width is
+            // `o_groups * o_lora_rank`, not the per-group rank.
+            let reducedWidth = hasDown ? shapes.outputReducedWidth : shapes.attentionOutputWidth
             try encodeGemv(
                 encoder,
                 weight: up,
                 scale: weights.scaleTensor(.attnWoB, layer: index),
-                inDim: hasDown ? max(1, config.oLoraRank) : shapes.attentionOutputWidth,
+                inDim: reducedWidth,
                 outDim: shapes.hidden,
                 input: hasDown ? workspace.reduced : workspace.attentionOut,
                 output: workspace.output
@@ -1020,68 +1066,110 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
     /// `position + 1` is a multiple of the ratio. Pooling on later positions would
     /// append the same row again and let the cache grow with the context rather
     /// than with the context / ratio.
+    /// Fills this position's slot in the compressor's group, and pools the group
+    /// the moment it completes.
+    ///
+    /// `Compressor.forward(x)` projects the layer's post-`attn_norm` input through
+    /// `attn.compressor.wkv` and `attn.compressor.wgate`, keeps the group in
+    /// `kv_state` / `score_state`, and only emits a row once the group is full. The
+    /// rows it pools are therefore NOT the ones the window cache holds: those have
+    /// been through this layer's own `wkv` and rope.
+    ///
+    /// Slot addressing is `position % ratio`, which is what makes a decode step's
+    /// partial group survive into the next step without a separate state machine.
     private func encodePoolIfComplete(
         layer: DeepSeekV41LayerPlan,
         position: Int,
-        encoder: MTLComputeCommandEncoder
+        encoder: MTLComputeCommandEncoder,
+        shape: DeepSeekV41AttentionShape
     ) throws {
         guard layer.ownsCompressedKV else { return }
         let ratio = max(1, layer.compressRatio)
+        let slot = position % ratio
+        let width = shapes.latentWidth
+        guard slot < ratio else { return }
+        let slotByteOffset = slot * width * MemoryLayout<Float>.stride
+
+        guard let kvWeight = weights.tensor(.compressorWkv, layer: layer.index) else {
+            throw DeepSeekV41EngineError.missingTensor("attn.compressor.wkv")
+        }
+        try encodeGemv(
+            encoder,
+            weight: kvWeight,
+            scale: weights.scaleTensor(.compressorWkv, layer: layer.index),
+            inDim: shapes.hidden,
+            outDim: width,
+            input: workspace.normed,
+            output: workspace.compressorLatents,
+            outputByteOffset: slotByteOffset
+        )
+        // A ratio of 1 is a plain projection: nothing to pool, and the checkpoint
+        // publishes no gate for those layers.
+        if ratio > 1 {
+            guard let gateWeight = weights.tensor(.compressorWgate, layer: layer.index) else {
+                throw DeepSeekV41EngineError.missingTensor("attn.compressor.wgate")
+            }
+            try encodeGemv(
+                encoder,
+                weight: gateWeight,
+                scale: weights.scaleTensor(.compressorWgate, layer: layer.index),
+                inDim: shapes.hidden,
+                outDim: width,
+                input: workspace.normed,
+                output: workspace.compressorScores,
+                outputByteOffset: slotByteOffset
+            )
+        }
+
         guard (position + 1) % ratio == 0 else { return }
         let rows = DeepSeekV41CacheAddressing.compressedRowCount(afterPosition: position, ratio: ratio)
         guard rows > 0 else { return }
         let block = DeepSeekV41CacheAddressing.poolRange(row: rows - 1, ratio: ratio)
         guard block.upperBound <= position + 1 else { return }
-        guard ratio <= gatherRows else {
-            throw DeepSeekV41EngineError.allocationFailed(
-                "a \(ratio)-row pool block does not fit the \(gatherRows)-row gather buffer"
-            )
-        }
-        guard let windowBuffer = cache.windowBuffer,
-              let base = cache.layout.windowBase[layer.index] else {
-            throw DeepSeekV41EngineError.allocationFailed("the window ring")
-        }
-        let destinationRow = DeepSeekV41CacheAddressing.compressedByteOffset(
-            ownerLayer: layer.index,
-            row: rows - 1,
-            layout: cache.layout
-        )
-        guard let destinationRow, let compressedBuffer = cache.compressedBuffer else {
+        guard let compressedBuffer = cache.compressedBuffer,
+              let destinationRow = DeepSeekV41CacheAddressing.compressedByteOffset(
+                  ownerLayer: layer.index,
+                  row: rows - 1,
+                  layout: cache.layout
+              ) else {
             throw DeepSeekV41EngineError.allocationFailed("the compressed cache")
         }
 
-        // Gather the block out of the ring, then pool it. The gate logits are the
-        // reference's zeros: `attn.compressor.wgate` is a projection of the latent
-        // whose combination rule is `DeepSeekV41Conformance.compressorPooling`
-        // (unverified), so the device path pools with uniform gates exactly like the
-        // reference instead of inventing a different weighting.
-        try encodeRowIndices(
-            Array(block).map { DeepSeekV41CacheAddressing.windowRow(for: $0, geometry: geometry) },
-            at: 0
-        )
-        try encodeGather(
-            encoder,
-            cacheBuffer: windowBuffer,
-            byteOffset: base,
-            rowCount: ratio,
-            destinationRowOffset: 0
-        )
-        try encodeClear(encoder, buffer: workspace.gates, count: ratio)
-
         encoder.setComputePipelineState(pipelines.poolLatents)
-        encoder.setBuffer(workspace.gathered, offset: 0, index: 0)
-        encoder.setBuffer(workspace.gates, offset: 0, index: 1)
+        encoder.setBuffer(workspace.compressorLatents, offset: 0, index: 0)
+        encoder.setBuffer(workspace.compressorScores, offset: 0, index: 1)
         encoder.setBuffer(workspace.pooled, offset: 0, index: 2)
-        var width = UInt32(shapes.latentWidth)
+        var poolWidth = UInt32(width)
         var blockSize = UInt32(ratio)
-        encoder.setBytes(&width, length: 4, index: 3)
+        encoder.setBytes(&poolWidth, length: 4, index: 3)
         encoder.setBytes(&blockSize, length: 4, index: 4)
         encoder.dispatchThreads(
-            MTLSize(width: shapes.latentWidth, height: 1, depth: 1),
-            threadsPerThreadgroup: threadgroup(shapes.latentWidth)
+            MTLSize(width: width, height: 1, depth: 1),
+            threadsPerThreadgroup: threadgroup(width)
         )
         encoder.memoryBarrier(scope: .buffers)
 
+        // `Compressor.forward` returns `norm(kv)`; `_compress_kv` rotates that row
+        // afterwards, at the position of the FIRST token of the group, which is
+        // `row * ratio`.
+        try encodeNorm(
+            encoder,
+            input: workspace.pooled,
+            gain: vectors.gain(.compressorNorm, layer: layer.index, width: width),
+            output: workspace.pooled,
+            width: width
+        )
+        try encodeRope(
+            encoder,
+            vector: workspace.pooled,
+            rowWidth: width,
+            headDim: 0,
+            sliceStart: shape.latentRopeStart,
+            sliceLength: shape.latentRopeWidth,
+            table: layer.ropeTable,
+            latent: true,
+            position: max(0, rows - 1) * ratio
+        )
         try encodeStore(
             encoder,
             latent: workspace.pooled,
@@ -1106,7 +1194,8 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             config: config,
             plan: plan,
             geometry: geometry,
-            ownerRowLimit: geometry.compressedRows
+            ownerRowLimit: cache.layout.compressedRowsByOwner[layer.compressedKVSource]
+                ?? geometry.compressedRows
         )
         let windowCount = rowPlan.windowRows.count
         let compressedCount = rowPlan.compressedRows.count
@@ -1125,12 +1214,14 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         }
 
         var cursor = 0
-        try encodeRowIndices(rowPlan.windowRows, at: 0)
+        try encodeRowIndices(rowPlan.windowRows, into: workspace.rowIndices, at: 0)
         cursor += windowCount
         try encodeGather(
             encoder,
             cacheBuffer: windowBuffer,
             byteOffset: windowBase,
+            rowIndices: workspace.rowIndices,
+            rowIndexOffset: 0,
             rowCount: windowCount,
             destinationRowOffset: 0
         )
@@ -1139,11 +1230,13 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
                   let compressedBase = cache.layout.compressedBase[layer.compressedKVSource] else {
                 throw DeepSeekV41EngineError.allocationFailed("the compressed cache")
             }
-            try encodeRowIndices(rowPlan.compressedRows, at: cursor)
+            try encodeRowIndices(rowPlan.compressedRows, into: workspace.rowIndices, at: cursor)
             try encodeGather(
                 encoder,
                 cacheBuffer: compressedBuffer,
                 byteOffset: compressedBase,
+                rowIndices: workspace.rowIndices,
+                rowIndexOffset: cursor,
                 rowCount: compressedCount,
                 destinationRowOffset: windowCount
             )
@@ -1410,7 +1503,11 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         inDim: Int,
         outDim: Int,
         input: MTLBuffer,
-        output: MTLBuffer
+        output: MTLBuffer,
+        weightByteOffset: UInt64 = 0,
+        scaleByteOffset: UInt64 = 0,
+        inputByteOffset: Int = 0,
+        outputByteOffset: Int = 0
     ) throws {
         guard inDim > 0, outDim > 0 else {
             throw DeepSeekV41EngineError.allocationFailed("a \(outDim)x\(inDim) projection")
@@ -1435,10 +1532,10 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             )
             encoder.setBuffer(weightBuffer, offset: 0, index: 0)
             encoder.setBuffer(scaleBuffer, offset: 0, index: 1)
-            encoder.setBuffer(input, offset: 0, index: 2)
-            encoder.setBuffer(output, offset: 0, index: 3)
-            var weightOffset = UInt64(weight.byteOffset)
-            var scaleOffset = UInt64(scale.byteOffset)
+            encoder.setBuffer(input, offset: inputByteOffset, index: 2)
+            encoder.setBuffer(output, offset: outputByteOffset, index: 3)
+            var weightOffset = UInt64(weight.byteOffset) + weightByteOffset
+            var scaleOffset = UInt64(scale.byteOffset) + scaleByteOffset
             encoder.setBytes(&weightOffset, length: 8, index: 4)
             encoder.setBytes(&scaleOffset, length: 8, index: 5)
             encoder.setBytes(&inDimension, length: 4, index: 6)
@@ -1446,9 +1543,9 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         case .bf16:
             encoder.setComputePipelineState(pipelines.bf16Gemv)
             encoder.setBuffer(weightBuffer, offset: 0, index: 0)
-            encoder.setBuffer(input, offset: 0, index: 1)
-            encoder.setBuffer(output, offset: 0, index: 2)
-            var weightOffset = UInt64(weight.byteOffset)
+            encoder.setBuffer(input, offset: inputByteOffset, index: 1)
+            encoder.setBuffer(output, offset: outputByteOffset, index: 2)
+            var weightOffset = UInt64(weight.byteOffset) + weightByteOffset
             encoder.setBytes(&weightOffset, length: 8, index: 3)
             encoder.setBytes(&inDimension, length: 4, index: 4)
             encoder.setBytes(&outDimension, length: 4, index: 5)
@@ -1460,6 +1557,62 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             threadsPerThreadgroup: threadgroup(outDim)
         )
         encoder.memoryBarrier(scope: .buffers)
+    }
+
+    /// A projection whose weight is block-diagonal over `groups` head groups.
+    ///
+    /// `attn.wo_a` is published as `groups` dense blocks stacked along the rows
+    /// (`[o_groups * o_lora_rank][heads * head_dim / o_groups]`, 8192 x 4096 at 8
+    /// groups) and the reference reads it with a per-group einsum. One dense GEMV
+    /// over it would read every column, which is a different matrix. Each group is
+    /// therefore its own dispatch, offset into the weight, its scale, the input and
+    /// the output; a single group degenerates to the ordinary GEMV.
+    private func encodeBlockDiagonalProjection(
+        _ encoder: MTLComputeCommandEncoder,
+        weight: DeepSeekV41DeviceTensor,
+        scale: DeepSeekV41DeviceTensor?,
+        groups: Int,
+        inDim: Int,
+        outDim: Int,
+        input: MTLBuffer,
+        output: MTLBuffer
+    ) throws {
+        let groupCount = max(1, groups)
+        guard groupCount > 1 else {
+            try encodeGemv(
+                encoder, weight: weight, scale: scale, inDim: inDim, outDim: outDim,
+                input: input, output: output
+            )
+            return
+        }
+        guard inDim % groupCount == 0, outDim % groupCount == 0 else {
+            throw DeepSeekV41EngineError.unsupportedStage(
+                "attn.wo_a: \(outDim)x\(inDim) does not split into \(groupCount) head groups"
+            )
+        }
+        let valueBytes = DeepSeekV41DtypeWidth.bytesPerValue(dtype: weight.dtype)
+        let perGroupIn = inDim / groupCount
+        let perGroupOut = outDim / groupCount
+        // Both companions are contiguous by output row: the weight's rows are
+        // `perGroupIn` values wide and its scale rows `perGroupIn / 32` blocks, so
+        // group g starts after `g * perGroupOut` of each.
+        let weightStride = Double(perGroupOut * perGroupIn) * valueBytes
+        let scaleStride = Double(perGroupOut * max(1, perGroupIn / 32))
+        for group in 0..<groupCount {
+            try encodeGemv(
+                encoder,
+                weight: weight,
+                scale: scale,
+                inDim: perGroupIn,
+                outDim: perGroupOut,
+                input: input,
+                output: output,
+                weightByteOffset: UInt64(weightStride * Double(group)),
+                scaleByteOffset: UInt64(scaleStride * Double(group)),
+                inputByteOffset: group * perGroupIn * MemoryLayout<Float>.stride,
+                outputByteOffset: group * perGroupOut * MemoryLayout<Float>.stride
+            )
+        }
     }
 
     private func encodeSwiGLU(
@@ -1649,18 +1802,29 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         encoder.memoryBarrier(scope: .buffers)
     }
 
+    /// Rotates the rope slice of every `headDim`-wide block in `vector`.
+    ///
+    /// `sliceStart`/`sliceLength` select the rotated slice inside each block, which is
+    /// how the decoupled payload keeps the `d_nope` prefix out of the rotation, and
+    /// `inverse` conjugates it so the attention output can be returned to the
+    /// unrotated frame its projection was trained on.
     private func encodeRope(
         _ encoder: MTLComputeCommandEncoder,
         vector: MTLBuffer,
         rowWidth: Int,
         headDim: Int,
+        sliceStart: Int,
+        sliceLength: Int,
         table: DeepSeekV41RopeTable,
-        position: Int
+        latent: Bool,
+        position: Int,
+        inverse: Bool = false
     ) throws {
-        guard let frequencies = frequencies[table] else {
+        let tables = latent ? latentFrequencies : queryFrequencies
+        guard let frequencies = tables[table] else {
             throw DeepSeekV41EngineError.allocationFailed("a RoPE frequency table")
         }
-        let pairCount = (headDim == 0 ? rowWidth : headDim) / 2
+        let pairCount = max(0, sliceLength) / 2
         guard pairCount > 0 else { return }
         encoder.setComputePipelineState(pipelines.rope)
         encoder.setBuffer(vector, offset: 0, index: 0)
@@ -1670,11 +1834,15 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         var pairs = UInt32(min(pairCount, frequencies.length / MemoryLayout<Float>.stride))
         var base = UInt32(max(0, position))
         var batch: UInt32 = 1
+        var offset = UInt32(max(0, sliceStart))
+        var conjugate: UInt32 = inverse ? 1 : 0
         encoder.setBytes(&width, length: 4, index: 2)
         encoder.setBytes(&localHeadDim, length: 4, index: 3)
         encoder.setBytes(&pairs, length: 4, index: 4)
         encoder.setBytes(&base, length: 4, index: 5)
         encoder.setBytes(&batch, length: 4, index: 6)
+        encoder.setBytes(&offset, length: 4, index: 7)
+        encoder.setBytes(&conjugate, length: 4, index: 8)
         encoder.dispatchThreads(
             MTLSize(width: Int(pairs), height: 1, depth: 1),
             threadsPerThreadgroup: threadgroup(Int(pairs))
@@ -1715,14 +1883,21 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         _ encoder: MTLComputeCommandEncoder,
         cacheBuffer: MTLBuffer,
         byteOffset: Int,
+        rowIndices: MTLBuffer,
+        rowIndexOffset: Int,
         rowCount: Int,
         destinationRowOffset: Int
     ) throws {
         guard rowCount > 0 else { return }
+        // The kernel indexes `rowIndices[row]` from zero, so the bound buffer has
+        // to start at this gather's first row. Binding offset 0 here is what made
+        // the compressed gather re-read the window rows: the compressed indices
+        // are written after the window's in the shared list.
+        let indexByteOffset = rowIndexOffset * MemoryLayout<UInt32>.stride
         let elementOffset = byteOffset / max(1, geometry.precision.valueBytesPerElement)
         encoder.setComputePipelineState(pipelines.gatherLatents)
         encoder.setBuffer(cacheBuffer, offset: 0, index: 0)
-        encoder.setBuffer(workspace.rowIndices, offset: 0, index: 1)
+        encoder.setBuffer(rowIndices, offset: indexByteOffset, index: 1)
         encoder.setBuffer(workspace.gathered, offset: 0, index: 2)
         var offset = UInt64(elementOffset)
         var width = UInt32(shapes.latentWidth)
@@ -1741,15 +1916,19 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
     /// Writes the gather's row list. The indices are cache rows (already ring
     /// mapped), which is why this is a host fill: the ring mapping is a pure
     /// function of the position.
-    private func encodeRowIndices(_ rows: [Int], at offset: Int) throws {
+    private func encodeRowIndices(
+        _ rows: [Int],
+        into buffer: MTLBuffer,
+        at offset: Int
+    ) throws {
         guard !rows.isEmpty else { return }
-        guard offset + rows.count <= workspace.rowIndices.length / MemoryLayout<UInt32>.stride else {
+        guard offset + rows.count <= buffer.length / MemoryLayout<UInt32>.stride else {
             throw DeepSeekV41EngineError.allocationFailed(
                 "\(offset + rows.count) gather rows against a "
-                    + "\(workspace.rowIndices.length / MemoryLayout<UInt32>.stride)-row buffer"
+                    + "\(buffer.length / MemoryLayout<UInt32>.stride)-row buffer"
             )
         }
-        let pointer = workspace.rowIndices.contents().assumingMemoryBound(to: UInt32.self)
+        let pointer = buffer.contents().assumingMemoryBound(to: UInt32.self)
         for (index, row) in rows.enumerated() {
             pointer[offset + index] = UInt32(max(0, row))
         }

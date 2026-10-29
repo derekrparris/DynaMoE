@@ -8639,9 +8639,13 @@ kernel void dsv41_hc_sinkhorn(
 // load log says which one is in use rather than pretending they are equivalent.
 // ============================================================================
 
-/// MSL Kernel: rotary embedding over a batch of latents, with the inverse
+/// MSL Kernel: rotary embedding over a batch of vectors, with the inverse
 /// frequencies computed on the host so the YaRN ramp lives in one place
 /// (`DeepSeekV41RoPE.inverseFrequencies`).
+///
+/// Values pair ADJACENTLY (`row[2i]` with `row[2i+1]`), the layout the checkpoint's
+/// `apply_rotary_emb` produces with `view_as_complex`, not the two halves of the
+/// slice: the two conventions give different scores for the same weights.
 kernel void dsv41_rope_latent(
     device float* vectorBuffer [[buffer(0)]],
     device const float* invFreqBuffer [[buffer(1)]],
@@ -8650,28 +8654,32 @@ kernel void dsv41_rope_latent(
     constant uint32_t& pairCount [[buffer(4)]],
     constant uint32_t& basePosition [[buffer(5)]],
     constant uint32_t& batchSize [[buffer(6)]],
+    constant uint32_t& sliceOffset [[buffer(7)]],
+    constant uint32_t& inverse [[buffer(8)]],
     uint2 pos [[thread_position_in_grid]]
 ) {
     uint pair = pos.x;
     uint tokenIdx = pos.y;
     if (tokenIdx >= batchSize || pair >= pairCount) return;
 
-    // `headDim` of 0 means the whole row is one head (the latent record); otherwise
-    // every head of width `headDim` is rotated independently (the query, which is
-    // `numHeads` concatenated heads). Both use the same frequency table and the same
-    // position, so the phase is shared.
+    // `headDim` of 0 means the whole row is one head (a latent record); otherwise
+    // every head of width `headDim` is rotated independently (the query, or one head
+    // of the attention output). `sliceOffset` + `2 * pairCount` is the rotated slice
+    // inside each head: the decoupled rope payload is the TRAILING `qk_rope_head_dim`
+    // values, so the non-rope prefix must not move.
     uint32_t localHeadDim = (headDim == 0u) ? rowWidth : headDim;
-    uint32_t halfHead = localHeadDim / 2u;
-    if (pair >= halfHead) return;
+    if (sliceOffset + 2u * pairCount > localHeadDim) return;
 
     float angle = (float)(basePosition + tokenIdx) * invFreqBuffer[pair];
     float cosValue = cos(angle);
-    float sinValue = sin(angle);
+    // A conjugated rotation is the same angle with the opposite sign, which is how the
+    // attention output's payload is returned to the unrotated frame.
+    float sinValue = sin(angle) * (inverse != 0u ? -1.0f : 1.0f);
 
     uint64_t rowBase = (uint64_t)tokenIdx * (uint64_t)rowWidth;
     for (uint32_t headBase = 0; headBase + localHeadDim <= rowWidth; headBase += localHeadDim) {
-        uint64_t lowIndex = rowBase + headBase + pair;
-        uint64_t highIndex = lowIndex + halfHead;
+        uint64_t lowIndex = rowBase + headBase + sliceOffset + 2u * pair;
+        uint64_t highIndex = lowIndex + 1u;
         float low = vectorBuffer[lowIndex];
         float high = vectorBuffer[highIndex];
         vectorBuffer[lowIndex] = low * cosValue - high * sinValue;
@@ -8786,13 +8794,13 @@ kernel void dsv41_attention_csa2_f32(
     }
 }
 
-/// MSL Kernel: pools `ratio` gathered latents into one compressed row, weighted by
-/// the softmax of the compressor's gate logits.
+/// MSL Kernel: pools `ratio` projected rows into one compressed row, weighted by
+/// the per-dimension softmax of the compressor's gate logits.
 /// One threadgroup per output dimension; the block size is `ratio`, never more
 /// than a handful, so a serial reduction per dimension is the cheap form.
 kernel void dsv41_pool_latents_f32(
     device const float* latentBuffer [[buffer(0)]],  // [ratio * width]
-    device const float* gateBuffer [[buffer(1)]],    // [ratio]
+    device const float* gateBuffer [[buffer(1)]],    // [ratio * width]
     device float* pooledBuffer [[buffer(2)]],        // [width]
     constant uint32_t& width [[buffer(3)]],
     constant uint32_t& blockSize [[buffer(4)]],
@@ -8800,15 +8808,24 @@ kernel void dsv41_pool_latents_f32(
 ) {
     if (dim >= width || blockSize == 0) return;
 
+    // The gate is per DIMENSION: `score.softmax(dim=2)` runs over the group axis
+    // of a [batch, groups, ratio, head_dim] tensor, so this channel's weights are
+    // its own softmax over the group, not one shared weight per row.
     float maxGate = -1e30f;
-    for (uint32_t row = 0; row < blockSize; ++row) maxGate = max(maxGate, gateBuffer[row]);
+    for (uint32_t row = 0; row < blockSize; ++row) {
+        maxGate = max(maxGate, gateBuffer[(uint64_t)row * width + dim]);
+    }
     float total = 0.0f;
-    for (uint32_t row = 0; row < blockSize; ++row) total += exp(gateBuffer[row] - maxGate);
+    for (uint32_t row = 0; row < blockSize; ++row) {
+        total += exp(gateBuffer[(uint64_t)row * width + dim] - maxGate);
+    }
     float inverse = total > 0.0f ? (1.0f / total) : (1.0f / (float)blockSize);
 
     float accumulator = 0.0f;
     for (uint32_t row = 0; row < blockSize; ++row) {
-        float weight = total > 0.0f ? exp(gateBuffer[row] - maxGate) * inverse : inverse;
+        float weight = total > 0.0f
+            ? exp(gateBuffer[(uint64_t)row * width + dim] - maxGate) * inverse
+            : inverse;
         accumulator += weight * latentBuffer[(uint64_t)row * width + dim];
     }
     pooledBuffer[dim] = accumulator;

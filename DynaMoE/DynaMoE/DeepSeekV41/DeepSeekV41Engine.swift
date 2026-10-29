@@ -504,13 +504,19 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
     public let sharedIntermediate: MTLBuffer
     /// One pooled compressed row, before it is written to the cache.
     public let pooled: MTLBuffer
+    /// The compressor's per-position `wkv(x)` results for the group being filled,
+    /// `maxRatio * latentWidth` floats. The compressor projects the layer input, so
+    /// these are not the same rows the window cache holds.
+    public let compressorLatents: MTLBuffer
+    /// The compressor's per-position `wgate(x)` scores, the same geometry. The
+    /// softmax that pools them runs per DIMENSION over the group.
+    public let compressorScores: MTLBuffer
     /// The `wq_a` / `wo_a` rank-width scratch.
     public let reduced: MTLBuffer
     public let moeOut: MTLBuffer
     public let streams: MTLBuffer
     public let logits: MTLBuffer
     public let rowIndices: MTLBuffer
-    public let gates: MTLBuffer
     public let tokenIDs: MTLBuffer
     /// Rows the gather allocates for one layer's attention: window + compressed.
     public let gatherRows: Int
@@ -541,12 +547,13 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
               let intermediate = make(float4(shapes.expertIntermediate)),
               let sharedIntermediate = make(float4(shapes.sharedIntermediate)),
               let pooled = make(float4(shapes.latentWidth)),
-              let reduced = make(float4(max(1, max(shapes.qLoraRank, shapes.oLoraRank)))),
+              let compressorLatents = make(float4(maxCompressed * shapes.latentWidth)),
+              let compressorScores = make(float4(maxCompressed * shapes.latentWidth)),
+              let reduced = make(float4(max(1, max(shapes.qLoraRank, shapes.outputReducedWidth)))),
               let moeOut = make(float4(shapes.hidden)),
               let streams = make(float4(mult * shapes.hidden)),
               let logits = make(float4(config.vocabSize)),
               let rowIndices = make(4 * gather),
-              let gates = make(float4(maxCompressed + 1)),
               let tokenIDs = make(4) else {
             return nil
         }
@@ -564,12 +571,13 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
         self.intermediate = intermediate
         self.sharedIntermediate = sharedIntermediate
         self.pooled = pooled
+        self.compressorLatents = compressorLatents
+        self.compressorScores = compressorScores
         self.reduced = reduced
         self.moeOut = moeOut
         self.streams = streams
         self.logits = logits
         self.rowIndices = rowIndices
-        self.gates = gates
         self.tokenIDs = tokenIDs
         self.gatherRows = gather
     }

@@ -49,9 +49,8 @@ final class DeepSeekV41ConfigTests: XCTestCase {
         "routed_scaling_factor": 2.5,
         "swiglu_limit": 10.0,
         "q_lora_rank": 1536,
-        "kv_lora_rank": 512,
-        "qk_nope_head_dim": 512,
-        "qk_rope_head_dim": 0,
+        "head_dim": 512,
+        "qk_rope_head_dim": 64,
         "v_head_dim": 512,
         "o_groups": 8,
         "o_lora_rank": 1024,
@@ -206,6 +205,83 @@ final class DeepSeekV41ConfigTests: XCTestCase {
         var config = try config()
         config.engramRowCounts = [1]
         XCTAssertThrowsError(try config.makeLayerPlan())
+    }
+
+    /// The checkpoint publishes `head_dim` 512 and `qk_rope_head_dim` 64 and no
+    /// `qk_nope_head_dim`: the rope payload is the trailing 64 of each 512-wide head,
+    /// so the non-rope width is the difference and the cache record stays 512 wide.
+    /// Reading `qk_nope_head_dim` out of `head_dim` instead makes the head 576 wide,
+    /// which no longer matches the record the cache stores.
+    func testRopePayloadIsTheTrailingSliceOfTheHead() throws {
+        let config = try config()
+        XCTAssertEqual(config.qkRopeHeadDim, 64)
+        XCTAssertEqual(config.qkNopeHeadDim, 448)
+        XCTAssertEqual(config.qkHeadDim, 512)
+        XCTAssertEqual(config.vHeadDim, 512)
+        XCTAssertEqual(config.cacheRecordWidth, 512)
+        XCTAssertEqual(config.fp8CacheRecordBytes, 528)
+        XCTAssertEqual(config.fp4CacheRecordBytes, 288)
+    }
+
+    /// The published geometry of the output projection: `wo_a` is block-diagonal
+    /// over `o_groups`, so it publishes `o_groups * o_lora_rank` rows and `wo_b`
+    /// reads that whole concatenation.
+    func testOutputProjectionGeometryIsGrouped() throws {
+        let config = try config()
+        XCTAssertEqual(config.oGroups, 8)
+        XCTAssertEqual(config.oLoraRank, 1024)
+        let shapes = DeepSeekV41TensorShapes(config: config)
+        XCTAssertEqual(shapes.attentionOutputWidth, 128 * 512)
+        XCTAssertEqual(shapes.outputGroups, 8)
+        XCTAssertEqual(
+            shapes.outputReducedWidth, 8 * 1024,
+            "wo_b reads o_groups * o_lora_rank, so pricing it at o_lora_rank halves the rank"
+        )
+        // Per group: 16 heads (128 / 8) of 512 values.
+        XCTAssertEqual(shapes.attentionOutputWidth / shapes.outputGroups, 16 * 512)
+    }
+
+
+
+    /// A declared `head_dim` that its parts do not add up to is the shape that
+    /// silently widens every head, so it is rejected rather than reconciled.
+    func testAHeadWidthThatDisagreesWithItsPartsIsRejected() throws {
+        let json = Self.wrapperJSON
+            .replacingOccurrences(of: "\"head_dim\": 512,", with: "\"head_dim\": 576, \"qk_nope_head_dim\": 448,")
+        XCTAssertThrowsError(try DeepSeekV41Config.decode(jsonData: Data(json.utf8))) { error in
+            XCTAssertTrue(
+                "\(error)".contains("head_dim"),
+                "expected the head width to be named, got \(error)"
+            )
+        }
+    }
+
+    func testAnOddOrOversizedRopePayloadIsRejected() {
+        for rope in [63, 512, 514] {
+            let json = Self.wrapperJSON
+                .replacingOccurrences(of: "\"qk_rope_head_dim\": 64,", with: "\"qk_rope_head_dim\": \(rope),")
+            XCTAssertThrowsError(
+                try DeepSeekV41Config.decode(jsonData: Data(json.utf8)),
+                "qk_rope_head_dim \(rope) should not load"
+            )
+        }
+    }
+
+    /// A pure sliding-window layer rotates at plain `rope_theta` with no YaRN block,
+    /// which is the checkpoint's `original_seq_len = 0` branch.
+    func testWindowLayersDoNotExtrapolate() throws {
+        let config = try config()
+        let plan = try config.makeLayerPlan()
+        let window = DeepSeekV41AttentionShape.make(config: config, layer: plan[0])
+        let compressed = DeepSeekV41AttentionShape.make(config: config, layer: plan[2])
+        XCTAssertEqual(window.ropeScaling, .none)
+        XCTAssertEqual(window.ropeTheta, 10_000)
+        XCTAssertEqual(compressed.ropeScaling.factor, 8)
+        XCTAssertEqual(compressed.ropeScaling.originalLength, 131_072)
+        XCTAssertEqual(compressed.ropeTheta, 160_000)
+        // Both rails rotate the same 64-wide slice.
+        XCTAssertEqual(window.queryRopeWidth, 64)
+        XCTAssertEqual(window.latentRopeWidth, 64)
     }
 
     /// The architecture must win before the topology heuristics: 384 experts and
@@ -1174,19 +1250,18 @@ final class DeepSeekV41ConfigEdgeTests: XCTestCase {
      "engram_compressed_vocab_size": 100, "engram_pad_token_id": 2}
     """
 
-    /// A decoupled rope payload is refused instead of loading a checkpoint whose two
-    /// backends would rotate the latent differently.
-    func testDecoupledRopePayloadIsRefused() {
+    /// A decoupled rope payload loads, and the record it caches is the head width
+    /// rather than the head width plus the payload: 64 non-rope values with a 64-wide
+    /// payload is a 128-wide record, not a 192-wide one.
+    func testDecoupledRopePayloadLoadsAsATrailingSlice() throws {
         let json = Self.minimalJSON.replacingOccurrences(
             of: "\"qk_nope_head_dim\": 64",
             with: "\"qk_nope_head_dim\": 64, \"qk_rope_head_dim\": 64"
         )
-        XCTAssertThrowsError(try decode(json)) { error in
-            guard case DeepSeekV41ConfigError.invalidField(let field, _)? = error as? DeepSeekV41ConfigError else {
-                return XCTFail("unexpected error \(error)")
-            }
-            XCTAssertEqual(field, "qk_rope_head_dim")
-        }
+        let config = try decode(json)
+        XCTAssertEqual(config.qkRopeHeadDim, 64)
+        XCTAssertEqual(config.qkHeadDim, 128)
+        XCTAssertEqual(config.cacheRecordWidth, 128)
     }
 
     /// Engram row counts are ~4x10^8 and can exceed 32 bits, so the reader must not
