@@ -1457,9 +1457,7 @@ final class DeepSeekV41VisionExpandTests: XCTestCase {
     )
 
     func testEmptyMarkerDoesNotLoopForever() {
-        let markers = DeepSeekV41VisionMarkers(
-            imagePlaceholder: "", imageOpen: "<", imageClose: ">", imageToken: "x"
-        )
+        let markers = DeepSeekV41VisionMarkers(imagePlaceholder: "", imageToken: "x")
         XCTAssertEqual(
             DeepSeekV41VisionLayout.expand(text: "hi", images: [(32, 32)], spec: spec, markers: markers),
             "hi"
@@ -1467,32 +1465,27 @@ final class DeepSeekV41VisionExpandTests: XCTestCase {
     }
 
     func testExtraPlaceholderIsKeptVisibly() {
-        let markers = DeepSeekV41VisionMarkers(
-            imagePlaceholder: "<img>", imageOpen: "<", imageClose: ">", imageToken: "x"
-        )
+        let markers = DeepSeekV41VisionMarkers(imagePlaceholder: "<img>", imageToken: "x")
         let out = DeepSeekV41VisionLayout.expand(
             text: "<img> and <img>", images: [(32, 32)], spec: spec, markers: markers
         )
         XCTAssertTrue(out.contains(" and <img>"), out)
-        XCTAssertFalse(out.contains("xx and"), out)
+        // 32 x 32 at patch 16 is a 2 x 2 grid: 2 rows of (2 + 1) plus two delimiters.
+        XCTAssertTrue(out.hasPrefix(String(repeating: "x", count: 8) + " and"), out)
     }
 
     func testExtraImageIsReportedInsteadOfDroppedSilently() {
-        let markers = DeepSeekV41VisionMarkers(
-            imagePlaceholder: "<img>", imageOpen: "<", imageClose: ">", imageToken: "x"
-        )
+        let markers = DeepSeekV41VisionMarkers(imagePlaceholder: "<img>", imageToken: "x")
         let expansion = DeepSeekV41VisionLayout.expandReporting(
             text: "<img>", images: [(32, 32), (32, 32)], spec: spec, markers: markers
         )
-        XCTAssertEqual(expansion.text, "<xxxx>")
+        XCTAssertEqual(expansion.text, String(repeating: "x", count: 8))
         XCTAssertEqual(expansion.report.unusedImageCount, 1)
         XCTAssertFalse(expansion.report.isBalanced)
     }
 
     func testPlaceholderWithoutImagesIsReported() {
-        let markers = DeepSeekV41VisionMarkers(
-            imagePlaceholder: "<img>", imageOpen: "<", imageClose: ">", imageToken: "x"
-        )
+        let markers = DeepSeekV41VisionMarkers(imagePlaceholder: "<img>", imageToken: "x")
         let expansion = DeepSeekV41VisionLayout.expandReporting(
             text: "<img>lost", images: [], spec: spec, markers: markers
         )
@@ -1502,13 +1495,11 @@ final class DeepSeekV41VisionExpandTests: XCTestCase {
     }
 
     func testExtraPlaceholderIsReported() {
-        let markers = DeepSeekV41VisionMarkers(
-            imagePlaceholder: "<img>", imageOpen: "<", imageClose: ">", imageToken: "x"
-        )
+        let markers = DeepSeekV41VisionMarkers(imagePlaceholder: "<img>", imageToken: "x")
         let expansion = DeepSeekV41VisionLayout.expandReporting(
             text: "<img><img>", images: [(32, 32)], spec: spec, markers: markers
         )
-        XCTAssertEqual(expansion.text, "<xxxx><img>")
+        XCTAssertEqual(expansion.text, String(repeating: "x", count: 8) + "<img>")
         XCTAssertEqual(expansion.report.unfilledPlaceholderCount, 1)
     }
 }

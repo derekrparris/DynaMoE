@@ -173,47 +173,81 @@ final class DeepSeekV41VisionLayoutTests: XCTestCase {
         XCTAssertEqual(spec().tokenStride, 48)
     }
 
-    func testTokenCountRoundsUpToWholeStrides() {
-        XCTAssertEqual(DeepSeekV41VisionLayout.tokenCount(width: 48, height: 48, stride: 48), 1)
-        XCTAssertEqual(DeepSeekV41VisionLayout.tokenCount(width: 49, height: 48, stride: 48), 2)
-        XCTAssertEqual(DeepSeekV41VisionLayout.tokenCount(width: 96, height: 144, stride: 48), 6)
-        XCTAssertEqual(DeepSeekV41VisionLayout.tokenCount(width: 0, height: 10, stride: 48), 0)
+    /// `num_image_tokens(n_llm_h, n_llm_w) = n_llm_h * (n_llm_w + 1) + 2`: the
+    /// aligner grid, a newline position per row, and the two delimiters.
+    func testTokenCountIsTheAlignerGridPlusNewlinesAndDelimiters() {
+        XCTAssertEqual(DeepSeekV41VisionLayout.imageTokenCount(columns: 1, rows: 1), 4)
+        XCTAssertEqual(DeepSeekV41VisionLayout.imageTokenCount(columns: 10, rows: 10), 112)
+        XCTAssertEqual(DeepSeekV41VisionLayout.imageTokenCount(columns: 0, rows: 10), 0)
+    }
+
+    func testSpanIsTheGridInReadingOrderWrappedByDelimiters() {
+        XCTAssertEqual(
+            DeepSeekV41VisionLayout.span(columns: 2, rows: 2),
+            [.start, .image, .image, .newLine, .image, .image, .newLine, .end]
+        )
+        XCTAssertEqual(DeepSeekV41VisionLayout.span(columns: 0, rows: 2), [])
+    }
+
+    /// `llm_grid` rounds the patch grid up to whole downsample blocks, because the
+    /// aligner pads before it unfolds. The size is expected to be patch-aligned,
+    /// which is what `fit` returns.
+    func testGridCountsWholeDownsampleBlocks() {
+        let spec = spec()
+        // 3 patches -> one block; 6 patches -> two.
+        XCTAssertEqual(DeepSeekV41VisionLayout.grid(width: 48, height: 48, spec: spec).columns, 1)
+        XCTAssertEqual(DeepSeekV41VisionLayout.grid(width: 96, height: 48, spec: spec).columns, 2)
+        XCTAssertEqual(DeepSeekV41VisionLayout.grid(width: 48, height: 144, spec: spec).rows, 3)
+        XCTAssertEqual(DeepSeekV41VisionLayout.grid(width: 0, height: 10, spec: spec).columns, 0)
     }
 
     func testOversizedImageIsShrunkInsideTheTokenCap() {
         let fitted = DeepSeekV41VisionLayout.fit(width: 4000, height: 3000, spec: spec())
+        XCTAssertEqual(fitted.columns, 36)
+        XCTAssertEqual(fitted.rows, 27)
+        XCTAssertEqual(fitted.tokens, 1001)
         XCTAssertLessThanOrEqual(fitted.tokens, 1024)
-        XCTAssertGreaterThan(fitted.tokens, 0)
-        // The result is a whole number of tokens on both sides.
-        XCTAssertEqual(fitted.width % 48, 0)
-        XCTAssertEqual(fitted.height % 48, 0)
-        XCTAssertEqual(fitted.width / 48 * (fitted.height / 48), fitted.tokens)
-        // Aspect ratio is preserved to within a token.
+        // Aspect ratio is preserved to within a block.
         let aspect = Double(fitted.width) / Double(fitted.height)
-        XCTAssertEqual(aspect, 4.0 / 3.0, accuracy: 0.08)
+        XCTAssertEqual(aspect, 4.0 / 3.0, accuracy: 0.05)
+        // The returned pixel size reads back as the grid that was priced.
+        let grid = DeepSeekV41VisionLayout.grid(width: fitted.width, height: fitted.height, spec: spec())
+        XCTAssertEqual(grid.columns, fitted.columns)
+        XCTAssertEqual(grid.rows, fitted.rows)
     }
 
     func testImageInsideTheBudgetIsLeftAlone() {
         let fitted = DeepSeekV41VisionLayout.fit(width: 480, height: 480, spec: spec())
         XCTAssertEqual(fitted.width, 480)
         XCTAssertEqual(fitted.height, 480)
-        // 480 / 48 = 10 on each side.
-        XCTAssertEqual(fitted.tokens, 100)
+        // 480 / 48 = 10 blocks on each side: 10 rows of 10 images plus a newline,
+        // wrapped by the two delimiters.
+        XCTAssertEqual(fitted.columns, 10)
+        XCTAssertEqual(fitted.rows, 10)
+        XCTAssertEqual(fitted.tokens, 112)
     }
 
+    /// The floor is applied in PIXELS, not in tokens: below it the image is upscaled
+    /// until it covers the floor, rounded up to whole patches.
     func testTinyImageIsUpscaledToThePixelFloor() {
         let fitted = DeepSeekV41VisionLayout.fit(width: 48, height: 48, spec: spec())
-        XCTAssertGreaterThanOrEqual(fitted.tokens * 48 * 48, 65_536)
+        XCTAssertGreaterThanOrEqual(fitted.width * fitted.height, 65_536)
+        XCTAssertEqual(fitted.width, 256)
+        XCTAssertEqual(fitted.height, 256)
+        XCTAssertEqual(fitted.tokens, 44)
     }
 
-    func testCapWinsOverFloorWhenTheyConflict() {
-        // A cap of one token cannot also satisfy a 65k pixel floor.
+    /// A budget smaller than the delimiters alone costs still yields the smallest
+    /// grid that exists rather than an empty one.
+    func testCapSmallerThanTheSmallestSpanYieldsTheSmallestSpan() {
         let fitted = DeepSeekV41VisionLayout.fit(
             width: 4000,
             height: 3000,
             spec: spec(minPixels: 65_536, maxTokens: 1)
         )
-        XCTAssertEqual(fitted.tokens, 1)
+        XCTAssertEqual(fitted.columns, 1)
+        XCTAssertEqual(fitted.rows, 1)
+        XCTAssertEqual(fitted.tokens, 4)
     }
 
     func testNoCapAndNoFloorMeansNativeSize() {
@@ -225,19 +259,17 @@ final class DeepSeekV41VisionLayoutTests: XCTestCase {
         XCTAssertEqual(fitted.width, 960)
         XCTAssertEqual(fitted.height, 480)
         // 960 / 48 = 20 columns, 480 / 48 = 10 rows.
-        XCTAssertEqual(fitted.tokens, 200)
+        XCTAssertEqual(fitted.tokens, 10 * 21 + 2)
     }
 
-    func testPlaceholderRepeatsTheImageTokenOncePerPatch() {
+    /// The span repeats one token, not a wrapped run: every position of an image
+    /// span carries the same token id and `span(columns:rows:)` is what tells the
+    /// positions apart.
+    func testPlaceholderRepeatsTheImageTokenOncePerSpanPosition() {
         let markers = DeepSeekV41VisionMarkers.familyDefault
-        let placeholder = DeepSeekV41VisionLayout.placeholder(tokenCount: 3, marker: markers)
-        XCTAssertTrue(placeholder.hasPrefix(markers.imageOpen))
-        XCTAssertTrue(placeholder.hasSuffix(markers.imageClose))
-        XCTAssertEqual(
-            placeholder.components(separatedBy: markers.imageToken).count - 1,
-            3
-        )
-        XCTAssertEqual(DeepSeekV41VisionLayout.placeholder(tokenCount: 0, marker: markers), "")
+        let placeholder = DeepSeekV41VisionLayout.placeholder(columns: 2, rows: 2, marker: markers)
+        XCTAssertEqual(placeholder, String(repeating: markers.imageToken, count: 8))
+        XCTAssertEqual(DeepSeekV41VisionLayout.placeholder(columns: 0, rows: 0, marker: markers), "")
     }
 
     func testExpandReplacesOnePlaceholderPerAttachedImage() {
@@ -249,10 +281,17 @@ final class DeepSeekV41VisionLayoutTests: XCTestCase {
             spec: spec(),
             markers: markers
         )
-        XCTAssertEqual(expanded.components(separatedBy: markers.imageOpen).count - 1, 2)
         XCTAssertFalse(expanded.contains(markers.imagePlaceholder))
         XCTAssertTrue(expanded.hasPrefix("look "))
         XCTAssertTrue(expanded.contains(" then "))
+        // The first image costs its span, the second (upscaled to the pixel floor)
+        // costs its own.
+        let first = DeepSeekV41VisionLayout.fit(width: 480, height: 480, spec: spec()).tokens
+        let second = DeepSeekV41VisionLayout.fit(width: 48, height: 48, spec: spec()).tokens
+        XCTAssertEqual(
+            expanded.components(separatedBy: markers.imageToken).count - 1,
+            first + second
+        )
     }
 
     func testExpandLeavesTextOnlyPromptsUntouched() {
@@ -275,6 +314,126 @@ final class DeepSeekV41VisionLayoutTests: XCTestCase {
         XCTAssertEqual(white.0, 1, accuracy: 1e-5)
         let mid = DeepSeekV41VisionLayout.normalize(r: 128, g: 128, b: 128)
         XCTAssertEqual(mid.0, 128.0 / 255 * 2 - 1, accuracy: 1e-5)
+    }
+}
+
+final class DeepSeekV41VisionPreprocessTests: XCTestCase {
+
+    private func spec(patch: Int = 16, downsample: Int = 1) -> DeepSeekV41VisionSpec {
+        DeepSeekV41VisionSpec(
+            patchSize: patch,
+            downsampleRatio: downsample,
+            minPixels: 0,
+            maxImageTokens: 0,
+            numHiddenLayers: 1,
+            hiddenSize: 8,
+            numAttentionHeads: 1,
+            intermediateSize: 8,
+            imageTokenID: 7
+        )
+    }
+
+    /// R: `4 * x`, G: `4 * y`, B: 200, so every channel and every pixel is
+    /// distinguishable after normalization.
+    private func gradient(width: Int, height: Int) -> [UInt8] {
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(width * height * 3)
+        for y in 0..<height {
+            for x in 0..<width {
+                bytes.append(UInt8(x * 4 % 256))
+                bytes.append(UInt8(y * 4 % 256))
+                bytes.append(200)
+            }
+        }
+        return bytes
+    }
+
+    /// `x.reshape(3, n_h, p, n_w, p).permute(1, 3, 0, 2, 4)`: one row per patch, in
+    /// reading order, channel-major inside the patch.
+    func testPatchesAreChannelMajorAndInReadingOrder() {
+        let patches = DeepSeekV41VisionPreprocess.patches(
+            rgb: gradient(width: 32, height: 32),
+            width: 32,
+            height: 32,
+            spec: spec()
+        )
+        XCTAssertEqual(patches.count, 4)
+        XCTAssertTrue(patches.allSatisfy { $0.count == 3 * 16 * 16 })
+
+        let topLeft = patches[0]
+        // Channel-major: R plane first, then G, then B.
+        XCTAssertEqual(topLeft[0], DeepSeekV41VisionLayout.normalize(r: 0, g: 0, b: 200).0, accuracy: 1e-6)
+        XCTAssertEqual(topLeft[16 * 16], DeepSeekV41VisionLayout.normalize(r: 0, g: 0, b: 200).1, accuracy: 1e-6)
+        XCTAssertEqual(topLeft[2 * 16 * 16], DeepSeekV41VisionLayout.normalize(r: 0, g: 0, b: 200).2, accuracy: 1e-6)
+        // Pixel (1, 0) of the patch reads source x = 1.
+        XCTAssertEqual(topLeft[1], DeepSeekV41VisionLayout.normalize(r: 4, g: 0, b: 0).0, accuracy: 1e-6)
+        // The patch's second image row is 16 values into the G plane, and reads y = 1.
+        XCTAssertEqual(
+            topLeft[16 * 16 + 16],
+            DeepSeekV41VisionLayout.normalize(r: 0, g: 4, b: 0).1,
+            accuracy: 1e-6
+        )
+
+        // The second patch is the top-RIGHT one, so it starts at source x = 16.
+        XCTAssertEqual(patches[1][0], DeepSeekV41VisionLayout.normalize(r: 64, g: 0, b: 0).0, accuracy: 1e-6)
+    }
+
+    /// A tall image is padded on both sides with the checkpoint's gray (127) rather
+    /// than stretched, so the margin columns are gray and the drawn columns are not.
+    func testPaddedImageCentresWithTheCheckpointGrey() {
+        let placement = DeepSeekV41VisionPreprocess.placement(
+            width: 10,
+            height: 40,
+            spec: spec()
+        )
+        XCTAssertEqual(placement.targetWidth, 16)
+        XCTAssertEqual(placement.targetHeight, 48)
+        XCTAssertEqual(placement.drawnWidth, 12)
+        XCTAssertEqual(placement.drawnHeight, 48)
+        XCTAssertEqual(placement.left, 2)
+        XCTAssertEqual(placement.top, 0)
+        XCTAssertFalse(placement.stretches)
+
+        let patches = DeepSeekV41VisionPreprocess.patches(
+            rgb: gradient(width: 10, height: 40),
+            width: 10,
+            height: 40,
+            spec: spec()
+        )
+        XCTAssertEqual(patches.count, 3)
+        let first = patches[0]
+        // Columns 0 and 1 are the pad; column 2 reads source x = 0.
+        XCTAssertEqual(first[0], DeepSeekV41VisionLayout.normalize(r: 127, g: 127, b: 127).0, accuracy: 1e-6)
+        XCTAssertEqual(first[1], DeepSeekV41VisionLayout.normalize(r: 127, g: 127, b: 127).0, accuracy: 1e-6)
+        XCTAssertEqual(first[2], DeepSeekV41VisionLayout.normalize(r: 0, g: 0, b: 0).0, accuracy: 1e-6)
+    }
+
+    /// The ratio cap equalises the sides first, so the image fills the box instead of
+    /// being padded into it.
+    func testRatioCapStretchesRatherThanPads() {
+        let spec = DeepSeekV41VisionSpec(
+            patchSize: 8,
+            downsampleRatio: 1,
+            minPixels: 0,
+            maxImageTokens: 0,
+            numHiddenLayers: 1,
+            hiddenSize: 8,
+            numAttentionHeads: 1,
+            intermediateSize: 8,
+            imageTokenID: 7,
+            maxWidthHeightRatio: 1
+        )
+        let placement = DeepSeekV41VisionPreprocess.placement(width: 80, height: 10, spec: spec)
+        XCTAssertTrue(placement.stretches)
+        XCTAssertEqual(placement.left, 0)
+        XCTAssertEqual(placement.top, 0)
+        XCTAssertEqual(placement.drawnWidth, placement.targetWidth)
+    }
+
+    func testShortBufferYieldsNoPatches() {
+        XCTAssertTrue(
+            DeepSeekV41VisionPreprocess.patches(rgb: [0, 0, 0], width: 32, height: 32, spec: spec()).isEmpty
+        )
     }
 }
 
@@ -330,14 +489,17 @@ final class DeepSeekV41VisionPlanTests: XCTestCase {
 
     func testTokenCountMatchesTheLayoutRule() {
         let plan = DeepSeekV41VisionTowerPlan(spec: spec(), projectorOutputWidth: 7168)
-        // 480 / 48 = 10 tokens on each side. Pinned as a literal: comparing
-        // against the helper under test would pass even if the helper were wrong.
-        XCTAssertEqual(plan.tokenCount(width: 480, height: 480), 100)
-        XCTAssertEqual(plan.tokenCount(width: 96, height: 144), 2 * 3)
+        // 480 / 48 = 10 blocks on each side: 10 rows of (10 images + newline) plus
+        // the two delimiters. Pinned as a literal: comparing against the helper
+        // under test would pass even if the helper were wrong.
+        XCTAssertEqual(plan.tokenCount(width: 480, height: 480), 112)
+        // 96 x 144 is 2 x 3 blocks: 3 * (2 + 1) + 2.
+        XCTAssertEqual(plan.tokenCount(width: 96, height: 144), 11)
     }
 
-    /// A square image whose floor exceeds a very small cap must stay square.
-    /// Clamping only the column count produced 6x5 instead of 5x5.
+    /// A square image whose floor exceeds a very small cap must stay square, and
+    /// the cap must still hold: the solved size is 32 x 32 at patch 8, which is a
+    /// 4 x 4 grid costing 22 positions.
     func testSquareImageStaysSquareWhenTheFloorExceedsTheCap() {
         let tight = DeepSeekV41VisionSpec(
             patchSize: 8, downsampleRatio: 1, minPixels: 36 * 8 * 8, maxImageTokens: 25,
@@ -345,9 +507,11 @@ final class DeepSeekV41VisionPlanTests: XCTestCase {
             intermediateSize: 32, imageTokenID: 1
         )
         let fitted = DeepSeekV41VisionLayout.fit(width: 48, height: 48, spec: tight)
-        XCTAssertEqual(fitted.tokens, 25)
+        XCTAssertEqual(fitted.tokens, 22)
+        XCTAssertLessThanOrEqual(fitted.tokens, 25)
+        XCTAssertEqual(fitted.columns, fitted.rows)
         XCTAssertEqual(fitted.width, fitted.height)
-        XCTAssertEqual(fitted.width / tight.tokenStride, 5)
+        XCTAssertEqual(fitted.width / tight.tokenStride, 4)
     }
 }
 

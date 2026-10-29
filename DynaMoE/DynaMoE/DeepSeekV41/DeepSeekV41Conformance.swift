@@ -94,6 +94,15 @@ nonisolated public enum DeepSeekV41Conformance {
     public static let dsparkDrafting: Gate = .unverified
 
     /// The vision tower's patch grid and image token layout.
+    ///
+    /// The GEOMETRY now matches `image_processor.py`: the resize plan is
+    /// `plan_image_grid` + `safe_resize`, the patch grid is `llm_grid`, the span is
+    /// `num_image_tokens = rows * (columns + 1) + 2`, and the patches are emitted in
+    /// the checkpoint's `reshape(3, n_h, p, n_w, p)` order. Two things still keep the
+    /// gate open: no tower runner exists (there is no 32-block ViT/aligner forward),
+    /// and the token IDENTIFIER is unverified, because the reference writes the same
+    /// `image_token_id` at every span position and trusts the tokenizer for it,
+    /// while this port renders the span from a marker string.
     public static let visionPatching: Gate = .unverified
 
     /// Every gate, paired with the label the load log prints.
