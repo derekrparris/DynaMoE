@@ -1263,6 +1263,40 @@ final class DeepSeekV41ConfigEdgeTests: XCTestCase {
         XCTAssertTrue(config.engramTables.isEmpty)
         XCTAssertThrowsError(try config.makeLayerPlan())
     }
+
+    /// `hc_*_scale` is a plain role, not a quantized companion: its name ends in
+    /// `_scale`, not `.scale`, so the catalog resolves it through the normal
+    /// lookup and the vector bank never falls back to the identity value.
+    func testHyperConnectionScaleResolvesAsAPlainVector() {
+        let catalog = DeepSeekV41WeightCatalog(
+            named: [
+                DeepSeekV41TensorRef(name: "layers.0.hc_attn_scale", dtype: "BF16", shape: [4])
+            ],
+            layerCount: 1
+        )
+        XCTAssertNotNil(catalog.tensor(.hcAttnScale, layer: 0))
+    }
+
+    /// The loader keys "never map this" off its own classifier, not the Rust
+    /// display string.
+    func testEngramNamesAreStreamedByTheSwiftClassifier() {
+        XCTAssertTrue(DeepSeekV41WeightCatalog.isStreamedName("layers.1.engram.embed.weight"))
+        XCTAssertTrue(DeepSeekV41WeightCatalog.isStreamedName("layers.14.engram.embed.scale"))
+        XCTAssertFalse(DeepSeekV41WeightCatalog.isStreamedName("layers.1.attn.wkv.weight"))
+    }
+
+    /// `layerCount` was accepted and never read, so a manifest placing a
+    /// backbone tensor past the last layer validated clean.
+    func testTensorsPastTheLastLayerAreReported() {
+        let catalog = DeepSeekV41WeightCatalog(
+            named: [
+                DeepSeekV41TensorRef(name: "layers.5.attn_norm.weight", dtype: "BF16", shape: [64])
+            ],
+            layerCount: 2
+        )
+        XCTAssertEqual(catalog.slots.count, 1)
+        XCTAssertEqual(catalog.outOfRangeLayers.count, 1, "\(catalog.outOfRangeLayers)")
+    }
 }
 
 // MARK: - Vision placeholder expansion
