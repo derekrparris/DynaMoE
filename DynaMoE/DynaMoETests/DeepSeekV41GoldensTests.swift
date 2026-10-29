@@ -1309,3 +1309,174 @@ final class DeepSeekV41VisionGoldenTests: XCTestCase {
         )
     }
 }
+
+// MARK: - Prefill chunk
+
+/// What a chunk of positions reads and what it pools: the two rules a batched
+/// prefill has to reproduce, taken from `get_window_topk_idxs` and from both
+/// branches of `Compressor.forward`.
+///
+/// The port walks a prompt one position at a time. A chunk pass computes the same
+/// numbers in a different ORDER, and order is exactly what the two positional rules
+/// here can break: which window rows a query reads once they have been written into
+/// the ring, and which groups a chunk completes when its length is not a multiple
+/// of the ratio. The reference answers both, so both are asserted instead of being
+/// re-derived from the architecture description.
+///
+/// `chunkRows` and `stepRows` are the same rows from the two branches, and they are
+/// equal to the last bit of a Float32 only by luck: the reductions run in tensor
+/// shapes of different rank, so they are compared at the tolerance the reference's
+/// own FP32 order justifies. The claim a batched port makes is that they agree, not
+/// that they are the same bits.
+final class DeepSeekV41ChunkGoldenTests: XCTestCase {
+
+    private let window = 3
+    private let positions = 5
+    private let ratio = 2
+    private let width = 4
+    private let hidden = 8
+
+    /// `[position][dim]`, the chunk's block inputs in ascending position order.
+    private static let inputs: [Float] = [
+        0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0,
+        2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0,
+        4.25, 4.5, 4.75, 5.0, 5.25, 5.5, 5.75, 6.0,
+        6.25, 6.5, 6.75, 7.0, 7.25, 7.5, 7.75, 8.0,
+        8.25, 8.5, 8.75, 9.0, 9.25, 9.5, 9.75, 10.0,
+    ]
+
+    /// `attn.compressor.wkv`, `[head_dim][dim]`, row-major.
+    private static let kvWeight: [Float] = [
+        -0.2743486762046814, -0.29252973198890686, -0.11096779257059097, 0.2449793964624405, 0.1938299536705017, 0.0271333996206522, 0.5312392115592957, -0.23078827559947968,
+        -0.10173508524894714, -0.10976564139127731, -0.32761093974113464, -0.18267247080802917, -0.9094019532203674, -0.20123140513896942, 0.015708519145846367, -0.18294356763362885,
+        0.14256815612316132, -0.3770979046821594, 0.584096372127533, 0.02197224833071232, -0.42252734303474426, -0.21017824113368988, -0.42883339524269104, 0.207710862159729,
+        -0.26240235567092896, 0.2526072561740875, 0.5875536203384399, 0.28500065207481384, -0.07786837220191956, -0.3613465428352356, -0.4851985275745392, -0.040346261113882065,
+    ]
+
+    /// `attn.compressor.wgate`, `[head_dim][dim]`, row-major.
+    private static let gateWeight: [Float] = [
+        -0.2961757779121399, -0.19481568038463593, 0.0826670229434967, 0.5185345411300659, 0.10048672556877136, -0.31101828813552856, -0.39707642793655396, -0.09807982295751572,
+        0.15090014040470123, -0.021074937656521797, -0.41118288040161133, 0.9671960473060608, -0.21570582687854767, 0.29945796728134155, -0.3636859655380249, -0.35620594024658203,
+        -0.2053443193435669, 0.07546232640743256, 0.22728553414344788, 0.41214895248413086, -0.18166284263134003, -0.22688943147659302, 0.07892361283302307, -0.0828431099653244,
+        0.19894123077392578, 0.19902102649211884, -0.22693189978599548, -0.2658155858516693, 0.02506062760949135, 0.002452727174386382, 0.21632415056228638, -0.07565955817699432,
+    ]
+
+    /// `[row][head_dim]`: what `Compressor.forward(x, start_pos=0)` returns for the
+    /// chunk, i.e. `len // ratio` rows and no row for the trailing remainder.
+    private static let chunkRows: [Float] = [
+        0.7392598390579224, -4.384644985198975, -1.4002892971038818, -0.892249584197998,
+        1.0934498310089111, -12.383255004882812, -3.329446315765381, -1.3002517223358154,
+    ]
+
+    /// The same rows from the decode branch, one position per call.
+    private static let stepRows: [Float] = [
+        0.7392597794532776, -4.384644508361816, -1.4002890586853027, -0.892249584197998,
+        1.0934498310089111, -12.383255004882812, -3.329446315765381, -1.3002517223358154,
+    ]
+
+    /// `[query][slot]`: the chunk positions each query reads, -1 where that query has
+    /// not reached the slot yet.
+    private static let chunkWindowSlots: [[Int]] = [
+        [0, -1, -1],
+        [0, 1, -1],
+        [0, 1, 2],
+        [1, 2, 3],
+        [2, 3, 4],
+    ]
+
+    /// The same window after it has been written into the ring, listed oldest slot
+    /// first, -1 where the sequence has not filled that slot.
+    private static let decodeWindowSlots: [(startPos: Int, slots: [Int])] = [
+        (0, [0]),
+        (1, [-1, 0, 1]),
+        (3, [1, 2, 0]),
+        (7, [2, 0, 1]),
+    ]
+
+    /// One entry per position: whether the walk pooled a row there. It is also the
+    /// per-query compressed visibility, since a row a position produced is a row the
+    /// positions after it may read.
+    private static let stepProducedAt = [false, true, false, true, false]
+
+    private func geometry() -> DeepSeekV41CacheGeometry {
+        DeepSeekV41CacheGeometry(
+            width: width,
+            precision: .fp16,
+            windowRows: window,
+            compressedRows: 0,
+            indexerKeyWidth: 0,
+            candidateBlocks: 0
+        )
+    }
+
+    func testEachQueryInAChunkReadsItsOwnCausalWindow() {
+        for (query, slots) in Self.chunkWindowSlots.enumerated() {
+            let expected = slots.filter { $0 >= 0 }
+            let range = DeepSeekV41CacheAddressing.windowRange(
+                position: query, windowSize: window
+            )
+            XCTAssertEqual(Array(range), expected, "query \(query)")
+        }
+    }
+
+    /// A decode step reads the same ring, not the chunk's key matrix, so the slots it
+    /// names are physical rows rotated to start at the oldest one still live.
+    func testADecodeStepReadsTheRingRotatedOldestFirst() {
+        for (startPos, slots) in Self.decodeWindowSlots {
+            let rows = DeepSeekV41CacheAddressing.windowRange(
+                position: startPos, windowSize: window
+            ).map { DeepSeekV41CacheAddressing.windowRow(for: $0, geometry: geometry()) }
+            XCTAssertEqual(rows, slots.filter { $0 >= 0 }, "start_pos \(startPos)")
+        }
+    }
+
+    func testAChunkCompletesExactlyTheGroupsTheWalkCompletes() {
+        var produced = 0
+        for (position, pooled) in Self.stepProducedAt.enumerated() {
+            XCTAssertEqual(
+                DeepSeekV41CacheAddressing.compressorCompletesGroup(
+                    position: position, ratio: ratio
+                ),
+                pooled,
+                "position \(position) pools"
+            )
+            if pooled { produced += 1 }
+            XCTAssertEqual(
+                DeepSeekV41CacheAddressing.compressedRowCount(
+                    afterPosition: position, ratio: ratio
+                ),
+                produced,
+                "rows visible to position \(position)"
+            )
+        }
+        XCTAssertEqual(produced, Self.chunkRows.count / width)
+    }
+
+    func testTheChunkPoolsWhatTheWalkPools() {
+        for row in 0..<(Self.chunkRows.count / width) {
+            let inputs = DeepSeekV41CacheAddressing.poolRange(row: row, ratio: ratio).map { position in
+                let start = position * hidden
+                return Array(Self.inputs[start..<(start + hidden)])
+            }
+            let pooled = DeepSeekV41Compressor.pooledLatent(
+                inputs: inputs,
+                kvWeight: DeepSeekV41Matrix(rows: width, columns: hidden, values: Self.kvWeight),
+                gateWeight: DeepSeekV41Matrix(rows: width, columns: hidden, values: Self.gateWeight)
+            )
+            for dimension in 0..<width {
+                XCTAssertEqual(
+                    pooled[dimension],
+                    Self.chunkRows[row * width + dimension],
+                    accuracy: 1e-5,
+                    "row \(row) dim \(dimension) against the chunk branch"
+                )
+                XCTAssertEqual(
+                    pooled[dimension],
+                    Self.stepRows[row * width + dimension],
+                    accuracy: 1e-5,
+                    "row \(row) dim \(dimension) against the decode branch"
+                )
+            }
+        }
+    }
+}

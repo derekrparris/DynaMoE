@@ -95,6 +95,28 @@ nonisolated public enum DeepSeekV41Conformance {
     /// `scores` weights) and the renormalization to happen only for `topk > 1`.
     public static let routerScoring: Gate = .verifiedAgainstReference
 
+    /// Which cache rows each query of a chunk reads, and what a chunk pools.
+    ///
+    /// MATCHED AGAINST `get_window_topk_idxs` and both branches of
+    /// `Compressor.forward`. This is the rule a batched prefill needs and a
+    /// per-position walk does not: the walk addresses one query at a time, while a
+    /// chunk has to know, for every query in it at once, which window rows that query
+    /// may read and which compressed rows already exist.
+    ///
+    /// `Tools/dsv41_goldens.py chunk` asks the reference for both: a five-position
+    /// chunk over a three-slot window (so every query's window differs, and a query
+    /// at the end of the chunk reads rows the ring has since rotated), and the same
+    /// window as a decode step lists it, rotated oldest-first with unwritten slots
+    /// marked. It also runs `Compressor.forward` over the chunk and position by
+    /// position, which is the equality a batched pool claims: `len // ratio` rows,
+    /// pooled from the same positions, with the trailing remainder left unpooled.
+    /// `DeepSeekV41ChunkGoldenTests` carries the vectors.
+    ///
+    /// What it does NOT cover: attended values, because `sparse_attn` is a tilelang
+    /// kernel and cannot run here. The row lists are the rule; the arithmetic over
+    /// them is `DeepSeekV41AttentionReference`'s own and is pinned separately.
+    public static let chunkAddressing: Gate = .verifiedAgainstReference
+
     /// How the compressed-row candidate blocks are scored and truncated.
     ///
     /// Both backends currently read rows through
@@ -186,6 +208,7 @@ nonisolated public enum DeepSeekV41Conformance {
                 ? .verifiedAgainstReference : .unverified),
             ("compressor pooling", compressorPooling),
             ("compressor accumulation", compressorAccumulation),
+            ("chunk addressing", chunkAddressing),
             ("router scoring", routerScoring),
             ("Engram combination", engramCombination),
             ("candidate selection", candidateSelection),

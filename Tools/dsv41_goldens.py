@@ -35,11 +35,14 @@ Usage:
 
 Cases: `engram` (Engram.forward), `compressor` (Compressor.forward, one block),
 `compressor_state` (Compressor.forward over a decode sequence: which slot a
-position fills and when a row comes out), `router` (Gate.forward, under both
-per-logit scorings), `dspark` (`DSparkBlock`'s `forward_embed` seed plus its
-`forward_head` chain: the Markov bias, the per-step draw, and the confidence
-ordering), and `vision` (`ViT.forward` + `Aligner.forward` over a given patch
-grid, plus the spelling and id of the token that addresses an image span).
+position fills and when a row comes out), `chunk` (which window slots each query
+of a prefill chunk reads, `get_window_topk_idxs` for both of its branches, plus
+the chunk branch of `Compressor.forward` against its decode branch), `router`
+(Gate.forward, under both per-logit scorings), `dspark` (`DSparkBlock`'s
+`forward_embed` seed plus its `forward_head` chain: the Markov bias, the
+per-step draw, and the confidence ordering), and `vision` (`ViT.forward` +
+`Aligner.forward` over a given patch grid, plus the spelling and id of the token
+that addresses an image span).
 
 Two gates deliberately have no case yet. `hyperConnections` needs
 `kernel.hc_split_sinkhorn`, the real Sinkhorn, which is a tilelang kernel and so
@@ -51,6 +54,14 @@ contains. What it cannot cover, and what therefore keeps the gate open, is the
 draft block's own attention and MoE: those run only through `forward_spec`, which
 nothing in the checkpoint's own generator calls, so there is no reference output
 for a draft block forward over a real prefix.
+
+`chunk` exists because a batched prefill is the first place the port would run
+more than one position through a layer, and the two rules that decide whether that
+pass sees what a per-position walk sees are positional: the sliding-window mask
+over a chunk, and the compressor splitting a chunk into complete groups plus a
+trailing remainder. `get_window_topk_idxs` is pure torch, so the mask is asked
+rather than restated; the attention that consumes it is not, which is why this
+case pins the row lists and not attended values.
 
 `vision` starts from a patch grid rather than an image: `load_image`'s PIL
 bicubic resample is preprocessing, and pinning it here would pin Pillow instead
@@ -655,6 +666,111 @@ def compressor_state_case(torch, reference) -> dict:
     }
 
 
+def chunk_case(torch, reference) -> dict:
+    """What a batch of positions reads, and what it pools: the prefill-chunk rules.
+
+    The port walks a prompt one position at a time today and is about to take the
+    checkpoint's own shape, where a chunk of positions goes through the block in one
+    pass. Two rules decide whether that pass sees what the walk sees, and both are
+    positional rather than numeric:
+
+      * the sliding-window mask. In a chunk every query attends over its own causal
+        window, which `get_window_topk_idxs` lists as chunk positions, with -1 where
+        a position has not been written yet. A decode step reuses the same ring but
+        has to rotate it, oldest slot first, and report the slots still unwritten at
+        the start of a sequence.
+      * the compressor's group split. `Compressor.forward` at `start_pos=0` pools the
+        chunk's complete groups and leaves the trailing remainder in its state, so a
+        chunk whose length is not a multiple of the ratio produces `len // ratio`
+        rows. Running the SAME module position by position through its decode branch
+        has to produce the same rows, and that equality is what a batched port claims
+        when it stops calling the module once per position.
+
+    Both halves are asked of the reference rather than restated: the slot lists come
+    from `get_window_topk_idxs` and the rows from `Compressor.forward` under both of
+    its branches. `chunk_state` is recorded because the remainder the chunk did not
+    pool is visible there.
+    """
+    window = 3
+    positions = 5
+    ratio = 2
+    args = reference.ModelArgs(
+        dim=8,
+        head_dim=4,
+        norm_eps=1e-6,
+        window_size=window,
+        compress_ratios=[0, ratio],
+        max_batch_size=1,
+    )
+
+    chunk_slots = rows_of(reference.get_window_topk_idxs(window, 1, positions, 0))[0]
+    decode = [
+        {
+            "start_pos": start_pos,
+            "slots": rows_of(reference.get_window_topk_idxs(window, 1, 1, start_pos))[0][0],
+        }
+        for start_pos in (0, 1, 3, 7)
+    ]
+
+    # One distinct row per position, so a group pooled from the wrong positions is
+    # visible in its values rather than only in the row count.
+    x = (
+        torch.arange(1.0, 1.0 + positions * args.dim, dtype=torch.float32).view(1, positions, args.dim)
+        * 0.25
+    )
+    chunk_module = fill(reference.Compressor(args, 1), torch)
+    chunk_module.norm = torch.nn.Identity()
+    step_module = fill(reference.Compressor(args, 1), torch)
+    step_module.norm = torch.nn.Identity()
+
+    with torch.no_grad():
+        chunk_rows = rows_of(chunk_module(x, 0)[0])
+        step_rows = []
+        produced_at = []
+        for position in range(positions):
+            out = step_module(x[:, position : position + 1], position)
+            produced_at.append(out is not None)
+            if out is not None:
+                step_rows.append(rows_of(out[0, 0]))
+        chunk_state = rows_of(chunk_module.kv_state[0])
+
+    return {
+        "gate": "chunkAddressing",
+        "reference": (
+            "inference/model.py get_window_topk_idxs and Compressor.forward, both branches "
+            f"({snapshot_note()})"
+        ),
+        "config": {
+            "window_size": window,
+            "positions": positions,
+            "compress_ratio": ratio,
+            "dim": args.dim,
+            "head_dim": args.head_dim,
+        },
+        "input": {
+            "positions": rows_of(x[0]),
+            "wkv": rows_of(chunk_module.wkv.weight),
+            "wgate": rows_of(chunk_module.wgate.weight),
+        },
+        "expected": {
+            # [positions][min(positions, window)]: the chunk positions each query reads,
+            # -1 where that query has not reached the slot yet.
+            "chunk_window_slots": chunk_slots,
+            # Ring SLOTS, not positions: where a query's window sits once the ring has
+            # been written. Rotated oldest first, -1 where a slot is still unwritten.
+            "decode_window_slots": decode,
+            # [positions // ratio][head_dim], pooled by the chunk branch.
+            "chunk_rows": chunk_rows,
+            # The same rows from the decode branch, one position at a time.
+            "step_rows": step_rows,
+            # One entry per position: whether that position completed a group.
+            "step_produced_at": produced_at,
+            # [ratio][head_dim]: the trailing remainder the chunk left unpooled.
+            "chunk_state": chunk_state,
+        },
+    }
+
+
 def _vision_identifier(snapshot: str) -> dict:
     """What token an image span is spelled with, from the checkpoint's own files.
 
@@ -834,6 +950,7 @@ CASES = {
     "engram": engram_case,
     "compressor": compressor_case,
     "compressor_state": compressor_state_case,
+    "chunk": chunk_case,
     "router": router_case,
     "dspark": dspark_case,
     "vision": vision_case,
