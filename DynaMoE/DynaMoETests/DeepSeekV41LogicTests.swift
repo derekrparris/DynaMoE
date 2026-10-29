@@ -557,7 +557,12 @@ final class DeepSeekV41MemoryPlanTests: XCTestCase {
         let memory = DeepSeekV41MemoryPlan.make(
             config: config, plan: plan, catalog: nil, contextLength: 1_048_576
         )
-        XCTAssertEqual(memory.compressedCacheBytes, 2 * 288 * 1_048_576)
+        // Each owner is priced from its own ratio: layer 2 is ratio 2 and layer
+        // 20 is ratio 1, and each has one trailing partial-block row.
+        XCTAssertEqual(
+            memory.compressedCacheBytes,
+            ((1_048_576 / 2 + 1) + (1_048_576 + 1)) * 288
+        )
         // The rings are priced at the same record width as the compressed caches,
         // which is the FP4 design width by default here.
         XCTAssertEqual(memory.windowRingBytes, 40 * 128 * config.fp4CacheRecordBytes)
@@ -568,7 +573,7 @@ final class DeepSeekV41MemoryPlanTests: XCTestCase {
         // as many as the ratio-1 owner.
         XCTAssertEqual(
             memory.indexerBytes,
-            1_048_576 / 2 * 128 * 2 + 1_048_576 * 128 * 2
+            (1_048_576 / 2 + 1) * 128 * 2 + (1_048_576 + 1) * 128 * 2
         )
         XCTAssertLessThan(memory.cacheBytes, 2 * 1_073_741_824, "caches must fit in 2 GB")
     }
@@ -846,6 +851,13 @@ final class DeepSeekV41CacheReuseTests: XCTestCase {
                 prefixCount: 200, storedPositions: 300, windowRows: 128
             )
         )
+        // The prefix itself fits in the ring, but the ring has already wrapped:
+        // rows 0...3 now hold positions 128...131, not the prefix's positions.
+        XCTAssertFalse(
+            DeepSeekV41CacheAddressing.prefixIsReusable(
+                prefixCount: 4, storedPositions: 300, windowRows: 128
+            )
+        )
     }
 
     func testPrefixPastWhatIsStoredIsNotReusable() {
@@ -940,7 +952,10 @@ final class DeepSeekV41MemoryPlanHonestyTests: XCTestCase {
     func testFP16OverridePricesTheWindowRingsToo() throws {
         let fp16 = try memory(recordBytesOverride: 1_024)
         let config = try DeepSeekV41Config.decode(jsonData: Data(DeepSeekV41ConfigTests.wrapperJSON.utf8))
-        XCTAssertEqual(fp16.compressedCacheBytes, 2 * 1_024 * 4_096)
+        XCTAssertEqual(
+            fp16.compressedCacheBytes,
+            ((4_096 / 2 + 1) + (4_096 + 1)) * 1_024
+        )
         XCTAssertEqual(fp16.windowRingBytes, 40 * config.windowSize * 1_024)
     }
 }

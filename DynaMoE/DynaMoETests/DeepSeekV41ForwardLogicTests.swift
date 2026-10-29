@@ -734,14 +734,13 @@ final class DeepSeekV41ForwardTests: XCTestCase {
 
         // Layer 1 is the compressed owner with ratio 2, so rows appear at positions
         // 1, 3, 5 ... and never at an even position.
-        for position in [0, 1, 2, 3] {
+        // A ratio-2 owner pools at positions 1 and 3 only. Pinned as literals
+        // rather than derived from the helper the implementation calls.
+        let expectedRows = [0, 1, 1, 2]
+        for (position, expected) in expectedRows.enumerated() {
             _ = forward.forwardToken(7, position: position)
             let rows = forward.compressed[1] ?? []
-            XCTAssertEqual(
-                rows.count,
-                DeepSeekV41CacheAddressing.compressedRowCount(afterPosition: position, ratio: 2),
-                "position \(position)"
-            )
+            XCTAssertEqual(rows.count, expected, "position \(position)")
         }
         XCTAssertEqual(forward.compressed[1]?.count, 2)
         // A window-only layer owns no compressed cache.

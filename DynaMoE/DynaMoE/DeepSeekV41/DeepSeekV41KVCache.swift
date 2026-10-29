@@ -74,8 +74,12 @@ nonisolated public struct DeepSeekV41CacheGeometry: Sendable, Equatable {
     public let precision: DeepSeekV41CachePrecision
     /// Rows in one layer's sliding-window ring.
     public let windowRows: Int
-    /// Rows in one owner layer's compressed cache.
+    /// Rows in the widest owner layer's compressed cache. Per-owner row counts
+    /// live in `DeepSeekV41CacheLayout.compressedRowsByOwner`.
     public let compressedRows: Int
+    /// Sequence length the caches were provisioned for; per-owner rows are
+    /// derived from it and the owner's own compress ratio.
+    public let contextLength: Int
     /// Values in one indexer key.
     public let indexerKeyWidth: Int
     /// Candidate blocks scored per token position.
@@ -92,7 +96,8 @@ nonisolated public struct DeepSeekV41CacheGeometry: Sendable, Equatable {
         windowRows: Int,
         compressedRows: Int,
         indexerKeyWidth: Int,
-        candidateBlocks: Int
+        candidateBlocks: Int,
+        contextLength: Int = 0
     ) {
         self.width = width
         self.precision = precision
@@ -100,6 +105,13 @@ nonisolated public struct DeepSeekV41CacheGeometry: Sendable, Equatable {
         self.compressedRows = compressedRows
         self.indexerKeyWidth = indexerKeyWidth
         self.candidateBlocks = candidateBlocks
+        self.contextLength = max(0, contextLength)
+    }
+
+    /// Rows one owner with `ratio` produces over the provisioned context.
+    public func compressedRows(forRatio ratio: Int) -> Int {
+        guard contextLength > 0, ratio > 0 else { return 0 }
+        return contextLength / ratio + 1
     }
 
     /// Geometry for a config. `contextLength` is the sequence length the turn may
@@ -111,11 +123,12 @@ nonisolated public struct DeepSeekV41CacheGeometry: Sendable, Equatable {
         contextLength: Int,
         precision: DeepSeekV41CachePrecision = .fp8Block32
     ) -> DeepSeekV41CacheGeometry {
-        // The shortest compress ratio in the plan sets the row count, so a layer
-        // that pools every token (ratio 1) is provisioned for the whole context.
-        let ratios = plan.filter { $0.flavor == .compressed }.map(\.compressRatio)
-        let shortestRatio = max(1, ratios.min() ?? 1)
-        let rows = max(0, contextLength) / shortestRatio + 1
+        // Only cache OWNERS allocate compressed rows; a compressed layer that
+        // reads its owner's rows must not widen every owner's allocation. Each
+        // owner's row count comes from its own ratio.
+        let ownerRatios = plan.filter(\.ownsCompressedKV).map { max(1, $0.compressRatio) }
+        let widestRatio = max(1, ownerRatios.max() ?? 1)
+        let rows = max(0, contextLength) / widestRatio + 1
         return DeepSeekV41CacheGeometry(
             width: config.cacheRecordWidth,
             precision: precision,
@@ -124,7 +137,8 @@ nonisolated public struct DeepSeekV41CacheGeometry: Sendable, Equatable {
             indexerKeyWidth: max(0, config.indexHeadDim),
             candidateBlocks: config.candidateBlockSize > 0
                 ? max(0, contextLength) / config.candidateBlockSize + 1
-                : 0
+                : 0,
+            contextLength: contextLength
         )
     }
 }
@@ -140,8 +154,13 @@ nonisolated public struct DeepSeekV41CacheLayout: Sendable, Equatable {
     public let windowBase: [Int: Int]
     /// Owner layer index -> byte offset inside the compressed buffer.
     public let compressedBase: [Int: Int]
+    /// Owner layer index -> rows allocated to it. Owners with different compress
+    /// ratios do not share a row count.
+    public let compressedRowsByOwner: [Int: Int]
     /// Index-owning layer -> byte offset inside the indexer key buffer.
     public let indexerBase: [Int: Int]
+    /// Index-owning layer -> rows allocated to it.
+    public let indexerRowsByOwner: [Int: Int]
     /// Candidate-source layer -> byte offset inside the candidate score buffer.
     public let candidateBase: [Int: Int]
 
@@ -157,7 +176,9 @@ nonisolated public struct DeepSeekV41CacheLayout: Sendable, Equatable {
 
         var windowBase: [Int: Int] = [:]
         var compressedBase: [Int: Int] = [:]
+        var compressedRowsByOwner: [Int: Int] = [:]
         var indexerBase: [Int: Int] = [:]
+        var indexerRowsByOwner: [Int: Int] = [:]
         var candidateBase: [Int: Int] = [:]
 
         var windowCursor = 0
@@ -170,12 +191,16 @@ nonisolated public struct DeepSeekV41CacheLayout: Sendable, Equatable {
         var candidateCursor = 0
         for layer in plan {
             if layer.ownsCompressedKV {
+                let rows = geometry.compressedRows(forRatio: layer.compressRatio)
                 compressedBase[layer.index] = compressedCursor
-                compressedCursor += geometry.compressedBytesPerOwner
+                compressedRowsByOwner[layer.index] = rows
+                compressedCursor += rows * geometry.recordBytes
             }
             if layer.ownsCompressedIndex {
+                let rows = geometry.compressedRows(forRatio: layer.compressRatio)
                 indexerBase[layer.index] = indexerCursor
-                indexerCursor += geometry.compressedRows * geometry.indexerKeyBytes
+                indexerRowsByOwner[layer.index] = rows
+                indexerCursor += rows * geometry.indexerKeyBytes
             }
             if layer.isCandidateSource {
                 candidateBase[layer.index] = candidateCursor
@@ -185,7 +210,9 @@ nonisolated public struct DeepSeekV41CacheLayout: Sendable, Equatable {
 
         self.windowBase = windowBase
         self.compressedBase = compressedBase
+        self.compressedRowsByOwner = compressedRowsByOwner
         self.indexerBase = indexerBase
+        self.indexerRowsByOwner = indexerRowsByOwner
         self.candidateBase = candidateBase
         self.windowBytes = windowCursor
         self.compressedBytes = compressedCursor
@@ -252,7 +279,8 @@ nonisolated public enum DeepSeekV41CacheAddressing {
         layout: DeepSeekV41CacheLayout
     ) -> Int? {
         guard let base = layout.compressedBase[ownerLayer] else { return nil }
-        guard row >= 0, row < layout.geometry.compressedRows else { return nil }
+        let rows = layout.compressedRowsByOwner[ownerLayer] ?? layout.geometry.compressedRows
+        guard row >= 0, row < rows else { return nil }
         return base + row * layout.geometry.recordBytes
     }
 
@@ -263,7 +291,8 @@ nonisolated public enum DeepSeekV41CacheAddressing {
         layout: DeepSeekV41CacheLayout
     ) -> Int? {
         guard let base = layout.indexerBase[layer] else { return nil }
-        guard row >= 0, row < layout.geometry.compressedRows else { return nil }
+        let rows = layout.indexerRowsByOwner[layer] ?? layout.geometry.compressedRows
+        guard row >= 0, row < rows else { return nil }
         return base + row * layout.geometry.indexerKeyBytes
     }
 
@@ -324,6 +353,7 @@ nonisolated public enum DeepSeekV41CacheAddressing {
         windowRows: Int
     ) -> Bool {
         guard prefixCount > 0 else { return true }
+        guard storedPositions <= max(0, windowRows) else { return false }
         guard prefixCount <= storedPositions else { return false }
         return prefixCount <= max(0, windowRows)
     }

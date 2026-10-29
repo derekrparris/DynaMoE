@@ -119,8 +119,15 @@ nonisolated public struct DeepSeekV41MemoryPlan: Sendable, Equatable {
         // design width, so the reported total never flatters the allocation.
         let recordBytes = recordBytesOverride
             ?? (useFP4MainCache ? config.fp4CacheRecordBytes : config.fp8CacheRecordBytes)
-        let owners = plan.filter(\.ownsCompressedKV).count
-        let compressed = owners * recordBytes * max(0, contextLength)
+        // Each owner's rows come from its OWN ratio, which is what the layout
+        // allocates. Charging every owner the whole context over-reported a
+        // ratio-2 owner by 2x, and the cache used to charge every owner the
+        // shortest ratio in the plan, so the log and the allocation disagreed.
+        let compressed = plan
+            .filter(\.ownsCompressedKV)
+            .reduce(0) { total, layer in
+                total + (max(0, contextLength) / max(1, layer.compressRatio) + 1) * recordBytes
+            }
 
         // Window rings are per layer and bounded by window_size, so they do not
         // grow with the context. Priced at `recordBytes`, the same width the
@@ -129,18 +136,15 @@ nonisolated public struct DeepSeekV41MemoryPlan: Sendable, Equatable {
         let ringRecords = max(0, config.windowSize)
         let windowRings = plan.count * ringRecords * recordBytes
 
-        // The indexer keeps one key per COMPRESSED row. Its width comes from
-        // the checkpoint's own `attn.indexer.wk` shape when the catalog has it
-        // (the probe prints it), because widening this by `index_n_heads` would
-        // turn a ~250 MB cache into ~8 GB. The candidate pass keeps one score
-        // per candidate block per token.
-        let defaultKeyWidth = config.indexHeadDim
+        // The indexer keeps one PER-ROW key per compressed row, at
+        // `index_head_dim` values. That is the width the cache geometry
+        // allocates, so pricing anything else (the wk matrix's first dimension
+        // is `index_n_heads * index_head_dim`) makes the log disagree with the
+        // allocation. The candidate pass keeps one score per block per token.
         var indexerBytes = 0
         for layer in plan where layer.ownsCompressedIndex {
-            let rows = max(0, contextLength) / max(1, layer.compressRatio)
-            let keyWidth = catalog?.tensor(.indexerWk, layer: layer.index)?.shape.first
-                ?? defaultKeyWidth
-            indexerBytes += rows * keyWidth * MemoryLayout<UInt16>.stride
+            let rows = max(0, contextLength) / max(1, layer.compressRatio) + 1
+            indexerBytes += rows * config.indexHeadDim * MemoryLayout<UInt16>.stride
         }
         let blockSize = max(1, config.candidateBlockSize)
         let candidateBytes = config.candidateSourceLayerID >= 0

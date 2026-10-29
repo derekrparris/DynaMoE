@@ -216,6 +216,24 @@ final class DeepSeekV41AttentionRowPlanTests: XCTestCase {
                     planRows.totalRows,
                     "layer \(layer.index) position \(position)"
                 )
+                // Counts agreeing is not enough: the rows must be the ones the
+                // plan names. Compare the actual latents, window first then
+                // compressed rows oldest-to-newest.
+                for (offset, windowPosition) in planRows.windowPositions.enumerated() {
+                    XCTAssertEqual(
+                        keys[offset],
+                        forward.latents[layer.index][windowPosition],
+                        "layer \(layer.index) position \(position) window row \(windowPosition)"
+                    )
+                }
+                let ownerRows = forward.compressed[layer.compressedKVSource] ?? []
+                for (offset, row) in planRows.compressedRows.enumerated() {
+                    XCTAssertEqual(
+                        keys[planRows.windowPositions.count + offset],
+                        ownerRows[row],
+                        "layer \(layer.index) position \(position) compressed row \(row)"
+                    )
+                }
             }
         }
     }
