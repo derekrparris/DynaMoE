@@ -54,10 +54,31 @@ nonisolated public enum DeepSeekV41Conformance {
     /// two backends are checked against the reference's numbers rather than
     /// against each other.
     ///
-    /// What it does NOT cover: the decode path's slot addressing
-    /// (`position % ratio`), which is host code and is pinned by its own tests,
-    /// and the fp8 storage width, which is exercised by the kernel tests.
+    /// What it does NOT cover: the fp8 storage width, which is exercised by the
+    /// kernel tests, and the accumulator state the group is pooled from, which is
+    /// `compressorAccumulation`.
     public static let compressorPooling: Gate = .verifiedAgainstReference
+
+    /// Where a decode position's latent waits, and when it is pooled.
+    ///
+    /// MATCHED AGAINST `Compressor.forward`'s decode branch: the position fills slot
+    /// `start_pos % ratio` of ITS OWN module's state, and a compressed row comes out
+    /// only when `(start_pos + 1) % ratio == 0`. `Tools/dsv41_goldens.py
+    /// compressor_state` runs the reference module over a seven-position sequence at
+    /// ratio 3, and `DeepSeekV41CompressorStateGoldenTests` pins what came out: rows
+    /// at positions 2 and 5 and nothing between, each slot holding the projection of
+    /// the newest position congruent to it, and each row pooled from its whole group
+    /// in ascending position order.
+    ///
+    /// This gate exists because a bug shipped past the pooling gate and produced
+    /// plausible text: the port kept one per-position group shared between the four
+    /// compressed-KV owners, and the ratio-1 owner rewrote slot 0 every position, so
+    /// the ratio-2 owners pooled their latent together with another layer's.
+    ///
+    /// The per-owner partition itself (`compressorOwnerSlots`) is host addressing
+    /// rather than a numeric rule, and is pinned by its own tests; what this gate
+    /// covers is the geometry those offsets must obey.
+    public static let compressorAccumulation: Gate = .verifiedAgainstReference
 
     /// How a raw gate logit becomes a routing score (`scoring_func`) and how the
     /// selection bias is applied.
@@ -154,6 +175,7 @@ nonisolated public enum DeepSeekV41Conformance {
             ("Engram hashing", DeepSeekV41EngramHasher.conformance == .verifiedAgainstReference
                 ? .verifiedAgainstReference : .unverified),
             ("compressor pooling", compressorPooling),
+            ("compressor accumulation", compressorAccumulation),
             ("router scoring", routerScoring),
             ("Engram combination", engramCombination),
             ("candidate selection", candidateSelection),

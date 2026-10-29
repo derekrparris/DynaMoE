@@ -33,10 +33,12 @@ Usage:
     python3 Tools/dsv41_goldens.py all --json out.json
     python3 Tools/dsv41_goldens.py all --snapshot <snapshot dir>
 
-Cases: `engram` (Engram.forward), `compressor` (Compressor.forward), `router`
-(Gate.forward, under both per-logit scorings), and `dspark` (`DSparkBlock`'s
-`forward_embed` seed plus its `forward_head` chain: the Markov bias, the per-step
-draw, and the confidence ordering).
+Cases: `engram` (Engram.forward), `compressor` (Compressor.forward, one block),
+`compressor_state` (Compressor.forward over a decode sequence: which slot a
+position fills and when a row comes out), `router` (Gate.forward, under both
+per-logit scorings), and `dspark` (`DSparkBlock`'s `forward_embed` seed plus its
+`forward_head` chain: the Markov bias, the per-step draw, and the confidence
+ordering).
 
 Two gates deliberately have no case yet. `hyperConnections` needs
 `kernel.hc_split_sinkhorn`, the real Sinkhorn, which is a tilelang kernel and so
@@ -574,9 +576,81 @@ def dspark_case(torch, reference) -> dict:
     }
 
 
+def compressor_state_case(torch, reference) -> dict:
+    """`Compressor.forward` across a decode sequence: the accumulator lifecycle.
+
+    `compressor` pins one block's pooling arithmetic. This pins what the SAME module
+    does when positions arrive one at a time, which is where a real bug lived: the
+    state is per module instance (`kv_state` / `score_state` are buffers), a position
+    fills slot `start_pos % ratio`, and a row comes out only when
+    `(start_pos + 1) % ratio == 0`. A port that shares one per-position block across
+    the owners, or that counts slots instead of taking the position modulo the ratio,
+    pools one layer's latent together with another's and produces plausible text.
+
+    The norm is replaced by `Identity` so the returned rows are the pooled latent
+    itself — the normalisation is pinned by the `compressor` case, and comparing
+    against `pooledLatent` requires the raw form.
+
+    What makes this suite discriminating is `kv_state` at the end: it holds one row
+    per slot, each the projection of a DIFFERENT position, so a port that shares one
+    block between owners, or that advances a slot counter instead of taking the
+    position modulo the ratio, cannot reproduce it.
+    """
+    args = reference.ModelArgs(
+        dim=8,
+        head_dim=4,
+        norm_eps=1e-6,
+        compress_ratios=[0, 3],
+        max_batch_size=1,
+    )
+    module = fill(reference.Compressor(args, 1), torch)
+    module.norm = torch.nn.Identity()
+    ratio = module.compress_ratio
+    positions = 7
+
+    # One distinct row per position, so a slot written twice or by the wrong
+    # position is visible in `kv_state` rather than merely in the pooled output.
+    x = (
+        torch.arange(1.0, 1.0 + positions * args.dim, dtype=torch.float32).view(1, positions, args.dim)
+        * 0.25
+    )
+
+    with torch.no_grad():
+        outputs = []
+        for position in range(positions):
+            out = module(x[:, position : position + 1], position)
+            outputs.append(None if out is None else rows_of(out[0, 0]))
+        state = rows_of(module.kv_state[0])
+
+    return {
+        "gate": "compressorAccumulation",
+        "reference": f"inference/model.py Compressor.forward, decode branch ({snapshot_note()})",
+        "config": {
+            "dim": args.dim,
+            "head_dim": args.head_dim,
+            "compress_ratio": ratio,
+            "positions": positions,
+            "norm_eps": args.norm_eps,
+        },
+        "input": {
+            "positions": rows_of(x[0]),
+            "wkv": rows_of(module.wkv.weight),
+            "wgate": rows_of(module.wgate.weight),
+        },
+        "expected": {
+            # One entry per position: null while the group is still filling.
+            "outputs": outputs,
+            # [ratio][head_dim]: the slots the sequence left behind. Slot i must hold
+            # `wkv(x[p])` for the last p with `p % ratio == i`.
+            "kv_state": state,
+        },
+    }
+
+
 CASES = {
     "engram": engram_case,
     "compressor": compressor_case,
+    "compressor_state": compressor_state_case,
     "router": router_case,
     "dspark": dspark_case,
 }

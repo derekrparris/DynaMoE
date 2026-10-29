@@ -1519,7 +1519,11 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     ) throws {
         guard layer.ownsCompressedKV else { return }
         let ratio = max(1, layer.compressRatio)
-        let slot = position % ratio
+        // The slot is the position's offset inside its own group, exactly as
+        // `Compressor.forward` addresses `kv_state[:, start_pos % ratio]`.
+        guard let slot = DeepSeekV41CacheAddressing.compressorSlot(
+            position: position, ratio: ratio
+        ) else { return }
         let width = shapes.latentWidth
         guard slot < ratio else { return }
         guard let owner = compressorOwnerSlots[layer.index] else {
@@ -1570,7 +1574,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             )
         }
 
-        guard (position + 1) % ratio == 0 else { return }
+        guard DeepSeekV41CacheAddressing.compressorCompletesGroup(
+            position: position, ratio: ratio
+        ) else { return }
         let rows = DeepSeekV41CacheAddressing.compressedRowCount(afterPosition: position, ratio: ratio)
         guard rows > 0 else { return }
         let block = DeepSeekV41CacheAddressing.poolRange(row: rows - 1, ratio: ratio)

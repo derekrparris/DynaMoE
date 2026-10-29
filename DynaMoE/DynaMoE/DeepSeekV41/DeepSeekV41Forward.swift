@@ -818,7 +818,9 @@ nonisolated public final class DeepSeekV41CPUForward {
         // exactly on the positions where `position + 1` is a multiple of the ratio.
         // Pooling on every later position would append the same row again and let
         // the cache grow with the context instead of with the context / ratio.
-        guard (position + 1) % ratio == 0 else { return }
+        guard DeepSeekV41CacheAddressing.compressorCompletesGroup(
+            position: position, ratio: ratio
+        ) else { return }
         let rows = DeepSeekV41CacheAddressing.compressedRowCount(afterPosition: position, ratio: ratio)
         let completed = DeepSeekV41CacheAddressing.poolRange(row: rows - 1, ratio: ratio)
         guard rows > 0, completed.upperBound <= position + 1 else { return }

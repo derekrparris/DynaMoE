@@ -347,6 +347,34 @@ nonisolated public enum DeepSeekV41CacheAddressing {
         return (owner * groupWidth + slot) * width * MemoryLayout<Float>.stride
     }
 
+    /// Which slot of its own group a decode position fills.
+    ///
+    /// `Compressor.forward`'s decode branch stores the position's latent at
+    /// `kv_state[:, start_pos % ratio]`, so the slot is the position's offset inside
+    /// the group, not a counter the caller advances. Tracking it as a counter is how
+    /// a resumed turn (which starts at a position the caller did not count to) ends
+    /// up overwriting the wrong slot.
+    ///
+    /// A ratio of 1 is one position per group, and that owner's slot 0 is rewritten
+    /// on every position, which is the reference's behaviour for a plain projection.
+    public static func compressorSlot(position: Int, ratio: Int) -> Int? {
+        guard position >= 0, ratio >= 1 else { return nil }
+        return position % ratio
+    }
+
+    /// Whether this position completes a group, i.e. whether a compressed row comes
+    /// out of it.
+    ///
+    /// `Compressor.forward` pools when `(start_pos + 1) % ratio == 0`. Pooling on
+    /// any later position would append the same row again, which is why this is a
+    /// rule rather than a convenience: a port that pooled whenever the state looked
+    /// full grows the compressed cache with the context instead of with the context
+    /// divided by the ratio.
+    public static func compressorCompletesGroup(position: Int, ratio: Int) -> Bool {
+        guard position >= 0, ratio >= 1 else { return false }
+        return (position + 1) % ratio == 0
+    }
+
     /// The compressed rows a position's compressed attentions may read: every
     /// row produced so far, capped to the fewest the token budget allows.
     ///

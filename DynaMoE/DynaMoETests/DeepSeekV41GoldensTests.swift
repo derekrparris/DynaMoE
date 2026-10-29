@@ -694,3 +694,140 @@ final class DeepSeekV41DSparkGoldenTests: XCTestCase {
         XCTAssertNotEqual(sampled, chain(temperature: 0))
     }
 }
+
+// MARK: - Compressor accumulator lifecycle
+
+/// `Compressor.forward` across a decode sequence: when a compressed row comes out,
+/// and where each position's latent waits until it does.
+///
+/// A real bug lived here, and the existing `compressor` case could not see it: the
+/// pooling arithmetic was correct, the state it pooled was not. The port kept ONE
+/// per-position group state addressed by `position % ratio` alone and shared it
+/// between the four compressed-KV owners. Layer 20 has ratio 1 and rewrites slot 0
+/// on every position, so a ratio-2 owner pooled its own latent together with layer
+/// 20's at every odd position — plausible output, no error anywhere.
+///
+/// So this pins the three rules that decide the state, all from the reference's own
+/// decode branch:
+///
+///  * a row comes out exactly when `(position + 1) % ratio == 0` (rows at 2 and 5 of
+///    a seven-position sequence, nulls everywhere else);
+///  * a position writes slot `position % ratio` of its own state, so each slot holds
+///    the projection of the NEWEST position congruent to it;
+///  * a completed row is pooled from its whole group, in ascending position order.
+final class DeepSeekV41CompressorStateGoldenTests: XCTestCase {
+
+    private let dim = 8
+    private let width = 4
+    private let ratio = 3
+    private let positions = 7
+
+    /// [position][dim]: the block's inputs, one per decode step.
+    private static let inputs: [Float] = [
+        0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0,
+        2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0,
+        4.25, 4.5, 4.75, 5.0, 5.25, 5.5, 5.75, 6.0,
+        6.25, 6.5, 6.75, 7.0, 7.25, 7.5, 7.75, 8.0,
+        8.25, 8.5, 8.75, 9.0, 9.25, 9.5, 9.75, 10.0,
+        10.25, 10.5, 10.75, 11.0, 11.25, 11.5, 11.75, 12.0,
+        12.25, 12.5, 12.75, 13.0, 13.25, 13.5, 13.75, 14.0,
+    ]
+
+    /// `attn.compressor.wkv`, `[head_dim][dim]`, row-major.
+    private static let kvWeight: [Float] = [
+        -0.2743486762046814, -0.29252973198890686, -0.11096779257059097, 0.2449793964624405, 0.1938299536705017, 0.0271333996206522, 0.5312392115592957, -0.23078827559947968,
+        -0.10173508524894714, -0.10976564139127731, -0.32761093974113464, -0.18267247080802917, -0.9094019532203674, -0.20123140513896942, 0.015708519145846367, -0.18294356763362885,
+        0.14256815612316132, -0.3770979046821594, 0.584096372127533, 0.02197224833071232, -0.42252734303474426, -0.21017824113368988, -0.42883339524269104, 0.207710862159729,
+        -0.26240235567092896, 0.2526072561740875, 0.5875536203384399, 0.28500065207481384, -0.07786837220191956, -0.3613465428352356, -0.4851985275745392, -0.040346261113882065,
+    ]
+
+    /// `attn.compressor.wgate`, `[head_dim][dim]`, row-major.
+    private static let gateWeight: [Float] = [
+        -0.2961757779121399, -0.19481568038463593, 0.0826670229434967, 0.5185345411300659, 0.10048672556877136, -0.31101828813552856, -0.39707642793655396, -0.09807982295751572,
+        0.15090014040470123, -0.021074937656521797, -0.41118288040161133, 0.9671960473060608, -0.21570582687854767, 0.29945796728134155, -0.3636859655380249, -0.35620594024658203,
+        -0.2053443193435669, 0.07546232640743256, 0.22728553414344788, 0.41214895248413086, -0.18166284263134003, -0.22688943147659302, 0.07892361283302307, -0.0828431099653244,
+        0.19894123077392578, 0.19902102649211884, -0.22693189978599548, -0.2658155858516693, 0.02506062760949135, 0.002452727174386382, 0.21632415056228638, -0.07565955817699432,
+    ]
+
+    /// [slot][head_dim]: `kv_state` after the sequence.
+    private static let stateSlots: [Float] = [
+        1.7605504989624023, -26.281524658203125, -6.658795356750488, -2.006782054901123,
+        1.4063611030578613, -18.282913208007812, -4.729639530181885, -1.598780632019043,
+        1.5834558010101318, -22.28221893310547, -5.694217681884766, -1.8027818202972412,
+    ]
+
+    /// [row][head_dim]: the rows the sequence produced, in order.
+    private static let pooledRows: [Float] = [
+        0.7599607706069946, -6.549576759338379, -1.959981918334961, -1.0066688060760498,
+        1.2912460565567017, -18.54749298095703, -4.85371732711792, -1.6186723709106445,
+    ]
+
+    private func input(at position: Int) -> [Float] {
+        Array(Self.inputs[(position * dim)..<((position + 1) * dim)])
+    }
+
+    private var kvWeight: DeepSeekV41Matrix {
+        DeepSeekV41Matrix(rows: width, columns: dim, values: Self.kvWeight)
+    }
+
+    private var gateWeight: DeepSeekV41Matrix {
+        DeepSeekV41Matrix(rows: width, columns: dim, values: Self.gateWeight)
+    }
+
+    func testARowComesOutOnlyWhenTheGroupCompletes() {
+        let produced = (0..<positions).filter {
+            DeepSeekV41CacheAddressing.compressorCompletesGroup(position: $0, ratio: ratio)
+        }
+        // The reference returned a row at positions 2 and 5 and nil at the other five.
+        XCTAssertEqual(produced, [2, 5])
+        // Pooling on any later position would append the same row again: a group is
+        // exactly `ratio` positions, so the sequence produced floor(7 / 3) rows.
+        XCTAssertEqual(
+            produced.count,
+            DeepSeekV41CacheAddressing.compressedRowCount(afterPosition: positions - 1, ratio: ratio)
+        )
+    }
+
+    func testEachSlotHoldsTheNewestPositionCongruentToIt() {
+        for slot in 0..<ratio {
+            let newest = (0..<positions).last { DeepSeekV41CacheAddressing.compressorSlot(position: $0, ratio: ratio) == slot }
+            guard let newest else { return XCTFail("no position landed in slot \(slot)") }
+            let projected = kvWeight.apply(input(at: newest))
+            for dimension in 0..<width {
+                XCTAssertEqual(
+                    projected[dimension],
+                    Self.stateSlots[slot * width + dimension],
+                    accuracy: 1e-4,
+                    "slot \(slot) (position \(newest)) dim \(dimension)"
+                )
+            }
+        }
+    }
+
+    func testACompletedRowIsPooledFromItsWholeGroup() {
+        let produced = (0..<positions).filter {
+            DeepSeekV41CacheAddressing.compressorCompletesGroup(position: $0, ratio: ratio)
+        }
+        for (row, position) in produced.enumerated() {
+            let rows = DeepSeekV41CacheAddressing.compressedRowCount(afterPosition: position, ratio: ratio)
+            let group = DeepSeekV41CacheAddressing.poolRange(row: rows - 1, ratio: ratio)
+            // The group is the row's own span, in ascending position order: slot order
+            // and position order agree inside one group, which is why pooling slots
+            // left to right is the same rule the prefill path uses.
+            XCTAssertEqual(Array(group), Array((row * ratio)..<((row + 1) * ratio)))
+            let pooled = DeepSeekV41Compressor.pooledLatent(
+                inputs: group.map { input(at: $0) },
+                kvWeight: kvWeight,
+                gateWeight: gateWeight
+            )
+            for dimension in 0..<width {
+                XCTAssertEqual(
+                    pooled[dimension],
+                    Self.pooledRows[row * width + dimension],
+                    accuracy: 1e-4,
+                    "row \(row) dim \(dimension)"
+                )
+            }
+        }
+    }
+}
