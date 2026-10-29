@@ -408,26 +408,6 @@ nonisolated public enum DeepSeekV41CacheAddressing {
         return start..<(position + 1)
     }
 
-    /// Whether a cache holding `storedPositions` positions can serve a prefix of
-    /// `prefixCount` positions.
-    ///
-    /// The only bound is that those positions are stored at all. The sliding-window
-    /// ring deliberately does not enter into it, and it is worth saying why, because
-    /// it looks like it should: a resumed turn never replays the positions it skips,
-    /// so rows the ring has overwritten are rows nothing reads again. What a position
-    /// after the prefix reads is the trailing `windowSize` window rows, which the
-    /// ring always holds because they are the newest ones written, plus every
-    /// compressed row of every completed block, which are retained for the whole
-    /// context rather than ringed. A bound at `windowRows` would cap reuse at the
-    /// window size, i.e. at 128 of a prompt's positions here, and buy nothing.
-    public static func prefixIsReusable(
-        prefixCount: Int,
-        storedPositions: Int
-    ) -> Bool {
-        guard prefixCount > 0 else { return true }
-        return prefixCount <= storedPositions
-    }
-
     /// The prefix a turn may actually skip: the pin's common prefix, cut to what the
     /// cache holds.
     ///
@@ -438,6 +418,13 @@ nonisolated public enum DeepSeekV41CacheAddressing {
     /// match is no reuse at all rather than a partial one, and the caller re-prefills
     /// the prompt in full. The last prompt token is never skipped: its logits are
     /// what the first sampled token comes from.
+    ///
+    /// The window ring is not a bound, and it is worth saying why, because it looks
+    /// like it should: a resumed turn never replays the positions it skips, so rows
+    /// the ring has overwritten are rows nothing reads again. What a position after
+    /// the prefix reads is the trailing window rows, which the ring always holds
+    /// because they are the newest ones written, plus every compressed row of every
+    /// completed block, which are retained for the whole context rather than ringed.
     public static func reusablePrefix(
         proposed: Int,
         storedPositions: Int,
@@ -611,18 +598,5 @@ nonisolated public final class DeepSeekV41KVCache: @unchecked Sendable {
         stateLock.lock()
         storedValue = 0
         stateLock.unlock()
-    }
-
-    /// Whether the cache still holds every position up to `prefixCount` intact.
-    ///
-    /// Only the position count matters. The window ring keeps the newest
-    /// `windowRows` positions, but the rows it overwrote belong to positions a
-    /// resumed turn skips and never replays, and the compressed rows survive for
-    /// the whole context. See `DeepSeekV41CacheAddressing.prefixIsReusable`.
-    public func canReuse(prefixCount: Int) -> Bool {
-        DeepSeekV41CacheAddressing.prefixIsReusable(
-            prefixCount: prefixCount,
-            storedPositions: storedPositions
-        )
     }
 }

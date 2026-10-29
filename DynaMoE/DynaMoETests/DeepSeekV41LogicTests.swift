@@ -1500,40 +1500,40 @@ final class DeepSeekV41CompressorGroupTests: XCTestCase {
 
 final class DeepSeekV41CacheReuseTests: XCTestCase {
 
-    func testAStoredPrefixIsReusable() {
-        XCTAssertTrue(
-            DeepSeekV41CacheAddressing.prefixIsReusable(
-                prefixCount: 64, storedPositions: 100
-            )
-        )
-    }
-
     /// The window ring is not a bound, because a resumed turn never replays what it
     /// skips. Every window row a later position reads is one the ring still holds,
-    /// and the compressed rows are retained rather than ringed.
+    /// and the compressed rows are retained rather than ringed. A count past the
+    /// window size is therefore skipped like any other.
     func testAPrefixPastTheWindowRingIsReusable() {
-        XCTAssertTrue(
-            DeepSeekV41CacheAddressing.prefixIsReusable(
-                prefixCount: 200, storedPositions: 300
-            )
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 600, storedPositions: 300, promptTokens: 1_000
+            ),
+            300
         )
-        XCTAssertTrue(
-            DeepSeekV41CacheAddressing.prefixIsReusable(
-                prefixCount: 300, storedPositions: 300
-            )
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 300, storedPositions: 300, promptTokens: 1_000
+            ),
+            300
         )
     }
 
     func testPrefixPastWhatIsStoredIsNotReusable() {
-        XCTAssertFalse(
-            DeepSeekV41CacheAddressing.prefixIsReusable(
-                prefixCount: 40, storedPositions: 20
-            )
+        // The pin claims twice what the cache holds, so only the resident count is
+        // skipped and the rest of the prompt is prefilled.
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 40, storedPositions: 20, promptTokens: 100
+            ),
+            20
         )
-        XCTAssertTrue(
-            DeepSeekV41CacheAddressing.prefixIsReusable(
-                prefixCount: 0, storedPositions: 20
-            )
+        // An empty cache has nothing to reuse whatever the pin claims.
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 0, storedPositions: 0, promptTokens: 100
+            ),
+            0
         )
     }
 
