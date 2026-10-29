@@ -36,9 +36,10 @@ Usage:
 Cases: `engram` (Engram.forward), `compressor` (Compressor.forward, one block),
 `compressor_state` (Compressor.forward over a decode sequence: which slot a
 position fills and when a row comes out), `router` (Gate.forward, under both
-per-logit scorings), and `dspark` (`DSparkBlock`'s `forward_embed` seed plus its
+per-logit scorings), `dspark` (`DSparkBlock`'s `forward_embed` seed plus its
 `forward_head` chain: the Markov bias, the per-step draw, and the confidence
-ordering).
+ordering), and `vision` (`ViT.forward` + `Aligner.forward` over a given patch
+grid, plus the spelling and id of the token that addresses an image span).
 
 Two gates deliberately have no case yet. `hyperConnections` needs
 `kernel.hc_split_sinkhorn`, the real Sinkhorn, which is a tilelang kernel and so
@@ -50,6 +51,12 @@ contains. What it cannot cover, and what therefore keeps the gate open, is the
 draft block's own attention and MoE: those run only through `forward_spec`, which
 nothing in the checkpoint's own generator calls, so there is no reference output
 for a draft block forward over a real prefix.
+
+`vision` starts from a patch grid rather than an image: `load_image`'s PIL
+bicubic resample is preprocessing, and pinning it here would pin Pillow instead
+of the tower. Everything the tower and the aligner do to patches is covered,
+including the resize-free half of `plan_image_grid` that `DeepSeekV41VisionLayout`
+implements separately.
 
 torch and numpy are required. `brew install pytorch` puts the Python package
 inside the formula's venv rather than on `sys.path`, so point PYTHONPATH at it:
@@ -64,6 +71,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import sys
 import types
 
@@ -647,12 +655,188 @@ def compressor_state_case(torch, reference) -> dict:
     }
 
 
+def _vision_identifier(snapshot: str) -> dict:
+    """What token an image span is spelled with, from the checkpoint's own files.
+
+    The port renders an image span as a run of one marker string, so the marker's
+    spelling IS the position's token id. Three files agree about it and none of them
+    is the port's source: `encoding/encoding.py` defines `IMAGE_PLACEHOLDER`, the
+    tokenizer lists that spelling among its added tokens, and the config's
+    `image_token_id` is the id it was added under. `image_processor.prepare_vl_inputs`
+    cross-checks the last two at runtime and raises when they disagree.
+    """
+    with open(os.path.join(snapshot, "config.json"), "r", encoding="utf-8") as handle:
+        config = json.load(handle)
+    with open(os.path.join(snapshot, "tokenizer.json"), "r", encoding="utf-8") as handle:
+        tokenizer = json.load(handle)
+    with open(os.path.join(snapshot, "encoding", "encoding.py"), "r", encoding="utf-8") as handle:
+        encoding_source = handle.read()
+
+    match = re.search(r'^IMAGE_PLACEHOLDER = "([^"]*)"', encoding_source, re.MULTILINE)
+    if match is None:
+        raise SystemExit("encoding/encoding.py no longer defines IMAGE_PLACEHOLDER")
+    placeholder = match.group(1)
+
+    added = {entry["content"]: entry.get("id") for entry in tokenizer.get("added_tokens") or []}
+    image_token_id = config.get("image_token_id")
+    if image_token_id is None:
+        image_token_id = (config.get("text_config") or {}).get("image_token_id")
+    spelled_at_config_id = next(
+        (text for text, ident in added.items() if ident == image_token_id), None
+    )
+
+    return {
+        "placeholder": placeholder,
+        "placeholder_codepoints": [ord(character) for character in placeholder],
+        "placeholder_token_id": added.get(placeholder),
+        "config_image_token_id": image_token_id,
+        "token_spelled_at_config_id": spelled_at_config_id,
+        "token_spelled_at_config_id_codepoints": (
+            [ord(character) for character in spelled_at_config_id] if spelled_at_config_id else None
+        ),
+    }
+
+
+def vision_case(torch, reference) -> dict:
+    """`ViT.forward` then `Aligner.forward`: patch grid to language-width rows.
+
+    Small enough to read and wide enough to be discriminating: hidden 8 with two
+    heads (so the 2D rotary has a real frequency vector and is shared across heads),
+    a 2x3 patch grid of 2x2 pixels (an ODD patch-column count, so the aligner's
+    padding to the next multiple of the ratio is exercised), one block, and a
+    downsample ratio of 2 (two aligner rows of two cells over hidden*4-wide cells).
+
+    The patches are given, not resized from an image: `load_image`'s PIL bicubic
+    resample is preprocessing, and pinning it would pin Pillow. Everything the tower
+    does to a patch grid is here.
+
+    Stage outputs come from forward hooks on the reference's own modules rather than
+    from a re-implementation of `Block.forward`, so a failing vector names the stage
+    that broke without this script restating the rule it is checking.
+
+    The identifier half is here too, because the gate has two reasons: the tower's
+    arithmetic (below) and the spelling of the token that addresses an image span.
+    """
+    args = reference.ModelArgs(
+        dim=5,
+        hc_mult=1,
+        max_batch_size=1,
+        vision_n_layers=1,
+        vision_dim=8,
+        vision_n_heads=2,
+        vision_inter_dim=4,
+        vision_patch_size=2,
+        vision_rope_theta=100.0,
+        vision_downsample_ratio=2,
+        vision_max_n_token=1024,
+        vision_min_pixels=0,
+    )
+    vit = fill(reference.ViT(args), torch)
+    aligner = fill(reference.Aligner(args), torch)
+
+    patch_size = args.vision_patch_size
+    n_h, n_w = 2, 3
+    # One row per patch of `3 * patchSize^2` values, channel-major, as
+    # `load_image`'s `reshape(3, n_h, p, n_w, p).permute(1, 3, 0, 2, 4)` emits them.
+    patches = torch.tensor(
+        [
+            ((token * 7 + dimension * 3) % 5 - 2) * 0.25
+            for token in range(n_h * n_w)
+            for dimension in range(3 * patch_size * patch_size)
+        ],
+        dtype=torch.float32,
+    ).view(n_h * n_w, 3, patch_size, patch_size)
+
+    stages = {}
+    handles = []
+    for name, module in (
+        ("patch_embed", vit.patch_embed),
+        ("attn", vit.blocks[0].attn),
+        ("mlp", vit.blocks[0].mlp),
+        ("block", vit.blocks[0]),
+        ("norm", vit.norm),
+    ):
+
+        def capture(_module, _inputs, output, name=name):
+            stages[name] = output.detach().float()
+
+        handles.append(module.register_forward_hook(capture))
+
+    with torch.no_grad():
+        # `ViT.forward(patches, n_h, n_w)` builds the rotary table itself; the aligner
+        # then unshuffles the tower's output on the SAME patch grid.
+        tower = vit(patches, n_h, n_w)
+        aligned = aligner(tower, n_h, n_w)
+
+    for handle in handles:
+        handle.remove()
+    if set(stages) != {"patch_embed", "attn", "mlp", "block", "norm"}:
+        raise SystemExit(f"vision hooks did not all fire: {sorted(stages)}")
+    if not torch.equal(stages["norm"], tower):
+        raise SystemExit("the final-norm hook and the tower's return value disagree")
+
+    block = vit.blocks[0]
+    return {
+        "gate": "visionPatching",
+        "reference": (
+            f"inference/vision.py ViT.forward + Aligner.forward ({snapshot_note()})"
+        ),
+        "config": {
+            "hidden": args.vision_dim,
+            "heads": args.vision_n_heads,
+            "intermediate": args.vision_inter_dim,
+            "patch_size": patch_size,
+            "downsample_ratio": args.vision_downsample_ratio,
+            "rope_theta": args.vision_rope_theta,
+            "rope_dim": vit.rope_dim,
+            "text_hidden": args.dim,
+            "rows": n_h,
+            "columns": n_w,
+            "norm_eps": 1e-6,
+        },
+        "input": {
+            "patches": rows_of(patches.view(n_h * n_w, -1)),
+            "patch_embed_weight": rows_of(vit.patch_embed.proj.weight),
+            "patch_embed_bias": rows_of(vit.patch_embed.proj.bias),
+            "block_norm1_gain": rows_of(block.norm1.weight),
+            "block_wqkv_weight": rows_of(block.attn.wqkv.weight),
+            "block_wqkv_bias": rows_of(block.attn.wqkv.bias),
+            "block_wo_weight": rows_of(block.attn.wo.weight),
+            "block_wo_bias": rows_of(block.attn.wo.bias),
+            "block_norm2_gain": rows_of(block.norm2.weight),
+            "block_w1_weight": rows_of(block.mlp.w1.weight),
+            "block_w2_weight": rows_of(block.mlp.w2.weight),
+            "final_norm_gain": rows_of(vit.norm.weight),
+            "aligner_w1_weight": rows_of(aligner.w1.weight),
+            "aligner_w1_bias": rows_of(aligner.w1.bias),
+            "aligner_w2_weight": rows_of(aligner.w2.weight),
+            "aligner_w2_bias": rows_of(aligner.w2.bias),
+        },
+        "expected": {
+            # [tokens][hidden]: the patch projection, before any block.
+            "patch_embed": rows_of(stages["patch_embed"]),
+            # [tokens][hidden]: attention's output after `wo`, rotary included.
+            "attn": rows_of(stages["attn"]),
+            # [tokens][hidden]: the MLP branch alone, after `w2`.
+            "mlp": rows_of(stages["mlp"]),
+            # [tokens][hidden]: the residual stream after the block.
+            "block": rows_of(stages["block"]),
+            # [tokens][hidden]: `ViT.forward`'s return value, i.e. the final norm.
+            "normalized": rows_of(stages["norm"]),
+            # [cells][text_hidden]: one language-width row per aligner cell.
+            "aligner": rows_of(aligned),
+        },
+        "identifier": _vision_identifier(_SNAPSHOT),
+    }
+
+
 CASES = {
     "engram": engram_case,
     "compressor": compressor_case,
     "compressor_state": compressor_state_case,
     "router": router_case,
     "dspark": dspark_case,
+    "vision": vision_case,
 }
 
 _SNAPSHOT = ""

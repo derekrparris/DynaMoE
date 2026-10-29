@@ -533,9 +533,7 @@ nonisolated public enum DeepSeekV41VisionPreprocess {
 /// How an image occupies the prompt. An image becomes one run of the image token,
 /// once per span position; there are no distinct wrapper tokens, because the
 /// checkpoint writes `image_token_id` everywhere in the span and keeps the
-/// start/image/newline/end distinction in a parallel type array. The spelling of
-/// the token is what `DeepSeekV41Conformance.visionPatching` tracks until a probe
-/// confirms it against the checkpoint's tokenizer.
+/// start/image/newline/end distinction in a parallel type array.
 nonisolated public struct DeepSeekV41VisionMarkers: Sendable, Equatable {
     /// What the chat UI/API writes where an image belongs.
     public let imagePlaceholder: String
@@ -547,11 +545,22 @@ nonisolated public struct DeepSeekV41VisionMarkers: Sendable, Equatable {
         self.imageToken = imageToken
     }
 
-    /// DeepSeek's published multimodal form. Built from unicode escapes rather than
-    /// retyped (AGENTS.md: never retype tag-bearing strings).
+    /// The checkpoint's own spelling, which is not a guess: `encoding/encoding.py`
+    /// defines `IMAGE_PLACEHOLDER`, the tokenizer lists that exact string as added
+    /// token 129,264, and `config.json`'s `image_token_id` is that id.
+    /// `image_processor.prepare_vl_inputs` asserts the last two agree before it
+    /// builds a span, so a port that spells the marker differently renders prompt
+    /// text the model has never seen.
+    ///
+    /// Both fields hold the same string on purpose: every position of a span carries
+    /// the same token id, and `DeepSeekV41VisionLayout.span(columns:rows:)` is what
+    /// tells the positions apart.
+    ///
+    /// Built from unicode escapes rather than retyped (AGENTS.md: never retype
+    /// tag-bearing strings).
     public static let familyDefault = DeepSeekV41VisionMarkers(
-        imagePlaceholder: "<" + "\u{FF5C}" + "image" + "\u{2581}" + "placeholder" + "\u{FF5C}" + ">",
-        imageToken: "<" + "\u{FF5C}" + "image" + "\u{FF5C}" + ">"
+        imagePlaceholder: "<" + "\u{FF5C}" + "deepseek" + "_" + "image" + "\u{FF5C}" + ">",
+        imageToken: "<" + "\u{FF5C}" + "deepseek" + "_" + "image" + "\u{FF5C}" + ">"
     )
 }
 

@@ -157,17 +157,27 @@ nonisolated public enum DeepSeekV41Conformance {
     /// The GEOMETRY matches `image_processor.py`: the resize plan is
     /// `plan_image_grid` + `safe_resize`, the patch grid is `llm_grid`, the span is
     /// `num_image_tokens = rows * (columns + 1) + 2`, and the patches are emitted in
-    /// the checkpoint's `reshape(3, n_h, p, n_w, p)` order. `DeepSeekV41VisionForward`
-    /// runs the tower itself and matches an independent mirror of `vision.py` on a
-    /// fixture.
+    /// the checkpoint's `reshape(3, n_h, p, n_w, p)` order.
     ///
-    /// Two things still keep the gate open: the token IDENTIFIER is unverified,
-    /// because the reference writes the same `image_token_id` at every span position
-    /// and trusts the tokenizer for it while this port renders the span from a
-    /// marker string; and no reference vectors for a REAL image exist, so the tower
-    /// is checked against a transcription rather than against the checkpoint's own
-    /// output.
-    public static let visionPatching: Gate = .unverified
+    /// The TOWER matches the reference's own `ViT`/`Aligner`: `Tools/dsv41_goldens.py
+    /// vision` instantiates both at a tiny config, feeds a given patch grid, and
+    /// records the patch projection, the attention branch, the MLP branch, the block
+    /// output, the final norm and the aligner rows.
+    /// `DeepSeekV41VisionGoldenTests` carries them. The fixture uses two heads (the
+    /// 2D rotary is shared, so one head would hide a per-head table), three patch
+    /// columns (odd, so the aligner's padding to the ratio is exercised) and one
+    /// block.
+    ///
+    /// The token IDENTIFIER is matched too, which is the part that used to be a
+    /// guess. An image span is a run of one token: `prepare_vl_inputs` writes
+    /// `image_token_id` at every position and keeps the start/image/newline/end
+    /// distinction in a parallel `token_types` array. `encoding/encoding.py` names
+    /// that spelling `IMAGE_PLACEHOLDER`, the tokenizer lists that exact string as
+    /// added token 129,264, and `config.json`'s `image_token_id` is 129,264;
+    /// `prepare_vl_inputs` asserts the last two agree. The same case emits those
+    /// codepoints and `DeepSeekV41VisionMarkers.familyDefault` is asserted against
+    /// them, so the marker cannot drift into a spelling the tokenizer splits.
+    public static let visionPatching: Gate = .verifiedAgainstReference
 
     /// Every gate, paired with the label the load log prints.
     public static var all: [(name: String, gate: Gate)] {

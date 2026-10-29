@@ -922,22 +922,26 @@ final class DeepSeekV41ConformanceGateTests: XCTestCase {
 
     func testOnlyTheRulesWithReferenceVectorsAreVerified() {
         // Checked-in vectors, from `Tools/dsv41_goldens.py` and its test suites:
-        // Engram indexing, the Engram combination, the compressor's pooling and the
-        // router's scoring.
+        // Engram indexing, the Engram combination, the compressor's pooling and
+        // accumulation, the router's scoring, and the vision tower together with the
+        // spelling of the token that addresses an image span.
         XCTAssertEqual(DeepSeekV41EngramHasher.conformance, .verifiedAgainstReference)
         XCTAssertEqual(DeepSeekV41Conformance.engramCombination, .verifiedAgainstReference)
         XCTAssertEqual(DeepSeekV41Conformance.compressorPooling, .verifiedAgainstReference)
+        XCTAssertEqual(DeepSeekV41Conformance.compressorAccumulation, .verifiedAgainstReference)
         XCTAssertEqual(DeepSeekV41Conformance.routerScoring, .verifiedAgainstReference)
+        XCTAssertEqual(DeepSeekV41Conformance.visionPatching, .verifiedAgainstReference)
         // Still transcribed-only: no golden has been generated for these yet.
         XCTAssertEqual(DeepSeekV41Conformance.candidateSelection, .unverified)
         XCTAssertEqual(DeepSeekV41Conformance.hyperConnections, .unverified)
         XCTAssertEqual(DeepSeekV41Conformance.dsparkDrafting, .unverified)
-        XCTAssertEqual(DeepSeekV41Conformance.visionPatching, .unverified)
-        XCTAssertEqual(DeepSeekV41Conformance.unverifiedSummary.count, 4)
+        XCTAssertEqual(DeepSeekV41Conformance.unverifiedSummary.count, 3)
         XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("Engram hashing"))
         XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("Engram combination"))
         XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("compressor pooling"))
+        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("compressor accumulation"))
         XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("router scoring"))
+        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("vision patching"))
     }
 }
 

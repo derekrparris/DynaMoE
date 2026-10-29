@@ -306,16 +306,16 @@ final class DeepSeekV41VisionLayoutTests: XCTestCase {
             spec: spec(),
             markers: markers
         )
-        XCTAssertFalse(expanded.contains(markers.imagePlaceholder))
-        XCTAssertTrue(expanded.hasPrefix("look "))
-        XCTAssertTrue(expanded.contains(" then "))
-        // The first image costs its span, the second (upscaled to the pixel floor)
-        // costs its own.
+        // The marker and the image token are the same string, because the checkpoint
+        // writes one token id at every span position. So the expansion is asserted by
+        // its shape: the two markers became the two spans, in reading order, and
+        // nothing between them moved.
         let first = DeepSeekV41VisionLayout.fit(width: 480, height: 480, spec: spec()).tokens
         let second = DeepSeekV41VisionLayout.fit(width: 48, height: 48, spec: spec()).tokens
         XCTAssertEqual(
-            expanded.components(separatedBy: markers.imageToken).count - 1,
-            first + second
+            expanded,
+            "look " + String(repeating: markers.imageToken, count: first)
+                + " then " + String(repeating: markers.imageToken, count: second)
         )
     }
 
