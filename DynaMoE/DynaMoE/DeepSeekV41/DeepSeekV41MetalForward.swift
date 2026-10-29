@@ -1175,7 +1175,9 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         encoder: MTLComputeCommandEncoder
     ) throws {
         // The shared expert runs for every token, unscaled, and accumulates into the
-        // same vector the routed experts do.
+        // same vector the routed experts do. A checkpoint that declares no shared
+        // expert does not run one, so its absence is not a missing tensor.
+        guard config.sharedExpertCount > 0 else { return }
         guard let w1 = weights.tensor(.sharedExpertW1, layer: layer.index),
               let w3 = weights.tensor(.sharedExpertW3, layer: layer.index),
               let w2 = weights.tensor(.sharedExpertW2, layer: layer.index) else {

@@ -316,7 +316,10 @@ final class DeepSeekV41DevicePlanTests: XCTestCase {
         XCTAssertEqual(DeepSeekV41DevicePlan.encodedStages, Set(pipeline))
         XCTAssertEqual(DeepSeekV41DevicePlan.frontHalf.count + DeepSeekV41DevicePlan.backHalf.count, pipeline.count)
         XCTAssertEqual(DeepSeekV41DevicePlan.frontHalf.last, .router)
-        XCTAssertEqual(DeepSeekV41DevicePlan.backHalf, [.sharedExpert, .routedExperts, .writeFFNStreams, .collapseStreams])
+        // Routed experts clear `moeOut`, so they must run BEFORE the shared
+        // expert accumulates into it; the reverse order discarded the shared
+        // term on every layer.
+        XCTAssertEqual(DeepSeekV41DevicePlan.backHalf, [.routedExperts, .sharedExpert, .writeFFNStreams, .collapseStreams])
         XCTAssertEqual(Array(DeepSeekV41DevicePlan.frontHalf) + DeepSeekV41DevicePlan.backHalf, pipeline)
     }
 }

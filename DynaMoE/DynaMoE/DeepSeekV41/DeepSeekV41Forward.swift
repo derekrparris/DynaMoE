@@ -254,8 +254,8 @@ nonisolated public enum DeepSeekV41ForwardStages {
         .ffnNorm,
         .engram,
         .router,
-        .sharedExpert,
         .routedExperts,
+        .sharedExpert,
         .writeFFNStreams,
         .collapseStreams
     ]
@@ -661,8 +661,10 @@ nonisolated public final class DeepSeekV41CPUForward {
             }
         }
 
-        // The shared expert runs for every token, unscaled.
-        if let s1 = weights.matrix(.sharedExpertW1, layer: layer),
+        // The shared expert runs for every token, unscaled, when the checkpoint
+        // declares one.
+        if config.sharedExpertCount > 0,
+           let s1 = weights.matrix(.sharedExpertW1, layer: layer),
            let s3 = weights.matrix(.sharedExpertW3, layer: layer),
            let s2 = weights.matrix(.sharedExpertW2, layer: layer) {
             let activated = DeepSeekV41Activation.swiglu(
