@@ -94,13 +94,29 @@ nonisolated public enum DeepSeekV41TensorRole: String, Sendable, Equatable, Case
     case draftMarkovHead
     case draftConfidence
 
-    // Vision tower and its projector. The checkpoint publishes both alongside the
-    // text tower; nothing in the text graph reads them, so they are classified
-    // only so the load can say "present, deliberately unused" instead of treating
-    // a smolvision tower as an unknown tensor.
-    case visionEncoder
-    case visionProjector
-    case visionMarker
+    // Vision tower, its projector and the three image markers. The checkpoint
+    // publishes both alongside the text tower and the text graph never reads them,
+    // but they are classified tensor by tensor rather than collapsed into one
+    // "tower" role: the tower forward has to address `wqkv` separately from `wo`,
+    // and one slot per block would silently keep only the last one.
+    case visionPatchEmbed
+    case visionPatchEmbedBias
+    case visionBlockNorm1
+    case visionBlockWqkv
+    case visionBlockWqkvBias
+    case visionBlockWo
+    case visionBlockWoBias
+    case visionBlockNorm2
+    case visionBlockW1
+    case visionBlockW2
+    case visionFinalNorm
+    case visionAlignerW1
+    case visionAlignerW1Bias
+    case visionAlignerW2
+    case visionAlignerW2Bias
+    case visionImageStart
+    case visionImageNewline
+    case visionImageEnd
 
     /// Roles whose resolved tensor is streamed from disk and never mapped into
     /// a Metal buffer (the Engram table is one ~100 GB tensor).
@@ -132,7 +148,12 @@ nonisolated public enum DeepSeekV41TensorRole: String, Sendable, Equatable, Case
     /// reads them.
     public var isVision: Bool {
         switch self {
-        case .visionEncoder, .visionProjector, .visionMarker:
+        case .visionPatchEmbed, .visionPatchEmbedBias, .visionBlockNorm1,
+             .visionBlockWqkv, .visionBlockWqkvBias, .visionBlockWo,
+             .visionBlockWoBias, .visionBlockNorm2, .visionBlockW1, .visionBlockW2,
+             .visionFinalNorm, .visionAlignerW1, .visionAlignerW1Bias,
+             .visionAlignerW2, .visionAlignerW2Bias, .visionImageStart,
+             .visionImageNewline, .visionImageEnd:
             return true
         default:
             return false
@@ -355,18 +376,38 @@ nonisolated public struct DeepSeekV41WeightCatalog: Sendable {
         // never reads them, but they are published in the same checkpoint, so an
         // unclassified name here would refuse an otherwise complete text load.
         if let rest = remainder(of: name, prefix: "vision.") {
-            // `vision.patch_embed.*` and `vision.norm.*` are tower-wide; everything
-            // else lives in a numbered stage.
-            return slot(
-                .visionEncoder, scope: .vision, layer: visionBlockIndex(rest),
-                expert: nil, scale: false, ref
-            )
+            if let role = visionTowerRole(rest) {
+                return slot(role, scope: .vision, layer: nil, expert: nil, scale: false, ref)
+            }
+            // `vision.blocks.N.<stage>`: one model per stage, addressed by block.
+            guard let block = visionBlockIndex(rest) else { return nil }
+            let body = String(rest.split(separator: ".", maxSplits: 2).last ?? "")
+            guard let role = visionBlockRole(body) else { return nil }
+            return slot(role, scope: .vision, layer: block, expert: nil, scale: false, ref)
         }
         if remainder(of: name, prefix: "aligner.") != nil {
-            return slot(.visionProjector, scope: .vision, layer: nil, expert: nil, scale: false, ref)
+            switch name {
+            case "aligner.w1.weight":
+                return slot(.visionAlignerW1, scope: .vision, layer: nil, expert: nil, scale: false, ref)
+            case "aligner.w1.bias":
+                return slot(.visionAlignerW1Bias, scope: .vision, layer: nil, expert: nil, scale: false, ref)
+            case "aligner.w2.weight":
+                return slot(.visionAlignerW2, scope: .vision, layer: nil, expert: nil, scale: false, ref)
+            case "aligner.w2.bias":
+                return slot(.visionAlignerW2Bias, scope: .vision, layer: nil, expert: nil, scale: false, ref)
+            default:
+                return nil
+            }
         }
-        if ["image_start", "image_newline", "image_end"].contains(name) {
-            return slot(.visionMarker, scope: .vision, layer: nil, expert: nil, scale: false, ref)
+        switch name {
+        case "image_start":
+            return slot(.visionImageStart, scope: .vision, layer: nil, expert: nil, scale: false, ref)
+        case "image_newline":
+            return slot(.visionImageNewline, scope: .vision, layer: nil, expert: nil, scale: false, ref)
+        case "image_end":
+            return slot(.visionImageEnd, scope: .vision, layer: nil, expert: nil, scale: false, ref)
+        default:
+            break
         }
 
         // Backbone layer.
@@ -383,6 +424,45 @@ nonisolated public struct DeepSeekV41WeightCatalog: Sendable {
         let parts = blockRest.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
         guard parts.count == 2, let block = Int(parts[0]), block >= 0 else { return nil }
         return block
+    }
+
+    /// Tower-wide vision tensors: the patch embedding and the final norm.
+    private static func visionTowerRole(_ rest: String) -> DeepSeekV41TensorRole? {
+        switch rest {
+        case "patch_embed.proj.weight":
+            return .visionPatchEmbed
+        case "patch_embed.proj.bias":
+            return .visionPatchEmbedBias
+        case "norm.weight":
+            return .visionFinalNorm
+        default:
+            return nil
+        }
+    }
+
+    /// One vision transformer block's stages, keyed by the name below
+    /// `vision.blocks.N.`.
+    private static func visionBlockRole(_ body: String) -> DeepSeekV41TensorRole? {
+        switch body {
+        case "norm1.weight":
+            return .visionBlockNorm1
+        case "attn.wqkv.weight":
+            return .visionBlockWqkv
+        case "attn.wqkv.bias":
+            return .visionBlockWqkvBias
+        case "attn.wo.weight":
+            return .visionBlockWo
+        case "attn.wo.bias":
+            return .visionBlockWoBias
+        case "norm2.weight":
+            return .visionBlockNorm2
+        case "mlp.w1.weight":
+            return .visionBlockW1
+        case "mlp.w2.weight":
+            return .visionBlockW2
+        default:
+            return nil
+        }
     }
 
     /// Classifies the part of a name below its layer prefix. Backbone layers and

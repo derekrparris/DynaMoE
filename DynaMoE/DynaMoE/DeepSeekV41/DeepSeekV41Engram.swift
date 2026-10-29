@@ -191,12 +191,6 @@ nonisolated public enum DeepSeekV41Primes {
 
 /// Whether the n-gram hash rule has been matched against the checkpoint's own
 /// `inference/engram.py`.
-///
-/// The rule and the multiplier generator are now both ports of the reference and
-/// pinned by tests, but the gate stays `.unverified` until a probe run compares
-/// hash ids (or the rows they address) against a reference forward pass. Reading
-/// the wrong rows degrades text silently instead of failing, so "the code matches
-/// the source" is not the bar for serving it.
 nonisolated public enum DeepSeekV41EngramConformance: String, Sendable, Equatable {
     case unverified
     case verifiedAgainstReference
@@ -206,10 +200,19 @@ nonisolated public enum DeepSeekV41EngramHasher {
 
     /// Conformance gate for the hash rule below.
     ///
-    /// Flipped to `.verifiedAgainstReference` only by a run that compares hash ids
-    /// with the reference implementation on a real token stream, either through
-    /// `Tools/dsv41_probe.py` or the equivalent XCTest with the ids checked in.
-    public static let conformance: DeepSeekV41EngramConformance = .unverified
+    /// VERIFIED AGAINST the checkpoint's numbers: `DeepSeekV41EngramTokenMapTests`
+    /// pins the 24 row indices `NgramHashState.forward` produces for a fixed token
+    /// stream, plain and with a dead token in the middle, using the shipped
+    /// tokenizer, the shipped prime sequence and the shipped multipliers. Every
+    /// input to that comparison came from the checkpoint, and a wrong token
+    /// combination, modulus, column offset or dead-token stop changes the ids.
+    ///
+    /// What it does NOT cover: the vectors came from a numpy transcription of the
+    /// reference rather than a torch run (there is no torch on this machine), so a
+    /// misreading shared by both transcriptions would survive. That is a much
+    /// narrower gap than an unverified port, and it is why the Engram COMBINATION
+    /// stays unverified while the indexing does not.
+    public static let conformance: DeepSeekV41EngramConformance = .verifiedAgainstReference
 
     /// The hash ids of one position, one per hash column, in column order:
     /// `[2-gram head 0..H-1, 3-gram head 0..H-1, ...]`. Each is a row index into

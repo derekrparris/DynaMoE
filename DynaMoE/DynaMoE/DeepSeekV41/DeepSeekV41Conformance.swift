@@ -93,16 +93,21 @@ nonisolated public enum DeepSeekV41Conformance {
     /// DSpark's draft-chain construction.
     public static let dsparkDrafting: Gate = .unverified
 
-    /// The vision tower's patch grid and image token layout.
+    /// The vision tower's patch grid, image token layout, and the tower forward.
     ///
-    /// The GEOMETRY now matches `image_processor.py`: the resize plan is
+    /// The GEOMETRY matches `image_processor.py`: the resize plan is
     /// `plan_image_grid` + `safe_resize`, the patch grid is `llm_grid`, the span is
     /// `num_image_tokens = rows * (columns + 1) + 2`, and the patches are emitted in
-    /// the checkpoint's `reshape(3, n_h, p, n_w, p)` order. Two things still keep the
-    /// gate open: no tower runner exists (there is no 32-block ViT/aligner forward),
-    /// and the token IDENTIFIER is unverified, because the reference writes the same
-    /// `image_token_id` at every span position and trusts the tokenizer for it,
-    /// while this port renders the span from a marker string.
+    /// the checkpoint's `reshape(3, n_h, p, n_w, p)` order. `DeepSeekV41VisionForward`
+    /// runs the tower itself and matches an independent mirror of `vision.py` on a
+    /// fixture.
+    ///
+    /// Two things still keep the gate open: the token IDENTIFIER is unverified,
+    /// because the reference writes the same `image_token_id` at every span position
+    /// and trusts the tokenizer for it while this port renders the span from a
+    /// marker string; and no reference vectors for a REAL image exist, so the tower
+    /// is checked against a transcription rather than against the checkpoint's own
+    /// output.
     public static let visionPatching: Gate = .unverified
 
     /// Every gate, paired with the label the load log prints.

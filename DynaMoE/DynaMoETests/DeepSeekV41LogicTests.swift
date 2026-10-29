@@ -471,11 +471,12 @@ final class DeepSeekV41EngramTests: XCTestCase {
         XCTAssertEqual(layout.byteOffset(column: 0, bucket: 5), 5 * 264)
     }
 
-    /// Until a probe run compares hash ids with the reference implementation, the
-    /// runtime must not claim the hash is verified. This test fails the day someone
-    /// flips the flag without the vectors behind it.
-    func testHashConformanceIsDeclaredUnverified() {
-        XCTAssertEqual(DeepSeekV41EngramHasher.conformance, .unverified)
+    /// The hash ids are pinned against the reference in
+    /// `DeepSeekV41EngramTokenMapTests`, which is what this gate records. The
+    /// combination rule next to it has no vectors, so it stays open.
+    func testHashConformanceFollowsTheCheckedInVectors() {
+        XCTAssertEqual(DeepSeekV41EngramHasher.conformance, .verifiedAgainstReference)
+        XCTAssertEqual(DeepSeekV41Conformance.engramCombination, .unverified)
     }
 
     func testSyntheticTokenMapCompression() throws {
@@ -820,18 +821,39 @@ final class DeepSeekV41WeightCatalogTests: XCTestCase {
         )
         XCTAssertEqual(catalog.unconsumed, [])
         XCTAssertEqual(catalog.slots.filter { $0.role.isVision }.count, 7)
-        // One numbered stage (blocks.3); the patch embed and the tower norm are
-        // tower-wide, so they carry no block index.
+        // Each tower tensor gets its own role, because the forward has to address
+        // `wqkv` separately from `wo` in the same block.
         XCTAssertEqual(
-            catalog.slots.filter { $0.role == .visionEncoder && $0.layer != nil }.count, 1
+            catalog.slots.filter { $0.role == .visionBlockWqkv && $0.layer == 3 }.count, 1
         )
-        XCTAssertEqual(
-            catalog.slots.filter { $0.role == .visionEncoder && $0.layer == nil }.count, 2
-        )
-        XCTAssertEqual(catalog.slots.filter { $0.role == .visionProjector }.count, 1)
-        XCTAssertEqual(catalog.slots.filter { $0.role == .visionMarker }.count, 3)
+        XCTAssertEqual(catalog.slots.filter { $0.role == .visionPatchEmbed }.count, 1)
+        XCTAssertEqual(catalog.slots.filter { $0.role == .visionFinalNorm }.count, 1)
+        XCTAssertEqual(catalog.slots.filter { $0.role == .visionAlignerW1 }.count, 1)
+        XCTAssertEqual(catalog.slots.filter { $0.role == .visionImageStart }.count, 1)
+        XCTAssertEqual(catalog.slots.filter { $0.role == .visionImageNewline }.count, 1)
+        XCTAssertEqual(catalog.slots.filter { $0.role == .visionImageEnd }.count, 1)
         // A vision block index is not a backbone layer index.
         XCTAssertEqual(catalog.outOfRangeLayers, [])
+    }
+
+    /// Every tensor the published checkpoint ships for the tower must classify,
+    /// with no two of them sharing a slot. A collapse here would leave the tower
+    /// unable to address its own weights.
+    func testEveryPublishedVisionTensorClassifiesDistinctly() {
+        var names = ["vision.patch_embed.proj.weight", "vision.patch_embed.proj.bias",
+                     "vision.norm.weight",
+                     "aligner.w1.weight", "aligner.w1.bias",
+                     "aligner.w2.weight", "aligner.w2.bias",
+                     "image_start", "image_newline", "image_end"]
+        for stage in ["norm1.weight", "attn.wqkv.weight", "attn.wqkv.bias",
+                      "attn.wo.weight", "attn.wo.bias", "norm2.weight",
+                      "mlp.w1.weight", "mlp.w2.weight"] {
+            names.append("vision.blocks.7.\(stage)")
+        }
+        let catalog = DeepSeekV41WeightCatalog(named: names.map { tensor($0, "BF16", [8, 8]) }, layerCount: 40)
+        XCTAssertEqual(catalog.unconsumed, [], "every tower tensor must classify")
+        let keys = Set(catalog.slots.map(\.key))
+        XCTAssertEqual(keys.count, names.count, "two tower tensors share a slot")
     }
 }
 
@@ -842,7 +864,8 @@ final class DeepSeekV41WeightCatalogTests: XCTestCase {
 final class DeepSeekV41ConformanceGateTests: XCTestCase {
 
     func testEveryNumericRuleIsStillUnverified() {
-        XCTAssertEqual(DeepSeekV41EngramHasher.conformance, .unverified)
+        // Engram indexing is the one rule with checked-in reference vectors.
+        XCTAssertEqual(DeepSeekV41EngramHasher.conformance, .verifiedAgainstReference)
         XCTAssertEqual(DeepSeekV41Conformance.compressorPooling, .unverified)
         XCTAssertEqual(DeepSeekV41Conformance.routerScoring, .unverified)
         XCTAssertEqual(DeepSeekV41Conformance.candidateSelection, .unverified)
@@ -850,7 +873,8 @@ final class DeepSeekV41ConformanceGateTests: XCTestCase {
         XCTAssertEqual(DeepSeekV41Conformance.hyperConnections, .unverified)
         XCTAssertEqual(DeepSeekV41Conformance.dsparkDrafting, .unverified)
         XCTAssertEqual(DeepSeekV41Conformance.visionPatching, .unverified)
-        XCTAssertEqual(DeepSeekV41Conformance.unverifiedSummary.count, 8)
+        XCTAssertEqual(DeepSeekV41Conformance.unverifiedSummary.count, 7)
+        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("Engram hashing"))
     }
 }
 

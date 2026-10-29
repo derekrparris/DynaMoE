@@ -231,4 +231,121 @@ final class DeepSeekV41EngramTokenMapTests: XCTestCase {
             76_632_096_046_245
         )
     }
+
+    /// The hash ids the checkpoint's own `NgramHashState.forward` produces for a
+    /// fixed token stream, with the real tokenizer, the real primes and the real
+    /// multipliers. These are what a wrong token combination, a wrong modulus, a
+    /// wrong column offset, or a failed dead-token stop would break.
+    ///
+    /// The vectors were produced by transcribing `inference/engram.py` to numpy
+    /// against the shipped checkpoint (torch is not installed here), which catches
+    /// every Swift-side error but cannot catch a misreading shared by both
+    /// transcriptions. `DeepSeekV41EngramHasher.conformance` records that.
+    func testHashIDsMatchTheReferenceImplementation() throws {
+        guard let snapshot = snapshotDirectory() else {
+            throw XCTSkip("DeepSeek-V4.1 snapshot not downloaded")
+        }
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let lookup = try DeepSeekV41EngramStreamingLookup.make(
+            snapshotDir: snapshot, config: config, readers: [:], layouts: [:]
+        )
+        let layouts = try DeepSeekV41EngramLayout.make(specs: config.engramTables)
+        let layout = try XCTUnwrap(layouts[1])
+        let tokens: [Int32] = [100, 200, 300, 400]
+
+        // Position p's history is the first p + 1 tokens, which is the same
+        // sequence the reference caches across a prefill.
+        let expected: [[Int]] = [
+            [
+                3989020, 19038837, 45135465, 61913933,
+                71102850, 95505005, 99707086, 112292666,
+                137848244, 151005857, 169931958, 184697020,
+                202312792, 211130386, 224368909, 250675925,
+                270288342, 272058306, 288579295, 304842476,
+                321018987, 337284938, 355005607, 371750246,
+            ],
+            [
+                8096306, 20819876, 46706395, 61812199,
+                68519480, 92101719, 111895343, 119450548,
+                138600501, 146963571, 164826726, 184486170,
+                195800898, 217480571, 226027187, 248697710,
+                259516641, 273851426, 300838174, 314337122,
+                328671951, 342177089, 358460708, 383888346,
+            ],
+            [
+                14028251, 30844725, 33831812, 57751100,
+                77705247, 89710083, 111716398, 123004891,
+                130318346, 157858198, 172874745, 178712678,
+                205042416, 218244461, 230093842, 242904193,
+                264615563, 281416332, 299987276, 309282102,
+                320815583, 346121208, 367864773, 382147547,
+            ],
+            [
+                1125008, 27883854, 47776074, 62942897,
+                77792347, 93435383, 101261865, 119371375,
+                131484935, 150235616, 170409637, 182387730,
+                207644214, 220306788, 239343561, 254185542,
+                269324153, 285150118, 292022643, 319470343,
+                327105897, 338565252, 363307824, 378023145,
+            ],
+        ]
+        for (position, expectedIDs) in expected.enumerated() {
+            let history = Array(tokens.prefix(position + 1))
+            XCTAssertEqual(
+                DeepSeekV41EngramHasher.hashIDs(
+                    history: history,
+                    dead: [Bool](repeating: false, count: history.count),
+                    tokenMap: lookup.tokenMap,
+                    layout: layout
+                ),
+                expectedIDs,
+                "plain position \(position)"
+            )
+        }
+
+        // The same stream with position 1 dead. Only the n-grams that would span it
+        // move, which is what proves the stop is cumulative rather than per-slot.
+        let deadExpected: [Int: [Int]] = [
+            1: [
+                4299726, 29253038, 43157972, 58397134,
+                65256332, 88876378, 100686433, 112312540,
+                129401291, 144510675, 170979806, 184903880,
+                199719089, 215127204, 230239700, 250883315,
+                264341430, 275127613, 298781502, 318608685,
+                331826823, 351654054, 365224186, 370096053,
+            ],
+            2: [
+                7785261, 29112129, 39781933, 61162137,
+                77305978, 88040264, 109411220, 120753092,
+                140244104, 155700236, 175141915, 179425587,
+                200281299, 210742407, 226475631, 254747386,
+                263247096, 281211384, 300108174, 309564825,
+                331872718, 341338543, 353415297, 378777369,
+            ],
+            3: [
+                1125008, 27883854, 47776074, 62942897,
+                77792347, 93435383, 101261865, 119371375,
+                132239409, 154202434, 160870031, 191079570,
+                199363370, 219550331, 225886319, 241527619,
+                258014235, 279009660, 291933183, 306406397,
+                326726311, 341212037, 358460623, 375918763,
+            ],
+        ]
+        let dead = [false, true, false, false]
+        for (position, expectedIDs) in deadExpected.sorted(by: { $0.key < $1.key }) {
+            let history = Array(tokens.prefix(position + 1))
+            XCTAssertEqual(
+                DeepSeekV41EngramHasher.hashIDs(
+                    history: history,
+                    dead: Array(dead.prefix(history.count)),
+                    tokenMap: lookup.tokenMap,
+                    layout: layout
+                ),
+                expectedIDs,
+                "dead-at-1 position \(position)"
+            )
+        }
+    }
 }

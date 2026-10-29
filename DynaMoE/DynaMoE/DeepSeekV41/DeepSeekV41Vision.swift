@@ -45,6 +45,9 @@ nonisolated public struct DeepSeekV41VisionSpec: Sendable, Equatable {
     /// `max_wh_ratio`: an image wider than `maxWidthHeightRatio` times its height is
     /// clamped before any other resizing. Nil means no clamp.
     public let maxWidthHeightRatio: Double?
+    /// `rope_theta` for the tower's 2D rotary table, which is a different theta from
+    /// the language model's.
+    public let ropeTheta: Double
 
     /// Pixels one output token covers, per side.
     public var tokenStride: Int { max(1, patchSize) * max(1, downsampleRatio) }
@@ -59,7 +62,8 @@ nonisolated public struct DeepSeekV41VisionSpec: Sendable, Equatable {
         numAttentionHeads: Int,
         intermediateSize: Int,
         imageTokenID: Int,
-        maxWidthHeightRatio: Double? = nil
+        maxWidthHeightRatio: Double? = nil,
+        ropeTheta: Double = 10_000
     ) {
         self.patchSize = patchSize
         self.downsampleRatio = downsampleRatio
@@ -71,6 +75,7 @@ nonisolated public struct DeepSeekV41VisionSpec: Sendable, Equatable {
         self.intermediateSize = intermediateSize
         self.imageTokenID = imageTokenID
         self.maxWidthHeightRatio = maxWidthHeightRatio
+        self.ropeTheta = ropeTheta
     }
 
     /// Decodes a `vision_config` object. Returns nil when the block is absent, which
@@ -104,7 +109,8 @@ nonisolated public struct DeepSeekV41VisionSpec: Sendable, Equatable {
             numAttentionHeads: int("num_attention_heads", "n_heads") ?? 0,
             intermediateSize: int("intermediate_size", "mlp_ratio") ?? 0,
             imageTokenID: int("image_token_id") ?? -1,
-            maxWidthHeightRatio: number("max_wh_ratio")
+            maxWidthHeightRatio: number("max_wh_ratio"),
+            ropeTheta: number("rope_theta", "vision_rope_theta") ?? 10_000
         )
     }
 }
