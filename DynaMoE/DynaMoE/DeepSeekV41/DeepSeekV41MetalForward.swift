@@ -531,6 +531,10 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// part in an n-gram and its gate is zero.
     private var deadTokens: [Bool] = []
     private var pendingDead = false
+    /// Which block of the compressor scratch each owner fills. Divided from the
+    /// plan at load, because the block a layer writes is a property of the layer
+    /// rather than of the position being run.
+    private let compressorOwnerSlots: [Int: Int]
     /// Fills the arena slots from the shards. Nil means the routed experts are read
     /// through the zero-copy shard mappings, which is correct but pays a page fault
     /// per 16 KB and collapses to ~0.065 GB/s once it interleaves with GPU work.
@@ -559,6 +563,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         )
         self.swigluLimit = runtime.config.swigluLimit ?? 0
         self.gatherRows = runtime.workspace.gatherRows
+        self.compressorOwnerSlots = DeepSeekV41CacheAddressing.compressorOwnerSlots(
+            plan: runtime.plan
+        )
         self.contextLength = runtime.contextLength
         self.skipEngram = runtime.allowEngramSkip
         self.streamer = runtime.expertStreamer
@@ -1465,7 +1472,22 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         let slot = position % ratio
         let width = shapes.latentWidth
         guard slot < ratio else { return }
-        let slotByteOffset = slot * width * MemoryLayout<Float>.stride
+        guard let owner = compressorOwnerSlots[layer.index] else {
+            throw DeepSeekV41EngineError.allocationFailed(
+                "layers.\(layer.index): no compressor slot block was allocated for this owner"
+            )
+        }
+        let groupWidth = workspace.compressorGroupWidth
+        guard let groupByteOffset = DeepSeekV41CacheAddressing.compressorSlotByteOffset(
+                  owner: owner, slot: 0, groupWidth: groupWidth, width: width
+              ),
+              let slotByteOffset = DeepSeekV41CacheAddressing.compressorSlotByteOffset(
+                  owner: owner, slot: slot, groupWidth: groupWidth, width: width
+              ) else {
+            throw DeepSeekV41EngineError.allocationFailed(
+                "layers.\(layer.index): the compressor group is \(groupWidth) slots wide"
+            )
+        }
 
         guard let kvWeight = weights.tensor(.compressorWkv, layer: layer.index) else {
             throw DeepSeekV41EngineError.missingTensor("attn.compressor.wkv")
@@ -1513,8 +1535,10 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         }
 
         encoder.setComputePipelineState(pipelines.poolLatents)
-        encoder.setBuffer(workspace.compressorLatents, offset: 0, index: 0)
-        encoder.setBuffer(workspace.compressorScores, offset: 0, index: 1)
+        // Bound at this owner's block: the pool reads the group from row 0 of the
+        // buffers it is given, and another owner's block is not part of it.
+        encoder.setBuffer(workspace.compressorLatents, offset: groupByteOffset, index: 0)
+        encoder.setBuffer(workspace.compressorScores, offset: groupByteOffset, index: 1)
         encoder.setBuffer(workspace.pooled, offset: 0, index: 2)
         var poolWidth = UInt32(width)
         var blockSize = UInt32(ratio)

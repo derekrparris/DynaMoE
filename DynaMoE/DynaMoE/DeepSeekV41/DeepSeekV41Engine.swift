@@ -463,7 +463,12 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
             return nil
         }
         let shapes = DeepSeekV41TensorShapes(config: config)
-        guard let workspace = DeepSeekV41Workspace(device: device, shapes: shapes, config: config) else {
+        guard let workspace = DeepSeekV41Workspace(
+                  device: device,
+                  shapes: shapes,
+                  config: config,
+                  compressedOwners: plan.filter(\.ownsCompressedKV).count
+              ) else {
             DeepSeekV41Runtime.record("the per-token workspace could not be allocated")
             return nil
         }
@@ -703,12 +708,18 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
     /// One pooled compressed row, before it is written to the cache.
     public let pooled: MTLBuffer
     /// The compressor's per-position `wkv(x)` results for the group being filled,
-    /// `maxRatio * latentWidth` floats. The compressor projects the layer input, so
-    /// these are not the same rows the window cache holds.
+    /// one block per compressed-KV owner, `groupCount * maxRatio * latentWidth`
+    /// floats. The compressor projects the layer input, so these are not the same
+    /// rows the window cache holds, and the state is per layer rather than shared:
+    /// two owners pooling out of one block mixed their latents.
     public let compressorLatents: MTLBuffer
     /// The compressor's per-position `wgate(x)` scores, the same geometry. The
     /// softmax that pools them runs per DIMENSION over the group.
     public let compressorScores: MTLBuffer
+    /// How many compressed-KV owners the compressor scratch is split across.
+    public let compressorGroups: Int
+    /// Slots one owner's compressor block holds, i.e. the widest compress ratio.
+    public let compressorGroupWidth: Int
     /// The `wq_a` / `wo_a` rank-width scratch.
     public let reduced: MTLBuffer
     public let moeOut: MTLBuffer
@@ -730,9 +741,18 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
     /// Rows the gather allocates for one layer's attention: window + compressed.
     public let gatherRows: Int
 
-    public init?(device: MTLDevice, shapes: DeepSeekV41TensorShapes, config: DeepSeekV41Config) {
+    public init?(
+        device: MTLDevice,
+        shapes: DeepSeekV41TensorShapes,
+        config: DeepSeekV41Config,
+        compressedOwners: Int
+    ) {
         let mult = max(1, config.hcMult)
         let maxCompressed = max(1, config.compressRatios.max() ?? 1)
+        // `Compressor` keeps one group per module instance, so a layer's slots are
+        // its own. The block is the widest ratio wide; a narrow owner leaves the
+        // remaining slots unused rather than pooling another layer's latents.
+        let compressorGroups = max(1, compressedOwners)
         // Rows one position gathers: its window plus whatever the addressing rule
         // may select. `index_topk == 0` would mean "the whole compressed cache", so
         // the candidate-block budget bounds it and the executor reports a cache
@@ -763,8 +783,12 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
               let intermediate = make(float4(shapes.expertIntermediate)),
               let sharedIntermediate = make(float4(shapes.sharedIntermediate)),
               let pooled = make(float4(shapes.latentWidth)),
-              let compressorLatents = make(float4(maxCompressed * shapes.latentWidth)),
-              let compressorScores = make(float4(maxCompressed * shapes.latentWidth)),
+              let compressorLatents = make(
+                  float4(maxCompressed * compressorGroups * shapes.latentWidth)
+              ),
+              let compressorScores = make(
+                  float4(maxCompressed * compressorGroups * shapes.latentWidth)
+              ),
               let reduced = make(float4(max(1, max(shapes.qLoraRank, shapes.outputReducedWidth)))),
               let moeOut = make(float4(shapes.hidden)),
               let streams = make(float4(mult * shapes.hidden)),
@@ -793,6 +817,8 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
         self.pooled = pooled
         self.compressorLatents = compressorLatents
         self.compressorScores = compressorScores
+        self.compressorGroups = compressorGroups
+        self.compressorGroupWidth = maxCompressed
         self.reduced = reduced
         self.moeOut = moeOut
         self.streams = streams

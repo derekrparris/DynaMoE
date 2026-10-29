@@ -1422,6 +1422,76 @@ final class DeepSeekV41PreflightSizeTests: XCTestCase {
     }
 }
 
+// MARK: - Compressor group
+
+/// The compressor's per-position state is per OWNER, not shared.
+///
+/// It used to be one block addressed by `position % ratio` alone. Owners run in
+/// index order at every position, so the earlier slots of a block were last
+/// written by whichever owner ran latest at the previous position, and a ratio-2
+/// owner pooled its own latent together with another layer's.
+final class DeepSeekV41CompressorGroupTests: XCTestCase {
+
+    private func plan(owners: [Int], ratio: Int) -> [DeepSeekV41LayerPlan] {
+        let source = owners.first ?? -1
+        return (0..<8).map { index in
+            let isOwner = owners.contains(index)
+            return DeepSeekV41LayerPlan(
+                index: index,
+                flavor: isOwner ? .compressed : .windowOnly,
+                compressRatio: isOwner ? ratio : 0,
+                compressedKVSource: isOwner ? index : source,
+                compressedIndexSource: -1,
+                isCandidateSource: false,
+                engramTable: nil,
+                ropeTable: .compress
+            )
+        }
+    }
+
+    func testEachOwnerGetsItsOwnBlockInIndexOrder() {
+        let slots = DeepSeekV41CacheAddressing.compressorOwnerSlots(
+            plan: plan(owners: [5, 1, 3], ratio: 2)
+        )
+        XCTAssertEqual(slots, [1: 0, 3: 1, 5: 2])
+        XCTAssertNil(slots[0], "a layer that owns no compressed rows fills no block")
+        XCTAssertNil(slots[2])
+    }
+
+    func testTwoOwnersNeverShareASlot() throws {
+        let width = 4
+        let groupWidth = 2
+        let first = try XCTUnwrap(
+            DeepSeekV41CacheAddressing.compressorSlotByteOffset(
+                owner: 0, slot: 1, groupWidth: groupWidth, width: width
+            )
+        )
+        let second = try XCTUnwrap(
+            DeepSeekV41CacheAddressing.compressorSlotByteOffset(
+                owner: 1, slot: 0, groupWidth: groupWidth, width: width
+            )
+        )
+        XCTAssertEqual(first, width * MemoryLayout<Float>.stride)
+        XCTAssertEqual(second, groupWidth * width * MemoryLayout<Float>.stride)
+        XCTAssertNotEqual(first, second, "an owner's block must not overlap the next one's")
+    }
+
+    /// A narrow owner's unused slots are the difference between the group width and
+    /// its own ratio, and they stay inside its own block.
+    func testANarrowOwnerLeavesItsSpareSlotsUnused() {
+        XCTAssertNil(
+            DeepSeekV41CacheAddressing.compressorSlotByteOffset(
+                owner: 0, slot: 2, groupWidth: 2, width: 4
+            )
+        )
+        XCTAssertNotNil(
+            DeepSeekV41CacheAddressing.compressorSlotByteOffset(
+                owner: 1, slot: 1, groupWidth: 2, width: 4
+            )
+        )
+    }
+}
+
 // MARK: - Cache reuse
 
 final class DeepSeekV41CacheReuseTests: XCTestCase {

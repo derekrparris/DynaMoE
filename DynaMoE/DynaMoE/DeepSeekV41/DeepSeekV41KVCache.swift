@@ -307,6 +307,46 @@ nonisolated public enum DeepSeekV41CacheAddressing {
         return base + block * MemoryLayout<Float>.stride
     }
 
+    // MARK: Compressor group
+
+    /// Which block of compressor slots each compressed-KV owner fills.
+    ///
+    /// `Compressor` keeps `kv_state` and `score_state` per module instance, so the
+    /// slots one layer fills are never the slots another layer fills. Addressing a
+    /// shared block by `position % ratio` alone does not give that: owners run in
+    /// index order at every position, so the earlier slots of a block were last
+    /// written by whichever owner ran latest at the previous position (layer 20,
+    /// ratio 1, writes slot 0 every position), and a ratio-2 owner then pooled its
+    /// own latent together with that other layer's. One block per owner is what
+    /// the reference has, and it also makes a group survive a turn boundary
+    /// without a separate state machine.
+    public static func compressorOwnerSlots(plan: [DeepSeekV41LayerPlan]) -> [Int: Int] {
+        var out: [Int: Int] = [:]
+        var ordinal = 0
+        for layer in plan.sorted(by: { $0.index < $1.index }) where layer.ownsCompressedKV {
+            out[layer.index] = ordinal
+            ordinal += 1
+        }
+        return out
+    }
+
+    /// Byte offset of one slot in one owner's compressor group.
+    ///
+    /// `groupWidth` is one owner's block in slots (the widest ratio the checkpoint
+    /// declares), so a narrow owner leaves its spare slots unused instead of
+    /// reaching into the next owner's block.
+    public static func compressorSlotByteOffset(
+        owner: Int,
+        slot: Int,
+        groupWidth: Int,
+        width: Int
+    ) -> Int? {
+        guard owner >= 0, slot >= 0, width > 0, groupWidth > 0, slot < groupWidth else {
+            return nil
+        }
+        return (owner * groupWidth + slot) * width * MemoryLayout<Float>.stride
+    }
+
     /// The compressed rows a position's compressed attentions may read: every
     /// row produced so far, capped to the fewest the token budget allows.
     ///
