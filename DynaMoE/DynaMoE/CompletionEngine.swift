@@ -27,7 +27,7 @@ import Metal
 
 // MARK: - Thinking / Response Boundary Splitting (whitespace tolerant)
 
-public enum TurnTextSplitter {
+nonisolated public enum TurnTextSplitter {
     /// Reasoning open/close marker tags used across model families (Qwen, DeepSeek, Ornith, etc.).
     private static let openTags = ["<think>", "<thought>", "<|thought|>", "<|channel>"]
     private static let closeTags = ["</think>", "</thought>", "</|thought|>", "<channel|>"]

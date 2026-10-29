@@ -1153,6 +1153,17 @@ final class ServerController: ObservableObject {
 
         let memory = TurnMemorySettings.persisted(defaults)
 
+        // The dialect's stop markers belong to the sampler, not just to the
+        // renderer: without them a generation that emits the next role marker
+        // keeps going until maxTokens instead of ending the turn.
+        var stopSequences = inputs.stopSequences
+        if engine.promptModelConfig?.isDeepSeekV41Model == true {
+            for stop in engine.promptDialect.stopSequences
+            where !stop.isEmpty && !stopSequences.contains(stop) {
+                stopSequences.append(stop)
+            }
+        }
+
         let turnRequest = CompletionTurnRequest(
             promptTokenIds: promptTokenIds,
             formattedPrompt: formattedPrompt,
@@ -1164,7 +1175,7 @@ final class ServerController: ObservableObject {
             agentStep: 0,
             forceSynthesis: false,
             isSplicedContinuation: false,
-            stopSequences: inputs.stopSequences,
+            stopSequences: stopSequences,
             asOfDate: renderedAsOfDate
         )
         return TurnPlan(

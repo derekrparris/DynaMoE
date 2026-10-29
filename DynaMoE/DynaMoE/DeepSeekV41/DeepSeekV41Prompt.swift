@@ -36,11 +36,20 @@ import Foundation
 nonisolated public struct DeepSeekV41PromptMarkers: Sendable, Equatable {
     public let beginOfSentence: String
     public let endOfSentence: String
+    public let system: String
     public let user: String
     public let assistant: String
     public let toolCallsBegin: String
     public let toolCallSeparator: String
     public let toolCallsEnd: String
+    /// The reasoning channel the template opens and closes. Defaults come from
+    /// the checkpoint's declared special tokens, not from a renderer constant.
+    public let reasoningOpen: String
+    public let reasoningClose: String
+
+    public static let defaultSystem = "<" + "\u{FF5C}" + "System" + "\u{FF5C}" + ">"
+    public static let defaultReasoningOpen = TurnTextSplitter.canonicalReasoningOpenTag
+    public static let defaultReasoningClose = TurnTextSplitter.canonicalReasoningCloseTag
 
     /// The published DeepSeek V3.x / V4 spellings. Fullwidth vertical bar
     /// (U+FF5C) around every role name, lower-one-eighth-block (U+2581) inside
@@ -52,7 +61,10 @@ nonisolated public struct DeepSeekV41PromptMarkers: Sendable, Equatable {
         assistant: "<" + "\u{FF5C}" + "Assistant" + "\u{FF5C}" + ">",
         toolCallsBegin: "<" + "\u{FF5C}" + "tool" + "\u{2581}" + "calls" + "\u{2581}" + "begin" + "\u{FF5C}" + ">",
         toolCallSeparator: "<" + "\u{FF5C}" + "tool" + "\u{2581}" + "sep" + "\u{FF5C}" + ">",
-        toolCallsEnd: "<" + "\u{FF5C}" + "tool" + "\u{2581}" + "calls" + "\u{2581}" + "end" + "\u{FF5C}" + ">"
+        toolCallsEnd: "<" + "\u{FF5C}" + "tool" + "\u{2581}" + "calls" + "\u{2581}" + "end" + "\u{FF5C}" + ">",
+        system: DeepSeekV41PromptMarkers.defaultSystem,
+        reasoningOpen: DeepSeekV41PromptMarkers.defaultReasoningOpen,
+        reasoningClose: DeepSeekV41PromptMarkers.defaultReasoningClose
     )
 
     public init(
@@ -62,15 +74,21 @@ nonisolated public struct DeepSeekV41PromptMarkers: Sendable, Equatable {
         assistant: String,
         toolCallsBegin: String,
         toolCallSeparator: String,
-        toolCallsEnd: String
+        toolCallsEnd: String,
+        system: String = DeepSeekV41PromptMarkers.defaultSystem,
+        reasoningOpen: String = DeepSeekV41PromptMarkers.defaultReasoningOpen,
+        reasoningClose: String = DeepSeekV41PromptMarkers.defaultReasoningClose
     ) {
         self.beginOfSentence = beginOfSentence
         self.endOfSentence = endOfSentence
+        self.system = system
         self.user = user
         self.assistant = assistant
         self.toolCallsBegin = toolCallsBegin
         self.toolCallSeparator = toolCallSeparator
         self.toolCallsEnd = toolCallsEnd
+        self.reasoningOpen = reasoningOpen
+        self.reasoningClose = reasoningClose
     }
 }
 
@@ -113,8 +131,16 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
         guard let template = chatTemplate(in: snapshotDir) else {
             return DeepSeekV41PromptDialect()
         }
+        let extracted = extractMarkers(in: template)
+        // A template that names no marker proves nothing about the dialect. It
+        // used to be reported as `checkpointTemplate` anyway, which made the
+        // load log claim a checkpoint-specific dialect the renderer was not
+        // actually using.
+        guard extracted.matched > 0 else {
+            return DeepSeekV41PromptDialect(template: template)
+        }
         return DeepSeekV41PromptDialect(
-            markers: markers(in: template),
+            markers: extracted.markers,
             source: .checkpointTemplate,
             template: template
         )
@@ -152,45 +178,78 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
     /// text between the bars, which tolerates both `及各`-style
     /// markers and templates that spell roles as `及各`/`及各`.
     public static func markers(in template: String) -> DeepSeekV41PromptMarkers {
+        extractMarkers(in: template).markers
+    }
+
+    /// `markers(in:)` plus how many markers the template actually named, so a
+    /// caller can tell an extracted dialect from the family fallback.
+    static func extractMarkers(
+        in template: String
+    ) -> (markers: DeepSeekV41PromptMarkers, matched: Int) {
         let quoted = quotedLiterals(in: template)
         var begin = DeepSeekV41PromptMarkers.familyDefault.beginOfSentence
         var end = DeepSeekV41PromptMarkers.familyDefault.endOfSentence
+        var system = DeepSeekV41PromptMarkers.familyDefault.system
         var user = DeepSeekV41PromptMarkers.familyDefault.user
         var assistant = DeepSeekV41PromptMarkers.familyDefault.assistant
         var toolBegin = DeepSeekV41PromptMarkers.familyDefault.toolCallsBegin
         var toolSep = DeepSeekV41PromptMarkers.familyDefault.toolCallSeparator
         var toolEnd = DeepSeekV41PromptMarkers.familyDefault.toolCallsEnd
+        var reasoningOpen = DeepSeekV41PromptMarkers.defaultReasoningOpen
+        var reasoningClose = DeepSeekV41PromptMarkers.defaultReasoningClose
+        var matched = 0
 
         for literal in quoted {
-            guard literal.contains("\u{FF5C}") else { continue }
-            let role = roleName(in: literal)
-            switch role {
-            case "beginofsentence", "bos", "begin":
-                begin = literal
-            case "endofsentence", "eos", "end":
-                end = literal
-            case "user", "human", "userrole":
-                user = literal
-            case "assistant", "bot", "model", "assistantrole":
-                assistant = literal
-            case "toolcallsbegin", "toolcalls":
-                toolBegin = literal
-            case "toolsep", "toolseparator":
-                toolSep = literal
-            case "toolcallsend":
-                toolEnd = literal
-            default:
+            if literal.contains("\u{FF5C}") {
+                switch roleName(in: literal) {
+                case "beginofsentence", "bos", "begin":
+                    begin = literal
+                case "endofsentence", "eos", "end":
+                    end = literal
+                case "system", "sys", "systemrole":
+                    system = literal
+                case "user", "human", "userrole":
+                    user = literal
+                case "assistant", "bot", "model", "assistantrole":
+                    assistant = literal
+                case "toolcallsbegin", "toolcalls":
+                    toolBegin = literal
+                case "toolsep", "toolseparator":
+                    toolSep = literal
+                case "toolcallsend":
+                    toolEnd = literal
+                default:
+                    continue
+                }
+                matched += 1
                 continue
             }
+            // Reasoning tags are special tokens, not fullwidth-bar markers, so
+            // they are discovered from their literal spelling instead.
+            let lowered = literal.lowercased()
+            guard literal.hasPrefix("<"), literal.hasSuffix(">"),
+                  lowered.contains("think") || lowered.contains("reason") else { continue }
+            if lowered.contains("end") || lowered.hasPrefix("</") {
+                reasoningClose = literal
+            } else {
+                reasoningOpen = literal
+            }
+            matched += 1
         }
-        return DeepSeekV41PromptMarkers(
-            beginOfSentence: begin,
-            endOfSentence: end,
-            user: user,
-            assistant: assistant,
-            toolCallsBegin: toolBegin,
-            toolCallSeparator: toolSep,
-            toolCallsEnd: toolEnd
+        return (
+            DeepSeekV41PromptMarkers(
+                beginOfSentence: begin,
+                endOfSentence: end,
+                user: user,
+                assistant: assistant,
+                toolCallsBegin: toolBegin,
+                toolCallSeparator: toolSep,
+                toolCallsEnd: toolEnd,
+                system: system,
+                reasoningOpen: reasoningOpen,
+                reasoningClose: reasoningClose
+            ),
+            matched
         )
     }
 
@@ -238,8 +297,9 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
 
     // MARK: Reasoning effort
 
-    /// The effort budget range the checkpoint accepts. Mirrors
-    /// `ModelConfig.reasoningEffortBounds`, which is what the Settings UI reads.
+    /// The effort budget range the checkpoint accepts. The UI keeps the
+    /// discrete levels (25 for low, 100 for high) rather than exposing a
+    /// continuous slider until the runtime can actually serve a turn.
     public static let effortBounds = 1...100
 
     /// Renders the graded effort instruction. DeepSeek reads an integer budget
@@ -279,6 +339,31 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
         case "high", "max", "maximum": return effortBounds.upperBound
         default: return nil
         }
+    }
+
+    // MARK: Splitting recorded turns
+
+    /// Splits a recorded assistant turn into reasoning and answer using the
+    /// dialect's own channel markers. The shared splitter only knows the
+    /// canonical tags, so a checkpoint that declares different ones would keep
+    /// its reasoning in the visible answer.
+    public func splitReasoning(
+        _ raw: String
+    ) -> (think: String?, resp: String) {
+        var text = raw
+        let canonicalOpen = TurnTextSplitter.canonicalReasoningOpenTag
+        let canonicalClose = TurnTextSplitter.canonicalReasoningCloseTag
+        if markers.reasoningOpen != canonicalOpen, !markers.reasoningOpen.isEmpty {
+            text = text.replacingOccurrences(of: markers.reasoningOpen, with: canonicalOpen)
+        }
+        if markers.reasoningClose != canonicalClose, !markers.reasoningClose.isEmpty {
+            text = text.replacingOccurrences(of: markers.reasoningClose, with: canonicalClose)
+        }
+        let split = TurnTextSplitter.splitThinkingAndResponse(
+            raw: text,
+            promptRequestsThinking: false
+        )
+        return (think: split.think, resp: split.resp)
     }
 
     // MARK: Rendering
@@ -329,11 +414,11 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
             effort: effort
         )
         if !system.isEmpty {
-            out += system
+            out += m.system + system
         }
         for turn in turns {
             if turn.isUser {
-                out += m.user + turn.text
+                out += m.user + escaped(turn.text)
             } else {
                 out += assistantBody(for: turn, thinkingEnabled: thinkingEnabled)
             }
@@ -348,20 +433,18 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
     /// from the pinned prompt loses the whole prefix.
     func assistantBody(for turn: Turn, thinkingEnabled: Bool) -> String {
         let m = markers
-        let hasReasoning = !(turn.reasoning ?? "").isEmpty
         var body = m.assistant
         if let reasoning = turn.reasoning, !reasoning.isEmpty {
-            body += TurnTextSplitter.canonicalReasoningOpenTag
+            body += m.reasoningOpen
             body += "\n"
             body += reasoning
-            body += TurnTextSplitter.canonicalReasoningCloseTag
+            body += m.reasoningClose
             body += "\n\n"
         } else if thinkingEnabled {
             // An earlier turn generated with thinking on but no recorded
             // reasoning still has to carry an empty channel: the marker belongs
             // to the turn, not to the setting that happens to be on now.
-            body += TurnTextSplitter.canonicalReasoningOpenTag + "\n\n"
-                + TurnTextSplitter.canonicalReasoningCloseTag + "\n\n"
+            body += m.reasoningOpen + "\n\n" + m.reasoningClose + "\n\n"
         }
         body += turn.text
         body += m.endOfSentence
@@ -372,7 +455,7 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
     func assistantPrefix(thinkingEnabled: Bool) -> String {
         var out = markers.assistant
         if thinkingEnabled {
-            out += TurnTextSplitter.canonicalReasoningOpenTag + "\n"
+            out += markers.reasoningOpen + "\n"
         }
         return out
     }
@@ -384,8 +467,33 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
     public func toolResultTurn(name: String, payload: String) -> String {
         let m = markers
         return m.user + m.toolCallsBegin + "function" + m.toolCallSeparator + name + "\n"
-            + payload
+            + escaped(payload)
             + m.toolCallsEnd
+    }
+
+    /// Neutralizes marker literals in untrusted text (a user prompt or a tool
+    /// payload) so it cannot forge a role or tool boundary. A zero-width
+    /// no-break space after the leading `<` keeps the visible text intact while
+    /// breaking the exact special-token spelling.
+    public func escaped(_ text: String) -> String {
+        guard !text.isEmpty else { return text }
+        let literals = [
+            markers.beginOfSentence, markers.endOfSentence, markers.system,
+            markers.user, markers.assistant, markers.toolCallsBegin,
+            markers.toolCallSeparator, markers.toolCallsEnd,
+            markers.reasoningOpen, markers.reasoningClose
+        ]
+        .filter { !$0.isEmpty }
+        .sorted { $0.count > $1.count }
+        var out = text
+        for literal in literals {
+            guard let first = literal.first else { continue }
+            out = out.replacingOccurrences(
+                of: literal,
+                with: String(first) + "\u{FEFF}" + String(literal.dropFirst())
+            )
+        }
+        return out
     }
 
     /// Stop sequences: the turn ends at the end-of-sentence marker, and the tool

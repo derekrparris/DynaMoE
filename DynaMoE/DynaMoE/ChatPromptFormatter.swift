@@ -291,10 +291,7 @@ public enum ChatPromptFormatter {
                 guard turn.role == .assistant else {
                     return .init(isUser: true, text: turn.text)
                 }
-                let split = TurnTextSplitter.splitThinkingAndResponse(
-                    raw: turn.text,
-                    promptRequestsThinking: false
-                )
+                let split = promptDialect.splitReasoning(turn.text)
                 return .init(isUser: false, text: split.resp, reasoning: split.think)
             }
             return promptDialect.render(
@@ -413,14 +410,20 @@ public enum ChatPromptFormatter {
     /// The markers are the RESOLVED dialect's, not the family default: a checkpoint
     /// whose template renames them would otherwise be probed for one spelling and
     /// rendered in another, and every harness prompt would be wrapped twice.
+    ///
+    /// The probe requires the prompt to *begin* with a role/sentence marker. It
+    /// used to pass any prompt that merely contained one, so a user message
+    /// quoting `<|User|>` was treated as harness-authored and injected verbatim
+    /// as a turn boundary.
     static func isAlreadyDeepSeekTemplated(
         _ prompt: String,
         markers: DeepSeekV41PromptMarkers = .familyDefault
     ) -> Bool {
         let m = markers
-        return prompt.contains(m.user)
-            || prompt.contains(m.assistant)
-            || prompt.contains(m.beginOfSentence)
+        let trimmed = prompt.drop { $0.isWhitespace }
+        return [m.beginOfSentence, m.system, m.user, m.assistant]
+            .filter { !$0.isEmpty }
+            .contains { trimmed.hasPrefix($0) }
     }
 
     /// The tag that closes an assistant turn for this family, or nil when the
