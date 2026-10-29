@@ -599,20 +599,25 @@ final class DeepSeekV41RouterTests: XCTestCase {
         XCTAssertFalse(DeepSeekV41Router.sigmoid(-1000).isNaN)
     }
 
-    func testTopKIsSelectedBySigmoidScore() {
+    func testTopKIsSelectedByScore() {
         let routing = DeepSeekV41Router.route(
             logits: [3, -3, 1, 0.5],
             bias: nil,
             topK: 2,
-            scalingFactor: 1
+            scalingFactor: 1,
+            scoringFunction: .sigmoid
         )
         XCTAssertEqual(routing.expertIDs, [0, 2])
         XCTAssertEqual(routing.weights.reduce(0, +), 1, accuracy: 1e-5)
     }
 
     func testScalingFactorMultipliesTheMixture() {
-        let plain = DeepSeekV41Router.route(logits: [1, 2, 3, 4], bias: nil, topK: 2, scalingFactor: 1)
-        let scaled = DeepSeekV41Router.route(logits: [1, 2, 3, 4], bias: nil, topK: 2, scalingFactor: 2.5)
+        let plain = DeepSeekV41Router.route(
+            logits: [1, 2, 3, 4], bias: nil, topK: 2, scalingFactor: 1, scoringFunction: .sigmoid
+        )
+        let scaled = DeepSeekV41Router.route(
+            logits: [1, 2, 3, 4], bias: nil, topK: 2, scalingFactor: 2.5, scoringFunction: .sigmoid
+        )
         XCTAssertEqual(plain.expertIDs, scaled.expertIDs)
         for (before, after) in zip(plain.weights, scaled.weights) {
             XCTAssertEqual(after, before * 2.5, accuracy: 1e-5)
@@ -621,28 +626,33 @@ final class DeepSeekV41RouterTests: XCTestCase {
 
     func testBiasChangesSelectionButNotTheReportedWeights() {
         // Expert 3 loses on raw logits but wins once its bias is applied.
-        let unbiased = DeepSeekV41Router.route(logits: [2, 1, 0, -1], bias: nil, topK: 1, scalingFactor: 1)
+        let unbiased = DeepSeekV41Router.route(
+            logits: [2, 1, 0, -1], bias: nil, topK: 1, scalingFactor: 1, scoringFunction: .sigmoid
+        )
         let biased = DeepSeekV41Router.route(
             logits: [2, 1, 0, -1],
             bias: [0, 0, 0, 100],
             topK: 1,
-            scalingFactor: 1
+            scalingFactor: 1,
+            scoringFunction: .sigmoid
         )
         XCTAssertEqual(unbiased.expertIDs, [0])
         XCTAssertEqual(biased.expertIDs, [3])
-        // A single selected expert always carries the whole mixture.
-        XCTAssertEqual(biased.weights, [1])
+        // `norm_topk_prob` only renormalizes when more than one expert is selected,
+        // so a lone expert keeps its own score rather than being scaled up to 1.
+        XCTAssertEqual(biased.weights, [DeepSeekV41Router.sigmoid(-1)])
     }
 
     /// The bias ranks experts but must not change the mixture of the ones that are
-    /// selected: each weight is the expert's own unbiased `sigmoid(logit)`,
-    /// normalized over the selection.
+    /// selected: each weight is the expert's own unbiased scored value, normalized
+    /// over the selection.
     func testBiasDoesNotEnterTheMixtureWeights() {
         let routing = DeepSeekV41Router.route(
             logits: [2, 1],
             bias: [100, 0],
             topK: 2,
-            scalingFactor: 1
+            scalingFactor: 1,
+            scoringFunction: .sigmoid
         )
         XCTAssertEqual(routing.expertIDs, [0, 1])
         let first = DeepSeekV41Router.sigmoid(2)
@@ -651,7 +661,7 @@ final class DeepSeekV41RouterTests: XCTestCase {
         XCTAssertEqual(routing.weights[1], second / (first + second), accuracy: 1e-5)
         // The reported scores stay the biased selection values, so a test can assert
         // the ranking without re-deriving it.
-        XCTAssertEqual(routing.scores[0], DeepSeekV41Router.sigmoid(102), accuracy: 1e-5)
+        XCTAssertEqual(routing.scores[0], DeepSeekV41Router.sigmoid(2) + 100, accuracy: 1e-5)
         XCTAssertEqual(routing.scores[1], DeepSeekV41Router.sigmoid(1), accuracy: 1e-5)
     }
 
@@ -660,6 +670,63 @@ final class DeepSeekV41RouterTests: XCTestCase {
         XCTAssertEqual(DeepSeekV41Router.route(logits: [1], bias: nil, topK: 0, scalingFactor: 1), .empty)
         // topK larger than the expert count is clamped, not trusted.
         XCTAssertEqual(DeepSeekV41Router.route(logits: [1, 2], bias: nil, topK: 9, scalingFactor: 1).expertIDs.count, 2)
+    }
+
+    /// `sqrt(softplus(x))`, pinned so the family default cannot drift. The three
+    /// scoring functions are different monotone maps, not rescalings, so a wrong
+    /// one reorders the experts.
+    func testSqrtSoftplusIsTheCheckpointScoringFunction() {
+        XCTAssertEqual(DeepSeekV41Router.score(0, function: .sqrtsoftplus), 0.832_554_6, accuracy: 1e-5)
+        XCTAssertEqual(DeepSeekV41Router.score(1, function: .sqrtsoftplus), 1.145_976_3, accuracy: 1e-5)
+        XCTAssertEqual(DeepSeekV41Router.score(-1, function: .sqrtsoftplus), 0.559_697_9, accuracy: 1e-5)
+        // Large positive logits must not overflow through exp().
+        XCTAssertEqual(DeepSeekV41Router.score(1_000, function: .sqrtsoftplus), 31.622_776, accuracy: 1e-3)
+        XCTAssertFalse(DeepSeekV41Router.score(1_000, function: .sqrtsoftplus).isNaN)
+        // The default must be the checkpoint's function, not the V3 family's.
+        XCTAssertEqual(DeepSeekV41ScoringFunction("sqrtsoftplus"), .sqrtsoftplus)
+        XCTAssertEqual(DeepSeekV41ScoringFunction(nil), .sqrtsoftplus)
+        XCTAssertEqual(DeepSeekV41ScoringFunction("noaux_tc"), .sigmoid)
+    }
+
+    /// The bias is added to the SCORED value, so under sqrtsoftplus a bias of 100
+    /// has a completely different reach than under sigmoid. Selecting on the wrong
+    /// side of the monotone map is the failure this pins.
+    func testBiasIsAddedAfterScoringAndOnlyMovesTheSelection() {
+        let routed = DeepSeekV41Router.route(
+            logits: [2, 1],
+            bias: [100, 0],
+            topK: 2,
+            scalingFactor: 1,
+            scoringFunction: .sqrtsoftplus
+        )
+        XCTAssertEqual(routed.expertIDs, [0, 1])
+        let first = DeepSeekV41Router.score(2, function: .sqrtsoftplus)
+        let second = DeepSeekV41Router.score(1, function: .sqrtsoftplus)
+        XCTAssertEqual(routed.weights[0], first / (first + second), accuracy: 1e-5)
+        XCTAssertEqual(routed.weights[1], second / (first + second), accuracy: 1e-5)
+        XCTAssertEqual(routed.scores[0], first + 100, accuracy: 1e-5)
+        XCTAssertEqual(routed.scores[1], second, accuracy: 1e-5)
+    }
+
+    /// `gate_temp` divides the logit BEFORE the scoring function, so it is not a
+    /// rescale of the reported weights.
+    func testGateTemperatureDividesBeforeScoring() {
+        let hot = DeepSeekV41Router.route(
+            logits: [4, 0], bias: nil, topK: 2, scalingFactor: 1,
+            scoringFunction: .sqrtsoftplus, gateTemp: 2
+        )
+        XCTAssertEqual(hot.scores[0], DeepSeekV41Router.score(2, function: .sqrtsoftplus), accuracy: 1e-5)
+        XCTAssertEqual(hot.scores[1], DeepSeekV41Router.score(0, function: .sqrtsoftplus), accuracy: 1e-5)
+    }
+
+    /// `norm_topk_prob` renormalizes only when more than one expert is selected;
+    /// a lone expert keeps its own score.
+    func testSingleExpertIsNotRenormalized() {
+        let routed = DeepSeekV41Router.route(
+            logits: [3, 0], bias: nil, topK: 1, scalingFactor: 1, scoringFunction: .sqrtsoftplus
+        )
+        XCTAssertEqual(routed.expertIDs, [0])
+        XCTAssertEqual(routed.weights, [DeepSeekV41Router.score(3, function: .sqrtsoftplus)])
     }
 }
 

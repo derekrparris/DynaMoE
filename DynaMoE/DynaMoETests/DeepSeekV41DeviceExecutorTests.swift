@@ -535,16 +535,19 @@ final class DeepSeekV41RouterKernelTests: XCTestCase {
 
     /// The kernel is the GPU half of `DeepSeekV41Router.route`, so it is checked
     /// against it on the same inputs: the bias ranks, and the weights are the
-    /// unbiased sigmoids. A CPU/GPU agreement on the wrong rule would pass a
+    /// unbiased scores. A CPU/GPU agreement on the wrong rule would pass a
     /// self-consistency test, which is why the expected values come from the
     /// documented rule and not from a second kernel run.
+    ///
+    /// Driven with `scoring_func = sigmoid` so the expectation is a closed form;
+    /// the sqrtsoftplus path is pinned against literals in the CPU suite.
     func testKernelMatchesTheReferenceRouting() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             XCTFail("No Metal GPU device")
             return
         }
         guard let library = device.makeDefaultLibrary(),
-              let function = library.makeFunction(name: "dsv41_router_topk_sigmoid"),
+              let function = library.makeFunction(name: "dsv41_router_topk"),
               let pipeline = try? device.makeComputePipelineState(function: function),
               let queue = device.makeCommandQueue() else {
             XCTFail("Could not build the router pipeline")
@@ -577,10 +580,14 @@ final class DeepSeekV41RouterKernelTests: XCTestCase {
         var top = UInt32(topK)
         var scale = scaling
         var normalise: UInt32 = 1
+        var scoring: UInt32 = 0  // sigmoid
+        var temperature: Float = 1
         encoder.setBytes(&expertCount, length: 4, index: 4)
         encoder.setBytes(&top, length: 4, index: 5)
         encoder.setBytes(&scale, length: 4, index: 6)
         encoder.setBytes(&normalise, length: 4, index: 7)
+        encoder.setBytes(&scoring, length: 4, index: 8)
+        encoder.setBytes(&temperature, length: 4, index: 9)
         encoder.dispatchThreads(
             MTLSize(width: 1, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
@@ -593,9 +600,13 @@ final class DeepSeekV41RouterKernelTests: XCTestCase {
         let indices = indexBuffer.contents().assumingMemoryBound(to: UInt32.self)
         let weights = weightBuffer.contents().assumingMemoryBound(to: Float.self)
         let reference = DeepSeekV41Router.route(
-            logits: logits, bias: bias, topK: topK, scalingFactor: scaling
+            logits: logits, bias: bias, topK: topK, scalingFactor: scaling,
+            scoringFunction: .sigmoid
         )
-        XCTAssertEqual(reference.expertIDs, [2, 4, 0], "selection should follow sigmoid(logit + bias)")
+        // The bias is added to the SCORED value, so expert 4's `sigmoid(-3) + 5`
+        // outranks expert 2's `sigmoid(4)`; adding it to the raw logit instead, as
+        // the V3 rule did, would rank 2 first.
+        XCTAssertEqual(reference.expertIDs, [4, 2, 0], "selection should follow sigmoid(logit) + bias")
         for rank in 0..<topK {
             XCTAssertEqual(Int(indices[rank]), reference.expertIDs[rank], "rank \(rank)")
             XCTAssertEqual(weights[rank], reference.weights[rank], accuracy: 1e-5, "rank \(rank)")
@@ -603,7 +614,8 @@ final class DeepSeekV41RouterKernelTests: XCTestCase {
         // Expert 4 is selected only because of its bias, but its weight is its own
         // unbiased sigmoid's share, not its biased score's.
         let withoutBias = DeepSeekV41Router.route(
-            logits: logits, bias: nil, topK: topK, scalingFactor: scaling
+            logits: logits, bias: nil, topK: topK, scalingFactor: scaling,
+            scoringFunction: .sigmoid
         )
         XCTAssertFalse(withoutBias.expertIDs.contains(4))
         let unbiased = logits.map { DeepSeekV41Router.sigmoid($0) }
@@ -611,6 +623,11 @@ final class DeepSeekV41RouterKernelTests: XCTestCase {
         for (rank, expert) in reference.expertIDs.enumerated() {
             XCTAssertEqual(weights[rank], unbiased[expert] / total * scaling, accuracy: 1e-4)
         }
+        // Expert 4's selection value is sigmoid(-3) + 5 = 5.047, while its weight is
+        // its unbiased sigmoid(-3) = 0.047. Weighting by the selection value instead
+        // would multiply its share by over a hundred.
+        let selectionValue = DeepSeekV41Router.sigmoid(-3) + 5
+        XCTAssertNotEqual(weights[0], selectionValue / total * scaling, accuracy: 0.1)
     }
 }
 

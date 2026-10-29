@@ -816,7 +816,10 @@ nonisolated public final class DeepSeekV41CPUForward {
             logits: logits,
             bias: bias,
             topK: config.numActivatedExperts,
-            scalingFactor: config.routedScalingFactor
+            scalingFactor: config.routedScalingFactor,
+            normalise: config.normalizeTopKProb,
+            scoringFunction: config.scoringFunction,
+            gateTemp: config.gateTemp
         )
     }
 

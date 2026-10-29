@@ -241,6 +241,59 @@ final class DeepSeekV41ConfigTests: XCTestCase {
         XCTAssertEqual(shapes.attentionOutputWidth / shapes.outputGroups, 16 * 512)
     }
 
+    /// `Gate.forward`: `scoring_func` is decoded, the default is the checkpoint's
+    /// sqrtsoftplus rather than the V3 family's sigmoid, and `gate_temp` divides
+    /// the logit before the scoring function.
+    func testRouterScoringConfigDecodes() throws {
+        let config = try config()
+        XCTAssertEqual(config.scoringFunction, .sqrtsoftplus)
+        XCTAssertEqual(config.gateTemp, 1)
+        XCTAssertEqual(config.normalizeTopKProb, true)
+
+        let scored = Self.wrapperJSON
+            .replacingOccurrences(
+                of: "\"num_nextn_predict_layers\": 3,",
+                with: "\"num_nextn_predict_layers\": 3, \"scoring_func\": \"sigmoid\", \"gate_temp\": 0.5,"
+            )
+        let decoded = try DeepSeekV41Config.decode(jsonData: Data(scored.utf8))
+        XCTAssertEqual(decoded.scoringFunction, .sigmoid)
+        XCTAssertEqual(decoded.gateTemp, 0.5, accuracy: 1e-6)
+
+        // A non-positive temperature would hand the router infinities.
+        let zeroTemp = Self.wrapperJSON
+            .replacingOccurrences(
+                of: "\"num_nextn_predict_layers\": 3,",
+                with: "\"num_nextn_predict_layers\": 3, \"gate_temp\": 0,"
+            )
+        XCTAssertThrowsError(try DeepSeekV41Config.decode(jsonData: Data(zeroTemp.utf8))) { error in
+            XCTAssertTrue("\(error)".contains("gate_temp"), "expected gate_temp to be named, got \(error)")
+        }
+    }
+
+    /// `get_moe_config`: a DSpark stage routes its own expert count when the
+    /// checkpoint publishes one, and falls back to the backbone's otherwise.
+    func testDraftStagesHaveTheirOwnExpertCounts() throws {
+        let config = try config()
+        XCTAssertEqual(config.draftExpertCounts.routed, config.numRoutedExperts)
+        XCTAssertEqual(config.draftExpertCounts.activated, config.numActivatedExperts)
+
+        let dspark = Self.wrapperJSON
+            .replacingOccurrences(
+                of: "\"num_nextn_predict_layers\": 3,",
+                with: "\"num_nextn_predict_layers\": 3, \"dspark_n_routed_experts\": 128, \"dspark_num_experts_per_tok\": 3,"
+            )
+        let decoded = try DeepSeekV41Config.decode(jsonData: Data(dspark.utf8))
+        XCTAssertEqual(decoded.draftExpertCounts.routed, 128)
+        XCTAssertEqual(decoded.draftExpertCounts.activated, 3)
+
+        // A DSpark top-k wider than its own expert set can never be satisfied.
+        let impossible = Self.wrapperJSON
+            .replacingOccurrences(
+                of: "\"num_nextn_predict_layers\": 3,",
+                with: "\"num_nextn_predict_layers\": 3, \"dspark_n_routed_experts\": 4, \"dspark_num_experts_per_tok\": 9,"
+            )
+        XCTAssertThrowsError(try DeepSeekV41Config.decode(jsonData: Data(impossible.utf8)))
+    }
 
 
     /// A declared `head_dim` that its parts do not add up to is the shape that
@@ -663,6 +716,25 @@ final class DeepSeekV41WeightCatalogTests: XCTestCase {
         XCTAssertEqual(catalog.slots.filter { $0.role == .visionMarker }.count, 3)
         // A vision block index is not a backbone layer index.
         XCTAssertEqual(catalog.outOfRangeLayers, [])
+    }
+}
+
+// MARK: - Conformance gates
+
+/// Pins every gate. A gate that flips without the reference vectors and a test
+/// update would otherwise be invisible: the load log is the only place it shows.
+final class DeepSeekV41ConformanceGateTests: XCTestCase {
+
+    func testEveryNumericRuleIsStillUnverified() {
+        XCTAssertEqual(DeepSeekV41EngramHasher.conformance, .unverified)
+        XCTAssertEqual(DeepSeekV41Conformance.compressorPooling, .unverified)
+        XCTAssertEqual(DeepSeekV41Conformance.routerScoring, .unverified)
+        XCTAssertEqual(DeepSeekV41Conformance.candidateSelection, .unverified)
+        XCTAssertEqual(DeepSeekV41Conformance.engramCombination, .unverified)
+        XCTAssertEqual(DeepSeekV41Conformance.hyperConnections, .unverified)
+        XCTAssertEqual(DeepSeekV41Conformance.dsparkDrafting, .unverified)
+        XCTAssertEqual(DeepSeekV41Conformance.visionPatching, .unverified)
+        XCTAssertEqual(DeepSeekV41Conformance.unverifiedSummary.count, 8)
     }
 }
 

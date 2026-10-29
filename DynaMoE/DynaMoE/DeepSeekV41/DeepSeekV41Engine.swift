@@ -252,7 +252,7 @@ nonisolated public struct DeepSeekV41Pipelines {
         self.attention = try make("dsv41_attention_csa2_f32")
         self.poolLatents = try make("dsv41_pool_latents_f32")
         self.indexerScores = try make("dsv41_indexer_scores_f32")
-        self.router = try make("dsv41_router_topk_sigmoid")
+        self.router = try make("dsv41_router_topk")
         self.hcMix = try make("dsv41_hc_mix_f32")
         self.hcWrite = try make("dsv41_hc_write_f32")
         self.clear = try make("clear_vector_f32")

@@ -7,12 +7,14 @@
 //  Three things here differ from the Mixtral/Qwen MoE paths in the rest of the
 //  engine:
 //
-//    1. Routing is SIGMOID top-k with a per-expert selection bias, not softmax.
-//       Softmax over 384 experts makes every router logit compete with 383 others,
-//       so a checkpoint trained with sigmoid gates routes to a different set than
-//       its weights expect. The bias is added for SELECTION only and never appears
-//       in the weight, which is what keeps a rarely-chosen expert from being
-//       starved forever without corrupting the mixture of the ones that are chosen.
+//    1. Routing is top-k over a SCORED logit with a per-expert selection bias, not
+//       a softmax gate. `scoring_func` on this checkpoint is `sqrtsoftplus`, and a
+//       softmax over 384 experts would make every logit compete with 383 others, so
+//       a checkpoint trained with this gate routes to a different set than its
+//       weights expect. The bias is added to the SCORED value for SELECTION only
+//       and never appears in the weight, which is what keeps a rarely-chosen expert
+//       from being starved forever without corrupting the mixture of the ones that
+//       are chosen.
 //
 //    2. The mixture is rescaled by `routed_scaling_factor` after normalizing over
 //       the selected experts.
@@ -38,10 +40,10 @@ nonisolated public struct DeepSeekV41Routing: Sendable, Equatable {
     public let expertIDs: [Int]
     /// The weight applied to each expert's output, already normalized and scaled.
     public let weights: [Float]
-    /// The selection scores before normalization (sigmoid of logit + bias). Kept
+    /// The selection values, i.e. `score(logit / gate_temp) + bias` per expert. Kept
     /// so the tests can assert the ranking instead of inferring it. These are NOT
     /// the values the mixture weights are normalized from; those are the unbiased
-    /// `sigmoid(logit)`.
+    /// scored values of the selected experts.
     public let scores: [Float]
 
     public init(expertIDs: [Int], weights: [Float], scores: [Float]) {
@@ -55,7 +57,7 @@ nonisolated public struct DeepSeekV41Routing: Sendable, Equatable {
 
 nonisolated public enum DeepSeekV41Router {
 
-    /// Sigmoid, computed so a large-magnitude logit cannot overflow.
+    /// The logistic function, computed so a large-magnitude input cannot overflow.
     public static func sigmoid(_ value: Float) -> Float {
         if value >= 0 {
             return 1 / (1 + exp(-value))
@@ -64,61 +66,109 @@ nonisolated public enum DeepSeekV41Router {
         return exponential / (1 + exponential)
     }
 
+    /// `scoring_func` applied to one gate logit.
+    ///
+    /// The checkpoint ships `sqrtsoftplus`, and the three options are not
+    /// rescalings of each other: each is a different monotone map, so the same
+    /// logits plus the same bias rank the experts differently under `sigmoid` than
+    /// under `sqrtsoftplus`. Selecting on the wrong one runs the wrong experts.
+    public static func score(_ logit: Float, function: DeepSeekV41ScoringFunction) -> Float {
+        switch function {
+        case .sigmoid:
+            return sigmoid(logit)
+        case .sqrtsoftplus:
+            // `softplus(x).sqrt()`. Softplus is evaluated as
+            // `max(x, 0) + log1p(exp(-|x|))` so a large positive logit cannot
+            // overflow `exp`.
+            let softplus = max(logit, 0) + log1p(exp(-abs(logit)))
+            return sqrt(softplus)
+        case .softmax:
+            // Softmax is a distribution over ALL experts, so it cannot be applied
+            // to one logit at a time. `route` normalizes the whole vector instead.
+            return logit
+        }
+    }
+
     /// Routes one token.
     ///
-    /// The bias is a SELECTION aid only: the ranking uses
-    /// `sigmoid(logit + bias)`, while the mixture weight each selected expert
-    /// receives is its own unbiased `sigmoid(logit)`. Folding the bias into the
-    /// weight would change every token's mixture, which is exactly what the bias
-    /// is not allowed to do.
+    /// The reference is `Gate.forward`:
+    ///
+    ///     scores = linear(x) / gate_temp
+    ///     scores = softmax | sigmoid | sqrt(softplus) applied to scores
+    ///     indices = (scores + bias).topk(topk)
+    ///     weights = scores[indices]  (normalized, then *= route_scale)
+    ///
+    /// The bias is added to the SCORED value, not to the raw logit and not after a
+    /// second monotone map, and it steers selection only: the returning weights are
+    /// the unbiased scores of the experts that were chosen.
     ///
     /// - Parameters:
     ///   - logits: router output, one per routed expert.
-    ///   - bias: per-expert selection bias from `ffn.gate.bias`, or nil.
+    ///   - bias: per-expert selection bias (`ffn.gate.bias`, or `bias_vl` inside an
+    ///     image span), or nil.
     ///   - topK: experts to activate.
     ///   - scalingFactor: `routed_scaling_factor`; 0 or negative disables it.
-    ///   - normalise: divide the selected weights by their sum. The checkpoint's
-    ///     `norm_topk_prob` equivalent; when off the raw sigmoid scores are used.
+    ///   - normalise: `norm_topk_prob`. The reference renormalizes only when
+    ///     `topk > 1` and adds 1e-20 rather than `norm_eps`, to match training.
+    ///   - scoringFunction: `scoring_func`.
+    ///   - gateTemp: `gate_temp`; the logits are divided by it first.
     public static func route(
         logits: [Float],
         bias: [Float]?,
         topK: Int,
         scalingFactor: Float,
-        normalise: Bool = true
+        normalise: Bool = true,
+        scoringFunction: DeepSeekV41ScoringFunction = .sqrtsoftplus,
+        gateTemp: Float = 1
     ) -> DeepSeekV41Routing {
         guard !logits.isEmpty, topK > 0 else { return .empty }
         let count = min(topK, logits.count)
+        let temperature = gateTemp > 0 ? gateTemp : 1
 
-        // Unbiased mixture weights and biased selection scores, computed from the
-        // same logits so the two can never drift.
-        let weights = logits.map { sigmoid($0) }
-        var scores = logits
-        if let bias, bias.count == logits.count {
-            for index in scores.indices { scores[index] += bias[index] }
+        // Scored values, in the order the reference computes them.
+        var scored: [Float]
+        if scoringFunction == .softmax {
+            var maxLogit = -Float.greatestFiniteMagnitude
+            for logit in logits { maxLogit = max(maxLogit, logit / temperature) }
+            var exponentials = logits.map { exp($0 / temperature - maxLogit) }
+            let total = exponentials.reduce(0, +)
+            if total > 0 {
+                exponentials = exponentials.map { $0 / total }
+            }
+            scored = exponentials
+        } else {
+            scored = logits.map { score($0 / temperature, function: scoringFunction) }
         }
-        for index in scores.indices { scores[index] = sigmoid(scores[index]) }
 
-        // Rank by score, ties broken by expert id so the selection is stable and a
-        // reused prefix routes identically.
-        let ranked = scores.indices.sorted { lhs, rhs in
-            scores[lhs] == scores[rhs] ? lhs < rhs : scores[lhs] > scores[rhs]
+        // Selection sees `scores + bias`; the mixture sees `scores`.
+        var selection = scored
+        if let bias, bias.count == logits.count {
+            for index in selection.indices { selection[index] += bias[index] }
+        }
+
+        // Rank by selection value, ties broken by expert id so a reused prefix
+        // routes identically.
+        let ranked = selection.indices.sorted { lhs, rhs in
+            selection[lhs] == selection[rhs] ? lhs < rhs : selection[lhs] > selection[rhs]
         }
         let selected = Array(ranked.prefix(count))
-        var selectedScores = selected.map { weights[$0] }
+        var selectedWeights = selected.map { scored[$0] }
 
-        if normalise {
-            let total = selectedScores.reduce(0, +)
+        // `norm_topk_prob and topk > 1`: a single selected expert is left alone, and
+        // the epsilon is the training-time 1e-20, not `norm_eps`.
+        if normalise, count > 1 {
+            let total = selectedWeights.reduce(0, +) + 1e-20
             if total > 0 {
-                selectedScores = selectedScores.map { $0 / total }
+                selectedWeights = selectedWeights.map { $0 / total }
             }
         }
         if scalingFactor > 0 {
-            selectedScores = selectedScores.map { $0 * scalingFactor }
+            selectedWeights = selectedWeights.map { $0 * scalingFactor }
         }
         return DeepSeekV41Routing(
             expertIDs: selected,
-            weights: selectedScores,
-            scores: Array(scores)
+            weights: selectedWeights,
+            scores: Array(selection)
         )
     }
 }
@@ -202,7 +252,11 @@ nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
     ///
     /// Pairs already resident keep their slot, so the returned indices are stable
     /// across calls and a caller can rely on a slot's contents for the duration of
-    /// one layer.
+    /// one layer. When `pairs.count` exceeds `capacity`, some indices repeat: the
+    /// arena cannot hold more slots than it has, so the later pair overwrites the
+    /// slot an earlier pair in the same call received. Callers must therefore keep
+    /// `pairs.count <= capacity` (top-k times one arena slot per layer is the
+    /// intended use).
     public func acquire(_ pairs: [(layer: Int, expert: Int)]) -> [Int] {
         lock.lock()
         defer { lock.unlock() }

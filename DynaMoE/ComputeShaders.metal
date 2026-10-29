@@ -8866,12 +8866,17 @@ kernel void dsv41_indexer_scores_f32(
     blockScores[blockIdx] = (blockMax == -1e30f) ? 0.0f : blockMax;
 }
 
-/// MSL Kernel: sigmoid top-k routing with a per-expert selection bias.
-/// The bias is added for SELECTION only and never enters the weight, which keeps a
-/// starved expert from being starved forever without changing the mixture of the
-/// experts that are actually chosen. The ranking is `sigmoid(logit + bias)`; the
-/// weight of each selected expert is its own unbiased `sigmoid(logit)`.
-kernel void dsv41_router_topk_sigmoid(
+/// MSL Kernel: scored top-k routing with a per-expert selection bias.
+///
+/// The rule is `Gate.forward`: `score = fn(logit / gate_temp)`, selection ranks by
+/// `score + bias`, and the mixture weight of a selected expert is its own unbiased
+/// `score`. The bias therefore changes WHICH experts run but never how much weight
+/// they get.
+///
+/// `scoringFunction` is 0 = sigmoid, 1 = sqrtsoftplus. Softmax (2) is a
+/// distribution over all experts and needs a second pass over them, so the
+/// executor refuses it rather than computing it one expert at a time.
+kernel void dsv41_router_topk(
     device const float* logits [[buffer(0)]],
     device const float* biasBuffer [[buffer(1)]],     // may be null
     device uint32_t* expertIndices [[buffer(2)]],
@@ -8880,6 +8885,8 @@ kernel void dsv41_router_topk_sigmoid(
     constant uint32_t& topK [[buffer(5)]],
     constant float& scalingFactor [[buffer(6)]],
     constant uint32_t& normalise [[buffer(7)]],
+    constant uint32_t& scoringFunction [[buffer(8)]],
+    constant float& gateTemp [[buffer(9)]],
     uint tid [[thread_position_in_grid]]
 ) {
     if (tid != 0 || expertCount == 0 || topK == 0) return;
@@ -8903,13 +8910,15 @@ kernel void dsv41_router_topk_sigmoid(
     uint32_t topIndex[64];
     uint32_t filled = 0;
 
+    float temperature = gateTemp > 0.0f ? gateTemp : 1.0f;
     for (uint32_t expert = 0; expert < expertCount; ++expert) {
-        float logit = logits[expert];
-        float value = logit + ((biasBuffer != nullptr) ? biasBuffer[expert] : 0.0f);
-        float score = value >= 0.0f ? (1.0f / (1.0f + exp(-value)))
-                                    : (exp(value) / (1.0f + exp(value)));
-        float weight = logit >= 0.0f ? (1.0f / (1.0f + exp(-logit)))
-                                     : (exp(logit) / (1.0f + exp(logit)));
+        float logit = logits[expert] / temperature;
+        // The weight is the UNBIASED score; the bias only moves the ranking.
+        float weight = (scoringFunction == 0u)
+            ? (logit >= 0.0f ? (1.0f / (1.0f + exp(-logit)))
+                             : (exp(logit) / (1.0f + exp(logit))))
+            : sqrt(max(logit, 0.0f) + log(1.0f + exp(-fabs(logit))));
+        float score = weight + ((biasBuffer != nullptr) ? biasBuffer[expert] : 0.0f);
 
         uint32_t position = filled;
         while (position > 0) {
@@ -8940,9 +8949,12 @@ kernel void dsv41_router_topk_sigmoid(
         }
     }
 
+    // `norm_topk_prob and topk > 1`, with the training-time 1e-20 rather than
+    // `norm_eps` (`Gate.forward`).
     float total = 0.0f;
-    if (normalise != 0u) {
+    if (normalise != 0u && filled > 1u) {
         for (uint32_t rank = 0; rank < filled; ++rank) total += topWeight[rank];
+        total += 1e-20f;
     }
     for (uint32_t rank = 0; rank < filled; ++rank) {
         float mixWeight = topWeight[rank];

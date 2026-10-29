@@ -1371,6 +1371,14 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         _ encoder: MTLComputeCommandEncoder,
         layer: Int
     ) throws {
+        guard config.scoringFunction != .softmax else {
+            // `softmax` normalizes over every expert, so it cannot be evaluated one
+            // expert at a time the way this single-thread scan does. Refusing is
+            // the honest answer; silently routing on the wrong scores is not.
+            throw DeepSeekV41EngineError.unsupportedStage(
+                "scoring_func softmax (the kernel implements sigmoid and sqrtsoftplus)"
+            )
+        }
         encoder.setComputePipelineState(pipelines.router)
         encoder.setBuffer(workspace.routerLogits, offset: 0, index: 0)
         // An absent bias is a bound zero vector, not an unbound slot: the kernel
@@ -1388,11 +1396,15 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         var expertCount = UInt32(config.numRoutedExperts)
         var topK = UInt32(max(1, config.numActivatedExperts))
         var scaling = config.routedScalingFactor
-        var normalise: UInt32 = 1
+        var normalise: UInt32 = config.normalizeTopKProb ? 1 : 0
+        var scoring: UInt32 = config.scoringFunction == .sigmoid ? 0 : 1
+        var temperature = config.gateTemp
         encoder.setBytes(&expertCount, length: 4, index: 4)
         encoder.setBytes(&topK, length: 4, index: 5)
         encoder.setBytes(&scaling, length: 4, index: 6)
         encoder.setBytes(&normalise, length: 4, index: 7)
+        encoder.setBytes(&scoring, length: 4, index: 8)
+        encoder.setBytes(&temperature, length: 4, index: 9)
         encoder.dispatchThreads(
             MTLSize(width: 1, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)

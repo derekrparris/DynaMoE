@@ -43,7 +43,23 @@ nonisolated public enum DeepSeekV41Conformance {
     }
 
     /// How a run of positions pools into one compressed row.
+    ///
+    /// The RULE now matches `Compressor.forward` in the checkpoint's
+    /// `inference/model.py` (project the layer input through `wkv` and `wgate`,
+    /// softmax the gate over the group PER DIMENSION, `RMSNorm`, then rotate at the
+    /// group's first position), and both backends implement that one rule. What is
+    /// still missing is a numeric vector produced by a reference run, so the gate
+    /// stays open: reading the reference and agreeing with it is not the same as
+    /// having compared outputs.
     public static let compressorPooling: Gate = .unverified
+
+    /// How a raw gate logit becomes a routing score (`scoring_func`) and how the
+    /// selection bias is applied.
+    ///
+    /// Matches `Gate.forward` (`score + bias` selects, `score` weights), but the
+    /// CPU reference and the kernel are only self-consistent until a real routing
+    /// vector is checked in.
+    public static let routerScoring: Gate = .unverified
 
     /// How the compressed-row candidate blocks are scored and truncated.
     ///
@@ -82,6 +98,7 @@ nonisolated public enum DeepSeekV41Conformance {
             ("Engram hashing", DeepSeekV41EngramHasher.conformance == .verifiedAgainstReference
                 ? .verifiedAgainstReference : .unverified),
             ("compressor pooling", compressorPooling),
+            ("router scoring", routerScoring),
             ("Engram combination", engramCombination),
             ("candidate selection", candidateSelection),
             ("hyper-connections", hyperConnections),
