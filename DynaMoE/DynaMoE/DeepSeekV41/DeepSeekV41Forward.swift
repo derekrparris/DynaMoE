@@ -252,6 +252,8 @@ nonisolated public struct DeepSeekV41TensorShapes: Sendable, Equatable {
 nonisolated public enum DeepSeekV41ForwardStages {
 
     public enum Stage: String, Sendable, Equatable {
+        /// Project the flattened stack through `hc_attn_fn` and split the logits.
+        case hcAttentionCoefficients
         case mixAttentionStreams
         case attnNorm
         case queryDown
@@ -268,6 +270,8 @@ nonisolated public enum DeepSeekV41ForwardStages {
         case outputDown
         case outputUp
         case writeAttentionStreams
+        /// The same for `hc_ffn_fn`, which reads the POST-attention stack.
+        case hcFFNCoefficients
         case mixFFNStreams
         case ffnNorm
         case engram
@@ -289,6 +293,7 @@ nonisolated public enum DeepSeekV41ForwardStages {
     /// after the attention half had already read a residual without it.
     public static let layerPipeline: [Stage] = [
         .engram,
+        .hcAttentionCoefficients,
         .mixAttentionStreams,
         .attnNorm,
         .queryDown,
@@ -305,6 +310,7 @@ nonisolated public enum DeepSeekV41ForwardStages {
         .outputDown,
         .outputUp,
         .writeAttentionStreams,
+        .hcFFNCoefficients,
         .mixFFNStreams,
         .ffnNorm,
         .router,

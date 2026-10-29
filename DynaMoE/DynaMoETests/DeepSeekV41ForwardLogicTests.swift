@@ -1489,9 +1489,11 @@ final class DeepSeekV41TensorShapeTests: XCTestCase {
         let stages = DeepSeekV41ForwardStages.layerPipeline
         XCTAssertEqual(Set(stages).count, stages.count)
         // Engram memory is written into the residual at the top of the layer, so it
-        // has to run before the stage that mixes the streams for attention.
+        // has to run before the stage that mixes the streams for attention, and that
+        // mix depends on the coefficients the `hc_*_fn` projection just produced.
         XCTAssertEqual(stages.first, .engram)
-        XCTAssertEqual(stages.dropFirst().first, .mixAttentionStreams)
+        XCTAssertEqual(stages.dropFirst().first, .hcAttentionCoefficients)
+        XCTAssertEqual(stages.dropFirst(2).first, .mixAttentionStreams)
         XCTAssertEqual(stages.last, .collapseStreams)
         // The attention stage must come after the latent is written.
         let write = stages.firstIndex(of: .writeLatent)

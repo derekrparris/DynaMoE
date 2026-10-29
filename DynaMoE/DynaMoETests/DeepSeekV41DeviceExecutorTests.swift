@@ -1143,3 +1143,251 @@ final class DeepSeekV41SinkhornKernelTests: XCTestCase {
         }
     }
 }
+
+/// The GPU half of the mHC rule. The host side is pinned against the checkpoint by
+/// `DeepSeekV41HyperConnectionGoldenTests`, so these compare the kernels with
+/// `DeepSeekV41HyperConnections` on the same inputs: a disagreement is a kernel bug
+/// rather than a second derivation of the rule.
+final class DeepSeekV41HyperConnectionKernelTests: XCTestCase {
+
+    private let copies = 2
+    private let dim = 3
+    private var width: Int { copies * dim }
+    private var mixCount: Int { (2 + copies) * copies }
+
+    private let streams: [Float] = [0.2, -0.4, 0.6, 0.1, 0.3, -0.5]
+    private let scale: [Float] = [0.7, -0.3, 0.5]
+    private let base: [Float] = [0.05, -0.1, 0.2, 0.0, -0.05, 0.1, 0.15, -0.2]
+    private let projection: [Float] = [
+        0.4, -0.2, 0.1, 0.3, -0.5, 0.2,
+        -0.1, 0.6, 0.2, -0.3, 0.1, 0.4,
+        0.2, 0.1, -0.4, 0.5, 0.3, -0.2,
+        -0.3, 0.2, 0.5, 0.1, -0.6, 0.2,
+        0.1, -0.5, 0.3, 0.2, 0.4, -0.1,
+        0.5, 0.3, -0.1, -0.2, 0.2, 0.6,
+        -0.2, 0.4, 0.6, 0.1, -0.3, 0.3,
+        0.3, -0.1, 0.2, 0.6, 0.1, -0.4,
+    ]
+
+    private var stack: [[Float]] {
+        (0..<copies).map { copy in
+            (0..<dim).map { streams[copy * dim + $0] }
+        }
+    }
+
+    private func hostCoefficients() -> DeepSeekV41HyperConnections.Coefficients {
+        DeepSeekV41HyperConnections.coefficients(
+            streams: stack,
+            projection: DeepSeekV41Matrix(
+                rows: mixCount, columns: width, values: projection
+            ),
+            scale: scale,
+            base: base,
+            normalizationEpsilon: 1e-6,
+            epsilon: 1e-6,
+            iterations: 3
+        )
+    }
+
+    private func environment() throws -> (
+        MTLDevice, MTLLibrary, MTLCommandQueue
+    ) {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        let library = try XCTUnwrap(device.makeDefaultLibrary())
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+        return (device, library, queue)
+    }
+
+    private func pipeline(_ name: String, _ library: MTLLibrary, _ device: MTLDevice) throws
+        -> MTLComputePipelineState {
+        let function = try XCTUnwrap(library.makeFunction(name: name))
+        return try device.makeComputePipelineState(function: function)
+    }
+
+    private func buffer(_ device: MTLDevice, _ values: [Float]) throws -> MTLBuffer {
+        try XCTUnwrap(
+            device.makeBuffer(
+                bytes: values, length: values.count * MemoryLayout<Float>.stride,
+                options: .storageModeShared
+            )
+        )
+    }
+
+    func testProjectionAndSplitMatchTheHostRule() throws {
+        let (device, library, queue) = try environment()
+        let project = try pipeline("dsv41_hc_project_f32", library, device)
+        let split = try pipeline("dsv41_hc_split_f32", library, device)
+
+        let weightBuffer = try buffer(device, projection)
+        let streamBuffer = try buffer(device, streams)
+        let logitsBuffer = try XCTUnwrap(
+            device.makeBuffer(
+                length: mixCount * MemoryLayout<Float>.stride, options: .storageModeShared
+            )
+        )
+        let preBuffer = try XCTUnwrap(
+            device.makeBuffer(
+                length: copies * MemoryLayout<Float>.stride, options: .storageModeShared
+            )
+        )
+        let postBuffer = try XCTUnwrap(
+            device.makeBuffer(
+                length: copies * MemoryLayout<Float>.stride, options: .storageModeShared
+            )
+        )
+        let combBuffer = try XCTUnwrap(
+            device.makeBuffer(
+                length: copies * copies * MemoryLayout<Float>.stride, options: .storageModeShared
+            )
+        )
+        let scaleBuffer = try buffer(device, scale)
+        let baseBuffer = try buffer(device, base)
+
+        let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+        let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(project)
+        encoder.setBuffer(weightBuffer, offset: 0, index: 0)
+        encoder.setBuffer(streamBuffer, offset: 0, index: 1)
+        encoder.setBuffer(logitsBuffer, offset: 0, index: 2)
+        var weightOffset = UInt64(0)
+        var normEpsilon: Float = 1e-6
+        var widthDimension = UInt32(width)
+        var outDimension = UInt32(mixCount)
+        encoder.setBytes(&weightOffset, length: 8, index: 3)
+        encoder.setBytes(&normEpsilon, length: 4, index: 4)
+        encoder.setBytes(&widthDimension, length: 4, index: 5)
+        encoder.setBytes(&outDimension, length: 4, index: 6)
+        encoder.dispatchThreads(
+            MTLSize(width: mixCount, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+        encoder.memoryBarrier(scope: .buffers)
+
+        encoder.setComputePipelineState(split)
+        encoder.setBuffer(logitsBuffer, offset: 0, index: 0)
+        encoder.setBuffer(scaleBuffer, offset: 0, index: 1)
+        encoder.setBuffer(baseBuffer, offset: 0, index: 2)
+        encoder.setBuffer(preBuffer, offset: 0, index: 3)
+        encoder.setBuffer(postBuffer, offset: 0, index: 4)
+        encoder.setBuffer(combBuffer, offset: 0, index: 5)
+        var copiesDimension = UInt32(copies)
+        var iterations = UInt32(3)
+        var epsilon: Float = 1e-6
+        encoder.setBytes(&copiesDimension, length: 4, index: 6)
+        encoder.setBytes(&iterations, length: 4, index: 7)
+        encoder.setBytes(&epsilon, length: 4, index: 8)
+        encoder.dispatchThreads(
+            MTLSize(width: 32, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        let host = hostCoefficients()
+        let logits = logitsBuffer.contents().assumingMemoryBound(to: Float.self)
+        for index in 0..<mixCount {
+            XCTAssertEqual(logits[index], host.logits[index], accuracy: 1e-5, "logit \(index)")
+        }
+        let pre = preBuffer.contents().assumingMemoryBound(to: Float.self)
+        let post = postBuffer.contents().assumingMemoryBound(to: Float.self)
+        let comb = combBuffer.contents().assumingMemoryBound(to: Float.self)
+        for copy in 0..<copies {
+            XCTAssertEqual(pre[copy], host.pre[copy], accuracy: 1e-6, "pre \(copy)")
+            XCTAssertEqual(post[copy], host.post[copy], accuracy: 1e-6, "post \(copy)")
+        }
+        for index in 0..<(copies * copies) {
+            XCTAssertEqual(comb[index], host.comb[index], accuracy: 1e-6, "comb \(index)")
+        }
+    }
+
+    func testCollapseAndExpansionMatchTheHostRule() throws {
+        let (device, library, queue) = try environment()
+        let prePipeline = try pipeline("dsv41_hc_pre_f32", library, device)
+        let postPipeline = try pipeline("dsv41_hc_post_f32", library, device)
+
+        let mix: [Float] = [0.6, 0.4]
+        let sublayerOutput: [Float] = [0.5, -0.25, 1.0]
+        let host = hostCoefficients()
+
+        let streamBuffer = try buffer(device, streams)
+        let residualBuffer = try XCTUnwrap(
+            device.makeBuffer(
+                length: streams.count * MemoryLayout<Float>.stride, options: .storageModeShared
+            )
+        )
+        let collapsedBuffer = try XCTUnwrap(
+            device.makeBuffer(
+                length: dim * MemoryLayout<Float>.stride, options: .storageModeShared
+            )
+        )
+        let mixBuffer = try buffer(device, mix)
+        let outputBuffer = try buffer(device, sublayerOutput)
+        let gainsBuffer = try buffer(device, host.post)
+        let combBuffer = try buffer(device, host.comb)
+        let descaledStreams = try buffer(device, streams)
+
+        let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+        let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(prePipeline)
+        encoder.setBuffer(streamBuffer, offset: 0, index: 0)
+        encoder.setBuffer(mixBuffer, offset: 0, index: 1)
+        encoder.setBuffer(collapsedBuffer, offset: 0, index: 2)
+        encoder.setBuffer(residualBuffer, offset: 0, index: 3)
+        var widthDimension = UInt32(dim)
+        var copiesDimension = UInt32(copies)
+        encoder.setBytes(&widthDimension, length: 4, index: 4)
+        encoder.setBytes(&copiesDimension, length: 4, index: 5)
+        encoder.dispatchThreads(
+            MTLSize(width: dim, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+        encoder.memoryBarrier(scope: .buffers)
+
+        encoder.setComputePipelineState(postPipeline)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 0)
+        encoder.setBuffer(residualBuffer, offset: 0, index: 1)
+        encoder.setBuffer(gainsBuffer, offset: 0, index: 2)
+        encoder.setBuffer(combBuffer, offset: 0, index: 3)
+        encoder.setBuffer(descaledStreams, offset: 0, index: 4)
+        var streamWidth = UInt32(dim)
+        var streamCopies = UInt32(copies)
+        encoder.setBytes(&streamWidth, length: 4, index: 5)
+        encoder.setBytes(&streamCopies, length: 4, index: 6)
+        encoder.dispatchThreads(
+            MTLSize(width: dim, height: copies, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        let collapsed = DeepSeekV41HyperConnections.pre(streams: stack, mix: mix)
+        let collapsedOut = collapsedBuffer.contents().assumingMemoryBound(to: Float.self)
+        let residual = residualBuffer.contents().assumingMemoryBound(to: Float.self)
+        for index in 0..<dim {
+            XCTAssertEqual(collapsedOut[index], collapsed[index], accuracy: 1e-6, "collapse \(index)")
+            // The snapshot `hc_post` mixes back in is the block input, unchanged.
+            XCTAssertEqual(residual[index], streams[index], accuracy: 1e-6, "residual \(index)")
+        }
+
+        let expanded = DeepSeekV41HyperConnections.post(
+            output: sublayerOutput, residual: stack, gains: host.post, comb: host.comb
+        )
+        let expandedOut = descaledStreams.contents().assumingMemoryBound(to: Float.self)
+        for copy in 0..<copies {
+            for index in 0..<dim {
+                XCTAssertEqual(
+                    expandedOut[copy * dim + index],
+                    expanded[copy][index],
+                    accuracy: 1e-6,
+                    "copy \(copy) dim \(index)"
+                )
+            }
+        }
+    }
+}

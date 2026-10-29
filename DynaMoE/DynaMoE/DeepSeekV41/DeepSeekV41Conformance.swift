@@ -174,12 +174,15 @@ nonisolated public enum DeepSeekV41Conformance {
     /// reference's own code. The softmax / `+eps` / column-normalize order is this
     /// port's reading of that kernel, not a number the reference produced.
     ///
-    /// The device path applies the same coefficients (`dsv41_hc_sinkhorn` plus the
-    /// projection and the two write kernels) but has never run against a checkpoint,
-    /// so its own arithmetic is kernel-tested rather than forward-tested. It also
-    /// still reads `hc_*_fn` as a per-stream vector instead of projecting the
-    /// flattened stack — see `DeepSeekV41MetalForward.encodeStreamMix`, which has to
-    /// grow that projection before the two backends compute the same rule.
+    /// The device path runs the same rule in four kernels: `dsv41_hc_project_f32`
+    /// (the FP32 projection of the flattened stack), `dsv41_hc_split_f32` (the
+    /// three-way split, sharing the Sinkhorn schedule with `dsv41_hc_sinkhorn`),
+    /// `dsv41_hc_pre_f32` (the collapse, which also snapshots the block input) and
+    /// `dsv41_hc_post_f32` (the expansion). `DeepSeekV41HyperConnectionKernelTests`
+    /// compares all four with this host rule on the same inputs, so a disagreement
+    /// is a kernel bug. What that cannot show, because the checkpoint has never been
+    /// run, is the wiring: which mix each stage reads and where the residual is
+    /// snapshotted.
     public static let hyperConnections: Gate = .verifiedAgainstReference
 
     /// DSpark's draft-chain construction.

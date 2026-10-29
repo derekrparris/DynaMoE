@@ -208,6 +208,13 @@ nonisolated public struct DeepSeekV41Pipelines {
     /// The Engram gate and residual add, one threadgroup per hyper-connection copy.
     public let engramGate: MTLComputePipelineState
     public let hcSinkhorn: MTLComputePipelineState
+    /// The mHC rule: project the flattened stack, split the logits, collapse with a
+    /// mix, expand back through `comb`.
+    public let hcProject: MTLComputePipelineState
+    public let hcSplit: MTLComputePipelineState
+    public let hcPre: MTLComputePipelineState
+    public let hcPost: MTLComputePipelineState
+    public let hcIdentityMix: MTLComputePipelineState
     public let rope: MTLComputePipelineState
     public let storeLatent: MTLComputePipelineState
     public let gatherLatents: MTLComputePipelineState
@@ -215,9 +222,8 @@ nonisolated public struct DeepSeekV41Pipelines {
     public let poolLatents: MTLComputePipelineState
     public let indexerScores: MTLComputePipelineState
     public let router: MTLComputePipelineState
-    public let hcMix: MTLComputePipelineState
-    public let hcWrite: MTLComputePipelineState
     public let clear: MTLComputePipelineState
+    public let copy: MTLComputePipelineState
     public let vectorAdd: MTLComputePipelineState
     /// Gain-vector RMSNorm the executor binds (the shard-offset `rmsnorm_bf16`
     /// assumes a bf16 gain, and the executor resolves every gain to FP32 once).
@@ -248,6 +254,11 @@ nonisolated public struct DeepSeekV41Pipelines {
         self.engramDequantRows = try make("dsv41_engram_dequant_rows")
         self.engramGate = try make("dsv41_engram_gate_f32")
         self.hcSinkhorn = try make("dsv41_hc_sinkhorn")
+        self.hcProject = try make("dsv41_hc_project_f32")
+        self.hcSplit = try make("dsv41_hc_split_f32")
+        self.hcPre = try make("dsv41_hc_pre_f32")
+        self.hcPost = try make("dsv41_hc_post_f32")
+        self.hcIdentityMix = try make("dsv41_hc_identity_mix_f32")
         self.rope = try make("dsv41_rope_latent")
         self.storeLatent = try make("dsv41_store_latent_f16")
         self.gatherLatents = try make("dsv41_gather_latents_f16")
@@ -255,9 +266,8 @@ nonisolated public struct DeepSeekV41Pipelines {
         self.poolLatents = try make("dsv41_pool_latents_f32")
         self.indexerScores = try make("dsv41_indexer_scores_f32")
         self.router = try make("dsv41_router_topk")
-        self.hcMix = try make("dsv41_hc_mix_f32")
-        self.hcWrite = try make("dsv41_hc_write_f32")
         self.clear = try make("clear_vector_f32")
+        self.copy = try make("dsv41_copy_f32")
         self.vectorAdd = try make("vector_add_f32")
         self.rmsNormGain = try make("dsv41_rmsnorm_f32_gain")
         self.fp8SwiGLU = try make("dsv41_fp8_block32_swiglu_gate_up")
@@ -728,6 +738,20 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
     public let reduced: MTLBuffer
     public let moeOut: MTLBuffer
     public let streams: MTLBuffer
+    /// The `hc_*_fn` logits for the sub-layer being computed, `(2 + mult) * mult`.
+    public let hcLogits: MTLBuffer
+    /// The collapse weight the NEXT sub-layer reads. Reset to the identity mix at
+    /// the start of every forward pass (`make_identity_pre_mix`).
+    public let hcMix: MTLBuffer
+    public let hcAttentionPre: MTLBuffer
+    public let hcAttentionPost: MTLBuffer
+    public let hcAttentionComb: MTLBuffer
+    public let hcFFNPre: MTLBuffer
+    public let hcFFNPost: MTLBuffer
+    public let hcFFNComb: MTLBuffer
+    /// The block input `hc_post` mixes back in. `hc_pre` writes it in the same pass
+    /// that collapses the stack, because `hc_post` cannot read the streams in place.
+    public let hcResidual: MTLBuffer
     public let logits: MTLBuffer
     public let rowIndices: MTLBuffer
     public let tokenIDs: MTLBuffer
@@ -796,6 +820,15 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
               let reduced = make(float4(max(1, max(shapes.qLoraRank, shapes.outputReducedWidth)))),
               let moeOut = make(float4(shapes.hidden)),
               let streams = make(float4(mult * shapes.hidden)),
+              let hcLogits = make(float4((2 + mult) * mult)),
+              let hcMix = make(float4(mult)),
+              let hcAttentionPre = make(float4(mult)),
+              let hcAttentionPost = make(float4(mult)),
+              let hcAttentionComb = make(float4(mult * mult)),
+              let hcFFNPre = make(float4(mult)),
+              let hcFFNPost = make(float4(mult)),
+              let hcFFNComb = make(float4(mult * mult)),
+              let hcResidual = make(float4(mult * shapes.hidden)),
               let logits = make(float4(config.vocabSize)),
               let rowIndices = make(4 * gather),
               let tokenIDs = make(4),
@@ -826,6 +859,15 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
         self.reduced = reduced
         self.moeOut = moeOut
         self.streams = streams
+        self.hcLogits = hcLogits
+        self.hcMix = hcMix
+        self.hcAttentionPre = hcAttentionPre
+        self.hcAttentionPost = hcAttentionPost
+        self.hcAttentionComb = hcAttentionComb
+        self.hcFFNPre = hcFFNPre
+        self.hcFFNPost = hcFFNPost
+        self.hcFFNComb = hcFFNComb
+        self.hcResidual = hcResidual
         self.logits = logits
         self.rowIndices = rowIndices
         self.tokenIDs = tokenIDs

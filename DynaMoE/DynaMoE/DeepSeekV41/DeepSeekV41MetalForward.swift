@@ -325,6 +325,7 @@ nonisolated public enum DeepSeekV41DevicePlan {
     /// layer pipeline.
     public static let encodedStages: Set<DeepSeekV41ForwardStages.Stage> = [
         .engram,
+        .hcAttentionCoefficients,
         .mixAttentionStreams,
         .attnNorm,
         .queryDown,
@@ -341,6 +342,7 @@ nonisolated public enum DeepSeekV41DevicePlan {
         .outputDown,
         .outputUp,
         .writeAttentionStreams,
+        .hcFFNCoefficients,
         .mixFFNStreams,
         .ffnNorm,
         .router,
@@ -503,11 +505,13 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// identity value rather than an unbound buffer. Metal leaves an unbound slot
     /// undefined; the kernels test for `nullptr`, which an unbound buffer is not.
     private let zeros: MTLBuffer?
-    /// `hc_*_scale` absent means a scale of 1, so its identity is ones, not zeros.
+    /// The identity for a multiplicative slot, which is ones rather than zeros.
     private let ones: MTLBuffer?
     /// `attn_sink` absent means "no sink entry", which the kernel spells `-1e30`.
     private let sinkDisabled: MTLBuffer?
     private let mult: Int
+    /// `(2 + mult) * mult`: how many logits `hc_*_fn` produces per position.
+    private let mixCount: Int
     private let recordElements: Int
     private let swigluLimit: Float
     private let gatherRows: Int
@@ -556,6 +560,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         self.workspace = runtime.workspace
         self.shardBuffers = shardBuffers
         self.mult = max(1, runtime.config.hcMult)
+        self.mixCount = (2 + self.mult) * self.mult
         self.recordElements = max(
             1,
             runtime.cache.layout.geometry.recordBytes
@@ -673,8 +678,8 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         self.latentFrequencies = latents
 
         // Identity buffers for the optional kernel slots, sized for every place one
-        // is substituted: router bias (one per expert), hc scale/base (one per
-        // stream or dimension), and the attention sink (one per head).
+        // is substituted: router bias (one per expert), the engram per-copy weights
+        // (one per copy and dimension), and the attention sink (one per head).
         let zeroCount = max(
             16,
             max(
@@ -728,11 +733,14 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             store(.compressorNorm, l)
             store(.indexerKNorm, l)
             store(.routerBias, l)
-            store(.hcAttnFn, l, resizeTo: max(1, runtime.config.hcMult))
-            store(.hcAttnScale, l, resizeTo: max(1, runtime.config.hcMult))
+            // The projection itself is read from the shard bytes by
+            // `encodeHyperConnectionCoefficients` (it is FP32, which the quantized
+            // GEMV kernels do not cover), so only the two small companions are
+            // staged here. `hc_*_scale` keeps all three values: they scale the
+            // pre, post and comb sections, not the copies.
+            store(.hcAttnScale, l)
             store(.hcAttnBase, l)
-            store(.hcFfnFn, l, resizeTo: max(1, runtime.config.hcMult))
-            store(.hcFfnScale, l, resizeTo: max(1, runtime.config.hcMult))
+            store(.hcFfnScale, l)
             store(.hcFfnBase, l)
             // `q_weight` and `k_weight` are ones-initialized per-copy parameters
             // that only ever appear multiplied together (`Engram.forward`), so they
@@ -966,12 +974,29 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         )
         encoder.memoryBarrier(scope: .buffers)
 
+        // Every hyper-connection copy starts as this position's embedding
+        // (`Array(repeating: hidden, count: mult)`), and the stack's first collapse
+        // is the identity mix (`make_identity_pre_mix`), so the mix a forward pass
+        // carries is reset here beside the streams it belongs to.
         try encodeClear(encoder, buffer: workspace.streams, count: mult * shapes.hidden)
-        try encodeStreamWrite(
-            encoder,
-            contribution: workspace.hidden,
-            writeScales: nil
+        for copy in 0..<mult {
+            try encodeCopy(
+                encoder,
+                from: workspace.hidden,
+                to: workspace.streams,
+                count: shapes.hidden,
+                destinationByteOffset: copy * shapes.hidden * MemoryLayout<Float>.stride
+            )
+        }
+        encoder.setComputePipelineState(pipelines.hcIdentityMix)
+        encoder.setBuffer(workspace.hcMix, offset: 0, index: 0)
+        var copies = UInt32(mult)
+        encoder.setBytes(&copies, length: 4, index: 1)
+        encoder.dispatchThreads(
+            MTLSize(width: mult, height: 1, depth: 1),
+            threadsPerThreadgroup: threadgroup(mult)
         )
+        encoder.memoryBarrier(scope: .buffers)
         encoder.endEncoding()
         // Nothing reads the embedding on the host, so this does not wait: the first
         // layer's front half is ordered behind it on the same queue.
@@ -983,13 +1008,14 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         let commandBuffer = try makeCommandBuffer()
         let encoder = try makeEncoder(commandBuffer)
 
-        // The collapsed stream is stream 0, exactly like the reference's `collapse`.
-        // It sits at byte 0 of the stream buffer, so no copy is needed.
+        // `.collapseStreams` already collapsed the stack with the mix the last
+        // block produced (`layer.hc_pre(h, pre_mix)`), and it wrote that vector into
+        // `hidden`; this normalizes it and projects the head.
         try encodeNorm(
             encoder,
-            input: workspace.streams,
+            input: workspace.hidden,
             gain: vectors.gain(.finalNorm, layer: nil, width: shapes.hidden),
-            output: workspace.hidden,
+            output: workspace.output,
             width: shapes.hidden
         )
         encoder.memoryBarrier(scope: .buffers)
@@ -1003,7 +1029,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             scale: weights.scaleTensor(.lmHead),
             inDim: shapes.hidden,
             outDim: config.vocabSize,
-            input: workspace.hidden,
+            input: workspace.output,
             output: workspace.logits
         )
         encoder.endEncoding()
@@ -1086,14 +1112,27 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         let shape = DeepSeekV41AttentionShape.make(config: config, layer: layer)
 
         switch stage {
-        case .mixAttentionStreams:
-            try encodeStreamMix(
+        case .hcAttentionCoefficients:
+            try encodeHyperConnectionCoefficients(
                 encoder,
-                readWeights: vectors.buffer(.hcAttnFn, layer: index)
-                    ?? vectors.constant(1 / Float(mult), count: mult),
-                scale: vectors.buffer(.hcAttnScale, layer: index),
-                bias: vectors.buffer(.hcAttnBase, layer: index),
-                output: workspace.normed
+                layer: index,
+                function: .hcAttnFn,
+                base: .hcAttnBase,
+                scale: .hcAttnScale,
+                pre: workspace.hcAttentionPre,
+                post: workspace.hcAttentionPost,
+                comb: workspace.hcAttentionComb
+            )
+
+        case .mixAttentionStreams:
+            // The sub-layer reads the stack collapsed with the mix the PREVIOUS
+            // sub-layer produced. `hc_pre` also snapshots the block input, because
+            // `hc_post` mixes it back in and cannot read the streams in place.
+            try encodeHyperConnectionPre(
+                encoder,
+                mix: workspace.hcMix,
+                output: workspace.normed,
+                snapshotting: true
             )
 
         case .attnNorm:
@@ -1274,20 +1313,32 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             )
 
         case .writeAttentionStreams:
-            try encodeStreamWrite(
+            try encodeHyperConnectionPost(
                 encoder,
-                contribution: workspace.output,
-                writeScales: vectors.buffer(.hcAttnScale, layer: index)
+                output: workspace.output,
+                gains: workspace.hcAttentionPost,
+                comb: workspace.hcAttentionComb
+            )
+
+        case .hcFFNCoefficients:
+            try encodeHyperConnectionCoefficients(
+                encoder,
+                layer: index,
+                function: .hcFfnFn,
+                base: .hcFfnBase,
+                scale: .hcFfnScale,
+                pre: workspace.hcFFNPre,
+                post: workspace.hcFFNPost,
+                comb: workspace.hcFFNComb
             )
 
         case .mixFFNStreams:
-            try encodeStreamMix(
+            // The feed-forward reads its stack collapsed with ATTENTION's `pre`.
+            try encodeHyperConnectionPre(
                 encoder,
-                readWeights: vectors.buffer(.hcFfnFn, layer: index)
-                    ?? vectors.constant(1 / Float(mult), count: mult),
-                scale: vectors.buffer(.hcFfnScale, layer: index),
-                bias: vectors.buffer(.hcFfnBase, layer: index),
-                output: workspace.normed
+                mix: workspace.hcAttentionPre,
+                output: workspace.normed,
+                snapshotting: true
             )
 
         case .ffnNorm:
@@ -1327,17 +1378,29 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             )
 
         case .writeFFNStreams:
-            try encodeStreamWrite(
+            try encodeHyperConnectionPost(
                 encoder,
-                contribution: workspace.moeOut,
-                writeScales: vectors.buffer(.hcFfnScale, layer: index)
+                output: workspace.moeOut,
+                gains: workspace.hcFFNPost,
+                comb: workspace.hcFFNComb
+            )
+            // Whatever this feed-forward decided is what the NEXT layer's attention
+            // collapses with, and after the last layer what the head collapses with
+            // (`Transformer.forward` returns `ffn_pre` up the stack).
+            try encodeCopy(
+                encoder, from: workspace.hcFFNPre, to: workspace.hcMix, count: mixCount
             )
 
         case .collapseStreams:
             // The block collapses once, after the last layer, so a later stage can
-            // never observe a half-collapsed state. The stage stays in the list
-            // because both backends order their work by it.
-            break
+            // never observe a half-collapsed state; `finishBlock` then normalizes and
+            // projects this vector.
+            try encodeHyperConnectionPre(
+                encoder,
+                mix: workspace.hcMix,
+                output: workspace.hidden,
+                snapshotting: false
+            )
         }
     }
 
@@ -2262,43 +2325,97 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         encoder.memoryBarrier(scope: .buffers)
     }
 
-    /// Collapses the streams with a per-stream weight vector.
+    /// `hc_*_fn` applied to the FLATTENED stack, split into the three coefficient
+    /// sets.
     ///
-    /// NOT the reference rule yet. `Block.hc_mixes` projects the FLATTENED stack
-    /// through `hc_*_fn` onto `(2 + mult) * mult` logits and splits those into
-    /// `pre` / `post` / `comb`, which is what `DeepSeekV41HyperConnections` does on
-    /// the host and what `DeepSeekV41Conformance.hyperConnections` is pinned
-    /// against. Until this stage grows that projection (a GEMV over the stream
-    /// buffer), the split kernel and carried `pre` mixes per sub-layer, it reads
-    /// `hc_*_fn` as if it were `pre` and drops `comb` entirely. The path is
-    /// unreachable today (`isRuntimeAvailable` is false and `launchTurn` refuses the
-    /// family), so this is a to-do rather than a live wrong answer.
-    private func encodeStreamMix(
+    /// The projection is FP32 in the checkpoint — `layers.N.hc_attn_fn` is published
+    /// as `[24, 20480]` — so it reads the shard bytes directly instead of going
+    /// through the quantized GEMV kernels, and a checkpoint that published it at a
+    /// quantized or bf16 width is refused rather than read at the wrong stride.
+    private func encodeHyperConnectionCoefficients(
         _ encoder: MTLComputeCommandEncoder,
-        readWeights: MTLBuffer?,
-        scale: MTLBuffer?,
-        bias: MTLBuffer?,
-        output: MTLBuffer
+        layer: Int,
+        function: DeepSeekV41TensorRole,
+        base: DeepSeekV41TensorRole,
+        scale: DeepSeekV41TensorRole,
+        pre: MTLBuffer,
+        post: MTLBuffer,
+        comb: MTLBuffer
     ) throws {
-        guard let readWeights else {
-            throw DeepSeekV41EngineError.allocationFailed("a hyper-connection read vector")
+        guard let projection = weights.tensor(function, layer: layer),
+              let buffer = shardBuffer(projection) else {
+            throw DeepSeekV41EngineError.missingTensor(function.rawValue)
         }
-        encoder.setComputePipelineState(pipelines.hcMix)
-        encoder.setBuffer(workspace.streams, offset: 0, index: 0)
-        encoder.setBuffer(readWeights, offset: 0, index: 1)
-        // Absent `hc_*_scale` means a scale of 1 and absent `hc_*_base` means a
-        // bias of 0, so each slot is bound to its own identity rather than left
-        // undefined for a kernel that dereferences it.
-        guard let scaleBuffer = scale ?? ones, let biasBuffer = bias ?? zeros else {
-            throw DeepSeekV41EngineError.allocationFailed("the hyper-connection identity vectors")
+        guard DeepSeekV41DtypeWidth.bytesPerValue(dtype: projection.dtype) == 4 else {
+            throw DeepSeekV41EngineError.unsupportedDtype(
+                "\(function.rawValue) (expected FP32)", projection.dtype
+            )
         }
-        encoder.setBuffer(scaleBuffer, offset: 0, index: 2)
-        encoder.setBuffer(biasBuffer, offset: 0, index: 3)
-        encoder.setBuffer(output, offset: 0, index: 4)
-        var width = UInt32(shapes.hidden)
-        var streams = UInt32(mult)
+        guard let baseBuffer = vectors.buffer(base, layer: layer),
+              let scaleBuffer = vectors.buffer(scale, layer: layer) else {
+            throw DeepSeekV41EngineError.missingTensor(base.rawValue)
+        }
+
+        encoder.setComputePipelineState(pipelines.hcProject)
+        encoder.setBuffer(buffer, offset: 0, index: 0)
+        encoder.setBuffer(workspace.streams, offset: 0, index: 1)
+        encoder.setBuffer(workspace.hcLogits, offset: 0, index: 2)
+        var weightOffset = UInt64(projection.byteOffset)
+        var normalizationEpsilon = config.rmsNormEps
+        var width = UInt32(mult * shapes.hidden)
+        var outDim = UInt32(mixCount)
+        encoder.setBytes(&weightOffset, length: 8, index: 3)
+        encoder.setBytes(&normalizationEpsilon, length: 4, index: 4)
         encoder.setBytes(&width, length: 4, index: 5)
-        encoder.setBytes(&streams, length: 4, index: 6)
+        encoder.setBytes(&outDim, length: 4, index: 6)
+        encoder.dispatchThreads(
+            MTLSize(width: mixCount, height: 1, depth: 1),
+            threadsPerThreadgroup: threadgroup(mixCount)
+        )
+        encoder.memoryBarrier(scope: .buffers)
+
+        encoder.setComputePipelineState(pipelines.hcSplit)
+        encoder.setBuffer(workspace.hcLogits, offset: 0, index: 0)
+        encoder.setBuffer(scaleBuffer, offset: 0, index: 1)
+        encoder.setBuffer(baseBuffer, offset: 0, index: 2)
+        encoder.setBuffer(pre, offset: 0, index: 3)
+        encoder.setBuffer(post, offset: 0, index: 4)
+        encoder.setBuffer(comb, offset: 0, index: 5)
+        var copies = UInt32(mult)
+        var iterations = UInt32(max(0, config.hcSinkhornIterations))
+        var epsilon = config.hcEps
+        encoder.setBytes(&copies, length: 4, index: 6)
+        encoder.setBytes(&iterations, length: 4, index: 7)
+        encoder.setBytes(&epsilon, length: 4, index: 8)
+        // The split is one thread: `hc_mult` is 4 and the schedule is serial.
+        encoder.dispatchThreads(
+            MTLSize(width: 32, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+        encoder.memoryBarrier(scope: .buffers)
+    }
+
+    /// `hc_pre`: collapse the stack with `mix` into `output`, optionally snapshotting
+    /// the stack into `workspace.hcResidual` for the `hc_post` that follows.
+    private func encodeHyperConnectionPre(
+        _ encoder: MTLComputeCommandEncoder,
+        mix: MTLBuffer,
+        output: MTLBuffer,
+        snapshotting: Bool
+    ) throws {
+        encoder.setComputePipelineState(pipelines.hcPre)
+        encoder.setBuffer(workspace.streams, offset: 0, index: 0)
+        encoder.setBuffer(mix, offset: 0, index: 1)
+        encoder.setBuffer(output, offset: 0, index: 2)
+        if snapshotting {
+            encoder.setBuffer(workspace.hcResidual, offset: 0, index: 3)
+        } else {
+            encoder.setBuffer(nil, offset: 0, index: 3)
+        }
+        var width = UInt32(shapes.hidden)
+        var copies = UInt32(mult)
+        encoder.setBytes(&width, length: 4, index: 4)
+        encoder.setBytes(&copies, length: 4, index: 5)
         encoder.dispatchThreads(
             MTLSize(width: shapes.hidden, height: 1, depth: 1),
             threadsPerThreadgroup: threadgroup(shapes.hidden)
@@ -2306,25 +2423,49 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         encoder.memoryBarrier(scope: .buffers)
     }
 
-    private func encodeStreamWrite(
+    /// `hc_post`: expand `output` to every copy and mix the snapshotted block input
+    /// back in through `comb`.
+    private func encodeHyperConnectionPost(
         _ encoder: MTLComputeCommandEncoder,
-        contribution: MTLBuffer,
-        writeScales: MTLBuffer?
+        output: MTLBuffer,
+        gains: MTLBuffer,
+        comb: MTLBuffer
     ) throws {
-        encoder.setComputePipelineState(pipelines.hcWrite)
-        encoder.setBuffer(workspace.streams, offset: 0, index: 0)
-        encoder.setBuffer(contribution, offset: 0, index: 1)
-        guard let scales = writeScales ?? ones else {
-            throw DeepSeekV41EngineError.allocationFailed("the hyper-connection identity vectors")
-        }
-        encoder.setBuffer(scales, offset: 0, index: 2)
+        encoder.setComputePipelineState(pipelines.hcPost)
+        encoder.setBuffer(output, offset: 0, index: 0)
+        encoder.setBuffer(workspace.hcResidual, offset: 0, index: 1)
+        encoder.setBuffer(gains, offset: 0, index: 2)
+        encoder.setBuffer(comb, offset: 0, index: 3)
+        encoder.setBuffer(workspace.streams, offset: 0, index: 4)
         var width = UInt32(shapes.hidden)
-        var streams = UInt32(mult)
-        encoder.setBytes(&width, length: 4, index: 3)
-        encoder.setBytes(&streams, length: 4, index: 4)
+        var copies = UInt32(mult)
+        encoder.setBytes(&width, length: 4, index: 5)
+        encoder.setBytes(&copies, length: 4, index: 6)
         encoder.dispatchThreads(
             MTLSize(width: shapes.hidden, height: mult, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: threadgroup(shapes.hidden).width, height: 1, depth: 1)
+            threadsPerThreadgroup: MTLSize(
+                width: threadgroup(shapes.hidden).width, height: 1, depth: 1
+            )
+        )
+        encoder.memoryBarrier(scope: .buffers)
+    }
+
+    private func encodeCopy(
+        _ encoder: MTLComputeCommandEncoder,
+        from source: MTLBuffer,
+        to destination: MTLBuffer,
+        count: Int,
+        destinationByteOffset: Int = 0
+    ) throws {
+        guard count > 0 else { return }
+        encoder.setComputePipelineState(pipelines.copy)
+        encoder.setBuffer(source, offset: 0, index: 0)
+        encoder.setBuffer(destination, offset: destinationByteOffset, index: 1)
+        var length = UInt32(count)
+        encoder.setBytes(&length, length: 4, index: 2)
+        encoder.dispatchThreads(
+            MTLSize(width: count, height: 1, depth: 1),
+            threadsPerThreadgroup: threadgroup(count)
         )
         encoder.memoryBarrier(scope: .buffers)
     }

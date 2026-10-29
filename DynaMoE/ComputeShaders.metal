@@ -8648,16 +8648,71 @@ kernel void dsv41_engram_gate_f32(
     }
 }
 
-/// MSL Kernel: the Sinkhorn split of the mHC mixing matrix.
-///
-/// `logits` is an n x n block. The schedule is the reference's
-/// (`hc_split_sinkhorn_kernel`), not a symmetric normalization: one row softmax,
-/// `+eps`, ONE column normalization, then `iterations - 1` rounds of row-then-column,
-/// every divisor `(sum + eps)`. After a single round the columns are exact and the
-/// rows are only approximately so, which is what makes the schedule visible.
-/// One thread runs the whole block: n is at most `hc_mult` (4 on the published
-/// checkpoint), so the serial loop is cheaper than the coordination a parallel
-/// version would need.
+/// MSL Kernel: `destination = source` over `count` FP32 values. Used to carry a
+/// sub-layer's `pre` mix forward without a second dispatch shape per sub-layer.
+kernel void dsv41_copy_f32(
+    device const float* source [[buffer(0)]],
+    device float* destination [[buffer(1)]],
+    constant uint32_t& count [[buffer(2)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < count) destination[i] = source[i];
+}
+
+/// The Sinkhorn schedule, in place, exactly as `hc_split_sinkhorn_kernel` runs it:
+/// one row softmax, `+eps`, ONE column normalization, then `iterations - 1` rounds
+/// of row-then-column, every divisor `(sum + eps)`. Shared by the kernel that
+/// normalizes a matrix the caller already has and the one that splits the mHC
+/// logits, so the schedule exists once.
+inline void dsv41_hc_sinkhorn_into(
+    device float* matrix,
+    uint n,
+    uint iterations,
+    float epsilon
+) {
+    // Row softmax. The max is subtracted per ROW so a large logit cannot overflow
+    // to infinity (every later sum would be `inf`), and so a row far below the
+    // block's max does not underflow to a zero sum.
+    for (uint r = 0; r < n; ++r) {
+        float rowMax = -1e30f;
+        for (uint c = 0; c < n; ++c) rowMax = max(rowMax, matrix[r * n + c]);
+        float sum = 0.0f;
+        for (uint c = 0; c < n; ++c) {
+            float value = exp(matrix[r * n + c] - rowMax);
+            matrix[r * n + c] = value;
+            sum += value;
+        }
+        float inverse = sum > 0.0f ? 1.0f / sum : 0.0f;
+        for (uint c = 0; c < n; ++c) matrix[r * n + c] *= inverse;
+    }
+    for (uint i = 0; i < n * n; ++i) matrix[i] += epsilon;
+    if (iterations == 0) return;
+
+    for (uint c = 0; c < n; ++c) {
+        float sum = 0.0f;
+        for (uint r = 0; r < n; ++r) sum += matrix[r * n + c];
+        float inverse = 1.0f / (sum + epsilon);
+        for (uint r = 0; r < n; ++r) matrix[r * n + c] *= inverse;
+    }
+    for (uint iteration = 1; iteration < iterations; ++iteration) {
+        for (uint r = 0; r < n; ++r) {
+            float sum = 0.0f;
+            for (uint c = 0; c < n; ++c) sum += matrix[r * n + c];
+            float inverse = 1.0f / (sum + epsilon);
+            for (uint c = 0; c < n; ++c) matrix[r * n + c] *= inverse;
+        }
+        for (uint c = 0; c < n; ++c) {
+            float sum = 0.0f;
+            for (uint r = 0; r < n; ++r) sum += matrix[r * n + c];
+            float inverse = 1.0f / (sum + epsilon);
+            for (uint r = 0; r < n; ++r) matrix[r * n + c] *= inverse;
+        }
+    }
+}
+
+/// MSL Kernel: Sinkhorn normalization of an existing `n x n` block, in place on
+/// `outputMatrix` (which is seeded from `logits` first). Same schedule as the
+/// split above; see `dsv41_hc_sinkhorn_into`.
 kernel void dsv41_hc_sinkhorn(
     device const float* logits [[buffer(0)]],
     device float* outputMatrix [[buffer(1)]],
@@ -8669,46 +8724,140 @@ kernel void dsv41_hc_sinkhorn(
     if (tid != 0) return;
     uint n = dimension;
     if (n == 0 || n > 16) return;
+    for (uint i = 0; i < n * n; ++i) outputMatrix[i] = logits[i];
+    dsv41_hc_sinkhorn_into(outputMatrix, n, iterations, epsilon);
+}
 
-    // Row softmax. The max is subtracted per ROW so a large logit cannot overflow
-    // to infinity (every later sum would be `inf` and the normalization a no-op of
-    // NaNs), and so a row orders of magnitude below the block's max does not
-    // underflow to a zero sum.
-    for (uint r = 0; r < n; ++r) {
-        float rowMax = -1e30f;
-        for (uint c = 0; c < n; ++c) rowMax = max(rowMax, logits[r * n + c]);
-        float sum = 0.0f;
-        for (uint c = 0; c < n; ++c) {
-            float value = exp(logits[r * n + c] - rowMax);
-            outputMatrix[r * n + c] = value;
-            sum += value;
-        }
-        float inverse = sum > 0.0f ? 1.0f / sum : 0.0f;
-        for (uint c = 0; c < n; ++c) outputMatrix[r * n + c] *= inverse;
-    }
-    for (uint i = 0; i < n * n; ++i) outputMatrix[i] += epsilon;
+/// MSL Kernel: the mHC coefficient projection.
+///
+/// `hc_*_fn` is `[outDim][mult * dim]` FP32 (24 x 20480 on the published
+/// checkpoint), applied to the FLATTENED stack and scaled by
+/// `rsqrt(mean(x^2) + norm_eps)` — one statistic per position, over the whole
+/// stack. The RMS is recomputed per row rather than staged: `outDim` is 24, so the
+/// extra pass costs less than the barrier a shared reduction would need.
+/// Grid: (outDim, 1, 1).
+kernel void dsv41_hc_project_f32(
+    device const float* rawWeightBuffer [[buffer(0)]],
+    device const float* streamBuffer [[buffer(1)]],
+    device float* logitsBuffer [[buffer(2)]],
+    constant uint64_t& weightOffset [[buffer(3)]],
+    constant float& normEpsilon [[buffer(4)]],
+    constant uint32_t& width [[buffer(5)]],
+    constant uint32_t& outDim [[buffer(6)]],
+    uint row [[thread_position_in_grid]]
+) {
+    if (row >= outDim || width == 0) return;
+    device const float* wPtr = rawWeightBuffer + weightOffset + (uint64_t)row * width;
 
-    if (iterations == 0) return;
-    for (uint c = 0; c < n; ++c) {
-        float sum = 0.0f;
-        for (uint r = 0; r < n; ++r) sum += outputMatrix[r * n + c];
-        float inverse = 1.0f / (sum + epsilon);
-        for (uint r = 0; r < n; ++r) outputMatrix[r * n + c] *= inverse;
+    float sumSquares = 0.0f;
+    for (uint32_t i = 0; i < width; ++i) sumSquares += streamBuffer[i] * streamBuffer[i];
+    float rstd = rsqrt(sumSquares / (float)width + normEpsilon);
+
+    float total = 0.0f;
+    for (uint32_t i = 0; i < width; ++i) total += wPtr[i] * streamBuffer[i];
+    logitsBuffer[row] = total * rstd;
+}
+
+/// MSL Kernel: the mHC split — `(2 + mult) * mult` logits to `pre`, `post` and
+/// `comb`.
+///
+/// One thread runs the whole split: `mult` is at most `hc_mult` (4 on the published
+/// checkpoint) and the Sinkhorn schedule is serial, so the coordination a parallel
+/// version would need costs more than the loop.
+kernel void dsv41_hc_split_f32(
+    device const float* logits [[buffer(0)]],
+    device const float* scaleBuffer [[buffer(1)]],   // [3]
+    device const float* baseBuffer [[buffer(2)]],    // [(2 + mult) * mult]
+    device float* preBuffer [[buffer(3)]],           // [mult]
+    device float* postBuffer [[buffer(4)]],          // [mult]
+    device float* combBuffer [[buffer(5)]],          // [mult * mult]
+    constant uint32_t& mult [[buffer(6)]],
+    constant uint32_t& iterations [[buffer(7)]],
+    constant float& epsilon [[buffer(8)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid != 0) return;
+    uint n = mult;
+    if (n == 0 || n > 16) return;
+    uint mixCount = (2 + n) * n;
+
+    for (uint copy = 0; copy < n; ++copy) {
+        float pre = logits[copy] * scaleBuffer[0] + baseBuffer[copy];
+        preBuffer[copy] = 1.0f / (1.0f + exp(-pre)) + epsilon;
+        float post = logits[n + copy] * scaleBuffer[1] + baseBuffer[n + copy];
+        postBuffer[copy] = 2.0f * (1.0f / (1.0f + exp(-post)));
     }
-    for (uint iteration = 1; iteration < iterations; ++iteration) {
-        for (uint r = 0; r < n; ++r) {
-            float sum = 0.0f;
-            for (uint c = 0; c < n; ++c) sum += outputMatrix[r * n + c];
-            float inverse = 1.0f / (sum + epsilon);
-            for (uint c = 0; c < n; ++c) outputMatrix[r * n + c] *= inverse;
-        }
-        for (uint c = 0; c < n; ++c) {
-            float sum = 0.0f;
-            for (uint r = 0; r < n; ++r) sum += outputMatrix[r * n + c];
-            float inverse = 1.0f / (sum + epsilon);
-            for (uint r = 0; r < n; ++r) outputMatrix[r * n + c] *= inverse;
-        }
+    uint base = 2 * n;
+    for (uint i = 0; i < n * n; ++i) {
+        combBuffer[i] = logits[base + i] * scaleBuffer[2] + baseBuffer[base + i];
     }
+    (void)mixCount;
+    dsv41_hc_sinkhorn_into(combBuffer, n, iterations, epsilon);
+}
+
+/// MSL Kernel: `hc_pre` — collapse the copies into the one vector a sub-layer
+/// reads, optionally snapshotting the stack first.
+///
+/// The snapshot is why this kernel exists rather than a separate copy: `hc_post`
+/// needs the block input that the collapse consumed, and taking it here is one
+/// pass instead of two. `residualOut` may be null when nothing reads it back.
+/// Grid: (width, 1, 1).
+kernel void dsv41_hc_pre_f32(
+    device const float* streamBuffer [[buffer(0)]],   // [mult][width]
+    device const float* mixBuffer [[buffer(1)]],      // [mult]
+    device float* outputBuffer [[buffer(2)]],         // [width]
+    device float* residualOut [[buffer(3)]],          // [mult][width] or null
+    constant uint32_t& width [[buffer(4)]],
+    constant uint32_t& mult [[buffer(5)]],
+    uint dim [[thread_position_in_grid]]
+) {
+    if (dim >= width) return;
+    float accumulator = 0.0f;
+    for (uint32_t copy = 0; copy < mult; ++copy) {
+        float value = streamBuffer[(uint64_t)copy * width + dim];
+        accumulator += mixBuffer[copy] * value;
+        if (residualOut != nullptr) residualOut[(uint64_t)copy * width + dim] = value;
+    }
+    outputBuffer[dim] = accumulator;
+}
+
+/// MSL Kernel: `hc_post` — expand a sub-layer's output back to every copy and mix
+/// the block's input in through `comb`.
+///
+/// `residual` must not alias `streams`: every thread reads all copies of its
+/// dimension, so writing them in place would race with the reads of the copies a
+/// neighbouring thread is about to use. `dsv41_hc_pre_f32` is what fills the
+/// separate buffer.
+/// Grid: (width, mult, 1).
+kernel void dsv41_hc_post_f32(
+    device const float* outputBuffer [[buffer(0)]],   // [width]
+    device const float* residualBuffer [[buffer(1)]], // [mult][width]
+    device const float* gainsBuffer [[buffer(2)]],    // [mult]
+    device const float* combBuffer [[buffer(3)]],     // [mult][mult]
+    device float* streamBuffer [[buffer(4)]],         // [mult][width]
+    constant uint32_t& width [[buffer(5)]],
+    constant uint32_t& mult [[buffer(6)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint dim = pos.x;
+    uint copy = pos.y;
+    if (dim >= width || copy >= mult) return;
+    float total = gainsBuffer[copy] * outputBuffer[dim];
+    for (uint32_t source = 0; source < mult; ++source) {
+        total += combBuffer[copy * mult + source] * residualBuffer[(uint64_t)source * width + dim];
+    }
+    streamBuffer[(uint64_t)copy * width + dim] = total;
+}
+
+/// MSL Kernel: the mix a forward pass starts from — copy 0 only
+/// (`make_identity_pre_mix`). One thread.
+kernel void dsv41_hc_identity_mix_f32(
+    device float* mixBuffer [[buffer(0)]],
+    constant uint32_t& mult [[buffer(1)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= mult) return;
+    mixBuffer[tid] = (tid == 0) ? 1.0f : 0.0f;
 }
 
 // ============================================================================
@@ -9050,46 +9199,6 @@ kernel void dsv41_router_topk(
         expertIndices[rank] = topIndex[rank];
         expertWeights[rank] = mixWeight;
     }
-}
-
-/// MSL Kernel: the mHC read — combines the hyper-connection streams with a mixing
-/// matrix row, then applies the per-stream `hc_*_scale` and the per-dimension
-/// `hc_*_base` bias.
-kernel void dsv41_hc_mix_f32(
-    device const float* streamBuffer [[buffer(0)]],   // [mult * width]
-    device const float* readWeights [[buffer(1)]],   // [mult]
-    device const float* scaleBuffer [[buffer(2)]],   // [mult] or null
-    device const float* biasBuffer [[buffer(3)]],    // [width] or null
-    device float* outputBuffer [[buffer(4)]],        // [width]
-    constant uint32_t& width [[buffer(5)]],
-    constant uint32_t& mult [[buffer(6)]],
-    uint dim [[thread_position_in_grid]]
-) {
-    if (dim >= width) return;
-    float accumulator = 0.0f;
-    for (uint32_t stream = 0; stream < mult; ++stream) {
-        float scale = (scaleBuffer != nullptr) ? scaleBuffer[stream] : 1.0f;
-        float bias = (biasBuffer != nullptr) ? biasBuffer[dim] : 0.0f;
-        accumulator += readWeights[stream] * (streamBuffer[(uint64_t)stream * width + dim] * scale + bias);
-    }
-    outputBuffer[dim] = accumulator;
-}
-
-/// MSL Kernel: the mHC write — accumulates a sub-layer's contribution into every
-/// stream with that stream's own write scale.
-kernel void dsv41_hc_write_f32(
-    device float* streamBuffer [[buffer(0)]],         // [mult * width]
-    device const float* contribution [[buffer(1)]],  // [width]
-    device const float* writeScales [[buffer(2)]],   // [mult] or null
-    constant uint32_t& width [[buffer(3)]],
-    constant uint32_t& mult [[buffer(4)]],
-    uint2 pos [[thread_position_in_grid]]
-) {
-    uint dim = pos.x;
-    uint stream = pos.y;
-    if (dim >= width || stream >= mult) return;
-    float scale = (writeScales != nullptr) ? writeScales[stream] : 1.0f;
-    streamBuffer[(uint64_t)stream * width + dim] += scale * contribution[dim];
 }
 
 // ============================================================================
