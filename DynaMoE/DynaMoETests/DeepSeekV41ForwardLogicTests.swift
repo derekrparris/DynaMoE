@@ -1399,3 +1399,270 @@ final class DeepSeekV41TensorShapeTests: XCTestCase {
         XCTAssertLessThan(write!, attend!)
     }
 }
+
+// MARK: - Chunk prefill
+
+/// A chunk prefill measured against the walk it replaces.
+///
+/// `prefillChunk` runs a prompt through each layer once, all positions at a time: the
+/// shape the checkpoint's own prefill uses, and the first step toward a device path
+/// that stops paying for six expert weight reads per token. What has to hold is that it
+/// agrees with the position-by-position walk, because a change in the order rows are
+/// written or groups are pooled moves numbers without failing anywhere. Every
+/// comparison here is therefore numeric and per position, and the cache the two passes
+/// leave behind is compared too: a following decode step reads it.
+final class DeepSeekV41ChunkForwardTests: XCTestCase {
+
+    private func assertRowsMatch(
+        _ chunked: [[Float]],
+        _ walked: [[Float]],
+        _ label: String
+    ) {
+        XCTAssertEqual(chunked.count, walked.count, "\(label) row count")
+        for (position, row) in chunked.enumerated() where walked.indices.contains(position) {
+            XCTAssertEqual(row.count, walked[position].count, "\(label) position \(position)")
+            for dimension in row.indices where walked[position].indices.contains(dimension) {
+                XCTAssertEqual(
+                    row[dimension],
+                    walked[position][dimension],
+                    accuracy: 1e-5,
+                    "\(label) position \(position) dim \(dimension)"
+                )
+            }
+        }
+    }
+
+    private func assertLogitsMatch(
+        _ chunked: [Float],
+        _ walked: [Float],
+        _ label: String
+    ) {
+        XCTAssertEqual(chunked.count, walked.count, "\(label) width")
+        for dimension in chunked.indices where walked.indices.contains(dimension) {
+            XCTAssertEqual(
+                chunked[dimension],
+                walked[dimension],
+                accuracy: 1e-5,
+                "\(label) logit \(dimension)"
+            )
+        }
+    }
+
+    /// Engram rows for every hash column, so the in-memory store can stand in for the
+    /// streaming lookup the way `DeepSeekV41EngramForwardTests` does.
+    private func engramSource(
+        config: DeepSeekV41Config,
+        plan: [DeepSeekV41LayerPlan]
+    ) -> DeepSeekV41DenseWeightSource {
+        let source = DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        guard let table = plan.first(where: { $0.engramTable != nil })?.engramTable else {
+            return source
+        }
+        let spec = config.engramTables[table]
+        let columns = max(1, spec.maxNgramSize - 1) * spec.headCount
+        for column in 0..<columns {
+            let row = (0..<spec.headDimension).map { Float($0 + column + 1) * 0.25 }
+            source.setEngramRow(row, layer: spec.layer, column: column)
+        }
+        return source
+    }
+
+    func testAChunkMatchesTheWalkAtEveryPosition() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let tokens = [3, 5, 7, 9, 11]
+
+        let walk = DeepSeekV41CPUForward(
+            config: config,
+            plan: plan,
+            weights: DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        )
+        var walked: [[Float]] = []
+        for (position, token) in tokens.enumerated() {
+            walked.append(walk.forwardToken(token, position: position))
+        }
+
+        let chunked = DeepSeekV41CPUForward(
+            config: config,
+            plan: plan,
+            weights: DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        )
+        let chunk = chunked.prefillChunk(tokens, capturingLogitsAt: Set(tokens.indices))
+
+        for position in tokens.indices {
+            let captured = try XCTUnwrap(chunk.captured[position], "position \(position)")
+            assertLogitsMatch(captured, walked[position], "position \(position)")
+        }
+        // The last position's logits are the ones the caller samples from.
+        XCTAssertEqual(chunk.last.count, config.vocabSize)
+        XCTAssertEqual(chunk.last, chunk.captured[tokens.count - 1])
+
+        // The cache has to be the same one, not merely a similar one: a decode step or a
+        // resumed turn reads these rows.
+        XCTAssertEqual(chunked.storedPositions, walk.storedPositions)
+        XCTAssertEqual(chunked.tokenHistory, walk.tokenHistory)
+        XCTAssertEqual(chunked.deadTokens, walk.deadTokens)
+        XCTAssertEqual(chunked.candidateScores.count, walk.candidateScores.count)
+        XCTAssertEqual(chunked.engramGates.keys.sorted(), walk.engramGates.keys.sorted())
+        XCTAssertEqual(chunked.compressed.keys.sorted(), walk.compressed.keys.sorted())
+        for (owner, rows) in walk.compressed {
+            let chunkedRows = try XCTUnwrap(chunked.compressed[owner], "owner \(owner)")
+            XCTAssertEqual(chunkedRows.count, rows.count, "owner \(owner) row count")
+            for (row, values) in chunkedRows.enumerated() where rows.indices.contains(row) {
+                for dimension in values.indices where rows[row].indices.contains(dimension) {
+                    XCTAssertEqual(
+                        values[dimension],
+                        rows[row][dimension],
+                        accuracy: 1e-5,
+                        "owner \(owner) row \(row) dim \(dimension)"
+                    )
+                }
+            }
+        }
+        for layer in plan {
+            assertRowsMatch(
+                chunked.latents[layer.index],
+                walk.latents[layer.index],
+                "layer \(layer.index) latent"
+            )
+            assertRowsMatch(
+                chunked.attentionInputs[layer.index],
+                walk.attentionInputs[layer.index],
+                "layer \(layer.index) attention input"
+            )
+        }
+    }
+
+    func testDecodeContinuesFromAChunk() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let tokens = [3, 5, 7]
+
+        let walk = DeepSeekV41CPUForward(
+            config: config,
+            plan: plan,
+            weights: DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        )
+        _ = walk.prefill(tokens: tokens)
+
+        let chunked = DeepSeekV41CPUForward(
+            config: config,
+            plan: plan,
+            weights: DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        )
+        _ = chunked.prefillChunk(tokens)
+        XCTAssertEqual(chunked.storedPositions, tokens.count)
+
+        // The position after the chunk reads the ring and the compressed rows the chunk
+        // wrote, so this is where a chunk that pooled or rotated differently shows up.
+        let next = 13
+        assertLogitsMatch(
+            chunked.forwardToken(next, position: tokens.count),
+            walk.forwardToken(next, position: tokens.count),
+            "decode after the chunk"
+        )
+    }
+
+    func testAChunkPoolsOnlyTheGroupsItCompletes() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let owner = try XCTUnwrap(plan.first { $0.ownsCompressedKV })
+        let ratio = max(1, owner.compressRatio)
+        // Five positions at ratio two: two rows, and the fifth position waits for the one
+        // that completes its group.
+        let tokens = [3, 5, 7, 9, 11]
+        let forward = DeepSeekV41CPUForward(
+            config: config,
+            plan: plan,
+            weights: DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        )
+        _ = forward.prefillChunk(tokens)
+        XCTAssertEqual(forward.compressed[owner.index]?.count, tokens.count / ratio)
+    }
+
+    func testTheHeadOnlyRunsForThePositionsAsked() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let source = DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+
+        let bare = DeepSeekV41CPUForward(config: config, plan: plan, weights: source)
+            .prefillChunk([3, 5, 7, 9])
+        XCTAssertTrue(bare.captured.isEmpty)
+        XCTAssertEqual(bare.last.count, config.vocabSize)
+
+        // 9 is past the end of a four-position chunk, so it is dropped rather than
+        // reported as an empty entry.
+        let kept = DeepSeekV41CPUForward(config: config, plan: plan, weights: source)
+            .prefillChunk([3, 5, 7, 9], capturingLogitsAt: [1, 9])
+        XCTAssertEqual(Set(kept.captured.keys), [1])
+        XCTAssertEqual(kept.last.count, config.vocabSize)
+    }
+
+    func testAChunkRefusesASequenceTheCacheAlreadyHolds() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let forward = DeepSeekV41CPUForward(
+            config: config,
+            plan: plan,
+            weights: DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        )
+        _ = forward.prefillChunk([3, 5])
+        // A resumed prefix is a walk: the reference has no chunked form of it, and a chunk
+        // that guessed would fill the ring and finish groups its own way.
+        let second = forward.prefillChunk([7])
+        XCTAssertTrue(second.last.isEmpty)
+        XCTAssertEqual(forward.storedPositions, 2)
+        XCTAssertEqual(forward.tokenHistory.count, 2)
+    }
+
+    /// The Engram layers hash the token stream, so a chunk has to hand each position the
+    /// history that ENDS at it. Handing over the whole chunk hashes every position as if
+    /// it were the last one, which reads different table rows and still produces text.
+    func testAnEngramChunkHashesTheSameNgramsAsTheWalk() throws {
+        let config = try DeepSeekV41TestFixtures.engramConfig()
+        let plan = try config.makeLayerPlan()
+        let tokens = [3, 5, 7, 9]
+        let layer = try XCTUnwrap(plan.first { $0.engramTable != nil }).index
+
+        let walkSource = engramSource(config: config, plan: plan)
+        let walk = DeepSeekV41CPUForward(
+            config: config,
+            plan: plan,
+            weights: walkSource,
+            engramLookup: walkSource
+        )
+        var walked: [[Float]] = []
+        for (position, token) in tokens.enumerated() {
+            walked.append(walk.forwardToken(token, position: position))
+        }
+
+        let chunkSource = engramSource(config: config, plan: plan)
+        let chunked = DeepSeekV41CPUForward(
+            config: config,
+            plan: plan,
+            weights: chunkSource,
+            engramLookup: chunkSource
+        )
+        let chunk = chunked.prefillChunk(tokens, capturingLogitsAt: Set(tokens.indices))
+
+        for position in tokens.indices {
+            let captured = try XCTUnwrap(chunk.captured[position], "position \(position)")
+            assertLogitsMatch(captured, walked[position], "position \(position)")
+        }
+        // The gates are recorded per lookup, so a chunk that hashed the wrong history is
+        // visible here even where the logits happen to be close.
+        let chunkGates = try XCTUnwrap(chunked.engramGates[layer])
+        let walkGates = try XCTUnwrap(walk.engramGates[layer])
+        XCTAssertEqual(chunkGates.count, walkGates.count)
+        for (position, gates) in chunkGates.enumerated() where walkGates.indices.contains(position) {
+            for dimension in gates.indices where walkGates[position].indices.contains(dimension) {
+                XCTAssertEqual(
+                    gates[dimension],
+                    walkGates[position][dimension],
+                    accuracy: 1e-5,
+                    "layer \(layer) position \(position) gate \(dimension)"
+                )
+            }
+        }
+    }
+}

@@ -437,10 +437,23 @@ nonisolated public enum DeepSeekV41EngramCombination {
 
 // MARK: - Reference forward
 
+/// What a chunk prefill kept: the logits after its last position, which is what the
+/// first sample reads, plus any position the caller named.
+nonisolated public struct DeepSeekV41ChunkLogits: Sendable, Equatable {
+    public let last: [Float]
+    public let captured: [Int: [Float]]
+
+    public init(last: [Float], captured: [Int: [Float]] = [:]) {
+        self.last = last
+        self.captured = captured
+    }
+}
+
 /// The CPU forward: the graph itself, with no Metal.
 ///
-/// One instance per turn. `prefill` walks a prompt and leaves the cache holding
-/// every position; `forwardToken` appends one position and returns the logits.
+/// One instance per turn. `prefill` walks a prompt one position at a time and
+/// `prefillChunk` runs it in one pass; both leave the cache holding every position,
+/// and `forwardToken` appends one more position and returns its logits.
 nonisolated public final class DeepSeekV41CPUForward {
 
     public let config: DeepSeekV41Config
@@ -578,16 +591,72 @@ nonisolated public final class DeepSeekV41CPUForward {
         deadTokens.append(pendingDead)
         pendingDead = false
 
-        var hidden = embedding
+        // One position is a chunk of one, so the walk and the batched pass run the same
+        // graph. A second copy of it could drift from this one everywhere at once and
+        // still produce plausible numbers.
         let mult = max(1, config.hcMult)
-        var streams = Array(repeating: hidden, count: mult)
-
+        var streams: [[[Float]]] = [Array(repeating: embedding, count: mult)]
         for layer in plan {
-            runLayer(layer, at: position, streams: &streams)
+            runChunkLayer(layer, positions: position..<(position + 1), streams: &streams)
+        }
+        return logits(streams[0])
+    }
+
+    /// Runs `tokens` from position 0 as ONE chunk, the shape the checkpoint's own
+    /// prefill uses, and returns the logits after the last position.
+    ///
+    /// `generate.py` feeds the prompt to a single `forward` call and decodes position
+    /// by position only afterwards, which is why a chunk here always starts at 0. A
+    /// resumed prefix is a walk instead: the reference has no chunked form of it, and
+    /// inventing one would be an unverified rule about how a chunk starting mid-sequence
+    /// fills the ring and finishes a compressor group.
+    ///
+    /// `capture` names positions relative to the chunk, which for a chunk are the
+    /// prompt's own indices. The head only runs for those and for the last position,
+    /// because it is `vocabSize` outputs per position and nothing reads the rest.
+    ///
+    /// `markNextTokenDead` applies to the chunk's FIRST position only: a dead flag sits
+    /// on one position at a time, so an image span, which marks every token in it, still
+    /// goes through the walk.
+    public func prefillChunk(
+        _ tokens: [Int],
+        capturingLogitsAt capture: Set<Int> = []
+    ) -> DeepSeekV41ChunkLogits {
+        guard !tokens.isEmpty, storedPositions == 0 else {
+            return DeepSeekV41ChunkLogits(last: [])
+        }
+        for (position, token) in tokens.enumerated() {
+            tokenHistory.append(Int32(truncatingIfNeeded: token))
+            deadTokens.append(position == 0 ? pendingDead : false)
+        }
+        pendingDead = false
+
+        let mult = max(1, config.hcMult)
+        var streams: [[[Float]]] = []
+        streams.reserveCapacity(tokens.count)
+        for token in tokens {
+            streams.append(Array(repeating: embed(token), count: mult))
+        }
+        for layer in plan {
+            runChunkLayer(layer, positions: 0..<tokens.count, streams: &streams)
         }
 
+        let keep = capture.filter { $0 >= 0 && $0 < tokens.count }
+        var captured: [Int: [Float]] = [:]
+        var last: [Float] = []
+        for position in 0..<tokens.count
+        where position == tokens.count - 1 || keep.contains(position) {
+            let output = logits(streams[position])
+            if position == tokens.count - 1 { last = output }
+            if keep.contains(position) { captured[position] = output }
+        }
+        return DeepSeekV41ChunkLogits(last: last, captured: captured)
+    }
+
+    /// The block's output: the collapsed stream, the final norm, then the head.
+    private func logits(_ streams: [[Float]]) -> [Float] {
         // The block's output is the collapsed stream, not an average of the streams.
-        hidden = collapse(streams)
+        var hidden = collapse(streams)
         hidden = rmsNorm(hidden, role: .finalNorm, layer: nil, epsilon: config.rmsNormEps)
         // A tied checkpoint has no separate head: the embedding matrix is the head,
         // transposed. The catalog reports the same tensor either way, so the tie flag
@@ -600,100 +669,147 @@ nonisolated public final class DeepSeekV41CPUForward {
 
     // MARK: One layer
 
-    private func runLayer(
+    /// One layer over a run of consecutive positions: a whole chunk, or a single
+    /// position when the caller is walking.
+    ///
+    /// The order inside the layer is the part batching changes. Engram lands first, per
+    /// position. Then every position's attention input, query and latent are computed
+    /// and WRITTEN before any attention runs, because a query near the end of the chunk
+    /// reads rows the earlier positions of it wrote. That cannot hand a query a row from
+    /// its own future: the row plan is a function of the position, and it never names a
+    /// window position past the query or a compressed row its group has not finished.
+    /// Compressed groups are then pooled from the same writes, and the attention and
+    /// feed-forward sub-layers run per position.
+    ///
+    /// `streams` is indexed from `positions.lowerBound`, so a caller with one position
+    /// passes a one-element array and a chunk passes one entry per position.
+    private func runChunkLayer(
         _ layer: DeepSeekV41LayerPlan,
-        at position: Int,
-        streams: inout [[Float]]
+        positions: Range<Int>,
+        streams: inout [[[Float]]]
     ) {
         let index = layer.index
         let shape = DeepSeekV41AttentionShape.make(config: config, layer: layer)
+        let base = positions.lowerBound
 
         // Engram memory lands in the residual stream at the TOP of the layer, before
         // the attention sub-layer reads it (`Model.forward` calls `layer.engram(h,
         // ...)` ahead of `layer(...)`).
         if let engramTable = layer.engramTable {
-            writeEngram(layer: index, table: engramTable, streams: &streams)
+            for position in positions {
+                writeEngram(
+                    layer: index,
+                    table: engramTable,
+                    position: position,
+                    streams: &streams[position - base]
+                )
+            }
         }
 
-        // Attention sub-layer.
-        let attnInput = mixStreams(
-            streams,
-            readRole: .hcAttnFn,
-            scaleRole: .hcAttnScale,
-            baseRole: .hcAttnBase,
-            layer: index
-        )
-        let normed = rmsNorm(attnInput, role: .attnNorm, layer: index, epsilon: config.rmsNormEps)
-
-        var query = queryPath(normed, layer: index, shape: shape)
-        DeepSeekV41RoPE.rotateHeads(
-            &query,
-            heads: shape.numHeads,
-            headDim: shape.qkHeadDim,
-            sliceStart: shape.queryRopeStart,
-            sliceLength: shape.queryRopeWidth,
-            position: position,
-            frequencies: queryFrequencyTable[layer.ropeTable] ?? []
-        )
-
-        var latent = latentPath(normed, layer: index)
-        DeepSeekV41RoPE.rotateSlice(
-            &latent,
-            start: shape.latentRopeStart,
-            length: shape.latentRopeWidth,
-            position: position,
-            frequencies: latentFrequencyTable[layer.ropeTable] ?? []
-        )
-        appendLatent(layer: layer, position: position, latent: latent)
-        appendAttentionInput(layer: index, position: position, input: normed)
-        pooledLatent(layer: layer, position: position, shape: shape)
-
-        let keys = attentionKeys(layer: layer, position: position)
-        let sink = weights.vector(.attnSink, layer: index)
-        var attended = DeepSeekV41AttentionReference.attend(
-            query: query,
-            keys: keys,
-            shape: shape,
-            sink: sink
-        )
-        // The keys stay stored rotated, so the output's rope payload has to come back
-        // out before the output projection. The reference conjugates the SAME slice it
-        // rotated into the keys (`apply_rotary_emb(o[..., -rd:], freqs_cis, True)`);
-        // leaving it in rotates every value the projection reads.
-        if shape.outputCarriesRope {
-            DeepSeekV41RoPE.rotateHeads(
-                &attended,
-                heads: shape.numHeads,
-                headDim: shape.vHeadDim,
-                sliceStart: shape.outputRopeStart,
-                sliceLength: shape.latentRopeWidth,
-                position: position,
-                frequencies: latentFrequencyTable[layer.ropeTable] ?? [],
-                inverse: true
+        // Attention sub-layer: the block input every position reads, then its query and
+        // its latent, which are the two rails the cache is written from.
+        var normedInputs: [[Float]] = []
+        normedInputs.reserveCapacity(positions.count)
+        for position in positions {
+            let attnInput = mixStreams(
+                streams[position - base],
+                readRole: .hcAttnFn,
+                scaleRole: .hcAttnScale,
+                baseRole: .hcAttnBase,
+                layer: index
+            )
+            normedInputs.append(
+                rmsNorm(attnInput, role: .attnNorm, layer: index, epsilon: config.rmsNormEps)
             )
         }
-        let attnOut = outputPath(attended, layer: index, shape: shape)
-        DeepSeekV41HyperConnections.write(
-            streams: &streams,
-            contribution: attnOut,
-            writeScales: weights.vector(.hcAttnScale, layer: index)
-        )
+
+        var queries: [[Float]] = []
+        queries.reserveCapacity(positions.count)
+        for (offset, position) in positions.enumerated() {
+            let normed = normedInputs[offset]
+            var query = queryPath(normed, layer: index, shape: shape)
+            DeepSeekV41RoPE.rotateHeads(
+                &query,
+                heads: shape.numHeads,
+                headDim: shape.qkHeadDim,
+                sliceStart: shape.queryRopeStart,
+                sliceLength: shape.queryRopeWidth,
+                position: position,
+                frequencies: queryFrequencyTable[layer.ropeTable] ?? []
+            )
+            queries.append(query)
+
+            var latent = latentPath(normed, layer: index)
+            DeepSeekV41RoPE.rotateSlice(
+                &latent,
+                start: shape.latentRopeStart,
+                length: shape.latentRopeWidth,
+                position: position,
+                frequencies: latentFrequencyTable[layer.ropeTable] ?? []
+            )
+            appendLatent(layer: layer, position: position, latent: latent)
+            appendAttentionInput(layer: index, position: position, input: normed)
+        }
+
+        // A compressed owner pools the groups this run completed, from the block inputs
+        // written above. A trailing partial group stays unpooled: it completes on a
+        // later position, which is the reference's `remainder` split.
+        for position in positions {
+            pooledLatent(layer: layer, position: position, shape: shape)
+        }
+
+        let sink = weights.vector(.attnSink, layer: index)
+        for (offset, position) in positions.enumerated() {
+            let keys = attentionKeys(layer: layer, position: position)
+            var attended = DeepSeekV41AttentionReference.attend(
+                query: queries[offset],
+                keys: keys,
+                shape: shape,
+                sink: sink
+            )
+            // The keys stay stored rotated, so the output's rope payload has to come back
+            // out before the output projection. The reference conjugates the SAME slice it
+            // rotated into the keys (`apply_rotary_emb(o[..., -rd:], freqs_cis, True)`);
+            // leaving it in rotates every value the projection reads.
+            if shape.outputCarriesRope {
+                DeepSeekV41RoPE.rotateHeads(
+                    &attended,
+                    heads: shape.numHeads,
+                    headDim: shape.vHeadDim,
+                    sliceStart: shape.outputRopeStart,
+                    sliceLength: shape.latentRopeWidth,
+                    position: position,
+                    frequencies: latentFrequencyTable[layer.ropeTable] ?? [],
+                    inverse: true
+                )
+            }
+            let attnOut = outputPath(attended, layer: index, shape: shape)
+            DeepSeekV41HyperConnections.write(
+                streams: &streams[position - base],
+                contribution: attnOut,
+                writeScales: weights.vector(.hcAttnScale, layer: index)
+            )
+        }
 
         // Feed-forward sub-layer.
-        let ffnInput = mixStreams(
-            streams,
-            readRole: .hcFfnFn,
-            scaleRole: .hcFfnScale,
-            baseRole: .hcFfnBase,
-            layer: index
-        )
-        let ffnNormed = rmsNorm(ffnInput, role: .ffnNorm, layer: index, epsilon: config.rmsNormEps)
-        let ffnOut = feedForward(ffnNormed, layer: index)
-        DeepSeekV41HyperConnections.write(
-            streams: &streams,
-            contribution: ffnOut,
-            writeScales: weights.vector(.hcFfnScale, layer: index)
-        )
+        for position in positions {
+            let ffnInput = mixStreams(
+                streams[position - base],
+                readRole: .hcFfnFn,
+                scaleRole: .hcFfnScale,
+                baseRole: .hcFfnBase,
+                layer: index
+            )
+            let ffnNormed = rmsNorm(
+                ffnInput, role: .ffnNorm, layer: index, epsilon: config.rmsNormEps
+            )
+            let ffnOut = feedForward(ffnNormed, layer: index)
+            DeepSeekV41HyperConnections.write(
+                streams: &streams[position - base],
+                contribution: ffnOut,
+                writeScales: weights.vector(.hcFfnScale, layer: index)
+            )
+        }
     }
 
     // MARK: Attention pieces
@@ -856,7 +972,15 @@ nonisolated public final class DeepSeekV41CPUForward {
     }
 
     private func recordCandidateScores(layer: DeepSeekV41LayerPlan, position: Int) {
-        let rows = compressed[layer.compressedKVSource] ?? []
+        // A chunk pools every group it completed before any position reads them, so the
+        // record is cut to the rows this position could have seen: the same set a
+        // per-position walk had when it reached the same position.
+        let ownerRatio = plan.first(where: { $0.index == layer.compressedKVSource })?.compressRatio
+            ?? layer.compressRatio
+        let visible = DeepSeekV41CacheAddressing.compressedRowCount(
+            afterPosition: position, ratio: max(1, ownerRatio)
+        )
+        let rows = Array((compressed[layer.compressedKVSource] ?? []).prefix(max(0, visible)))
         guard !rows.isEmpty else { return }
         let queries = [Array(rows[rows.count - 1].prefix(max(1, config.indexHeadDim)))]
         let scores = DeepSeekV41Indexer.blockScores(
@@ -932,17 +1056,30 @@ nonisolated public final class DeepSeekV41CPUForward {
     /// projection reads. A column with no row is zero-filled rather than skipped:
     /// the concatenation is positional, so a missing row is a zero row in its own
     /// slot, and dropping it would shift every later column.
-    private func writeEngram(layer: Int, table: Int, streams: inout [[Float]]) {
+    private func writeEngram(
+        layer: Int,
+        table: Int,
+        position: Int,
+        streams: inout [[Float]]
+    ) {
         guard let engramLookup else { return }
         // `Engram.forward` zeroes the gate wherever `token_mask` is false, so a dead
         // position (an image span) passes through untouched rather than reading pad
-        // rows into the stream.
-        guard deadTokens.last != true else { return }
+        // rows into the stream. The flag belongs to `position`, not to the newest entry:
+        // a chunk appends its whole history before any layer runs.
+        guard deadTokens.indices.contains(position), deadTokens[position] != true else { return }
         let spec = config.engramTables[table]
         // `(max_ngram_size - 1) * n_heads` hash columns, one row each.
         let columns = max(1, spec.maxNgramSize - 1) * spec.headCount
+        // The hash looks only at the tail of the history, but it is a tail ENDING AT THIS
+        // POSITION: a chunk's later tokens must not reach back into this position's
+        // n-grams.
+        let end = min(position + 1, tokenHistory.count)
+        guard end > 0 else { return }
         guard let retrieved = try? engramLookup.engramRows(
-            layer: layer, history: tokenHistory, dead: deadTokens
+            layer: layer,
+            history: Array(tokenHistory[0..<end]),
+            dead: Array(deadTokens[0..<min(end, deadTokens.count)])
         ), !retrieved.isEmpty else { return }
         var rows = retrieved
         if rows.count < columns {
