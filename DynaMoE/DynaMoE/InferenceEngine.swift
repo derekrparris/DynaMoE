@@ -1163,7 +1163,9 @@ extension TensorMetadata {
     /// instead, so segmentation passes them through and the loader must not
     /// expect a buffer for them. The Rust core marks them by category rather
     /// than by a separate flag so the FFI record stays unchanged.
-    var isStreamedTensor: Bool { category.hasPrefix("Engram") }
+    var isStreamedTensor: Bool {
+        category.hasPrefix("Engram") || DeepSeekV41WeightCatalog.isStreamedName(name)
+    }
 }
 
 extension EngineCachedLayer {

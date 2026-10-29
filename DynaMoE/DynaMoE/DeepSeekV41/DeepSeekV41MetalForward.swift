@@ -539,7 +539,18 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             _ layer: Int?,
             resizeTo count: Int? = nil
         ) {
-            _ = bank.store(role, layer: layer, ref: catalog.tensor(role, layer: layer), resizeTo: count)
+            // `hc_*_scale` and the quantized companions classify with `isScale`
+            // set, so the plain lookup misses them. Try the scale slot too; a
+            // scalar that exists but cannot be decoded is reported rather than
+            // silently replaced by its identity value.
+            let ref = catalog.tensor(role, layer: layer)
+                ?? catalog.tensor(role, layer: layer, scale: true)
+            guard let ref else { return }
+            if !bank.store(role, layer: layer, ref: ref, resizeTo: count) {
+                problems.append(
+                    "\(role.rawValue)\(layer.map { " layer \($0)" } ?? "") could not be decoded"
+                )
+            }
         }
         store(.finalNorm, nil)
         for layer in runtime.plan {
@@ -549,6 +560,8 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             store(.attnWqANorm, l)
             store(.attnKvNorm, l)
             store(.attnSink, l)
+            store(.compressorNorm, l)
+            store(.indexerKNorm, l)
             store(.routerBias, l)
             store(.hcAttnFn, l, resizeTo: max(1, runtime.config.hcMult))
             store(.hcAttnScale, l, resizeTo: max(1, runtime.config.hcMult))

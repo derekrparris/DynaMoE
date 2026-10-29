@@ -408,8 +408,8 @@ final class DeepSeekV41WeightCatalogTests: XCTestCase {
                 tensor("layers.3.attn.attn_sink", "F32", [8]),
                 tensor("layers.3.ffn.gate.bias", "F32", [2]),
                 tensor("layers.3.ffn.gate.bias_vl", "F32", [2]),
-                tensor("layers.3.engram.wkv.weight", "F8_E4M3", [1000, 8]),
-                tensor("layers.3.engram.wkv.scale", "F8_E8M0", [1000, 1])
+                tensor("layers.3.engram.embed.weight", "F8_E4M3", [1000, 8]),
+                tensor("layers.3.engram.embed.scale", "F8_E8M0", [1000, 1])
             ],
             layerCount: 4
         )
@@ -450,11 +450,11 @@ final class DeepSeekV41WeightCatalogTests: XCTestCase {
             ],
             layerCount: 4
         )
-        XCTAssertNotNil(catalog.tensor(.draftMainProj, layer: 0))
-        XCTAssertNotNil(catalog.tensor(.draftNorm, layer: 2))
-        XCTAssertNotNil(catalog.tensor(.draftMarkovHead, layer: 1))
-        XCTAssertNotNil(catalog.tensor(.draftConfidence, layer: 0))
-        XCTAssertNotNil(catalog.tensor(.draftExpertW3, layer: 1, expert: 5))
+        XCTAssertNotNil(catalog.tensor(.draftMainProj, scope: .draft, layer: 0))
+        XCTAssertNotNil(catalog.tensor(.draftNorm, scope: .draft, layer: 2))
+        XCTAssertNotNil(catalog.tensor(.draftMarkovHead, scope: .draft, layer: 1))
+        XCTAssertNotNil(catalog.tensor(.draftConfidence, scope: .draft, layer: 0))
+        XCTAssertNotNil(catalog.tensor(.expertW3, scope: .draft, layer: 1, expert: 5))
         XCTAssertTrue(catalog.unconsumed.isEmpty)
     }
 
@@ -474,11 +474,143 @@ final class DeepSeekV41WeightCatalogTests: XCTestCase {
         XCTAssertNotNil(ref)
         XCTAssertFalse(ref?.isSupportedDtype ?? true)
     }
+
+    /// The published checkpoint ships `attn.compressor.norm` and
+    /// `attn.indexer.k_norm`. Both are referenced by the reference implementation
+    /// (`Compressor` normalises its pooled row, `Indexer` normalises its key) and
+    /// neither used to classify, so a real load reported them as unconsumed.
+    func testCompressorAndIndexerGainsClassify() {
+        let catalog = DeepSeekV41WeightCatalog(
+            named: [
+                tensor("layers.2.attn.compressor.norm.weight", "BF16", [512]),
+                tensor("layers.2.attn.indexer.k_norm.weight", "BF16", [128])
+            ],
+            layerCount: 40
+        )
+        XCTAssertEqual(catalog.tensor(.compressorNorm, layer: 2)?.shape, [512])
+        XCTAssertEqual(catalog.tensor(.indexerKNorm, layer: 2)?.shape, [128])
+        XCTAssertTrue(catalog.unconsumed.isEmpty, "\(catalog.unconsumed)")
+        // Both are per-channel gains, not quantized linears: a `.scale` companion
+        // would mean the classifier split the name wrongly.
+        XCTAssertEqual(catalog.streamedTensorNames.count, 0)
+    }
+
+    /// `engram.embed` is the n-gram table (one ~98 GB row block); `engram.wkv` is
+    /// a 25 600 x 6 144 projection over the retrieved rows. Mapping the
+    /// projection as the table would hand ~150 MB to a reader that preads rows
+    /// out of a table, so the two must never swap.
+    func testEngramTableIsTheEmbeddingAndWkvIsAProjection() {
+        let catalog = DeepSeekV41WeightCatalog(
+            named: [
+                tensor("layers.1.engram.embed.weight", "F8_E4M3", [384_006_168, 256]),
+                tensor("layers.1.engram.embed.scale", "F8_E8M0", [384_006_168, 8]),
+                tensor("layers.1.engram.wkv.weight", "F8_E4M3", [25_600, 6_144]),
+                tensor("layers.1.engram.wkv.scale", "F8_E8M0", [800, 192]),
+                tensor("layers.1.engram.q_weight", "BF16", [4, 5_120]),
+                tensor("layers.1.engram.k_weight", "BF16", [4, 5_120])
+            ],
+            layerCount: 40
+        )
+        XCTAssertEqual(catalog.tensor(.engramTable, layer: 1)?.name, "layers.1.engram.embed.weight")
+        XCTAssertEqual(catalog.tensor(.engramWkv, layer: 1)?.name, "layers.1.engram.wkv.weight")
+        XCTAssertNotNil(catalog.tensor(.engramWkv, layer: 1, scale: true))
+        XCTAssertEqual(catalog.tensor(.engramQuery, layer: 1)?.shape, [4, 5_120])
+        // Only the table and its scale are streamed; the projection is a dense
+        // matrix the loader may map.
+        XCTAssertEqual(
+            catalog.streamedTensorNames,
+            ["layers.1.engram.embed.weight", "layers.1.engram.embed.scale"]
+        )
+    }
+
+    /// A DSpark stage is a full backbone block under `mtp.N.*`. Its tensors must
+    /// land in the draft namespace: `mtp.0.attn.wkv` and `layers.0.attn.wkv` are
+    /// different weights, and a shared slot would drop one of them.
+    func testDraftStagesCarryBackboneBlocksInTheirOwnNamespace() {
+        let catalog = DeepSeekV41WeightCatalog(
+            named: [
+                tensor("layers.0.attn.wkv.weight", "F8_E4M3", [512, 5120]),
+                tensor("layers.0.attn.wkv.scale", "F8_E8M0", [16, 160]),
+                tensor("mtp.0.attn.wkv.weight", "F8_E4M3", [512, 5120]),
+                tensor("mtp.0.attn.wkv.scale", "F8_E8M0", [16, 160]),
+                tensor("mtp.0.attn.wq_b.weight", "F8_E4M3", [32768, 1280]),
+                tensor("mtp.0.ffn.gate.bias", "F32", [384]),
+                tensor("mtp.0.hc_attn_fn", "BF16", [4, 4])
+            ],
+            layerCount: 40
+        )
+        XCTAssertEqual(catalog.unconsumed, [])
+        XCTAssertEqual(catalog.duplicateRoles.count, 0, "\(catalog.duplicateRoles)")
+        XCTAssertEqual(catalog.tensor(.attnWkv, layer: 0)?.name, "layers.0.attn.wkv.weight")
+        XCTAssertEqual(
+            catalog.tensor(.attnWkv, scope: .draft, layer: 0)?.name, "mtp.0.attn.wkv.weight"
+        )
+        XCTAssertEqual(
+            catalog.tensor(.attnWkv, scope: .draft, layer: 0, scale: true)?.name,
+            "mtp.0.attn.wkv.scale"
+        )
+        XCTAssertNotNil(catalog.tensor(.attnWqB, scope: .draft, layer: 0))
+        XCTAssertNotNil(catalog.tensor(.routerBias, scope: .draft, layer: 0))
+        XCTAssertNotNil(catalog.tensor(.hcAttnFn, scope: .draft, layer: 0))
+        // Draft blocks are not backbone layers, so a block index must never be
+        // range-checked against the backbone layer count.
+        XCTAssertEqual(catalog.outOfRangeLayers, [])
+    }
+
+    /// The vision tower, its projector, and the three image markers ship in the
+    /// same checkpoint. None of them classifies into the text graph, but leaving
+    /// them unconsumed would refuse a text-only load of a complete checkpoint.
+    func testVisionTowerTensorsDoNotReadAsUnconsumed() {
+        let catalog = DeepSeekV41WeightCatalog(
+            named: [
+                tensor("vision.patch_embed.proj.weight", "BF16", [1_024, 3, 16, 16]),
+                tensor("vision.blocks.3.attn.wqkv.weight", "BF16", [3_072, 1_024]),
+                tensor("vision.norm.weight", "BF16", [1_024]),
+                tensor("aligner.w1.weight", "BF16", [5_120, 4_096]),
+                tensor("image_start", "BF16", [5_120]),
+                tensor("image_newline", "BF16", [5_120]),
+                tensor("image_end", "BF16", [5_120])
+            ],
+            layerCount: 40
+        )
+        XCTAssertEqual(catalog.unconsumed, [])
+        XCTAssertEqual(catalog.slots.filter { $0.role.isVision }.count, 7)
+        // One numbered stage (blocks.3); the patch embed and the tower norm are
+        // tower-wide, so they carry no block index.
+        XCTAssertEqual(
+            catalog.slots.filter { $0.role == .visionEncoder && $0.layer != nil }.count, 1
+        )
+        XCTAssertEqual(
+            catalog.slots.filter { $0.role == .visionEncoder && $0.layer == nil }.count, 2
+        )
+        XCTAssertEqual(catalog.slots.filter { $0.role == .visionProjector }.count, 1)
+        XCTAssertEqual(catalog.slots.filter { $0.role == .visionMarker }.count, 3)
+        // A vision block index is not a backbone layer index.
+        XCTAssertEqual(catalog.outOfRangeLayers, [])
+    }
 }
 
 // MARK: - Preflight
 
 final class DeepSeekV41PreflightTests: XCTestCase {
+
+    /// A valid safetensors file with a readable header and `dataBytes` of data.
+    private func writeShard(at url: URL, dataBytes: Int) throws {
+        let header = "{\"w\":{\"dtype\":\"U8\",\"shape\":[\(dataBytes)],"
+            + "\"data_offsets\":[0,\(dataBytes)]}}"
+        var data = Data()
+        var length = UInt64(header.utf8.count).littleEndian
+        withUnsafeBytes(of: &length) { data.append(contentsOf: $0) }
+        data.append(contentsOf: header.utf8)
+        data.append(Data(repeating: 1, count: dataBytes))
+        try data.write(to: url)
+    }
+
+    private func shardSize(dataBytes: Int) -> Int {
+        let header = "{\"w\":{\"dtype\":\"U8\",\"shape\":[\(dataBytes)],"
+            + "\"data_offsets\":[0,\(dataBytes)]}}"
+        return 8 + header.utf8.count + dataBytes
+    }
 
     func testIncompleteDownloadIsReported() throws {
         let dir = FileManager.default.temporaryDirectory
@@ -486,8 +618,9 @@ final class DeepSeekV41PreflightTests: XCTestCase {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 
+        let presentSize = shardSize(dataBytes: 1_000)
         let index = """
-        {"metadata": {"total_size": 2000},
+        {"metadata": {"total_size": \(presentSize * 2)},
          "weight_map": {"a": "model-00001-of-00002.safetensors",
                         "b": "model-00002-of-00002.safetensors"}}
         """
@@ -495,14 +628,16 @@ final class DeepSeekV41PreflightTests: XCTestCase {
             to: dir.appendingPathComponent("model.safetensors.index.json"),
             atomically: true, encoding: .utf8
         )
-        try Data(repeating: 0, count: 1000)
-            .write(to: dir.appendingPathComponent("model-00001-of-00002.safetensors"))
+        try writeShard(
+            at: dir.appendingPathComponent("model-00001-of-00002.safetensors"),
+            dataBytes: 1_000
+        )
 
         let report = try XCTUnwrap(DeepSeekV41Preflight.inspect(snapshotDir: dir))
         XCTAssertEqual(report.shardCount, 2)
         XCTAssertEqual(report.presentShardCount, 1)
-        XCTAssertEqual(report.bytesPresent, 1000)
-        XCTAssertEqual(report.bytesExpected, 2000)
+        XCTAssertEqual(report.bytesPresent, presentSize)
+        XCTAssertEqual(report.bytesExpected, presentSize * 2)
         XCTAssertFalse(report.isComplete)
         XCTAssertEqual(report.issues.map(\.name), ["model-00002-of-00002.safetensors"])
         XCTAssertTrue(report.humanSummary.hasPrefix("1/2 shards"), report.humanSummary)
@@ -523,11 +658,13 @@ final class DeepSeekV41PreflightTests: XCTestCase {
             to: dir.appendingPathComponent("model.safetensors.index.json"),
             atomically: true, encoding: .utf8
         )
-        try Data(repeating: 0, count: 10)
-            .write(to: dir.appendingPathComponent("model-00001-of-00001.safetensors"))
+        try writeShard(
+            at: dir.appendingPathComponent("model-00001-of-00001.safetensors"),
+            dataBytes: 10
+        )
 
         let report = try XCTUnwrap(DeepSeekV41Preflight.inspect(snapshotDir: dir))
-        XCTAssertTrue(report.isComplete)
+        XCTAssertTrue(report.isComplete, "\(report.issues)")
         XCTAssertTrue(report.issues.isEmpty)
     }
 
@@ -619,7 +756,7 @@ final class DeepSeekV41MemoryPlanTests: XCTestCase {
                 DeepSeekV41TensorRef(name: "head.weight", dtype: "F8_E4M3", shape: [1000, 64]),
                 // Expert and streamed tensors must not be counted as resident.
                 DeepSeekV41TensorRef(name: "layers.0.ffn.experts.0.w1.weight", dtype: "I8", shape: [64, 64]),
-                DeepSeekV41TensorRef(name: "layers.1.engram.wkv.weight", dtype: "F8_E4M3", shape: [64, 8])
+                DeepSeekV41TensorRef(name: "layers.1.engram.embed.weight", dtype: "F8_E4M3", shape: [64, 8])
             ],
             layerCount: 2
         )

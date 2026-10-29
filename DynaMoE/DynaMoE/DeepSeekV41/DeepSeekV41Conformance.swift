@@ -58,6 +58,13 @@ nonisolated public enum DeepSeekV41Conformance {
     public static let candidateSelection: Gate = .unverified
 
     /// How retrieved Engram rows are combined into the layer's residual.
+    ///
+    /// Still an INFERENCE and known to disagree with the reference in two places:
+    /// `Engram.forward` forms `kv = wkv(embed(hashes).flatten(-2))`, splits it into a
+    /// per-hc-copy key and one shared value, and gates the VALUE by a normalized
+    /// dot product against the residual stream; the port instead softmaxes the rows
+    /// per head and adds the result to the post-`ffn_norm` input. Rewiring it moves
+    /// where the contribution lands in the residual, so it is its own pass.
     public static let engramCombination: Gate = .unverified
 
     /// The mHC hyper-connection mixing rule.

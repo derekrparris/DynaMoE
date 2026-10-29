@@ -180,10 +180,13 @@ nonisolated public final class DeepSeekV41DeviceWeights: @unchecked Sendable {
 
     public func scaleTensor(
         _ role: DeepSeekV41TensorRole,
+        scope: DeepSeekV41TensorScope = .backbone,
         layer: Int? = nil,
         expert: Int? = nil
     ) -> DeepSeekV41DeviceTensor? {
-        let key = "\(role.rawValue)|\(layer.map(String.init) ?? "-")|\(expert.map(String.init) ?? "-")|s"
+        let key = DeepSeekV41WeightCatalog.key(
+            role, scope: scope, layer: layer, expert: expert, scale: true
+        )
         guard let slot = catalog.slot(matchingKey: key) else { return nil }
         return scales[slot.ref.name]
     }

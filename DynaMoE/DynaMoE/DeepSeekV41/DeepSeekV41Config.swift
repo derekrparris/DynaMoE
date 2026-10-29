@@ -171,6 +171,37 @@ nonisolated public enum DeepSeekV41RopeTable: String, Sendable, Equatable, Codab
     case compress
 }
 
+/// `scoring_func`: the monotone map from a raw gate logit to a routing score.
+///
+/// The published checkpoint uses `sqrtsoftplus`, and `sigmoid` is not a rescale
+/// of it: the two order the experts differently, so the wrong one changes WHICH
+/// experts run, not just how much weight each gets.
+nonisolated public enum DeepSeekV41ScoringFunction: String, Sendable, Equatable, Codable {
+    /// `sigmoid(logit)`. The DeepSeek-V3 family's rule.
+    case sigmoid
+    /// `sqrt(softplus(logit))`. What V4.1 ships.
+    case sqrtsoftplus
+    /// `softmax(logit)` over all experts, i.e. the scores already sum to 1.
+    case softmax
+
+    /// Decodes `scoring_func`, tolerating the older checkpoints that only publish
+    /// `topk_method` (`noaux_tc` implies the sigmoid scoring the V3 family used).
+    public init(_ raw: String?) {
+        switch (raw ?? "").lowercased() {
+        case "sqrtsoftplus", "softplus", "sqrt_softplus":
+            self = .sqrtsoftplus
+        case "softmax":
+            self = .softmax
+        case "sigmoid", "noaux_tc", "noaux_tc_bias":
+            self = .sigmoid
+        default:
+            // The published config always names one; a checkpoint that does not is
+            // treated as the family default rather than guessed per layer.
+            self = .sqrtsoftplus
+        }
+    }
+}
+
 // MARK: - Layer plan
 
 /// Everything the forward pass needs to know about one backbone layer, resolved
@@ -340,12 +371,25 @@ nonisolated public struct DeepSeekV41Config: Sendable, Equatable {
     public var routedScalingFactor: Float
     public var swigluLimit: Float?
     public var routerHasBias: Bool
+    /// `scoring_func`: how a raw gate logit becomes a routing score. The published
+    /// checkpoint uses `sqrtsoftplus`, and the difference is not a rescale: a
+    /// sigmoid compresses every logit, so it changes which experts land in the
+    /// top-k, not merely how much weight they get.
+    public var scoringFunction: DeepSeekV41ScoringFunction
+    /// `gate_temp`: the logits are divided by it before the scoring function.
+    public var gateTemp: Float
+    /// `norm_topk_prob`: renormalise the selected weights to sum to 1.
+    public var normalizeTopKProb: Bool
 
     // DSpark drafter
     public var numNextNPredictLayers: Int
     public var dsparkBlockSize: Int
     public var dsparkNoiseTokenID: Int
     public var dsparkTargetLayerIDs: [Int]
+    /// Routed / activated expert counts for the DSpark stages, which differ from
+    /// the backbone's (`get_moe_config`). Zero means "same as the backbone".
+    public var dsparkRoutedExperts: Int
+    public var dsparkActivatedExperts: Int
 
     // Tokenizer
     public var bosTokenID: Int
@@ -454,6 +498,16 @@ nonisolated public struct DeepSeekV41Config: Sendable, Equatable {
     /// Total Engram bytes on disk, the dominant streaming cost of this model.
     public var totalEngramBytes: Int {
         engramTables.reduce(0) { $0 + $1.totalBytes }
+    }
+
+    /// `get_moe_config` for a DSpark stage: the published DSpark counts win, and a
+    /// zero falls back to the backbone's (the reference does the same with
+    /// `dspark_n_routed_experts or n_routed_experts`).
+    public var draftExpertCounts: (routed: Int, activated: Int) {
+        (
+            dsparkRoutedExperts > 0 ? dsparkRoutedExperts : numRoutedExperts,
+            dsparkActivatedExperts > 0 ? dsparkActivatedExperts : numActivatedExperts
+        )
     }
 
     // MARK: Layer plan
@@ -709,10 +763,17 @@ nonisolated public extension DeepSeekV41Config {
             routedScalingFactor: text.float("routed_scaling_factor", "route_scale") ?? 1,
             swigluLimit: text.float("swiglu_limit"),
             routerHasBias: text.bool("moe_router_enable_expert_bias", "router_bias") ?? true,
+            scoringFunction: DeepSeekV41ScoringFunction(
+                text.string("scoring_func", "score_func") ?? text.string("topk_method")
+            ),
+            gateTemp: text.float("gate_temp") ?? 1,
+            normalizeTopKProb: text.bool("norm_topk_prob") ?? true,
             numNextNPredictLayers: text.int("num_nextn_predict_layers") ?? 0,
             dsparkBlockSize: text.int("dspark_block_size") ?? 0,
             dsparkNoiseTokenID: text.int("dspark_noise_token_id") ?? -1,
             dsparkTargetLayerIDs: text.ints("dspark_target_layer_ids") ?? [],
+            dsparkRoutedExperts: text.int("dspark_n_routed_experts") ?? 0,
+            dsparkActivatedExperts: text.int("dspark_num_experts_per_tok", "dspark_n_activated_experts") ?? 0,
             bosTokenID: root.int("bos_token_id") ?? 0,
             eosTokenIDs: DeepSeekV41Config.tokenIDs(root, "eos_token_id") ?? [1],
             padTokenID: root.int("pad_token_id") ?? 2,
@@ -766,6 +827,20 @@ nonisolated public extension DeepSeekV41Config {
         }
         guard hcMult >= 1 else {
             throw DeepSeekV41ConfigError.invalidField("hc_mult", "must be at least 1")
+        }
+        guard gateTemp > 0, gateTemp.isFinite else {
+            // `scores = logits / gate_temp` runs before the scoring function, so a
+            // zero here either traps or hands the router infinities.
+            throw DeepSeekV41ConfigError.invalidField("gate_temp", "must be positive")
+        }
+        if numNextNPredictLayers > 0 {
+            let routed = dsparkRoutedExperts > 0 ? dsparkRoutedExperts : numRoutedExperts
+            let activated = dsparkActivatedExperts > 0 ? dsparkActivatedExperts : numActivatedExperts
+            guard activated > 0, activated <= routed else {
+                throw DeepSeekV41ConfigError.invalidField(
+                    "dspark_num_experts_per_tok", "must be in 1...\(routed)"
+                )
+            }
         }
         if engramLayerIDs.isEmpty {
             guard engramHeadCount == 0 else {

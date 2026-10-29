@@ -15,11 +15,13 @@
 //       per-head sink logit and two optional side networks (indexer,
 //       compressor) that exist only on layers the plan marks as compressed.
 //    3. Routed experts are `ffn.experts.{E}.w{1,2,3}` with a paired scale
-//       tensor each, and the Engram tables (`engram.wkv`) are ~100 GB single
-//       tensors that must never be handed to Metal.
+//       tensor each, and the Engram tables (`engram.embed`, one per
+//       `engram_layer_ids` entry) are ~100 GB single tensors that must never be
+//       handed to Metal. `engram.wkv` is a dense projection OVER the retrieved
+//       rows, not the table, and must not be confused with it.
 //
 //  The catalog therefore does two jobs:
-//    * resolve every name to a (role, layer, expert) slot with tolerant
+//    * resolve every name to a (scope, role, layer, expert) slot with tolerant
 //      suffix matching, because the exact scale suffix (`weight_scale` vs
 //      `scale`) is not fixed across DeepSeek's checkpoints, and
 //    * FAIL CLOSED: any tensor the catalog cannot place, and any slot the plan
@@ -53,8 +55,10 @@ nonisolated public enum DeepSeekV41TensorRole: String, Sendable, Equatable, Case
     case indexerWqB
     case indexerWk
     case indexerWeights
+    case indexerKNorm
     case compressorWkv
     case compressorWgate
+    case compressorNorm
 
     // Feed-forward
     case ffnNorm
@@ -78,6 +82,7 @@ nonisolated public enum DeepSeekV41TensorRole: String, Sendable, Equatable, Case
 
     // Engram
     case engramTable
+    case engramWkv
     case engramQuery
     case engramKey
 
@@ -88,18 +93,46 @@ nonisolated public enum DeepSeekV41TensorRole: String, Sendable, Equatable, Case
     case draftMarkovEmbed
     case draftMarkovHead
     case draftConfidence
-    case draftExpertW1
-    case draftExpertW2
-    case draftExpertW3
+
+    // Vision tower and its projector. The checkpoint publishes both alongside the
+    // text tower; nothing in the text graph reads them, so they are classified
+    // only so the load can say "present, deliberately unused" instead of treating
+    // a smolvision tower as an unknown tensor.
+    case visionEncoder
+    case visionProjector
+    case visionMarker
 
     /// Roles whose resolved tensor is streamed from disk and never mapped into
     /// a Metal buffer (the Engram table is one ~100 GB tensor).
     public var isStreamed: Bool { self == .engramTable }
 
+    /// Roles indexed by a DSpark draft block rather than a backbone layer.
+    public var isDraft: Bool {
+        switch self {
+        case .draftMainProj, .draftMainNorm, .draftNorm, .draftMarkovEmbed,
+             .draftMarkovHead, .draftConfidence:
+            return true
+        default:
+            return false
+        }
+    }
+
     /// Roles that exist only when the plan says the layer has a compressor.
     public var requiresCompressor: Bool {
         switch self {
-        case .compressorWkv, .compressorWgate, .indexerWqB, .indexerWk, .indexerWeights:
+        case .compressorWkv, .compressorWgate, .compressorNorm,
+             .indexerWqB, .indexerWk, .indexerWeights, .indexerKNorm:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Roles from the vision tower or its projector. Nothing in the text graph
+    /// reads them.
+    public var isVision: Bool {
+        switch self {
+        case .visionEncoder, .visionProjector, .visionMarker:
             return true
         default:
             return false
@@ -138,10 +171,23 @@ nonisolated public struct DeepSeekV41TensorRef: Sendable, Equatable {
     }
 }
 
+/// Which namespace a tensor name lives in. The DSpark stages under `mtp.N.*` are
+/// full backbone blocks (attention, MoE, hyper-connections) with their own layer
+/// indices, so without a scope `mtp.0.attn.wkv` and `layers.0.attn.wkv` would
+/// resolve to the same slot and one of them would be silently dropped.
+nonisolated public enum DeepSeekV41TensorScope: String, Sendable, Equatable {
+    case backbone
+    case draft
+    case vision
+}
+
 /// Where a tensor lives in the model: a role, optionally per layer and per
 /// expert, plus whether it is the paired quantization-scale companion.
 nonisolated public struct DeepSeekV41TensorSlot: Sendable, Equatable {
     public let role: DeepSeekV41TensorRole
+    /// Namespace the name came from; `layer` is a backbone layer index, a draft
+    /// block index, or a vision block index depending on it.
+    public let scope: DeepSeekV41TensorScope
     /// Backbone layer, or the draft block index for `draft*` roles, or nil for
     /// model-level tensors.
     public let layer: Int?
@@ -151,12 +197,14 @@ nonisolated public struct DeepSeekV41TensorSlot: Sendable, Equatable {
 
     public init(
         role: DeepSeekV41TensorRole,
+        scope: DeepSeekV41TensorScope = .backbone,
         layer: Int?,
         expert: Int?,
         isScale: Bool,
         ref: DeepSeekV41TensorRef
     ) {
         self.role = role
+        self.scope = scope
         self.layer = layer
         self.expert = expert
         self.isScale = isScale
@@ -164,7 +212,7 @@ nonisolated public struct DeepSeekV41TensorSlot: Sendable, Equatable {
     }
 
     public var key: String {
-        "\(role.rawValue)|\(layer.map(String.init) ?? "-")|\(expert.map(String.init) ?? "-")|\(isScale ? "s" : "w")"
+        "\(scope.rawValue)|\(role.rawValue)|\(layer.map(String.init) ?? "-")|\(expert.map(String.init) ?? "-")|\(isScale ? "s" : "w")"
     }
 }
 
@@ -179,11 +227,16 @@ nonisolated public struct DeepSeekV41WeightCatalog: Sendable {
     /// win silently, which is how a checkpoint with both `attn.kv_norm` and
     /// `attn.wkv_norm` would load one and ignore the other.
     public let duplicateRoles: [String]
+    /// Backbone tensors naming a layer the config does not have. `layerCount`
+    /// used to be accepted and never read, so a truncated manifest placing
+    /// tensors past the last layer validated clean.
+    public let outOfRangeLayers: [String]
 
     private let index: [String: DeepSeekV41TensorSlot]
 
     public init(named tensors: [DeepSeekV41TensorRef], layerCount: Int) {
         var slots: [DeepSeekV41TensorSlot] = []
+        var outOfRange: [String] = []
         var unconsumed: [String] = []
         var duplicates: [String] = []
         var index: [String: DeepSeekV41TensorSlot] = [:]
@@ -192,9 +245,13 @@ nonisolated public struct DeepSeekV41WeightCatalog: Sendable {
                 unconsumed.append(tensor.name)
                 continue
             }
+            if let layer = slot.layer, slot.scope == .backbone,
+               layer < 0 || layer >= max(0, layerCount) {
+                outOfRange.append("\(tensor.name) names layer \(layer) of \(layerCount)")
+            }
             if let existing = index[slot.key] {
                 duplicates.append(
-                    "\(existing.ref.name) and \(tensor.name) both resolve to \(slot.role.rawValue)\(slot.layer.map { " layer \($0)" } ?? "")"
+                    "\(existing.ref.name) and \(tensor.name) both resolve to \(slot.scope.rawValue) \(slot.role.rawValue)\(slot.layer.map { " layer \($0)" } ?? "")"
                 )
                 slots.append(slot)
                 continue
@@ -205,17 +262,39 @@ nonisolated public struct DeepSeekV41WeightCatalog: Sendable {
         self.slots = slots
         self.unconsumed = unconsumed
         self.duplicateRoles = duplicates
+        self.outOfRangeLayers = outOfRange
         self.index = index
+    }
+
+    /// Whether a tensor name is one the loader must never map into a Metal
+    /// buffer. Swift keys this off its own classifier so the decision does not
+    /// depend on the display string the Rust core happens to emit.
+    public static func isStreamedName(_ name: String) -> Bool {
+        let ref = DeepSeekV41TensorRef(name: name, dtype: "", shape: [])
+        return classify(name: name, ref: ref)?.role.isStreamed == true
     }
 
     public func tensor(
         _ role: DeepSeekV41TensorRole,
+        scope: DeepSeekV41TensorScope = .backbone,
         layer: Int? = nil,
         expert: Int? = nil,
         scale: Bool = false
     ) -> DeepSeekV41TensorRef? {
-        let key = "\(role.rawValue)|\(layer.map(String.init) ?? "-")|\(expert.map(String.init) ?? "-")|\(scale ? "s" : "w")"
+        let key = Self.key(role, scope: scope, layer: layer, expert: expert, scale: scale)
         return index[key]?.ref
+    }
+
+    /// The role-index key. Every lookup and the slot's own key come from here, so
+    /// the two cannot drift apart.
+    public static func key(
+        _ role: DeepSeekV41TensorRole,
+        scope: DeepSeekV41TensorScope = .backbone,
+        layer: Int?,
+        expert: Int? = nil,
+        scale: Bool = false
+    ) -> String {
+        "\(scope.rawValue)|\(role.rawValue)|\(layer.map(String.init) ?? "-")|\(expert.map(String.init) ?? "-")|\(scale ? "s" : "w")"
     }
 
     /// Looks a slot up by its `role|layer|expert|w|s` key. Used by the device-side
@@ -226,8 +305,11 @@ nonisolated public struct DeepSeekV41WeightCatalog: Sendable {
     }
 
     /// Per-expert tensors that were published for a layer, ascending.
-    public func expertIndices(layer: Int) -> [Int] {
-        Set(slots.filter { $0.role == .expertW1 && $0.layer == layer }.compactMap(\.expert)).sorted()
+    public func expertIndices(layer: Int, scope: DeepSeekV41TensorScope = .backbone) -> [Int] {
+        Set(
+            slots.filter { $0.role == .expertW1 && $0.layer == layer && $0.scope == scope }
+                .compactMap(\.expert)
+        ).sorted()
     }
 
     /// Streamed slots: the Engram table and its scale companion. Both live in
@@ -262,32 +344,70 @@ nonisolated public struct DeepSeekV41WeightCatalog: Sendable {
             break
         }
 
-        // Draft block (`mtp.N.…`).
+        // Draft blocks (`mtp.N.…`): full backbone stages in their own namespace.
         if let rest = remainder(of: name, prefix: "mtp.") {
             let parts = rest.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
             guard parts.count == 2, let block = Int(parts[0]), block >= 0 else { return nil }
-            return classifyDraft(String(parts[1]), block: block, ref: ref)
+            return classifyBlock(String(parts[1]), scope: .draft, layer: block, ref: ref)
+        }
+
+        // Vision tower, its projector, and the three image markers. The text graph
+        // never reads them, but they are published in the same checkpoint, so an
+        // unclassified name here would refuse an otherwise complete text load.
+        if let rest = remainder(of: name, prefix: "vision.") {
+            // `vision.patch_embed.*` and `vision.norm.*` are tower-wide; everything
+            // else lives in a numbered stage.
+            return slot(
+                .visionEncoder, scope: .vision, layer: visionBlockIndex(rest),
+                expert: nil, scale: false, ref
+            )
+        }
+        if remainder(of: name, prefix: "aligner.") != nil {
+            return slot(.visionProjector, scope: .vision, layer: nil, expert: nil, scale: false, ref)
+        }
+        if ["image_start", "image_newline", "image_end"].contains(name) {
+            return slot(.visionMarker, scope: .vision, layer: nil, expert: nil, scale: false, ref)
         }
 
         // Backbone layer.
         guard let rest = remainder(of: name, prefix: "layers.") else { return nil }
         let parts = rest.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
         guard parts.count == 2, let layer = Int(parts[0]), layer >= 0 else { return nil }
-        let body = String(parts[1])
+        return classifyBlock(String(parts[1]), scope: .backbone, layer: layer, ref: ref)
+    }
+
+    /// The `vision.blocks.N.…` stage index, nil for the tower-wide tensors
+    /// (`vision.patch_embed.*`, `vision.norm.*`).
+    private static func visionBlockIndex(_ rest: String) -> Int? {
+        guard let blockRest = remainder(of: rest, prefix: "blocks.") else { return nil }
+        let parts = blockRest.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2, let block = Int(parts[0]), block >= 0 else { return nil }
+        return block
+    }
+
+    /// Classifies the part of a name below its layer prefix. Backbone layers and
+    /// DSpark stages publish the same block (attention, MoE, hyper-connections),
+    /// so they share this table and differ only in scope.
+    private static func classifyBlock(
+        _ body: String,
+        scope: DeepSeekV41TensorScope,
+        layer: Int,
+        ref: DeepSeekV41TensorRef
+    ) -> DeepSeekV41TensorSlot? {
         let (base, isScale) = splitScale(body)
 
         if let expertRest = remainder(of: base, prefix: "ffn.experts.") {
             let expertParts = expertRest.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
             guard expertParts.count == 2, let expert = Int(expertParts[0]), expert >= 0 else { return nil }
-            let role = expertRole(String(expertParts[1]))
-            guard let role else { return nil }
-            return slot(role, layer: layer, expert: expert, scale: isScale, ref)
+            guard let role = expertRole(String(expertParts[1])) else { return nil }
+            return slot(role, scope: scope, layer: layer, expert: expert, scale: isScale, ref)
         }
 
         let roles: [String: DeepSeekV41TensorRole] = [
             "attn_norm": .attnNorm,
             "ffn_norm": .ffnNorm,
             "attn.wq_a": .attnWqA,
+            "attn.q_norm": .attnWqANorm,
             "attn.wq_a_norm": .attnWqANorm,
             "attn.wq_b": .attnWqB,
             "attn.wkv": .attnWkv,
@@ -299,8 +419,10 @@ nonisolated public struct DeepSeekV41WeightCatalog: Sendable {
             "attn.indexer.wq_b": .indexerWqB,
             "attn.indexer.wk": .indexerWk,
             "attn.indexer.weights_proj": .indexerWeights,
+            "attn.indexer.k_norm": .indexerKNorm,
             "attn.compressor.wkv": .compressorWkv,
             "attn.compressor.wgate": .compressorWgate,
+            "attn.compressor.norm": .compressorNorm,
             "ffn.gate": .routerWeight,
             "ffn.gate.bias": .routerBias,
             "ffn.gate.bias_vl": .routerVisionBias,
@@ -313,45 +435,33 @@ nonisolated public struct DeepSeekV41WeightCatalog: Sendable {
             "hc_ffn_fn": .hcFfnFn,
             "hc_ffn_base": .hcFfnBase,
             "hc_ffn_scale": .hcFfnScale,
-            "engram.wkv": .engramTable,
+            // `engram.embed` is the n-gram table itself (`engram_num_embeddings`
+            // rows by `engram_head_dim`, plus its per-block scale companion).
+            // `engram.wkv` is a dense projection over the retrieved rows, so it
+            // must not be mistaken for the table: mapping it as one would map a
+            // 25 600 x 6 144 matrix where a ~98 GB table lives.
+            "engram.embed": .engramTable,
+            "engram.wkv": .engramWkv,
             "engram.q_weight": .engramQuery,
-            "engram.k_weight": .engramKey
-        ]
-        if let role = roles[base] {
-            // Norms carry no scale companion; only quantized linears do.
-            return slot(role, layer: layer, expert: nil, scale: isScale, ref)
-        }
-        return nil
-    }
-
-    private static func classifyDraft(
-        _ body: String,
-        block: Int,
-        ref: DeepSeekV41TensorRef
-    ) -> DeepSeekV41TensorSlot? {
-        let (base, isScale) = splitScale(body)
-        if let expertRest = remainder(of: base, prefix: "ffn.experts.") {
-            let expertParts = expertRest.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
-            guard expertParts.count == 2, let expert = Int(expertParts[0]), expert >= 0 else { return nil }
-            guard let role = expertRole(String(expertParts[1])) else { return nil }
-            let mapped: DeepSeekV41TensorRole
-            switch role {
-            case .expertW1: mapped = .draftExpertW1
-            case .expertW2: mapped = .draftExpertW2
-            default: mapped = .draftExpertW3
-            }
-            return slot(mapped, layer: block, expert: expert, scale: isScale, ref)
-        }
-        let roles: [String: DeepSeekV41TensorRole] = [
+            "engram.k_weight": .engramKey,
+            // DSpark heads. Stage 0 carries the target-layer projection, the last
+            // stage carries the norm and the two output heads.
             "main_proj": .draftMainProj,
             "main_norm": .draftMainNorm,
-            "norm": .draftNorm,
             "markov_head.embed": .draftMarkovEmbed,
             "markov_head.head": .draftMarkovHead,
             "confidence_head.proj": .draftConfidence
         ]
-        guard let role = roles[base] else { return nil }
-        return slot(role, layer: block, expert: nil, scale: isScale, ref)
+        if let role = roles[base] {
+            // Norms carry no scale companion; only quantized linears do.
+            return slot(role, scope: scope, layer: layer, expert: nil, scale: isScale, ref)
+        }
+        // `norm` is the final RMSNorm of the last DSpark stage. It is spelled like
+        // the model-level `norm.weight`, which is why it only means anything here.
+        if scope == .draft && base == "norm" {
+            return slot(.draftNorm, scope: scope, layer: layer, expert: nil, scale: isScale, ref)
+        }
+        return nil
     }
 
     private static func expertRole(_ name: String) -> DeepSeekV41TensorRole? {
@@ -384,12 +494,20 @@ nonisolated public struct DeepSeekV41WeightCatalog: Sendable {
 
     private static func slot(
         _ role: DeepSeekV41TensorRole,
+        scope: DeepSeekV41TensorScope = .backbone,
         layer: Int?,
         expert: Int?,
         scale: Bool,
         _ ref: DeepSeekV41TensorRef
     ) -> DeepSeekV41TensorSlot {
-        DeepSeekV41TensorSlot(role: role, layer: layer, expert: expert, isScale: scale, ref: ref)
+        DeepSeekV41TensorSlot(
+            role: role,
+            scope: scope,
+            layer: layer,
+            expert: expert,
+            isScale: scale,
+            ref: ref
+        )
     }
 }
 
@@ -435,6 +553,7 @@ extension DeepSeekV41WeightCatalog {
         for duplicate in duplicateRoles {
             problems.append("two tensors claim one role: \(duplicate)")
         }
+        problems.append(contentsOf: outOfRangeLayers)
 
         // Model-level.
         for (role, label) in [(DeepSeekV41TensorRole.tokenEmbedding, "embed.weight"),
@@ -458,18 +577,23 @@ extension DeepSeekV41WeightCatalog {
                 (.attnWkv, "attn.wkv.weight"),
                 (.attnWoA, "attn.wo_a.weight"),
                 (.attnWoB, "attn.wo_b.weight"),
-                (.routerWeight, "ffn.gate.weight"),
-                (.sharedExpertW1, "ffn.shared_experts.w1.weight"),
-                (.sharedExpertW2, "ffn.shared_experts.w2.weight"),
-                (.sharedExpertW3, "ffn.shared_experts.w3.weight")
+                (.routerWeight, "ffn.gate.weight")
             ]
+            if config.sharedExpertCount > 0 {
+                required.append(contentsOf: [
+                    (.sharedExpertW1, "ffn.shared_experts.w1.weight"),
+                    (.sharedExpertW2, "ffn.shared_experts.w2.weight"),
+                    (.sharedExpertW3, "ffn.shared_experts.w3.weight")
+                ])
+            }
             if config.qLoraRank > 0 {
                 required.append((.attnWqANorm, "attn.wq_a_norm.weight"))
             }
             required.append((.attnWqB, "attn.wq_b.weight"))
-            if config.kvLoraRank > 0 {
-                required.append((.attnKvNorm, "attn.kv_norm.weight"))
-            }
+            // `kv_norm` is unconditional in the reference (`RMSNorm(head_dim)` over the
+            // whole cache record), independent of whether the checkpoint also publishes
+            // a separate `kv_lora_rank`.
+            required.append((.attnKvNorm, "attn.kv_norm.weight"))
             if config.hcMult > 1 {
                 required.append(contentsOf: [
                     (.hcAttnFn, "hc_attn_fn"),
@@ -478,22 +602,32 @@ extension DeepSeekV41WeightCatalog {
                     (.hcFfnBase, "hc_ffn_base")
                 ])
             }
-            if layer.flavor == .compressed {
-                required.append(contentsOf: [
-                    (.compressorWkv, "attn.compressor.wkv.weight"),
-                    (.compressorWgate, "attn.compressor.wgate.weight")
-                ])
-                if layer.ownsCompressedIndex || config.indexTopK > 0 {
-                    required.append(contentsOf: [
-                        (.indexerWqB, "attn.indexer.wq_b.weight"),
-                        (.indexerWk, "attn.indexer.wk.weight"),
-                        (.indexerWeights, "attn.indexer.weights_proj.weight")
-                    ])
+            // Only the four `kv_source_layer_ids` layers publish compressor
+            // weights: the other compressed layers read the rows their source
+            // layer wrote. `wgate` is ratio-specific too, because a ratio of 1 is
+            // a plain projection with no gate (``Compressor.forward``).
+            if layer.ownsCompressedKV {
+                required.append((.compressorWkv, "attn.compressor.wkv.weight"))
+                if layer.compressRatio > 1 {
+                    required.append((.compressorWgate, "attn.compressor.wgate.weight"))
                 }
+                required.append((.compressorNorm, "attn.compressor.norm.weight"))
+            }
+            if layer.flavor == .compressed && (layer.ownsCompressedIndex || config.indexTopK > 0) {
+                required.append(contentsOf: [
+                    (.indexerWqB, "attn.indexer.wq_b.weight"),
+                    (.indexerWk, "attn.indexer.wk.weight"),
+                    (.indexerWeights, "attn.indexer.weights_proj.weight")
+                ])
+            }
+            if layer.ownsCompressedIndex {
+                // `Indexer.forward` normalises the projected key before rotating it.
+                required.append((.indexerKNorm, "attn.indexer.k_norm.weight"))
             }
             if layer.engramTable != nil {
                 required.append(contentsOf: [
-                    (.engramTable, "engram.wkv"),
+                    (.engramTable, "engram.embed.weight"),
+                    (.engramWkv, "engram.wkv.weight"),
                     (.engramQuery, "engram.q_weight"),
                     (.engramKey, "engram.k_weight")
                 ])
@@ -528,17 +662,57 @@ extension DeepSeekV41WeightCatalog {
             }
         }
 
-        // DSpark draft blocks.
+        // DSpark stages. Each `mtp.N.*` is a full `Block` (attention, MoE,
+        // hyper-connections) in the draft namespace; only stage 0 carries the
+        // target-layer projection and only the last stage carries the norm and
+        // the two output heads (``DSparkBlock.__init__``).
         for block in 0..<config.numNextNPredictLayers {
-            for (role, label) in [(DeepSeekV41TensorRole.draftMainProj, "main_proj.weight"),
-                                  (.draftMainNorm, "main_norm.weight"),
-                                  (.draftNorm, "norm.weight"),
-                                  (.draftMarkovEmbed, "markov_head.embed.weight"),
-                                  (.draftMarkovHead, "markov_head.head.weight"),
-                                  (.draftConfidence, "confidence_head.proj.weight")] {
-                if tensor(role, layer: block) == nil {
-                    problems.append("mtp.\(block): missing \(label)")
-                }
+            var required: [(DeepSeekV41TensorRole, String)] = [
+                (.attnNorm, "attn_norm.weight"),
+                (.attnWqA, "attn.wq_a.weight"),
+                (.attnWqB, "attn.wq_b.weight"),
+                (.attnWkv, "attn.wkv.weight"),
+                (.attnKvNorm, "attn.kv_norm.weight"),
+                (.attnWoA, "attn.wo_a.weight"),
+                (.attnWoB, "attn.wo_b.weight"),
+                (.ffnNorm, "ffn_norm.weight"),
+                (.routerWeight, "ffn.gate.weight")
+            ]
+            if config.qLoraRank > 0 {
+                required.append((.attnWqANorm, "attn.q_norm.weight"))
+            }
+            if config.hcMult > 1 {
+                required.append(contentsOf: [
+                    (.hcAttnFn, "hc_attn_fn"),
+                    (.hcAttnBase, "hc_attn_base"),
+                    (.hcFfnFn, "hc_ffn_fn"),
+                    (.hcFfnBase, "hc_ffn_base")
+                ])
+            }
+            if block == 0 {
+                required.append(contentsOf: [
+                    (.draftMainProj, "main_proj.weight"),
+                    (.draftMainNorm, "main_norm.weight")
+                ])
+            }
+            if block == config.numNextNPredictLayers - 1 {
+                required.append(contentsOf: [
+                    (.draftNorm, "norm.weight"),
+                    (.draftMarkovEmbed, "markov_head.embed.weight"),
+                    (.draftMarkovHead, "markov_head.head.weight"),
+                    (.draftConfidence, "confidence_head.proj.weight")
+                ])
+            }
+            for (role, label) in required where tensor(role, scope: .draft, layer: block) == nil {
+                problems.append("mtp.\(block): missing \(label)")
+            }
+            let draftExperts = expertIndices(layer: block, scope: .draft)
+            if draftExperts.isEmpty {
+                problems.append("mtp.\(block): no routed experts (ffn.experts.*)")
+            } else if draftExperts.count != config.draftExpertCounts.routed {
+                problems.append(
+                    "mtp.\(block): \(draftExperts.count) routed experts, config says \(config.draftExpertCounts.routed)"
+                )
             }
         }
 
