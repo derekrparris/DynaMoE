@@ -8346,3 +8346,824 @@ kernel void apply_rope_tree_proportional(
         qkVector[idx1] = v0 * sinVal + v1 * cosVal;
     }
 }
+
+// ============================================================================
+// MARK: - DeepSeek V4.1 numerics
+//
+// Four weight formats the rest of the engine does not carry:
+//   * dense linears: E4M3 with ue8m0 scales on a 32x32 block grid
+//     (the existing `fp8_block_gemv` covers the 128x128 DeepSeek-V3 grid),
+//   * routed experts: MXFP4 (E2M1, two values per byte) with one E8M0 scale
+//     per 32 values,
+//   * Engram table rows: E4M3 with one E8M0 scale per 32, dequantized when the
+//     row arrives from disk,
+//   * mHC: a Sinkhorn-normalized mixing matrix over the hyper-connection
+//     streams.
+//
+// These are deliberately self-contained: they share only the fp8/bf16 helpers
+// above, so a change here cannot perturb any other family's kernels.
+// ============================================================================
+
+/// Unpacks one MXFP4 (E2M1) nibble. Values are the standard OCP table:
+/// exp 00 -> {0, 0.5}, 01 -> {1, 1.5}, 10 -> {2, 3}, 11 -> {4, 6}.
+inline float dsv41_unpack_e2m1(uchar nibble) {
+    const float table[8] = { 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f };
+    float magnitude = table[nibble & 0x07];
+    return (nibble & 0x08) ? -magnitude : magnitude;
+}
+
+/// MSL Kernel: 32x32 block-scaled FP8 GEMV (y = W_e4m3 * x, ue8m0 scales).
+/// Weight layout: [outDim][inDim] E4M3, scales [outDim/32][inDim/32] E8M0.
+/// Grid: (outDim, batchSize, 1); one thread per output row.
+kernel void dsv41_fp8_block32_gemv(
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const uchar* rawScaleBuffer [[buffer(1)]],
+    device const float* inputVector [[buffer(2)]],
+    device float* outputVector [[buffer(3)]],
+    constant uint64_t& weightOffset [[buffer(4)]],
+    constant uint64_t& scaleOffset [[buffer(5)]],
+    constant uint32_t& inDim [[buffer(6)]],
+    constant uint32_t& outDim [[buffer(7)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint row = pos.x;
+    uint tokenIdx = pos.y;
+    if (row >= outDim || (inDim % 32u) != 0u) return;
+
+    const uint32_t blockCount = inDim / 32u;
+    const uint32_t scaleRowBase = (row / 32u) * blockCount;
+    device const uchar* wPtr = rawWeightBuffer + weightOffset + ((uint64_t)row * inDim);
+    device const float* xPtr = inputVector + ((uint64_t)tokenIdx * inDim);
+
+    float total = 0.0f;
+    for (uint32_t block = 0; block < blockCount; ++block) {
+        float blockScale = decode_e8m0_scale(rawScaleBuffer[scaleOffset + scaleRowBase + block]);
+        uint32_t base = block * 32u;
+        float blockDot = 0.0f;
+        for (uint32_t i = 0; i < 8; ++i) {
+            uint32_t at = base + i * 4u;
+            uchar4 w4 = *(device const uchar4*)(wPtr + at);
+            float4 x4 = *(device const float4*)(xPtr + at);
+            blockDot += unpack_e4m3(w4.x) * x4.x;
+            blockDot += unpack_e4m3(w4.y) * x4.y;
+            blockDot += unpack_e4m3(w4.z) * x4.z;
+            blockDot += unpack_e4m3(w4.w) * x4.w;
+        }
+        total += blockDot * blockScale;
+    }
+    outputVector[((uint64_t)tokenIdx * outDim) + row] = total;
+}
+
+/// MSL Kernel: MXFP4 GEMV (y = W_e2m1 * x, one E8M0 scale per 32 values).
+/// Weight layout: [outDim][inDim/2] bytes (low nibble = even index),
+/// scales [outDim][inDim/32] E8M0. Grid: (outDim, batchSize, 1).
+kernel void dsv41_mxfp4_gemv(
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const uchar* rawScaleBuffer [[buffer(1)]],
+    device const float* inputVector [[buffer(2)]],
+    device float* outputVector [[buffer(3)]],
+    constant uint64_t& weightOffset [[buffer(4)]],
+    constant uint64_t& scaleOffset [[buffer(5)]],
+    constant uint32_t& inDim [[buffer(6)]],
+    constant uint32_t& outDim [[buffer(7)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint row = pos.x;
+    uint tokenIdx = pos.y;
+    if (row >= outDim || (inDim % 32u) != 0u) return;
+
+    const uint32_t byteCount = inDim / 2u;
+    const uint32_t scaleCount = inDim / 32u;
+    device const uchar* wPtr = rawWeightBuffer + weightOffset + ((uint64_t)row * byteCount);
+    device const uchar* sPtr = rawScaleBuffer + scaleOffset + ((uint64_t)row * scaleCount);
+    device const float* xPtr = inputVector + ((uint64_t)tokenIdx * inDim);
+
+    float total = 0.0f;
+    for (uint32_t block = 0; block < scaleCount; ++block) {
+        float blockScale = decode_e8m0_scale(sPtr[block]);
+        uint32_t baseByte = block * 16u;      // 16 bytes hold 32 values
+        uint32_t baseValue = block * 32u;
+        float blockDot = 0.0f;
+        for (uint32_t i = 0; i < 16; ++i) {
+            uchar packed = wPtr[baseByte + i];
+            blockDot += dsv41_unpack_e2m1(packed & 0x0F) * xPtr[baseValue + i * 2u];
+            blockDot += dsv41_unpack_e2m1((packed >> 4) & 0x0F) * xPtr[baseValue + i * 2u + 1u];
+        }
+        total += blockDot * blockScale;
+    }
+    outputVector[((uint64_t)tokenIdx * outDim) + row] = total;
+}
+
+/// MSL Kernel: fused MXFP4 SwiGLU gate+up with the checkpoint's `swiglu_limit`.
+/// Writes silu(min(gate, limit)) * clamp(up, -limit, limit) for one output row.
+/// A non-positive limit disables the clamp.
+kernel void dsv41_mxfp4_swiglu_gate_up(
+    device const uchar* gateWeightBuffer [[buffer(0)]],
+    device const uchar* gateScaleBuffer [[buffer(1)]],
+    device const uchar* upWeightBuffer [[buffer(2)]],
+    device const uchar* upScaleBuffer [[buffer(3)]],
+    device const float* inputVector [[buffer(4)]],
+    device float* outputVector [[buffer(5)]],
+    constant uint64_t& gateWeightOffset [[buffer(6)]],
+    constant uint64_t& gateScaleOffset [[buffer(7)]],
+    constant uint64_t& upWeightOffset [[buffer(8)]],
+    constant uint64_t& upScaleOffset [[buffer(9)]],
+    constant uint32_t& inDim [[buffer(10)]],
+    constant uint32_t& outDim [[buffer(11)]],
+    constant float& swigluLimit [[buffer(12)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint row = pos.x;
+    uint tokenIdx = pos.y;
+    if (row >= outDim || (inDim % 32u) != 0u) return;
+
+    const uint32_t byteCount = inDim / 2u;
+    const uint32_t scaleCount = inDim / 32u;
+    uint64_t rowByte = (uint64_t)row * byteCount;
+    uint64_t rowScale = (uint64_t)row * scaleCount;
+
+    device const uchar* gPtr = gateWeightBuffer + gateWeightOffset + rowByte;
+    device const uchar* gsPtr = gateScaleBuffer + gateScaleOffset + rowScale;
+    device const uchar* uPtr = upWeightBuffer + upWeightOffset + rowByte;
+    device const uchar* usPtr = upScaleBuffer + upScaleOffset + rowScale;
+    device const float* xPtr = inputVector + ((uint64_t)tokenIdx * inDim);
+
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (uint32_t block = 0; block < scaleCount; ++block) {
+        float gScale = decode_e8m0_scale(gsPtr[block]);
+        float uScale = decode_e8m0_scale(usPtr[block]);
+        uint32_t baseByte = block * 16u;
+        uint32_t baseValue = block * 32u;
+        float gateDot = 0.0f;
+        float upDot = 0.0f;
+        for (uint32_t i = 0; i < 16; ++i) {
+            uchar gPacked = gPtr[baseByte + i];
+            uchar uPacked = uPtr[baseByte + i];
+            float x0 = xPtr[baseValue + i * 2u];
+            float x1 = xPtr[baseValue + i * 2u + 1u];
+            gateDot += dsv41_unpack_e2m1(gPacked & 0x0F) * x0;
+            gateDot += dsv41_unpack_e2m1((gPacked >> 4) & 0x0F) * x1;
+            upDot += dsv41_unpack_e2m1(uPacked & 0x0F) * x0;
+            upDot += dsv41_unpack_e2m1((uPacked >> 4) & 0x0F) * x1;
+        }
+        gate += gateDot * gScale;
+        up += upDot * uScale;
+    }
+    if (swigluLimit > 0.0f) {
+        gate = min(gate, swigluLimit);
+        up = clamp(up, -swigluLimit, swigluLimit);
+    }
+    float siluGate = gate / (1.0f + exp(-gate));
+    outputVector[((uint64_t)tokenIdx * outDim) + row] = siluGate * up;
+}
+
+/// MSL Kernel: weighted MXFP4 down-projection accumulate.
+/// y += routingWeight * (W_e2m1 * activation), one expert per dispatch, so the
+/// caller can fold the top-k experts into a single vector without a host round
+/// trip per expert.
+kernel void dsv41_mxfp4_down_accumulate(
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const uchar* rawScaleBuffer [[buffer(1)]],
+    device const float* activationVector [[buffer(2)]],
+    device float* outputVector [[buffer(3)]],
+    constant uint64_t& weightOffset [[buffer(4)]],
+    constant uint64_t& scaleOffset [[buffer(5)]],
+    constant uint32_t& inDim [[buffer(6)]],
+    constant uint32_t& outDim [[buffer(7)]],
+    constant float& routingWeight [[buffer(8)]],
+    uint row [[thread_position_in_grid]]
+) {
+    if (row >= outDim || (inDim % 32u) != 0u) return;
+
+    const uint32_t byteCount = inDim / 2u;
+    const uint32_t scaleCount = inDim / 32u;
+    device const uchar* wPtr = rawWeightBuffer + weightOffset + ((uint64_t)row * byteCount);
+    device const uchar* sPtr = rawScaleBuffer + scaleOffset + ((uint64_t)row * scaleCount);
+
+    float total = 0.0f;
+    for (uint32_t block = 0; block < scaleCount; ++block) {
+        float blockScale = decode_e8m0_scale(sPtr[block]);
+        uint32_t baseByte = block * 16u;
+        uint32_t baseValue = block * 32u;
+        float blockDot = 0.0f;
+        for (uint32_t i = 0; i < 16; ++i) {
+            uchar packed = wPtr[baseByte + i];
+            blockDot += dsv41_unpack_e2m1(packed & 0x0F) * activationVector[baseValue + i * 2u];
+            blockDot += dsv41_unpack_e2m1((packed >> 4) & 0x0F) * activationVector[baseValue + i * 2u + 1u];
+        }
+        total += blockDot * blockScale;
+    }
+    outputVector[row] += routingWeight * total;
+}
+
+/// MSL Kernel: dequantizes streamed Engram table rows (E4M3 + one E8M0 per 32)
+/// into FP32 so the existing bf16/f32 GEMV kernels can consume them.
+/// Input rows are contiguous: [headDim] values then [headDim/32] scale bytes.
+kernel void dsv41_engram_dequant_rows(
+    device const uchar* rawRowBuffer [[buffer(0)]],
+    device float* outputRows [[buffer(1)]],
+    constant uint32_t& rowCount [[buffer(2)]],
+    constant uint32_t& headDim [[buffer(3)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint dim = pos.x;
+    uint row = pos.y;
+    if (row >= rowCount || dim >= headDim) return;
+
+    uint32_t valueBytes = headDim;
+    uint32_t scaleCount = (headDim + 31u) / 32u;
+    device const uchar* rowPtr = rawRowBuffer + (uint64_t)row * (valueBytes + scaleCount);
+
+    uint32_t scaleIdx = dim / 32u;
+    float scale = decode_e8m0_scale(rowPtr[valueBytes + scaleIdx]);
+    outputRows[(uint64_t)row * headDim + dim] = unpack_e4m3(rowPtr[dim]) * scale;
+}
+
+/// MSL Kernel: Sinkhorn normalization for the mHC mixing matrix.
+/// `logits` is an n x n block; the kernel exponentiates it and alternates row
+/// and column normalization `iterations` times, leaving a doubly-stochastic
+/// matrix (rows and columns each sum to 1). One thread runs the whole block:
+/// n is at most `hc_mult` (4 on the published checkpoint), so the serial loop
+/// is cheaper than the coordination a parallel version would need.
+kernel void dsv41_hc_sinkhorn(
+    device const float* logits [[buffer(0)]],
+    device float* outputMatrix [[buffer(1)]],
+    constant uint32_t& dimension [[buffer(2)]],
+    constant uint32_t& iterations [[buffer(3)]],
+    constant float& epsilon [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid != 0) return;
+    uint n = dimension;
+    if (n == 0 || n > 16) return;
+
+    // Exponentiate once; Sinkhorn only rescales from here on. The max is
+    // subtracted first so a large logit cannot overflow to infinity, which would
+    // make every later row/column sum `inf` and the normalization a no-op of NaNs.
+    float maxLogit = -1e30f;
+    for (uint i = 0; i < n * n; ++i) {
+        maxLogit = max(maxLogit, logits[i]);
+    }
+    for (uint i = 0; i < n * n; ++i) {
+        outputMatrix[i] = exp(logits[i] - maxLogit);
+    }
+    for (uint iteration = 0; iteration < iterations; ++iteration) {
+        for (uint r = 0; r < n; ++r) {
+            float rowSum = 0.0f;
+            for (uint c = 0; c < n; ++c) rowSum += outputMatrix[r * n + c];
+            float inv = 1.0f / max(rowSum, epsilon);
+            for (uint c = 0; c < n; ++c) outputMatrix[r * n + c] *= inv;
+        }
+        for (uint c = 0; c < n; ++c) {
+            float colSum = 0.0f;
+            for (uint r = 0; r < n; ++r) colSum += outputMatrix[r * n + c];
+            float inv = 1.0f / max(colSum, epsilon);
+            for (uint r = 0; r < n; ++r) outputMatrix[r * n + c] *= inv;
+        }
+    }
+}
+
+// ============================================================================
+// MARK: - DeepSeek V4.1 forward-path kernels
+//
+// The latent cache is the center of this graph: one record per position that is
+// both the key and the value for every head, written once and then attended over
+// as a GATHERED dense block (window rows first, then the compressed rows the
+// indexer selected). Gathering first is what keeps one attention kernel serving
+// both halves of CSA2 instead of two kernels with different row addressing.
+//
+// The cache is resident at FP16 here (`dsv41_store_latent_f16`). The checkpoint's
+// designed form is E4M3 with a per-32 E8M0 footer; that path lands once its
+// quantize/dequantize pair is checked against the reference, and until then the
+// load log says which one is in use rather than pretending they are equivalent.
+// ============================================================================
+
+/// MSL Kernel: rotary embedding over a batch of vectors, with the inverse
+/// frequencies computed on the host so the YaRN ramp lives in one place
+/// (`DeepSeekV41RoPE.inverseFrequencies`).
+///
+/// Values pair ADJACENTLY (`row[2i]` with `row[2i+1]`), the layout the checkpoint's
+/// `apply_rotary_emb` produces with `view_as_complex`, not the two halves of the
+/// slice: the two conventions give different scores for the same weights.
+kernel void dsv41_rope_latent(
+    device float* vectorBuffer [[buffer(0)]],
+    device const float* invFreqBuffer [[buffer(1)]],
+    constant uint32_t& rowWidth [[buffer(2)]],
+    constant uint32_t& headDim [[buffer(3)]],
+    constant uint32_t& pairCount [[buffer(4)]],
+    constant uint32_t& basePosition [[buffer(5)]],
+    constant uint32_t& batchSize [[buffer(6)]],
+    constant uint32_t& sliceOffset [[buffer(7)]],
+    constant uint32_t& inverse [[buffer(8)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint pair = pos.x;
+    uint tokenIdx = pos.y;
+    if (tokenIdx >= batchSize || pair >= pairCount) return;
+
+    // `headDim` of 0 means the whole row is one head (a latent record); otherwise
+    // every head of width `headDim` is rotated independently (the query, or one head
+    // of the attention output). `sliceOffset` + `2 * pairCount` is the rotated slice
+    // inside each head: the decoupled rope payload is the TRAILING `qk_rope_head_dim`
+    // values, so the non-rope prefix must not move.
+    uint32_t localHeadDim = (headDim == 0u) ? rowWidth : headDim;
+    if (sliceOffset + 2u * pairCount > localHeadDim) return;
+
+    float angle = (float)(basePosition + tokenIdx) * invFreqBuffer[pair];
+    float cosValue = cos(angle);
+    // A conjugated rotation is the same angle with the opposite sign, which is how the
+    // attention output's payload is returned to the unrotated frame.
+    float sinValue = sin(angle) * (inverse != 0u ? -1.0f : 1.0f);
+
+    uint64_t rowBase = (uint64_t)tokenIdx * (uint64_t)rowWidth;
+    for (uint32_t headBase = 0; headBase + localHeadDim <= rowWidth; headBase += localHeadDim) {
+        uint64_t lowIndex = rowBase + headBase + sliceOffset + 2u * pair;
+        uint64_t highIndex = lowIndex + 1u;
+        float low = vectorBuffer[lowIndex];
+        float high = vectorBuffer[highIndex];
+        vectorBuffer[lowIndex] = low * cosValue - high * sinValue;
+        vectorBuffer[highIndex] = low * sinValue + high * cosValue;
+    }
+}
+
+/// MSL Kernel: writes one position's latent into its cache row as FP16.
+/// `physicalRow` is the ring row, resolved on the host.
+kernel void dsv41_store_latent_f16(
+    device const float* latentBuffer [[buffer(0)]],
+    device half* cacheBuffer [[buffer(1)]],
+    constant uint64_t& cacheOffset [[buffer(2)]],
+    constant uint32_t& width [[buffer(3)]],
+    constant uint32_t& physicalRow [[buffer(4)]],
+    uint dim [[thread_position_in_grid]]
+) {
+    if (dim >= width) return;
+    uint64_t destination = cacheOffset + ((uint64_t)physicalRow * (uint64_t)width) + dim;
+    cacheBuffer[destination] = half(latentBuffer[dim]);
+}
+
+/// MSL Kernel: gathers cache rows into a dense FP32 block so one attention pass
+/// can read window and compressed rows without per-row branching.
+/// `rowIndices` holds CACHE rows (already ring-mapped) in attention order.
+kernel void dsv41_gather_latents_f16(
+    device const half* cacheBuffer [[buffer(0)]],
+    device const uint32_t* rowIndices [[buffer(1)]],
+    device float* denseBuffer [[buffer(2)]],
+    constant uint64_t& cacheOffset [[buffer(3)]],
+    constant uint32_t& width [[buffer(4)]],
+    constant uint32_t& rowCount [[buffer(5)]],
+    constant uint64_t& destinationRowOffset [[buffer(6)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint dim = pos.x;
+    uint row = pos.y;
+    if (row >= rowCount || dim >= width) return;
+    uint32_t source = rowIndices[row];
+    uint64_t destination = (destinationRowOffset + (uint64_t)row) * (uint64_t)width + dim;
+    denseBuffer[destination] =
+        float(cacheBuffer[cacheOffset + ((uint64_t)source * width) + dim]);
+}
+
+/// MSL Kernel: CSA2 attention for one query position over a dense latent block.
+///
+/// The sink is an extra logit in the denominator with no value row, so a head can
+/// attend to nothing and emit zeros. It is per head and comes from `attn_sink`.
+kernel void dsv41_attention_csa2_f32(
+    device const float* queryBuffer [[buffer(0)]],   // [heads * qkHeadDim]
+    device const float* keyBuffer [[buffer(1)]],     // [rowCount * width]
+    device const float* sinkBuffer [[buffer(2)]],    // [heads] or null
+    device float* outputBuffer [[buffer(3)]],        // [heads * vHeadDim]
+    constant uint32_t& rowCount [[buffer(4)]],
+    constant uint32_t& headCount [[buffer(5)]],
+    constant uint32_t& qkHeadDim [[buffer(6)]],
+    constant uint32_t& valueDim [[buffer(7)]],
+    constant uint32_t& width [[buffer(8)]],
+    uint headIdx [[thread_position_in_grid]]
+) {
+    if (headIdx >= headCount) return;
+
+    float invSqrt = rsqrt((float)qkHeadDim);
+    uint32_t queryBase = headIdx * qkHeadDim;
+    uint32_t queryWidth = min(qkHeadDim, width);
+
+    // Online softmax over the gathered rows, then the sink as a value-free entry.
+    float maxScore = -1e30f;
+    for (uint32_t row = 0; row < rowCount; ++row) {
+        uint64_t keyBase = (uint64_t)row * width;
+        float dot = 0.0f;
+        for (uint32_t dim = 0; dim < queryWidth; ++dim) {
+            dot += queryBuffer[queryBase + dim] * keyBuffer[keyBase + dim];
+        }
+        maxScore = max(maxScore, dot * invSqrt);
+    }
+    float sinkLogit = (sinkBuffer != nullptr) ? sinkBuffer[headIdx] : -1e30f;
+    maxScore = max(maxScore, sinkLogit);
+
+    float denominator = 0.0f;
+    for (uint32_t row = 0; row < rowCount; ++row) {
+        uint64_t keyBase = (uint64_t)row * width;
+        float dot = 0.0f;
+        for (uint32_t dim = 0; dim < queryWidth; ++dim) {
+            dot += queryBuffer[queryBase + dim] * keyBuffer[keyBase + dim];
+        }
+        denominator += exp(dot * invSqrt - maxScore);
+    }
+    if (sinkBuffer != nullptr) denominator += exp(sinkLogit - maxScore);
+
+    float inverse = denominator > 0.0f ? (1.0f / denominator) : 0.0f;
+    uint32_t valueWidth = min(valueDim, width);
+
+    // Accumulate in a second pass so the weights are normalized by the full set.
+    uint32_t outputBase = headIdx * valueDim;
+    for (uint32_t dim = 0; dim < valueWidth; ++dim) {
+        outputBuffer[outputBase + dim] = 0.0f;
+    }
+    for (uint32_t row = 0; row < rowCount; ++row) {
+        uint64_t keyBase = (uint64_t)row * width;
+        float dot = 0.0f;
+        for (uint32_t dim = 0; dim < queryWidth; ++dim) {
+            dot += queryBuffer[queryBase + dim] * keyBuffer[keyBase + dim];
+        }
+        float weight = exp(dot * invSqrt - maxScore) * inverse;
+        for (uint32_t dim = 0; dim < valueWidth; ++dim) {
+            outputBuffer[outputBase + dim] += weight * keyBuffer[keyBase + dim];
+        }
+    }
+    for (uint32_t dim = valueWidth; dim < valueDim; ++dim) {
+        outputBuffer[outputBase + dim] = 0.0f;
+    }
+}
+
+/// MSL Kernel: pools `ratio` projected rows into one compressed row, weighted by
+/// the per-dimension softmax of the compressor's gate logits.
+/// One threadgroup per output dimension; the block size is `ratio`, never more
+/// than a handful, so a serial reduction per dimension is the cheap form.
+kernel void dsv41_pool_latents_f32(
+    device const float* latentBuffer [[buffer(0)]],  // [ratio * width]
+    device const float* gateBuffer [[buffer(1)]],    // [ratio * width]
+    device float* pooledBuffer [[buffer(2)]],        // [width]
+    constant uint32_t& width [[buffer(3)]],
+    constant uint32_t& blockSize [[buffer(4)]],
+    uint dim [[thread_position_in_grid]]
+) {
+    if (dim >= width || blockSize == 0) return;
+
+    // The gate is per DIMENSION: `score.softmax(dim=2)` runs over the group axis
+    // of a [batch, groups, ratio, head_dim] tensor, so this channel's weights are
+    // its own softmax over the group, not one shared weight per row.
+    float maxGate = -1e30f;
+    for (uint32_t row = 0; row < blockSize; ++row) {
+        maxGate = max(maxGate, gateBuffer[(uint64_t)row * width + dim]);
+    }
+    float total = 0.0f;
+    for (uint32_t row = 0; row < blockSize; ++row) {
+        total += exp(gateBuffer[(uint64_t)row * width + dim] - maxGate);
+    }
+    float inverse = total > 0.0f ? (1.0f / total) : (1.0f / (float)blockSize);
+
+    float accumulator = 0.0f;
+    for (uint32_t row = 0; row < blockSize; ++row) {
+        float weight = total > 0.0f
+            ? exp(gateBuffer[(uint64_t)row * width + dim] - maxGate) * inverse
+            : inverse;
+        accumulator += weight * latentBuffer[(uint64_t)row * width + dim];
+    }
+    pooledBuffer[dim] = accumulator;
+}
+
+/// MSL Kernel: indexer block scores. Each block's score is the MAX over its rows
+/// and over the indexer query heads of `dot(q, key) / sqrt(keyWidth)`, which is
+/// the same rule the Qwen-sparse-attention scorer uses: a block is only worth
+/// reading if some row in it is relevant.
+kernel void dsv41_indexer_scores_f32(
+    device const float* queryBuffer [[buffer(0)]],  // [heads * keyWidth]
+    device const float* keyBuffer [[buffer(1)]],    // [rowCount * keyWidth]
+    device float* blockScores [[buffer(2)]],
+    constant uint32_t& headCount [[buffer(3)]],
+    constant uint32_t& keyWidth [[buffer(4)]],
+    constant uint32_t& rowCount [[buffer(5)]],
+    constant uint32_t& blockSize [[buffer(6)]],
+    uint blockIdx [[thread_position_in_grid]]
+) {
+    if (blockSize == 0) return;
+    uint32_t start = blockIdx * blockSize;
+    if (start >= rowCount) return;
+    uint32_t end = min(start + blockSize, rowCount);
+
+    float invSqrt = rsqrt((float)keyWidth);
+    float blockMax = -1e30f;
+    for (uint32_t row = start; row < end; ++row) {
+        uint64_t keyBase = (uint64_t)row * keyWidth;
+        for (uint32_t head = 0; head < headCount; ++head) {
+            uint32_t queryBase = head * keyWidth;
+            float dot = 0.0f;
+            for (uint32_t dim = 0; dim < keyWidth; ++dim) {
+                dot += queryBuffer[queryBase + dim] * keyBuffer[keyBase + dim];
+            }
+            blockMax = max(blockMax, dot * invSqrt);
+        }
+    }
+    blockScores[blockIdx] = (blockMax == -1e30f) ? 0.0f : blockMax;
+}
+
+/// MSL Kernel: scored top-k routing with a per-expert selection bias.
+///
+/// The rule is `Gate.forward`: `score = fn(logit / gate_temp)`, selection ranks by
+/// `score + bias`, and the mixture weight of a selected expert is its own unbiased
+/// `score`. The bias therefore changes WHICH experts run but never how much weight
+/// they get.
+///
+/// `scoringFunction` is 0 = sigmoid, 1 = sqrtsoftplus. Softmax (2) is a
+/// distribution over all experts and needs a second pass over them, so the
+/// executor refuses it rather than computing it one expert at a time.
+kernel void dsv41_router_topk(
+    device const float* logits [[buffer(0)]],
+    device const float* biasBuffer [[buffer(1)]],     // may be null
+    device uint32_t* expertIndices [[buffer(2)]],
+    device float* expertWeights [[buffer(3)]],
+    constant uint32_t& expertCount [[buffer(4)]],
+    constant uint32_t& topK [[buffer(5)]],
+    constant float& scalingFactor [[buffer(6)]],
+    constant uint32_t& normalise [[buffer(7)]],
+    constant uint32_t& scoringFunction [[buffer(8)]],
+    constant float& gateTemp [[buffer(9)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid != 0 || expertCount == 0 || topK == 0) return;
+    uint32_t count = min(topK, expertCount);
+    // Leaving here would keep the previous token's routing in the readback buffer,
+    // so an impossible top-k fails by being visibly wrong rather than silently
+    // stale. The published checkpoint's top-k is ~6.
+    if (count > 64u || expertCount > 65536u) {
+        for (uint32_t rank = 0; rank < count && rank < 64u; ++rank) {
+            expertIndices[rank] = 0u;
+            expertWeights[rank] = 0.0f;
+        }
+        return;
+    }
+
+    // Selection is a bounded insertion sort: scan the experts once, keeping the
+    // best `count` in descending order, ties broken by ascending expert id so the
+    // selection is deterministic and a reused prefix routes identically.
+    float topScore[64];
+    float topWeight[64];
+    uint32_t topIndex[64];
+    uint32_t filled = 0;
+
+    float temperature = gateTemp > 0.0f ? gateTemp : 1.0f;
+    for (uint32_t expert = 0; expert < expertCount; ++expert) {
+        float logit = logits[expert] / temperature;
+        // The weight is the UNBIASED score; the bias only moves the ranking.
+        float weight = (scoringFunction == 0u)
+            ? (logit >= 0.0f ? (1.0f / (1.0f + exp(-logit)))
+                             : (exp(logit) / (1.0f + exp(logit))))
+            : sqrt(max(logit, 0.0f) + log(1.0f + exp(-fabs(logit))));
+        float score = weight + ((biasBuffer != nullptr) ? biasBuffer[expert] : 0.0f);
+
+        uint32_t position = filled;
+        while (position > 0) {
+            bool goesBefore = score > topScore[position - 1]
+                || (score == topScore[position - 1] && expert < topIndex[position - 1]);
+            if (!goesBefore) break;
+            position--;
+        }
+        if (filled < count) {
+            for (uint32_t move = filled; move > position; --move) {
+                topScore[move] = topScore[move - 1];
+                topWeight[move] = topWeight[move - 1];
+                topIndex[move] = topIndex[move - 1];
+            }
+            topScore[position] = score;
+            topWeight[position] = weight;
+            topIndex[position] = expert;
+            filled++;
+        } else if (position < count) {
+            for (uint32_t move = count - 1; move > position; --move) {
+                topScore[move] = topScore[move - 1];
+                topWeight[move] = topWeight[move - 1];
+                topIndex[move] = topIndex[move - 1];
+            }
+            topScore[position] = score;
+            topWeight[position] = weight;
+            topIndex[position] = expert;
+        }
+    }
+
+    // `norm_topk_prob and topk > 1`, with the training-time 1e-20 rather than
+    // `norm_eps` (`Gate.forward`).
+    float total = 0.0f;
+    if (normalise != 0u && filled > 1u) {
+        for (uint32_t rank = 0; rank < filled; ++rank) total += topWeight[rank];
+        total += 1e-20f;
+    }
+    for (uint32_t rank = 0; rank < filled; ++rank) {
+        float mixWeight = topWeight[rank];
+        if (normalise != 0u && total > 0.0f) mixWeight /= total;
+        if (scalingFactor > 0.0f) mixWeight *= scalingFactor;
+        expertIndices[rank] = topIndex[rank];
+        expertWeights[rank] = mixWeight;
+    }
+}
+
+/// MSL Kernel: the mHC read — combines the hyper-connection streams with a mixing
+/// matrix row, then applies the per-stream `hc_*_scale` and the per-dimension
+/// `hc_*_base` bias.
+kernel void dsv41_hc_mix_f32(
+    device const float* streamBuffer [[buffer(0)]],   // [mult * width]
+    device const float* readWeights [[buffer(1)]],   // [mult]
+    device const float* scaleBuffer [[buffer(2)]],   // [mult] or null
+    device const float* biasBuffer [[buffer(3)]],    // [width] or null
+    device float* outputBuffer [[buffer(4)]],        // [width]
+    constant uint32_t& width [[buffer(5)]],
+    constant uint32_t& mult [[buffer(6)]],
+    uint dim [[thread_position_in_grid]]
+) {
+    if (dim >= width) return;
+    float accumulator = 0.0f;
+    for (uint32_t stream = 0; stream < mult; ++stream) {
+        float scale = (scaleBuffer != nullptr) ? scaleBuffer[stream] : 1.0f;
+        float bias = (biasBuffer != nullptr) ? biasBuffer[dim] : 0.0f;
+        accumulator += readWeights[stream] * (streamBuffer[(uint64_t)stream * width + dim] * scale + bias);
+    }
+    outputBuffer[dim] = accumulator;
+}
+
+/// MSL Kernel: the mHC write — accumulates a sub-layer's contribution into every
+/// stream with that stream's own write scale.
+kernel void dsv41_hc_write_f32(
+    device float* streamBuffer [[buffer(0)]],         // [mult * width]
+    device const float* contribution [[buffer(1)]],  // [width]
+    device const float* writeScales [[buffer(2)]],   // [mult] or null
+    constant uint32_t& width [[buffer(3)]],
+    constant uint32_t& mult [[buffer(4)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint dim = pos.x;
+    uint stream = pos.y;
+    if (dim >= width || stream >= mult) return;
+    float scale = (writeScales != nullptr) ? writeScales[stream] : 1.0f;
+    streamBuffer[(uint64_t)stream * width + dim] += scale * contribution[dim];
+}
+
+// ============================================================================
+// MARK: - DeepSeek V4.1 executor kernels
+//
+// Three gaps the first kernel pass left, all found by writing the device
+// executor against the stage list:
+//
+//   * the dense linears are E4M3 with ue8m0 scales on a 32x32 grid, and the only
+//     fused SwiGLU / weighted-down kernels in the repo are the V3 128x128 grid
+//     (bf16 row scales) and the MXFP4 pair. Neither can be reuse-pointed at a
+//     32x32 ue8m0 tensor, so the two FFN shapes are here rather than perturbing
+//     a kernel every other family's decode depends on,
+//   * the norms read their gain through a shard byte offset that assumes bf16.
+//     The checkpoints that carry fp8 linears also carry bf16 norms, but a
+//     converted checkpoint may not, and a norm gain read at the wrong stride is
+//     a silently-wrong result rather than a crash. The executor therefore
+//     resolves every gain to a plain FP32 vector once, at load, and the kernel
+//     below reads that.
+// ============================================================================
+
+/// MSL Kernel: RMSNorm over a doubled-precision FP32 gain vector.
+///
+/// One threadgroup per row, in-place safe (each lane only touches the indices it
+/// reads, and the reduction before the write pass is a barrier). `gainBuffer`
+/// always has `dim` entries: the executor substitutes ones when the checkpoint
+/// publishes no gain for the slot, which is what the reference's rmsNorm does
+/// when the gain's width disagrees with the input.
+kernel void dsv41_rmsnorm_f32_gain(
+    device const float* inVector [[buffer(0)]],
+    device const float* gainBuffer [[buffer(1)]],
+    device float* outVector [[buffer(2)]],
+    constant uint32_t& dim [[buffer(3)]],
+    constant float& eps [[buffer(4)]],
+    threadgroup float* sharedWarpSums [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]],
+    uint tgIdx [[threadgroup_position_in_grid]]
+) {
+    if (dim == 0) return;
+    device const float* inPtr = inVector + (uint64_t)tgIdx * (uint64_t)dim;
+    device float* outPtr = outVector + (uint64_t)tgIdx * (uint64_t)dim;
+
+    float localSum = 0.0f;
+    for (uint32_t i = tid; i < dim; i += tgSize) {
+        float value = inPtr[i];
+        localSum += value * value;
+    }
+    float totalSum = threadgroup_reduce_sum(localSum, sharedWarpSums, tid, tgSize);
+    float invRms = rsqrt(totalSum / (float)dim + eps);
+
+    for (uint32_t i = tid; i < dim; i += tgSize) {
+        outPtr[i] = inPtr[i] * invRms * gainBuffer[i];
+    }
+}
+
+/// MSL Kernel: fused E4M3 32x32 block-scaled SwiGLU gate+up with the
+/// checkpoint's `swiglu_limit`. Numerically the same rule as
+/// `dsv41_mxfp4_swiglu_gate_up`: write `silu(min(gate, limit)) *
+/// clamp(up, -limit, limit)`, and let a non-positive limit disable the clamp.
+kernel void dsv41_fp8_block32_swiglu_gate_up(
+    device const uchar* gateWeightBuffer [[buffer(0)]],
+    device const uchar* gateScaleBuffer [[buffer(1)]],
+    device const uchar* upWeightBuffer [[buffer(2)]],
+    device const uchar* upScaleBuffer [[buffer(3)]],
+    device const float* inputVector [[buffer(4)]],
+    device float* outputVector [[buffer(5)]],
+    constant uint64_t& gateWeightOffset [[buffer(6)]],
+    constant uint64_t& gateScaleOffset [[buffer(7)]],
+    constant uint64_t& upWeightOffset [[buffer(8)]],
+    constant uint64_t& upScaleOffset [[buffer(9)]],
+    constant uint32_t& inDim [[buffer(10)]],
+    constant uint32_t& outDim [[buffer(11)]],
+    constant float& swigluLimit [[buffer(12)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint row = pos.x;
+    uint tokenIdx = pos.y;
+    if (row >= outDim || (inDim % 32u) != 0u) return;
+
+    const uint32_t blockCount = inDim / 32u;
+    const uint32_t scaleRowBase = (row / 32u) * blockCount;
+    uint64_t rowByte = (uint64_t)row * (uint64_t)inDim;
+    uint64_t rowScale = scaleRowBase;
+
+    device const uchar* gPtr = gateWeightBuffer + gateWeightOffset + rowByte;
+    device const uchar* gsPtr = gateScaleBuffer + gateScaleOffset + rowScale;
+    device const uchar* uPtr = upWeightBuffer + upWeightOffset + rowByte;
+    device const uchar* usPtr = upScaleBuffer + upScaleOffset + rowScale;
+    device const float* xPtr = inputVector + ((uint64_t)tokenIdx * (uint64_t)inDim);
+
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (uint32_t block = 0; block < blockCount; ++block) {
+        float gScale = decode_e8m0_scale(gsPtr[block]);
+        float uScale = decode_e8m0_scale(usPtr[block]);
+        uint32_t base = block * 32u;
+        float gateDot = 0.0f;
+        float upDot = 0.0f;
+        for (uint32_t i = 0; i < 8; ++i) {
+            uint32_t at = base + i * 4u;
+            uchar4 g4 = *(device const uchar4*)(gPtr + at);
+            uchar4 u4 = *(device const uchar4*)(uPtr + at);
+            float4 x4 = *(device const float4*)(xPtr + at);
+            gateDot += unpack_e4m3(g4.x) * x4.x;
+            gateDot += unpack_e4m3(g4.y) * x4.y;
+            gateDot += unpack_e4m3(g4.z) * x4.z;
+            gateDot += unpack_e4m3(g4.w) * x4.w;
+            upDot += unpack_e4m3(u4.x) * x4.x;
+            upDot += unpack_e4m3(u4.y) * x4.y;
+            upDot += unpack_e4m3(u4.z) * x4.z;
+            upDot += unpack_e4m3(u4.w) * x4.w;
+        }
+        gate += gateDot * gScale;
+        up += upDot * uScale;
+    }
+    if (swigluLimit > 0.0f) {
+        gate = min(gate, swigluLimit);
+        up = clamp(up, -swigluLimit, swigluLimit);
+    }
+    float siluGate = gate / (1.0f + exp(-gate));
+    outputVector[((uint64_t)tokenIdx * (uint64_t)outDim) + row] = siluGate * up;
+}
+
+/// MSL Kernel: weighted E4M3 32x32 block-scaled down-projection accumulate.
+/// One dispatch per expert so the top-k mixture folds into one vector without a
+/// host round trip per expert, exactly like `dsv41_mxfp4_down_accumulate`.
+kernel void dsv41_fp8_block32_down_accumulate(
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const uchar* rawScaleBuffer [[buffer(1)]],
+    device const float* activationVector [[buffer(2)]],
+    device float* outputVector [[buffer(3)]],
+    constant uint64_t& weightOffset [[buffer(4)]],
+    constant uint64_t& scaleOffset [[buffer(5)]],
+    constant uint32_t& inDim [[buffer(6)]],
+    constant uint32_t& outDim [[buffer(7)]],
+    constant float& routingWeight [[buffer(8)]],
+    uint row [[thread_position_in_grid]]
+) {
+    if (row >= outDim || (inDim % 32u) != 0u) return;
+
+    const uint32_t blockCount = inDim / 32u;
+    const uint32_t scaleRowBase = (row / 32u) * blockCount;
+    device const uchar* wPtr = rawWeightBuffer + weightOffset + ((uint64_t)row * (uint64_t)inDim);
+    device const uchar* sPtr = rawScaleBuffer + scaleOffset + scaleRowBase;
+
+    float total = 0.0f;
+    for (uint32_t block = 0; block < blockCount; ++block) {
+        float blockScale = decode_e8m0_scale(sPtr[block]);
+        uint32_t base = block * 32u;
+        float blockDot = 0.0f;
+        for (uint32_t i = 0; i < 8; ++i) {
+            uint32_t at = base + i * 4u;
+            uchar4 w4 = *(device const uchar4*)(wPtr + at);
+            float4 x4 = *(device const float4*)(activationVector + at);
+            blockDot += unpack_e4m3(w4.x) * x4.x;
+            blockDot += unpack_e4m3(w4.y) * x4.y;
+            blockDot += unpack_e4m3(w4.z) * x4.z;
+            blockDot += unpack_e4m3(w4.w) * x4.w;
+        }
+        total += blockDot * blockScale;
+    }
+    outputVector[row] += routingWeight * total;
+}

@@ -1072,7 +1072,7 @@ public final class InferenceEngine {
                 curFirst = nil
             }
 
-            for t in tensors {
+            for t in tensors where !t.isStreamedTensor {
                 // A single tensor whose page-aligned span exceeds the buffer limit cannot
                 // be contained by any segment. Without this check it is emitted in an
                 // oversized segment, the loader silently skips that buffer, and the tensor
@@ -1112,6 +1112,14 @@ public final class InferenceEngine {
         var newTensors: [TensorMetadata] = []
         newTensors.reserveCapacity(summary.tensors.count)
         for t in summary.tensors {
+            // Streamed tensors (DeepSeek V4.1's ~100 GB Engram tables) never become
+            // Metal buffers: they are read with pread at render time, and their span
+            // is deliberately larger than `maxBufferLength`. Pass them through
+            // untouched instead of demanding a segment for them.
+            if t.isStreamedTensor {
+                newTensors.append(t)
+                continue
+            }
             // Every shard in the summary was remapped above; a tensor whose shard has no
             // remap references a shard that does not exist, so it would load unmapped.
             guard let segs = remap[t.shardIndex], !segs.isEmpty else {
@@ -1144,6 +1152,19 @@ public final class InferenceEngine {
             tensors: newTensors,
             layers: summary.layers
         )
+    }
+}
+
+extension TensorMetadata {
+    /// Tensors that must never become Metal buffers.
+    ///
+    /// DeepSeek V4.1's Engram tables are each ~100 GB in a single tensor, past
+    /// every Apple GPU's `maxBufferLength`. They are read row by row with pread
+    /// instead, so segmentation passes them through and the loader must not
+    /// expect a buffer for them. The Rust core marks them by category rather
+    /// than by a separate flag so the FFI record stays unchanged.
+    var isStreamedTensor: Bool {
+        category.hasPrefix("Engram") || DeepSeekV41WeightCatalog.isStreamedName(name)
     }
 }
 

@@ -5906,7 +5906,8 @@ struct ContentView: View {
             thinkingEnabled: thinkingEnabled,
             modelSupportsThinking: modelSupportsThinking,
             modelConfig: modelConfig,
-            thinkingEffort: thinkingEffortLevel
+            thinkingEffort: thinkingEffortLevel,
+            promptDialect: CompletionEngine.shared.promptDialect
         )
 
         // Expose the exact prompt text to the harness: the path-repair hint uses it
@@ -7294,6 +7295,25 @@ struct ContentView: View {
                     }
                 }
                 
+                // Preflight opens shards and walks the tensor catalog, so run it
+                // here, off the main actor: doing it inside `MainActor.run` stalls
+                // the UI for every load of a multi-thousand-tensor checkpoint.
+                var deepSeekReport: [String]?
+                if arch == .deepSeekV41Flash,
+                   let dsConfig = try? DeepSeekV41Config.decode(
+                       contentsOf: dirUrl.appendingPathComponent("config.json")
+                   ) {
+                    deepSeekReport = DeepSeekV41LoadDiagnostics.report(
+                        snapshotDir: dirUrl,
+                        config: dsConfig,
+                        summary: loadedSummary,
+                        contextLength: min(
+                            dsConfig.maxPositionEmbeddings,
+                            UserDefaults.standard.object(forKey: "dynamoe_max_tokens") as? Int ?? 8_192
+                        )
+                    )
+                }
+
                 await MainActor.run {
                     // A newer load superseded this one; drop the result rather than
                     // replacing the requested engine with this stale one.
@@ -7315,6 +7335,15 @@ struct ContentView: View {
                     WorkingSetManager.shared.registerShardMappings(registryBuffers)
                     self.modelConfig = cfg
                     self.detectedArchitecture = arch
+                    // DeepSeek V4.1 is served by its own engine and cannot run on the
+                    // generic decode loop, so report what the checkpoint actually looks
+                    // like at load time: download completeness, tensor coverage, and
+                    // where the memory goes. A half-finished download is the normal
+                    // state for hours, and this is the only place a user sees it. The
+                    // report itself was computed off the main actor above.
+                    for line in deepSeekReport ?? [] {
+                        print("🔎 [DeepSeekV41] \(line)")
+                    }
                     // Do NOT restore a system prompt captured before the load here.
                     // This completion runs asynchronously AFTER switchModel has already
                     // called applyProfile, so writing back the pre-load value clobbered

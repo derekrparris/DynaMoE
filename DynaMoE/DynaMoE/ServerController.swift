@@ -1102,7 +1102,8 @@ final class ServerController: ObservableObject {
                 thinkingEnabled: thinkingEnabled,
                 modelSupportsThinking: info.supportsThinking,
                 modelConfig: engine.promptModelConfig,
-                thinkingEffort: thinkingEffort
+                thinkingEffort: thinkingEffort,
+                promptDialect: engine.promptDialect
             )
         } else {
             formattedPrompt = ChatPromptFormatter.formatConversation(
@@ -1111,7 +1112,8 @@ final class ServerController: ObservableObject {
                 thinkingEnabled: thinkingEnabled,
                 modelSupportsThinking: info.supportsThinking,
                 modelConfig: engine.promptModelConfig,
-                thinkingEffort: thinkingEffort
+                thinkingEffort: thinkingEffort,
+                promptDialect: engine.promptDialect
             )
         }
 
@@ -1151,6 +1153,17 @@ final class ServerController: ObservableObject {
 
         let memory = TurnMemorySettings.persisted(defaults)
 
+        // The dialect's stop markers belong to the sampler, not just to the
+        // renderer: without them a generation that emits the next role marker
+        // keeps going until maxTokens instead of ending the turn.
+        var stopSequences = inputs.stopSequences
+        if engine.promptModelConfig?.isDeepSeekV41Model == true {
+            for stop in engine.promptDialect.stopSequences
+            where !stop.isEmpty && !stopSequences.contains(stop) {
+                stopSequences.append(stop)
+            }
+        }
+
         let turnRequest = CompletionTurnRequest(
             promptTokenIds: promptTokenIds,
             formattedPrompt: formattedPrompt,
@@ -1162,7 +1175,7 @@ final class ServerController: ObservableObject {
             agentStep: 0,
             forceSynthesis: false,
             isSplicedContinuation: false,
-            stopSequences: inputs.stopSequences,
+            stopSequences: stopSequences,
             asOfDate: renderedAsOfDate
         )
         return TurnPlan(
@@ -1325,7 +1338,10 @@ final class ServerController: ObservableObject {
         modelConfig: ModelConfig?,
         systemPrompt: String
     ) -> [ChatPromptFormatter.ConversationTurn] {
-        let closer = ChatPromptFormatter.assistantTurnCloseTag(modelConfig: modelConfig)
+        let closer = ChatPromptFormatter.assistantTurnCloseTag(
+            modelConfig: modelConfig,
+            promptDialect: CompletionEngine.shared.promptDialect
+        )
         guard let index = conversation.lastIndex(where: { $0.role == .assistant }),
               let recorded = ServerTurnMemory.shared.recordedRawTurn(
                   sessionId: sessionId,

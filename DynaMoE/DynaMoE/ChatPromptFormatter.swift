@@ -26,7 +26,8 @@ public enum ChatPromptFormatter {
         thinkingEnabled: Bool,
         modelSupportsThinking: Bool,
         modelConfig: ModelConfig?,
-        thinkingEffort: ThinkingEffort? = nil
+        thinkingEffort: ThinkingEffort? = nil,
+        promptDialect: DeepSeekV41PromptDialect = DeepSeekV41PromptDialect()
     ) -> String {
         let thinkSuffix: String
         if thinkingEnabled {
@@ -39,7 +40,20 @@ public enum ChatPromptFormatter {
 
         let isLing = (modelConfig?.isLingModel == true)
         let formattedPrompt: String
-        if isLing {
+        if modelConfig?.isDeepSeekV41Model == true {
+            // DeepSeek V4.1: fullwidth-bar role markers, and an effort budget
+            // rendered inside the system turn rather than a named thinking level.
+            if isAlreadyDeepSeekTemplated(prompt, markers: promptDialect.markers) {
+                formattedPrompt = prompt
+            } else {
+                formattedPrompt = promptDialect.render(
+                    turns: [.init(isUser: true, text: prompt)],
+                    cleanSystem: cleanSystem,
+                    thinkingEnabled: thinkingEnabled,
+                    effort: thinkingEffort
+                )
+            }
+        } else if isLing {
             if prompt.contains("<role>") {
                 formattedPrompt = prompt
             } else {
@@ -263,9 +277,30 @@ public enum ChatPromptFormatter {
         thinkingEnabled: Bool,
         modelSupportsThinking: Bool,
         modelConfig: ModelConfig?,
-        thinkingEffort: ThinkingEffort? = nil
+        thinkingEffort: ThinkingEffort? = nil,
+        promptDialect: DeepSeekV41PromptDialect = DeepSeekV41PromptDialect()
     ) -> String {
         guard !turns.isEmpty else { return "" }
+
+        if modelConfig?.isDeepSeekV41Model == true {
+            // A completed assistant turn is rendered from its own content: the
+            // reasoning splitter already marks where its channel closed, so the
+            // dialect re-opens the channel only for a turn that carried
+            // reasoning, and always for the turn being generated now.
+            let rendered = turns.map { turn -> DeepSeekV41PromptDialect.Turn in
+                guard turn.role == .assistant else {
+                    return .init(isUser: true, text: turn.text)
+                }
+                let split = promptDialect.splitReasoning(turn.text)
+                return .init(isUser: false, text: split.resp, reasoning: split.think)
+            }
+            return promptDialect.render(
+                turns: rendered,
+                cleanSystem: cleanSystem,
+                thinkingEnabled: thinkingEnabled,
+                effort: thinkingEffort
+            )
+        }
 
         if modelConfig?.isLingModel == true {
             let lingThinking = thinkingEnabled ? "detailed thinking on" : "detailed thinking off"
@@ -367,11 +402,39 @@ public enum ChatPromptFormatter {
         return p
     }
 
+    /// A prompt that already carries the dialect's own role marker only arrives
+    /// from the agent harness (which renders tool continuations itself), so it is
+    /// passed through verbatim. Mirrors the `<role>` / `<|Bot|>` / `<|turn>`
+    /// passthrough probes the other families use.
+    ///
+    /// The markers are the RESOLVED dialect's, not the family default: a checkpoint
+    /// whose template renames them would otherwise be probed for one spelling and
+    /// rendered in another, and every harness prompt would be wrapped twice.
+    ///
+    /// The probe requires the prompt to *begin* with a role/sentence marker. It
+    /// used to pass any prompt that merely contained one, so a user message
+    /// quoting `<|User|>` was treated as harness-authored and injected verbatim
+    /// as a turn boundary.
+    static func isAlreadyDeepSeekTemplated(
+        _ prompt: String,
+        markers: DeepSeekV41PromptMarkers = .familyDefault
+    ) -> Bool {
+        let m = markers
+        let trimmed = prompt.drop { $0.isWhitespace }
+        return [m.beginOfSentence, m.system, m.user, m.assistant]
+            .filter { !$0.isEmpty }
+            .contains { trimmed.hasPrefix($0) }
+    }
+
     /// The tag that closes an assistant turn for this family, or nil when the
     /// family's assistant turns carry no explicit closer. The server drops a
     /// trailing closer from a recorded raw generation before splicing it into
     /// history, so the renderer does not close the turn twice.
-    public static func assistantTurnCloseTag(modelConfig: ModelConfig?) -> String? {
+    public static func assistantTurnCloseTag(
+        modelConfig: ModelConfig?,
+        promptDialect: DeepSeekV41PromptDialect = DeepSeekV41PromptDialect()
+    ) -> String? {
+        if modelConfig?.isDeepSeekV41Model == true { return promptDialect.markers.endOfSentence }
         if modelConfig?.isLingModel == true { return "<|role_end|>" }
         if modelConfig?.isSparkModel == true { return nil }
         if modelConfig?.isGemma4Model == true { return "<turn|>" }

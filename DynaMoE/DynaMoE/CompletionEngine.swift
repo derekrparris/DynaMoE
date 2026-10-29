@@ -27,7 +27,7 @@ import Metal
 
 // MARK: - Thinking / Response Boundary Splitting (whitespace tolerant)
 
-public enum TurnTextSplitter {
+nonisolated public enum TurnTextSplitter {
     /// Reasoning open/close marker tags used across model families (Qwen, DeepSeek, Ornith, etc.).
     private static let openTags = ["<think>", "<thought>", "<|thought|>", "<|channel>"]
     private static let closeTags = ["</think>", "</thought>", "</|thought|>", "<channel|>"]
@@ -232,6 +232,7 @@ public final class CompletionEngine: @unchecked Sendable {
     private var tokenizer: DynaMoeTokenizer?
     private var shardBuffers: [UInt32: MTLBuffer] = [:]
     private var activeLoadedModelPath: String?
+    private var cachedPromptDialect: DeepSeekV41PromptDialect?
 
     private init() {}
 
@@ -322,6 +323,83 @@ public final class CompletionEngine: @unchecked Sendable {
         guard modelConfig != nil, let tokenizer = tokenizer else {
             stateLock.unlock()
             throw CompletionLaunchError.engineNotReady("❌ Metal or Tokenizer not ready for text generation. Please load model and tokenizer in Settings.")
+        }
+        // DeepSeek V4.1 is detected natively but its forward pass is served by a
+        // dedicated runtime (latent CSA2 attention, mHC residual streams, Engram
+        // memory, MXFP4 experts). Refuse here rather than letting the generic
+        // decode loop run over tensors it cannot bind: that path would emit
+        // plausible text from the wrong graph.
+        //
+        // The refusal is as specific as the checkpoint allows: it builds the
+        // runtime, which resolves every tensor to a role, opens the Engram tables
+        // and prices the caches, and reports exactly what is missing. A half
+        // finished download and an unclassified tensor family are different
+        // problems and they must not both read as "still being ported".
+        if let config = modelConfig, config.isDeepSeekV41Model {
+            let path = activeLoadedModelPath
+            let loadedSummary = summary
+            let loadedShards = shardBuffers
+            stateLock.unlock()
+
+            guard let snapshotDir = path.map({ URL(fileURLWithPath: $0) }) else {
+                throw CompletionLaunchError.engineNotReady(
+                    "⚠️ DeepSeek V4.1 Flash is loaded but its snapshot directory is unknown, so its "
+                        + "architecture config cannot be read."
+                )
+            }
+            let dsConfig: DeepSeekV41Config
+            do {
+                dsConfig = try DeepSeekV41Config.decode(
+                    contentsOf: snapshotDir.appendingPathComponent("config.json")
+                )
+            } catch {
+                throw CompletionLaunchError.engineNotReady(
+                    "⚠️ DeepSeek V4.1 Flash config.json could not be decoded: \(error)"
+                )
+            }
+            // The cache is provisioned for the prompt plus the turn's token budget,
+            // capped at what the checkpoint says it can address.
+            let contextLength = max(
+                1,
+                min(dsConfig.maxPositionEmbeddings, request.sampling.maxTokens + request.promptTokenIds.count)
+            )
+            if let runtime = DeepSeekV41Runtime(
+                snapshotDir: snapshotDir,
+                summary: loadedSummary,
+                config: dsConfig,
+                shardBuffers: loadedShards,
+                contextLength: contextLength
+            ) {
+                if !runtime.isRunnable {
+                    throw CompletionLaunchError.engineNotReady(
+                        "⚠️ DeepSeek V4.1 Flash checkpoint cannot be run yet:\n"
+                            + runtime.describe()
+                    )
+                }
+                // The block forward runs a position on device now, so the refusal
+                // reports what is actually left (the turn loop) instead of claiming
+                // the graph is missing.
+                let forward = runtime.forward()
+                guard forward.isRunnable else {
+                    throw CompletionLaunchError.engineNotReady(
+                        "⚠️ DeepSeek V4.1 Flash cannot run its block forward yet:\n"
+                            + runtime.describe()
+                    )
+                }
+                throw CompletionLaunchError.engineNotReady(
+                    "⚠️ DeepSeek V4.1 Flash is loaded, its caches are provisioned and its per-position "
+                        + "block forward is wired to Metal, but the turn loop that drives prefill, "
+                        + "sampling and streamed frames is not, so a turn cannot run yet.\n"
+                        + runtime.describe()
+                )
+            }
+            let checkpoint = DeepSeekV41Preflight.inspect(snapshotDir: snapshotDir)
+            let state = checkpoint.map { " (checkpoint: \($0.humanSummary))" } ?? ""
+            let detail = DeepSeekV41Runtime.lastInitializationError.map { "\nReason: \($0)" } ?? ""
+            throw CompletionLaunchError.engineNotReady(
+                "⚠️ DeepSeek V4.1 Flash detected, but its runtime could not be built "
+                    + "(Metal device, library, cache or workspace allocation failed).\(state)\(detail)"
+            )
         }
         guard let device = MTLCreateSystemDefaultDevice(),
               let commandQueue = device.makeCommandQueue(),
@@ -10379,5 +10457,26 @@ if layer.attnGateProjTensor != nil,
         self.tokenizer = tokenizer
         self.shardBuffers = shardBuffers
         self.activeLoadedModelPath = activeLoadedModelPath
+        self.cachedPromptDialect = nil
+    }
+
+    /// The prompt dialect for the loaded checkpoint, resolved once from its own
+    /// `chat_template.jinja` (falling back to the family default). Cached because
+    /// every turn renders a prompt and the template never changes under a load.
+    public var promptDialect: DeepSeekV41PromptDialect {
+        stateLock.lock()
+        if let cached = cachedPromptDialect {
+            stateLock.unlock()
+            return cached
+        }
+        let path = activeLoadedModelPath
+        stateLock.unlock()
+        let resolved = DeepSeekV41PromptDialect.resolve(
+            snapshotDir: path.map { URL(fileURLWithPath: $0) }
+        )
+        stateLock.lock()
+        cachedPromptDialect = resolved
+        stateLock.unlock()
+        return resolved
     }
 }

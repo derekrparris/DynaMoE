@@ -6,12 +6,15 @@ pub use jetspec::*;
 use memmap2::{Mmap, MmapOptions};
 use safetensors::SafeTensors;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokenizers::Tokenizer;
+use tokenizers::normalizers::{
+    Lowercase, NormalizerWrapper, Replace, Sequence, Strip, StripAccents, NFD, NFKC,
+};
+use tokenizers::{NormalizedString, Normalizer, Tokenizer};
 
 #[derive(Debug, uniffi::Error)]
 pub enum EngineError {
@@ -59,6 +62,107 @@ impl DynaMoeTokenizer {
             .map_err(|e| EngineError::TokenizerError { details: e.to_string() })?;
         Ok(text)
     }
+
+    /// Builds DeepSeek-V4.1's Engram compressed token map: every token id mapped
+    /// onto a smaller id space where tokens that normalize alike collapse, so
+    /// " The", "the" and "THE" hash the same n-gram.
+    ///
+    /// This is the checkpoint's `build_compressed_token_map`
+    /// (`inference/engram.py`) and it lives in Rust rather than in Swift because
+    /// the function runs the `tokenizers` crate's own normalizer chain.
+    /// Reimplementing NFKC / NFD / StripAccents / Lowercase over Foundation would
+    /// drift on the Unicode edge cases and silently rehash every n-gram.
+    ///
+    /// `expected_compressed_vocab_size` is the checkpoint's
+    /// `engram_compressed_vocab_size`. The reference asserts the map collapses to
+    /// exactly that, and so does this: every hash multiplier is derived from that
+    /// size, so a mismatch reads the wrong memory rows without failing. Passing 0
+    /// skips the comparison, which only the probe uses.
+    pub fn build_engram_token_map(
+        &self,
+        expected_compressed_vocab_size: u32,
+        pad_token_id: u32,
+    ) -> Result<EngramTokenMap, EngineError> {
+        let normalizer = engram_normalizer();
+        let vocab_size = self.tokenizer.get_vocab_size(true);
+        // A new compressed id is handed out in first-seen order as the vocabulary is
+        // walked, which is what makes the map reproducible.
+        let mut key_to_new: HashMap<String, u32> = HashMap::new();
+        let mut lookup = vec![0u32; vocab_size];
+        for token_id in 0..vocab_size as u32 {
+            let text = self.tokenizer.decode(&[token_id], false)
+                .map_err(|e| EngineError::TokenizerError { details: e.to_string() })?;
+            let key = if text.contains('\u{fffd}') {
+                // A partial UTF-8 byte token: nothing to normalize, so key it by its
+                // raw form.
+                self.tokenizer.id_to_token(token_id).unwrap_or(text)
+            } else {
+                let normalized = normalize_str(&normalizer, &text);
+                if normalized.is_empty() { text } else { normalized }
+            };
+            let next = key_to_new.len() as u32;
+            let compressed = *key_to_new.entry(key).or_insert(next);
+            lookup[token_id as usize] = compressed;
+        }
+
+        let compressed_vocab_size = key_to_new.len() as u32;
+        if expected_compressed_vocab_size != 0
+            && compressed_vocab_size != expected_compressed_vocab_size
+        {
+            return Err(EngineError::TokenizerError {
+                details: format!(
+                    "Engram compressed vocabulary is {} tokens but the checkpoint declares engram_compressed_vocab_size={}",
+                    compressed_vocab_size, expected_compressed_vocab_size
+                ),
+            });
+        }
+        let pad_id = *lookup.get(pad_token_id as usize).ok_or_else(|| EngineError::TokenizerError {
+            details: format!(
+                "Engram pad token {} is outside the tokenizer vocabulary {}",
+                pad_token_id, vocab_size
+            ),
+        })?;
+
+        Ok(EngramTokenMap { lookup, compressed_vocab_size, pad_id })
+    }
+}
+
+/// The Engram token-map normalizer chain, in the checkpoint's order:
+/// NFKC, NFD, StripAccents, Lowercase, collapse runs of whitespace to one space,
+/// protect a lone space with a private-use sentinel, Strip, then restore it.
+///
+/// The sentinel is why a token that is exactly one space survives `Strip` instead
+/// of collapsing to the empty string and merging with unrelated tokens.
+fn engram_normalizer() -> NormalizerWrapper {
+    use tokenizers::normalizers::replace::ReplacePattern;
+
+    const SENTINEL: &str = "\u{e000}";
+    let replace = |pattern: &str, content: &str| {
+        NormalizerWrapper::Replace(
+            Replace::new(ReplacePattern::Regex(pattern.to_owned()), content)
+                .expect("engram normalizer pattern is a literal regex")
+        )
+    };
+    NormalizerWrapper::Sequence(Sequence::new(vec![
+        NormalizerWrapper::NFKC(NFKC),
+        NormalizerWrapper::NFD(NFD),
+        NormalizerWrapper::StripAccents(StripAccents),
+        NormalizerWrapper::Lowercase(Lowercase),
+        replace(r"[ \t\r\n]+", " "),
+        replace(r"^ $", SENTINEL),
+        NormalizerWrapper::StripNormalizer(Strip::new(true, true)),
+        replace(SENTINEL, " "),
+    ]))
+}
+
+/// `Normalizer` has no string entry point of its own; the Python binding wraps the
+/// same two calls.
+fn normalize_str(normalizer: &NormalizerWrapper, text: &str) -> String {
+    let mut normalized = NormalizedString::from(text);
+    match normalizer.normalize(&mut normalized) {
+        Ok(()) => normalized.get().to_string(),
+        Err(_) => text.to_string(),
+    }
 }
 
 // MARK: - Model Engine Records & Objects
@@ -76,6 +180,18 @@ pub struct NgramRowDescriptor {
     pub shard_index: u32,
     pub row_offset_bytes: u64,
     pub row_length_bytes: u64,
+}
+
+/// DeepSeek-V4.1's Engram compressed token map, as built from the tokenizer.
+///
+/// `lookup[i]` is the compressed id of token `i`, `compressed_vocab_size` is the
+/// number of distinct keys, and `pad_id` is the compressed id of the checkpoint's
+/// `engram_pad_id` (n-gram slots with no history hash as that, matching training).
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct EngramTokenMap {
+    pub lookup: Vec<u32>,
+    pub compressed_vocab_size: u32,
+    pub pad_id: u32,
 }
 
 #[derive(uniffi::Record, Clone, Debug)]
@@ -256,7 +372,25 @@ fn parse_layer_and_expert(name: &str) -> (String, Option<u32>, Option<u32>) {
         }
     }
 
-    let category = if name.contains("embed_tokens") || name.contains("wte") || name.contains("word_embeddings") {
+    let category = if name.contains(".engram.") {
+        "Engram (n-gram memory)".to_string()
+    } else if name.contains("attn.compressor.") {
+        "CSA2 Compressor".to_string()
+    } else if name.contains("attn.indexer.") {
+        "CSA2 Indexer".to_string()
+    } else if name.contains("attn.wq_a") || name.contains("attn.wq_b") || name.contains("attn.wkv")
+        || name.contains("attn.wo_a") || name.contains("attn.wo_b") || name.contains("attn.kv_norm")
+        || name.contains("attn.attn_sink") {
+        "Multi-Head Latent Attention (MLA)".to_string()
+    } else if name.contains("hc_attn_") || name.contains("hc_ffn_") {
+        "Hyper-Connection Residual".to_string()
+    } else if name.starts_with("embed.") {
+        "Embedding".to_string()
+    } else if name.starts_with("head.") {
+        "LM Head".to_string()
+    } else if name.contains("ffn.gate") {
+        "MoE Router".to_string()
+    } else if name.contains("embed_tokens") || name.contains("wte") || name.contains("word_embeddings") {
         "Embedding".to_string()
     } else if name.contains("ngram_embedding") || name.contains(".ple.") || name.contains("ple_embedding") {
         "N-Gram Predictive Local Embedding".to_string()
@@ -2066,6 +2200,78 @@ mod tests {
         assert_eq!(e_id, Some(127));
     }
 
+    /// DeepSeek V4.1 checkpoints have no `model.` root, so the layer path is
+    /// `layers.N.…`. Every family member has to be classified explicitly or the
+    /// generic rules funnel them into "Other", and the Engram tables have to be
+    /// marked streamed so they are never mapped into a Metal buffer.
+    #[test]
+    fn test_deepseek_v41_tensor_parsing() {
+        let (cat_embed, l_embed, _) = parse_layer_and_expert("embed.weight");
+        assert_eq!(cat_embed, "Embedding");
+        assert_eq!(l_embed, None);
+
+        let (cat_head, _, _) = parse_layer_and_expert("head.weight");
+        assert_eq!(cat_head, "LM Head");
+
+        let (cat_final_norm, _, _) = parse_layer_and_expert("norm.weight");
+        assert_eq!(cat_final_norm, "LayerNorm");
+
+        let (cat_wq_a, l_wq_a, _) = parse_layer_and_expert("layers.3.attn.wq_a.weight");
+        assert_eq!(cat_wq_a, "Multi-Head Latent Attention (MLA)");
+        assert_eq!(l_wq_a, Some(3));
+
+        let (cat_wkv, _, _) = parse_layer_and_expert("layers.3.attn.wkv.weight");
+        assert_eq!(cat_wkv, "Multi-Head Latent Attention (MLA)");
+
+        let (cat_sink, _, _) = parse_layer_and_expert("layers.3.attn.attn_sink");
+        assert_eq!(cat_sink, "Multi-Head Latent Attention (MLA)");
+
+        let (cat_indexer, l_idx, _) = parse_layer_and_expert("layers.20.attn.indexer.wk.weight");
+        assert_eq!(cat_indexer, "CSA2 Indexer");
+        assert_eq!(l_idx, Some(20));
+
+        let (cat_compressor, _, _) = parse_layer_and_expert("layers.20.attn.compressor.wgate.weight");
+        assert_eq!(cat_compressor, "CSA2 Compressor");
+
+        let (cat_hc, _, _) = parse_layer_and_expert("layers.0.hc_attn_fn");
+        assert_eq!(cat_hc, "Hyper-Connection Residual");
+
+        let (cat_gate_bias, _, _) = parse_layer_and_expert("layers.0.ffn.gate.bias");
+        assert_eq!(cat_gate_bias, "MoE Router");
+
+        let (cat_gate_vl, _, _) = parse_layer_and_expert("layers.0.ffn.gate.bias_vl");
+        assert_eq!(cat_gate_vl, "MoE Router");
+
+        let (cat_shared, _, _) = parse_layer_and_expert("layers.0.ffn.shared_experts.w1.weight");
+        assert_eq!(cat_shared, "Shared Expert");
+
+        let (cat_expert, l_exp, e_exp) = parse_layer_and_expert("layers.0.ffn.experts.383.w3.weight");
+        assert_eq!(cat_expert, "Routed Expert #383");
+        assert_eq!(l_exp, Some(0));
+        assert_eq!(e_exp, Some(383));
+
+        let (cat_expert_scale, _, e_scale) = parse_layer_and_expert("layers.0.ffn.experts.383.w3.weight_scale");
+        assert_eq!(cat_expert_scale, "Routed Expert #383");
+        assert_eq!(e_scale, Some(383));
+
+        // Engram tables: their own category, and streamed.
+        let (cat_engram, l_engram, _) = parse_layer_and_expert("layers.1.engram.wkv.weight");
+        assert_eq!(cat_engram, "Engram (n-gram memory)");
+        assert_eq!(l_engram, Some(1));
+        // The Swift side keys "never map this" off the category, not a flag.
+        let (cat_engram_scale, _, _) = parse_layer_and_expert("layers.14.engram.wkv.scale");
+        assert_eq!(cat_engram_scale, "Engram (n-gram memory)");
+
+        // The published checkpoint's Engram tensors are single ~100 GB blocks.
+        let row_bytes = 256 + 8;
+        let table_bytes = 384_006_168u64 * row_bytes;
+        assert!(table_bytes > 64 * 1024 * 1024 * 1024, "Engram table must exceed any Metal buffer");
+
+        // Draft blocks keep their own bucket.
+        let (cat_mtp, _, _) = parse_layer_and_expert("mtp.0.main_proj.weight");
+        assert_eq!(cat_mtp, "Multi-Token Prediction");
+    }
+
     #[test]
     fn test_real_ling_3_tiny_snapshot() {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/derekparris".to_string());
@@ -2140,5 +2346,106 @@ mod tests {
         assert!(ids.contains(&130976), "<|Bot|> token id present");
         assert!(ids.contains(&130973), "<|User|> token id present");
         assert!(ids.contains(&130972), "<|System|> token id present");
+    }
+
+    /// The compressed map is what the whole Engram hash is built on, so its two
+    /// rules get a self-contained fixture: tokens that normalize alike collapse
+    /// (case, accents, whitespace runs), a lone space survives as its own key
+    /// rather than collapsing to the empty string, and compressed ids are handed
+    /// out in first-seen vocabulary order.
+    #[test]
+    fn test_engram_token_map_collapses_normalized_tokens() {
+        let json = r#"{
+          "version": "1.0",
+          "truncation": null,
+          "padding": null,
+          "added_tokens": [],
+          "normalizer": null,
+          "pre_tokenizer": null,
+          "post_processor": null,
+          "decoder": null,
+          "model": {
+            "type": "WordLevel",
+            "vocab": {
+              " Hello": 0,
+              "hello": 1,
+              "HELLO": 2,
+              " the": 3,
+              "the": 4,
+              "h\u00e9llo": 5,
+              "za": 6,
+              " ": 7,
+              "\t\t": 8
+            },
+            "unk_token": "<unk>"
+          }
+        }"#;
+        let tokenizer = Tokenizer::from_bytes(json.as_bytes()).unwrap();
+        let engine = DynaMoeTokenizer { tokenizer };
+
+        let map = engine.build_engram_token_map(0, 0).unwrap();
+        // Hello / hello / HELLO / héllo all normalize to "hello"; the / the collapse
+        // too; the two whitespace-only tokens collapse to the space key.
+        assert_eq!(map.lookup, vec![0, 0, 0, 1, 1, 0, 2, 3, 3]);
+        assert_eq!(map.compressed_vocab_size, 4);
+        // The pad token's COMPRESSED id, not the raw id.
+        assert_eq!(map.pad_id, 0);
+        let padded = engine.build_engram_token_map(0, 6).unwrap();
+        assert_eq!(padded.pad_id, 2);
+    }
+
+    /// A declared `engram_compressed_vocab_size` that the tokenizer does not
+    /// reproduce is an error, not a warning: every hash multiplier derives from
+    /// that size, so continuing would read the wrong rows silently.
+    #[test]
+    fn test_engram_token_map_rejects_a_size_mismatch() {
+        let json = r#"{
+          "version": "1.0",
+          "truncation": null,
+          "padding": null,
+          "added_tokens": [],
+          "normalizer": null,
+          "pre_tokenizer": null,
+          "post_processor": null,
+          "decoder": null,
+          "model": {"type": "WordLevel", "vocab": {" a": 0, "b": 1}, "unk_token": "<unk>"}
+        }"#;
+        let engine = DynaMoeTokenizer {
+            tokenizer: Tokenizer::from_bytes(json.as_bytes()).unwrap(),
+        };
+        let error = engine.build_engram_token_map(99_092, 0).unwrap_err();
+        assert!(format!("{error}").contains("engram_compressed_vocab_size"));
+        // The pad id is validated against the tokenizer vocabulary, not the
+        // compressed one.
+        assert!(engine.build_engram_token_map(0, 2).is_err());
+    }
+
+    /// The decisive check for the whole chain: on the real DeepSeek-V4.1
+    /// checkpoint, this map must collapse to exactly the published
+    /// `engram_compressed_vocab_size`. Nothing else in the reference constrains
+    /// the normalization steps, so reproducing this number is what proves the
+    /// Swift side is hashing the vocabulary the checkpoint trained on.
+    #[test]
+    fn test_engram_token_map_matches_the_published_checkpoint() {
+        let hub = PathBuf::from(
+            "/Users/derekparris/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots",
+        );
+        // The hub names snapshots by commit; tests take whichever is downloaded.
+        let snapshot = std::fs::read_dir(&hub)
+            .ok()
+            .and_then(|entries| entries.filter_map(|e| e.ok()).map(|e| e.path()).next());
+        let tok_path = match snapshot {
+            Some(dir) => dir.join("tokenizer.json"),
+            None => hub.join("missing/tokenizer.json"),
+        };
+        if !tok_path.exists() {
+            println!("DeepSeek-V4.1 snapshot not present; skipping");
+            return;
+        }
+        let engine = DynaMoeTokenizer::new(tok_path.to_string_lossy().to_string()).unwrap();
+        let map = engine.build_engram_token_map(99_092, 2).unwrap();
+        assert_eq!(map.compressed_vocab_size, 99_092);
+        assert_eq!(map.lookup.len(), 129_280);
+        assert_eq!(map.pad_id, 2);
     }
 }
