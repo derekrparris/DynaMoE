@@ -332,7 +332,9 @@ public class LocalModelManager: ObservableObject {
 
             let isGemma4 = archLower.contains("gemma4") || (rawModelType?.localizedCaseInsensitiveContains("gemma4") ?? false) || textType.localizedCaseInsensitiveContains("gemma4")
             if textType.localizedCaseInsensitiveContains("deepseek_v41") || archLower.contains("deepseekv41") || (rawModelType?.localizedCaseInsensitiveContains("deepseek_v41") ?? false) {
-                architectureName = "DeepSeek V4.1 Flash (CED / CSA2 MoE)"
+                architectureName = DeepSeekV41Availability.isRuntimeAvailable
+                    ? "DeepSeek V4.1 Flash (CED / CSA2 MoE)"
+                    : "DeepSeek V4.1 Flash (CED / CSA2 MoE, runtime not available)"
             } else if isGemma4 {
                 architectureName = isMoE ? "Gemma 4 Hybrid Attention MoE" : "Gemma 4 Hybrid Attention"
             } else if archString.localizedCaseInsensitiveContains("qwen3_5") || archString.localizedCaseInsensitiveContains("ornith") || (rawModelType?.localizedCaseInsensitiveContains("qwen3_5") ?? false) || (rawModelType?.localizedCaseInsensitiveContains("ornith") ?? false) {

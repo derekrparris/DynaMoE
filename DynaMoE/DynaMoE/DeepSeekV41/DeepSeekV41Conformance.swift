@@ -13,14 +13,22 @@
 //  looks like it is working.
 //
 //  So each such rule carries a gate here. The load log prints the unverified ones,
-//  `Tools/dsv41_probe.py` is what produces the reference vectors, and flipping a
-//  gate to `.verifiedAgainstReference` is a one-line change accompanied by a test
-//  that carries the vectors. Nothing in the runtime branches on these gates: they
-//  are diagnostics, not switches, because refusing to run at all would make the
-//  first real checkpoint unusable.
+//  `Tools/dsv41_probe.py` dumps the checkpoint's own files (it does not compute
+//  reference outputs), and flipping a gate to `.verifiedAgainstReference` is a
+//  one-line change accompanied by a test that carries vectors produced by a real
+//  reference run. The gates are diagnostics rather than switches, with
+//  one deliberate exception: the device forward refuses an Engram layer while the
+//  hash combination is unverified, because reading the wrong rows is silent.
 //
 
 import Foundation
+
+/// Whether the family can serve a turn yet. Detection and the clear refusal stay
+/// on unconditionally; discovery and the graded-effort UI read this so a user is
+/// not invited to download a ~510 GB checkpoint that can only fail closed.
+nonisolated public enum DeepSeekV41Availability {
+    public static let isRuntimeAvailable = false
+}
 
 nonisolated public enum DeepSeekV41Conformance {
 

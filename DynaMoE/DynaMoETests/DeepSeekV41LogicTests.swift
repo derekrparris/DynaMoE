@@ -236,7 +236,10 @@ final class DeepSeekV41ConfigTests: XCTestCase {
         XCTAssertEqual(qwen.resolveArchitectureType(summary: nil), .hybridSsmMoe)
     }
 
-    func testEffortBoundsAndEffortLevelSupport() throws {
+    /// Until the turn loop exists, the family is detected (so the load refuses
+    /// clearly) but discovery must not advertise graded effort.
+    func testGradedEffortIsNotAdvertisedWhileTheRuntimeIsUnavailable() throws {
+        XCTAssertFalse(DeepSeekV41Availability.isRuntimeAvailable)
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("dsv41-effort-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -244,9 +247,7 @@ final class DeepSeekV41ConfigTests: XCTestCase {
         try Self.wrapperJSON.write(
             to: dir.appendingPathComponent("config.json"), atomically: true, encoding: .utf8
         )
-        XCTAssertEqual(ModelConfig.reasoningEffortBounds(modelPath: dir.path), 1...100)
-        XCTAssertTrue(ModelConfig.supportsThinkingLevels(modelPath: dir.path))
-        XCTAssertNil(ModelConfig.reasoningEffortBounds(modelPath: nil))
+        XCTAssertFalse(ModelConfig.supportsThinkingLevels(modelPath: dir.path))
     }
 }
 

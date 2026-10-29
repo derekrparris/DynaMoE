@@ -1046,21 +1046,12 @@ public struct ModelConfig: Codable {
             return cached.boolValue
         }
         let directory = URL(fileURLWithPath: path)
-        let supported = isDeepSeekV41Directory(directory)
+        let supported = (DeepSeekV41Availability.isRuntimeAvailable
+                && isDeepSeekV41Directory(directory))
             || (isSparkDirectory(directory)
                 && chatTemplateText(in: directory)?.contains("reasoning_effort") == true)
         thinkingLevelsCache.setObject(NSNumber(value: supported), forKey: key)
         return supported
-    }
-
-    /// The continuous reasoning-effort range a model accepts, or nil when the
-    /// model has no graded effort. DeepSeek V4.1 renders an integer budget
-    /// (`Reasoning Effort: N`) over 1...100; the other graded family (Spark
-    /// X2.6) exposes discrete levels instead.
-    nonisolated public static func reasoningEffortBounds(modelPath: String?) -> ClosedRange<Int>? {
-        guard let path = modelPath, !path.isEmpty else { return nil }
-        guard isDeepSeekV41Directory(URL(fileURLWithPath: path)) else { return nil }
-        return 1...100
     }
 
     /// Scan-time detection runs off the main actor, so the shared cache must be
