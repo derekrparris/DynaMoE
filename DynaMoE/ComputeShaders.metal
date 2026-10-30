@@ -8741,6 +8741,10 @@ kernel void dsv41_hc_sinkhorn(
 /// byte offset inside its shard, and advancing a `float*` by it reads four times
 /// too far. Every other projection kernel takes a `uchar*` for exactly this reason,
 /// and a test that binds the weight at offset 0 cannot see the difference.
+/// Grid: (outDim, slots, 1) — one row of the projection per thread, and one SLOT
+/// per grid row. A block of positions projects every slot in one dispatch instead
+/// of one dispatch per position; `slots` is 1 for a decode step, so the walk is the
+/// same kernel with a grid one row tall.
 kernel void dsv41_hc_project_f32(
     device const uchar* rawWeightBuffer [[buffer(0)]],
     device const float* streamBuffer [[buffer(1)]],
@@ -8749,19 +8753,26 @@ kernel void dsv41_hc_project_f32(
     constant float& normEpsilon [[buffer(4)]],
     constant uint32_t& width [[buffer(5)]],
     constant uint32_t& outDim [[buffer(6)]],
-    uint row [[thread_position_in_grid]]
+    constant uint32_t& slotCount [[buffer(7)]],
+    uint2 position [[thread_position_in_grid]]
 ) {
-    if (row >= outDim || width == 0) return;
+    uint row = position.x;
+    uint slot = position.y;
+    if (row >= outDim || width == 0 || slot >= slotCount) return;
     device const float* wPtr = (device const float*)(rawWeightBuffer + weightOffset)
         + (uint64_t)row * width;
+    // Every per-slot vector is `stride` wide, so the slot is an offset rather than a
+    // separate binding.
+    device const float* stream = streamBuffer + (uint64_t)slot * width;
+    device float* logits = logitsBuffer + (uint64_t)slot * outDim;
 
     float sumSquares = 0.0f;
-    for (uint32_t i = 0; i < width; ++i) sumSquares += streamBuffer[i] * streamBuffer[i];
+    for (uint32_t i = 0; i < width; ++i) sumSquares += stream[i] * stream[i];
     float rstd = rsqrt(sumSquares / (float)width + normEpsilon);
 
     float total = 0.0f;
-    for (uint32_t i = 0; i < width; ++i) total += wPtr[i] * streamBuffer[i];
-    logitsBuffer[row] = total * rstd;
+    for (uint32_t i = 0; i < width; ++i) total += wPtr[i] * stream[i];
+    logits[row] = total * rstd;
 }
 
 /// MSL Kernel: the mHC split — `(2 + mult) * mult` logits to `pre`, `post` and
@@ -8770,35 +8781,45 @@ kernel void dsv41_hc_project_f32(
 /// One thread runs the whole split: `mult` is at most `hc_mult` (4 on the published
 /// checkpoint) and the Sinkhorn schedule is serial, so the coordination a parallel
 /// version would need costs more than the loop.
+/// Grid: (slots, 1, 1) — one thread per position, each running its own Sinkhorn.
+///
+/// The schedule is serial and `mult` is at most 16, so a thread's chain cannot be
+/// split, but a BLOCK of positions can run its chains side by side instead of one
+/// dispatch per position: the chains are independent, and the grid is what makes
+/// them concurrent.
 kernel void dsv41_hc_split_f32(
     device const float* logits [[buffer(0)]],
     device const float* scaleBuffer [[buffer(1)]],   // [3]
     device const float* baseBuffer [[buffer(2)]],    // [(2 + mult) * mult]
-    device float* preBuffer [[buffer(3)]],           // [mult]
-    device float* postBuffer [[buffer(4)]],          // [mult]
-    device float* combBuffer [[buffer(5)]],          // [mult * mult]
+    device float* preBuffer [[buffer(3)]],           // [slots][mult]
+    device float* postBuffer [[buffer(4)]],          // [slots][mult]
+    device float* combBuffer [[buffer(5)]],          // [slots][mult * mult]
     constant uint32_t& mult [[buffer(6)]],
     constant uint32_t& iterations [[buffer(7)]],
     constant float& epsilon [[buffer(8)]],
-    uint tid [[thread_position_in_grid]]
+    constant uint32_t& slotCount [[buffer(9)]],
+    uint slot [[thread_position_in_grid]]
 ) {
-    if (tid != 0) return;
+    if (slot >= slotCount) return;
     uint n = mult;
     if (n == 0 || n > 16) return;
     uint mixCount = (2 + n) * n;
+    device const float* slotLogits = logits + (uint64_t)slot * mixCount;
+    device float* pre = preBuffer + (uint64_t)slot * n;
+    device float* post = postBuffer + (uint64_t)slot * n;
+    device float* comb = combBuffer + (uint64_t)slot * n * n;
 
     for (uint copy = 0; copy < n; ++copy) {
-        float pre = logits[copy] * scaleBuffer[0] + baseBuffer[copy];
-        preBuffer[copy] = 1.0f / (1.0f + exp(-pre)) + epsilon;
-        float post = logits[n + copy] * scaleBuffer[1] + baseBuffer[n + copy];
-        postBuffer[copy] = 2.0f * (1.0f / (1.0f + exp(-post)));
+        float preValue = slotLogits[copy] * scaleBuffer[0] + baseBuffer[copy];
+        pre[copy] = 1.0f / (1.0f + exp(-preValue)) + epsilon;
+        float postValue = slotLogits[n + copy] * scaleBuffer[1] + baseBuffer[n + copy];
+        post[copy] = 2.0f * (1.0f / (1.0f + exp(-postValue)));
     }
     uint base = 2 * n;
     for (uint i = 0; i < n * n; ++i) {
-        combBuffer[i] = logits[base + i] * scaleBuffer[2] + baseBuffer[base + i];
+        comb[i] = slotLogits[base + i] * scaleBuffer[2] + baseBuffer[base + i];
     }
-    (void)mixCount;
-    dsv41_hc_sinkhorn_into(combBuffer, n, iterations, epsilon);
+    dsv41_hc_sinkhorn_into(comb, n, iterations, epsilon);
 }
 
 /// MSL Kernel: `hc_pre` — collapse the copies into the one vector a sub-layer
@@ -9124,6 +9145,13 @@ kernel void dsv41_indexer_scores_f32(
 /// `scoringFunction` is 0 = sigmoid, 1 = sqrtsoftplus. Softmax (2) is a
 /// distribution over all experts and needs a second pass over them, so the
 /// executor refuses it rather than computing it one expert at a time.
+/// Grid: (slots, 1, 1) — one thread per position.
+///
+/// The scan and its insertion sort are serial over the experts, which is one
+/// thread's worth of work, so a block runs its positions as concurrent threads in
+/// one dispatch instead of one dispatch per position. `slots` is 1 for a decode
+/// step. `indexStride` is the readback buffer's per-slot stride in UINT32s (the
+/// caller pads it to at least four entries per slot, so it is not `topK`).
 kernel void dsv41_router_topk(
     device const float* logits [[buffer(0)]],
     device const float* biasBuffer [[buffer(1)]],     // may be null
@@ -9135,17 +9163,22 @@ kernel void dsv41_router_topk(
     constant uint32_t& normalise [[buffer(7)]],
     constant uint32_t& scoringFunction [[buffer(8)]],
     constant float& gateTemp [[buffer(9)]],
-    uint tid [[thread_position_in_grid]]
+    constant uint32_t& indexStride [[buffer(10)]],
+    constant uint32_t& slotCount [[buffer(11)]],
+    uint slot [[thread_position_in_grid]]
 ) {
-    if (tid != 0 || expertCount == 0 || topK == 0) return;
+    if (slot >= slotCount || expertCount == 0 || topK == 0) return;
+    device const float* slotLogits = logits + (uint64_t)slot * expertCount;
+    device uint32_t* slotIndices = expertIndices + (uint64_t)slot * indexStride;
+    device float* slotWeights = expertWeights + (uint64_t)slot * topK;
     uint32_t count = min(topK, expertCount);
     // Leaving here would keep the previous token's routing in the readback buffer,
     // so an impossible top-k fails by being visibly wrong rather than silently
     // stale. The published checkpoint's top-k is ~6.
     if (count > 64u || expertCount > 65536u) {
         for (uint32_t rank = 0; rank < count && rank < 64u; ++rank) {
-            expertIndices[rank] = 0u;
-            expertWeights[rank] = 0.0f;
+            slotIndices[rank] = 0u;
+            slotWeights[rank] = 0.0f;
         }
         return;
     }
@@ -9160,7 +9193,7 @@ kernel void dsv41_router_topk(
 
     float temperature = gateTemp > 0.0f ? gateTemp : 1.0f;
     for (uint32_t expert = 0; expert < expertCount; ++expert) {
-        float logit = logits[expert] / temperature;
+        float logit = slotLogits[expert] / temperature;
         // The weight is the UNBIASED score; the bias only moves the ranking.
         float weight = (scoringFunction == 0u)
             ? (logit >= 0.0f ? (1.0f / (1.0f + exp(-logit)))
@@ -9208,8 +9241,8 @@ kernel void dsv41_router_topk(
         float mixWeight = topWeight[rank];
         if (normalise != 0u && total > 0.0f) mixWeight /= total;
         if (scalingFactor > 0.0f) mixWeight *= scalingFactor;
-        expertIndices[rank] = topIndex[rank];
-        expertWeights[rank] = mixWeight;
+        slotIndices[rank] = topIndex[rank];
+        slotWeights[rank] = mixWeight;
     }
 }
 

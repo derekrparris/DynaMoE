@@ -265,10 +265,13 @@ nonisolated public enum DeepSeekV41Conformance {
     /// it, the dense half holds 85% of the device time (the mixture 15%), and inside
     /// the dense half the per-position stages dominate — `writeLatent` 42%, the two
     /// mHC coefficient stages 33% — because `dsv41_hc_split_f32` runs its whole
-    /// Sinkhorn schedule on ONE thread, repeated per position. So the graph is no
-    /// longer the question, and neither is the arena: what is left is per-position
-    /// serial work, and above all the fact that none of this has run against real
-    /// weights. The turn loop already routes a from-position-0 prompt through
+    /// Sinkhorn schedule on ONE thread, repeated per position. The mHC pair and the
+    /// router now take a slot dimension, so a block runs its positions as grid rows:
+    /// that took the pass to ~2.4x at block width 4 and halved the dense half's
+    /// device time again, and left `writeLatent` (cache write, gather, attention) as
+    /// the largest remaining per-position stage. So the graph is no longer the
+    /// question, and neither is the arena: what is left is per-position serial work,
+    /// and above all the fact that none of this has run against real weights. The turn loop already routes a from-position-0 prompt through
     /// `DeepSeekV41PositionForward.prefillChunk`, so nothing outside the executor has
     /// to change either way (numbers and caveats in `Benchmarks/PERF_FINDINGS.md`,
     /// "DSV4.1 #1" to "DSV4.1 #3").

@@ -3756,3 +3756,79 @@ Tests: `DeepSeekV41PrefillMeasurementTests.testWhereABlocksRemainingTimeGoes`
 stage table plus the calibration), both opt-in and both asserting the
 correctness invariant — the block must still return the walk's logits through
 the instrumented paths — rather than a timing threshold.
+
+## DSV4.1 #4: A SLOT DIMENSION ON THE mHC PAIR AND THE ROUTER
+
+**What changed, and why it was the next thing.** `DSV4.1 #3` split a block's
+remaining cost and found the dense half holding 85% of the device time, with
+the two mHC coefficient stages at 33% of it. The reason is visible in the
+kernels: `dsv41_hc_split_f32` returns immediately for every thread except
+`tid == 0`, so a block paid the whole Sinkhorn schedule once per position per
+sub-layer, and `dsv41_router_topk` is the same shape (one thread scans every
+expert). `dsv41_hc_project_f32` was a `mixCount`-wide grid at one position.
+
+All three now take a slot dimension — `thread_position_in_grid.y` for the
+projection, `.x` for the split and the router — and the executor dispatches
+them once per layer instead of once per position, with the slot applied as an
+offset inside the kernel. The arithmetic, the Sinkhorn schedule and the router
+rule are untouched; only the grid and the addressing changed. A decode step
+passes one slot, so the walk runs the same kernels it always did.
+
+**Before → after, same harness** (synthetic checkpoint, 32 positions, best of
+3 after a warmup, block widths from the ring; three runs after the change):
+
+| window | slots | speedup before | speedup after | chunk ms/pos before | chunk ms/pos after |
+|-------:|------:|---------------:|--------------:|--------------------:|-------------------:|
+| 2 | 2 | 2.06x | 1.91-1.99x | 0.418 | 0.442-0.458 |
+| 4 | 4 | 2.01x | 2.39-2.44x | 0.320 | 0.273-0.282 |
+| 8 | 8 | 1.97x | 2.50-2.56x | 0.347 | 0.284-0.293 |
+| 16 | 8 | 1.80x | 2.10-2.15x | 0.439 | 0.377-0.389 |
+
+Per position per layer the block went from 0.133-0.143 ms to 0.117-0.121 ms.
+Blocks wider than two positions gained 15-25%; **width 2 is slightly WORSE**,
+which is what a two-wide grid should do — there is almost nothing to
+parallelize, and the kernels pay one more constant to read.
+
+**The attribution moved a long way, and not only where expected.**
+
+| measure (ms per position per layer) | before | after |
+|---|---:|---:|
+| dense half encoded (host) | 0.0237 | 0.0174 |
+| dense half waited on | 0.2064 | 0.0879 |
+| mixture encoded (host) | 0.0186 | 0.0127 |
+| dense device | 0.1709 | 0.0646 |
+| mixture device | 0.0307 | 0.0159 |
+| `hc{Attn,FFN}Coefficients` (per-stage layout) | 0.060-0.067 each | 0.009 each |
+| `router` | 0.013 | 0.004 |
+| `writeLatent` | 0.155-0.166 | 0.079 |
+
+The dense half's device time fell 2.6x, which is more than the 33% the mHC pair
+held before. The explanation is that a single-thread dispatch is not only slow
+itself, it stalls everything queued behind it: `writeLatent` was never touched
+and still halved, and the host wait fell further than the device work did. So
+the honest reading is "removing one-thread dispatches unblocks the queue", and
+a per-stage table measured around such a stage attributes its neighbours' lost
+time to them. Read each table as a ranking, and the whole-block wall as the
+result.
+
+**What is left.** `writeLatent` — the cache write, the row gather and the
+attention — is now 54% of a dense half that is itself 2.6x cheaper, at 0.079
+ms/position/layer. It cannot be batched the same way: the ring tears if a
+position's successor writes before its predecessor's query reads, and the row
+plan (which rows a position attends to) is resolved on the host per position.
+It needs its own reasoning, so it stays the open item.
+
+**Caveats.** Synthetic widths again: at hidden 64 the mHC projections are a
+handful of multiplies, so part of what this change removed is fixed per-dispatch
+cost that a 7,168-wide model would amortize on its own. What transfers is the
+serialization — a one-thread Sinkhorn per position and a one-thread expert scan
+per position are the same cost at any width. Nothing here is measured at real
+weights.
+
+Tests: the existing mHC kernel and graph parity cases, plus
+`DeepSeekV41DeviceGraphParityTests.testTheHyperConnectionCoefficientsDispatchOneSlotPerPosition`,
+which drives two slots with different stacks through the project and split
+kernels and compares each against `DeepSeekV41HyperConnections.coefficients` —
+the failure mode a slot grid introduces is a slot reading its neighbour's
+stack. `testTheChunkSeamReturnsTheWalksLogits` still requires bit-identical
+logits from the batched path. Full DeepSeek suite: 402 tests, 0 failures.

@@ -653,12 +653,18 @@ final class DeepSeekV41RouterKernelTests: XCTestCase {
         var normalise: UInt32 = 1
         var scoring: UInt32 = 0  // sigmoid
         var temperature: Float = 1
+        // The readback buffer is a single slot here, so the stride only has to be
+        // large enough for the top-k this case asks for.
+        var indexStride = UInt32(4)
+        var slotCount: UInt32 = 1
         encoder.setBytes(&expertCount, length: 4, index: 4)
         encoder.setBytes(&top, length: 4, index: 5)
         encoder.setBytes(&scale, length: 4, index: 6)
         encoder.setBytes(&normalise, length: 4, index: 7)
         encoder.setBytes(&scoring, length: 4, index: 8)
         encoder.setBytes(&temperature, length: 4, index: 9)
+        encoder.setBytes(&indexStride, length: 4, index: 10)
+        encoder.setBytes(&slotCount, length: 4, index: 11)
         encoder.dispatchThreads(
             MTLSize(width: 1, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
@@ -1255,10 +1261,13 @@ final class DeepSeekV41HyperConnectionKernelTests: XCTestCase {
         var normEpsilon: Float = 1e-6
         var widthDimension = UInt32(width)
         var outDimension = UInt32(mixCount)
+        // One slot: this case drives the kernel the way a decode step does.
+        var slotCount: UInt32 = 1
         encoder.setBytes(&weightOffset, length: 8, index: 3)
         encoder.setBytes(&normEpsilon, length: 4, index: 4)
         encoder.setBytes(&widthDimension, length: 4, index: 5)
         encoder.setBytes(&outDimension, length: 4, index: 6)
+        encoder.setBytes(&slotCount, length: 4, index: 7)
         encoder.dispatchThreads(
             MTLSize(width: mixCount, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
@@ -1278,6 +1287,7 @@ final class DeepSeekV41HyperConnectionKernelTests: XCTestCase {
         encoder.setBytes(&copiesDimension, length: 4, index: 6)
         encoder.setBytes(&iterations, length: 4, index: 7)
         encoder.setBytes(&epsilon, length: 4, index: 8)
+        encoder.setBytes(&slotCount, length: 4, index: 9)
         encoder.dispatchThreads(
             MTLSize(width: 32, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)

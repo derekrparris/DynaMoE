@@ -592,10 +592,13 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         var epsilon: Float = checkpoint.config.rmsNormEps
         var widthDimension = UInt32(width)
         var outDimension = UInt32(mixCount)
+        // One slot: this case pins the BYTE OFFSET, not the slot grid.
+        var slotCount: UInt32 = 1
         encoder.setBytes(&weightOffset, length: 8, index: 3)
         encoder.setBytes(&epsilon, length: 4, index: 4)
         encoder.setBytes(&widthDimension, length: 4, index: 5)
         encoder.setBytes(&outDimension, length: 4, index: 6)
+        encoder.setBytes(&slotCount, length: 4, index: 7)
         encoder.dispatchThreads(
             MTLSize(width: mixCount, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
@@ -623,6 +626,174 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
                 pointer[row], expected[row], accuracy: 1e-5,
                 "row \(row) read from byte offset \(byteOffset)"
             )
+        }
+    }
+
+    /// The mHC coefficient pair dispatched over a BLOCK of slots.
+    ///
+    /// `dsv41_hc_project_f32` takes its slot from `thread_position_in_grid.y` and
+    /// `dsv41_hc_split_f32` from `.x`, so a block of positions shares one dispatch.
+    /// The failure mode is the one any batched kernel has: a slot that reads its
+    /// neighbour's stack looks like a plausible model for one position and is wrong
+    /// everywhere else. Two slots with different stacks pin it.
+    func testTheHyperConnectionCoefficientsDispatchOneSlotPerPosition() throws {
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let library = device.makeDefaultLibrary(),
+              let projectFunction = library.makeFunction(name: "dsv41_hc_project_f32"),
+              let splitFunction = library.makeFunction(name: "dsv41_hc_split_f32"),
+              let project = try? device.makeComputePipelineState(function: projectFunction),
+              let split = try? device.makeComputePipelineState(function: splitFunction),
+              let queue = device.makeCommandQueue() else {
+            throw XCTSkip("No Metal device or kernel")
+        }
+        let checkpoint = DeepSeekV41SyntheticCheckpoint()
+        let mult = max(1, checkpoint.config.hcMult)
+        let mixCount = (2 + mult) * mult
+        let hidden = checkpoint.shape.hidden
+        let width = mult * hidden
+        let slots = 2
+
+        guard let index = checkpoint.tensors.firstIndex(where: { $0.name == "layers.0.hc_attn_fn" }),
+              let shard = checkpoint.shardBuffer(device: device),
+              let logits = device.makeBuffer(
+                  length: slots * mixCount * MemoryLayout<Float>.stride,
+                  options: .storageModeShared
+              ),
+              let pre = device.makeBuffer(
+                  length: slots * mult * MemoryLayout<Float>.stride,
+                  options: .storageModeShared
+              ),
+              let post = device.makeBuffer(
+                  length: slots * mult * MemoryLayout<Float>.stride,
+                  options: .storageModeShared
+              ),
+              let comb = device.makeBuffer(
+                  length: slots * mult * mult * MemoryLayout<Float>.stride,
+                  options: .storageModeShared
+              ) else {
+            throw XCTSkip("the synthetic shard could not be mapped")
+        }
+        let tensor = checkpoint.tensors[index]
+        let byteOffset = checkpoint.layout[index].offset
+
+        // Two stacks that differ in every element, so a slot reading its neighbour
+        // cannot pass.
+        let table = checkpoint.tensors.first { $0.name == "embed.weight" }
+        let embedding = table?.values ?? []
+        var stacks: [[Float]] = []
+        for slot in 0..<slots {
+            let start = min(3 + slot, checkpoint.config.vocabSize - 1) * hidden
+            let row = Array(embedding[start..<(start + hidden)])
+            stacks.append([[Float]](repeating: row, count: mult).flatMap { $0 })
+        }
+        guard let streamBuffer = device.makeBuffer(
+                  bytes: stacks.flatMap { $0 },
+                  length: slots * width * MemoryLayout<Float>.stride,
+                  options: .storageModeShared
+              ) else {
+            throw XCTSkip("no stream buffer")
+        }
+
+        let scale: [Float] = [0.5, -0.25, 1.5]
+        let base = (0..<mixCount).map { Float($0) * 0.125 - 0.5 }
+        guard let scaleBuffer = device.makeBuffer(
+                  bytes: scale, length: 3 * MemoryLayout<Float>.stride,
+                  options: .storageModeShared
+              ),
+              let baseBuffer = device.makeBuffer(
+                  bytes: base, length: mixCount * MemoryLayout<Float>.stride,
+                  options: .storageModeShared
+              ) else {
+            throw XCTSkip("no coefficient buffers")
+        }
+
+        let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+        let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(project)
+        encoder.setBuffer(shard, offset: 0, index: 0)
+        encoder.setBuffer(streamBuffer, offset: 0, index: 1)
+        encoder.setBuffer(logits, offset: 0, index: 2)
+        var weightOffset = UInt64(byteOffset)
+        var epsilon: Float = checkpoint.config.rmsNormEps
+        var widthDimension = UInt32(width)
+        var outDimension = UInt32(mixCount)
+        var slotCount = UInt32(slots)
+        encoder.setBytes(&weightOffset, length: 8, index: 3)
+        encoder.setBytes(&epsilon, length: 4, index: 4)
+        encoder.setBytes(&widthDimension, length: 4, index: 5)
+        encoder.setBytes(&outDimension, length: 4, index: 6)
+        encoder.setBytes(&slotCount, length: 4, index: 7)
+        encoder.dispatchThreads(
+            MTLSize(width: mixCount, height: slots, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+        encoder.memoryBarrier(scope: .buffers)
+
+        encoder.setComputePipelineState(split)
+        encoder.setBuffer(logits, offset: 0, index: 0)
+        encoder.setBuffer(scaleBuffer, offset: 0, index: 1)
+        encoder.setBuffer(baseBuffer, offset: 0, index: 2)
+        encoder.setBuffer(pre, offset: 0, index: 3)
+        encoder.setBuffer(post, offset: 0, index: 4)
+        encoder.setBuffer(comb, offset: 0, index: 5)
+        var copies = UInt32(mult)
+        var iterations = UInt32(3)
+        var sinkhornEpsilon: Float = 1e-6
+        encoder.setBytes(&copies, length: 4, index: 6)
+        encoder.setBytes(&iterations, length: 4, index: 7)
+        encoder.setBytes(&sinkhornEpsilon, length: 4, index: 8)
+        encoder.setBytes(&slotCount, length: 4, index: 9)
+        encoder.dispatchThreads(
+            MTLSize(width: slots, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: slots, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        let matrix = DeepSeekV41Matrix(rows: mixCount, columns: width, values: tensor.values)
+        let logitsPointer = logits.contents().assumingMemoryBound(to: Float.self)
+        let prePointer = pre.contents().assumingMemoryBound(to: Float.self)
+        let postPointer = post.contents().assumingMemoryBound(to: Float.self)
+        let combPointer = comb.contents().assumingMemoryBound(to: Float.self)
+        for slot in 0..<slots {
+            let stack = [[Float]](
+                (0..<mult).map { Array(stacks[slot][($0 * hidden)..<(($0 + 1) * hidden)]) }
+            )
+            let expected = DeepSeekV41HyperConnections.coefficients(
+                streams: stack,
+                projection: matrix,
+                scale: scale,
+                base: base,
+                normalizationEpsilon: checkpoint.config.rmsNormEps,
+                epsilon: sinkhornEpsilon,
+                iterations: 3
+            )
+            for row in 0..<mixCount {
+                XCTAssertEqual(
+                    logitsPointer[slot * mixCount + row], expected.logits[row],
+                    accuracy: 1e-5,
+                    "slot \(slot): logit \(row) came from another slot's stack"
+                )
+            }
+            for copy in 0..<mult {
+                XCTAssertEqual(
+                    prePointer[slot * mult + copy], expected.pre[copy], accuracy: 1e-6,
+                    "slot \(slot): pre \(copy)"
+                )
+                XCTAssertEqual(
+                    postPointer[slot * mult + copy], expected.post[copy], accuracy: 1e-6,
+                    "slot \(slot): post \(copy)"
+                )
+            }
+            for entry in 0..<(mult * mult) {
+                XCTAssertEqual(
+                    combPointer[slot * mult * mult + entry], expected.comb[entry],
+                    accuracy: 1e-6,
+                    "slot \(slot): comb \(entry)"
+                )
+            }
         }
     }
 

@@ -1401,19 +1401,17 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
 
         switch stage {
         case .hcAttentionCoefficients:
-            try eachSlot { slot in
-                try encodeHyperConnectionCoefficients(
-                    encoder,
-                    layer: index,
-                    function: .hcAttnFn,
-                    base: .hcAttnBase,
-                    scale: .hcAttnScale,
-                    pre: workspace.hcAttentionPre,
-                    post: workspace.hcAttentionPost,
-                    comb: workspace.hcAttentionComb,
-                    slot: slot
-                )
-            }
+            try encodeHyperConnectionCoefficients(
+                encoder,
+                layer: index,
+                function: .hcAttnFn,
+                base: .hcAttnBase,
+                scale: .hcAttnScale,
+                pre: workspace.hcAttentionPre,
+                post: workspace.hcAttentionPost,
+                comb: workspace.hcAttentionComb,
+                count: count
+            )
 
         case .mixAttentionStreams:
             try eachSlot { slot in
@@ -1639,19 +1637,17 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             }
 
         case .hcFFNCoefficients:
-            try eachSlot { slot in
-                try encodeHyperConnectionCoefficients(
-                    encoder,
-                    layer: index,
-                    function: .hcFfnFn,
-                    base: .hcFfnBase,
-                    scale: .hcFfnScale,
-                    pre: workspace.hcFFNPre,
-                    post: workspace.hcFFNPost,
-                    comb: workspace.hcFFNComb,
-                    slot: slot
-                )
-            }
+            try encodeHyperConnectionCoefficients(
+                encoder,
+                layer: index,
+                function: .hcFfnFn,
+                base: .hcFfnBase,
+                scale: .hcFfnScale,
+                pre: workspace.hcFFNPre,
+                post: workspace.hcFFNPost,
+                comb: workspace.hcFFNComb,
+                count: count
+            )
 
         case .mixFFNStreams:
             try eachSlot { slot in
@@ -1694,9 +1690,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 rows: count
             )
             encoder.memoryBarrier(scope: .buffers)
-            try eachSlot { slot in
-                try encodeRouter(encoder, layer: index, slot: slot)
-            }
+            try encodeRouter(encoder, layer: index, count: count)
 
         case .sharedExpert, .routedExperts, .writeFFNStreams, .collapseStreams:
             throw DeepSeekV41EngineError.unsupportedStage(
@@ -2929,10 +2923,13 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// The router's top-k, read back so the mixture can bind each expert's byte
     /// offset. `normalise` is on: the checkpoint scales the normalized scores by
     /// `routed_scaling_factor`, which the kernel applies after normalizing.
+    ///
+    /// One thread per position: the expert scan and its insertion sort are serial,
+    /// so a block runs its positions as grid rows rather than one dispatch each.
     private func encodeRouter(
         _ encoder: MTLComputeCommandEncoder,
         layer: Int,
-        slot: Int = 0
+        count: Int = 1
     ) throws {
         guard config.scoringFunction != .softmax else {
             // `softmax` normalizes over every expert, so it cannot be evaluated one
@@ -2942,12 +2939,12 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 "scoring_func softmax (the kernel implements sigmoid and sqrtsoftplus)"
             )
         }
+        let slots = max(1, count)
+        // The readback buffer pads each slot to at least four entries, so the kernel
+        // is told that stride rather than assuming `topK`.
+        let indexStride = max(4 * config.numActivatedExperts, 16)  // bytes per slot
         encoder.setComputePipelineState(pipelines.router)
-        encoder.setBuffer(
-            workspace.routerLogits,
-            offset: workspace.slotOffset(slot, width: config.numRoutedExperts),
-            index: 0
-        )
+        encoder.setBuffer(workspace.routerLogits, offset: 0, index: 0)
         // An absent bias is a bound zero vector, not an unbound slot: the kernel
         // checks the pointer against `nullptr` and then dereferences it.
         let bias = vectors.buffer(.routerBias, layer: layer)
@@ -2958,16 +2955,8 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         } else {
             throw DeepSeekV41EngineError.allocationFailed("the router bias placeholder")
         }
-        encoder.setBuffer(
-            workspace.expertIndices,
-            offset: slot * max(4 * config.numActivatedExperts, 16),
-            index: 2
-        )
-        encoder.setBuffer(
-            workspace.expertWeights,
-            offset: workspace.slotOffset(slot, width: config.numActivatedExperts),
-            index: 3
-        )
+        encoder.setBuffer(workspace.expertIndices, offset: 0, index: 2)
+        encoder.setBuffer(workspace.expertWeights, offset: 0, index: 3)
         var expertCount = UInt32(config.numRoutedExperts)
         var topK = UInt32(max(1, config.numActivatedExperts))
         var scaling = config.routedScalingFactor
@@ -2980,9 +2969,13 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         encoder.setBytes(&normalise, length: 4, index: 7)
         encoder.setBytes(&scoring, length: 4, index: 8)
         encoder.setBytes(&temperature, length: 4, index: 9)
+        var strideInIndices = UInt32(indexStride / MemoryLayout<UInt32>.stride)  // bytes -> entries
+        var slotCount = UInt32(slots)
+        encoder.setBytes(&strideInIndices, length: 4, index: 10)
+        encoder.setBytes(&slotCount, length: 4, index: 11)
         encoder.dispatchThreads(
-            MTLSize(width: 1, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
+            MTLSize(width: slots, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: max(1, min(32, slots)), height: 1, depth: 1)
         )
     }
 
@@ -3414,12 +3407,14 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         pre: MTLBuffer,
         post: MTLBuffer,
         comb: MTLBuffer,
-        slot: Int = 0
+        count: Int = 1
     ) throws {
-        let streamOffset = workspace.slotOffset(slot, width: mult * shapes.hidden)
-        let logitsOffset = workspace.slotOffset(slot, width: mixCount)
-        let preOffset = workspace.slotOffset(slot, width: mult)
-        let combOffset = workspace.slotOffset(slot, width: mult * mult)
+        // Slots are an offset INSIDE the kernel, not a binding, so a block of
+        // positions is one dispatch for the projection and one for the split. The
+        // split's Sinkhorn is serial per position, which is exactly why the block
+        // runs its positions side by side as grid rows instead of one chain after
+        // another.
+        let slots = max(1, count)
         guard let projection = weights.tensor(function, layer: layer),
               let buffer = shardBuffer(projection) else {
             throw DeepSeekV41EngineError.missingTensor(function.rawValue)
@@ -3436,42 +3431,47 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
 
         encoder.setComputePipelineState(pipelines.hcProject)
         encoder.setBuffer(buffer, offset: 0, index: 0)
-        encoder.setBuffer(workspace.streams, offset: streamOffset, index: 1)
-        encoder.setBuffer(workspace.hcLogits, offset: logitsOffset, index: 2)
+        encoder.setBuffer(workspace.streams, offset: 0, index: 1)
+        encoder.setBuffer(workspace.hcLogits, offset: 0, index: 2)
         var weightOffset = UInt64(projection.byteOffset)
         var normalizationEpsilon = config.rmsNormEps
         var width = UInt32(mult * shapes.hidden)
         var outDim = UInt32(mixCount)
+        var slotCount = UInt32(slots)
         encoder.setBytes(&weightOffset, length: 8, index: 3)
         encoder.setBytes(&normalizationEpsilon, length: 4, index: 4)
         encoder.setBytes(&width, length: 4, index: 5)
         encoder.setBytes(&outDim, length: 4, index: 6)
+        encoder.setBytes(&slotCount, length: 4, index: 7)
         encoder.dispatchThreads(
-            MTLSize(width: mixCount, height: 1, depth: 1),
+            MTLSize(width: mixCount, height: slots, depth: 1),
             threadsPerThreadgroup: threadgroup(mixCount)
         )
         encoder.memoryBarrier(scope: .buffers)
 
         encoder.setComputePipelineState(pipelines.hcSplit)
-        encoder.setBuffer(workspace.hcLogits, offset: logitsOffset, index: 0)
+        encoder.setBuffer(workspace.hcLogits, offset: 0, index: 0)
         encoder.setBuffer(scaleBuffer, offset: 0, index: 1)
         encoder.setBuffer(baseBuffer, offset: 0, index: 2)
-        encoder.setBuffer(pre, offset: preOffset, index: 3)
-        encoder.setBuffer(post, offset: preOffset, index: 4)
-        encoder.setBuffer(comb, offset: combOffset, index: 5)
+        encoder.setBuffer(pre, offset: 0, index: 3)
+        encoder.setBuffer(post, offset: 0, index: 4)
+        encoder.setBuffer(comb, offset: 0, index: 5)
         var copies = UInt32(mult)
         var iterations = UInt32(max(0, config.hcSinkhornIterations))
         var epsilon = config.hcEps
         encoder.setBytes(&copies, length: 4, index: 6)
         encoder.setBytes(&iterations, length: 4, index: 7)
         encoder.setBytes(&epsilon, length: 4, index: 8)
-        // The split is one thread: `hc_mult` is 4 and the schedule is serial.
+        encoder.setBytes(&slotCount, length: 4, index: 9)
+        // One thread per position: `hc_mult` is 4 and the schedule is serial, so a
+        // slot's chain cannot be split, but a block's slots run concurrently.
         encoder.dispatchThreads(
-            MTLSize(width: 32, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+            MTLSize(width: slots, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: max(1, min(32, slots)), height: 1, depth: 1)
         )
         encoder.memoryBarrier(scope: .buffers)
 
+        // The probe is a single-position diagnostic, so it reads the first slot.
         if let probe = function == .hcAttnFn
             ? parityProbes.attentionLogits
             : parityProbes.feedForwardLogits {
