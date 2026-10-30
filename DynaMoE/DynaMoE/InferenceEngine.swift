@@ -862,11 +862,21 @@ public final class InferenceEngine {
                     parsedInter = parsed
                 }
             }
+            // A packed manifest can report an empty `shape`, so a routed expert's width
+            // then has to come from the config. It must come from `moe_intermediate_size`,
+            // never the dense MLP width: the two are unrelated numbers on every checkpoint
+            // that publishes both, and Qwen 3.8 Flash Next publishes only the MoE one,
+            // which left its expert MLP running 512-wide against 640-wide weights (which
+            // turned every repacked turn into gibberish).
+            let configuredMoeInter = config?.textConfig?.moeIntermediateSize ?? config?.moeIntermediateSize
+            let hasRoutedExperts = !expGW.isEmpty || !expFusedGU.isEmpty
+
             if let p = parsedInter {
                 interDim = p
+            } else if hasRoutedExperts, let moeInter = configuredMoeInter, moeInter > 0 {
+                interDim = UInt32(moeInter)
             } else if let cfgInter = config?.effectiveIntermediateSize, cfgInter > 0 {
-                // Packed formats report empty shapes; fall back to the config's dense
-                // MLP width (Gemma 4 keeps it in the nested text_config).
+                // Gemma 4 keeps its dense MLP width in the nested text_config.
                 interDim = UInt32(cfgInter)
             } else if let cfgInter = config?.intermediateSize {
                 interDim = UInt32(cfgInter)
@@ -876,7 +886,13 @@ public final class InferenceEngine {
 
             let grRead = layerTensors.first(where: { $0.name.contains("gated_residual.read") || $0.name.contains("residual_gate.read") })
             let grWrite = layerTensors.first(where: { $0.name.contains("gated_residual.write") || $0.name.contains("residual_gate.write") })
-            let qsaMqaIdx = layerTensors.first(where: { $0.name.contains("qsa.indexer") || $0.name.contains("self_attn.indexer") })
+            // The indexer's projection is what this field means, and its sibling norms match
+            // the same substring. Picking "the first indexer tensor" made the choice depend
+            // on load order: a packed manifest is name-sorted, a safetensors shard is not,
+            // so the same snapshot resolved `index_qk_proj` when packed and a 256-byte
+            // layernorm when streamed raw.
+            let qsaMqaIdx = layerTensors.first(where: { ($0.name.contains("qsa.indexer") || $0.name.contains("self_attn.indexer")) && $0.name.contains("proj") })
+                ?? layerTensors.first(where: { $0.name.contains("qsa.indexer") || $0.name.contains("self_attn.indexer") })
 
             let attnHcNorm = layerTensors.first(where: { $0.name.contains("attn_hyper_connection.hc_norm") || $0.name.contains("attn_hc.norm") || $0.name.contains("attn_norm_hc") })
             let attnHcDown = layerTensors.first(where: { $0.name.contains("attn_hyper_connection.input_mix_weight_down") || $0.name.contains("attn_hc.down") || $0.name.contains("attn_hc_down") })
