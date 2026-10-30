@@ -4035,3 +4035,89 @@ Tests: unchanged from `#5` — 405 tests, 6 skipped, 0 failures. The rewrite was
 verified before it was timed (`DeepSeekV41AttentionKernelTests` extended to dispatch
 the kernel with G=1, 2, 4 and 8 against the host rule, partial tail group included),
 so the table above is a timing of a correct kernel, not of a broken one.
+
+## DSV4.1 #7: THE STAGE TABLE WAS RANKING A TWO-HEAD MODEL
+
+**Why the ranking had to be re-taken.** `#5` and `#6` both closed with the same two
+names — `writeLatent` at 0.041 ms/position and `outputDown` at 0.026 — and both
+numbers came from a synthetic checkpoint that is TWO heads wide over a four-row
+window at hidden 64. A ranking of per-position stages taken from that model is a
+ranking of a different model: it has no 512-wide record to re-read, no 65,536-wide
+attention output to project down, and no four-copy residual stack to mix.
+
+So the harness got a second shape, `DeepSeekV41SyntheticShape.publishedWidths`:
+7,168 hidden, 128 heads of 512 (448 nope + 64 rope, so the cache record is the head
+width the published config derives), 8 output groups with `o_lora_rank` 1,024,
+`q_lora_rank` 1,536, `hc_mult` 4 with 20 Sinkhorn iterations, and a 640-row window so
+the ring hands attention the same row count a compressed layer sees. One layer, a
+128-token vocabulary, `moe_intermediate_size` 32 and four routed experts keep it
+holdable — the mixture was batched in `#2` and is not what this table ranks. That
+makes the DENSE half the shipped half down to the byte, which is what a per-stage
+ranking needs.
+
+**What one position of one layer costs at those widths** (`testWhereABlocksRemainingTimeGoesAtThePublishedWidths`,
+640-position prompt, block of 8, per-stage command buffers, M5 Max 128 GB macOS 27.2,
+wall 3.22 ms/position of which 3.24 ms is dense device time and 0.42 mixture):
+
+| stage | ms/position | share |
+|---|---:|---:|
+| `outputDown` | 1.864 | 57.6% |
+| `hcAttentionCoefficients` | 0.391 | 12.1% |
+| `hcFFNCoefficients` | 0.350 | 10.8% |
+| `writeLatent` | 0.249 | 7.7% |
+| `queryUp` | 0.097 | 3.0% |
+| `latentNorm` | 0.083 | 2.6% |
+| `outputUp` | 0.081 | 2.5% |
+| `queryDown`, `latentProject`, `router` | 0.024 each | 0.7% each |
+| the norms, ropes, mHC mixes, calibration | 0.001-0.011 | below 0.3% |
+
+**The finding.** `outputDown` is 57.6% of the dense half, and it was ranked seventh
+at 0.026 ms/position on the synthetic model — wrong by a factor of about seventy.
+The cause is a shape the synthetic model cannot express: `wo_a` is
+`o_lora_rank=1,024` by `attentionOutputWidth=65,536`, split into eight head groups,
+and `encodeBlockDiagonalProjection` is dispatched inside `eachSlot`, so each of a
+block's eight positions re-reads the entire 134 MB weight matrix in BF16 through 64
+GEMV dispatches (eight groups by eight slots). 1.864 ms for 134 MB per position is
+about 72 GB/s of weight traffic, and the weights are identical for every position of
+the block.
+
+**Why that is the next lever, and why the earlier arithmetic was wrong.** `#6`'s
+close-out said `outputDown` "cannot be merged into fewer dispatches because each
+group reads different weight bytes". That is true and it was the wrong measure: the
+cost is not the dispatch, it is the weight BYTES, and those are re-read once per
+POSITION rather than once per BLOCK. The fix is not fewer dispatches — it is a grid
+height of `count` on each of the eight per-group GEMVs, which reads every weight byte
+once per block instead of eight times. `queryUp` shows what that is worth on the same
+table: `wq_b` is 201 MB and already takes a `rows:` height, so it reads 25 MB per
+position and costs 0.097 ms — 258 GB/s of effective weight traffic, 3.5x the
+per-slot path's.
+
+The one thing the batched form needs is a ROW STRIDE on the GEMV kernels: within a
+block the input rows are contiguous at `attentionOutputWidth` stride while a group
+reads `perGroupIn` = 8,192 of those columns, so the kernel has to be told the stride
+rather than deriving it from `inDim`.
+
+**Caveats.** The synthetic weights are BF16; the published checkpoint's attention
+projections are quantised, so the real byte count per position is smaller — at FP8
+`outputDown` would be about 0.93 ms/position, at MXFP4 about 0.47, both still the
+largest term by a wide margin, and the 8x re-read factor is independent of dtype.
+The `hc*Coefficients` rows are each one FP32 GEMV of 24 rows by 28,672 columns, and
+were never measured at these widths before either: 0.74 ms/position between them is
+the second-largest term. They are already batched over the block — the projection
+takes a grid height of `slots` — so their cost is not repeated weight traffic: 2.75 MB
+of weights per block arriving in 0.39 ms is about 1 GB/s, which says the grid, not
+memory, is the limit. `hc_mult` 4 makes the output width 24, so the kernel dispatches
+24 threads and each one walks a 28,672-wide reduction serially. That is the same
+class of defect `#5` fixed in attention: a grid as wide as a small output dimension,
+with the whole reduction in one lane.
+
+Attention reads the window half of its row budget here (no compressed layers in the
+synthetic config), which is why `writeLatent` is 0.249 and the compressed-row half is
+measured separately by `#5`/`#6`. The case takes ~40 s because
+the synthetic blob is 190M values; it is opt-in like the rest. Device time is one
+command buffer per stage, so submission cost is excluded.
+
+Tests: `testWhereABlocksRemainingTimeGoesAtThePublishedWidths` (the table above,
+opt-in, so it is the seventh skipped case in a default run) plus the
+`publishedWidths` shape preset it runs on; every pre-existing case unchanged — 406
+tests, 7 skipped, 0 failures.

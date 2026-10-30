@@ -83,6 +83,68 @@ nonisolated struct DeepSeekV41SyntheticShape {
     var outputReducedWidth: Int { oGroups * oLoraRank }
 }
 
+// MARK: - Published widths
+
+extension DeepSeekV41SyntheticShape {
+
+    /// The checkpoint's own attention and residual geometry at a depth a test can
+    /// hold in memory.
+    ///
+    /// Every figure in `DeepSeekV41PrefillMeasurementTests` used to run on the
+    /// default shape above, which makes its ranking a ranking of a DIFFERENT model:
+    /// two 48-wide heads over a four-row window say nothing about what a block spends
+    /// when there are 128 heads over 640 rows of a 512-wide record.
+    ///
+    /// What this keeps real, and therefore what it may be used to rank:
+    /// - `hidden` 7,168; `head_dim` 512 as 448 nope + 64 rope, so the cache record is
+    ///   the head width, which is what the published config derives when it declares
+    ///   no `kv_lora_rank`; `v_head_dim` 512; 128 heads; `q_lora_rank` 1,536;
+    ///   `o_groups` 8 with `o_lora_rank` 1,024; `hc_mult` 4 with 20 Sinkhorn
+    ///   iterations; and a 640-row window, so the ring hands attention the same
+    ///   `window + index_topk` row count the compressed layers of the checkpoint do.
+    /// - The dense half is the shipped half down to the byte: `wq_a`, `wq_b`, `wo_a`,
+    ///   `wo_b`, the norms and the mHC projections all carry their published widths,
+    ///   so a per-stage number here is a per-stage number for the checkpoint.
+    ///
+    /// What it keeps deliberately cheap, and why that does not spoil the ranking:
+    /// - One layer by default, a 128-token vocabulary, `moe_intermediate_size` 32 and
+    ///   four routed experts taking two. The mixture's arithmetic is not what the
+    ///   stage table ranks (it was batched in DSV4.1 #2, and the expert arena has its
+    ///   own fixtures), and a bigger intermediate size would only add device time
+    ///   that no per-position stage competes with.
+    /// - No compressed layers, no Engram, no DSpark stage and no shared expert: the
+    ///   same exclusions the default shape makes. So attention reads the window half
+    ///   of its row budget only, and the compressed half is measured directly, at the
+    ///   published widths, by
+    ///   `DeepSeekV41PrefillMeasurementTests.testWhatOneAttentionDispatchCostsAtThePublishedWidths`.
+    static func publishedWidths(
+        layers: Int = 1,
+        window: Int = 640,
+        contextLength: Int = 720
+    ) -> DeepSeekV41SyntheticShape {
+        var shape = DeepSeekV41SyntheticShape()
+        shape.hidden = 7_168
+        shape.layers = layers
+        shape.heads = 128
+        shape.headDim = 512
+        shape.ropeHeadDim = 64
+        shape.valueHeadDim = 512
+        shape.kvLoraRank = 448
+        shape.qLoraRank = 1_536
+        shape.oLoraRank = 1_024
+        shape.oGroups = 8
+        shape.vocab = 128
+        shape.moeIntermediate = 32
+        shape.routedExperts = 4
+        shape.activatedExperts = 2
+        shape.window = window
+        shape.hcMult = 4
+        shape.hcIterations = 20
+        shape.contextLength = contextLength
+        return shape
+    }
+}
+
 // MARK: - Tensors
 
 /// One published tensor: its checkpoint name, the slot it resolves to, and the

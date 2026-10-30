@@ -651,4 +651,116 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
             )
         }
     }
+
+    /// The stage table at the widths the checkpoint publishes.
+    ///
+    /// Every case above runs on the two-head default shape, and a ranking taken from
+    /// it is a ranking of a DIFFERENT model. `#5` and `#6` both ended by naming
+    /// `writeLatent` and `outputDown` as the next levers, and both numbers came from
+    /// hidden 64 over a four-row window. This case runs the same stage accounting
+    /// against `DeepSeekV41SyntheticShape.publishedWidths`: 7,168 hidden, 128 heads
+    /// of 512 over a 640-row ring, eight output groups, four hyper-connection copies,
+    /// one layer and a deliberately cheap mixture, so the dense half is the shipped
+    /// half and what it costs per position is the checkpoint's answer rather than a
+    /// toy's.
+    ///
+    /// Self-validation is not repeated here, on purpose and because it cannot be: a
+    /// host reference over 190M weights and a 640-position prompt is not something a
+    /// test can run. The GRAPH is pinned at the default shape by
+    /// `DeepSeekV41DeviceGraphParityTests` — stage by stage, and the chunk seam
+    /// against the walk — and the attention kernel at these widths by
+    /// `testWhatOneAttentionDispatchCostsAtThePublishedWidths`. This case only
+    /// answers where a block's device time goes when the widths are the checkpoint's.
+    func testWhereABlocksRemainingTimeGoesAtThePublishedWidths() throws {
+        let positions = 640
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: .publishedWidths())
+        let runtime = try makeRuntime(checkpoint)
+        let device = runtime.forward()
+        let slots = DeepSeekV41DevicePlan.chunkSlots(
+            config: checkpoint.config,
+            contextLength: checkpoint.shape.contextLength
+        )
+        let shape = checkpoint.shape
+        let tokens = (0..<positions).map { $0 % checkpoint.config.vocabSize }
+        print(
+            String(
+                format: "[dsv41 published] hidden=%d heads=%d head_dim=%d record=%d "
+                    + "window=%d slots=%d layers=%d hcMult=%d",
+                shape.hidden,
+                shape.heads,
+                shape.headDim,
+                shape.latentWidth,
+                shape.window,
+                slots,
+                shape.layers,
+                shape.hcMult
+            )
+        )
+
+        // Two runs, fastest kept: the point is a ranking, and a ranking only needs the
+        // run the machine was not busy during.
+        var fastest: (wall: Double, stages: [String: UInt64], timing: DeepSeekV41BlockTiming)?
+        for _ in 0..<2 {
+            device.reset()
+            device.resetStageTiming()
+            device.resetBlockTiming()
+            device.recordsStageTiming = true
+            device.recordsBlockTiming = true
+            let wall = try milliseconds {
+                _ = try device.prefillChunk(tokens)
+            }
+            device.recordsStageTiming = false
+            device.recordsBlockTiming = false
+            let stages = device.stageTiming
+            XCTAssertFalse(stages.isEmpty, "no stage reported a device window")
+            if fastest == nil || wall < fastest!.wall {
+                fastest = (wall, stages, device.blockTiming)
+            }
+        }
+        let measured = try XCTUnwrap(fastest)
+        XCTAssertGreaterThan(measured.timing.layers, 0, "the switch recorded nothing")
+
+        let per = measured.timing.millisecondsPerPositionLayer()
+        let encoded = per.denseEncode + per.mixtureEncode
+        let deviceTime = per.denseDevice + per.mixtureDevice
+        let denseShare = deviceTime > 0 ? per.denseDevice / deviceTime : 0
+        let total = measured.stages.values.reduce(0, +)
+
+        print(
+            String(
+                format: "[dsv41 published] positions=%d, %.2f ms/position whole block",
+                positions,
+                measured.wall / Double(positions)
+            )
+        )
+        print(
+            String(
+                format: "[dsv41 published] host per position/layer: dense encode %.4f  "
+                    + "front wait %.4f  mixture encode %.4f ms",
+                per.denseEncode,
+                per.wait,
+                per.mixtureEncode
+            )
+        )
+        print(
+            String(
+                format: "[dsv41 published] DEVICE per position/layer: dense %.4f  mixture "
+                    + "%.4f ms (dense holds %.0f%%); encode is %.0f%% of accounted time",
+                per.denseDevice,
+                per.mixtureDevice,
+                denseShare * 100,
+                encoded + per.wait > 0 ? encoded / (encoded + per.wait) * 100 : 0
+            )
+        )
+        for (stage, nanoseconds) in measured.stages.sorted(by: { $0.value > $1.value }) {
+            print(
+                String(
+                    format: "[dsv41 published] %-26@ %8.3f ms/pos  %5.1f%%",
+                    stage as NSString,
+                    Double(nanoseconds) / Double(positions) / 1_000_000,
+                    Double(nanoseconds) / Double(max(1, total)) * 100
+                )
+            )
+        }
+    }
 }
