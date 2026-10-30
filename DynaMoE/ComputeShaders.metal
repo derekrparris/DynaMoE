@@ -8997,6 +8997,17 @@ kernel void dsv41_gather_latents_f16(
 ///
 /// The sink is an extra logit in the denominator with no value row, so a head can
 /// attend to nothing and emit zeros. It is per head and comes from `attn_sink`.
+///
+/// One THREADGROUP per head, `threads_per_threadgroup` lanes wide, because the
+/// shipped shape is the opposite of a wide grid: a compressed layer reads
+/// `window + index_topk` rows (128 + 512 on the published checkpoint) of a 512-wide
+/// record, and the loop over those rows is serial, so a one-thread-per-head grid is
+/// only as wide as the head count and leaves the rest of the die idle while 1.3
+/// million multiply-adds run in a single lane. A thread owns whole rows for the dot
+/// products and every `laneCount`-th output dimension for the accumulation, and the
+/// row scores are kept in threadgroup memory so the three passes share ONE dot
+/// product per row instead of recomputing it. The head's maximum and denominator
+/// are reductions across the threadgroup, kept in the scratch tail of `scores`.
 kernel void dsv41_attention_csa2_f32(
     device const float* queryBuffer [[buffer(0)]],   // [heads * qkHeadDim]
     device const float* keyBuffer [[buffer(1)]],     // [rowCount * width]
@@ -9007,58 +9018,77 @@ kernel void dsv41_attention_csa2_f32(
     constant uint32_t& qkHeadDim [[buffer(6)]],
     constant uint32_t& valueDim [[buffer(7)]],
     constant uint32_t& width [[buffer(8)]],
-    uint headIdx [[thread_position_in_grid]]
+    threadgroup float* scores [[threadgroup(0)]],    // [rowCount + one per SIMD group]
+    uint headIdx [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint laneInSimd [[thread_index_in_simdgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
 ) {
-    if (headIdx >= headCount) return;
+    if (headIdx >= headCount || rowCount == 0) return;
 
     float invSqrt = rsqrt((float)qkHeadDim);
     uint32_t queryBase = headIdx * qkHeadDim;
     uint32_t queryWidth = min(qkHeadDim, width);
+    uint32_t simdCount = (laneCount + 31u) / 32u;
+    threadgroup float* partials = scores + rowCount;
 
-    // Online softmax over the gathered rows, then the sink as a value-free entry.
-    float maxScore = -1e30f;
-    for (uint32_t row = 0; row < rowCount; ++row) {
-        uint64_t keyBase = (uint64_t)row * width;
-        float dot = 0.0f;
-        for (uint32_t dim = 0; dim < queryWidth; ++dim) {
-            dot += queryBuffer[queryBase + dim] * keyBuffer[keyBase + dim];
-        }
-        maxScore = max(maxScore, dot * invSqrt);
-    }
+    // The sink is an extra logit with no value row, so it enters the maximum and
+    // the denominator and contributes nothing to the output.
     float sinkLogit = (sinkBuffer != nullptr) ? sinkBuffer[headIdx] : -1e30f;
-    maxScore = max(maxScore, sinkLogit);
 
-    float denominator = 0.0f;
-    for (uint32_t row = 0; row < rowCount; ++row) {
+    // Pass 1: one row per thread, the whole dot product in that thread. A row is a
+    // contiguous record, so this walks memory forward instead of gathering it.
+    float localMax = -1e30f;
+    for (uint32_t row = lane; row < rowCount; row += laneCount) {
         uint64_t keyBase = (uint64_t)row * width;
         float dot = 0.0f;
         for (uint32_t dim = 0; dim < queryWidth; ++dim) {
             dot += queryBuffer[queryBase + dim] * keyBuffer[keyBase + dim];
         }
-        denominator += exp(dot * invSqrt - maxScore);
+        float score = dot * invSqrt;
+        scores[row] = score;
+        localMax = max(localMax, score);
     }
-    if (sinkBuffer != nullptr) denominator += exp(sinkLogit - maxScore);
+    float warpMax = simd_max(localMax);
+    if (laneInSimd == 0) partials[simdIdx] = warpMax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float maxScore = sinkLogit;
+    for (uint32_t group = 0; group < simdCount; ++group) {
+        maxScore = max(maxScore, partials[group]);
+    }
 
+    // Pass 2: the weights replace the scores in place, so the output pass reads
+    // them and pays for `exp` once.
+    float localSum = 0.0f;
+    for (uint32_t row = lane; row < rowCount; row += laneCount) {
+        float weight = exp(scores[row] - maxScore);
+        scores[row] = weight;
+        localSum += weight;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float warpSum = simd_sum(localSum);
+    if (laneInSimd == 0) partials[simdIdx] = warpSum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float denominator = (sinkBuffer != nullptr) ? exp(sinkLogit - maxScore) : 0.0f;
+    for (uint32_t group = 0; group < simdCount; ++group) {
+        denominator += partials[group];
+    }
     float inverse = denominator > 0.0f ? (1.0f / denominator) : 0.0f;
-    uint32_t valueWidth = min(valueDim, width);
 
-    // Accumulate in a second pass so the weights are normalized by the full set.
+    // Pass 3: one thread per output dimension, so this is an accumulator rather
+    // than a reduction: threads own disjoint dimensions and never collide.
+    uint32_t valueWidth = min(valueDim, width);
     uint32_t outputBase = headIdx * valueDim;
-    for (uint32_t dim = 0; dim < valueWidth; ++dim) {
-        outputBuffer[outputBase + dim] = 0.0f;
-    }
-    for (uint32_t row = 0; row < rowCount; ++row) {
-        uint64_t keyBase = (uint64_t)row * width;
-        float dot = 0.0f;
-        for (uint32_t dim = 0; dim < queryWidth; ++dim) {
-            dot += queryBuffer[queryBase + dim] * keyBuffer[keyBase + dim];
+    for (uint32_t dim = lane; dim < valueWidth; dim += laneCount) {
+        float accumulator = 0.0f;
+        for (uint32_t row = 0; row < rowCount; ++row) {
+            accumulator += scores[row] * keyBuffer[(uint64_t)row * width + dim];
         }
-        float weight = exp(dot * invSqrt - maxScore) * inverse;
-        for (uint32_t dim = 0; dim < valueWidth; ++dim) {
-            outputBuffer[outputBase + dim] += weight * keyBuffer[keyBase + dim];
-        }
+        outputBuffer[outputBase + dim] = accumulator * inverse;
     }
-    for (uint32_t dim = valueWidth; dim < valueDim; ++dim) {
+    // A record narrower than the value head leaves a tail that no row fills.
+    for (uint32_t dim = valueWidth + lane; dim < valueDim; dim += laneCount) {
         outputBuffer[outputBase + dim] = 0.0f;
     }
 }

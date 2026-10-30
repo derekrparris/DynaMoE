@@ -600,6 +600,210 @@ final class DeepSeekV41GatherKernelTests: XCTestCase {
     }
 }
 
+// MARK: - Attention kernel
+
+final class DeepSeekV41AttentionKernelTests: XCTestCase {
+
+    private func makePipeline() throws -> (MTLDevice, MTLComputePipelineState, MTLCommandQueue) {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        guard let library = device.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "dsv41_attention_csa2_f32"),
+              let pipeline = try? device.makeComputePipelineState(function: function),
+              let queue = device.makeCommandQueue() else {
+            XCTFail("Could not build the attention pipeline")
+            throw XCTSkip("no attention pipeline")
+        }
+        return (device, pipeline, queue)
+    }
+
+    private func values(_ count: Int, seed: Int) -> [Float] {
+        (0..<count).map { index in
+            Float((index &* 37 &+ seed &* 13) % 23 - 11) / 8
+        }
+    }
+
+    private func floats(_ buffer: MTLBuffer, count: Int) -> [Float] {
+        Array(UnsafeBufferPointer(
+            start: buffer.contents().assumingMemoryBound(to: Float.self),
+            count: count
+        ))
+    }
+
+    /// The kernel details a head's rows and dimensions to its threadgroup, so the
+    /// head's maximum and denominator are a reduction ACROSS SIMD groups. A row set
+    /// wider than one group is the case that goes wrong if only the first group's
+    /// partial is read, and it is the case the published checkpoint always has: 128
+    /// window rows plus `index_topk` compressed ones against a 128-thread threadgroup.
+    ///
+    /// The value head is also wider than the record here, so the tail that no row
+    /// fills has to be zeroed rather than left over from the last position.
+    func testTheAttentionKernelMatchesTheHostRuleAcrossItsWholeThreadgroup() throws {
+        let (device, pipeline, queue) = try makePipeline()
+
+        let heads = 3
+        let qkHeadDim = 8
+        let vHeadDim = 12
+        let width = 10
+        let rows = 200
+        let shape = DeepSeekV41AttentionShape(
+            numHeads: heads,
+            headsPerGroup: 1,
+            qkHeadDim: qkHeadDim,
+            vHeadDim: vHeadDim,
+            latentWidth: width,
+            qLoraRank: 0,
+            oLoraRank: 0,
+            isCompressed: false,
+            compressRatio: 1,
+            ropeTheta: 10000,
+            rotaryDim: 0
+        )
+        let query = values(heads * qkHeadDim, seed: 1)
+        let keys = values(rows * width, seed: 2)
+        let sink = values(heads, seed: 3)
+
+        guard let queryBuffer = device.makeBuffer(
+                  bytes: query,
+                  length: query.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let keyBuffer = device.makeBuffer(
+                  bytes: keys,
+                  length: keys.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let sinkBuffer = device.makeBuffer(
+                  bytes: sink,
+                  length: sink.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let outputBuffer = device.makeBuffer(
+                  length: heads * vHeadDim * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("Could not allocate the attention buffers")
+            return
+        }
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(queryBuffer, offset: 0, index: 0)
+        encoder.setBuffer(keyBuffer, offset: 0, index: 1)
+        encoder.setBuffer(sinkBuffer, offset: 0, index: 2)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 3)
+        var rowCount = UInt32(rows)
+        var headCount = UInt32(heads)
+        var headWidth = UInt32(qkHeadDim)
+        var headValue = UInt32(vHeadDim)
+        var recordWidth = UInt32(width)
+        encoder.setBytes(&rowCount, length: 4, index: 4)
+        encoder.setBytes(&headCount, length: 4, index: 5)
+        encoder.setBytes(&headWidth, length: 4, index: 6)
+        encoder.setBytes(&headValue, length: 4, index: 7)
+        encoder.setBytes(&recordWidth, length: 4, index: 8)
+        encoder.setThreadgroupMemoryLength(
+            (rows + 32) * MemoryLayout<Float>.stride, index: 0
+        )
+        encoder.dispatchThreadgroups(
+            MTLSize(width: heads, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        var reference = DeepSeekV41AttentionReference.attend(
+            query: query,
+            keys: (0..<rows).map { Array(keys[($0 * width)..<(($0 + 1) * width)]) },
+            shape: shape,
+            sink: sink
+        )
+        // No row fills the two dimensions past the record width, so they are zero by
+        // construction rather than whatever the softmax produced.
+        for head in 0..<heads {
+            for dim in width..<vHeadDim {
+                reference[head * vHeadDim + dim] = 0
+            }
+        }
+
+        let output = floats(outputBuffer, count: heads * vHeadDim)
+        let scale = reference.map(abs).max() ?? 1
+        for index in 0..<output.count {
+            XCTAssertEqual(
+                output[index],
+                reference[index],
+                accuracy: max(scale, 1) * 1e-5,
+                "the attention kernel disagrees with the host rule at \(index)"
+            )
+        }
+    }
+
+    /// A head whose row count is far below its threadgroup width: every idle thread
+    /// must still take part in the reduction, and a softmax over one row is that row.
+    func testASingleRowAttentionIsThatRow() throws {
+        let (device, pipeline, queue) = try makePipeline()
+
+        let heads = 2
+        let qkHeadDim = 4
+        let vHeadDim = 4
+        let width = 4
+        let rows = 1
+        let query: [Float] = [1, 0, 0, 0, 0, 1, 0, 0]
+        let keys: [Float] = [0.5, -0.25, 1.5, -2]
+
+        guard let queryBuffer = device.makeBuffer(
+                  bytes: query,
+                  length: query.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let keyBuffer = device.makeBuffer(
+                  bytes: keys,
+                  length: keys.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let outputBuffer = device.makeBuffer(
+                  length: heads * vHeadDim * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("Could not allocate the attention buffers")
+            return
+        }
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(queryBuffer, offset: 0, index: 0)
+        encoder.setBuffer(keyBuffer, offset: 0, index: 1)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 3)
+        var rowCount = UInt32(rows)
+        var headCount = UInt32(heads)
+        var headWidth = UInt32(qkHeadDim)
+        var headValue = UInt32(vHeadDim)
+        var recordWidth = UInt32(width)
+        encoder.setBytes(&rowCount, length: 4, index: 4)
+        encoder.setBytes(&headCount, length: 4, index: 5)
+        encoder.setBytes(&headWidth, length: 4, index: 6)
+        encoder.setBytes(&headValue, length: 4, index: 7)
+        encoder.setBytes(&recordWidth, length: 4, index: 8)
+        encoder.setThreadgroupMemoryLength(
+            (rows + 32) * MemoryLayout<Float>.stride, index: 0
+        )
+        encoder.dispatchThreadgroups(
+            MTLSize(width: heads, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        // With one row and no sink the softmax is 1, for both heads: the head's own
+        // query only scales the score, and a single weight normalizes away.
+        let output = floats(outputBuffer, count: heads * vHeadDim)
+        for dim in 0..<vHeadDim {
+            XCTAssertEqual(output[dim], keys[dim], accuracy: 1e-6)
+            XCTAssertEqual(output[vHeadDim + dim], keys[dim], accuracy: 1e-6)
+        }
+    }
+}
+
 // MARK: - Router kernel
 
 final class DeepSeekV41RouterKernelTests: XCTestCase {

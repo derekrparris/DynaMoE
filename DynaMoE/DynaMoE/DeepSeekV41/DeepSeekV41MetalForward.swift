@@ -229,6 +229,11 @@ nonisolated public enum DeepSeekV41DevicePlan {
     /// bound; pricing the indexed case off those counts instead allocated ~25×
     /// the buffer this checkpoint needs (16,512 rows for what is really 640) and
     /// made the readiness line misleading.
+    ///
+    /// This bounds the attention as well as the gather: the kernel keeps one score
+    /// per gathered row in threadgroup memory, so a budget past
+    /// `device.maxThreadgroupMemoryLength` / 4 is refused when the first position
+    /// decodes rather than gathered into a buffer nothing can read.
     public static func gatherRowBudget(config: DeepSeekV41Config) -> Int {
         let window = max(1, config.windowSize)
         if config.indexTopK > 0 { return window + config.indexTopK }
@@ -2804,12 +2809,46 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         encoder.setBytes(&qkHeadDim, length: 4, index: 6)
         encoder.setBytes(&valueDim, length: 4, index: 7)
         encoder.setBytes(&width, length: 4, index: 8)
-        encoder.dispatchThreads(
+        // One threadgroup per head, wide enough to fill the die: the row loop is a
+        // serial chain over `window + index_topk` records, so a grid as wide as the
+        // head count leaves most of the GPU idle while one lane per head walks 1.3
+        // million multiply-adds. The scores live in threadgroup memory, one float
+        // per gathered row, which is the same bound the gather buffer already
+        // enforces, plus the tail the threadgroup reduction writes its partials to.
+        let scoreBytes = (
+            (rowCount + Self.attentionReductionSlots) * MemoryLayout<Float>.stride + 15
+        ) & ~15
+        guard scoreBytes <= device.maxThreadgroupMemoryLength else {
+            throw DeepSeekV41EngineError.allocationFailed(
+                "position \(position) reads \(rowCount) rows, whose scores need "
+                    + "\(scoreBytes) bytes of threadgroup memory against a "
+                    + "\(device.maxThreadgroupMemoryLength)-byte limit"
+            )
+        }
+        encoder.setThreadgroupMemoryLength(scoreBytes, index: 0)
+        encoder.dispatchThreadgroups(
             MTLSize(width: shape.numHeads, height: 1, depth: 1),
-            threadsPerThreadgroup: threadgroup(shape.numHeads)
+            threadsPerThreadgroup: MTLSize(
+                width: Self.attentionThreadgroupWidth, height: 1, depth: 1
+            )
         )
         encoder.memoryBarrier(scope: .buffers)
     }
+
+    /// Threads one head's attention runs on.
+    ///
+    /// The kernel gives one thread a whole row for its dot products and strides the
+    /// output dimensions by `threads_per_threadgroup`, so this is the parallelism
+    /// one head gets; the reduction across the threadgroup is what the scratch tail
+    /// of the score block is for. Four SIMD groups is enough to cover a 640-row
+    /// attention's rows and a 512-wide record's dimensions with room to spare,
+    /// without costing a wide threadgroup that a two-head model would idle.
+    private static let attentionThreadgroupWidth = 128
+
+    /// Floats reserved after the score block for the threadgroup reduction, one per
+    /// SIMD group in the widest threadgroup `attentionThreadgroupWidth` could
+    /// become.
+    private static let attentionReductionSlots = 32
 
     // MARK: Feed-forward stages
 

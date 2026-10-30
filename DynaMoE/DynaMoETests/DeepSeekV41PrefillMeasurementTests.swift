@@ -472,4 +472,183 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
             )
         }
     }
+
+    /// What ONE attention dispatch costs at the widths the checkpoint publishes.
+    ///
+    /// Every figure above runs on the synthetic model, and that model's attention
+    /// is two heads over at most a handful of rows: a shape whose cost is the
+    /// dispatch, not the arithmetic. The shipped shape is the opposite. A compressed
+    /// layer reads `window + index_topk` rows — 128 + 512 — and each head walks them
+    /// three times over a 512-wide latent record, so a head is a serial chain of
+    /// about 1.3 million multiply-adds and the whole kernel is as wide as the head
+    /// COUNT. This case times the kernel at that shape, on real Metal, so a change
+    /// to it can be read against the shape that ships rather than against the shape
+    /// a test can afford to build a whole checkpoint around.
+    ///
+    /// Two honesty notes. The dispatch is issued from one command buffer, so this is
+    /// device time and not submission cost: in a block it sits in a buffer with the
+    /// rest of the layer, and the per-dispatch latency there is a separate term the
+    /// block figures above already carry. And the row counts are the row BUDGET, not
+    /// a measured row count for a prompt: a window-only layer reads 128, a compressed
+    /// layer reads up to 640 once its cache has filled, and both are below.
+    func testWhatOneAttentionDispatchCostsAtThePublishedWidths() throws {
+        guard let metal = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal device")
+        }
+        guard let library = metal.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "dsv41_attention_csa2_f32"),
+              let pipeline = try? metal.makeComputePipelineState(function: function),
+              let queue = metal.makeCommandQueue() else {
+            XCTFail("the attention kernel is not in the default library")
+            return
+        }
+
+        // The published text_config: 128 heads, head_dim 512, v_head_dim 512, and a
+        // cache record 512 wide (`kv_lora_rank` is absent, so the record is the head).
+        let heads = 128
+        let qkHeadDim = 512
+        let valueDim = 512
+        let width = 512
+        let shape = DeepSeekV41AttentionShape(
+            numHeads: heads,
+            headsPerGroup: 16,
+            qkHeadDim: qkHeadDim,
+            vHeadDim: valueDim,
+            latentWidth: width,
+            qLoraRank: 1536,
+            oLoraRank: 1024,
+            isCompressed: true,
+            compressRatio: 2,
+            ropeTheta: 160000,
+            rotaryDim: 64
+        )
+
+        func sample(_ count: Int, seed: UInt64) -> [Float] {
+            var state = seed
+            return (0..<count).map { _ in
+                state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+                return Float(Int32(truncatingIfNeeded: state >> 33)) / Float(1 << 30)
+            }
+        }
+
+        let query = sample(heads * qkHeadDim, seed: 1)
+        let sink = sample(heads, seed: 3).map { $0 * 4 }
+
+        func buffer(_ values: [Float]) -> MTLBuffer? {
+            values.withUnsafeBytes { bytes in
+                metal.makeBuffer(
+                    bytes: bytes.baseAddress!,
+                    length: bytes.count,
+                    options: .storageModeShared
+                )
+            }
+        }
+
+        guard let queryBuffer = buffer(query),
+              let sinkBuffer = buffer(sink),
+              let outputBuffer = metal.makeBuffer(
+                  length: heads * valueDim * MemoryLayout<Float>.stride,
+                  options: .storageModeShared
+              ) else {
+            XCTFail("the attention buffers did not allocate")
+            return
+        }
+
+        print("[dsv41 attention] heads=\(heads) qkHeadDim=\(qkHeadDim) width=\(width) sink=on")
+
+        for rows in [128, 136, 640] {
+            let keys = sample(rows * width, seed: UInt64(rows) &+ 7)
+            guard let keyBuffer = buffer(keys) else {
+                XCTFail("the \(rows)-row key block did not allocate")
+                return
+            }
+
+            func encode(_ encoder: MTLComputeCommandEncoder) {
+                encoder.setComputePipelineState(pipeline)
+                encoder.setBuffer(queryBuffer, offset: 0, index: 0)
+                encoder.setBuffer(keyBuffer, offset: 0, index: 1)
+                encoder.setBuffer(sinkBuffer, offset: 0, index: 2)
+                encoder.setBuffer(outputBuffer, offset: 0, index: 3)
+                var rowCount = UInt32(rows)
+                var headCount = UInt32(heads)
+                var headWidth = UInt32(qkHeadDim)
+                var headValue = UInt32(valueDim)
+                var recordWidth = UInt32(width)
+                encoder.setBytes(&rowCount, length: 4, index: 4)
+                encoder.setBytes(&headCount, length: 4, index: 5)
+                encoder.setBytes(&headWidth, length: 4, index: 6)
+                encoder.setBytes(&headValue, length: 4, index: 7)
+                encoder.setBytes(&recordWidth, length: 4, index: 8)
+            }
+
+            // The device window of `repetitions` dispatches, so submission cost is
+            // divided out and what is left is the kernel.
+            let repetitions = rows >= 640 ? 5 : 20
+            var perDispatch = Double.infinity
+            for attempt in 0..<(warmups + repetitions) {
+                guard attempt >= warmups else {
+                    guard let command = queue.makeCommandBuffer(),
+                          let encoder = command.makeComputeCommandEncoder() else { return }
+                    encode(encoder)
+                    encoder.setThreadgroupMemoryLength(
+                        (rows + 32) * MemoryLayout<Float>.stride, index: 0
+                    )
+                    encoder.dispatchThreadgroups(
+                        MTLSize(width: heads, height: 1, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
+                    )
+                    encoder.endEncoding()
+                    command.commit()
+                    command.waitUntilCompleted()
+                    continue
+                }
+                guard let command = queue.makeCommandBuffer(),
+                      let encoder = command.makeComputeCommandEncoder() else { return }
+                encode(encoder)
+                encoder.setThreadgroupMemoryLength((rows + 32) * MemoryLayout<Float>.stride, index: 0)
+                for _ in 0..<repetitions {
+                    encoder.dispatchThreadgroups(
+                        MTLSize(width: heads, height: 1, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
+                    )
+                }
+                encoder.endEncoding()
+                command.commit()
+                command.waitUntilCompleted()
+                let window = command.gpuEndTime - command.gpuStartTime
+                perDispatch = min(perDispatch, window / Double(repetitions) * 1000)
+            }
+
+            // The timing above is only worth reading if it is the same computation
+            // the host performs. Two heads are enough: the reduction, the sink and
+            // the output accumulation are the same code for every head.
+            let output = floats(outputBuffer, count: heads * valueDim)
+            let reference = DeepSeekV41AttentionReference.attend(
+                query: query,
+                keys: (0..<rows).map {
+                    Array(keys[($0 * width)..<(($0 + 1) * width)])
+                },
+                shape: shape,
+                sink: sink
+            )
+            for head in [0, 37] {
+                let range = (head * valueDim)..<((head + 1) * valueDim)
+                let scale = reference[range].map(abs).max() ?? 1
+                XCTAssertLessThan(
+                    worstDelta(Array(output[range]), Array(reference[range])) / max(scale, 1e-6),
+                    1e-4,
+                    "\(rows) rows: head \(head) does not match the host rule"
+                )
+            }
+
+            print(
+                String(
+                    format: "[dsv41 attention] %4d rows  %8.3f ms/dispatch  %8.3f us/head",
+                    rows,
+                    perDispatch,
+                    perDispatch * 1000 / Double(heads)
+                )
+            )
+        }
+    }
 }

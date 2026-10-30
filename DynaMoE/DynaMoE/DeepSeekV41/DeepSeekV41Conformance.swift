@@ -225,12 +225,13 @@ nonisolated public enum DeepSeekV41Conformance {
     ///
     /// The GRAPH around the rule now exists. `DeepSeekV41MetalForward.prefillChunk`
     /// runs a prompt in blocks of `workspace.slots` positions, and each block is one
-    /// pass: the norm, the linear stages and the RoPE dispatches cover every position
-    /// at once (the kernels read the token from `thread_position_in_grid.y`, except
-    /// the norm and embedding kernels, whose index is scalar and therefore X), while
-    /// the stages that cannot batch run per position inside the same command buffer —
-    /// the cache write and the attention that reads it, the mHC coefficients, the
-    /// Engram stage, and the routed mixture.
+    /// pass: the norm, the linear stages, the RoPE, the mHC coefficients, the router
+    /// and the routed mixture cover every position at once (the linear kernels read
+    /// the token from `thread_position_in_grid.y`, the slot-grid ones from the axis
+    /// their own doc names, and the norm and embedding kernels are scalar and
+    /// therefore X), while the stages that cannot batch run per position inside the
+    /// same command buffer — the cache write and the attention that reads it, the mHC
+    /// pre/post mix, the shared expert, and the Engram stage.
     ///
     /// Two bounds decide the shape rather than convenience. The cache is a RING of
     /// `window` rows, so writing position `p + 1` evicts a row a query at `p` still
@@ -255,8 +256,8 @@ nonisolated public enum DeepSeekV41Conformance {
     /// projection splitting its rows twice, and a RoPE batch rotating one row.
     ///
     /// What stays open: no comparison against the checkpoint's own numbers at real
-    /// weights. The pass has been MEASURED three times, and the third measurement is
-    /// what made the remaining reason narrow rather than vague. The first showed a
+    /// weights. The pass has been MEASURED four times, and each measurement narrowed
+    /// the remaining reason. The first showed a
     /// block beating the walk by only 1.0-1.26x with the mixture's per-position round
     /// trip as ~50-60% of a block's per-position cost; batching the mixture into one
     /// submission per layer, with one arena fill for the block's union, took it to
@@ -268,13 +269,24 @@ nonisolated public enum DeepSeekV41Conformance {
     /// Sinkhorn schedule on ONE thread, repeated per position. The mHC pair and the
     /// router now take a slot dimension, so a block runs its positions as grid rows:
     /// that took the pass to ~2.4x at block width 4 and halved the dense half's
-    /// device time again, and left `writeLatent` (cache write, gather, attention) as
-    /// the largest remaining per-position stage. So the graph is no longer the
-    /// question, and neither is the arena: what is left is per-position serial work,
-    /// and above all the fact that none of this has run against real weights. The turn loop already routes a from-position-0 prompt through
+    /// device time again, leaving `writeLatent` (cache write, gather, attention) as
+    /// the largest remaining per-position stage. The fourth measurement left the
+    /// synthetic model entirely and timed THAT stage's kernel at the widths the
+    /// checkpoint publishes, where it is not a dispatch question at all:
+    /// `dsv41_attention_csa2_f32` ran one thread per head, and a head walks
+    /// `window + index_topk` (128 + 512) records three times over a 512-wide latent,
+    /// so one position of one layer cost 68 ms on an idle GPU. The kernel now gives a
+    /// head a whole threadgroup, keeps the row scores in threadgroup memory so the
+    /// three passes share one dot product, and dispatches one thread per row; the
+    /// same dispatch costs 0.47 ms, and the block pass measures 3.1-3.9x at block
+    /// widths 8-16 against 2.1-2.6x before. So the graph is no longer the question,
+    /// neither is the arena, and neither is the attention kernel: what is left is
+    /// per-position serial work in the cache write, the gather and the mHC pre/post
+    /// mix, and above all the fact that none of this has run against real weights.
+    /// The turn loop already routes a from-position-0 prompt through
     /// `DeepSeekV41PositionForward.prefillChunk`, so nothing outside the executor has
     /// to change either way (numbers and caveats in `Benchmarks/PERF_FINDINGS.md`,
-    /// "DSV4.1 #1" to "DSV4.1 #3").
+    /// "DSV4.1 #1" to "DSV4.1 #5").
     public static let batchedDevicePrefill: Gate = .unverified
 
     /// The vision tower's patch grid, image token layout, and the tower forward.
