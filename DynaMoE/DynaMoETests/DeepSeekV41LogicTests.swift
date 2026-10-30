@@ -983,10 +983,14 @@ final class DeepSeekV41ConformanceGateTests: XCTestCase {
         XCTAssertEqual(DeepSeekV41Conformance.hyperConnections, .verifiedAgainstReference)
         XCTAssertEqual(DeepSeekV41Conformance.routerScoring, .verifiedAgainstReference)
         XCTAssertEqual(DeepSeekV41Conformance.visionPatching, .verifiedAgainstReference)
-        // Still transcribed-only: no golden has been generated for these yet.
+        // Still transcribed-only: no golden has been generated for these yet. The
+        // batched device prefill is the third: its addressing rule is verified, but
+        // the multi-position device graph that would consume it cannot be compared
+        // against a walk without real weights.
         XCTAssertEqual(DeepSeekV41Conformance.candidateSelection, .unverified)
         XCTAssertEqual(DeepSeekV41Conformance.dsparkDrafting, .unverified)
-        XCTAssertEqual(DeepSeekV41Conformance.unverifiedSummary.count, 2)
+        XCTAssertEqual(DeepSeekV41Conformance.batchedDevicePrefill, .unverified)
+        XCTAssertEqual(DeepSeekV41Conformance.unverifiedSummary.count, 3)
         XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("Engram hashing"))
         XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("Engram combination"))
         XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("compressor pooling"))
@@ -995,6 +999,7 @@ final class DeepSeekV41ConformanceGateTests: XCTestCase {
         XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("hyper-connections"))
         XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("router scoring"))
         XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("vision patching"))
+        XCTAssertTrue(DeepSeekV41Conformance.unverifiedSummary.contains("batched device prefill"))
     }
 }
 

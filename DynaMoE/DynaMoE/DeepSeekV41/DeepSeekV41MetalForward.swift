@@ -884,6 +884,24 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         return logits
     }
 
+    /// Runs a whole prompt as one chunk.
+    ///
+    /// The workspace holds ONE position: `normed`, `query`, `latent`, the router
+    /// logits and every hyper-connection buffer are single vectors, and the kernels
+    /// that fill them index one position's worth of bytes. There is nothing to widen
+    /// without adding a slot dimension to the workspace and an offset to every stage,
+    /// so this walks the positions and returns the last one's logits. That satisfies
+    /// the chunk contract numerically (the logits are the walk's), and the batching
+    /// the method exists for is `DeepSeekV41Conformance.batchedDevicePrefill`, which
+    /// stays open until there are real weights to compare a batched pass against.
+    public func prefillChunk(_ tokens: [Int]) throws -> DeepSeekV41ChunkLogits {
+        var last: [Float] = []
+        for (position, token) in tokens.enumerated() {
+            last = try forwardToken(token, position: position)
+        }
+        return DeepSeekV41ChunkLogits(last: last)
+    }
+
     // MARK: One position
 
     /// Appends one position and returns its logits.

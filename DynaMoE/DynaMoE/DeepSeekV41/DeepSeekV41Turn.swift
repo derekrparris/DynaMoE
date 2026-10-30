@@ -42,6 +42,8 @@ nonisolated public enum DeepSeekV41TurnError: Error, CustomStringConvertible {
     case emptyPrompt
     /// The block forward refused a position.
     case prefillFailed(position: Int, underlying: String)
+    /// The block forward refused a whole chunk.
+    case prefillChunkFailed(positions: Int, underlying: String)
 
     public var description: String {
         switch self {
@@ -52,6 +54,8 @@ nonisolated public enum DeepSeekV41TurnError: Error, CustomStringConvertible {
             return "⚠️ DeepSeek V4.1 received a prompt that tokenized to 0 tokens."
         case let .prefillFailed(position, underlying):
             return "❌ DeepSeek V4.1 prefill failed at position \(position): \(underlying)"
+        case let .prefillChunkFailed(positions, underlying):
+            return "❌ DeepSeek V4.1 prefill failed on a chunk of \(positions) positions: \(underlying)"
         }
     }
 }
@@ -89,6 +93,15 @@ nonisolated public protocol DeepSeekV41PositionForward: AnyObject {
     func resume(prefixTokenIds: [Int]) throws
     /// Appends one position and returns its logits.
     func forwardToken(_ token: Int, position: Int) throws -> [Float]
+    /// Runs a whole prompt as one chunk and returns the logits after its last
+    /// position.
+    ///
+    /// The reference feeds a prompt to a single `forward` call and only then decodes
+    /// position by position, so a chunk always starts at position 0: the turn loop
+    /// only asks for one when nothing is being resumed. An executor that cannot
+    /// batch answers by walking, which must produce the same logits, so this is a
+    /// performance contract rather than a numeric one.
+    func prefillChunk(_ tokens: [Int]) throws -> DeepSeekV41ChunkLogits
 }
 
 nonisolated public enum DeepSeekV41TurnRunner {
@@ -211,7 +224,12 @@ nonisolated public enum DeepSeekV41TurnRunner {
         let prefillStart = CFAbsoluteTimeGetCurrent()
         let newPositions = promptTokenIds.count - resumeFrom
         var logits: [Float] = []
-        for offset in resumeFrom..<promptTokenIds.count {
+        if resumeFrom == 0 {
+            // A turn from position 0 is a whole prompt, which is the shape the
+            // reference's single forward call takes: hand it over as one chunk so the
+            // executor can batch it instead of paying a full layer pass per token. A
+            // resumed turn keeps the walk, because there is no reference chunk that
+            // starts mid-sequence.
             if isCancelled() {
                 return cancelledOutput(
                     generated: [], text: "", promptTokens: promptTokenIds.count,
@@ -220,14 +238,34 @@ nonisolated public enum DeepSeekV41TurnRunner {
                     decodeSeconds: 0, firstToken: nil
                 )
             }
+            let prompt = promptTokenIds.map { Int($0) }
             do {
-                logits = try forward.forwardToken(Int(promptTokenIds[offset]), position: offset)
+                logits = try forward.prefillChunk(prompt).last
             } catch {
-                throw DeepSeekV41TurnError.prefillFailed(
-                    position: offset, underlying: "\(error)"
+                throw DeepSeekV41TurnError.prefillChunkFailed(
+                    positions: prompt.count, underlying: "\(error)"
                 )
             }
-            onPrefill(offset + 1 - resumeFrom, newPositions)
+            onPrefill(newPositions, newPositions)
+        } else {
+            for offset in resumeFrom..<promptTokenIds.count {
+                if isCancelled() {
+                    return cancelledOutput(
+                        generated: [], text: "", promptTokens: promptTokenIds.count,
+                        prefixTokensReused: resumeFrom,
+                        prefillSeconds: CFAbsoluteTimeGetCurrent() - prefillStart,
+                        decodeSeconds: 0, firstToken: nil
+                    )
+                }
+                do {
+                    logits = try forward.forwardToken(Int(promptTokenIds[offset]), position: offset)
+                } catch {
+                    throw DeepSeekV41TurnError.prefillFailed(
+                        position: offset, underlying: "\(error)"
+                    )
+                }
+                onPrefill(offset + 1 - resumeFrom, newPositions)
+            }
         }
         let prefillSeconds = CFAbsoluteTimeGetCurrent() - prefillStart
 

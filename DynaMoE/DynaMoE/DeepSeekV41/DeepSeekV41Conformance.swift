@@ -205,6 +205,32 @@ nonisolated public enum DeepSeekV41Conformance {
     /// too: the reference defines the drafter but ships no speculative loop.
     public static let dsparkDrafting: Gate = .unverified
 
+    /// Whether a prompt is prefilled as one batched pass on the device.
+    ///
+    /// The RULE a batched pass needs is matched: `chunkAddressing` pins which cache
+    /// rows each query of a chunk reads and which rows a chunk pools, and
+    /// `DeepSeekV41ChunkGoldenTests` carries the reference vectors. What is open is
+    /// the device graph AROUND that rule.
+    ///
+    /// The linear kernels are already there: `dsv41_fp8_block32_gemv`,
+    /// `dsv41_mxfp4_gemv`, `bf16_gemv` and both SwiGLU kernels read the token from
+    /// `thread_position_in_grid.y`, so a batch costs a grid height rather than a new
+    /// kernel. What is missing is everything around them. The down-accumulate pair
+    /// (`dsv41_*_down_accumulate`) addresses one token's activation and accumulator
+    /// with no token index, and the workspace in `DeepSeekV41Engine` holds a single
+    /// position: `normed`, `query`, `latent`, the router logits and every
+    /// hyper-connection buffer are one vector, and each stage binds them at offset 0.
+    /// A batch therefore means a slot dimension on the workspace and a base offset on
+    /// every stage, which no test can check: the local shards are header-only stubs
+    /// and the device forward has never been run, so a batched pass that disagrees
+    /// with the walk would produce different logits at full speed and nothing would
+    /// say which is right.
+    ///
+    /// The turn loop already routes a from-position-0 prompt through
+    /// `DeepSeekV41PositionForward.prefillChunk`, so the swap is confined to the
+    /// executor once there are weights to compare against.
+    public static let batchedDevicePrefill: Gate = .unverified
+
     /// The vision tower's patch grid, image token layout, and the tower forward.
     ///
     /// The GEOMETRY matches `image_processor.py`: the resize plan is
@@ -245,6 +271,7 @@ nonisolated public enum DeepSeekV41Conformance {
             ("candidate selection", candidateSelection),
             ("hyper-connections", hyperConnections),
             ("DSpark drafting", dsparkDrafting),
+            ("batched device prefill", batchedDevicePrefill),
             ("vision patching", visionPatching)
         ]
     }

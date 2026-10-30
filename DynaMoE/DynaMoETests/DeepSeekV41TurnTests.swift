@@ -89,6 +89,21 @@ private final class ScriptedForward: DeepSeekV41PositionForward, @unchecked Send
         // values only need a length the caller can read.
         return [0, 1, 2, 3]
     }
+
+    /// Records that the loop asked for a chunk, and walks it the way the device
+    /// executor does today: the same `forwardToken` path, so a chunk and a walk
+    /// are interchangeable by construction.
+    private(set) var chunkedPrompts: [[Int]] = []
+
+    func prefillChunk(_ tokens: [Int]) throws -> DeepSeekV41ChunkLogits {
+        chunkedPrompts.append(tokens)
+        guard !tokens.isEmpty else { return DeepSeekV41ChunkLogits(last: []) }
+        var last: [Float] = []
+        for (position, token) in tokens.enumerated() {
+            last = try forwardToken(token, position: position)
+        }
+        return DeepSeekV41ChunkLogits(last: last)
+    }
 }
 
 final class DeepSeekV41TurnLoopTests: XCTestCase {
@@ -171,6 +186,46 @@ final class DeepSeekV41TurnLoopTests: XCTestCase {
         XCTAssertEqual(forward.forwardedPositions, [0, 1, 2, 3])
         XCTAssertEqual(forward.forwardedTokens, [10, 11, 7, 7])
         XCTAssertEqual(forward.resetCount, 1)
+    }
+
+    /// A turn from position 0 is handed over as ONE chunk, which is the shape the
+    /// reference's prefill takes and the only one an executor may batch. The chunk
+    /// still answers with the logits of its last position, which is where the first
+    /// draw comes from.
+    func testAWholePromptIsPrefilledAsOneChunk() throws {
+        let forward = ScriptedForward(positionLimit: 64, scripted: [7])
+        var progress: [(Int, Int)] = []
+        let output = try run(
+            forward: forward,
+            prompt: [10, 11, 12],
+            settings: settings(maxTokens: 2),
+            prefill: { progress.append(($0, $1)) }
+        )
+        XCTAssertEqual(forward.chunkedPrompts, [[10, 11, 12]])
+        // Positions 0...2 belong to the chunk; position 3 is the first drawn token
+        // being fed back. The second draw hits the cap before it is forwarded.
+        XCTAssertEqual(forward.forwardedPositions, [0, 1, 2, 3])
+        XCTAssertEqual(output.promptTokens, 3)
+        XCTAssertEqual(progress.count, 1, "a chunk is one progress step, not three")
+        XCTAssertEqual(progress.first?.0, 3)
+        XCTAssertEqual(progress.first?.1, 3)
+    }
+
+    /// A resumed turn keeps the walk. The reference has no chunked form that starts
+    /// mid-sequence, so a prefix skip is never handed over as one.
+    func testAResumedTurnWalksInsteadOfChunking() throws {
+        let forward = ScriptedForward(positionLimit: 64, scripted: [7], resident: [10, 11])
+        let output = try run(
+            forward: forward,
+            prompt: [10, 11, 12],
+            prefixTokens: 2,
+            settings: settings(maxTokens: 1)
+        )
+        XCTAssertEqual(output.prefixTokensReused, 2)
+        XCTAssertTrue(forward.chunkedPrompts.isEmpty)
+        // Position 2 is the one prompt position the cache did not hold; the token
+        // drawn from it hits the cap before it is fed back.
+        XCTAssertEqual(forward.forwardedPositions, [2])
     }
 
     func testAStopSequenceEndsTheTurnAndIsReported() throws {
