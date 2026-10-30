@@ -4186,3 +4186,86 @@ Tests: the batched path is pinned by `DeepSeekV41DeviceGraphParityTests` —
 `testTheDeviceAndTheHostAgreeStageByStage` and
 `testTheChunkSeamReturnsTheWalksLogits` (bit-identical) — and the whole DeepSeek suite
 is green: 406 tests, 7 skipped, 0 failures.
+
+## DSV4.1 #9: THE mHC PROJECTION KEPT ITS REDUCTION IN ONE LANE
+
+**The shape of the defect.** `#7` left the two hyper-connection coefficient
+projections as the largest term of a block's dense half — 0.74 ms/position between
+them, 47% of it — and `dsv41_hc_project_f32` showed why in its dispatch rather than
+its traffic. The projection is `(2 + mult) * mult` logits over the flattened residual
+stack, which at `hc_mult` 4 is 24 logits over `mult * hidden` = 28,672 values per
+position. It ran one THREAD per logit, and each thread walked that reduction twice:
+once for the RMS statistic and once for the dot product. So a position was 24 lanes,
+against 2.75 MB of weight rows to read, and the block already handed it a grid height
+of `slots` — the parallelism that was missing was inside the reduction, not across
+positions.
+
+**The change.** One THREADGROUP per (slot, logit). Lanes stride the reduction,
+accumulate both operands in ONE pass over the stream, `simd_sum` in each warp, and the
+partials meet in threadgroup memory for a serial finish by lane 0. The grid is flat
+(`mixCount * slots` threadgroups, row-major) because a kernel's built-in position
+attributes are either all scalar or all vector, and the lane indices are scalars — a
+`uint2` threadgroup position next to a `uint` thread id does not compile.
+
+**The kernel alone** (`testWhatOneHyperConnectionProjectionCostsAtThePublishedWidths`,
+2.75 MB of weights over 8 slots, one command buffer, best of 20, self-checking three
+logits against the host rule before it prints):
+
+| threadgroup | ms/dispatch | ms/position |
+|---:|---:|---:|
+| 24 (one thread per logit) | 2.253 | 0.282 |
+| 32 | 0.188 | 0.023 |
+| 64 | 0.088 | 0.011 |
+| 128 | 0.045 | 0.006 |
+| **256** | **0.031** | **0.004** |
+| 512 | 0.034 | 0.004 |
+
+73x on the dispatch at 256 threads, which is what the checkpoint's shape affords:
+28,672 values over 256 lanes is 112 each, and the accumulators are two floats, so the
+width costs nothing until the threadgroup outgrows the reduction. 512 is 10% worse and
+250 wider for no gain.
+
+**What it did to the table** (published widths, `#7`'s case, same machine):
+
+| stage | `#8` | now |
+|---|---:|---:|
+| `hcAttentionCoefficients` | 0.393 | 0.011 |
+| `hcFFNCoefficients` | 0.350 | 0.012 |
+| dense device, ms/position | 1.581 | 0.775 |
+| whole block, ms/position | 1.57 | 1.22 |
+
+The dense half of a block is now 2.04x cheaper than before this slice, and the whole
+block — dense plus a mixture that is deliberately tiny in the synthetic model — is
+1.22 ms/position against 3.22 two slices ago.
+
+**The table it leaves** (ms/position): `writeLatent` 0.246 (30.3%), `outputDown` 0.213
+(26.1%), `queryUp` 0.096 (11.8%), `outputUp` 0.078 (9.7%), the calibration buffer
+0.038, `router`/`queryDown`/`latentProject` 0.024 each, then everything else at or
+under the floor. Note the calibration row: it is a buffer of eight no-op dispatches and
+it read 0.001 before this slice and 0.038 after, which is what a per-stage layout costs
+in submission latency once the work around it is gone. Anything at or below that row in
+this table is the instrument, not the stage.
+
+**What is left, and it is all one defect.** `outputDown` (0.213) now reads its 134 MB
+of weights once per block, which is right, but at 79 GB/s it is still three times off
+what `queryUp` gets from the same kind of traffic (262 GB/s at 0.096 ms/position over a
+201 MB matrix). Both are single-thread-per-output-row GEMVs whose reduction runs in one
+lane, which is exactly what this slice fixed in the mHC projection — `wq_b` is 65,536
+output rows over a 1,536-wide reduction, so its lanes are the output and the serial part
+is short, while `wo_a`'s bands are 1,024 rows over 8,192, where it is not. Widening the
+GEMV reduction is therefore the next slice, and it touches `bf16_gemv` — which the
+generic engine path also uses — rather than a DeepSeek-only kernel.
+
+**Caveats.** Same as `#7`/`#8`: BF16 synthetic weights (the checkpoint's attention
+projections are quantised, so the real mixture of costs differs while the ranking holds),
+no compressed layers so attention reads the window half of its row budget, one layer, and
+the mixture's 0.417 ms/position is dispatch overhead rather than expert arithmetic because
+the synthetic intermediate is 32. Device time is one command buffer per stage. The case is
+opt-in and takes ~40 s.
+
+Tests: `testWhatOneHyperConnectionProjectionCostsAtThePublishedWidths` (the kernel table
+above, opt-in) and the three direct kernel dispatches of `dsv41_hc_project_f32` in
+`DeepSeekV41HyperConnectionKernelTests` / `DeepSeekV41DeviceParityTests` now dispatch
+threadgroups with 256 threads and the reduction scratch. Whole DeepSeek suite: 407
+tests, 8 skipped, 0 failures — including `testTheDeviceAndTheHostAgreeStageByStage` and
+the bit-identical chunk seam, so the reordered reduction produces the same coefficients.

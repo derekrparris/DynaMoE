@@ -1472,9 +1472,10 @@ final class DeepSeekV41HyperConnectionKernelTests: XCTestCase {
         encoder.setBytes(&widthDimension, length: 4, index: 5)
         encoder.setBytes(&outDimension, length: 4, index: 6)
         encoder.setBytes(&slotCount, length: 4, index: 7)
-        encoder.dispatchThreads(
+        encoder.setThreadgroupMemoryLength(64 * MemoryLayout<Float>.stride, index: 0)
+        encoder.dispatchThreadgroups(
             MTLSize(width: mixCount, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1)
         )
         encoder.memoryBarrier(scope: .buffers)
 

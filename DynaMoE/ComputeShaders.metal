@@ -8770,25 +8770,54 @@ kernel void dsv41_hc_project_f32(
     constant uint32_t& width [[buffer(5)]],
     constant uint32_t& outDim [[buffer(6)]],
     constant uint32_t& slotCount [[buffer(7)]],
-    uint2 position [[thread_position_in_grid]]
+    threadgroup float* partials [[threadgroup(0)]],  // [32] squares, then [32] dots
+    // The grid is flat because the built-in attributes of a kernel are either all
+    // scalar or all vector, and the lane indices below are scalars.
+    uint groupIdx [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint laneInSimd [[thread_index_in_simdgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
 ) {
-    uint row = position.x;
-    uint slot = position.y;
-    if (row >= outDim || width == 0 || slot >= slotCount) return;
+    if (outDim == 0 || width == 0) return;
+    uint row = groupIdx % outDim;
+    uint slot = groupIdx / outDim;
+    if (slot >= slotCount) return;
     device const float* wPtr = (device const float*)(rawWeightBuffer + weightOffset)
         + (uint64_t)row * width;
-    // Every per-slot vector is `stride` wide, so the slot is an offset rather than a
+    // Every per-slot vector is `width` wide, so the slot is an offset rather than a
     // separate binding.
     device const float* stream = streamBuffer + (uint64_t)slot * width;
     device float* logits = logitsBuffer + (uint64_t)slot * outDim;
 
+    // One pass over the stream for both operands: the RMS statistic and the dot
+    // product want the same values, and the reduction is what there is to
+    // parallelize — the row count is `(2 + mult) * mult`, 24 on the published
+    // checkpoint, so a thread per row left every position on one warp.
     float sumSquares = 0.0f;
-    for (uint32_t i = 0; i < width; ++i) sumSquares += stream[i] * stream[i];
-    float rstd = rsqrt(sumSquares / (float)width + normEpsilon);
-
     float total = 0.0f;
-    for (uint32_t i = 0; i < width; ++i) total += wPtr[i] * stream[i];
-    logits[row] = total * rstd;
+    for (uint32_t i = lane; i < width; i += laneCount) {
+        float value = stream[i];
+        sumSquares += value * value;
+        total += wPtr[i] * value;
+    }
+    float warpSquares = simd_sum(sumSquares);
+    float warpTotal = simd_sum(total);
+    if (laneInSimd == 0) {
+        partials[simdIdx] = warpSquares;
+        partials[32 + simdIdx] = warpTotal;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        uint32_t simdCount = (laneCount + 31u) / 32u;
+        float squares = 0.0f;
+        float sum = 0.0f;
+        for (uint32_t group = 0; group < simdCount; ++group) {
+            squares += partials[group];
+            sum += partials[32 + group];
+        }
+        logits[row] = sum * rsqrt(squares / (float)width + normEpsilon);
+    }
 }
 
 /// MSL Kernel: the mHC split — `(2 + mult) * mult` logits to `pre`, `post` and

@@ -763,4 +763,159 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
             )
         }
     }
+
+    /// What one mHC coefficient projection costs at the published widths.
+    ///
+    /// `testWhereABlocksRemainingTimeGoesAtThePublishedWidths` leaves the two
+    /// hyper-connection projections as the largest term of a block's dense half, at
+    /// 0.74 ms/position between them. The cause is visible in the dispatch rather than
+    /// the traffic: `(2 + mult) * mult` is 24 at `hc_mult` 4, so the kernel runs 24
+    /// threads per position and each one walks a `mult * hidden` = 28,672-wide
+    /// reduction twice, once for the RMS statistic and once for the dot product. That
+    /// is one warp-ish per position against 2.75 MB of weight rows.
+    ///
+    /// This times it alone, at that geometry, and checks a few logits against the host
+    /// rule before printing, so the number is never reported for a different
+    /// computation.
+    func testWhatOneHyperConnectionProjectionCostsAtThePublishedWidths() throws {
+        guard let metal = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal device")
+        }
+        guard let library = metal.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "dsv41_hc_project_f32"),
+              let pipeline = try? metal.makeComputePipelineState(function: function),
+              let queue = metal.makeCommandQueue() else {
+            XCTFail("the mHC projection kernel is not in the default library")
+            return
+        }
+
+        // The published geometry: hidden 7,168 with four hyper-connection copies, so
+        // the flattened stack is 28,672 wide and the projection has 24 output rows.
+        let mult = 4
+        let hidden = 7_168
+        let width = mult * hidden
+        let outDim = (2 + mult) * mult
+        // The ceiling `chunkSlots` applies: eight positions per block.
+        let slots = 8
+        let epsilon: Float = 1e-6
+
+        func sample(_ count: Int, seed: UInt64) -> [Float] {
+            var state = seed
+            return (0..<count).map { _ in
+                state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+                return Float(Int32(truncatingIfNeeded: state >> 33)) / Float(1 << 30)
+            }
+        }
+        func buffer(_ values: [Float]) -> MTLBuffer? {
+            values.withUnsafeBytes { bytes in
+                metal.makeBuffer(
+                    bytes: bytes.baseAddress!, length: bytes.count, options: .storageModeShared
+                )
+            }
+        }
+
+        let weights = sample(outDim * width, seed: 11)
+        let stream = sample(slots * width, seed: 12)
+        guard let weightBuffer = buffer(weights),
+              let streamBuffer = buffer(stream),
+              let logitsBuffer = metal.makeBuffer(
+                  length: slots * outDim * MemoryLayout<Float>.stride,
+                  options: .storageModeShared
+              ) else {
+            XCTFail("the mHC projection buffers did not allocate")
+            return
+        }
+        print(
+            "[dsv41 hc] width=\(width) outDim=\(outDim) slots=\(slots) "
+                + "weights=\(weights.count * 4 / 1_048_576) MB"
+        )
+
+        func encode(_ encoder: MTLComputeCommandEncoder) {
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(weightBuffer, offset: 0, index: 0)
+            encoder.setBuffer(streamBuffer, offset: 0, index: 1)
+            encoder.setBuffer(logitsBuffer, offset: 0, index: 2)
+            var weightOffset = UInt64(0)
+            var normEpsilon = epsilon
+            var w = UInt32(width)
+            var out = UInt32(outDim)
+            var slotCount = UInt32(slots)
+            encoder.setBytes(&weightOffset, length: 8, index: 3)
+            encoder.setBytes(&normEpsilon, length: 4, index: 4)
+            encoder.setBytes(&w, length: 4, index: 5)
+            encoder.setBytes(&out, length: 4, index: 6)
+            encoder.setBytes(&slotCount, length: 4, index: 7)
+        }
+        func dispatch(_ encoder: MTLComputeCommandEncoder, threads: Int) {
+            encoder.setThreadgroupMemoryLength(64 * MemoryLayout<Float>.stride, index: 0)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: outDim * slots, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1)
+            )
+        }
+
+        let repetitions = 20
+        var timings: [(threads: Int, perDispatch: Double)] = []
+        for threads in [32, 64, 128, 256, 512] {
+            var perDispatch = Double.infinity
+            for attempt in 0..<(warmups + repetitions) {
+                guard attempt >= warmups else {
+                    guard let command = queue.makeCommandBuffer(),
+                          let encoder = command.makeComputeCommandEncoder() else { return }
+                    encode(encoder)
+                    dispatch(encoder, threads: threads)
+                    encoder.endEncoding()
+                    command.commit()
+                    command.waitUntilCompleted()
+                    continue
+                }
+                guard let command = queue.makeCommandBuffer(),
+                      let encoder = command.makeComputeCommandEncoder() else { return }
+                encode(encoder)
+                for _ in 0..<repetitions {
+                    dispatch(encoder, threads: threads)
+                }
+                encoder.endEncoding()
+                command.commit()
+                command.waitUntilCompleted()
+                let window = command.gpuEndTime - command.gpuStartTime
+                perDispatch = min(perDispatch, window / Double(repetitions) * 1000)
+            }
+            timings.append((threads, perDispatch))
+        }
+
+        // The host rule, for one slot: `rstd` of the flattened stack times the dot of
+        // one weight row with it. Two rows are enough to catch a broken reduction.
+        let logits = floats(logitsBuffer, count: slots * outDim)
+        let slot = 0
+        let stack = Array(stream[(slot * width)..<((slot + 1) * width)])
+        let sumSquares = stack.reduce(0) { $0 + $1 * $1 }
+        let rstd = 1 / (sumSquares / Float(width) + epsilon).squareRoot()
+        for row in [0, 7, 23] {
+            let weightRow = Array(weights[(row * width)..<((row + 1) * width)])
+            var dot: Float = 0
+            for index in 0..<width { dot += weightRow[index] * stack[index] }
+            let expected = dot * rstd
+            let actual = logits[slot * outDim + row]
+            let scale = max(abs(expected), 1e-3)
+            XCTAssertLessThan(
+                abs(actual - expected) / scale,
+                2e-3,
+                "row \(row) disagrees with the host rule"
+            )
+        }
+
+        for (threads, perDispatch) in timings {
+            print(
+                String(
+                    format: "[dsv41 hc] %4d threads  %8.3f ms/dispatch  %8.3f ms/position "
+                        + "over %d slots",
+                    threads,
+                    perDispatch,
+                    perDispatch / Double(slots),
+                    slots
+                )
+            )
+        }
+    }
 }

@@ -2849,6 +2849,18 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// become.
     private static let attentionReductionSlots = 32
 
+    /// Threads the mHC coefficient projection's reduction runs on.
+    ///
+    /// The kernel gives a threadgroup one (slot, logit) pair and strides the
+    /// `mult * hidden` reduction across its lanes, so this is the parallelism one
+    /// logit gets. The published reduction is 28,672 wide, which leaves every lane
+    /// eight values at 256 threads, and the accumulators are two floats.
+    private static let hyperConnectionThreadgroupWidth = 256
+
+    /// Partials the mHC projection's reduction writes: one slot per SIMD group, for
+    /// the squares and for the dot product.
+    private static let hyperConnectionReductionSlots = 32
+
     // MARK: Feed-forward stages
 
     private func encodeSharedExpert(
@@ -3502,9 +3514,18 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         encoder.setBytes(&width, length: 4, index: 5)
         encoder.setBytes(&outDim, length: 4, index: 6)
         encoder.setBytes(&slotCount, length: 4, index: 7)
-        encoder.dispatchThreads(
-            MTLSize(width: mixCount, height: slots, depth: 1),
-            threadsPerThreadgroup: threadgroup(mixCount)
+        // One threadgroup per (slot, logit), because the reduction is the work: the
+        // output is only `(2 + mult) * mult` rows, so a thread per row left each
+        // position on a single warp while it walked `mult * hidden` values twice
+        // (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #9").
+        encoder.setThreadgroupMemoryLength(
+            Self.hyperConnectionReductionSlots * 2 * MemoryLayout<Float>.stride, index: 0
+        )
+        encoder.dispatchThreadgroups(
+            MTLSize(width: mixCount * slots, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: Self.hyperConnectionThreadgroupWidth, height: 1, depth: 1
+            )
         )
         encoder.memoryBarrier(scope: .buffers)
 
