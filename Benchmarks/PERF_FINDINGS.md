@@ -4383,3 +4383,61 @@ row strides, against a host block-diagonal product). Whole DeepSeek suite: 410 t
 skipped, 0 failures — including `testTheDeviceAndTheHostAgreeStageByStage` and the
 bit-identical chunk seam, so the stages that moved to the second kernel produce the same
 logits.
+
+## DSV4.1 #11: ONE GRID FOR EVERY BAND DID NOT BUY ANYTHING
+
+`#10` left `outputDown` at 0.145 ms/position in a table whose calibration row — eight
+no-op dispatches — was 0.040. The projection is eight band dispatches of `attn.wo_a`, so
+the obvious next move was to collapse them: `bf16_gemv_rows` already derives the row and
+the token from a flat index, so a third term (`band = withinToken / rowCount`) makes the
+whole block-diagonal projection one grid, and eight launches become one. It was
+implemented, self-validated against the host block-diagonal product, measured, and
+**reverted**.
+
+**What it measured.** Isolated, published shapes, one block of eight positions:
+
+| form | ms/position | weight traffic |
+|---|---:|---:|
+| eight wide-grid dispatches, one per band | **0.0133** | 158 GB/s |
+| one grid over all eight bands | 0.0172 | 123 GB/s |
+
+The single grid is 29% SLOWER. At a batch height of one it is the other way round and by
+more: 0.0518 against **0.0231**, 2.24x better, because eight launches of 1,024
+threadgroups each cannot overlap their ramp with each other the way one 8,192-threadgroup
+grid can. So the form is a trade, block against decode — and blocks are what this table
+ranks.
+
+**What it did not measure.** In place, in the published-widths table, the projection went
+from 0.145 to **0.146 ms/position** and the whole block stayed at 1.12. Eight launches
+collapsed into one and nothing moved. That is the finding worth keeping: `outputDown`'s
+0.145 is not launch count.
+
+**Which means the calibration row is not a floor you can subtract.** It reads 0.040 for
+eight dispatches that do nothing, and the tempting arithmetic is "eight launches cost
+0.040, so collapsing them saves a third of the stage". A stage with real work hides its
+launches under that work. The calibration row prices the per-stage command-buffer layout
+for a stage that has no work to overlap with, and nothing else.
+
+**What the stage is actually made of.** The same projection reads 16.8 MB of weights and
+costs 0.0133 isolated against 0.145 in place — a factor of eleven that neither kernel form
+touches. The whole dense half of a block moves 286 MB in 5.39 ms, which is 53 GB/s, while
+the isolated kernels reach 150-300 GB/s on the same bytes. Whatever that gap is — cold
+weights, DRAM latency rather than bandwidth, the shared-storage buffer being read through
+the same path as its writes — it is not the dispatch shape, and it is bigger than every
+remaining dispatch-level item in the table combined.
+
+**Caveats.** Same warnings as `#10`: the isolated numbers are cache-warm (20 dispatches
+over one weight in one command buffer) and are not additive into the block table; the
+synthetic weights are BF16; the mixture is fake. The banded form's grid was
+self-validated before it was timed, so neither number is measuring the wrong computation.
+
+**What this closes.** "Collapse the eight band launches" is off the remaining-work list,
+and with it the idea that the calibration row is recoverable time. `#10`'s eight-band loop
+is what ships. What is left in the dense half is `writeLatent` 0.246 (34.4%, still the
+ring's serialization) and the eleven-fold gap between isolated and in-place projection
+cost, which needs a measurement of its own before it needs a change.
+
+Tests: unchanged from `#10` — the experiment touched `bf16_gemv_rows`,
+`encodeBlockDiagonalProjection` and two test files, and all four were reverted with
+`git checkout --`; only this entry is committed. Whole DeepSeek suite: 410 tests, 9
+skipped, 0 failures.
