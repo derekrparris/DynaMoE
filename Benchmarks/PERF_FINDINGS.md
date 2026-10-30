@@ -3502,3 +3502,78 @@ larger than any other path on the machine. New coverage:
 `testCapacityMessageNamesACappedReserve`,
 `testCapacityMessageRendersUnboundedCapacityAndChatRemedy`, and the server test
 now builds its message through the real builder.
+
+## DSV4.1 #1: BLOCK PREFILL VS THE WALK (MEASURED, NOT YET WORTH BATCHING MORE)
+
+**Why this entry exists before any more work on the path.** `prefillChunk` now
+runs a prompt as blocks of positions: the dense stages (norms, linears, rope)
+dispatch once over the whole block, while the cache write, the attention that
+reads it, the mHC coefficients, the Engram rows and the routed mixture stay per
+position. That is a claim about cost. This journal already records
+optimizations shipped on the strength of such a claim and reverted once
+somebody measured them (Fix #6a, Fix #7), so the claim got a number first.
+
+**Setup.** `DeepSeekV41SyntheticCheckpoint` is the only runnable model in the
+repo — the local DeepSeek-V4.1 shards are 14 MB header-only stubs of a ~510 GB
+checkpoint, so nothing runs at published widths. Synthetic shape: hidden 64,
+head_dim 48, 2 layers, 2 heads in 2 output groups, 4 routed experts taking 2,
+no compressed layers, no Engram tables, FP16 KV cache. Prompt 32 positions,
+best of 3 runs after 1 warmup, one `reset()` per run. Machine: **M5 Max, 128 GB,
+macOS 27.2** (not the M1 Pro the budgets are tuned for). Reproduce with:
+
+```bash
+touch /tmp/dynamoe_dsv41_prefill_measure
+xcodebuild test-without-building -project DynaMoE.xcodeproj -scheme DynaMoE \
+  -destination 'platform=macOS,arch=arm64' -parallel-testing-enabled NO \
+  -only-testing:DynaMoETests/DeepSeekV41PrefillMeasurementTests
+```
+
+| window | slots | walk ms | chunk ms | speedup | walk ms/pos | chunk ms/pos |
+|-------:|------:|--------:|---------:|--------:|------------:|-------------:|
+| 2 | 2 | 31.10 | 24.72 | 1.26x | 0.972 | 0.773 |
+| 4 | 4 | 21.17 | 21.20 | 1.00x | 0.662 | 0.663 |
+| 8 | 8 | 23.46 | 21.27 | 1.10x | 0.733 | 0.665 |
+| 16 | 8 | 25.91 | 25.11 | 1.03x | 0.810 | 0.785 |
+
+(An earlier run of the same build gave 1.41x / 1.05x / 1.10x / 1.08x, so
+anything under ~1.15x is inside this harness's noise.)
+
+**Attribution.** A block costs 0.346 ms/position at one layer and 0.680 at two:
+**0.334 ms per position per layer**, linear in the layer count. A block of one
+position costs 0.934 ms, which is two layers of that plus the embedding block
+and the head. Scaling with layers means the cost is work the block still does
+per position; the block's fixed cost is gone. What remains per position per
+layer is one command buffer, one submission and one `waitUntilCompleted` for
+the expert arena — the mixture cannot batch because `ensureResident` may only
+refill a slot after the kernels reading it have finished
+(`DeepSeekV41MetalForward.runBlockLayer`).
+
+**Conclusion.** The dense batching is real but small at these widths: it removes
+dispatches that were never the floor. **The floor is the per-position mixture
+round trip**, roughly 85% of a block's per-position time. On a checkpoint whose
+arithmetic is 7,168-wide that round trip is a smaller share, so the real
+speedup at published widths is *larger* than these numbers and still not
+knowable here. Two honest consequences:
+
+- Do not flip the `batchedDevicePrefill` conformance gate on the strength of
+  this: it is port-against-port parity, not a number from real weights.
+- The next lever on this path is batching the **mixture** — an arena that holds
+  a block's expert union (or deduplicates residency across the block's
+  routings), so one submission covers the block instead of one per position.
+  That is an arena-size and streaming question, not a wider grid, and it is
+  worth ~0.33 ms/position/layer here before any real weights are involved.
+
+**Caveats worth keeping in mind.** The walk pays a per-position logits readback
+(`forwardToken` finishes a block of one each time) and the chunk reads logits
+only at the end; that difference is part of the measured win and is included
+rather than netted out. Varying the window changes the ring, so a row's
+walk-vs-chunk ratio is the only comparison valid within this table. The
+synthetic model has no compressed layers, no Engram and no DSpark stages, so
+none of their per-position costs are in these numbers.
+
+Tests: `DeepSeekV41PrefillMeasurementTests` (three opt-in cases: the width
+sweep, the per-layer attribution, and block-of-one versus block-of-N). They
+skip unless `/tmp/dynamoe_dsv41_prefill_measure` exists or
+`DYNAMOE_DSV41_PREFILL_MEASURE=1`, because `xcodebuild` does not forward the
+shell environment into an app-hosted test, and they assert only the correctness
+invariant (the block returns the walk's logits) rather than a timing threshold.

@@ -251,8 +251,16 @@ nonisolated public enum DeepSeekV41Conformance {
     /// projection splitting its rows twice, and a RoPE batch rotating one row.
     ///
     /// What stays open: no comparison against the checkpoint's own numbers at real
-    /// weights, and no measurement of what the pass is worth on real weights. The turn
-    /// loop already routes a from-position-0 prompt through
+    /// weights. And the pass has now been MEASURED, which is why the gate is not
+    /// closer to closing than parity makes it look: on the synthetic model a block
+    /// beats the walk by only 1.0-1.26x, and a block's cost scales linearly with the
+    /// layer count at ~0.33 ms/position/layer, because the one thing that still costs
+    /// a full round trip per position is the mixture's single `waitUntilCompleted`
+    /// for the arena. The dense batching removed dispatches that were never the
+    /// floor; batching the mixture is the next lever, and it is an arena question
+    /// rather than a grid question (numbers and caveats in
+    /// `Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #1"). The turn loop already routes a
+    /// from-position-0 prompt through
     /// `DeepSeekV41PositionForward.prefillChunk`, so nothing outside the executor has
     /// to change either way.
     public static let batchedDevicePrefill: Gate = .unverified
