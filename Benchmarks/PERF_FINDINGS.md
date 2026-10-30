@@ -3960,3 +3960,78 @@ below the threadgroup width), `DeepSeekV41DeviceGraphParityTests.testTheChunkSea
 (bit-identical logits from the batched path) and
 `testTheDeviceAndTheHostAgreeStageByStage`. Full DeepSeek suite: 405 tests, 6
 skipped, 0 failures.
+
+## DSV4.1 #6: SHARING A GATHERED ROW ACROSS HEADS MADE ATTENTION SLOWER
+
+**The idea, and why it looked free.** `#5` left the attention kernel with one
+threadgroup per head and recorded, as its remaining headroom, "how many heads share
+a loaded row". The rows are there to be shared: `workspace.gathered` is ONE dense
+block that every head reads, so at the published geometry a dispatch reads 640 rows
+of 512 floats — 1.3 MB of distinct rows — once per head, 168 MB in total. A
+threadgroup carrying `g` heads, with one thread holding `g` dot products through a
+single pass over the row and `g` accumulators through a single pass over a value
+dimension, divides that traffic by `g` and leaves the arithmetic per head identical
+(it still sums over dimensions in order, so the result is bit-identical).
+
+That was implemented, measured at the same published geometry as `#5`, and
+reverted. The measurement is below because the premise — that those 168 MB are
+memory traffic worth removing — is the part that turned out to be wrong, and the
+next person to read "how many heads share a loaded row" should know that.
+
+**What it cost** (same case as `#5`: one command buffer, `gpuStartTime`/
+`gpuEndTime`, best of 5-20 dispatches, M5 Max 128 GB macOS 27.2; `G` is the heads
+per threadgroup, and the register depth is how wide the unrolled accumulator loop
+compiles):
+
+| rows | shipped `#5` kernel | rewrite, G=1, depth 8 | rewrite, G=1, depth 2 | rewrite, G=2, depth 2 | rewrite, G=4, depth 8 |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 0.092-0.095 | 0.240 | 0.117 | 0.137 | 0.292 |
+| 136 | 0.120-0.124 | 0.348 | 0.158 | 0.187 | 0.428 |
+| 640 | 0.453-0.466 | 1.189 | 0.755 | 0.683 | 1.455 |
+
+Two things are in there, and the second is the interesting one.
+
+**The register state cost 2.5x before the group did anything.** The first rewrite
+carried a fixed eight-deep unrolled accumulator loop (so the per-head accumulators
+stay in registers rather than local memory), and `G=1` — the shipped behavior — came
+out 2.5x SLOWER than the kernel it replaced: 0.240 ms at 128 rows against 0.095,
+1.189 at 640 against 0.466. Eight live accumulators, eight maximums, eight
+denominators and eight inverses per thread is a register bill that costs resident
+threads, and attention at this shape is latency-bound enough that occupancy shows up
+directly. Narrowing the unroll to two brought `G=1` back to 0.117 / 0.158 / 0.755,
+still slower than shipped because a two-wide predicated inner loop does two loads
+and two multiply-adds per dimension where the shipped kernel does one.
+
+**The traffic did not matter.** After paying that overhead, `G=2` at the narrowed
+depth was 17% WORSE at 128 rows (0.137 against 0.117) and only 10% better at 640
+(0.683 against 0.755). Halving the record traffic moved the 640-row time by 10%,
+which is the answer: those 168 MB were never DRAM traffic, they were served from the
+cache hierarchy, so removing half of them bought a tenth of the kernel. The group
+also divides the threadgroup COUNT by `g` — 64 threadgroups at `G=2` — and that
+costs occupancy at exactly the widths where the kernel was already fast.
+
+A kernel templated on a compile-time group width would remove the predication and
+project to about 0.41 ms at 640 rows (9% better than shipped) and 0.111 ms at 128
+(17% worse), for the price of template entry points, more than one pipeline and a
+dispatch-side choice. Nine percent on the worst row count against seventeen on the
+common one is not a trade worth a second kernel, so the rewrite was reverted and
+the shipped kernel stands.
+
+**What this closes.** The "share a loaded row" branch of the `#5` follow-up. The
+remaining per-position cost of a block is the ring-interleaved `writeLatent` (cache
+write + pool + gather + attention, 0.041 ms/position), which cannot be batched
+without a staging copy of the block's own rows or a wider ring, and `outputDown`
+(0.026), whose eight head-group projections cannot be merged into fewer dispatches
+because each group reads different weight bytes. Neither is a traffic problem of the
+kind measured here.
+
+**Caveats.** The numbers come from the rewrite, which is no longer in the tree: the
+published-geometry case in the tree measures the shipped kernel, and reproducing a
+`G` row of the table means re-applying the change. Same instrument caveats as `#5`:
+device time from one command buffer, so submission latency is excluded, and the
+machine was contended during part of the run.
+
+Tests: unchanged from `#5` — 405 tests, 6 skipped, 0 failures. The rewrite was
+verified before it was timed (`DeepSeekV41AttentionKernelTests` extended to dispatch
+the kernel with G=1, 2, 4 and 8 against the host rule, partial tail group included),
+so the table above is a timing of a correct kernel, not of a broken one.
