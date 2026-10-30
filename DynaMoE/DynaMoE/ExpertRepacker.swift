@@ -84,6 +84,18 @@ public final class ExpertRepacker {
         return true
     }
 
+    /// Safetensors shapes reach Swift as a Rust debug-formatted string (`"[640, 2560]"`).
+    /// Packing has to parse them back: an empty `shape` erases the only record of a
+    /// tensor's width, and the engine then resolves dims from config defaults instead
+    /// (which is how a repacked Qwen 3.8 ran its expert MLP 512-wide against 640-wide
+    /// weights and produced gibberish).
+    static func parseShapeDisplay(_ display: String) -> [Int] {
+        display
+            .trimmingCharacters(in: CharacterSet(charactersIn: "[] "))
+            .split(separator: ",")
+            .compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+    }
+
     /// Fast repacking of a Safetensors HuggingFace snapshot into FlashMoE packed binary format
     public func repackSafetensors(
         sourceDir: URL,
@@ -157,7 +169,7 @@ public final class ExpertRepacker {
             nonExpertManifest[tensor.name] = FlashMoEWeightsManifest.TensorEntry(
                 offset: currentOffset,
                 size: tensorSize,
-                shape: [],
+                shape: Self.parseShapeDisplay(tensor.shapeDisplay),
                 dtype: tensor.dtype
             )
             currentOffset += tensorSize
@@ -242,7 +254,7 @@ public final class ExpertRepacker {
                     offset: componentOffset,
                     size: size,
                     dtype: t.dtype,
-                    shape: []
+                    shape: Self.parseShapeDisplay(t.shapeDisplay)
                 ))
                 componentOffset += size
             }
