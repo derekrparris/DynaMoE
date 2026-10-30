@@ -235,10 +235,14 @@ nonisolated public enum DeepSeekV41Conformance {
     /// Two bounds decide the shape rather than convenience. The cache is a RING of
     /// `window` rows, so writing position `p + 1` evicts a row a query at `p` still
     /// needs: the write, the pool and the attention therefore stay in one per-position
-    /// loop, and a block is capped at the window. And the expert ARENA holds a handful
-    /// of experts, so a block's union does not fit: the mixture stays per position,
-    /// with the wait that keeps the next read out of the slot the previous kernels are
-    /// still reading. Batching the mixture needs an arena redesign, not a wider grid.
+    /// loop, and a block is capped at the window. The second bound is the expert
+    /// ARENA: a slot may only be refilled once the kernels reading it have finished,
+    /// so the mixture is one submission only when the block's deduplicated expert
+    /// union can be resident all at once. The arena the memory plan sizes holds
+    /// hundreds of slots, and a block of `chunkSlots` (at most eight) routes at most
+    /// 48 at top-k 6, so the union fits and one command buffer covers the block; an
+    /// arena kept below that falls back to one fill-and-wait per position instead of
+    /// overwriting a slot a kernel is still reading.
     ///
     /// What changed about the gate's own reasoning: the local shards are still
     /// header-only stubs, but the device forward is no longer unrun.
@@ -251,18 +255,19 @@ nonisolated public enum DeepSeekV41Conformance {
     /// projection splitting its rows twice, and a RoPE batch rotating one row.
     ///
     /// What stays open: no comparison against the checkpoint's own numbers at real
-    /// weights. And the pass has now been MEASURED, which is why the gate is not
-    /// closer to closing than parity makes it look: on the synthetic model a block
-    /// beats the walk by only 1.0-1.26x, and a block's cost scales linearly with the
-    /// layer count at ~0.33 ms/position/layer, because the one thing that still costs
-    /// a full round trip per position is the mixture's single `waitUntilCompleted`
-    /// for the arena. The dense batching removed dispatches that were never the
-    /// floor; batching the mixture is the next lever, and it is an arena question
-    /// rather than a grid question (numbers and caveats in
-    /// `Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #1"). The turn loop already routes a
-    /// from-position-0 prompt through
+    /// weights. The pass has been MEASURED twice, and the second measurement is what
+    /// made the remaining reason narrow rather than vague. The first showed a block
+    /// beating the walk by only 1.0-1.26x with the mixture's per-position round trip
+    /// as ~50-60% of a block's per-position cost; batching the mixture into one
+    /// submission per layer, with one arena fill for the block's union, took it to
+    /// ~2.0x at every width and halved the per-position cost (0.33 -> 0.14
+    /// ms/position/layer). So the graph is no longer the question, and neither is the
+    /// arena: what is left is linear per-position DISPATCH work, and above all the
+    /// fact that none of this has run against real weights. The turn loop already
+    /// routes a from-position-0 prompt through
     /// `DeepSeekV41PositionForward.prefillChunk`, so nothing outside the executor has
-    /// to change either way.
+    /// to change either way (numbers and caveats in `Benchmarks/PERF_FINDINGS.md`,
+    /// "DSV4.1 #1" and "DSV4.1 #2").
     public static let batchedDevicePrefill: Gate = .unverified
 
     /// The vision tower's patch grid, image token layout, and the tower forward.

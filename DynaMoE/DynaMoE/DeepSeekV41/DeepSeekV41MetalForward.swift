@@ -1007,8 +1007,8 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         return logits
     }
 
-    /// One layer over a block: the dense half as one pass, then the mixture per
-    /// position.
+    /// One layer over a block: the dense half as one pass, then the mixture as one
+    /// pass when the block's experts are all resident at once.
     private func runBlockLayer(
         _ layer: DeepSeekV41LayerPlan,
         startPosition: Int,
@@ -1040,9 +1040,42 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
 
         let routings = (0..<count).map { readRouting(slot: $0) }
 
-        // The mixture stays per position. The arena holds a handful of experts, so a
-        // block's union does not fit, and a slot may only be refilled once the
-        // kernels reading it have finished: that is what the wait per position buys.
+        // The mixture as one submission, which is what makes a block cheaper than a
+        // walk: one arena fill for the block's expert union instead of one per
+        // position, one command buffer, and no round trip between positions. The
+        // fill is safe here because the front half above was just waited on, so the
+        // GPU is idle and no kernel is reading the slots about to be overwritten.
+        if let residents = try blockResidents(layer: layer, routings: routings) {
+            let expertCommand = try makeCommandBuffer()
+            let expertEncoder = try makeEncoder(expertCommand)
+            for index in 0..<count {
+                for stage in DeepSeekV41DevicePlan.backHalf {
+                    try encodeBlockExpertStage(
+                        stage,
+                        layer: layer,
+                        slot: index,
+                        encoder: expertEncoder,
+                        routing: routings[index],
+                        residents: residents[index]
+                    )
+                }
+            }
+            expertEncoder.endEncoding()
+            // Nothing of this half is read back on the host, so it is ordered rather
+            // than waited for: the next layer's front half commits behind it, and
+            // that wait drains this one (`runLayer` orders its experts half the same
+            // way). The last layer lands in `settlePending` before the logits.
+            try commit(
+                expertCommand,
+                stage: "layer \(layer.index) experts (block \(count))",
+                waiting: false
+            )
+            return
+        }
+
+        // A union too large for the arena stays per position: fill the slots this
+        // position routes, submit, and wait, because the next position's fill
+        // would otherwise land under a kernel still reading them.
         for index in 0..<count {
             let routing = routings[index]
             var residents: [DeepSeekV41ResidentExpert]?
@@ -1066,6 +1099,62 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             expertEncoder.endEncoding()
             try commit(expertCommand, stage: "layer \(layer.index) experts", waiting: true)
         }
+    }
+
+    /// Every position's routed experts resident at the same time, or nil when that
+    /// does not fit and the block has to be streamed per position.
+    ///
+    /// A block routes at most `count * topK` experts before deduplication, which is
+    /// well under the arena the memory plan sizes for this checkpoint (hundreds of
+    /// slots even on 16 GB) but not under an arena that was deliberately kept small.
+    /// The distinction is not cosmetic: a slot filled while a kernel is still reading
+    /// it is a wrong answer with no error, so "does not fit" has to be a different
+    /// layout rather than a bigger grid.
+    ///
+    /// No streamer is not a failure either — the experts are then read through the
+    /// shard mappings, nothing is refilled, and the block still batches.
+    private func blockResidents(
+        layer: DeepSeekV41LayerPlan,
+        routings: [DeepSeekV41Routing]
+    ) throws -> [[DeepSeekV41ResidentExpert]?]? {
+        guard let streamer else {
+            return Array(repeating: nil, count: routings.count)
+        }
+        var union: [Int] = []
+        var seen: Set<Int> = []
+        for routing in routings {
+            for expert in routing.expertIDs where seen.insert(expert).inserted {
+                union.append(expert)
+            }
+        }
+        guard !union.isEmpty else { return Array(repeating: nil, count: routings.count) }
+        guard union.count <= streamer.capacity else { return nil }
+
+        let filled = try streamer.ensureResident(layer: layer.index, experts: union)
+        var byExpert: [Int: DeepSeekV41ResidentExpert] = [:]
+        byExpert.reserveCapacity(union.count)
+        for (position, expert) in union.enumerated() {
+            byExpert[expert] = filled[position]
+        }
+        // The bindings are indexed by rank within a position's routing, so this has
+        // to keep `expertIDs` order rather than follow the union's.
+        var residents: [[DeepSeekV41ResidentExpert]?] = Array(
+            repeating: nil, count: routings.count
+        )
+        for (slot, routing) in routings.enumerated() where !routing.expertIDs.isEmpty {
+            var ranked: [DeepSeekV41ResidentExpert] = []
+            ranked.reserveCapacity(routing.expertIDs.count)
+            for expert in routing.expertIDs {
+                guard let resident = byExpert[expert] else {
+                    throw DeepSeekV41EngineError.missingTensor(
+                        "layers.\(layer.index).ffn.experts.\(expert) in the arena"
+                    )
+                }
+                ranked.append(resident)
+            }
+            residents[slot] = ranked
+        }
+        return residents
     }
 
     /// One stage of a block's dense half.

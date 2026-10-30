@@ -3577,3 +3577,90 @@ skip unless `/tmp/dynamoe_dsv41_prefill_measure` exists or
 `DYNAMOE_DSV41_PREFILL_MEASURE=1`, because `xcodebuild` does not forward the
 shell environment into an app-hosted test, and they assert only the correctness
 invariant (the block returns the walk's logits) rather than a timing threshold.
+
+## DSV4.1 #2: BATCHING THE MIXTURE, AND WHAT THE ROUND TRIP REALLY COST
+
+**What changed.** `DSV4.1 #1` measured the block prefill and named the
+per-position mixture round trip as the floor: `runBlockLayer` created one
+command buffer per position, submitted it, and waited, because
+`DeepSeekV41ExpertStreamer.ensureResident` may only refill an arena slot after
+the kernels reading it have finished. `DeepSeekV41MetalForward.runBlockLayer`
+now fills the arena once for the block's deduplicated expert union and encodes
+every position's mixture stages into **one** command buffer with no wait
+between positions. The wait moves to the block boundary: the half is committed
+unordered, and the next layer's front-half wait drains it — the same ordering a
+single decode position already relies on. When the union does not fit the arena
+(a deliberately small one), the layer keeps the old per-position fill-and-wait,
+because a slot overwritten under a running kernel is a wrong answer with no
+error.
+
+**Setup.** Unchanged from `DSV4.1 #1`: synthetic checkpoint (hidden 64, 2
+layers, 4 routed experts taking 2, FP16 KV, no compressed layers / Engram /
+DSpark), 32 positions, best of 3 after 1 warmup, one `reset()` per run. Machine
+**M5 Max, 128 GB, macOS 27.2**. Same reproduce command
+(`DeepSeekV41PrefillMeasurementTests`, opt-in via
+`/tmp/dynamoe_dsv41_prefill_measure`).
+
+**Before → after, same synthetic model.**
+
+| window | slots | walk ms | chunk ms | speedup | chunk ms/pos before | chunk ms/pos after |
+|-------:|------:|--------:|---------:|--------:|--------------------:|-------------------:|
+| 2 | 2 | 27.56 | 13.36 | 2.06x | 0.773 | 0.418 |
+| 4 | 4 | 20.57 | 10.24 | 2.01x | 0.663 | 0.320 |
+| 8 | 8 | 21.85 | 11.12 | 1.97x | 0.665 | 0.347 |
+| 16 | 8 | 25.22 | 14.04 | 1.80x | 0.785 | 0.439 |
+
+Two further runs of the same build: 2.08x / 1.99x / 2.00x / 1.80x and 2.11x /
+2.04x / 2.02x / 1.77x. The walk times moved by ~2% between sessions, so the
+walk column is stable enough for the ratio to be read; the spread inside the
+after column is under 2%.
+
+Per-layer attribution, same case: a block of 32 positions costs **0.185
+ms/position at 1 layer and 0.317 at 2** (three runs: 0.181/0.319, 0.181/0.324),
+so **~0.138 ms per position per layer**, down from 0.334. A block of one
+position costs 0.551-0.751 ms, down from 0.934.
+
+**Correction to `DSV4.1 #1`.** That entry inferred the round trip was "roughly
+85%" of a block's per-position cost, from the layer slope plus the block-of-one
+number. The direct before/after says **~50-60%**: at window 4 the block went
+from 0.663 to 0.320 ms/position (52% removed), and per layer from 0.334 to
+0.138 (59% removed). The inference was directionally right and numerically
+optimistic; this entry's number is the one to quote.
+
+**What is still per position** (~0.138 ms/position/layer here): the dense
+half's per-slot stages (`hcAttentionCoefficients`, the mHC pre-mix, the
+compressor writes, the gathered rows, the cache write, and the attention that
+reads it are all encoded per slot inside one command buffer), plus the
+mixture itself, which is still encoded per position: a clear, two dispatches
+per routed expert, the shared expert, and the hyper-connection write and
+collapse. Those are *dispatches*, not round trips: batching them further would
+need the kernels to take a position index where they currently take a slot
+pointer (`DeepSeekV41DevicePlan.chunkSlots` stays the ceiling at 8). Not
+measured separately, so not recommended yet — the next step on this path is
+another measurement, not another rewrite.
+
+**Caveats.**
+
+- This run had **no streamer**: the synthetic runtime is built with
+  `snapshotDir: nil`, so the experts come from the shard mapping and the
+  measurement isolates the round trip and the command-buffer count. On real
+  weights the same change also replaces `count` fills of top-k experts with one
+  fill of the block's union, which is a hit-rate question this harness cannot
+  see (at 384 experts and top-k 6 the union of 8 positions is up to 48, and the
+  arena the memory plan sizes holds hundreds, so it fits).
+- The arena-union path itself is unexercised by any test: the synthetic arena is
+  8 slots for 4 experts *and* the test runtime has no streamer, so the union
+  always fits and the fallback never runs. The fallback is the old code path,
+  kept verbatim.
+- The `batchedDevicePrefill` conformance gate still stays `.unverified`: this is
+  port-against-port parity on a synthetic model, with no real-weight number
+  anywhere on the machine.
+- Everything from `#1` about the walk paying a per-position logits readback,
+  window rows not being comparable to each other, and the absent compressed /
+  Engram / DSpark stages still holds.
+
+Tests: `DeepSeekV41DeviceGraphParityTests.testTheChunkSeamReturnsTheWalksLogits`
+is the guard — it walks `2 * window - 1` tokens and requires the block path to
+return bit-identical logits (worst delta 0, asserted at 1e-6), and every parity
+case asserts its tolerance through the same batched path. Full DeepSeek suite
+after the change: 399 tests, 73 classes, 0 failures.
