@@ -4574,3 +4574,58 @@ caller binds), `testTheWideGemvGridIsChosenByHowMuchWorkTheProjectionHas` extend
 three-way choice, and `testWhatOneProjectionCostsAtThePublishedWidths` grown a third column.
 Whole DeepSeek suite: 412 tests, 10 skipped, 0 failures — including
 `testTheDeviceAndTheHostAgreeStageByStage` and the bit-identical chunk seam.
+
+## DSV4.1 #14: THE CACHE LOOP IS THE ATTENTION, AND NOTHING ELSE SHOWS UP
+
+After `#13` the published-widths table reads `writeLatent` 0.247 ms/position, **51.2% of
+the dense half**, with everything else at or near the floor. `writeLatent` is one loop per
+position doing four things — store the latent row into the ring, pool it into the
+compressed cache when its group completes, gather the row budget, run attention — and
+until now nobody had said which of them the 0.247 belongs to.
+
+**Answered without new code, from a number that already existed.** `#5`'s
+`testWhatOneAttentionDispatchCostsAtThePublishedWidths` times this kernel alone at the
+published geometry (128 heads, head_dim 512, record 512):
+
+| window rows | ms/dispatch | us/head |
+|---:|---:|---:|
+| 128 | 0.092 | 0.72 |
+| 136 | 0.126 | 0.99 |
+| 640 | 0.453 | 3.54 |
+
+A 640-position prompt's window is `min(position + 1, 640)` rows, which averages ~320, and
+between 136 and 640 rows the cost is ~0.65 us/row. So one position's attention is about
+**0.245 ms**, eight of them are 1.96 ms per block, and `writeLatent` is 1.976. The store
+(448 halves), the gather (at most 640 rows of 512) and the loop's own bookkeeping are
+inside the noise floor of that comparison.
+
+**One of the four costs nothing at all, here.** `encodePoolIfComplete` returns
+immediately when the layer does not own a compressed KV cache, and the synthetic
+published-widths checkpoint has no compressed layers. That is a caveat with teeth: on a
+real compressed layer the pool runs TWO GEMVs per position inside the loop
+(`attn.compressor.wkv` and `attn.compressor.wgate`, 7,168 wide by 448), so this table
+understates `writeLatent` for exactly the layers the checkpoint's second half is made of.
+The synthetic model cannot price that, and no change here should be justified by this
+table's pool term being invisible.
+
+**So the lever is the attention's SHAPE, not the loop's plumbing.** One position is one
+dispatch of 128 threadgroups — 16,384 threads, a fifth of what the part can hold — and
+eight of them run back to back in one command buffer with a gather in front of each. The
+gathers cannot be hoisted: a gather for position p must follow the store for p (a causal
+query reads its own row) and precede the store for p + 1 (which evicts the oldest row p
+still needs), so the only way to launch the block's eight attends at once is eight gathered
+buffers, 5.2 MB at 640 rows of 512 half-precision values.
+
+**What to measure before building that.** The whole premise is that more threadgroups per
+launch is cheaper than more launches, and that is a two-line test on the existing case:
+time one dispatch at 8x the heads against eight dispatches at 1x, with the same rows and
+the same total work. If the batched launch is not clearly cheaper, eight gathered buffers
+and a slot dimension on the attention kernel buy nothing.
+
+**Caveats.** The attention numbers are cache-warm repetitions of one 640-row key block;
+the in-situ row counts differ per position and the estimate above interpolates between two
+measured row counts rather than measuring an average window. Same synthetic-weight and
+one-layer caveats as `#13`. Device time is one command buffer per stage.
+
+Tests: none added — the table above is `#5`'s existing opt-in case, re-read against the
+current table. Whole DeepSeek suite: 412 tests, 10 skipped, 0 failures.
