@@ -393,6 +393,31 @@ final class DeepSeekV41DevicePlanTests: XCTestCase {
         XCTAssertEqual(DeepSeekV41DevicePlan.backHalf, [.routedExperts, .sharedExpert, .writeFFNStreams, .collapseStreams])
         XCTAssertEqual(Array(DeepSeekV41DevicePlan.frontHalf) + DeepSeekV41DevicePlan.backHalf, pipeline)
     }
+
+    /// Which BF16 GEMV form a projection gets, at the shapes the checkpoint publishes.
+    ///
+    /// The two kernels differ only in where the parallelism sits, so the choice is a
+    /// cost decision and not a correctness one — but it is a decision, and it was
+    /// made against a measured crossover rather than a guess. These are the five
+    /// dense projections of a block of eight positions, plus the decode step, which
+    /// takes the threadgroup form at every size because a grid one row tall cannot
+    /// amortize a row's bytes across positions.
+    func testTheWideGemvGridIsChosenByHowMuchWorkTheProjectionHas() {
+        // attn.wkv: 448 rows. attn.wo_a's band: 128 rows over 8,192 columns, the
+        // projection that motivated the second kernel.
+        XCTAssertTrue(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 448, rows: 8))
+        XCTAssertTrue(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 128, rows: 8))
+        // 6,144 threads still measured 2.3x faster; 12,288 measured 10% slower.
+        XCTAssertTrue(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 768, rows: 8))
+        XCTAssertFalse(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 1_536, rows: 8))
+        // attn.wq_b: 73,728 rows, where one thread per row measured 2.4x faster.
+        XCTAssertFalse(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 73_728, rows: 8))
+        XCTAssertFalse(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 7_168, rows: 8))
+        // A decode step is one position, so every row count takes the wide grid.
+        XCTAssertTrue(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 7_168, rows: 1))
+        XCTAssertTrue(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 73_728, rows: 1))
+        XCTAssertTrue(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 448, rows: 0))
+    }
 }
 
 // MARK: - Query RoPE

@@ -918,4 +918,268 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
             )
         }
     }
+
+    /// What one dense projection costs, at the shapes the checkpoint runs.
+    ///
+    /// `bf16_gemv` gives one thread an output row and the reduction is a serial
+    /// loop, so its grid is `outDim * rows` threads and nothing else. `attn.wq_b`
+    /// is 73,728 rows, which covers a GPU; `attn.wo_a` splits into eight groups of
+    /// 128 rows over 8,192 columns, which is 1,024 threads for a block of eight
+    /// positions. This case prices that difference on the five projections rather
+    /// than on a toy shape, prices the threadgroup-per-row kernel that
+    /// `bf16_gemv_rows` offers against it, and then sweeps the row count to find
+    /// where one form overtakes the other.
+    ///
+    /// Every configuration self-checks before it is timed: both kernels' first and
+    /// last output rows are compared with a host dot product over the same bytes, so
+    /// a sweep cannot report a fast kernel that computes something else.
+    func testWhatOneProjectionCostsAtThePublishedWidths() throws {
+        guard let metal = MTLCreateSystemDefaultDevice(),
+              let library = metal.makeDefaultLibrary(),
+              let perRowFunction = library.makeFunction(name: "bf16_gemv"),
+              let rowsFunction = library.makeFunction(name: "bf16_gemv_rows"),
+              let perRow = try? metal.makeComputePipelineState(function: perRowFunction),
+              let rows = try? metal.makeComputePipelineState(function: rowsFunction),
+              let queue = metal.makeCommandQueue() else {
+            XCTFail("the GEMV kernels are not in the default library")
+            return
+        }
+
+        let repetitions = 20
+        let laneWidth = 64
+
+        var state: UInt64 = 0x9E37_79B9_7F4A_7C15
+        func nextUnit() -> Float {
+            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return Float(Int32(truncatingIfNeeded: state >> 33)) / Float(1 << 30)
+        }
+        // A tile copied over and over: a 226 MB weight does not need 113M distinct
+        // values to be priced, and generating them one at a time on the CPU costs
+        // more than the measurement.
+        let weightTile = (0..<4_096).map { _ in
+            UInt16(
+                truncatingIfNeeded:
+                    DeepSeekV41SyntheticCheckpoint.truncateToBF16(nextUnit() * 0.125).bitPattern >> 16
+            )
+        }
+        let inputTile = (0..<4_096).map { _ in nextUnit() }
+
+        func fill<T>(_ buffer: MTLBuffer, bytes: Int, tile: [T]) {
+            let valueStride = MemoryLayout<T>.stride
+            let destination = buffer.contents()
+            tile.withUnsafeBytes { source in
+                guard let base = source.baseAddress else { return }
+                var written = 0
+                while written < bytes {
+                    let chunk = min(tile.count * valueStride, bytes - written)
+                    memcpy(destination + written, base, chunk)
+                    written += chunk
+                }
+            }
+        }
+
+        /// One shape at one batch height: validate both kernels, then time both.
+        ///
+        /// `silent` skips the print, which is what the crossover sweep wants — it
+        /// only needs the two numbers.
+        func measure(
+            name: String,
+            outDim: Int,
+            inDim: Int,
+            dispatches: Int,
+            slots: Int,
+            laneSweep: Bool
+        ) throws {
+            let weightBytes = outDim * inDim * MemoryLayout<UInt16>.stride
+            guard let weight = metal.makeBuffer(length: weightBytes, options: .storageModeShared),
+                  let input = metal.makeBuffer(
+                      length: slots * inDim * MemoryLayout<Float>.stride, options: .storageModeShared
+                  ),
+                  let perRowOutput = metal.makeBuffer(
+                      length: slots * outDim * MemoryLayout<Float>.stride, options: .storageModeShared
+                  ),
+                  let rowsOutput = metal.makeBuffer(
+                      length: slots * outDim * MemoryLayout<Float>.stride, options: .storageModeShared
+                  ) else {
+                XCTFail("\(name): buffers did not allocate")
+                return
+            }
+            fill(weight, bytes: weightBytes, tile: weightTile)
+            fill(input, bytes: slots * inDim * MemoryLayout<Float>.stride, tile: inputTile)
+            memset(perRowOutput.contents(), 0, perRowOutput.length)
+            memset(rowsOutput.contents(), 0, rowsOutput.length)
+
+            func encode(
+                _ encoder: MTLComputeCommandEncoder,
+                pipeline: MTLComputePipelineState,
+                output: MTLBuffer,
+                lanes: Int
+            ) {
+                encoder.setComputePipelineState(pipeline)
+                var weightOffset = UInt64(0)
+                var inDimension = UInt32(inDim)
+                var outDimension = UInt32(outDim)
+                var inStride = UInt32(inDim)
+                var outStride = UInt32(outDim)
+                for _ in 0..<dispatches {
+                    encoder.setBuffer(weight, offset: 0, index: 0)
+                    encoder.setBuffer(input, offset: 0, index: 1)
+                    encoder.setBuffer(output, offset: 0, index: 2)
+                    encoder.setBytes(&weightOffset, length: 8, index: 3)
+                    encoder.setBytes(&inDimension, length: 4, index: 4)
+                    encoder.setBytes(&outDimension, length: 4, index: 5)
+                    encoder.setBytes(&inStride, length: 4, index: 6)
+                    encoder.setBytes(&outStride, length: 4, index: 7)
+                    if pipeline === rows {
+                        encoder.setThreadgroupMemoryLength(
+                            32 * MemoryLayout<Float>.stride, index: 0
+                        )
+                        encoder.dispatchThreadgroups(
+                            MTLSize(width: outDim * slots, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+                        )
+                    } else {
+                        // The executor's `threadgroup(_:)` caps the width at 64, so
+                        // this mirrors the launch the stage actually uses.
+                        encoder.dispatchThreads(
+                            MTLSize(width: outDim, height: slots, depth: 1),
+                            threadsPerThreadgroup: MTLSize(
+                                width: max(1, min(outDim, 64)), height: 1, depth: 1
+                            )
+                        )
+                    }
+                }
+            }
+
+            func run(_ pipeline: MTLComputePipelineState, _ output: MTLBuffer, _ lanes: Int) {
+                guard let command = queue.makeCommandBuffer(),
+                      let encoder = command.makeComputeCommandEncoder() else { return }
+                encode(encoder, pipeline: pipeline, output: output, lanes: lanes)
+                encoder.endEncoding()
+                command.commit()
+                command.waitUntilCompleted()
+                XCTAssertNil(command.error, "\(name): the dispatch failed")
+            }
+            run(perRow, perRowOutput, 0)
+            run(rows, rowsOutput, laneWidth)
+
+            // The host rule over the same bytes, at the first and last row, for both
+            // kernels. Cheap enough at every shape here.
+            let weights = weight.contents().assumingMemoryBound(to: UInt16.self)
+            let inputs = input.contents().assumingMemoryBound(to: Float.self)
+            for (output, label) in [(perRowOutput, "perRow"), (rowsOutput, "rows")] {
+                let values = output.contents().assumingMemoryBound(to: Float.self)
+                for (row, token) in [(0, 0), (outDim - 1, slots - 1)] {
+                    var expected: Float = 0
+                    for index in 0..<inDim {
+                        let value = Float(bitPattern: UInt32(weights[row * inDim + index]) << 16)
+                        expected += value * inputs[token * inDim + index]
+                    }
+                    let actual = values[token * outDim + row]
+                    XCTAssertLessThan(
+                        abs(actual - expected) / max(abs(expected), 1e-3),
+                        1e-4,
+                        "\(name) \(label) row \(row) token \(token) disagrees with the host rule"
+                    )
+                }
+            }
+
+            func best(_ pipeline: MTLComputePipelineState, _ output: MTLBuffer, _ lanes: Int)
+                -> (milliseconds: Double, gigabytesPerSecond: Double) {
+                var fastest = Double.infinity
+                for attempt in 0..<3 {
+                    guard let command = queue.makeCommandBuffer(),
+                          let encoder = command.makeComputeCommandEncoder() else {
+                        return (0, 0)
+                    }
+                    // `repetitions` identical dispatches per window: the first window
+                    // is a single warm-up, and the minimum over the rest is the floor.
+                    let count = attempt == 0 ? 1 : repetitions
+                    for _ in 0..<count {
+                        encode(encoder, pipeline: pipeline, output: output, lanes: lanes)
+                    }
+                    encoder.endEncoding()
+                    command.commit()
+                    command.waitUntilCompleted()
+                    let window = command.gpuEndTime - command.gpuStartTime
+                    fastest = min(fastest, window / Double(count) * 1000)
+                }
+                let bytes = Double(dispatches * outDim * inDim * 2)
+                return (fastest, bytes / (fastest / 1000) / 1e9)
+            }
+
+            let shipped = best(perRow, perRowOutput, 0)
+            let widened = best(rows, rowsOutput, laneWidth)
+            print(
+                String(
+                    format: "[dsv41 gemv] %-14@ slots=%-2d out=%-6d in=%-5d "
+                        + "perRow %8.4f ms/pos %5.0f GB/s   rows %8.4f ms/pos %5.0f GB/s "
+                        + "(%+.2fx)",
+                    name as NSString,
+                    slots,
+                    outDim,
+                    inDim,
+                    shipped.milliseconds / Double(slots),
+                    shipped.gigabytesPerSecond,
+                    widened.milliseconds / Double(slots),
+                    widened.gigabytesPerSecond,
+                    shipped.milliseconds / widened.milliseconds
+                )
+            )
+            guard laneSweep else { return }
+            for lanes in [32, 64, 128, 256] {
+                let swept = best(rows, rowsOutput, lanes)
+                print(
+                    String(
+                        format: "[dsv41 gemv] %-14@ slots=%-2d %11@ lanes=%-4d           "
+                            + "%8.4f ms/pos %5.0f GB/s",
+                        name as NSString,
+                        slots,
+                        "" as NSString,
+                        lanes,
+                        swept.milliseconds / Double(slots),
+                        swept.gigabytesPerSecond
+                    )
+                )
+            }
+        }
+
+        // The five bf16 projections of a block, at the published widths. The grouped
+        // output projection is eight band dispatches of the same geometry, so it is
+        // priced as one stage of eight. Both batch heights matter: a decode step is
+        // the same kernel with a grid one row tall.
+        let shapes: [(name: String, outDim: Int, inDim: Int, dispatches: Int)] = [
+            ("latentProject", 448, 7_168, 1),
+            ("queryDown", 1_536, 7_168, 1),
+            ("queryUp", 73_728, 1_536, 1),
+            ("outputUp", 7_168, 1_024, 1),
+            ("outputDown(8)", 128, 8_192, 8),
+        ]
+        for slots in [8, 1] {
+            for shape in shapes {
+                try measure(
+                    name: shape.name,
+                    outDim: shape.outDim,
+                    inDim: shape.inDim,
+                    dispatches: shape.dispatches,
+                    slots: slots,
+                    laneSweep: slots == 8
+                )
+            }
+        }
+
+        // Where the two forms cross over: one wide reduction (8,192 columns, the
+        // output projection's band width) against a growing row count. The rule the
+        // executor applies comes from this table, not from intuition.
+        for outDim in [96, 192, 384, 768, 1_536, 3_072, 6_144] {
+            try measure(
+                name: "crossover",
+                outDim: outDim,
+                inDim: 8_192,
+                dispatches: 1,
+                slots: 8,
+                laneSweep: false
+            )
+        }
+    }
 }

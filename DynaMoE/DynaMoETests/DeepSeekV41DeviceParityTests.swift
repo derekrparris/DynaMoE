@@ -871,6 +871,100 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         }
     }
 
+    /// The same projection with the reduction spread across a threadgroup.
+    ///
+    /// `bf16_gemv_rows` is the form the executor chooses for a short, wide
+    /// projection, and the executor batches a block into it: the grid is flat, so
+    /// the row is `groupIdx % outDim` and the token is `groupIdx / outDim`. Both of
+    /// those are contracts a plausible-looking kernel could get wrong in a way the
+    /// model would survive at the first position, so this pins the batched grid and
+    /// the two row strides — a group reads its band of a wider row and writes its
+    /// band of a wider output.
+    func testTheWideGemvGridKeepsTheTokenAndTheRowStrides() throws {
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let library = device.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "bf16_gemv_rows"),
+              let gemv = try? device.makeComputePipelineState(function: function),
+              let queue = device.makeCommandQueue() else {
+            throw XCTSkip("No Metal device or kernel")
+        }
+        let groups = 2
+        let perGroupIn = 8
+        let perGroupOut = 3
+        let inDim = groups * perGroupIn
+        let outDim = groups * perGroupOut
+        let rows = 3
+
+        let values = (0..<(outDim * perGroupIn)).map { index in
+            DeepSeekV41SyntheticCheckpoint.truncateToBF16(Float((index % 11) - 5) / 8)
+        }
+        let input = (0..<(rows * inDim)).map { index in Float((index % 7) - 3) / 4 }
+        let halves = values.map { UInt16(truncatingIfNeeded: $0.bitPattern >> 16) }
+        guard let weightBytes = halves.withUnsafeBytes({ raw -> MTLBuffer? in
+                  device.makeBuffer(
+                      bytes: raw.baseAddress!, length: raw.count, options: .storageModeShared
+                  )
+              }),
+              let inputBuffer = input.withUnsafeBytes({ raw -> MTLBuffer? in
+                  device.makeBuffer(
+                      bytes: raw.baseAddress!, length: raw.count, options: .storageModeShared
+                  )
+              }),
+              let output = device.makeBuffer(
+                  length: rows * outDim * MemoryLayout<Float>.stride, options: .storageModeShared
+              ),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw XCTSkip("could not allocate the wide-grid projection's buffers")
+        }
+        memset(output.contents(), 0, output.length)
+
+        let valueBytes = 2
+        for group in 0..<groups {
+            encoder.setComputePipelineState(gemv)
+            encoder.setBuffer(weightBytes, offset: 0, index: 0)
+            encoder.setBuffer(
+                inputBuffer, offset: group * perGroupIn * MemoryLayout<Float>.stride, index: 1
+            )
+            encoder.setBuffer(
+                output, offset: group * perGroupOut * MemoryLayout<Float>.stride, index: 2
+            )
+            var weightOffset = UInt64(group * perGroupOut * perGroupIn * valueBytes)
+            var inDimension = UInt32(perGroupIn)
+            var outDimension = UInt32(perGroupOut)
+            var inStride = UInt32(inDim)
+            var outStride = UInt32(outDim)
+            encoder.setBytes(&weightOffset, length: 8, index: 3)
+            encoder.setBytes(&inDimension, length: 4, index: 4)
+            encoder.setBytes(&outDimension, length: 4, index: 5)
+            encoder.setBytes(&inStride, length: 4, index: 6)
+            encoder.setBytes(&outStride, length: 4, index: 7)
+            encoder.setThreadgroupMemoryLength(32 * MemoryLayout<Float>.stride, index: 0)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: perGroupOut * rows, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+            )
+            if group + 1 < groups { encoder.memoryBarrier(scope: .buffers) }
+        }
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        let matrix = DeepSeekV41Matrix(rows: outDim, columns: perGroupIn, values: values)
+        let pointer = output.contents().assumingMemoryBound(to: Float.self)
+        for token in 0..<rows {
+            let row = Array(input[(token * inDim)..<((token + 1) * inDim)])
+            let expected = matrix.applyBlockDiagonal(row, groups: groups)
+            for column in 0..<outDim {
+                XCTAssertEqual(
+                    pointer[token * outDim + column], expected[column], accuracy: 1e-4,
+                    "token \(token) row \(column)"
+                )
+            }
+        }
+    }
+
     /// A grouped output projection, dispatched the way the executor dispatches it.
     ///
     /// `attn.wo_a` is `groups` blocks stacked along the ROWS, each as wide as one

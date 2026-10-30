@@ -4269,3 +4269,117 @@ above, opt-in) and the three direct kernel dispatches of `dsv41_hc_project_f32` 
 threadgroups with 256 threads and the reduction scratch. Whole DeepSeek suite: 407
 tests, 8 skipped, 0 failures — including `testTheDeviceAndTheHostAgreeStageByStage` and
 the bit-identical chunk seam, so the reordered reduction produces the same coefficients.
+
+## DSV4.1 #10: THE GEMV PUT ONE THREAD ON A WHOLE OUTPUT ROW
+
+`bf16_gemv` gives a thread an output row and the reduction is a serial loop, so the grid
+is `outDim * rows` threads and nothing else. That is the right shape when there are a
+lot of rows — `attn.wq_b` is 73,728 of them over a 1,536-wide reduction, and its lanes
+are the output, so the machine is covered. It is the wrong shape when there are very few
+and the reduction is wide: `attn.wo_a` is eight bands of 128 rows over 8,192 columns, so
+a block of eight positions is **1,024 threads in total** on a 40-core GPU, and `attn.wkv`
+is 448 rows, which is 3,584. `#9` had just shown what one lane per reduction costs in the
+mHC projection (73x). This is the same defect in five stages.
+
+**The two forms.** `bf16_gemv_rows` (new) gives an output row a threadgroup: lanes stride
+the reduction, `simd_sum` per warp, partials in `[[threadgroup(0)]]`, lane 0 finishes. The
+grid is flat (`outDim * rows`) so `row = groupIdx % outDim` and the token is
+`groupIdx / outDim` — the same flat-grid constraint `dsv41_hc_project_f32` ran into,
+where a `threadgroup` buffer cannot be declared beside vector grid attributes. Striding
+the reduction across lanes also makes a lane's load adjacent to its neighbours' instead
+of 16 KB away, which is part of what the one-thread form pays for. Both kernels take the
+same two row strides, so a band-driven caller binds them and every other caller leaves
+them zero. The choice is `DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim:rows:)` — a
+plan rule, not a constant — and the shipped `bf16_gemv` is untouched, because the app's
+generic decode path dispatches it and no measurement here covers that path.
+
+**Kernel alone, published shapes, one block of eight positions** (`testWhatOneProjection
+CostsAtThePublishedWidths`, self-validated against a host dot product at 1e-4 before
+timing). Weights are hammered 20x per window, so these are cache-warm:
+
+| stage | shape | one thread per row | threadgroup per row | |
+|---|---|---:|---:|---:|
+| `latentProject` (`attn.wkv`) | 448 x 7,168 | 0.0340 | **0.0065** | 5.2x |
+| `outputDown`, one band (`attn.wo_a`) | 128 x 8,192 | 0.1416 | **0.0132** | 10.7x |
+| `queryDown` (`attn.wq_a`) | 1,536 x 7,168 | 0.0419 | **0.0227** | 1.8x |
+| `outputUp` (`attn.wo_b`) | 7,168 x 1,024 | **0.0080** | 0.0145 | 0.6x |
+| `queryUp` (`attn.wq_b`) | 73,728 x 1,536 | **0.1637** | 0.3911 | 0.4x |
+
+and at a batch height of one, every shape prefers the threadgroup form, because a grid
+one row tall never has a second position to amortize a row's bytes over: 20.2x on
+`latentProject`, 22.1x on `outputDown`'s band, 6.2x on `queryDown`, 1.6x on `outputUp`,
+1.4x on `queryUp`. So the rule has two clauses — a decode step takes the wide grid at any
+row count, and a block takes it up to 8,192 threads.
+
+**The crossover, measured rather than guessed** (8,192-column reduction, eight
+positions, so the row count is the only variable):
+
+| rows | threads | one thread per row | threadgroup per row | |
+|---:|---:|---:|---:|---:|
+| 96 | 768 | 0.0182 | **0.0013** | 13.9x |
+| 192 | 1,536 | 0.0183 | **0.0022** | 8.3x |
+| 384 | 3,072 | 0.0184 | **0.0034** | 5.4x |
+| 768 | 6,144 | 0.0226 | **0.0099** | 2.3x |
+| 1,536 | 12,288 | **0.0230** | 0.0252 | 0.9x |
+| 3,072 | 24,576 | **0.0281** | 0.0567 | 0.5x |
+| 6,144 | 49,152 | **0.0676** | 0.1654 | 0.4x |
+
+The threshold sits at 8,192 threads: between a 2.3x win and a 10% loss. A 64-lane
+threadgroup with only a few float4 loads each spends more time at its barrier than on the
+reduction, which is why the tall shapes lose.
+
+**Lane width** at the same shapes: 64 and 128 are within noise of each other, 32 costs
+the narrow bands up to 11%, 256 up to 50%. 64 shipped.
+
+**What it did to the table** (published widths, `#7`'s case, same machine):
+
+| stage | `#9` | now |
+|---|---:|---:|
+| `outputDown` | 0.213 | 0.145 |
+| `latentProject` | 0.024 | 0.012 |
+| `queryDown` | 0.024 | 0.025 |
+| `queryUp` | 0.096 | 0.096 |
+| `outputUp` | 0.078 | 0.079 |
+| dense device, ms/position | 0.775 | 0.674 |
+| whole block, ms/position | 1.22 | 1.12 |
+
+The in-situ gain is far smaller than the kernel table suggests, and the reason is worth
+writing down: the isolated case hammers one warm weight 20 times, while a stage inside a
+block reads weights that fell out of cache since the last block, and each stage's number
+in the block table includes the tail of its predecessor (they run back to back in one
+command buffer). `outputUp` reads 0.008 alone and 0.079 in place, which is not the stage
+being slow — it is the stage waiting. Treat the isolated table as a ranking of the two
+kernel forms and the block table as the authority on what a stage costs.
+
+`queryDown` and `queryUp` did not move because they kept the shipped kernel by the rule
+above, so the 0.9x crossover row is what protects them.
+
+**The table it leaves** (ms/position): `writeLatent` 0.246 (34.4%), `outputDown` 0.145
+(20.3%), `queryUp` 0.096 (13.4%), `outputUp` 0.079 (11.0%), the calibration buffer 0.042,
+`queryDown` 0.025, `latentProject` 0.012, then `hcFFNCoefficients`/`hcAttentionCoefficients`
+/`ffnNorm`/`attnNorm` 0.011 each, which is the floor. Dense device 0.674, mixture 0.416 —
+the mixture is now 38% of device time on a model whose expert arithmetic is fake.
+
+**What is left.** Two things, and both are visible in this table. `outputDown` is still
+14.5 GB/s of weight traffic even after the fix, because it is **eight dispatches** of one
+band each and the calibration row says eight dispatches cost 0.042 ms/position on their
+own; a single flat grid over all eight bands would remove seven launches, and the
+threadgroup-per-row form makes that a small change rather than a redesign (the band
+becomes arithmetic on the flat index, exactly as the slot does in `dsv41_hc_project_f32`).
+`writeLatent` at 34.4% is still the ring's serialization and still needs a design
+decision before it can be touched.
+
+**Caveats.** Same as `#7`-`#9`: BF16 synthetic weights, no compressed layers, one layer,
+a synthetic mixture that is dispatch overhead. Plus one new one — the isolated kernel
+numbers are cache-warm and are not additive into the block table. Device time is one
+command buffer per stage. The case is opt-in and takes ~25 s, and it now sweeps both
+batch heights and the crossover, so it is self-validating at every configuration it
+times.
+
+Tests: `testWhatOneProjectionCostsAtThePublishedWidths` (both tables above, opt-in),
+`testTheWideGemvGridIsChosenByHowMuchWorkTheProjectionHas` (the plan rule, pure logic)
+and `testTheWideGemvGridKeepsTheTokenAndTheRowStrides` (the batched flat grid and the two
+row strides, against a host block-diagonal product). Whole DeepSeek suite: 410 tests, 9
+skipped, 0 failures — including `testTheDeviceAndTheHostAgreeStageByStage` and the
+bit-identical chunk seam, so the stages that moved to the second kernel produce the same
+logits.

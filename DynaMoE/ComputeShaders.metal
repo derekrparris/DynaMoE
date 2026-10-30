@@ -1552,6 +1552,76 @@ kernel void bf16_gemv(
     outputVector[((uint64_t)tokenIdx * outStride) + row] = dot0 + dot1;
 }
 
+/// MSL Kernel: BF16 GEMV with the reduction spread across a threadgroup.
+///
+/// `bf16_gemv` gives one thread a whole output row, so the reduction is a serial
+/// loop and the grid is only `outDim * rows` threads tall. That is fine where the
+/// row count is large — `attn.wq_b` is 73,728 rows and reaches a few hundred GB/s —
+/// and it starves the machine where the row count is small and the reduction is
+/// wide: `attn.wo_a` splits into eight groups of 128 rows over 8,192 columns, so a
+/// block of eight positions is 1,024 threads in total (`Benchmarks/PERF_FINDINGS.md`,
+/// "DSV4.1 #10"). Striding the reduction across lanes also makes a lane's load
+/// adjacent to its neighbours' instead of 16 KB away, which is what the one-thread
+/// form pays for a scattered warp.
+///
+/// Grid: (outDim * rows, 1, 1) flat, `row = groupIdx % outDim` and the token is
+/// `groupIdx / outDim`. Strides match `bf16_gemv`: zero means the row is exactly
+/// the dimension, so a caller batching rows out of a wider layout binds them.
+/// `[[threadgroup(0)]]` needs one float per 32 lanes.
+kernel void bf16_gemv_rows(
+    device const ushort* rawWeightBuffer [[buffer(0)]],
+    device const float* inputVector [[buffer(1)]],
+    device float* outputVector [[buffer(2)]],
+    constant uint64_t& weightOffset [[buffer(3)]],
+    constant uint32_t& inDim [[buffer(4)]],
+    constant uint32_t& outDim [[buffer(5)]],
+    constant uint32_t& inputRowStride [[buffer(6)]],
+    constant uint32_t& outputRowStride [[buffer(7)]],
+    threadgroup float* partials [[threadgroup(0)]],
+    uint groupIdx [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint laneInSimd [[thread_index_in_simdgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
+) {
+    if (inDim == 0u || outDim == 0u) return;
+
+    uint32_t row = groupIdx % outDim;
+    uint32_t tokenIdx = groupIdx / outDim;
+    uint32_t inStride = inputRowStride != 0u ? inputRowStride : inDim;
+    uint32_t outStride = outputRowStride != 0u ? outputRowStride : outDim;
+    device const ushort* wRow = rawWeightBuffer + (weightOffset / 2) + ((uint64_t)row * inDim);
+    device const float* inPtr = inputVector + ((uint64_t)tokenIdx * inStride);
+
+    float dot0 = 0.0f;
+    float dot1 = 0.0f;
+    uint32_t num4 = inDim / 4;
+    for (uint32_t i = lane; i < num4; i += laneCount) {
+        uint32_t base = i * 4;
+        ushort4 w4 = load_ushort4_unaligned(wRow + base);
+        float4 in4 = *(device const float4*)(inPtr + base);
+        dot0 += (bf16_to_fp32(w4.x) * in4.x) + (bf16_to_fp32(w4.y) * in4.y);
+        dot1 += (bf16_to_fp32(w4.z) * in4.z) + (bf16_to_fp32(w4.w) * in4.w);
+    }
+    for (uint32_t i = num4 * 4 + lane; i < inDim; i += laneCount) {
+        dot0 += bf16_to_fp32(wRow[i]) * inPtr[i];
+    }
+
+    // Two accumulators above already buy the loop some independence; what is left
+    // is one number per row, so the lanes reduce it in the width of the group.
+    float warpTotal = simd_sum(dot0 + dot1);
+    if (laneInSimd == 0u) partials[simdIdx] = warpTotal;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u) {
+        uint32_t simdCount = (laneCount + 31u) / 32u;
+        float total = 0.0f;
+        for (uint32_t group = 0; group < simdCount; ++group) {
+            total += partials[group];
+        }
+        outputVector[((uint64_t)tokenIdx * outStride) + row] = total;
+    }
+}
+
 /// MSL Kernel: Per-Head RMSNorm for Attention Heads (32-Thread SIMDgroup Cooperative, 2D Grid Aware)
 kernel void per_head_rmsnorm_bf16(
     device float* qkVector [[buffer(0)]],

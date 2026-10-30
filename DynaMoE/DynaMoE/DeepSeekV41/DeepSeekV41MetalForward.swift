@@ -98,6 +98,7 @@ nonisolated public enum DeepSeekV41Kernels {
     public static let mxfp4SwiGLU = "dsv41_mxfp4_swiglu_gate_up"
     public static let mxfp4DownAccumulate = "dsv41_mxfp4_down_accumulate"
     public static let bf16Gemv = "bf16_gemv"
+    public static let bf16GemvRows = "bf16_gemv_rows"
     public static let bf16SwiGLU = "bf16_swiglu_gate_up"
     public static let bf16DownAccumulate = "bf16_down_proj_accumulate"
     public static let bf16Embedding = "lookup_embeddings_bf16"
@@ -162,6 +163,35 @@ nonisolated public enum DeepSeekV41DevicePlan {
         case .bf16: return DeepSeekV41Kernels.bf16Gemv
         case .unsupported: return nil
         }
+    }
+
+    /// Whether a BF16 projection should spread one output row over a threadgroup.
+    ///
+    /// Two kernels compute the same dot product with the parallelism in different
+    /// places. `bf16_gemv` gives a thread a whole row and keeps the grid at
+    /// `outDim * rows` threads; `bf16_gemv_rows` gives a row a threadgroup. Neither
+    /// dominates, and which wins is decided by how much work the grid has
+    /// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #10"):
+    ///
+    /// - A hundred-odd rows of a wide reduction starve the first form. `attn.wo_a`
+    ///   is eight bands of 128 rows over 8,192 columns, so a block of eight
+    ///   positions is 1,024 threads; the row-per-threadgroup form is 10.7x faster
+    ///   there and 5.2x faster on `attn.wkv` (448 rows).
+    /// - A tall, narrow projection has plenty of rows and the reverse holds: at
+    ///   73,728 rows the first form is 2.4x faster, because a 64-lane threadgroup
+    ///   with three float4 loads each spends more time at its barrier than on the
+    ///   reduction.
+    ///
+    /// The threshold is where the measured crossover sits: the row-per-threadgroup
+    /// form still wins by 2.3x at 6,144 threads and loses by 10% at 12,288. A decode
+    /// step is the exception and takes the row-per-threadgroup form at any row
+    /// count, because with one row there is no second position to reuse a row's
+    /// bytes and the one-thread form was slower at every shape measured (1.4x to
+    /// 22x).
+    public static func bf16GemvWantsWideGrid(outDim: Int, rows: Int) -> Bool {
+        let height = max(1, rows)
+        guard height > 1 else { return true }
+        return outDim * height <= 8_192
     }
 
     /// The fused gate+up kernel, or nil when the format's kernel cannot apply the
@@ -2861,6 +2891,18 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// the squares and for the dot product.
     private static let hyperConnectionReductionSlots = 32
 
+    /// Lanes one output row of a BF16 projection's reduction runs on, when the row
+    /// is a threadgroup.
+    ///
+    /// The widest band the checkpoint asks for is 8,192 values over these lanes,
+    /// which is 32 float4 loads each. Measured at the published shapes: 64 and 128
+    /// lanes are within noise of each other, 32 lanes costs the narrow bands up to
+    /// 11%, and 256 lanes up to 50% (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #10").
+    private static let gemvLaneWidth = 64
+
+    /// Partials a BF16 projection's reduction writes: one slot per SIMD group.
+    private static let gemvReductionSlots = 32
+
     // MARK: Feed-forward stages
 
     private func encodeSharedExpert(
@@ -3211,7 +3253,14 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.setBytes(&inStride, length: 4, index: 8)
             encoder.setBytes(&outStride, length: 4, index: 9)
         case .bf16:
-            encoder.setComputePipelineState(pipelines.bf16Gemv)
+            // Two shapes of the same dot product: one thread per output row, or one
+            // threadgroup per output row with the reduction spread across its lanes.
+            // Which one is cheaper depends on how much work the grid has, so the
+            // choice is a plan rule rather than a constant.
+            let wideGrid = DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(
+                outDim: outDim, rows: max(1, rows)
+            )
+            encoder.setComputePipelineState(wideGrid ? pipelines.bf16GemvRows : pipelines.bf16Gemv)
             encoder.setBuffer(weightBuffer, offset: 0, index: 0)
             encoder.setBuffer(input, offset: inputByteOffset, index: 1)
             encoder.setBuffer(output, offset: outputByteOffset, index: 2)
@@ -3223,6 +3272,19 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.setBytes(&outDimension, length: 4, index: 5)
             encoder.setBytes(&inStride, length: 4, index: 6)
             encoder.setBytes(&outStride, length: 4, index: 7)
+            if wideGrid {
+                encoder.setThreadgroupMemoryLength(
+                    Self.gemvReductionSlots * MemoryLayout<Float>.stride, index: 0
+                )
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: outDim * max(1, rows), height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(
+                        width: Self.gemvLaneWidth, height: 1, depth: 1
+                    )
+                )
+                encoder.memoryBarrier(scope: .buffers)
+                return
+            }
         case .unsupported:
             throw DeepSeekV41EngineError.unsupportedDtype("a projection", weight.dtype)
         }
