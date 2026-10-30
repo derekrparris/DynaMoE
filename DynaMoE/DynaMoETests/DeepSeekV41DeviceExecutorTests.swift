@@ -417,6 +417,22 @@ final class DeepSeekV41DevicePlanTests: XCTestCase {
         XCTAssertTrue(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 7_168, rows: 1))
         XCTAssertTrue(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 73_728, rows: 1))
         XCTAssertTrue(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 448, rows: 0))
+
+        // A full block of eight positions takes the kernel that streams an output row
+        // once for every position, and it does so at every row count: it measured
+        // faster than both other forms from 448 rows to 73,728, so there is no
+        // threshold here to get wrong.
+        for outDim in [128, 448, 1_536, 7_168, 73_728] {
+            XCTAssertEqual(
+                DeepSeekV41DevicePlan.bf16GemvForm(outDim: outDim, rows: 8), .block,
+                "an eight-position block at \(outDim) rows"
+            )
+        }
+        // A shorter batch has no block kernel, and falls back to the two-way rule.
+        XCTAssertEqual(DeepSeekV41DevicePlan.bf16GemvForm(outDim: 128, rows: 1), .wideGrid)
+        XCTAssertEqual(DeepSeekV41DevicePlan.bf16GemvForm(outDim: 448, rows: 3), .wideGrid)
+        XCTAssertEqual(DeepSeekV41DevicePlan.bf16GemvForm(outDim: 7_168, rows: 3), .perRow)
+        XCTAssertEqual(DeepSeekV41DevicePlan.bf16GemvForm(outDim: 73_728, rows: 7), .perRow)
     }
 }
 

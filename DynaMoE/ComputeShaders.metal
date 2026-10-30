@@ -1622,6 +1622,137 @@ kernel void bf16_gemv_rows(
     }
 }
 
+/// MSL Kernel: BF16 GEMV for a full block of eight positions, reusing every
+/// loaded weight value across them.
+///
+/// `bf16_gemv_rows` gives a threadgroup one (row, token) pair, so a block of eight
+/// positions loads the same weight row eight times — 134 MB of loads for a band whose
+/// weight is 16.8 MB — and the stage settles at the request rate rather than the
+/// memory bandwidth (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #12"). Here a threadgroup
+/// owns one output row and streams it ONCE, keeping one accumulator per position, so
+/// the weight is read exactly as often as it changes.
+///
+/// Eight is `DeepSeekV41DevicePlan.chunkSlots`' ceiling, and the accumulators are
+/// named rather than indexed because an array indexed by a runtime bound does not stay
+/// in registers. A block shorter than eight positions uses `bf16_gemv_rows`.
+///
+/// Grid: (outDim, 1, 1), one threadgroup per output row. `[[threadgroup(0)]]` needs
+/// eight floats per 32 lanes, laid out warp-major.
+kernel void bf16_gemv_rows8(
+    device const ushort* rawWeightBuffer [[buffer(0)]],
+    device const float* inputVector [[buffer(1)]],
+    device float* outputVector [[buffer(2)]],
+    constant uint64_t& weightOffset [[buffer(3)]],
+    constant uint32_t& inDim [[buffer(4)]],
+    constant uint32_t& outDim [[buffer(5)]],
+    constant uint32_t& inputRowStride [[buffer(6)]],
+    constant uint32_t& outputRowStride [[buffer(7)]],
+    threadgroup float* partials [[threadgroup(0)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint laneInSimd [[thread_index_in_simdgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
+) {
+    if (inDim == 0u || outDim == 0u || row >= outDim) return;
+
+    uint32_t inStride = inputRowStride != 0u ? inputRowStride : inDim;
+    uint32_t outStride = outputRowStride != 0u ? outputRowStride : outDim;
+    device const ushort* wRow = rawWeightBuffer + (weightOffset / 2) + ((uint64_t)row * inDim);
+    // The lane offset comes in through `i`, which starts at `lane`; adding it here as
+    // well would shift every load by one lane and still produce plausible numbers.
+    device const float* inPtr = inputVector;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    float acc4 = 0.0f;
+    float acc5 = 0.0f;
+    float acc6 = 0.0f;
+    float acc7 = 0.0f;
+    uint32_t num4 = inDim / 4;
+    for (uint32_t i = lane; i < num4; i += laneCount) {
+        uint32_t base = i * 4;
+        ushort4 w4 = load_ushort4_unaligned(wRow + base);
+        float w0 = bf16_to_fp32(w4.x);
+        float w1 = bf16_to_fp32(w4.y);
+        float w2 = bf16_to_fp32(w4.z);
+        float w3 = bf16_to_fp32(w4.w);
+        device const float* p = inPtr + base;
+        float4 a0 = *(device const float4*)(p);
+        float4 a1 = *(device const float4*)(p + inStride);
+        float4 a2 = *(device const float4*)(p + 2 * inStride);
+        float4 a3 = *(device const float4*)(p + 3 * inStride);
+        float4 a4 = *(device const float4*)(p + 4 * inStride);
+        float4 a5 = *(device const float4*)(p + 5 * inStride);
+        float4 a6 = *(device const float4*)(p + 6 * inStride);
+        float4 a7 = *(device const float4*)(p + 7 * inStride);
+        acc0 += w0 * a0.x + w1 * a0.y + w2 * a0.z + w3 * a0.w;
+        acc1 += w0 * a1.x + w1 * a1.y + w2 * a1.z + w3 * a1.w;
+        acc2 += w0 * a2.x + w1 * a2.y + w2 * a2.z + w3 * a2.w;
+        acc3 += w0 * a3.x + w1 * a3.y + w2 * a3.z + w3 * a3.w;
+        acc4 += w0 * a4.x + w1 * a4.y + w2 * a4.z + w3 * a4.w;
+        acc5 += w0 * a5.x + w1 * a5.y + w2 * a5.z + w3 * a5.w;
+        acc6 += w0 * a6.x + w1 * a6.y + w2 * a6.z + w3 * a6.w;
+        acc7 += w0 * a7.x + w1 * a7.y + w2 * a7.z + w3 * a7.w;
+    }
+
+    // One warp sum per position, then a lane-0 pass over the partials. The layout is
+    // warp-major so a warp's eight writes are contiguous.
+    float sum0 = simd_sum(acc0);
+    float sum1 = simd_sum(acc1);
+    float sum2 = simd_sum(acc2);
+    float sum3 = simd_sum(acc3);
+    float sum4 = simd_sum(acc4);
+    float sum5 = simd_sum(acc5);
+    float sum6 = simd_sum(acc6);
+    float sum7 = simd_sum(acc7);
+    if (laneInSimd == 0u) {
+        uint32_t base = simdIdx * 8u;
+        partials[base + 0u] = sum0;
+        partials[base + 1u] = sum1;
+        partials[base + 2u] = sum2;
+        partials[base + 3u] = sum3;
+        partials[base + 4u] = sum4;
+        partials[base + 5u] = sum5;
+        partials[base + 6u] = sum6;
+        partials[base + 7u] = sum7;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u) {
+        uint32_t simdCount = (laneCount + 31u) / 32u;
+        float total0 = 0.0f;
+        float total1 = 0.0f;
+        float total2 = 0.0f;
+        float total3 = 0.0f;
+        float total4 = 0.0f;
+        float total5 = 0.0f;
+        float total6 = 0.0f;
+        float total7 = 0.0f;
+        for (uint32_t group = 0; group < simdCount; ++group) {
+            uint32_t base = group * 8u;
+            total0 += partials[base + 0u];
+            total1 += partials[base + 1u];
+            total2 += partials[base + 2u];
+            total3 += partials[base + 3u];
+            total4 += partials[base + 4u];
+            total5 += partials[base + 5u];
+            total6 += partials[base + 6u];
+            total7 += partials[base + 7u];
+        }
+        uint64_t blockOut = row;
+        outputVector[blockOut + 0 * outStride] = total0;
+        outputVector[blockOut + 1 * outStride] = total1;
+        outputVector[blockOut + 2 * outStride] = total2;
+        outputVector[blockOut + 3 * outStride] = total3;
+        outputVector[blockOut + 4 * outStride] = total4;
+        outputVector[blockOut + 5 * outStride] = total5;
+        outputVector[blockOut + 6 * outStride] = total6;
+        outputVector[blockOut + 7 * outStride] = total7;
+    }
+}
+
 /// MSL Kernel: Per-Head RMSNorm for Attention Heads (32-Thread SIMDgroup Cooperative, 2D Grid Aware)
 kernel void per_head_rmsnorm_bf16(
     device float* qkVector [[buffer(0)]],

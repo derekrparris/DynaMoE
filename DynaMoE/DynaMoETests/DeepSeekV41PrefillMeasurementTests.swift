@@ -938,8 +938,10 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
               let library = metal.makeDefaultLibrary(),
               let perRowFunction = library.makeFunction(name: "bf16_gemv"),
               let rowsFunction = library.makeFunction(name: "bf16_gemv_rows"),
+              let blockFunction = library.makeFunction(name: "bf16_gemv_rows8"),
               let perRow = try? metal.makeComputePipelineState(function: perRowFunction),
               let rows = try? metal.makeComputePipelineState(function: rowsFunction),
+              let block = try? metal.makeComputePipelineState(function: blockFunction),
               let queue = metal.makeCommandQueue() else {
             XCTFail("the GEMV kernels are not in the default library")
             return
@@ -1000,6 +1002,9 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
                   ),
                   let rowsOutput = metal.makeBuffer(
                       length: slots * outDim * MemoryLayout<Float>.stride, options: .storageModeShared
+                  ),
+                  let blockOutput = metal.makeBuffer(
+                      length: 8 * outDim * MemoryLayout<Float>.stride, options: .storageModeShared
                   ) else {
                 XCTFail("\(name): buffers did not allocate")
                 return
@@ -1008,6 +1013,7 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
             fill(input, bytes: slots * inDim * MemoryLayout<Float>.stride, tile: inputTile)
             memset(perRowOutput.contents(), 0, perRowOutput.length)
             memset(rowsOutput.contents(), 0, rowsOutput.length)
+            memset(blockOutput.contents(), 0, blockOutput.length)
 
             func encode(
                 _ encoder: MTLComputeCommandEncoder,
@@ -1038,6 +1044,14 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
                             MTLSize(width: outDim * slots, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
                         )
+                    } else if pipeline === block {
+                        encoder.setThreadgroupMemoryLength(
+                            32 * 8 * MemoryLayout<Float>.stride, index: 0
+                        )
+                        encoder.dispatchThreadgroups(
+                            MTLSize(width: outDim, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+                        )
                     } else {
                         // The executor's `threadgroup(_:)` caps the width at 64, so
                         // this mirrors the launch the stage actually uses.
@@ -1062,12 +1076,18 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
             }
             run(perRow, perRowOutput, 0)
             run(rows, rowsOutput, laneWidth)
+            // The block form only covers a full block of eight positions.
+            if slots == 8 { run(block, blockOutput, laneWidth) }
 
             // The host rule over the same bytes, at the first and last row, for both
             // kernels. Cheap enough at every shape here.
             let weights = weight.contents().assumingMemoryBound(to: UInt16.self)
             let inputs = input.contents().assumingMemoryBound(to: Float.self)
-            for (output, label) in [(perRowOutput, "perRow"), (rowsOutput, "rows")] {
+            var validated: [(MTLBuffer, String)] = [
+                (perRowOutput, "perRow"), (rowsOutput, "rows"),
+            ]
+            if slots == 8 { validated.append((blockOutput, "block")) }
+            for (output, label) in validated {
                 let values = output.contents().assumingMemoryBound(to: Float.self)
                 for (row, token) in [(0, 0), (outDim - 1, slots - 1)] {
                     var expected: Float = 0
@@ -1110,22 +1130,26 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
 
             let shipped = best(perRow, perRowOutput, 0)
             let widened = best(rows, rowsOutput, laneWidth)
-            print(
-                String(
-                    format: "[dsv41 gemv] %-14@ slots=%-2d out=%-6d in=%-5d "
-                        + "perRow %8.4f ms/pos %5.0f GB/s   rows %8.4f ms/pos %5.0f GB/s "
-                        + "(%+.2fx)",
-                    name as NSString,
-                    slots,
-                    outDim,
-                    inDim,
-                    shipped.milliseconds / Double(slots),
-                    shipped.gigabytesPerSecond,
-                    widened.milliseconds / Double(slots),
-                    widened.gigabytesPerSecond,
-                    shipped.milliseconds / widened.milliseconds
-                )
+            var line = String(
+                format: "[dsv41 gemv] %-14@ slots=%-2d out=%-6d in=%-5d "
+                    + "perRow %8.4f ms/pos   rows %8.4f ms/pos (%+.2fx)",
+                name as NSString,
+                slots,
+                outDim,
+                inDim,
+                shipped.milliseconds / Double(slots),
+                widened.milliseconds / Double(slots),
+                shipped.milliseconds / widened.milliseconds
             )
+            if slots == 8 {
+                let shared = best(block, blockOutput, laneWidth)
+                line += String(
+                    format: "   block %8.4f ms/pos (%+.2fx)",
+                    shared.milliseconds / 8,
+                    shipped.milliseconds / shared.milliseconds
+                )
+            }
+            print(line)
             guard laneSweep else { return }
             for lanes in [32, 64, 128, 256] {
                 let swept = best(rows, rowsOutput, lanes)

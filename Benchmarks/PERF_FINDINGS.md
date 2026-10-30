@@ -4500,3 +4500,77 @@ which is the strongest evidence that the footprint is not the variable.
 
 Tests: `testHowAStagesCostScalesWithTheWeightItReads` (the table above, opt-in, ~2 s).
 Whole DeepSeek suite: 411 tests, 10 skipped, 0 failures.
+
+## DSV4.1 #13: A BLOCK'S PROJECTIONS NOW READ EACH WEIGHT ROW ONCE
+
+`#12` ended on a description of the defect rather than a fix: every position of a block
+re-reads the same weight row, so `attn.wo_a`'s eight bands ask for 134 MB of loads to
+read 16.8 MB, and the stage settles at the request rate. The reuse it suggested is the
+opposite register trade to `#6`'s: there, sharing a loaded record row across heads needed
+eight deep per-head accumulator state and cost 2.5x in occupancy; here the shared operand
+is the weight and the per-position state is ONE float.
+
+`bf16_gemv_rows8` gives a threadgroup one output row and streams it once, keeping eight
+named accumulators — named because an array indexed by a runtime bound does not stay in
+registers, and eight is `chunkSlots`' ceiling. `DeepSeekV41DevicePlan.bf16GemvForm` picks
+between it, `bf16_gemv_rows` and `bf16_gemv`: an eight-position block always takes the
+block form, a shorter batch has no block kernel and falls back to `#10`'s two-way rule
+(decode prefers the wide grid at any row count).
+
+**Isolated, published shapes, one block of eight positions** (self-validated against a host
+dot at 1e-4 for all three forms before timing):
+
+| stage | shape | one thread per row | threadgroup per (row, position) | threadgroup per row |
+|---|---|---:|---:|---:|
+| `latentProject` | 448 x 7,168 | 0.0264 | 0.0038 | **0.0023** |
+| `queryDown` | 1,536 x 7,168 | 0.0222 | 0.0220 | **0.0058** |
+| `queryUp` | 73,728 x 1,536 | 0.1119 | 0.3833 | **0.0486** |
+| `outputUp` | 7,168 x 1,024 | 0.0080 | 0.0146 | **0.0029** |
+| `outputDown`, one band | 128 x 8,192 | 0.1462 | 0.0154 | **0.0095** |
+| `crossover` | 6,144 x 8,192 | 0.0688 | 0.1668 | **0.0369** |
+| `crossover` | 96 x 8,192 | 0.0182 | 0.0014 | **0.0012** |
+
+The block form wins at every shape measured, from 96 rows to 73,728, which is why it needs
+no threshold: 1.6x to 3.8x over whichever form shipped before it. The row-count crossover
+that `#10` had to find disappears at an eight-position batch, because the weight is read
+once whatever the row count is.
+
+**What it did to the table** (published widths, same case):
+| stage | `#10` | now |
+|---|---:|---:|
+| `queryUp` | 0.096 | 0.046 |
+| `outputDown` | 0.145 | 0.046 |
+| `outputUp` | 0.079 | 0.044 |
+| `queryDown` | 0.025 | 0.013 |
+| `latentProject` | 0.012 | 0.014 |
+| `writeLatent` | 0.246 | 0.247 |
+| dense device, ms/position | 0.674 | 0.480 |
+| whole block, ms/position | 1.12 | **0.93** |
+
+Dense device time is 1.40x cheaper and the whole block 1.20x, because the dense half is no
+longer most of it: the mixture is 0.417 against 0.480 now, so the deliberately-tiny
+synthetic mixture is 46% of device time and further dense wins buy little until it stops
+being fake.
+
+**The table it leaves.** `writeLatent` is **0.247 ms/position and 51.2% of the dense half**
+— it was 34.4% before this slice purely because the stages around it got cheaper. Every
+other dense stage is now at or near the floor, `queryUp`/`outputDown`/`outputUp` at 0.044-0.046
+having been 0.079-0.145.
+
+A note on the floor: the calibration row read 0.040 in `#10`'s table and reads 0.003 here,
+with no change to the calibration dispatch. It is a per-stage layout cost, and it moves with
+whatever else is in flight, so it has to be read off the same table as the stages rather than
+carried between them.
+
+**Caveats.** The isolated numbers are cache-warm, and one fixture quirk survives: the
+`outputDown` row times one band eight times, so its absolute figures are optimistic for both
+forms — the ratio is still measured like for like. BF16 synthetic weights (the checkpoint
+quantises its attention projections), one layer, no compressed layers, a 32-wide synthetic
+mixture.
+
+Tests: `testTheBlockGemvSharesOneLoadAcrossEightPositions` (all eight positions of all rows
+of a banded projection against the host product, with the group offsets a block-diagonal
+caller binds), `testTheWideGemvGridIsChosenByHowMuchWorkTheProjectionHas` extended to the
+three-way choice, and `testWhatOneProjectionCostsAtThePublishedWidths` grown a third column.
+Whole DeepSeek suite: 412 tests, 10 skipped, 0 failures — including
+`testTheDeviceAndTheHostAgreeStageByStage` and the bit-identical chunk seam.

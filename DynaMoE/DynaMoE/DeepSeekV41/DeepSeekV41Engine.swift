@@ -236,6 +236,7 @@ nonisolated public struct DeepSeekV41Pipelines {
     /// BF16 fallback for a checkpoint whose FFN was not quantized.
     public let bf16Gemv: MTLComputePipelineState
     public let bf16GemvRows: MTLComputePipelineState
+    public let bf16GemvBlock: MTLComputePipelineState
     public let bf16SwiGLU: MTLComputePipelineState
     public let bf16DownAccumulate: MTLComputePipelineState
     public let embeddingBF16: MTLComputePipelineState
@@ -275,6 +276,7 @@ nonisolated public struct DeepSeekV41Pipelines {
         self.fp8DownAccumulate = try make("dsv41_fp8_block32_down_accumulate")
         self.bf16Gemv = try make("bf16_gemv")
         self.bf16GemvRows = try make("bf16_gemv_rows")
+        self.bf16GemvBlock = try make("bf16_gemv_rows8")
         self.bf16SwiGLU = try make("bf16_swiglu_gate_up")
         self.bf16DownAccumulate = try make("bf16_down_proj_accumulate")
         self.embeddingBF16 = try make("lookup_embeddings_bf16")

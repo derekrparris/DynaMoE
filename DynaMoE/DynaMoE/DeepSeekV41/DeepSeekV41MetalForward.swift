@@ -99,11 +99,20 @@ nonisolated public enum DeepSeekV41Kernels {
     public static let mxfp4DownAccumulate = "dsv41_mxfp4_down_accumulate"
     public static let bf16Gemv = "bf16_gemv"
     public static let bf16GemvRows = "bf16_gemv_rows"
+    public static let bf16GemvBlock = "bf16_gemv_rows8"
     public static let bf16SwiGLU = "bf16_swiglu_gate_up"
     public static let bf16DownAccumulate = "bf16_down_proj_accumulate"
     public static let bf16Embedding = "lookup_embeddings_bf16"
     public static let mxfp8Embedding = "lookup_embeddings_mxfp8"
     public static let rmsNorm = "dsv41_rmsnorm_f32_gain"
+}
+
+/// The three shapes of one BF16 dot product: one thread per output row, one
+/// threadgroup per (row, position), or one threadgroup per row covering a whole block.
+nonisolated public enum DeepSeekV41BF16GemvForm: Equatable, Sendable {
+    case perRow
+    case wideGrid
+    case block
 }
 
 /// The pure half of the executor: tensor format to kernel, and the planning rules
@@ -192,6 +201,20 @@ nonisolated public enum DeepSeekV41DevicePlan {
         let height = max(1, rows)
         guard height > 1 else { return true }
         return outDim * height <= 8_192
+    }
+
+    /// Which of the three BF16 GEMV kernels a projection gets.
+    ///
+    /// A full block of eight positions — `chunkSlots`' ceiling — takes
+    /// `bf16_gemv_rows8`, which gives a threadgroup one output row and streams it once
+    /// for every position, so the weight is read as often as it changes instead of once
+    /// per position. It measured faster than both other forms at every published shape,
+    /// from 448 rows to 73,728, so there is no threshold to pick: an eight-position
+    /// block always wants it. A shorter batch has no such kernel and falls back to the
+    /// two-way rule in `bf16GemvWantsWideGrid`.
+    public static func bf16GemvForm(outDim: Int, rows: Int) -> DeepSeekV41BF16GemvForm {
+        if max(1, rows) == 8 { return .block }
+        return bf16GemvWantsWideGrid(outDim: outDim, rows: rows) ? .wideGrid : .perRow
     }
 
     /// The fused gate+up kernel, or nil when the format's kernel cannot apply the
@@ -3253,14 +3276,16 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.setBytes(&inStride, length: 4, index: 8)
             encoder.setBytes(&outStride, length: 4, index: 9)
         case .bf16:
-            // Two shapes of the same dot product: one thread per output row, or one
-            // threadgroup per output row with the reduction spread across its lanes.
-            // Which one is cheaper depends on how much work the grid has, so the
-            // choice is a plan rule rather than a constant.
-            let wideGrid = DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(
-                outDim: outDim, rows: max(1, rows)
-            )
-            encoder.setComputePipelineState(wideGrid ? pipelines.bf16GemvRows : pipelines.bf16Gemv)
+            // Three shapes of the same dot product, and which one is cheaper depends
+            // on how much work the grid has and on whether a whole block is running, so
+            // the choice is a plan rule rather than a constant.
+            let form = DeepSeekV41DevicePlan.bf16GemvForm(outDim: outDim, rows: max(1, rows))
+            let wideGrid = form != .perRow
+            switch form {
+            case .block: encoder.setComputePipelineState(pipelines.bf16GemvBlock)
+            case .wideGrid: encoder.setComputePipelineState(pipelines.bf16GemvRows)
+            case .perRow: encoder.setComputePipelineState(pipelines.bf16Gemv)
+            }
             encoder.setBuffer(weightBuffer, offset: 0, index: 0)
             encoder.setBuffer(input, offset: inputByteOffset, index: 1)
             encoder.setBuffer(output, offset: outputByteOffset, index: 2)
@@ -3272,6 +3297,21 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.setBytes(&outDimension, length: 4, index: 5)
             encoder.setBytes(&inStride, length: 4, index: 6)
             encoder.setBytes(&outStride, length: 4, index: 7)
+            if form == .block {
+                // One threadgroup per output row, each streaming the row once for all
+                // eight positions: the partials are eight floats per warp.
+                encoder.setThreadgroupMemoryLength(
+                    32 * 8 * MemoryLayout<Float>.stride, index: 0
+                )
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: outDim, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(
+                        width: Self.gemvLaneWidth, height: 1, depth: 1
+                    )
+                )
+                encoder.memoryBarrier(scope: .buffers)
+                return
+            }
             if wideGrid {
                 encoder.setThreadgroupMemoryLength(
                     Self.gemvReductionSlots * MemoryLayout<Float>.stride, index: 0
