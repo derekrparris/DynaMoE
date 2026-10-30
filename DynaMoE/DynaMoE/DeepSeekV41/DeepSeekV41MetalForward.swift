@@ -516,6 +516,63 @@ nonisolated public struct DeepSeekV41ParityProbes {
 
 // MARK: - Executor
 
+/// Where a block's per-layer time goes, in nanoseconds.
+///
+/// Three buckets rather than a profiler because the question is narrow: after the
+/// mixture was batched, a block still costs ~0.14 ms/position/layer, and the fix
+/// depends on whether that is host encode (fewer dispatches over more positions),
+/// device time (fewer or cheaper kernels), or the mixture's own encode. Zero unless
+/// `DeepSeekV41MetalForward.recordsBlockTiming` is on.
+nonisolated public struct DeepSeekV41BlockTiming: Sendable, Equatable {
+    /// Host time encoding every stage of the dense half, batched and per slot.
+    public var denseEncodeNanoseconds: UInt64 = 0
+    /// Host time blocked on the dense half, which is the routing readback's wait:
+    /// device time plus the commit — INCLUDING whatever the queue had not finished,
+    /// which is the previous layer's mixture. That is why the two device fields
+    /// below exist rather than trusting this one.
+    public var frontWaitNanoseconds: UInt64 = 0
+    /// Host time encoding the mixture half.
+    public var mixtureEncodeNanoseconds: UInt64 = 0
+    /// Device time the dense half's command buffers actually occupied, summed from
+    /// their own `gpuStartTime`/`gpuEndTime`. A previous half still running on the
+    /// queue is not counted here, so this and `mixtureDeviceNanoseconds` are the
+    /// split that says which half to work on.
+    public var denseDeviceNanoseconds: UInt64 = 0
+    /// The same for the mixture half.
+    public var mixtureDeviceNanoseconds: UInt64 = 0
+    /// Layers measured, so a caller divides by layers rather than by blocks.
+    public var layers: Int = 0
+    /// Positions measured, i.e. the sum of every measured block's width.
+    public var positions: Int = 0
+
+    public init() {}
+
+    public var encodedNanoseconds: UInt64 { denseEncodeNanoseconds + mixtureEncodeNanoseconds }
+
+    /// Per-position, per-layer cost of each bucket, in milliseconds. `positions`
+    /// already counts every measured block's width, so this is `layers * block
+    /// width` and dividing by it needs no further factor.
+    public func millisecondsPerPositionLayer() -> (
+        denseEncode: Double,
+        wait: Double,
+        mixtureEncode: Double,
+        denseDevice: Double,
+        mixtureDevice: Double
+    ) {
+        let divisor = Double(max(1, positions))
+        func milliseconds(_ nanoseconds: UInt64) -> Double {
+            Double(nanoseconds) / divisor / 1_000_000
+        }
+        return (
+            milliseconds(denseEncodeNanoseconds),
+            milliseconds(frontWaitNanoseconds),
+            milliseconds(mixtureEncodeNanoseconds),
+            milliseconds(denseDeviceNanoseconds),
+            milliseconds(mixtureDeviceNanoseconds)
+        )
+    }
+}
+
 /// One loaded DeepSeek-V4.1 checkpoint, driven one position at a time.
 ///
 /// `forwardToken` appends exactly one position (the cache holds every position the
@@ -591,6 +648,15 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// by `settlePending` at every readback and at the end of a token.
     private var pending: [(buffer: MTLCommandBuffer, stage: String)] = []
 
+    /// Command buffers whose device time `recordDeviceTiming` still has to read, with
+    /// the half they belong to (0 dense, 1 mixture). Only filled while
+    /// `recordsBlockTiming` is on, and only in the block path.
+    private var timingBuffers: [(buffer: MTLCommandBuffer, bucket: Int)] = []
+    /// One front-half buffer per stage, filled only while `recordsStageTiming` is on.
+    private var stageBuffers: [(stage: String, buffer: MTLCommandBuffer)] = []
+    /// Measurement-only scratch the calibration stage dispatches into.
+    private var calibrationScratch: MTLBuffer?
+
     /// Diagnostic readback, off in every production path.
     ///
     /// The intermediates a layer derives live in buffers a later stage of the SAME
@@ -600,6 +666,40 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// computed and what it computed FROM; without that a disagreement can only be
     /// reported, not attributed to a stage.
     public var parityProbes = DeepSeekV41ParityProbes()
+
+    /// Where a block's per-layer time goes, accumulated while `recordsBlockTiming`
+    /// is on. Off in every production path.
+    ///
+    /// The split is deliberately coarse: host time encoding the dense half, host
+    /// time blocked on the dense half's wait, and host time encoding the mixture.
+    /// Those three want opposite fixes — a per-slot kernel turned into a grid over
+    /// positions only helps if encode time is what dominates, and it costs nothing
+    /// if the wait is — so the number decides the next change instead of a dispatch
+    /// census (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #3").
+    public var recordsBlockTiming = false
+    public private(set) var blockTiming = DeepSeekV41BlockTiming()
+
+    /// Device time per dense-half stage, in nanoseconds, by stage name.
+    ///
+    /// Off unless `recordsStageTiming` is on, which changes the LAYOUT rather than
+    /// the work: each stage is committed in its own command buffer (submission order
+    /// on the queue is unchanged, and Metal tracks the buffers) so every stage
+    /// reports its own `gpuStartTime`/`gpuEndTime`. That is the only way to say which
+    /// stage holds the dense half's device time, which after the mixture was batched
+    /// is the largest single block of a block's cost.
+    public var recordsStageTiming = false
+    public private(set) var stageTiming: [String: UInt64] = [:]
+
+    /// Clears the accumulated timing, so a measurement times one prompt rather than
+    /// everything the executor has ever run.
+    public func resetBlockTiming() {
+        blockTiming = DeepSeekV41BlockTiming()
+    }
+
+    /// Clears the per-stage accumulation.
+    public func resetStageTiming() {
+        stageTiming.removeAll(keepingCapacity: true)
+    }
 
     public init(runtime: DeepSeekV41Runtime, shardBuffers: [UInt32: MTLBuffer]) {
         self.config = runtime.config
@@ -996,6 +1096,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         // Only the last position's logits are read.
         try finishBlock(slot: tokens.count - 1)
         try settlePending()
+        if recordsBlockTiming { recordDeviceTiming() }
         cache.noteStored(startPosition + tokens.count)
 
         var logits = [Float](repeating: 0, count: config.vocabSize)
@@ -1014,6 +1115,13 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         startPosition: Int,
         count: Int
     ) throws {
+        // Measurement only (`recordsBlockTiming`): four marks — layer start, dense
+        // half encoded, front half waited on, mixture encoded. The split is the one
+        // that matters, because host encode time and device time want opposite
+        // fixes: fewer dispatches over more positions, or fewer kernels.
+        let measuring = recordsBlockTiming
+        var marks: [UInt64] = measuring ? [DispatchTime.now().uptimeNanoseconds] : []
+
         // Engram rows are host reads, one position at a time, and each goes into the
         // table's staging block before the layer's command buffer exists.
         if layer.engramTable != nil {
@@ -1022,21 +1130,82 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             }
         }
 
-        let commandBuffer = try makeCommandBuffer()
-        let encoder = try makeEncoder(commandBuffer)
-        for stage in DeepSeekV41DevicePlan.frontHalf {
-            try encodeBlockStage(
-                stage,
-                layer: layer,
-                startPosition: startPosition,
-                count: count,
-                encoder: encoder
-            )
-        }
-        encoder.endEncoding()
         // The routing readback needs this half finished, for every position of the
-        // block at once: one wait instead of one per position.
-        try commit(commandBuffer, stage: "layer \(layer.index) attention (block \(count))")
+        // block at once: one wait instead of one per position. `recordsStageTiming`
+        // keeps that single wait but gives each stage its own command buffer, so the
+        // queue's submission order (and every hazard it protects) is unchanged while
+        // each stage reports its own device window.
+        if recordsStageTiming {
+            var frontBuffers: [MTLCommandBuffer] = []
+            for stage in DeepSeekV41DevicePlan.frontHalf {
+                let buffer = try makeCommandBuffer()
+                let encoder = try makeEncoder(buffer)
+                try encodeBlockStage(
+                    stage,
+                    layer: layer,
+                    startPosition: startPosition,
+                    count: count,
+                    encoder: encoder
+                )
+                encoder.endEncoding()
+                buffer.commit()
+                pending.append((
+                    buffer: buffer,
+                    stage: "layer \(layer.index) \(stage.rawValue) (block \(count))"
+                ))
+                stageBuffers.append((stage: stage.rawValue, buffer: buffer))
+                frontBuffers.append(buffer)
+            }
+            // Calibration: what `count` trivial dispatches cost with nothing to
+            // compute, so the stage table can be read as dispatch overhead against
+            // real work instead of guessed at. The scratch buffer is measurement-only
+            // and one dispatch writes 16 bytes.
+            if calibrationScratch == nil {
+                calibrationScratch = device.makeBuffer(length: 1024, options: .storageModeShared)
+            }
+            if let scratch = calibrationScratch {
+                let calibration = try makeCommandBuffer()
+                let calibrationEncoder = try makeEncoder(calibration)
+                for _ in 0..<count {
+                    try encodeClear(calibrationEncoder, buffer: scratch, count: 4)
+                }
+                calibrationEncoder.endEncoding()
+                calibration.commit()
+                pending.append((buffer: calibration, stage: "layer \(layer.index) calibration"))
+                stageBuffers.append((
+                    stage: "calibration(\(count) dispatch)",
+                    buffer: calibration
+                ))
+            }
+            if measuring { marks.append(DispatchTime.now().uptimeNanoseconds) }
+            try settlePending()
+            recordStageTiming()
+            if measuring {
+                marks.append(DispatchTime.now().uptimeNanoseconds)
+                for buffer in frontBuffers {
+                    timingBuffers.append((buffer: buffer, bucket: 0))
+                }
+            }
+        } else {
+            let commandBuffer = try makeCommandBuffer()
+            let encoder = try makeEncoder(commandBuffer)
+            for stage in DeepSeekV41DevicePlan.frontHalf {
+                try encodeBlockStage(
+                    stage,
+                    layer: layer,
+                    startPosition: startPosition,
+                    count: count,
+                    encoder: encoder
+                )
+            }
+            encoder.endEncoding()
+            if measuring { marks.append(DispatchTime.now().uptimeNanoseconds) }
+            try commit(commandBuffer, stage: "layer \(layer.index) attention (block \(count))")
+            if measuring {
+                marks.append(DispatchTime.now().uptimeNanoseconds)
+                timingBuffers.append((buffer: commandBuffer, bucket: 0))
+            }
+        }
 
         let routings = (0..<count).map { readRouting(slot: $0) }
 
@@ -1070,6 +1239,11 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 stage: "layer \(layer.index) experts (block \(count))",
                 waiting: false
             )
+            if measuring {
+                marks.append(DispatchTime.now().uptimeNanoseconds)
+                timingBuffers.append((buffer: expertCommand, bucket: 1))
+            }
+            recordLayerTiming(marks, positions: count)
             return
         }
 
@@ -1098,7 +1272,54 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             }
             expertEncoder.endEncoding()
             try commit(expertCommand, stage: "layer \(layer.index) experts", waiting: true)
+            if measuring { timingBuffers.append((buffer: expertCommand, bucket: 1)) }
         }
+        if measuring { marks.append(DispatchTime.now().uptimeNanoseconds) }
+        recordLayerTiming(marks, positions: count)
+    }
+
+    /// Folds one layer's four measurement marks into `blockTiming`.
+    private func recordLayerTiming(_ marks: [UInt64], positions: Int) {
+        guard marks.count == 4 else { return }
+        blockTiming.denseEncodeNanoseconds += marks[1] - marks[0]
+        blockTiming.frontWaitNanoseconds += marks[2] - marks[1]
+        blockTiming.mixtureEncodeNanoseconds += marks[3] - marks[2]
+        blockTiming.layers += 1
+        blockTiming.positions += positions
+    }
+
+    /// Reads the device time of every command buffer the measured layers committed.
+    ///
+    /// `gpuStartTime`/`gpuEndTime` are only meaningful once a buffer has finished, so
+    /// this runs after the block's `settlePending`. The windows overlap nothing —
+    /// a buffer that started early because the queue was still draining the previous
+    /// layer reports its own window, which is exactly the attribution a host-side
+    /// wait cannot give.
+    private func recordDeviceTiming() {
+        for entry in timingBuffers {
+            let start = entry.buffer.gpuStartTime
+            let end = entry.buffer.gpuEndTime
+            guard end > start else { continue }
+            let nanoseconds = UInt64((end - start) * 1_000_000_000)
+            if entry.bucket == 0 {
+                blockTiming.denseDeviceNanoseconds += nanoseconds
+            } else {
+                blockTiming.mixtureDeviceNanoseconds += nanoseconds
+            }
+        }
+        timingBuffers.removeAll(keepingCapacity: true)
+    }
+
+    /// Reads each front-half stage's own device window, after the wait that covered
+    /// them all. Called only from the `recordsStageTiming` layout.
+    private func recordStageTiming() {
+        for entry in stageBuffers {
+            let start = entry.buffer.gpuStartTime
+            let end = entry.buffer.gpuEndTime
+            guard end > start else { continue }
+            stageTiming[entry.stage, default: 0] += UInt64((end - start) * 1_000_000_000)
+        }
+        stageBuffers.removeAll(keepingCapacity: true)
     }
 
     /// Every position's routed experts resident at the same time, or nil when that

@@ -3664,3 +3664,95 @@ is the guard — it walks `2 * window - 1` tokens and requires the block path to
 return bit-identical logits (worst delta 0, asserted at 1e-6), and every parity
 case asserts its tolerance through the same batched path. Full DeepSeek suite
 after the change: 399 tests, 73 classes, 0 failures.
+
+## DSV4.1 #3: WHERE THE BLOCK'S REMAINING TIME ACTUALLY GOES
+
+**Why another measurement.** `DSV4.1 #2` batched the mixture and halved a
+block's per-position cost to ~0.14 ms/position/layer, then left the remainder
+unattributed. Two explanations were on the table and they want opposite fixes:
+host time spent encoding dispatches (fewer and wider dispatches), or device
+time spent running them (fewer or cheaper kernels). Guessing here is what this
+journal exists to prevent, so the executor grew a switch.
+
+**Method.** `DeepSeekV41MetalForward.recordsBlockTiming` marks four points per
+layer — layer start, dense half encoded, dense half waited on, mixture encoded
+— and accumulates host nanoseconds per bucket. That split still cannot say
+which HALF the device time belongs to, because the dense half's wait also
+absorbs whatever the queue had not finished (the previous layer's mixture), so
+`DeepSeekV41BlockTiming` also sums the command buffers' own
+`gpuStartTime`/`gpuEndTime`. Then `recordsStageTiming` changes the LAYOUT, not
+the work: each dense stage is committed in its own command buffer (the queue's
+submission order and every hazard it protects are unchanged), so every stage
+reports its own device window. Finally a `calibration` stage dispatches `count`
+trivial clears, which is what turn "device window" into "overhead" versus
+"work".
+
+Both switches are off in every production path; the cases that use them are
+opt-in like the rest of this file's measurements. Machine **M5 Max, 128 GB,
+macOS 27.2**, synthetic checkpoint (hidden 64, 2 layers, window 4, block width
+4), prompt 32 positions, best of `1 + 3` runs.
+
+**Host split, ms per position per layer** (three runs):
+
+| bucket | run 1 | run 2 | run 3 |
+|---|---:|---:|---:|
+| dense half encoded (host) | 0.0237 | 0.0235 | 0.0241 |
+| dense half waited on | 0.2064 | 0.2101 | 0.1480 |
+| mixture encoded (host) | 0.0186 | 0.0188 | 0.0181 |
+
+Host encode is ~17-22% of that total. The rest is blocked on the device.
+
+**Device time, ms per position per layer** (same runs):
+
+| half | run 1 | run 2 | run 3 |
+|---|---:|---:|---:|
+| dense | 0.1709 | 0.1707 | 0.1187 |
+| mixture | 0.0307 | 0.0303 | 0.0215 |
+
+**The dense half is 85% of the device time**, in every run. So the mixture is
+no longer the lever — it is ~15% — and batching more of it would buy little.
+
+**Inside the dense half** (instrumented layout, two runs, share of dense device
+time):
+
+| stage | ms/position | share |
+|---|---:|---:|
+| `writeLatent` (cache write + pool + gather + attention) | 0.155-0.166 | 42% |
+| `hcFFNCoefficients` (mHC project + split) | 0.060-0.067 | 16.5% |
+| `hcAttentionCoefficients` (the same pair) | 0.060-0.064 | 16.4% |
+| `outputDown` (block-diagonal projection) | 0.017 | 4.6% |
+| `router` | 0.013 | 3.4% |
+| everything else (norms, GEMVs, rope, mHC pre/post) | ≤0.006 each | ≤1.7% each |
+
+Two honesty notes about that table. The per-stage layout inflates absolute
+numbers: the same dense half measured 0.17 ms/position in one buffer and 0.36-
+0.39 spread over 22 buffers, so read the shares, not the milliseconds. And
+`calibration` — four trivial dispatches in one buffer — costs 0.004
+ms/position (16 µs per layer-block, ~4 µs per dispatch), which means dispatch
+overhead alone does NOT explain the mHC stages: each of those two stages costs
+~30x the calibration for two dispatches that compute a handful of numbers.
+
+**What that points at.** `dsv41_hc_split_f32` returns immediately for every
+thread except `tid == 0` — the whole split and its Sinkhorn schedule run on one
+GPU thread, and the block pays that serial chain `2 * count` times per layer.
+`hc_project` is `mixCount` (8) threads doing two 128-element passes each, which
+is the same shape of problem. The fix is not a wider grid over one position; it
+is a slot dimension, so the block's positions run their serial chains in
+parallel. `writeLatent` is the largest stage and the least tractable: the cache
+write, the gather and the attention are interleaved because the ring tears if a
+position's successor writes before its query reads (see
+`DeepSeekV41Conformance.batchedDevicePrefill`), so it needs its own reasoning
+before it is touched.
+
+**Caveats.** The synthetic widths make fixed per-dispatch cost dominate the
+arithmetic, so this ranking is a ranking of per-position WORK ITEMS, not a
+prediction at 7,168 hidden: `outputDown` and the mHC projections both grow with
+hidden, while their dispatch counts do not. Nothing here is measured at real
+weights, because the local shards are header-only stubs.
+
+Tests: `DeepSeekV41PrefillMeasurementTests.testWhereABlocksRemainingTimeGoes`
+(the three host buckets and the two device halves) and
+`DeepSeekV41PrefillMeasurementTests.testWhichDenseStageHoldsTheDeviceTime` (the
+stage table plus the calibration), both opt-in and both asserting the
+correctness invariant — the block must still return the walk's logits through
+the instrumented paths — rather than a timing threshold.

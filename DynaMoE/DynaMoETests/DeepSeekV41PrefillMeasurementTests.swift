@@ -283,4 +283,193 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
         )
         XCTAssertLessThan(block, blockOfOne * Double(positions))
     }
+
+    /// Where a block's remaining per-position time goes.
+    ///
+    /// After the mixture was batched (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #2") a
+    /// block still costs ~0.14 ms/position/layer, and that number has two possible
+    /// authors that want opposite fixes: host time spent ENCODING dispatches, which
+    /// fewer-and-wider would reduce, or device time spent in the dense half's wait,
+    /// which no amount of encoding would. `recordsBlockTiming` splits the two (and
+    /// the mixture's own encode), so the next change is chosen by this number rather
+    /// than by counting dispatches.
+    func testWhereABlocksRemainingTimeGoes() throws {
+        let checkpoint = DeepSeekV41SyntheticCheckpoint()
+        let runtime = try makeRuntime(checkpoint)
+        let device = runtime.forward()
+        let tokens = (0..<positions).map { $0 % checkpoint.config.vocabSize }
+        let blockWidth = DeepSeekV41DevicePlan.chunkSlots(
+            config: checkpoint.config,
+            contextLength: checkpoint.shape.contextLength
+        )
+
+        // The same prompt down the walk, so the buckets are known to be timing the
+        // same computation the other cases compare against.
+        let walked = try makeRuntime(checkpoint).forward()
+        var walkLogits: [Float] = []
+        for (position, token) in tokens.enumerated() {
+            walkLogits = try walked.forwardToken(token, position: position)
+        }
+
+        // The fastest run by accounted layer time, so the buckets and the wall time
+        // come from the same run rather than from different ones.
+        var fastest: (wall: Double, timing: DeepSeekV41BlockTiming)?
+        for _ in 0..<(warmups + repetitions) {
+            device.reset()
+            device.resetBlockTiming()
+            device.recordsBlockTiming = true
+            let wall = try milliseconds {
+                _ = try device.prefillChunk(tokens)
+            }
+            device.recordsBlockTiming = false
+            let timing = device.blockTiming
+            if fastest == nil || accounted(timing) < accounted(fastest!.timing) {
+                fastest = (wall, timing)
+            }
+        }
+        let measured = try XCTUnwrap(fastest)
+        XCTAssertGreaterThan(measured.timing.layers, 0, "the switch recorded nothing")
+
+        device.reset()
+        let chunk = try device.prefillChunk(tokens).last
+        let scale = walkLogits.map(abs).max() ?? 1
+        XCTAssertLessThan(
+            worstDelta(chunk, walkLogits) / max(scale, 1e-6),
+            2e-3,
+            "the bucket stopwatch is timing a different computation"
+        )
+
+        let per = measured.timing.millisecondsPerPositionLayer()
+        let layers = Double(accounted(measured.timing)) / 1_000_000
+        // Every bucket is a sub-interval of the same run, so their sum cannot exceed
+        // it. What is left over is the embedding block and the output head, which no
+        // bucket covers on purpose.
+        XCTAssertLessThanOrEqual(layers, measured.wall, "the layers cost more than the run")
+        let encoded = per.denseEncode + per.mixtureEncode
+        let encodeShare = encoded + per.wait > 0 ? encoded / (encoded + per.wait) : 0
+        let deviceTime = per.denseDevice + per.mixtureDevice
+        let deviceShare = deviceTime > 0 ? per.denseDevice / deviceTime : 0
+
+        print(
+            String(
+                format: "[dsv41 prefill] block of %d (tokens %d), slots=%d, layers=%d "
+                    + "recorded, positions=%d, %.2f ms/position",
+                positions,
+                tokens.count,
+                blockWidth,
+                measured.timing.layers,
+                measured.timing.positions,
+                measured.wall / Double(positions)
+            )
+        )
+        print(
+            String(
+                format: "[dsv41 prefill] host per position/layer: dense encode %.4f  "
+                    + "front wait %.4f  mixture encode %.4f ms",
+                per.denseEncode,
+                per.wait,
+                per.mixtureEncode
+            )
+        )
+        print(
+            String(
+                format: "[dsv41 prefill] DEVICE per position/layer: dense %.4f  mixture %.4f ms "
+                    + "(dense holds %.0f%% of the device time)",
+                per.denseDevice,
+                per.mixtureDevice,
+                deviceShare * 100
+            )
+        )
+        print(
+            String(
+                format: "[dsv41 prefill] encode share of the wait+encode %.0f%%; layers "
+                    + "accounted %.2f of a %.2f ms run",
+                encodeShare * 100,
+                layers,
+                measured.wall
+            )
+        )
+    }
+
+    private func accounted(_ timing: DeepSeekV41BlockTiming) -> UInt64 {
+        timing.denseEncodeNanoseconds + timing.frontWaitNanoseconds
+            + timing.mixtureEncodeNanoseconds
+    }
+
+    /// Which stage of the dense half holds its device time.
+    ///
+    /// `testWhereABlocksRemainingTimeGoes` says the dense half is ~85% of a block's
+    /// device time; this says where inside it. `recordsStageTiming` puts each stage
+    /// in its own command buffer so every stage reports a `gpuStartTime`/
+    /// `gpuEndTime` window, which costs a little per-stage overhead and is therefore
+    /// read as a ranking rather than as absolute milliseconds.
+    func testWhichDenseStageHoldsTheDeviceTime() throws {
+        let checkpoint = DeepSeekV41SyntheticCheckpoint()
+        let runtime = try makeRuntime(checkpoint)
+        let device = runtime.forward()
+        let tokens = (0..<positions).map { $0 % checkpoint.config.vocabSize }
+
+        var fastest: (wall: Double, stages: [String: UInt64], layers: Int, device: Double)?
+        for _ in 0..<(warmups + repetitions) {
+            device.reset()
+            device.resetStageTiming()
+            device.resetBlockTiming()
+            device.recordsStageTiming = true
+            device.recordsBlockTiming = true
+            let wall = try milliseconds {
+                _ = try device.prefillChunk(tokens)
+            }
+            device.recordsStageTiming = false
+            device.recordsBlockTiming = false
+            let stages = device.stageTiming
+            XCTAssertFalse(stages.isEmpty, "no stage reported a device window")
+            if fastest == nil || wall < fastest!.wall {
+                fastest = (
+                    wall,
+                    stages,
+                    device.blockTiming.layers,
+                    Double(device.blockTiming.denseDeviceNanoseconds) / 1_000_000
+                )
+            }
+        }
+        let measured = try XCTUnwrap(fastest)
+
+        // The layout change must not change the answer: same prompt, same logits.
+        device.reset()
+        let chunk = try device.prefillChunk(tokens).last
+        let walked = try makeRuntime(checkpoint).forward()
+        var walkLogits: [Float] = []
+        for (position, token) in tokens.enumerated() {
+            walkLogits = try walked.forwardToken(token, position: position)
+        }
+        let scale = walkLogits.map(abs).max() ?? 1
+        XCTAssertLessThan(
+            worstDelta(chunk, walkLogits) / max(scale, 1e-6),
+            2e-3,
+            "the per-stage layout changed the answer"
+        )
+
+        let total = measured.stages.values.reduce(0, +)
+        print(
+            String(
+                format: "[dsv41 prefill] dense device time by stage, %.2f ms/position over "
+                    + "%d layers (whole-block wall %.2f, dense device in one buffer %.2f "
+                    + "ms/position)",
+                Double(total) / Double(positions) / 1_000_000,
+                measured.layers,
+                measured.wall / Double(positions),
+                measured.device / Double(positions)
+            )
+        )
+        for (stage, nanoseconds) in measured.stages.sorted(by: { $0.value > $1.value }) {
+            print(
+                String(
+                    format: "[dsv41 prefill] %-24@ %8.3f ms/pos  %5.1f%%",
+                    stage as NSString,
+                    Double(nanoseconds) / Double(positions) / 1_000_000,
+                    Double(nanoseconds) / Double(max(1, total)) * 100
+                )
+            )
+        }
+    }
 }

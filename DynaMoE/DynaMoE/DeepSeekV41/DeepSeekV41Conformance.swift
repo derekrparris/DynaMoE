@@ -255,19 +255,23 @@ nonisolated public enum DeepSeekV41Conformance {
     /// projection splitting its rows twice, and a RoPE batch rotating one row.
     ///
     /// What stays open: no comparison against the checkpoint's own numbers at real
-    /// weights. The pass has been MEASURED twice, and the second measurement is what
-    /// made the remaining reason narrow rather than vague. The first showed a block
-    /// beating the walk by only 1.0-1.26x with the mixture's per-position round trip
-    /// as ~50-60% of a block's per-position cost; batching the mixture into one
+    /// weights. The pass has been MEASURED three times, and the third measurement is
+    /// what made the remaining reason narrow rather than vague. The first showed a
+    /// block beating the walk by only 1.0-1.26x with the mixture's per-position round
+    /// trip as ~50-60% of a block's per-position cost; batching the mixture into one
     /// submission per layer, with one arena fill for the block's union, took it to
     /// ~2.0x at every width and halved the per-position cost (0.33 -> 0.14
-    /// ms/position/layer). So the graph is no longer the question, and neither is the
-    /// arena: what is left is linear per-position DISPATCH work, and above all the
-    /// fact that none of this has run against real weights. The turn loop already
-    /// routes a from-position-0 prompt through
+    /// ms/position/layer). The third split what is left: host encode is only ~20% of
+    /// it, the dense half holds 85% of the device time (the mixture 15%), and inside
+    /// the dense half the per-position stages dominate — `writeLatent` 42%, the two
+    /// mHC coefficient stages 33% — because `dsv41_hc_split_f32` runs its whole
+    /// Sinkhorn schedule on ONE thread, repeated per position. So the graph is no
+    /// longer the question, and neither is the arena: what is left is per-position
+    /// serial work, and above all the fact that none of this has run against real
+    /// weights. The turn loop already routes a from-position-0 prompt through
     /// `DeepSeekV41PositionForward.prefillChunk`, so nothing outside the executor has
     /// to change either way (numbers and caveats in `Benchmarks/PERF_FINDINGS.md`,
-    /// "DSV4.1 #1" and "DSV4.1 #2").
+    /// "DSV4.1 #1" to "DSV4.1 #3").
     public static let batchedDevicePrefill: Gate = .unverified
 
     /// The vision tower's patch grid, image token layout, and the tower forward.
