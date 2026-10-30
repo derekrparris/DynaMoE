@@ -4441,3 +4441,62 @@ Tests: unchanged from `#10` — the experiment touched `bf16_gemv_rows`,
 `encodeBlockDiagonalProjection` and two test files, and all four were reverted with
 `git checkout --`; only this entry is committed. Whole DeepSeek suite: 410 tests, 9
 skipped, 0 failures.
+
+## DSV4.1 #12: THE PROJECTION WAS NOT ELEVEN TIMES ITS ISOLATED COST, IT WAS 2.2
+
+`#11` ended on an anomaly: the attention output projection measured 0.0133 ms/position in
+isolation and 0.145 inside the block, and the whole dense half appeared to move its
+weights at 53 GB/s against 150-300 GB/s for the isolated kernels. Both numbers were
+wrong, and they were wrong in a way a fixture can be wrong: the isolated case priced
+"eight bands" by timing one 2.1 MB band EIGHT TIMES.
+
+Fixed, with the geometry held still and only the number of distinct bands growing, so the
+two throughputs separate — requests per second, which a warm working set can serve from
+cache, against distinct bytes per second, which the memory system actually has to deliver:
+
+| bands | distinct | ms/position | GB/s unique | GB/s requested |
+|---:|---:|---:|---:|---:|
+| 1 | 2.0 MB | 0.0087 | 30 | 242 |
+| 2 | 4.0 MB | 0.0167 | 31 | 251 |
+| 4 | 8.0 MB | 0.0314 | 33 | 268 |
+| **8** | **16.0 MB** | **0.0660** | **32** | **254** |
+| 16 | 32.0 MB | 0.1381 | 30 | 243 |
+| 32 | 64.0 MB | 0.1204 | 70 | 557 |
+| 64 | 128.0 MB | 0.2447 | 69 | 549 |
+
+So the real isolated cost of the projection is **0.0660**, not 0.0133, and the in-place
+figure is **2.2x** that rather than 11x. The cost is linear in the number of bands (eight
+bands is 7.6x one band, for 8x the work) and it does not care about the footprint: 30-33
+GB/s unique holds from 2 MB to 32 MB with no cliff, which rules out the cache story `#11`
+reached for. The jump at 32 bands is the loop being long enough to amortize the dispatch
+ramp, not a memory effect.
+
+**What the stage is actually limited by.** Every position re-reads the same weight row:
+eight positions over one band is 16.8 MB of requests for 2.1 MB of weight, and that is
+where the 254 GB/s goes. The kernel is request-bound, not DRAM-bound — 30 GB/s of unique
+bytes is what 254 GB/s of requests buys when eight of them are the same row served from
+L2 rather than L1, because the eight threadgroups that want a row land on different cores.
+
+Per stage, in place, as distinct bytes per second (`weights / (8 x msPerPosition)`):
+`queryUp` 294 GB/s, `queryDown` 110, `latentProject` 67, `outputUp` 23, `outputDown` 14.5.
+The spread is not a rank of kernel quality — it is what fraction of each stage's traffic a
+row re-read inflates. `queryUp` reads 226 MB of weight per block, so its eight-fold
+redundancy is a small multiple of a big number and it lands near peak DRAM; `outputDown`
+reads 16.8 MB and its redundancy is the whole cost. So `#11`'s "the dense half runs at 53
+GB/s" is also withdrawn: pooled over the stages that dominate, the dense half moves
+254 MB at 240 GB/s, and the two small stages are slow for their own reason.
+
+**What it opens.** The re-read is removable and the shape of the reuse is the opposite of
+`#6`'s: there, sharing a loaded record row across heads needed eight deep accumulators and
+cost 2.5x in occupancy. Here the shared operand is the WEIGHT and the per-position state is
+one float — a threadgroup could take one output row for every position of the block, load
+each weight value once, and keep `slots` accumulators, cutting the request traffic eight
+times for eight registers. That is the next slice, and it is measurable the same way.
+
+**Caveats.** Cache-warm repetitions again; BF16 synthetic weights; one layer; a 32-wide
+synthetic mixture. The footprint rows 32 and 64 use a 134 MB buffer and are the only ones
+whose working set exceeds what the part can cache, and they are the FASTEST per byte,
+which is the strongest evidence that the footprint is not the variable.
+
+Tests: `testHowAStagesCostScalesWithTheWeightItReads` (the table above, opt-in, ~2 s).
+Whole DeepSeek suite: 411 tests, 10 skipped, 0 failures.

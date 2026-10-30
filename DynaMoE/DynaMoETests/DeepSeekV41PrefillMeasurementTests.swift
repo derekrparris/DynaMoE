@@ -1182,4 +1182,165 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
             )
         }
     }
+
+    /// Whether a stage's cost scales with how much DISTINCT weight it reads.
+    ///
+    /// `testWhatOneProjectionCostsAtThePublishedWidths` prices one band of the
+    /// attention output projection over and over — one 2.1 MB weight, eight
+    /// dispatches — and reports 0.0133 ms/position. The same projection inside a
+    /// block reads eight DIFFERENT bands, 16.8 MB, and the published-widths table
+    /// says 0.145. Both forms of the kernel are in the two numbers, so neither
+    /// explains the difference; the amount of distinct weight does.
+    ///
+    /// This holds the geometry fixed and grows only the number of distinct bands
+    /// dispatched, so the two throughputs separate: requests per second, which a warm
+    /// working set can serve from cache, against distinct bytes per second, which is
+    /// what the memory system actually has to deliver. If the second one falls off a
+    /// cliff as the footprint grows, a stage's in-place cost is a property of the
+    /// footprint and not of its kernel.
+    func testHowAStagesCostScalesWithTheWeightItReads() throws {
+        guard let metal = MTLCreateSystemDefaultDevice(),
+              let library = metal.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "bf16_gemv_rows"),
+              let pipeline = try? metal.makeComputePipelineState(function: function),
+              let queue = metal.makeCommandQueue() else {
+            throw XCTSkip("No Metal device or kernel")
+        }
+        // One band of `attn.wo_a` at the published widths, and a block of positions.
+        let outDim = 128
+        let inDim = 8_192
+        let slots = 8
+        let laneWidth = 64
+        // Enough headroom for the widest footprint below (64 bands = 134 MB).
+        let maxBands = 64
+        let weightBytes = maxBands * outDim * inDim * MemoryLayout<UInt16>.stride
+        let inputBytes = slots * inDim * MemoryLayout<Float>.stride
+        let outputBytes = slots * outDim * MemoryLayout<Float>.stride
+        guard let weight = metal.makeBuffer(length: weightBytes, options: .storageModeShared),
+              let input = metal.makeBuffer(length: inputBytes, options: .storageModeShared),
+              let output = metal.makeBuffer(length: outputBytes, options: .storageModeShared) else {
+            throw XCTSkip("could not allocate the footprint sweep's buffers")
+        }
+
+        var state: UInt64 = 0x243F_6A88_85A3_08D3
+        func nextUnit() -> Float {
+            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return Float(Int32(truncatingIfNeeded: state >> 33)) / Float(1 << 30)
+        }
+        let tile = (0..<4_096).map { _ in
+            UInt16(
+                truncatingIfNeeded:
+                    DeepSeekV41SyntheticCheckpoint.truncateToBF16(nextUnit() * 0.125).bitPattern >> 16
+            )
+        }
+        let inputTile = (0..<4_096).map { _ in nextUnit() }
+        func fill<T>(_ buffer: MTLBuffer, bytes: Int, values: [T]) {
+            let stride = MemoryLayout<T>.stride
+            let destination = buffer.contents()
+            values.withUnsafeBytes { source in
+                guard let base = source.baseAddress else { return }
+                var written = 0
+                while written < bytes {
+                    let chunk = min(values.count * stride, bytes - written)
+                    memcpy(destination + written, base, chunk)
+                    written += chunk
+                }
+            }
+        }
+        fill(weight, bytes: weightBytes, values: tile)
+        fill(input, bytes: inputBytes, values: inputTile)
+        memset(output.contents(), 0, output.length)
+
+        func encode(_ encoder: MTLComputeCommandEncoder, bands: Int) {
+            encoder.setComputePipelineState(pipeline)
+            var weightOffset = UInt64(0)
+            var inDimension = UInt32(inDim)
+            var outDimension = UInt32(outDim)
+            var inStride = UInt32(inDim)
+            var outStride = UInt32(outDim)
+            var noBand = UInt32(0)
+            // One dispatch per band, each reading a DIFFERENT 2.1 MB block, which is
+            // what the block-diagonal projection does.
+            for band in 0..<bands {
+                var bandOffset = UInt64(band * outDim * inDim * 2)
+                encoder.setBuffer(weight, offset: 0, index: 0)
+                encoder.setBuffer(input, offset: 0, index: 1)
+                encoder.setBuffer(output, offset: 0, index: 2)
+                encoder.setBytes(&bandOffset, length: 8, index: 3)
+                encoder.setBytes(&inDimension, length: 4, index: 4)
+                encoder.setBytes(&outDimension, length: 4, index: 5)
+                encoder.setBytes(&inStride, length: 4, index: 6)
+                encoder.setBytes(&outStride, length: 4, index: 7)
+                encoder.setBytes(&noBand, length: 4, index: 8)
+                encoder.setBytes(&noBand, length: 4, index: 9)
+                encoder.setBytes(&noBand, length: 4, index: 10)
+                encoder.setThreadgroupMemoryLength(
+                    32 * MemoryLayout<Float>.stride, index: 0
+                )
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: outDim * slots, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: laneWidth, height: 1, depth: 1)
+                )
+                weightOffset = bandOffset
+            }
+            _ = weightOffset
+        }
+
+        // The host rule once, so a fast row is never a different computation: the last
+        // band's first output row for the first and the last token.
+        if let command = queue.makeCommandBuffer(),
+           let encoder = command.makeComputeCommandEncoder() {
+            encode(encoder, bands: maxBands)
+            encoder.endEncoding()
+            command.commit()
+            command.waitUntilCompleted()
+        }
+        let weights = weight.contents().assumingMemoryBound(to: UInt16.self)
+        let inputs = input.contents().assumingMemoryBound(to: Float.self)
+        let values = output.contents().assumingMemoryBound(to: Float.self)
+        for (row, token) in [(0, 0), (outDim - 1, slots - 1)] {
+            var expected: Float = 0
+            for index in 0..<inDim {
+                let base = ((maxBands - 1) * outDim + row) * inDim + index
+                let value = Float(bitPattern: UInt32(weights[base]) << 16)
+                expected += value * inputs[token * inDim + index]
+            }
+            let actual = values[token * outDim + row]
+            XCTAssertLessThan(
+                abs(actual - expected) / max(abs(expected), 1e-3),
+                1e-4,
+                "row \(row) token \(token) disagrees with the host rule"
+            )
+        }
+
+        for bands in [1, 2, 4, 8, 16, 32, 64] {
+            var fastest = Double.infinity
+            for attempt in 0..<3 {
+                guard let command = queue.makeCommandBuffer(),
+                      let encoder = command.makeComputeCommandEncoder() else { return }
+                let count = attempt == 0 ? 1 : 5
+                for _ in 0..<count {
+                    encode(encoder, bands: bands)
+                }
+                encoder.endEncoding()
+                command.commit()
+                command.waitUntilCompleted()
+                let window = command.gpuEndTime - command.gpuStartTime
+                fastest = min(fastest, window / Double(count) * 1000)
+            }
+            let distinctBytes = Double(bands * outDim * inDim * 2)
+            let requestedBytes = distinctBytes * Double(slots)
+            print(
+                String(
+                    format: "[dsv41 footprint] %2d bands %5.1f MB distinct  %8.4f ms/pos  "
+                        + "%5.0f GB/s unique  %5.0f GB/s requested",
+                    bands,
+                    distinctBytes / 1_048_576,
+                    fastest / Double(slots),
+                    distinctBytes / (fastest / 1000) / 1e9,
+                    requestedBytes / (fastest / 1000) / 1e9
+                )
+            )
+        }
+    }
 }
