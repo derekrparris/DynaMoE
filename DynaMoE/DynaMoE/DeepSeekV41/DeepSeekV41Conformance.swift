@@ -185,7 +185,7 @@ nonisolated public enum DeepSeekV41Conformance {
     /// snapshotted.
     public static let hyperConnections: Gate = .verifiedAgainstReference
 
-    /// DSpark's draft-chain construction.
+    /// DSpark's draft-chain construction and the block it drafts with.
     ///
     /// The CHAIN is matched against `DSparkBlock.forward_head` in the checkpoint's
     /// `inference/model.py`: the Markov head is a full-vocab bias projected from the
@@ -197,13 +197,25 @@ nonisolated public enum DeepSeekV41Conformance {
     /// and the sampled chain; the two disagree, so a port that implements only one
     /// of them cannot pass.
     ///
-    /// What keeps this gate open is the draft BLOCK: `main_proj`/`main_norm`, its
-    /// window-cache attention, and the MoE under the DSpark expert counts. Those run
-    /// only through `forward_spec`, and nothing in the checkpoint's generator calls
-    /// it, so there is no reference output for a draft block forward over a real
-    /// prefix. The acceptance/emission rule and the confidence gate are this port's
-    /// too: the reference defines the drafter but ships no speculative loop.
-    public static let dsparkDrafting: Gate = .unverified
+    /// The BLOCK is matched by `Tools/dsv41_goldens.py dspark_block`: two
+    /// `DSparkBlock` stages run at a tiny config, with the window cache SEEDED by a
+    /// prefill call and then written and read by a draft call, stage 0's attention
+    /// (its input, its rotated queries and `sparse_attn`'s output) recorded
+    /// alongside both stages' residual streams, the collapse the head reads, the
+    /// head's own logits and the chain they produce.
+    /// `DeepSeekV41DSparkBlockGoldenTests` carries the vectors. What that covers
+    /// that a 2-copy hyper-connection test cannot: `hc_post` sums its mixing matrix
+    /// over the FIRST axis, so a port that walks a row instead of a column mixes
+    /// every copy with the wrong neighbours — invisible at two copies with a nearly
+    /// symmetric Sinkhorn matrix, and this case caught it.
+    ///
+    /// What stays this port's own: the acceptance/emission rule and the confidence
+    /// gate. The reference defines the drafter but ships no speculative loop, and
+    /// nothing in its generator calls `forward_spec`.
+    ///
+    /// `sparse_attn` is the one rule transcribed rather than executed here (it is a
+    /// tilelang kernel), on the same terms as `hyperConnections`' split.
+    public static let dsparkDrafting: Gate = .verifiedAgainstReference
 
     /// Whether a prompt is prefilled as one batched pass on the device.
     ///

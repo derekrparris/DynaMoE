@@ -543,13 +543,19 @@ final class DeepSeekV41BlockDiagonalProjectionTests: XCTestCase {
     /// `attn.wo_a` is `groups` dense blocks stacked along the rows. Reading it as
     /// one dense matrix multiplies each group's rows into every other group's
     /// heads, so the grouped result must equal two independent GEMVs.
+    ///
+    /// The published tensor is `[o_groups * o_lora_rank, heads * head_dim /
+    /// o_groups]` — the COLUMNS are one group's share of the attention output, not
+    /// the whole of it. Dividing them by the group count a second time reads an
+    /// eighth of each group's inputs on the real checkpoint, which is why the
+    /// matrix below is 4 x 2 rather than 4 x 4.
     func testGroupsReadOnlyTheirOwnColumns() {
-        // 2 groups, 2 rows per group, 2 columns per group.
-        let weight = DeepSeekV41Matrix(rows: 4, columns: 4, values: [
-            1, 2, 999, 999,
-            3, 4, 999, 999,
-            999, 999, 5, 6,
-            999, 999, 7, 8
+        // 2 groups, 2 rows per group, 2 columns PER GROUP (4 input values total).
+        let weight = DeepSeekV41Matrix(rows: 4, columns: 2, values: [
+            1, 2,
+            3, 4,
+            5, 6,
+            7, 8
         ])
         let input: [Float] = [1, 1, 2, 1]
         let grouped = weight.applyBlockDiagonal(input, groups: 2)
@@ -560,7 +566,8 @@ final class DeepSeekV41BlockDiagonalProjectionTests: XCTestCase {
             .apply([2, 1])
         XCTAssertEqual(grouped, first + second)
 
-        // And it must differ from the dense read, which is the bug being fixed.
+        // And the dense read has to disagree: it sums each row over all four
+        // columns, which is the bug being fixed.
         let dense = weight.apply(input)
         XCTAssertNotEqual(grouped, dense)
     }
@@ -1000,7 +1007,12 @@ final class DeepSeekV41HyperConnectionTests: XCTestCase {
     }
 
     func testPostExpandsTheOutputAndMixesTheResidualThroughComb() {
-        // y[j] = post[j] * x + sum_k comb[j][k] * residual[k]
+        // y[k] = post[k] * x + sum_j comb[j][k] * residual[j]
+        //
+        // The mixing matrix is SOURCE-first: `Block.hc_post` sums
+        // `comb.unsqueeze(-1) * residual.unsqueeze(-2)` over its middle axis, so an
+        // output copy reads a column. With this matrix and two distinct residuals
+        // the two readings cannot be confused.
         let residual: [[Float]] = [[1, 0], [0, 1]]
         let streams = DeepSeekV41HyperConnections.post(
             output: [2, 2],
@@ -1008,12 +1020,12 @@ final class DeepSeekV41HyperConnectionTests: XCTestCase {
             gains: [0.5, 0],
             comb: [0.25, 0.75, 0, 1]
         )
-        // copy 0: 0.5 * (2, 2) + 0.25 * (1, 0) + 0.75 * (0, 1)
+        // copy 0: 0.5 * (2, 2) + comb[0][0] * (1, 0) + comb[1][0] * (0, 1)
         XCTAssertEqual(streams[0][0], 1.25, accuracy: 1e-6)
-        XCTAssertEqual(streams[0][1], 1.75, accuracy: 1e-6)
-        // copy 1: 0 * output + 0 * (1, 0) + 1 * (0, 1)
-        XCTAssertEqual(streams[1][0], 0, accuracy: 1e-6)
-        XCTAssertEqual(streams[1][1], 1, accuracy: 1e-6)
+        XCTAssertEqual(streams[0][1], 1.0, accuracy: 1e-6)
+        // copy 1: 0 * output + comb[0][1] * (1, 0) + comb[1][1] * (0, 1)
+        XCTAssertEqual(streams[1][0], 0.75, accuracy: 1e-6)
+        XCTAssertEqual(streams[1][1], 1.0, accuracy: 1e-6)
     }
 }
 

@@ -519,6 +519,10 @@ def dspark_case(torch, reference) -> dict:
     block.head = fill(
         reference.ParallelHead(args.vocab_size, args.dim, args.norm_eps, args.hc_eps), torch, seed=8
     )
+    # `wo_a` is stored bf16 in the reference and cast up by the FP8 activation
+    # quantiser that precedes it; with that step an identity the cast has to happen
+    # here, and fp32 is what the rest of these vectors are in.
+    block.float()
 
     vocab = args.vocab_size
     block_size = args.dspark_block_size
@@ -602,6 +606,408 @@ def dspark_case(torch, reference) -> dict:
             ),
         },
     }
+
+
+def _act_quant_identity():
+    """`act_quant` as the goldens run it: no quantization.
+
+    The kernel quantizes an activation to FP8, rounds its per-block scale and then
+    dequantizes back (`inplace=True`), so what the block forward sees afterwards is
+    the same tensor carrying quantisation noise. These vectors are FP32 throughout
+    — the same reason every `Linear` here is dense — so the faithful version of that
+    step is the identity, and the noise stays out of the comparison.
+    """
+
+    def quantize(x, block_size=128, scale_fmt=None, scale_dtype=None, inplace=False):
+        return x
+
+    return quantize
+
+
+def _sparse_attn_for_goldens(torch, record):
+    """A torch transcription of `kernel.py`'s `sparse_attn`.
+
+    The draft block's attention is the one part of `DSparkBlock.forward` that cannot
+    be executed: `sparse_attn` is a tilelang kernel, and the torch function around
+    it only launches that kernel. The body below is transcribed from
+    `sparse_attn_kernel` — gather the listed rows, score, mask the pad index,
+    online-softmax, fold the sink into the DENOMINATOR, then a second gemm — with
+    its two BF16 casts dropped because these vectors are FP32.
+
+    Two details are carried over literally, because they decide the output rather
+    than its precision:
+
+      * a masked row scores `-inf`, while the running maximum starts at the FINITE
+        `-1e30`. A position whose indices are all masked therefore divides zero by
+        `exp(sink + 1e30) = inf` and comes back all zeros instead of NaN.
+      * `attn_sink` is a per-head bias on the denominator alone. It has no value
+        row, so it can only remove probability mass; treating it as an extra key
+        with a zero value row would look identical in the output, which is exactly
+        why the rule is worth pinning.
+    """
+
+    def attend(q, kv, attn_sink, topk_idxs, softmax_scale):
+        b, m, h, d = q.size()
+        topk = topk_idxs.size(-1)
+        valid = topk_idxs != -1
+        rows = torch.gather(
+            kv.unsqueeze(1).expand(b, m, kv.size(1), d),
+            2,
+            topk_idxs.clamp(min=0).unsqueeze(-1).expand(b, m, topk, d),
+        )
+        rows = torch.where(valid.unsqueeze(-1), rows, torch.zeros_like(rows))
+        scores = torch.einsum("bmhd,bmkd->bmhk", q, rows) * softmax_scale
+        scores = torch.where(valid.unsqueeze(2), scores, torch.full_like(scores, -torch.inf))
+        peak = scores.amax(dim=-1, keepdim=True).clamp(min=-1e30)
+        weights = torch.exp(scores - peak)
+        denominator = weights.sum(-1) + torch.exp(attn_sink.view(1, 1, h) - peak.squeeze(-1))
+        out = torch.einsum("bmhk,bmkd->bmhd", weights, rows) / denominator.unsqueeze(-1)
+        record.append({"q": q.detach().clone(), "out": out.detach().clone()})
+        return out
+
+    return attend
+
+
+def dspark_block_case(torch, reference) -> dict:
+    """`DSparkBlock.forward`: the draft block itself, not the chain it feeds.
+
+    `dspark` pins the projection that conditions the block and the head that walks
+    it, with the block's own logits handed to it as an input. What that case could
+    not see is everything between: `DSparkAttention` (a window cache the PREFILL
+    call seeds and the draft call appends one row to), the hyper-connection
+    bookkeeping around it, the MoE, and the collapse the head reads. That is the
+    wiring a port cannot invent, and this case asks the reference for it.
+
+    Four calls, in the order `Transformer.forward_spec` makes them:
+
+      1. `main_x` — the target layers' stacked attention inputs through stage 0's
+         `main_proj`/`main_norm`. Run over a prefix of `window + 2` positions so it
+         is a chunk rather than one row.
+      2. the seed. `start_pos == 0` writes the prefix's `wkv(main_x)` rows into each
+         stage's window ring and returns, which is why a seed that stored the wrong
+         rows is invisible until the next call. The prefix is LONGER than the
+         window, so this takes the rotation branch; a second module at the same
+         seeded weights takes the fitting branch, and both rings are recorded.
+      3. the draft. `start_pos = prefix_len`, one `main_x` row for the token being
+         drafted from, and `block_size` draft positions through EACH stage in one
+         pass. A stage's own rows are appended to the keys it gathers, so a draft
+         position attends over the window PLUS its siblings — the block is not
+         causal within itself.
+      4. the head, off the last stage's collapse.
+
+    Two stages, like the checkpoint's three, because the responsibilities are split
+    between them: only stage 0 carries `main_proj`/`main_norm` and only the last
+    stage carries `norm`, the Markov head and the confidence head.
+    """
+    args = reference.ModelArgs(
+        max_batch_size=1,
+        max_seq_len=16,
+        # Greedy, so `forward_head`'s draws are argmax and replay off any runtime.
+        temperature=0,
+        dtype="bf16",
+        # An fp4 expert weight cannot be seeded from a generator; see the docstring.
+        expert_dtype=None,
+        vocab_size=16,
+        dim=8,
+        moe_inter_dim=4,
+        n_layers=2,
+        n_mtp_layers=2,
+        n_heads=2,
+        n_routed_experts=3,
+        n_shared_experts=1,
+        n_activated_experts=2,
+        q_lora_rank=4,
+        head_dim=8,
+        rope_head_dim=4,
+        norm_eps=1e-6,
+        o_groups=2,
+        o_lora_rank=4,
+        window_size=3,
+        compress_ratios=(0, 0, 0, 0),
+        kv_source_layers=(),
+        index_source_layers=(),
+        swiglu_limit=2.0,
+        hc_mult=2,
+        hc_sinkhorn_iters=3,
+        hc_eps=1e-6,
+        dspark_block_size=4,
+        dspark_noise_token_id=15,
+        dspark_target_layer_ids=(0, 1),
+        dspark_markov_rank=3,
+        dspark_n_routed_experts=3,
+        dspark_n_activated_experts=2,
+    )
+    # A Transformer hands every stage the backbone's embedding and head; this case
+    # builds them itself so the vectors do not depend on a whole model.
+    embedding = fill(reference.ParallelEmbedding(args.vocab_size, args.dim), torch, seed=7)
+    head = fill(
+        reference.ParallelHead(args.vocab_size, args.dim, args.norm_eps, args.hc_eps), torch, seed=8
+    )
+    # Distinct seeds per stage, so a port that ran one stage's weights twice cannot
+    # reproduce the chained output.
+    stages = []
+    for index in range(args.n_mtp_layers):
+        stage = fill(reference.DSparkBlock(args.n_layers + index, args), torch, seed=20 + index)
+        stage.embed = embedding
+        stage.head = head
+        # `wo_a` is stored bf16 in the reference and cast up by the FP8 activation
+        # quantiser in front of it; with that step an identity the cast has to happen
+        # here, and fp32 is what the rest of these vectors are in.
+        stage.float()
+        stages.append(stage)
+    # The fitting-seed branch, at stage 0's weights (same seed, so not recorded twice).
+    short = fill(reference.DSparkBlock(args.n_layers, args), torch, seed=20).float()
+    short.embed = embedding
+
+    dim = args.dim
+    copies = args.hc_mult
+    targets = len(args.dspark_target_layer_ids)
+    block_size = args.dspark_block_size
+    window = args.window_size
+    prefix_len = window + 2
+    start_pos = prefix_len
+    seed_token = 7
+
+    generator = torch.Generator().manual_seed(11)
+    main_hidden_prefix = 0.3 * torch.randn(
+        1, prefix_len, dim * targets, generator=generator, dtype=torch.float32
+    )
+    main_hidden_step = 0.3 * torch.randn(
+        1, 1, dim * targets, generator=generator, dtype=torch.float32
+    )
+    input_ids = torch.tensor([[seed_token]], dtype=torch.long)
+
+    attended = []
+    norms = []
+    projected = []
+    ffn_in = []
+    ffn_out = []
+    collapses = []
+    original_sparse = reference.sparse_attn
+    original_quant = reference.act_quant
+    original_split = reference.hc_split_sinkhorn
+    original_attention_norm = stages[0].attn_norm
+    original_final_norm = stages[-1].norm
+    original_wo_b = stages[0].attn.wo_b
+    original_ffn = stages[0].ffn
+    original_ffn_norm = stages[0].ffn_norm
+    original_head = stages[-1].head
+    head_logits = []
+
+    class _Recording(torch.nn.Module):
+        """Passes a module through and keeps one of its tensors on the way.
+
+        The collapse the head reads is `hc_pre`'s output, and `hc_pre` is a method
+        rather than a module, so it cannot be wrapped; `norm` runs on exactly that
+        tensor, and its INPUT is recorded instead.
+        """
+
+        def __init__(self, inner, sink, keep):
+            super().__init__()
+            self.inner = inner
+            self.sink = sink
+            self.keep = keep
+
+        def forward(self, *inputs, **kwargs):
+            if self.keep == "input":
+                self.sink.append(inputs[0].detach().clone())
+            out = self.inner(*inputs, **kwargs)
+            if self.keep == "output":
+                self.sink.append(out.detach().clone())
+            return out
+
+    reference.sparse_attn = _sparse_attn_for_goldens(torch, attended)
+    reference.act_quant = _act_quant_identity()
+    reference.hc_split_sinkhorn = _hc_split_sinkhorn_for_goldens(torch, [])
+    stages[0].attn_norm = _Recording(original_attention_norm, norms, "output")
+    stages[-1].norm = _Recording(original_final_norm, collapses, "input")
+    stages[0].attn.wo_b = _Recording(original_wo_b, projected, "output")
+    stages[0].ffn_norm = _Recording(original_ffn_norm, ffn_in, "output")
+    stages[0].ffn = _Recording(original_ffn, ffn_out, "output")
+    stages[-1].head = _Recording(original_head, head_logits, "output")
+
+    try:
+        with torch.no_grad():
+            main_x_prefix = stages[0].main_norm(stages[0].main_proj(main_hidden_prefix))
+            main_x_step = stages[0].main_norm(stages[0].main_proj(main_hidden_step))
+            seed_stack, _ = stages[0].forward_embed(main_hidden_step, input_ids)
+
+            seed_mix = reference.make_identity_pre_mix(seed_stack, copies)
+            for stage in stages:
+                stage(seed_stack, 0, seed_mix, main_x_prefix)
+            seeded = [stage.attn.window_kv_cache[0].clone() for stage in stages]
+
+            # The same stage-0 weights, a prefix that FITS: the other branch of the
+            # seed (`cache[: len] = rows`, no rotation).
+            short_stack = short.embed(input_ids).unsqueeze(2).repeat(1, 1, copies, 1)
+            short(
+                short_stack,
+                0,
+                reference.make_identity_pre_mix(short_stack, copies),
+                main_x_prefix[:, : window - 1],
+            )
+
+            stack = seed_stack
+            pre_mix = reference.make_identity_pre_mix(stack, copies)
+            block_input = stack.clone()
+            through = []
+            for stage in stages:
+                stack, pre_mix = stage(stack, start_pos, pre_mix, main_x_step)
+                through.append(stack[0].clone())
+            drafted_window = [stage.attn.window_kv_cache[0].clone() for stage in stages]
+            out_ids, logits, confidence = stages[-1].forward_head(stack, pre_mix, input_ids)
+            # The stack after stage 0's attention sub-layer, composed from the
+            # reference's own `hc_mixes` / `hc_post` rather than re-derived.
+            _, attn_post, attn_comb = stages[0].hc_mixes(
+                block_input,
+                stages[0].hc_attn_fn,
+                stages[0].hc_attn_scale,
+                stages[0].hc_attn_base,
+            )
+            post_attention = reference.Block.hc_post(
+                stages[0], projected[0], block_input, attn_post, attn_comb
+            )
+    finally:
+        reference.sparse_attn = original_sparse
+        reference.act_quant = original_quant
+        reference.hc_split_sinkhorn = original_split
+        stages[0].attn_norm = original_attention_norm
+        stages[-1].norm = original_final_norm
+        stages[0].attn.wo_b = original_wo_b
+        stages[0].ffn = original_ffn
+        stages[0].ffn_norm = original_ffn_norm
+        stages[-1].head = original_head
+
+    # The seed call never attends (it only writes), so the recorded attention calls
+    # are the draft pass: one query tensor and one output per position.
+    queries = [entry["q"] for entry in attended]
+    attended_out = [entry["out"] for entry in attended]
+
+    def stage_weights(stage):
+        return {
+            "attn_norm": rows_of(stage.attn_norm.weight),
+            "wq_a": rows_of(stage.attn.wq_a.weight),
+            "q_norm": rows_of(stage.attn.q_norm.weight),
+            "wq_b": rows_of(stage.attn.wq_b.weight),
+            "wkv": rows_of(stage.attn.wkv.weight),
+            "kv_norm": rows_of(stage.attn.kv_norm.weight),
+            "wo_a": rows_of(stage.attn.wo_a.weight),
+            "wo_b": rows_of(stage.attn.wo_b.weight),
+            "attn_sink": rows_of(stage.attn.attn_sink),
+            "ffn_norm": rows_of(stage.ffn_norm.weight),
+            "hc_attn_fn": rows_of(stage.hc_attn_fn),
+            "hc_attn_base": rows_of(stage.hc_attn_base),
+            "hc_attn_scale": rows_of(stage.hc_attn_scale),
+            "hc_ffn_fn": rows_of(stage.hc_ffn_fn),
+            "hc_ffn_base": rows_of(stage.hc_ffn_base),
+            "hc_ffn_scale": rows_of(stage.hc_ffn_scale),
+            "router": rows_of(stage.ffn.gate.weight),
+            "router_bias": rows_of(stage.ffn.gate.bias),
+            "experts": [
+                {
+                    "w1": rows_of(expert.w1.weight),
+                    "w3": rows_of(expert.w3.weight),
+                    "w2": rows_of(expert.w2.weight),
+                }
+                for expert in stage.ffn.experts
+            ],
+            "shared": {
+                "w1": rows_of(stage.ffn.shared_experts.w1.weight),
+                "w3": rows_of(stage.ffn.shared_experts.w3.weight),
+                "w2": rows_of(stage.ffn.shared_experts.w2.weight),
+            },
+        }
+
+    return {
+        "gate": "dsparkDrafting",
+        "reference": (
+            "inference/model.py DSparkBlock.forward over DSparkAttention and Block.forward, "
+            "with sparse_attn transcribed from inference/kernel.py "
+            f"({snapshot_note()})"
+        ),
+        "config": {
+            "dim": dim,
+            "hc_mult": copies,
+            "sinkhorn_iters": args.hc_sinkhorn_iters,
+            "hc_eps": args.hc_eps,
+            "norm_eps": args.norm_eps,
+            "vocab_size": args.vocab_size,
+            "n_heads": args.n_heads,
+            "head_dim": args.head_dim,
+            "rope_head_dim": args.rope_head_dim,
+            "q_lora_rank": args.q_lora_rank,
+            "o_lora_rank": args.o_lora_rank,
+            "o_groups": args.o_groups,
+            "window_size": window,
+            "block_size": block_size,
+            "noise_token_id": args.dspark_noise_token_id,
+            "markov_rank": args.dspark_markov_rank,
+            "target_count": targets,
+            "stage_count": args.n_mtp_layers,
+            "prefix_len": prefix_len,
+            "start_pos": start_pos,
+            "routed_experts": args.dspark_n_routed_experts,
+            "activated_experts": args.dspark_n_activated_experts,
+            "swiglu_limit": args.swiglu_limit,
+            "temperature": args.temperature,
+        },
+        "input": {
+            "main_hidden_prefix": rows_of(main_hidden_prefix[0]),
+            "main_hidden_step": rows_of(main_hidden_step[0]),
+            "token": seed_token,
+        },
+        "weights": {
+            "embed": rows_of(embedding.weight),
+            "head": rows_of(head.weight),
+            # Stage 0 carries the target-layer projection, the last stage the norm
+            # and the two output heads; each stage carries a whole block.
+            "main_proj": rows_of(stages[0].main_proj.weight),
+            "main_norm": rows_of(stages[0].main_norm.weight),
+            "norm": rows_of(stages[-1].norm.weight),
+            "markov_embed": rows_of(stages[-1].markov_head.embed.weight),
+            "markov_head": rows_of(stages[-1].markov_head.head.weight),
+            "confidence": rows_of(stages[-1].confidence_head.proj.weight),
+            "stages": [stage_weights(stage) for stage in stages],
+        },
+        "expected": {
+            # [prefix][dim] and [1][dim]: the conditioning rows, before the block.
+            "main_x_prefix": rows_of(main_x_prefix[0]),
+            "main_x_step": rows_of(main_x_step[0]),
+            # [block][dim]: `forward_embed`'s stack, one copy (they are identical).
+            "draft_embedding": rows_of(seed_stack[0][:, 0]),
+            # [stage][window][head_dim]: the ring after each call. The short seed must
+            # land in slot order; the long one rotates so slot `len % window` is first.
+            "window_after_seed": [rows_of(ring) for ring in seeded],
+            "window_after_short_seed": rows_of(short.attn.window_kv_cache[0]),
+            "window_after_draft": [rows_of(ring) for ring in drafted_window],
+            # [block][dim]: `attn_norm(hc_pre(x, pre_mix))`, what stage 0's queries and
+            # latents are built from, and [block][n_heads][head_dim] out of
+            # `sparse_attn` before the output's rope payload is conjugated back out.
+            "attention_input": rows_of(norms[0][0]),
+            "attention_query": rows_of(queries[0][0].flatten(1)),
+            "attention_out": rows_of(attended_out[0][0].flatten(1)),
+            # [block][dim]: the attention sub-layer's output after the grouped
+            # `wo_a` and `wo_b`, and [block][dim]: the MoE's own output.
+            "attention_projected": rows_of(projected[0][0]),
+            "ffn_input": rows_of(ffn_in[0][0]),
+            "post_attention": rows_of(post_attention[0]),
+            "ffn_out": rows_of(ffn_out[0][0]),
+            # [stage][block][hc][dim]: the residual stream after each stage's
+            # attention AND ffn, so the chain is pinned stage by stage.
+            "stage_out": [rows_of(out) for out in through],
+            # [block][hc]: the mix the head collapses the last stage with.
+            "pre_mix": rows_of(pre_mix),
+            # [block][dim]: the collapse `forward_head` normalizes and projects.
+            "head_input": rows_of(collapses[0][0]),
+            # [block][vocab]: the draft head's own logits, before any Markov bias.
+            # Taken from the head itself, because `forward_head` adds the bias INTO
+            # `logits` in place and its return value is already mixed.
+            "block_logits": rows_of(head_logits[0][0]),
+            "output_ids": out_ids[0].tolist(),
+            "confidence": rows_of(confidence[0]),
+        },
+    }
+
 
 
 def compressor_state_case(torch, reference) -> dict:
@@ -1101,6 +1507,7 @@ CASES = {
     "hc": hc_case,
     "router": router_case,
     "dspark": dspark_case,
+    "dspark_block": dspark_block_case,
     "vision": vision_case,
 }
 

@@ -8846,8 +8846,11 @@ kernel void dsv41_hc_post_f32(
     uint copy = pos.y;
     if (dim >= width || copy >= mult) return;
     float total = gainsBuffer[copy] * outputBuffer[dim];
+    // The mixing matrix is indexed source-first (`Block.hc_post` sums
+    // `comb.unsqueeze(-1) * residual.unsqueeze(-2)` over its middle axis), so an
+    // output copy reads a COLUMN of it.
     for (uint32_t source = 0; source < mult; ++source) {
-        total += combBuffer[copy * mult + source] * residualBuffer[(uint64_t)source * width + dim];
+        total += combBuffer[source * mult + copy] * residualBuffer[(uint64_t)source * width + dim];
     }
     streamBuffer[(uint64_t)copy * width + dim] = total;
 }

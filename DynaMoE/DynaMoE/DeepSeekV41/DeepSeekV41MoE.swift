@@ -369,7 +369,13 @@ nonisolated public enum DeepSeekV41HyperConnections {
         public let pre: [Float]
         /// `mult` gains on the sub-layer's output, one per copy.
         public let post: [Float]
-        /// `mult × mult`, row-major: `comb[j][k]` is copy `k`'s share of copy `j`.
+        /// `mult × mult`, row-major and in the reference's own orientation:
+        /// `comb[j][k]` is how much of copy `j`'s residual copy `k`'s output takes.
+        /// The FIRST index is the residual the entry reads, not the copy it writes,
+        /// because `hc_post` sums `comb.unsqueeze(-1) * residual.unsqueeze(-2)` over
+        /// its middle axis. Reading a row as one copy's mixing weights is the
+        /// transpose, and with two copies a nearly symmetric Sinkhorn matrix hides
+        /// it.
         public let comb: [Float]
         /// The `(2 + mult) * mult` raw logits before the split. Kept because a
         /// probe run compares against them; nothing in the forward reads them.
@@ -528,10 +534,13 @@ nonisolated public enum DeepSeekV41HyperConnections {
         guard mult > 0 else { return residual }
         var streams = residual
         for copy in 0..<mult {
-            let base = copy * mult
             var row = [Float](repeating: 0, count: streams[copy].count)
-            for source in 0..<mult where base + source < comb.count {
-                let weight = comb[base + source]
+            // `comb[source * mult + copy]`: the matrix is indexed source-first, so
+            // copy `copy`'s output reads a COLUMN of it. Walking a row instead mixes
+            // every copy with the wrong neighbours, which two copies can hide and
+            // four cannot.
+            for source in 0..<mult where source * mult + copy < comb.count {
+                let weight = comb[source * mult + copy]
                 let stream = residual[source]
                 for dim in 0..<min(row.count, stream.count) {
                     row[dim] += weight * stream[dim]
