@@ -8800,15 +8800,18 @@ kernel void dsv41_hc_split_f32(
 ///
 /// The snapshot is why this kernel exists rather than a separate copy: `hc_post`
 /// needs the block input that the collapse consumed, and taking it here is one
-/// pass instead of two. `residualOut` may be null when nothing reads it back.
+/// pass instead of two. `snapshot` gates the write rather than a null buffer:
+/// an unbound buffer slot is undefined in Metal, not null, so the caller binds
+/// `residualOut` on every call and asks for the copy it actually reads back.
 /// Grid: (width, 1, 1).
 kernel void dsv41_hc_pre_f32(
     device const float* streamBuffer [[buffer(0)]],   // [mult][width]
     device const float* mixBuffer [[buffer(1)]],      // [mult]
     device float* outputBuffer [[buffer(2)]],         // [width]
-    device float* residualOut [[buffer(3)]],          // [mult][width] or null
+    device float* residualOut [[buffer(3)]],          // [mult][width], written when snapshot
     constant uint32_t& width [[buffer(4)]],
     constant uint32_t& mult [[buffer(5)]],
+    constant uint32_t& snapshot [[buffer(6)]],
     uint dim [[thread_position_in_grid]]
 ) {
     if (dim >= width) return;
@@ -8816,7 +8819,7 @@ kernel void dsv41_hc_pre_f32(
     for (uint32_t copy = 0; copy < mult; ++copy) {
         float value = streamBuffer[(uint64_t)copy * width + dim];
         accumulator += mixBuffer[copy] * value;
-        if (residualOut != nullptr) residualOut[(uint64_t)copy * width + dim] = value;
+        if (snapshot != 0) residualOut[(uint64_t)copy * width + dim] = value;
     }
     outputBuffer[dim] = accumulator;
 }

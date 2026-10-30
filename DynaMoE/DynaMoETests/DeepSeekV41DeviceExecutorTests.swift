@@ -1339,8 +1339,10 @@ final class DeepSeekV41HyperConnectionKernelTests: XCTestCase {
         encoder.setBuffer(residualBuffer, offset: 0, index: 3)
         var widthDimension = UInt32(dim)
         var copiesDimension = UInt32(copies)
+        var snapshot = UInt32(1)
         encoder.setBytes(&widthDimension, length: 4, index: 4)
         encoder.setBytes(&copiesDimension, length: 4, index: 5)
+        encoder.setBytes(&snapshot, length: 4, index: 6)
         encoder.dispatchThreads(
             MTLSize(width: dim, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
@@ -1388,6 +1390,56 @@ final class DeepSeekV41HyperConnectionKernelTests: XCTestCase {
                     "copy \(copy) dim \(index)"
                 )
             }
+        }
+    }
+
+    /// The final collapse has no `hc_post` after it, so it asks for no snapshot.
+    /// The flag is what says so, since the buffer is bound either way.
+    func testTheCollapseLeavesTheResidualAloneWhenNotSnapshotting() throws {
+        let (device, library, queue) = try environment()
+        let prePipeline = try pipeline("dsv41_hc_pre_f32", library, device)
+
+        let mix: [Float] = [0.6, 0.4]
+        let sentinel = [Float](repeating: -99, count: streams.count)
+        let streamBuffer = try buffer(device, streams)
+        let residualBuffer = try buffer(device, sentinel)
+        let collapsedBuffer = try XCTUnwrap(
+            device.makeBuffer(
+                length: dim * MemoryLayout<Float>.stride, options: .storageModeShared
+            )
+        )
+        let mixBuffer = try buffer(device, mix)
+
+        let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+        let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(prePipeline)
+        encoder.setBuffer(streamBuffer, offset: 0, index: 0)
+        encoder.setBuffer(mixBuffer, offset: 0, index: 1)
+        encoder.setBuffer(collapsedBuffer, offset: 0, index: 2)
+        encoder.setBuffer(residualBuffer, offset: 0, index: 3)
+        var widthDimension = UInt32(dim)
+        var copiesDimension = UInt32(copies)
+        var snapshot = UInt32(0)
+        encoder.setBytes(&widthDimension, length: 4, index: 4)
+        encoder.setBytes(&copiesDimension, length: 4, index: 5)
+        encoder.setBytes(&snapshot, length: 4, index: 6)
+        encoder.dispatchThreads(
+            MTLSize(width: dim, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        let collapsed = DeepSeekV41HyperConnections.pre(streams: stack, mix: mix)
+        let collapsedOut = collapsedBuffer.contents().assumingMemoryBound(to: Float.self)
+        let residual = residualBuffer.contents().assumingMemoryBound(to: Float.self)
+        for index in 0..<dim {
+            XCTAssertEqual(collapsedOut[index], collapsed[index], accuracy: 1e-6, "collapse \(index)")
+        }
+        for index in 0..<streams.count {
+            XCTAssertEqual(residual[index], sentinel[index], "residual \(index)")
         }
     }
 }

@@ -2407,15 +2407,13 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         encoder.setBuffer(workspace.streams, offset: 0, index: 0)
         encoder.setBuffer(mix, offset: 0, index: 1)
         encoder.setBuffer(output, offset: 0, index: 2)
-        if snapshotting {
-            encoder.setBuffer(workspace.hcResidual, offset: 0, index: 3)
-        } else {
-            encoder.setBuffer(nil, offset: 0, index: 3)
-        }
+        encoder.setBuffer(workspace.hcResidual, offset: 0, index: 3)
         var width = UInt32(shapes.hidden)
         var copies = UInt32(mult)
+        var snapshot = UInt32(snapshotting ? 1 : 0)
         encoder.setBytes(&width, length: 4, index: 4)
         encoder.setBytes(&copies, length: 4, index: 5)
+        encoder.setBytes(&snapshot, length: 4, index: 6)
         encoder.dispatchThreads(
             MTLSize(width: shapes.hidden, height: 1, depth: 1),
             threadsPerThreadgroup: threadgroup(shapes.hidden)
