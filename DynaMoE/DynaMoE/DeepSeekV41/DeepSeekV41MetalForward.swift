@@ -115,6 +115,21 @@ nonisolated public enum DeepSeekV41BF16GemvForm: Equatable, Sendable {
     case block
 }
 
+/// Swift mirror of `Dsv41AttentionSlotPlan` in `ComputeShaders.metal`, bound at buffer
+/// 9 of `dsv41_attention_csa2_f32`. One launch covers `slotCount` positions of a
+/// block: slot `s` reads its gathered rows at `s * keyRowStride`, and the per-slot row
+/// counts are bound separately at buffer 10 because the positions of a block do not
+/// all read the same number of rows.
+nonisolated public struct DeepSeekV41AttentionSlotPlan: Equatable, Sendable {
+    public var slotCount: UInt32
+    public var keyRowStride: UInt32
+
+    public init(slotCount: UInt32, keyRowStride: UInt32) {
+        self.slotCount = slotCount
+        self.keyRowStride = keyRowStride
+    }
+}
+
 /// The pure half of the executor: tensor format to kernel, and the planning rules
 /// that can be checked without a GPU or a checkpoint.
 nonisolated public enum DeepSeekV41DevicePlan {
@@ -1590,11 +1605,16 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             )
 
         case .writeLatent:
-            // The ring is why the cache write, the pool and the attention stay in
-            // one loop: writing position `p + 1` evicts `p + 1 - window`, which a
-            // query at `p` still needs, so each position must attend before its
-            // successor writes. `.compressPool` and `.attention` are therefore
-            // handled here rather than twice.
+            // The ring is why the cache write, the pool and the gather stay in one
+            // loop: writing position `p + 1` evicts `p + 1 - window`, which a query
+            // at `p` still needs, so each position must gather before its successor
+            // writes. Only the attention itself is hoisted out of the loop: it reads
+            // the gathered blocks and nothing else, so the whole block attends in ONE
+            // dispatch of `count * heads` threadgroups instead of `count` dispatches
+            // of `heads` — each of which is a fifth of the machine
+            // (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #14" and "#15").
+            var attentionRows: [Int] = []
+            attentionRows.reserveCapacity(count)
             try eachSlot { slot in
                 try encodeStore(
                     encoder,
@@ -1615,14 +1635,23 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                     shape: shape,
                     slotIndex: slot
                 )
-                try encodeAttention(
-                    layer: layer,
-                    position: startPosition + slot,
-                    encoder: encoder,
-                    shape: shape,
-                    slotIndex: slot
+                attentionRows.append(
+                    try encodeAttentionGather(
+                        layer: layer,
+                        position: startPosition + slot,
+                        encoder: encoder,
+                        shape: shape,
+                        slotIndex: slot
+                    )
                 )
             }
+            try encodeAttentionDispatch(
+                encoder: encoder,
+                shape: shape,
+                layerIndex: index,
+                slots: Array(0..<count),
+                rowCounts: attentionRows
+            )
 
         case .compressPool, .attention:
             // Both run inside `.writeLatent`: the ring forces the interleave.
@@ -1690,6 +1719,15 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                     gains: workspace.hcAttentionPost,
                     comb: workspace.hcAttentionComb,
                     slot: slot
+                )
+            }
+            // Slot 0's copy, which is the position a block is most likely to get wrong:
+            // its attention dispatch is not the last one in the block. Without this the
+            // probe is written only by the walk, so a parity check over a block reads a
+            // buffer nothing filled.
+            if let probe = parityProbes.afterAttention {
+                try encodeCopy(
+                    encoder, from: workspace.streams, to: probe, count: mult * shapes.hidden
                 )
             }
 
@@ -2774,6 +2812,39 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         shape: DeepSeekV41AttentionShape,
         slotIndex: Int = 0
     ) throws {
+        let rowCount = try encodeAttentionGather(
+            layer: layer,
+            position: position,
+            encoder: encoder,
+            shape: shape,
+            slotIndex: slotIndex
+        )
+        try encodeAttentionDispatch(
+            encoder: encoder,
+            shape: shape,
+            layerIndex: layer.index,
+            slots: [slotIndex],
+            rowCounts: [rowCount]
+        )
+    }
+
+    /// Gathers one position's window and compressed rows into ITS block of the
+    /// gathered buffer, and writes its row list into its own slice of `rowIndices`.
+    ///
+    /// Both are per position rather than shared, and the row list is why: it is a
+    /// host fill, and a host fill is not ordered against a dispatch that has not
+    /// executed yet. One shared list meant every gather in a block read the list of
+    /// the block's LAST position, so a chunk's intermediate positions attended over
+    /// their successors' rows (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #15").
+    ///
+    /// Returns the number of rows the position attends over.
+    private func encodeAttentionGather(
+        layer: DeepSeekV41LayerPlan,
+        position: Int,
+        encoder: MTLComputeCommandEncoder,
+        shape: DeepSeekV41AttentionShape,
+        slotIndex: Int = 0
+    ) throws -> Int {
         let rowPlan = DeepSeekV41CacheAddressing.attentionRowPlan(
             layer: layer,
             position: position,
@@ -2799,23 +2870,23 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             throw DeepSeekV41EngineError.allocationFailed("the window ring")
         }
 
-        var cursor = 0
-        try encodeRowIndices(rowPlan.windowRows, into: workspace.rowIndices, at: 0)
-        cursor += windowCount
+        let rowOffset = workspace.gatheredRowOffset(slotIndex)
+        try encodeRowIndices(rowPlan.windowRows, into: workspace.rowIndices, at: rowOffset)
         try encodeGather(
             encoder,
             cacheBuffer: windowBuffer,
             byteOffset: windowBase,
             rowIndices: workspace.rowIndices,
-            rowIndexOffset: 0,
+            rowIndexOffset: rowOffset,
             rowCount: windowCount,
-            destinationRowOffset: 0
+            destinationRowOffset: rowOffset
         )
         if compressedCount > 0 {
             guard let compressedBuffer = cache.compressedBuffer,
                   let compressedBase = cache.layout.compressedBase[layer.compressedKVSource] else {
                 throw DeepSeekV41EngineError.allocationFailed("the compressed cache")
             }
+            let cursor = rowOffset + windowCount
             try encodeRowIndices(rowPlan.compressedRows, into: workspace.rowIndices, at: cursor)
             try encodeGather(
                 encoder,
@@ -2824,21 +2895,43 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 rowIndices: workspace.rowIndices,
                 rowIndexOffset: cursor,
                 rowCount: compressedCount,
-                destinationRowOffset: windowCount
+                destinationRowOffset: cursor
             )
         }
         encoder.memoryBarrier(scope: .buffers)
+        return rowCount
+    }
+
+    /// One attention dispatch over `slots` already-gathered positions.
+    ///
+    /// Each slot's query and output are its own copy of the per-position vectors, and
+    /// slot `s` reads its gathered rows at `s * workspace.gatherRows`; the per-slot row
+    /// counts travel in the same buffer shape the kernel reads. A single slot is the
+    /// per-position form every caller used before the slot dimension existed.
+    private func encodeAttentionDispatch(
+        encoder: MTLComputeCommandEncoder,
+        shape: DeepSeekV41AttentionShape,
+        layerIndex: Int,
+        slots: [Int],
+        rowCounts: [Int]
+    ) throws {
+        guard let first = slots.first, let maxRows = rowCounts.max() else { return }
+        guard slots.count == rowCounts.count else {
+            throw DeepSeekV41EngineError.allocationFailed(
+                "\(slots.count) attention slots against \(rowCounts.count) row counts"
+            )
+        }
 
         encoder.setComputePipelineState(pipelines.attention)
         encoder.setBuffer(
             workspace.query,
-            offset: workspace.slotOffset(slotIndex, width: shape.queryWidth),
+            offset: workspace.slotOffset(first, width: shape.queryWidth),
             index: 0
         )
         encoder.setBuffer(workspace.gathered, offset: 0, index: 1)
         // The slot is always bound: an absent sink becomes a buffer of `-1e30`, the
         // kernel's own "disabled" spelling, instead of an undefined slot.
-        let sink = vectors.buffer(.attnSink, layer: layer.index)
+        let sink = vectors.buffer(.attnSink, layer: layerIndex)
             .flatMap { $0.length >= shape.numHeads * MemoryLayout<Float>.stride ? $0 : nil }
             ?? sinkDisabled
         if let sink {
@@ -2848,10 +2941,10 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         }
         encoder.setBuffer(
             workspace.attentionOut,
-            offset: workspace.slotOffset(slotIndex, width: shape.outputWidth),
+            offset: workspace.slotOffset(first, width: shape.outputWidth),
             index: 3
         )
-        var rows = UInt32(rowCount)
+        var rows = UInt32(rowCounts[0])
         var heads = UInt32(shape.numHeads)
         var qkHeadDim = UInt32(shape.qkHeadDim)
         var valueDim = UInt32(shape.vHeadDim)
@@ -2868,18 +2961,38 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         // per gathered row, which is the same bound the gather buffer already
         // enforces, plus the tail the threadgroup reduction writes its partials to.
         let scoreBytes = (
-            (rowCount + Self.attentionReductionSlots) * MemoryLayout<Float>.stride + 15
+            (maxRows + Self.attentionReductionSlots) * MemoryLayout<Float>.stride + 15
         ) & ~15
         guard scoreBytes <= device.maxThreadgroupMemoryLength else {
             throw DeepSeekV41EngineError.allocationFailed(
-                "position \(position) reads \(rowCount) rows, whose scores need "
-                    + "\(scoreBytes) bytes of threadgroup memory against a "
-                    + "\(device.maxThreadgroupMemoryLength)-byte limit"
+                "\(maxRows) rows of attention scores need \(scoreBytes) bytes of "
+                    + "threadgroup memory against a \(device.maxThreadgroupMemoryLength)-byte limit"
             )
         }
         encoder.setThreadgroupMemoryLength(scoreBytes, index: 0)
+        if slots.count > 1 {
+            // The slot-major layout the kernel derives from its threadgroup index
+            // only holds when the slots are a contiguous run starting at slot 0 of
+            // the workspace, which is the only form the block loop asks for.
+            guard slots.enumerated().allSatisfy({ $0.element == $0.offset }) else {
+                throw DeepSeekV41EngineError.allocationFailed(
+                    "batched attention needs the block's slots in order from 0"
+                )
+            }
+            var plan = DeepSeekV41AttentionSlotPlan(
+                slotCount: UInt32(slots.count),
+                keyRowStride: UInt32(gatherRows)
+            )
+            encoder.setBytes(
+                &plan, length: MemoryLayout<DeepSeekV41AttentionSlotPlan>.stride, index: 9
+            )
+            let counts = rowCounts.map { UInt32($0) }
+            counts.withUnsafeBytes { bytes in
+                encoder.setBytes(bytes.baseAddress!, length: bytes.count, index: 10)
+            }
+        }
         encoder.dispatchThreadgroups(
-            MTLSize(width: shape.numHeads, height: 1, depth: 1),
+            MTLSize(width: shape.numHeads * slots.count, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(
                 width: Self.attentionThreadgroupWidth, height: 1, depth: 1
             )

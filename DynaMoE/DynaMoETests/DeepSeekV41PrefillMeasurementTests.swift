@@ -652,6 +652,250 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
         }
     }
 
+    /// One batched attention launch against eight single-position ones.
+    ///
+    /// `#14` established that `writeLatent`'s time IS the attention and that the
+    /// attention runs one dispatch PER POSITION of a block: 128 threadgroups, which
+    /// the journal describes as a fifth of the machine, eight times over. The kernel
+    /// now carries a slot dimension, so a block can be one launch of 1,024
+    /// threadgroups instead. This case is the A/B that decides whether wiring that is
+    /// worth anything: same kernel, same per-threadgroup work, same total arithmetic,
+    /// same total gathered bytes, and eight DISTINCT gathered blocks in both arms, so
+    /// the only variables are the launch count and how much of the die one launch has
+    /// to fill.
+    ///
+    /// The row counts ramp because a block's positions do not read the same number of
+    /// rows: the window grows with the position until it fills the ring, so early
+    /// positions of a prompt read less than late ones.
+    func testWhetherOneBatchedAttentionLaunchBeatsEight() throws {
+        guard let metal = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal device")
+        }
+        guard let library = metal.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "dsv41_attention_csa2_f32"),
+              let pipeline = try? metal.makeComputePipelineState(function: function),
+              let queue = metal.makeCommandQueue() else {
+            XCTFail("the attention kernel is not in the default library")
+            return
+        }
+
+        // The published text_config, at the block width the published ring allows.
+        let slots = 8
+        let heads = 128
+        let qkHeadDim = 512
+        let valueDim = 512
+        let width = 512
+        let shape = DeepSeekV41AttentionShape(
+            numHeads: heads,
+            headsPerGroup: 16,
+            qkHeadDim: qkHeadDim,
+            vHeadDim: valueDim,
+            latentWidth: width,
+            qLoraRank: 1536,
+            oLoraRank: 1024,
+            isCompressed: true,
+            compressRatio: 2,
+            ropeTheta: 160000,
+            rotaryDim: 64
+        )
+        let rowsBySlot = (0..<slots).map { 128 + 64 * $0 }
+        let rowStride = rowsBySlot.max() ?? 0
+
+        func sampled(_ count: Int, seed: UInt64) -> [Float] {
+            [Float](unsafeUninitializedCapacity: count) { buffer, initialized in
+                var state = seed
+                for index in 0..<count {
+                    state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+                    buffer[index] = Float(Int32(truncatingIfNeeded: state >> 33)) / Float(1 << 30)
+                }
+                initialized = count
+            }
+        }
+
+        func buffer(_ values: [Float]) -> MTLBuffer? {
+            values.withUnsafeBytes { bytes in
+                metal.makeBuffer(
+                    bytes: bytes.baseAddress!,
+                    length: bytes.count,
+                    options: .storageModeShared
+                )
+            }
+        }
+
+        let query = sampled(slots * heads * qkHeadDim, seed: 11)
+        let keys = sampled(slots * rowStride * width, seed: 13)
+        let sink = sampled(heads, seed: 17).map { $0 * 4 }
+        guard let queryBuffer = buffer(query),
+              let keyBuffer = buffer(keys),
+              let sinkBuffer = buffer(sink),
+              let outputBuffer = metal.makeBuffer(
+                  length: slots * heads * valueDim * MemoryLayout<Float>.stride,
+                  options: .storageModeShared
+              ),
+              let slotCounts = metal.makeBuffer(
+                  length: slots * MemoryLayout<UInt32>.stride,
+                  options: .storageModeShared
+              ) else {
+            XCTFail("the attention buffers did not allocate")
+            return
+        }
+        let slotCountsPointer = slotCounts.contents().assumingMemoryBound(to: UInt32.self)
+        for (slot, rows) in rowsBySlot.enumerated() {
+            slotCountsPointer[slot] = UInt32(rows)
+        }
+
+        let querySlotBytes = heads * qkHeadDim * MemoryLayout<Float>.stride
+        let keySlotBytes = rowStride * width * MemoryLayout<Float>.stride
+        let outputSlotBytes = heads * valueDim * MemoryLayout<Float>.stride
+        let scoreBytes = (rowStride + 32) * MemoryLayout<Float>.stride
+
+        func bindScalars(_ encoder: MTLComputeCommandEncoder, rows: Int) {
+            var rowCount = UInt32(rows)
+            var headCount = UInt32(heads)
+            var headWidth = UInt32(qkHeadDim)
+            var headValue = UInt32(valueDim)
+            var recordWidth = UInt32(width)
+            encoder.setBytes(&rowCount, length: 4, index: 4)
+            encoder.setBytes(&headCount, length: 4, index: 5)
+            encoder.setBytes(&headWidth, length: 4, index: 6)
+            encoder.setBytes(&headValue, length: 4, index: 7)
+            encoder.setBytes(&recordWidth, length: 4, index: 8)
+        }
+
+        // ARM A: the shipped form, one dispatch per position, one gathered block each.
+        func encodeSinglePerPosition(_ encoder: MTLComputeCommandEncoder) {
+            encoder.setComputePipelineState(pipeline)
+            for slot in 0..<slots {
+                encoder.setBuffer(
+                    queryBuffer, offset: slot * querySlotBytes, index: 0
+                )
+                encoder.setBuffer(keyBuffer, offset: slot * keySlotBytes, index: 1)
+                encoder.setBuffer(sinkBuffer, offset: 0, index: 2)
+                encoder.setBuffer(
+                    outputBuffer, offset: slot * outputSlotBytes, index: 3
+                )
+                bindScalars(encoder, rows: rowsBySlot[slot])
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: heads, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
+                )
+            }
+        }
+
+        // ARM B: one launch, the slot dimension carrying the positions.
+        func encodeBatched(_ encoder: MTLComputeCommandEncoder) {
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(queryBuffer, offset: 0, index: 0)
+            encoder.setBuffer(keyBuffer, offset: 0, index: 1)
+            encoder.setBuffer(sinkBuffer, offset: 0, index: 2)
+            encoder.setBuffer(outputBuffer, offset: 0, index: 3)
+            // The scalar row count is unused once a slot plan is bound; the kernel
+            // reads `slotRowCounts` instead.
+            bindScalars(encoder, rows: 0)
+            var slotPlan = DeepSeekV41AttentionSlotPlan(
+                slotCount: UInt32(slots), keyRowStride: UInt32(rowStride)
+            )
+            encoder.setBytes(
+                &slotPlan, length: MemoryLayout<DeepSeekV41AttentionSlotPlan>.stride, index: 9
+            )
+            encoder.setBuffer(slotCounts, offset: 0, index: 10)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: slots * heads, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
+            )
+        }
+
+        let blocks = 10
+        func time(_ encode: (MTLComputeCommandEncoder) -> Void) -> Double {
+            var best = Double.infinity
+            for attempt in 0..<(warmups + blocks) {
+                guard let command = queue.makeCommandBuffer(),
+                      let encoder = command.makeComputeCommandEncoder() else { return .infinity }
+                encoder.setThreadgroupMemoryLength(scoreBytes, index: 0)
+                for _ in 0..<(attempt >= warmups ? blocks : 1) {
+                    encode(encoder)
+                }
+                encoder.endEncoding()
+                command.commit()
+                command.waitUntilCompleted()
+                guard attempt >= warmups else { continue }
+                let window = command.gpuEndTime - command.gpuStartTime
+                best = min(best, window / Double(blocks) * 1000)
+            }
+            return best
+        }
+
+        // Encode once for correctness, then read the two arms back and compare each
+        // against the host rule. The timing is only worth reading if it is the same
+        // computation; two heads of two different slots is enough, because the
+        // reduction, the sink and the accumulation are the same code everywhere.
+        func run(_ encode: (MTLComputeCommandEncoder) -> Void) -> [Float] {
+            guard let command = queue.makeCommandBuffer(),
+                  let encoder = command.makeComputeCommandEncoder() else { return [] }
+            // The scratch length has to be set BEFORE the dispatch is encoded; a
+            // dispatch keeps whatever was set when it was written.
+            encoder.setThreadgroupMemoryLength(scoreBytes, index: 0)
+            encode(encoder)
+            encoder.endEncoding()
+            command.commit()
+            command.waitUntilCompleted()
+            return floats(outputBuffer, count: slots * heads * valueDim)
+        }
+
+        let shipped = run(encodeSinglePerPosition)
+        let batched = run(encodeBatched)
+        for (slot, head) in [(2, 5), (7, 100)] {
+            // The host rule runs a whole position at a time, so the reference is one
+            // slot's worth of heads and the comparison picks the head out of it.
+            let queryBase = slot * heads * qkHeadDim
+            let reference = DeepSeekV41AttentionReference.attend(
+                query: Array(query[queryBase..<(queryBase + heads * qkHeadDim)]),
+                keys: (0..<rowsBySlot[slot]).map {
+                    Array(keys[((slot * rowStride + $0) * width)..<((slot * rowStride + $0 + 1) * width)])
+                },
+                shape: shape,
+                sink: sink
+            )
+            let range = (head * valueDim)..<((head + 1) * valueDim)
+            let scale = reference[range].map(abs).max() ?? 1
+            let outputBase = (slot * heads + head) * valueDim
+            let outputRange = outputBase..<(outputBase + valueDim)
+            XCTAssertLessThan(
+                worstDelta(Array(shipped[outputRange]), Array(reference[range])) / max(scale, 1e-6),
+                1e-4,
+                "slot \(slot) head \(head): the per-position launch does not match the host rule"
+            )
+            XCTAssertLessThan(
+                worstDelta(Array(batched[outputRange]), Array(reference[range])) / max(scale, 1e-6),
+                1e-4,
+                "slot \(slot) head \(head): the batched launch does not match the host rule"
+            )
+        }
+
+        let perPosition = time(encodeSinglePerPosition)
+        let oneLaunch = time(encodeBatched)
+        let totalRows = rowsBySlot.reduce(0, +)
+
+        print(
+            String(
+                format: "[dsv41 attention batch] slots=%d heads=%d rows=%d..%d total=%d",
+                slots, heads, rowsBySlot.first ?? 0, rowStride, totalRows
+            )
+        )
+        print(
+            String(
+                format: "[dsv41 attention batch] %d launches %8.3f ms/block  %8.3f ms/position",
+                slots, perPosition, perPosition / Double(slots)
+            )
+        )
+        print(
+            String(
+                format: "[dsv41 attention batch] %d launch  %8.3f ms/block  %8.3f ms/position  %.2fx",
+                1, oneLaunch, oneLaunch / Double(slots), perPosition / max(oneLaunch, 1e-9)
+            )
+        )
+    }
+
     /// The stage table at the widths the checkpoint publishes.
     ///
     /// Every case above runs on the two-head default shape, and a ranking taken from

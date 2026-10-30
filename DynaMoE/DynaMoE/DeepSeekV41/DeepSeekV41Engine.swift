@@ -785,14 +785,25 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
     /// several positions per dispatch — the kernels index the token from
     /// `thread_position_in_grid.y` — so every per-position vector lives in `slots`
     /// consecutive copies and a stage binds the copy it is working on. The
-    /// per-position scratch (`gathered`, `intermediate`, the compressor block, the
-    /// Engram staging) stays single: those are used one position at a time no
-    /// matter how wide the dispatch is.
+    /// per-position scratch (`intermediate`, the compressor block, the Engram
+    /// staging) stays single: those are used one position at a time no matter how
+    /// wide the dispatch is. `gathered` and `rowIndices` do NOT: both are per
+    /// position, because the gather's row list is a host fill and a host fill is not
+    /// ordered against a dispatch that has not executed yet.
     public let slots: Int
 
     /// Byte offset of one position's copy of a `width`-wide vector.
     public func slotOffset(_ slot: Int, width: Int) -> Int {
         min(max(slot, 0), max(0, slots - 1)) * width * MemoryLayout<Float>.stride
+    }
+
+    /// First row of one position's gathered block, and of its row list.
+    ///
+    /// `gathered` holds one `gatherRows`-row block per position, so this is the row
+    /// offset to gather into; `rowIndices` holds one `gatherRows`-long list per
+    /// position, so it is also the element offset to write that list at.
+    public func gatheredRowOffset(_ slot: Int) -> Int {
+        min(max(slot, 0), max(0, slots - 1)) * gatherRows
     }
 
     public init?(
@@ -833,7 +844,7 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
               let normed = make(slotBytes(shapes.hidden)),
               let query = make(slotBytes(shapes.queryWidth)),
               let latent = make(slotBytes(shapes.latentWidth)),
-              let gathered = make(float4(gather * shapes.latentWidth)),
+              let gathered = make(float4(gather * shapes.latentWidth * slots)),
               let attentionOut = make(slotBytes(shapes.attentionOutputWidth)),
               let output = make(slotBytes(shapes.hidden)),
               let routerLogits = make(slotBytes(config.numRoutedExperts)),
@@ -861,7 +872,7 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
               let hcFFNComb = make(slotBytes(mult * mult)),
               let hcResidual = make(slotBytes(mult * shapes.hidden)),
               let logits = make(float4(config.vocabSize)),
-              let rowIndices = make(4 * gather),
+              let rowIndices = make(4 * gather * slots),
               let tokenIDs = make(4),
               let engramRaw = make(engramRawBytes),
               let engramValues = make(float4(engramValueCount)),

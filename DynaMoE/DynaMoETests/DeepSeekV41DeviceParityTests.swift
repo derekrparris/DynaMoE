@@ -254,6 +254,72 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         XCTAssertEqual(worstDelta(chunk.last, last), 0, accuracy: 1e-6)
     }
 
+    /// Every position of a block attends over its OWN gathered rows.
+    ///
+    /// The gather's row list is a host fill into a shared buffer, and a host fill is
+    /// not ordered against a dispatch that has not executed yet: all of a stage's
+    /// gathers are encoded, and only then committed. While the list had one region for
+    /// the whole block, every gather in a block therefore read the list written for
+    /// the block's LAST position, so positions `0...n-2` attended over their
+    /// successor's rows. Nothing that is normally looked at shows it — attention
+    /// writes only that position's stream, and `prefillChunk` samples only the last
+    /// position's logits — so the after-attention probe is what makes it visible:
+    /// slot 0 of a block is a position whose attention dispatch is not the last one.
+    func testEveryPositionOfABlockAttendsOverItsOwnRows() throws {
+        let metal = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        // A ring wider than the block, which is the checkpoint's own ratio (128 over
+        // 8). With the two equal, every block is window-aligned and a successor's row
+        // list is a permutation of the rows its predecessor needs, so the sets coincide
+        // and a shared list hides behind attention's indifference to row order.
+        var shape = DeepSeekV41SyntheticShape()
+        shape.window = 10
+        shape.contextLength = 64
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+        let mult = max(1, checkpoint.config.hcMult)
+        let hidden = checkpoint.shape.hidden
+        let blockWidth = DeepSeekV41DevicePlan.chunkSlots(
+            config: checkpoint.config,
+            contextLength: checkpoint.shape.contextLength
+        )
+        XCTAssertGreaterThan(blockWidth, 1, "a block of one cannot show a shared row list")
+        XCTAssertGreaterThan(shape.window, blockWidth, "the ring has to outrun the block")
+        // Three blocks, and the comparison is made on the LAST one: the probe keeps the
+        // most recent write, and by then the window is full and each position's row
+        // list starts somewhere different.
+        let tokens = (0..<(blockWidth * 3)).map { 3 + $0 }
+        let target = (tokens.count - blockWidth)
+
+        let runtime = try makeRuntime(checkpoint)
+        let chunked = runtime.forward()
+        let chunkedProbe = try buffer(metal, mult * hidden)
+        chunked.parityProbes = DeepSeekV41ParityProbes(afterAttention: chunkedProbe)
+        _ = try chunked.prefillChunk(tokens)
+
+        // The same positions, one at a time, capturing after each. Position `target` is
+        // the one a shared row list replaces with a successor's rows; the arm the block
+        // does match is named in the failure, because matching a LATER position is that
+        // bug's signature.
+        let walked = try makeRuntime(checkpoint).forward()
+        let walkedProbe = try buffer(metal, mult * hidden)
+        walked.parityProbes = DeepSeekV41ParityProbes(afterAttention: walkedProbe)
+        var walkedStates: [[Float]] = []
+        for (position, token) in tokens.enumerated() {
+            _ = try walked.forwardToken(token, position: position)
+            walkedStates.append(floats(walkedProbe, count: mult * hidden))
+        }
+
+        let blockState = floats(chunkedProbe, count: mult * hidden)
+        let deltas = walkedStates.map { worstDelta(blockState, $0) }
+        XCTAssertLessThan(
+            deltas[target],
+            1e-5,
+            "position \(target) of a \(blockWidth)-position block does not match the walk "
+                + "after attention: it matches position "
+                + "\(deltas.firstIndex(where: { $0 < 1e-5 }).map(String.init) ?? "none") "
+                + "of the walk instead (\(deltas))"
+        )
+    }
+
     // MARK: One layer, stage by stage
 
     /// One layer and one position, replayed here from the reference's own helpers,

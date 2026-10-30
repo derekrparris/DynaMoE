@@ -9254,30 +9254,61 @@ kernel void dsv41_gather_latents_f16(
 /// row scores are kept in threadgroup memory so the three passes share ONE dot
 /// product per row instead of recomputing it. The head's maximum and denominator
 /// are reductions across the threadgroup, kept in the scratch tail of `scores`.
+///
+/// `slotPlan` batches several query positions into ONE launch. With a `slotCount`
+/// above one the grid is `slotCount * headCount` threadgroups, `slot = groupIdx /
+/// headCount` and `head = groupIdx % headCount`, so the slot-major query and output
+/// offsets stay `groupIdx * qkHeadDim` and `groupIdx * valueDim`, and the head part
+/// of the index is what selects its sink.
+/// Slot `s` reads its gathered block at row `s * keyRowStride`, and `slotRowCounts`
+/// carries one row count per slot because a block's positions do not all read the
+/// same number of rows (the first position of a prompt sees one window row, the
+/// eighth sees eight). Leaving `slotPlan` unbound is the single-position form: one
+/// dispatch per position, `rowCount` rows, the gathered block at row 0, which is
+/// what every caller dispatched before this existed.
+struct Dsv41AttentionSlotPlan {
+    uint32_t slotCount;
+    uint32_t keyRowStride;
+};
+
 kernel void dsv41_attention_csa2_f32(
-    device const float* queryBuffer [[buffer(0)]],   // [heads * qkHeadDim]
-    device const float* keyBuffer [[buffer(1)]],     // [rowCount * width]
+    device const float* queryBuffer [[buffer(0)]],   // [slots * heads * qkHeadDim]
+    device const float* keyBuffer [[buffer(1)]],     // [slots * keyRowStride * width]
     device const float* sinkBuffer [[buffer(2)]],    // [heads] or null
-    device float* outputBuffer [[buffer(3)]],        // [heads * vHeadDim]
+    device float* outputBuffer [[buffer(3)]],        // [slots * heads * vHeadDim]
     constant uint32_t& rowCount [[buffer(4)]],
     constant uint32_t& headCount [[buffer(5)]],
     constant uint32_t& qkHeadDim [[buffer(6)]],
     constant uint32_t& valueDim [[buffer(7)]],
     constant uint32_t& width [[buffer(8)]],
-    threadgroup float* scores [[threadgroup(0)]],    // [rowCount + one per SIMD group]
-    uint headIdx [[threadgroup_position_in_grid]],
+    constant Dsv41AttentionSlotPlan* slotPlan [[buffer(9)]],
+    device const uint32_t* slotRowCounts [[buffer(10)]],
+    threadgroup float* scores [[threadgroup(0)]],    // [max rows + one per SIMD group]
+    uint groupIdx [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_threadgroup]],
     uint laneCount [[threads_per_threadgroup]],
     uint laneInSimd [[thread_index_in_simdgroup]],
     uint simdIdx [[simdgroup_index_in_threadgroup]]
 ) {
-    if (headIdx >= headCount || rowCount == 0) return;
+    uint32_t slotCount = (slotPlan != nullptr && slotPlan->slotCount > 1u)
+        ? slotPlan->slotCount
+        : 1u;
+    if (groupIdx >= headCount * slotCount) return;
+    uint32_t slot = groupIdx / headCount;
+    uint32_t headIdx = groupIdx - slot * headCount;
+    uint32_t rows = (slotCount > 1u && slotRowCounts != nullptr)
+        ? slotRowCounts[slot]
+        : rowCount;
+    if (rows == 0u) return;
+    uint64_t keyRowBase = (slotCount > 1u)
+        ? (uint64_t)slot * (uint64_t)slotPlan->keyRowStride
+        : 0u;
 
     float invSqrt = rsqrt((float)qkHeadDim);
-    uint32_t queryBase = headIdx * qkHeadDim;
+    uint32_t queryBase = groupIdx * qkHeadDim;
     uint32_t queryWidth = min(qkHeadDim, width);
     uint32_t simdCount = (laneCount + 31u) / 32u;
-    threadgroup float* partials = scores + rowCount;
+    threadgroup float* partials = scores + rows;
 
     // The sink is an extra logit with no value row, so it enters the maximum and
     // the denominator and contributes nothing to the output.
@@ -9286,8 +9317,8 @@ kernel void dsv41_attention_csa2_f32(
     // Pass 1: one row per thread, the whole dot product in that thread. A row is a
     // contiguous record, so this walks memory forward instead of gathering it.
     float localMax = -1e30f;
-    for (uint32_t row = lane; row < rowCount; row += laneCount) {
-        uint64_t keyBase = (uint64_t)row * width;
+    for (uint32_t row = lane; row < rows; row += laneCount) {
+        uint64_t keyBase = (keyRowBase + (uint64_t)row) * width;
         float dot = 0.0f;
         for (uint32_t dim = 0; dim < queryWidth; ++dim) {
             dot += queryBuffer[queryBase + dim] * keyBuffer[keyBase + dim];
@@ -9307,7 +9338,7 @@ kernel void dsv41_attention_csa2_f32(
     // Pass 2: the weights replace the scores in place, so the output pass reads
     // them and pays for `exp` once.
     float localSum = 0.0f;
-    for (uint32_t row = lane; row < rowCount; row += laneCount) {
+    for (uint32_t row = lane; row < rows; row += laneCount) {
         float weight = exp(scores[row] - maxScore);
         scores[row] = weight;
         localSum += weight;
@@ -9325,11 +9356,11 @@ kernel void dsv41_attention_csa2_f32(
     // Pass 3: one thread per output dimension, so this is an accumulator rather
     // than a reduction: threads own disjoint dimensions and never collide.
     uint32_t valueWidth = min(valueDim, width);
-    uint32_t outputBase = headIdx * valueDim;
+    uint32_t outputBase = groupIdx * valueDim;
     for (uint32_t dim = lane; dim < valueWidth; dim += laneCount) {
         float accumulator = 0.0f;
-        for (uint32_t row = 0; row < rowCount; ++row) {
-            accumulator += scores[row] * keyBuffer[(uint64_t)row * width + dim];
+        for (uint32_t row = 0; row < rows; ++row) {
+            accumulator += scores[row] * keyBuffer[(keyRowBase + (uint64_t)row) * width + dim];
         }
         outputBuffer[outputBase + dim] = accumulator * inverse;
     }

@@ -4629,3 +4629,101 @@ one-layer caveats as `#13`. Device time is one command buffer per stage.
 
 Tests: none added — the table above is `#5`'s existing opt-in case, re-read against the
 current table. Whole DeepSeek suite: 412 tests, 10 skipped, 0 failures.
+
+## DSV4.1 #15: ONE ATTENTION LAUNCH PER BLOCK, AND THE ROW LIST IT EXPOSED
+
+`#14` priced `writeLatent` at 0.247 ms/position — 51.2% of a block's dense half — and
+attributed nearly all of it to the attention, then named the next measurement: one
+dispatch at 8x the grid against eight dispatches at 1x, same rows, same total work. The
+premise was that a position is 128 threadgroups, "a fifth of the machine", and a block
+runs eight of those back to back.
+
+**The measurement first, and it could not be done without the kernel.** The kernel returns
+early when its threadgroup index is past the head count, so widening the grid measures
+nothing. So `dsv41_attention_csa2_f32` grew a slot dimension before anything was wired:
+with `slotPlan` bound (buffer 9) the grid is `slotCount * headCount`, `slot = groupIdx /
+headCount`, `head = groupIdx % headCount`, and slot `s` reads its gathered block at row
+`s * keyRowStride`. The slot-major query and output offsets are then still `groupIdx *
+qkHeadDim` and `groupIdx * valueDim`, and the head part of the index selects the sink.
+Buffer 10 holds one row count per slot, because a block's positions do not read the same
+number of rows. Leaving `slotPlan` unbound is the old form, so nothing else changed.
+
+**The A/B** (`testWhetherOneBatchedAttentionLaunchBeatsEight`, opt-in): published geometry,
+8 slots with ramping row counts (128, 192, … 576 — 2,816 rows, 352 per position), eight
+DISTINCT gathered blocks in both arms, both arms validated against
+`DeepSeekV41AttentionReference.attend` at 1e-4 before anything is printed.
+
+| form | ms/block | ms/position | |
+|---|---:|---:|---:|
+| 8 launches of 128 threadgroups | 2.118 | 0.265 | |
+| 1 launch of 1,024 threadgroups | **0.964** | **0.120** | **2.20x** |
+
+0.265 ms/position is also the first direct confirmation of `#14`'s 0.245: the arithmetic
+that interpolated ~0.65 us/row over an average 320-row window lands within 8%.
+
+**The bug the slot dimension could not avoid.** A gather's row list is a host fill into
+`workspace.rowIndices`, and a host fill is not ordered against a dispatch that has not
+executed yet: every gather in a stage is encoded, and only then is the command buffer
+committed. While that buffer had ONE region for the whole block, every gather in a block
+read the list written for the block's LAST position. It is invisible in everything
+normally looked at — attention writes only that position's own stream, and
+`prefillChunk` samples only the last position's logits — and it is invisible even to a
+parity test for two more reasons: with the synthetic default (window 4, block 4) the
+blocks are window-aligned, so a successor's list is a permutation of the rows its
+predecessor needs and attention does not care about row order, and the probe that would
+have shown it was wired only by the walk, never by the block path. So the block path now
+writes the row list into its own per-position slice of `rowIndices` and gathers into its
+own per-position block of `gathered` (both `workspace.gatheredRowOffset(slot)` apart), and
+the block path's `.writeAttentionStreams` now honours `parityProbes.afterAttention` for
+slot 0.
+
+`testEveryPositionOfABlockAttendsOverItsOwnRows` pins it with a ring WIDER than the block
+(10 over 8, the checkpoint's own ratio is 128 over 8), three blocks, and a comparison of
+the last block's slot 0 against the walk at that position. With the row list temporarily
+put back on one shared region the case fails at 2.1e-3 against a 1e-5 bar; with the
+per-position region it passes. 2.1e-3 is small because the wrong rows are neighbours of
+the right ones and the softmax barely moves — the reason this needs a test rather than a
+number.
+
+**What it did to the table** (published widths, same case as `#13`/`#14`, same machine):
+
+| stage | `#13` | now | change |
+|---|---:|---:|---:|
+| `writeLatent` | 0.247 | **0.112** | 2.2x |
+| dense device, ms/position | 0.480 | **0.345** | 1.39x |
+| whole block, ms/position | 0.93 | **0.79** | 1.18x |
+
+`writeLatent` is 2.2x cheaper, which is the isolated A/B's own factor — the check that the
+in-situ win is the launch shape and not something that moved with it. It is now 30.4% of
+the block instead of 51.2%, and the mixture (0.416, unchanged) is 55% of the device half.
+
+**The table it leaves** (ms/position, whole block 0.79; dense device 0.3448, mixture
+0.4163): `writeLatent` 0.112 (30.4%), `queryUp` 0.047 (12.7%), `outputDown` 0.045 (12.3%),
+`outputUp` 0.044 (12.0%), the calibration buffer 0.024, `latentProject` 0.014, `queryDown`
+0.012, then `hcFFNCoefficients`/`hcAttentionCoefficients`/`ffnNorm`/`attnNorm` 0.011 each
+and everything else at 0.005 or under. The calibration row moved 0.003 → 0.024 with no
+change to its dispatch, which is `#11`'s warning repeating: it is an instrument, not a
+stage.
+
+Host split: dense encode 0.0699, front wait 0.2624, mixture encode 0.0114 — encode is now
+24% of accounted time.
+
+**What is left in the cache loop.** The gathers are still one dispatch each, and by `#14`'s
+constraint they cannot be hoisted past a store: gather for p must follow store p and
+precede store p + 1. Nothing measured says eight gather launches cost anything — they are
+512-wide by `rowCount` threads each — but the same argument that made the attention worth
+batching has not been tested on them, and now that each gather owns its own destination
+block in `gathered`, one slot-aware gather would be a strict drop-in if it did.
+
+**Caveats.** Same as `#13`/`#14`: BF16 synthetic weights (the checkpoint's attention
+projections are quantised, so absolute numbers differ while rankings hold), no compressed
+layers so the pool term is invisible and the positive margin is real but unmeasured, one
+layer, and the mixture's 0.416 ms/position is dispatch overhead because the synthetic
+intermediate is 32. The isolated A/B is cache-warm and its two arms share one key buffer
+allocation, so it ranks the two forms and is not additive into the block table. Device
+time is one command buffer per stage. Both cases are opt-in (~7 s and ~37 s).
+
+Tests: `testWhetherOneBatchedAttentionLaunchBeatsEight` (the table above, opt-in) and
+`testEveryPositionOfABlockAttendsOverItsOwnRows` (the regression). Whole DeepSeek suite:
+414 tests, 11 skipped, 0 failures, including `testTheChunkSeamReturnsTheWalksLogits` at
+bit-identical logits and `testTheDeviceAndTheHostAgreeStageByStage`.
