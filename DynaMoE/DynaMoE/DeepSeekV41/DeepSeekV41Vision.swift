@@ -113,6 +113,58 @@ nonisolated public struct DeepSeekV41VisionSpec: Sendable, Equatable {
             ropeTheta: number("rope_theta", "vision_rope_theta") ?? 10_000
         )
     }
+
+    /// Decodes the flat `inference/config.json`, which flattens the tower into
+    /// `vision_`-prefixed root keys instead of nesting a `vision_config`.
+    ///
+    /// Reading only the nested shape is not "a config without a tower": the flat
+    /// config publishes 32 tower layers and the tower it describes is the same
+    /// ViT. A nil spec turns off image prompting entirely, so the prefix is mapped
+    /// back to the canonical spellings rather than silently dropping the tower.
+    public static func decodeFlat(_ root: [String: Any]) -> DeepSeekV41VisionSpec? {
+        let canonical: [String: String] = [
+            "vision_n_layers": "num_hidden_layers",
+            "vision_dim": "hidden_size",
+            "vision_n_heads": "num_attention_heads",
+            "vision_inter_dim": "intermediate_size",
+            "vision_patch_size": "patch_size",
+            "vision_downsample_ratio": "downsample_ratio",
+            "vision_max_n_token": "max_image_tokens",
+            "vision_min_pixels": "min_pixels",
+            "vision_max_wh_ratio": "max_wh_ratio",
+            "vision_rope_theta": "rope_theta"
+        ]
+        var object: [String: Any] = [:]
+        for (flat, nested) in canonical {
+            guard let value = root[flat], !(value is NSNull) else { continue }
+            object[nested] = value
+        }
+        return decode(object)
+    }
+
+    /// The same spec with `imageTokenID` filled in.
+    ///
+    /// Both config shapes keep `image_token_id` at the root, beside the tower
+    /// rather than inside it, so a spec decoded from the block alone reports -1 and
+    /// the tower cannot say which id it expects. Nothing downstream reads -1 as a
+    /// real id, but a spec that disagrees with the config it came from is a trap
+    /// for the prompt builder.
+    public func fillingImageTokenID(_ id: Int) -> DeepSeekV41VisionSpec {
+        guard imageTokenID < 0, id >= 0 else { return self }
+        return DeepSeekV41VisionSpec(
+            patchSize: patchSize,
+            downsampleRatio: downsampleRatio,
+            minPixels: minPixels,
+            maxImageTokens: maxImageTokens,
+            numHiddenLayers: numHiddenLayers,
+            hiddenSize: hiddenSize,
+            numAttentionHeads: numAttentionHeads,
+            intermediateSize: intermediateSize,
+            imageTokenID: id,
+            maxWidthHeightRatio: maxWidthHeightRatio,
+            ropeTheta: ropeTheta
+        )
+    }
 }
 
 // MARK: - Layout

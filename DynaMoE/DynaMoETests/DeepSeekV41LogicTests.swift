@@ -14,14 +14,20 @@
 //  `n_heads = 8`, the bucket arithmetic must address exactly
 //  `engram_num_embeddings[0] = 384_006_168` rows of the published checkpoint.
 //
+//  The fixtures in `DeepSeekV41ConfigTests` are SYNTHETIC: they exercise decoding
+//  branches, and their widths are not the model's. Anything asserted as a fact
+//  about the checkpoint belongs in `DeepSeekV41PublishedConfigTests`, which decodes
+//  the two config files the checkpoint actually ships.
+//
 
 import XCTest
 @testable import DynaMoE
 
 final class DeepSeekV41ConfigTests: XCTestCase {
 
-    /// The multimodal wrapper shape: text tower under `text_config`, vision
-    /// tower beside it, token ids at the root.
+    /// The multimodal wrapper SHAPE, at synthetic widths: text tower under
+    /// `text_config`, vision tower beside it, token ids at the root. The published
+    /// file is `DeepSeekV41PublishedConfigTests.publishedWrapperJSON`.
     static let wrapperJSON = """
     {
       "architectures": ["DeepseekV41ForCausalLM"],
@@ -182,14 +188,18 @@ final class DeepSeekV41ConfigTests: XCTestCase {
 
     func testCompressedCacheIsSmallEvenAtFullContext() throws {
         let config = try config()
-        // 2 owners x 288 bytes x 1M tokens is ~576 MB of main cache; the window
-        // rings are bounded by window_size and cost nothing per token.
+        // This fixture declares two owners, so 2 x 288 bytes x 1M tokens is ~576 MB
+        // of main cache; the published checkpoint has four (see
+        // `DeepSeekV41PublishedConfigTests.testTheCacheCostsWhatFourOwnersCost`).
+        // The window rings are bounded by window_size and cost nothing per token.
         XCTAssertEqual(config.cacheBytesPerToken(useFP4Main: true), 576)
         XCTAssertEqual(config.cacheBytesPerToken(useFP4Main: false), 1056)
         let mainCache = config.cacheBytesPerToken(useFP4Main: true) * 1_048_576
         XCTAssertLessThan(Double(mainCache) / 1_073_741_824.0, 1.0)
     }
 
+    /// The flat shape at synthetic widths, narrowed to the fields this test needs.
+    /// The published file is `DeepSeekV41PublishedConfigTests.publishedFlatJSON`.
     func testFlatInferenceConfigDecodes() throws {
         let flat = """
         {"model_type": "deepseek_v41", "n_layers": 40, "dim": 7168, "n_heads": 128,
@@ -876,7 +886,8 @@ final class DeepSeekV41WeightCatalogTests: XCTestCase {
                 tensor("mtp.0.attn.wkv.scale", "F8_E8M0", [16, 160]),
                 tensor("mtp.0.attn.wq_b.weight", "F8_E4M3", [32768, 1280]),
                 tensor("mtp.0.ffn.gate.bias", "F32", [384]),
-                tensor("mtp.0.hc_attn_fn", "BF16", [4, 4])
+                // The published draft block publishes `hc_attn_fn` as F32 [24, 20480].
+                tensor("mtp.0.hc_attn_fn", "F32", [24, 20480])
             ],
             layerCount: 40
         )
@@ -1857,7 +1868,7 @@ final class DeepSeekV41ConfigEdgeTests: XCTestCase {
     func testHyperConnectionScaleResolvesAsAPlainVector() {
         let catalog = DeepSeekV41WeightCatalog(
             named: [
-                DeepSeekV41TensorRef(name: "layers.0.hc_attn_scale", dtype: "BF16", shape: [4])
+                DeepSeekV41TensorRef(name: "layers.0.hc_attn_scale", dtype: "F32", shape: [3])
             ],
             layerCount: 1
         )
@@ -1941,5 +1952,389 @@ final class DeepSeekV41VisionExpandTests: XCTestCase {
         )
         XCTAssertEqual(expansion.text, String(repeating: "x", count: 8) + "<img>")
         XCTAssertEqual(expansion.report.unfilledPlaceholderCount, 1)
+    }
+}
+
+/// The two config files the checkpoint actually ships, embedded verbatim so the
+/// decoder is measured against the model rather than against a fixture: the
+/// published `config.json` (multimodal wrapper) and `inference/config.json`
+/// (flat). Both are copied from snapshot `1bae0e1088993b9b82de08f59de5be5a34e42170`.
+///
+/// The fixtures elsewhere in this file are synthetic, and one of them used
+/// `hidden_size` 7168 with 128 heads, which no checkpoint has. A synthetic shape
+/// is fine for exercising decoding branches; it is not evidence about the model,
+/// so the numbers that describe the checkpoint are asserted here.
+final class DeepSeekV41PublishedConfigTests: XCTestCase {
+
+    static let publishedWrapperJSON = """
+    {
+      "architectures": ["DeepseekV41ForCausalLM"],
+      "model_type": "deepseek_v41",
+      "dtype": "bfloat16",
+      "transformers_version": "5.6.0",
+      "bos_token_id": 0,
+      "eos_token_id": 1,
+      "pad_token_id": 2,
+      "image_token_id": 129264,
+      "quantization_config":       {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [32, 32],
+        "scale_fmt": "ue8m0",
+        "expert_dtype": "fp4"
+      },
+      "text_config":       {
+        "model_type": "deepseek_v41_text",
+        "vocab_size": 129280,
+        "hidden_size": 5120,
+        "moe_intermediate_size": 2304,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 1,
+        "head_dim": 512,
+        "qk_rope_head_dim": 64,
+        "q_lora_rank": 1280,
+        "o_lora_rank": 1024,
+        "o_groups": 8,
+        "hidden_act": "silu",
+        "swiglu_limit": 10.0,
+        "rms_norm_eps": 1e-20,
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "initializer_range": 0.02,
+        "use_cache": true,
+        "tie_word_embeddings": false,
+        "max_position_embeddings": 1048576,
+        "rope_theta": 10000,
+        "rope_scaling":         {
+          "rope_type": "yarn",
+          "factor": 16,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        },
+        "n_routed_experts": 384,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 6,
+        "scoring_func": "sqrtsoftplus",
+        "topk_method": "noaux_tc",
+        "norm_topk_prob": true,
+        "routed_scaling_factor": 1.5,
+        "sliding_window": 128,
+        "compress_ratios": [0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0],
+        "compress_rope_theta": 160000,
+        "kv_source_layer_ids": [2, 8, 14, 20],
+        "index_source_layer_ids": [2, 8, 14, 20, 24, 28, 32, 36],
+        "index_n_heads": 32,
+        "index_head_dim": 128,
+        "index_topk": 512,
+        "candidate_source_layer_id": 20,
+        "candidate_topk_blocks": 2048,
+        "candidate_block_size": 8,
+        "hc_mult": 4,
+        "hc_sinkhorn_iters": 20,
+        "hc_eps": 1e-06,
+        "engram_layer_ids": [1, 14],
+        "engram_num_embeddings": [384006168, 384016682],
+        "engram_max_ngram_size": 4,
+        "engram_vocab_size": 16000000,
+        "engram_n_heads": 8,
+        "engram_head_dim": 256,
+        "engram_pad_token_id": 2,
+        "engram_compressed_vocab_size": 99092,
+        "num_nextn_predict_layers": 3,
+        "dspark_block_size": 5,
+        "dspark_noise_token_id": 128799,
+        "dspark_target_layer_ids": [37, 38, 39],
+        "dspark_markov_rank": 256,
+        "dspark_n_routed_experts": 128,
+        "dspark_num_experts_per_tok": 3
+      },
+      "vision_config":       {
+        "model_type": "deepseek_v41_vision",
+        "num_hidden_layers": 32,
+        "hidden_size": 1024,
+        "num_attention_heads": 16,
+        "intermediate_size": 2816,
+        "patch_size": 14,
+        "rope_theta": 10000,
+        "downsample_ratio": 3,
+        "max_image_tokens": 1024,
+        "min_pixels": 295936,
+        "max_wh_ratio": null
+      }
+    }
+    """
+
+    static let publishedFlatJSON = """
+    {
+      "vocab_size": 129280,
+      "dim": 5120,
+      "moe_inter_dim": 2304,
+      "n_layers": 40,
+      "n_mtp_layers": 3,
+      "dspark_block_size": 5,
+      "dspark_noise_token_id": 128799,
+      "dspark_target_layer_ids": [37, 38, 39],
+      "dspark_markov_rank": 256,
+      "dspark_n_routed_experts": 128,
+      "dspark_n_activated_experts": 3,
+      "n_heads": 64,
+      "n_routed_experts": 384,
+      "n_shared_experts": 1,
+      "n_activated_experts": 6,
+      "score_func": "sqrtsoftplus",
+      "route_scale": 1.5,
+      "swiglu_limit": 10.0,
+      "q_lora_rank": 1280,
+      "head_dim": 512,
+      "rope_head_dim": 64,
+      "norm_eps": 1e-20,
+      "o_groups": 8,
+      "o_lora_rank": 1024,
+      "window_size": 128,
+      "kv_source_layers": [2, 8, 14, 20],
+      "index_source_layers": [2, 8, 14, 20, 24, 28, 32, 36],
+      "original_seq_len": 65536,
+      "rope_theta": 10000,
+      "rope_factor": 16,
+      "beta_fast": 32,
+      "beta_slow": 1,
+      "index_n_heads": 32,
+      "index_head_dim": 128,
+      "index_topk": 512,
+      "candidate_source_layer": 20,
+      "candidate_topk_blocks": 2048,
+      "candidate_block_size": 8,
+      "hc_mult": 4,
+      "hc_sinkhorn_iters": 20,
+      "hc_eps": 1e-06,
+      "engram_layer_ids": [1, 14],
+      "engram_vocab_size": 16000000,
+      "engram_num_embeddings": [384006168, 384016682],
+      "engram_max_ngram_size": 4,
+      "engram_pad_id": 2,
+      "engram_compressed_vocab_size": 99092,
+      "dtype": "fp8",
+      "expert_dtype": "fp4",
+      "compress_rope_theta": 160000,
+      "compress_ratios": [0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0],
+      "vision_n_layers": 32,
+      "vision_dim": 1024,
+      "vision_n_heads": 16,
+      "vision_inter_dim": 2816,
+      "vision_patch_size": 14,
+      "vision_downsample_ratio": 3,
+      "vision_max_n_token": 1024,
+      "vision_min_pixels": 295936,
+      "vision_max_wh_ratio": null,
+      "image_token_id": 129264,
+      "engram_n_heads": 8,
+      "engram_head_dim": 256,
+      "vision_rope_theta": 10000
+    }
+    """
+
+    func wrapper() throws -> DeepSeekV41Config {
+        try DeepSeekV41Config.decode(jsonData: Data(Self.publishedWrapperJSON.utf8))
+    }
+
+    func flat() throws -> DeepSeekV41Config {
+        try DeepSeekV41Config.decode(jsonData: Data(Self.publishedFlatJSON.utf8))
+    }
+
+    func testTheWrapperDecodesThePublishedShape() throws {
+        let config = try wrapper()
+        XCTAssertEqual(config.modelType, "deepseek_v41")
+        XCTAssertEqual(config.hiddenSize, 5120)
+        XCTAssertEqual(config.numHiddenLayers, 40)
+        XCTAssertEqual(config.numAttentionHeads, 64)
+        XCTAssertEqual(config.numKeyValueHeads, 1)
+        XCTAssertEqual(config.vocabSize, 129280)
+        XCTAssertEqual(config.moeIntermediateSize, 2304)
+        // The checkpoint has no dense `intermediate_size`; the shared expert's width
+        // is `moe_inter_dim * n_shared_experts`, which the shard headers confirm
+        // (`ffn.shared_experts.w1` is [2304, 5120]).
+        XCTAssertEqual(config.intermediateSize, 0)
+        XCTAssertEqual(config.sharedExpertCount, 1)
+        XCTAssertEqual(config.qLoraRank, 1280)
+        XCTAssertEqual(config.oGroups, 8)
+        XCTAssertEqual(config.oLoraRank, 1024)
+        XCTAssertEqual(config.rmsNormEps, 1e-20)
+        XCTAssertEqual(config.routedScalingFactor, 1.5)
+        XCTAssertEqual(config.swigluLimit, 10)
+        XCTAssertEqual(config.normalizeTopKProb, true)
+        XCTAssertEqual(config.scoringFunction, .sqrtsoftplus)
+        XCTAssertEqual(config.kvLoraRank, 0)
+    }
+
+    /// `head_dim` 512 with a 64-wide rope payload leaves 448 non-rope values, and
+    /// the cache record is the 512-wide head: 528 bytes in FP8, 288 in FP4.
+    func testTheHeadAndCacheWidthsAreThePublishedOnes() throws {
+        let config = try wrapper()
+        XCTAssertEqual(config.qkRopeHeadDim, 64)
+        XCTAssertEqual(config.qkNopeHeadDim, 448)
+        XCTAssertEqual(config.qkHeadDim, 512)
+        XCTAssertEqual(config.vHeadDim, 512)
+        XCTAssertEqual(config.cacheRecordWidth, 512)
+        XCTAssertEqual(config.fp8CacheRecordBytes, 528)
+        XCTAssertEqual(config.fp4CacheRecordBytes, 288)
+    }
+
+    /// The flat config spells the rope width `rope_head_dim` and keeps the scaling
+    /// factors at the root. Reading only the wrapper's spelling left the rope width
+    /// at 0, which passes validation and then rotates nothing.
+    func testTheFlatConfigReadsTheRopeWidthAndTheScaling() throws {
+        let config = try flat()
+        XCTAssertEqual(config.qkRopeHeadDim, 64)
+        XCTAssertEqual(config.qkNopeHeadDim, 448)
+        XCTAssertEqual(config.qkHeadDim, 512)
+        XCTAssertEqual(config.cacheRecordWidth, 512)
+        XCTAssertEqual(config.rmsNormEps, 1e-20)
+        XCTAssertEqual(config.ropeFactor, 16)
+        XCTAssertEqual(config.ropeOriginalLength, 65536)
+        XCTAssertEqual(config.ropeBetaFast, 32)
+        XCTAssertEqual(config.ropeBetaSlow, 1)
+        XCTAssertEqual(config.compressRopeTheta, 160000)
+        XCTAssertEqual(config.windowSize, 128)
+        XCTAssertEqual(config.hiddenSize, 5120)
+        XCTAssertEqual(config.moeIntermediateSize, 2304)
+    }
+
+    /// The flat config has no `model_type` and no `architectures`, so identity has
+    /// to come from the layout: this is the file discovery sees on a real load.
+    func testTheFlatConfigIdentifiesItselfWithoutAName() {
+        let object = (try? JSONSerialization.jsonObject(with: Data(Self.publishedFlatJSON.utf8)))
+            as? [String: Any]
+        guard let object else { return XCTFail("the embedded flat config is not JSON") }
+        XCTAssertTrue(DeepSeekV41Config.identifies(object))
+    }
+
+    /// A config that names no family and carries none of this architecture's
+    /// layout fields stays another family's, so discovery keeps looking.
+    func testAnUnnamedConfigWithoutTheLayoutIsRefused() {
+        XCTAssertFalse(
+            DeepSeekV41Config.identifies([
+                "hidden_size": 4096,
+                "num_hidden_layers": 32,
+                "intermediate_size": 14336,
+                "num_attention_heads": 32
+            ])
+        )
+    }
+
+    /// `n_mtp_layers` is the flat spelling of the draft-head count. Missing it drops
+    /// the DSpark chain and leaves every `mtp.*` tensor unconsumed.
+    func testTheFlatConfigKeepsTheDraftHeads() throws {
+        let config = try flat()
+        XCTAssertEqual(config.numNextNPredictLayers, 3)
+        XCTAssertEqual(config.dsparkBlockSize, 5)
+        XCTAssertEqual(config.dsparkTargetLayerIDs, [37, 38, 39])
+        XCTAssertEqual(config.dsparkRoutedExperts, 128)
+        XCTAssertEqual(config.dsparkActivatedExperts, 3)
+    }
+
+    /// The flat config flattens the tower into `vision_`-prefixed root keys, so a
+    /// decoder that only reads a nested `vision_config` reports no tower at all.
+    func testBothShapesDescribeTheSameTower() throws {
+        let wrapper = try wrapper()
+        let flat = try flat()
+        for config in [wrapper, flat] {
+            guard let vision = config.vision else {
+                return XCTFail("no tower decoded")
+            }
+            XCTAssertEqual(vision.numHiddenLayers, 32)
+            XCTAssertEqual(vision.hiddenSize, 1024)
+            XCTAssertEqual(vision.numAttentionHeads, 16)
+            XCTAssertEqual(vision.intermediateSize, 2816)
+            XCTAssertEqual(vision.patchSize, 14)
+            XCTAssertEqual(vision.downsampleRatio, 3)
+            XCTAssertEqual(vision.maxImageTokens, 1024)
+            XCTAssertEqual(vision.minPixels, 295936)
+            XCTAssertEqual(vision.imageTokenID, 129264)
+            XCTAssertEqual(vision.ropeTheta, 10_000)
+            XCTAssertEqual(config.imageTokenID, 129264)
+        }
+        XCTAssertEqual(wrapper.vision, flat.vision)
+    }
+
+    /// Four layers own a compressed cache, not one: `kv_source_layers` is
+    /// [2, 8, 14, 20], and every compressed layer reads the most recent owner at or
+    /// before it. The reference hands each layer the one shared slot the previous
+    /// source wrote, which is the same rule.
+    func testFourLayersOwnACompressedCache() throws {
+        let config = try wrapper()
+        XCTAssertEqual(config.kvSourceLayerIDs, [2, 8, 14, 20])
+        XCTAssertEqual(config.indexSourceLayerIDs, [2, 8, 14, 20, 24, 28, 32, 36])
+        XCTAssertEqual(config.compressedKVOwnerLayerIndices, [2, 8, 14, 20])
+        // 43 ratios: the 40 backbone layers plus the three MTP layers.
+        XCTAssertEqual(config.compressRatios.count, 43)
+
+        let plan = try config.makeLayerPlan()
+        XCTAssertEqual(plan.count, 40)
+        XCTAssertEqual(plan[3].compressedKVSource, 2)
+        XCTAssertEqual(plan[9].compressedKVSource, 8)
+        XCTAssertEqual(plan[15].compressedKVSource, 14)
+        XCTAssertEqual(plan[19].compressedKVSource, 14)
+        XCTAssertEqual(plan[25].compressedKVSource, 20)
+        XCTAssertEqual(plan[39].compressedKVSource, 20)
+        XCTAssertEqual(plan[3].compressedIndexSource, 2)
+        XCTAssertEqual(plan[15].compressedIndexSource, 14)
+        XCTAssertEqual(plan[25].compressedIndexSource, 24)
+        XCTAssertEqual(plan[0].compressedKVSource, -1)
+    }
+
+    /// The cache is priced per owner, so the published four is twice the two the
+    /// synthetic fixtures used to describe.
+    func testTheCacheCostsWhatFourOwnersCost() throws {
+        let config = try wrapper()
+        XCTAssertEqual(config.cacheBytesPerToken(useFP4Main: true), 1152)
+        XCTAssertEqual(config.cacheBytesPerToken(useFP4Main: false), 2112)
+        let fp4AtFullContext = config.cacheBytesPerToken(useFP4Main: true) * 1_048_576
+        XCTAssertLessThan(Double(fp4AtFullContext) / 1_073_741_824.0, 1.2)
+    }
+
+    /// Engram, hyper-connections and the router settings are the same in both
+    /// shapes, and they are the checkpoint's own values.
+    func testTheSharedSettingsMatchTheCheckpoint() throws {
+        for config in [try wrapper(), try flat()] {
+            XCTAssertEqual(config.engramLayerIDs, [1, 14])
+            XCTAssertEqual(config.engramRowCounts, [384_006_168, 384_016_682])
+            XCTAssertEqual(config.engramMaxNgramSize, 4)
+            XCTAssertEqual(config.engramHeadCount, 8)
+            XCTAssertEqual(config.engramHeadDimension, 256)
+            XCTAssertEqual(config.engramVocabSize, 16_000_000)
+            XCTAssertEqual(config.engramCompressedVocabSize, 99092)
+            XCTAssertEqual(config.engramPadTokenID, 2)
+            XCTAssertEqual(config.hcMult, 4)
+            XCTAssertEqual(config.hcSinkhornIterations, 20)
+            XCTAssertEqual(config.hcEps, 1e-6)
+            XCTAssertEqual(config.numRoutedExperts, 384)
+            XCTAssertEqual(config.numActivatedExperts, 6)
+            XCTAssertEqual(config.indexNHeads, 32)
+            XCTAssertEqual(config.indexHeadDim, 128)
+            XCTAssertEqual(config.indexTopK, 512)
+            XCTAssertEqual(config.candidateSourceLayerID, 20)
+            XCTAssertEqual(config.candidateBlockSize, 8)
+            XCTAssertEqual(config.candidateTopKBlocks, 2048)
+            XCTAssertEqual(config.maxPositionEmbeddings, 1_048_576)
+            XCTAssertEqual(config.eosTokenIDs, [1])
+            XCTAssertEqual(config.bosTokenID, 0)
+            XCTAssertEqual(config.padTokenID, 2)
+            XCTAssertFalse(config.tieWordEmbeddings)
+        }
+        // The wrapper declares the scheme in `quantization_config`; the flat config
+        // has no such block and states the weight dtype directly.
+        XCTAssertEqual(try wrapper().quantizationMethod, "fp8")
+        XCTAssertEqual(try flat().quantizationMethod, nil)
+        XCTAssertEqual(try flat().dtype, "fp8")
+    }
+
+    func testNeitherPublishedShapeRaisesAWarning() throws {
+        for config in [try wrapper(), try flat()] {
+            let plan = try config.makeLayerPlan()
+            let warnings = config.warnings(layerPlan: plan)
+            XCTAssertTrue(warnings.isEmpty, "unexpected warnings: \(warnings)")
+        }
     }
 }

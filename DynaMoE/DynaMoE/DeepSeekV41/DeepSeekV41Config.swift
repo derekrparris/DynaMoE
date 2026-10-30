@@ -674,14 +674,28 @@ nonisolated public extension DeepSeekV41Config {
     }
 
     /// Cheap identity probe used by discovery before the full decode runs.
+    ///
+    /// The multimodal wrapper names the family in `model_type` / `architectures`.
+    /// The flat `inference/config.json` publishes neither, so it is identified by
+    /// the fields no other family has: `hc_mult` (the Sinkhorn-mixed residual
+    /// stack) over `compress_ratios` (the CSA2 compressed cache), on a flat
+    /// `dim` / `n_layers` shape. Without this the published flat config is
+    /// refused as another family's, which is what the port claimed to support and
+    /// did not: the old fixture carried a `model_type` the real file does not have.
     nonisolated static func identifies(_ object: [String: Any]) -> Bool {
         let root = DSV41JSON(object)
         let text = root.object("text_config")
         let types = [root.string("model_type"), text?.string("model_type")]
             .compactMap { $0?.lowercased() }
         let archs = (root.strings("architectures") ?? []).map { $0.lowercased() }
-        return types.contains { $0.contains("deepseek_v41") || $0.contains("deepseek_v4.1") }
-            || archs.contains { $0.contains("deepseekv41") }
+        if types.contains(where: { $0.contains("deepseek_v41") || $0.contains("deepseek_v4.1") })
+            || archs.contains(where: { $0.contains("deepseekv41") }) {
+            return true
+        }
+        return root.int("dim") != nil
+            && root.int("n_layers") != nil
+            && root.int("hc_mult") != nil
+            && root.ints("compress_ratios") != nil
     }
 
     static func decode(object: [String: Any]) throws -> DeepSeekV41Config {
@@ -708,7 +722,11 @@ nonisolated public extension DeepSeekV41Config {
         // so the non-rope width is the difference. Reading `qk_nope_head_dim` out of
         // `head_dim` instead makes every head 576 wide, which mismatches a cache record
         // that is `head_dim` wide and shifts every score.
-        let ropeHeadDim = text.int("qk_rope_head_dim") ?? 0
+        //
+        // The flat `inference/config.json` calls the rope width `rope_head_dim`. Reading
+        // only the wrapper's spelling leaves it at 0, which passes validation (zero is
+        // the legacy whole-record payload) and then rotates nothing at all.
+        let ropeHeadDim = text.int("qk_rope_head_dim", "rope_head_dim") ?? 0
         let declaredHeadDim = text.int("head_dim")
         let declaredNopeHeadDim = text.int("qk_nope_head_dim")
         let nopeHeadDim: Int
@@ -727,9 +745,13 @@ nonisolated public extension DeepSeekV41Config {
         }
         // Decoded before the config is built: the image token id can live in either
         // the root or the vision block, and a tower without a token id cannot be
-        // prompted for.
-        let visionSpec = DeepSeekV41VisionSpec.decode(root.object("vision_config")?.raw)
-            ?? DeepSeekV41VisionSpec.decode(text.object("vision_config")?.raw)
+        // prompted for. Both published shapes keep it at the root, so the spec is
+        // filled from there rather than left at the block's -1.
+        let visionSpec = (
+            DeepSeekV41VisionSpec.decode(root.object("vision_config")?.raw)
+                ?? DeepSeekV41VisionSpec.decode(text.object("vision_config")?.raw)
+                ?? DeepSeekV41VisionSpec.decodeFlat(root.raw)
+        )?.fillingImageTokenID(root.int("image_token_id") ?? -1)
 
         let config = DeepSeekV41Config(
             architectures: root.strings("architectures") ?? ["DeepseekV41ForCausalLM"],
@@ -757,10 +779,20 @@ nonisolated public extension DeepSeekV41Config {
             oLoraRank: text.int("o_lora_rank") ?? 0,
             ropeTheta: text.float("rope_theta") ?? 10_000,
             compressRopeTheta: text.float("compress_rope_theta") ?? text.float("rope_theta") ?? 10_000,
-            ropeFactor: ropeScaling?.float("factor") ?? 1,
-            ropeOriginalLength: ropeScaling?.int("original_max_position_embeddings") ?? 0,
-            ropeBetaFast: ropeScaling?.float("beta_fast") ?? 32,
-            ropeBetaSlow: ropeScaling?.float("beta_slow") ?? 1,
+            // The wrapper nests the scaling factors under `rope_scaling`; the flat
+            // `inference/config.json` puts `rope_factor` / `original_seq_len` /
+            // `beta_fast` / `beta_slow` at the root. Reading only the nested form
+            // leaves `ropeFactor == 1` and `ropeOriginalLength == 0`, which is not
+            // "no scaling": it is a different table for every position past the
+            // original length, and nothing downstream can tell.
+            ropeFactor: ropeScaling?.float("factor")
+                ?? text.float("rope_factor") ?? root.float("rope_factor") ?? 1,
+            ropeOriginalLength: ropeScaling?.int("original_max_position_embeddings")
+                ?? text.int("original_seq_len") ?? root.int("original_seq_len") ?? 0,
+            ropeBetaFast: ropeScaling?.float("beta_fast")
+                ?? text.float("beta_fast") ?? root.float("beta_fast") ?? 32,
+            ropeBetaSlow: ropeScaling?.float("beta_slow")
+                ?? text.float("beta_slow") ?? root.float("beta_slow") ?? 1,
             // `sliding_window` is the multimodal wrapper's spelling; the flat
             // `inference/config.json` calls the same field `window_size`. Reading
             // only one of them leaves `windowSize == 0`, which zeroes every
@@ -802,7 +834,10 @@ nonisolated public extension DeepSeekV41Config {
             ),
             gateTemp: text.float("gate_temp") ?? 1,
             normalizeTopKProb: text.bool("norm_topk_prob") ?? true,
-            numNextNPredictLayers: text.int("num_nextn_predict_layers") ?? 0,
+            // The flat config spells the draft-head count `n_mtp_layers`. Missing it
+            // drops the whole DSpark chain: no draft block loads, and the `mtp.*`
+            // tensors the catalog then sees are reported as unconsumed.
+            numNextNPredictLayers: text.int("num_nextn_predict_layers", "n_mtp_layers") ?? 0,
             dsparkBlockSize: text.int("dspark_block_size") ?? 0,
             dsparkNoiseTokenID: text.int("dspark_noise_token_id") ?? -1,
             dsparkTargetLayerIDs: text.ints("dspark_target_layer_ids") ?? [],
