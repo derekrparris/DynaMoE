@@ -470,6 +470,35 @@ nonisolated final class DeepSeekV41VectorBank: @unchecked Sendable {
     }
 }
 
+// MARK: - Parity probes
+
+/// Buffers the device writes its intermediates into, so a parity harness can read
+/// what a stage computed after the workspace has reused the buffer.
+///
+/// Every field is nil in production, and a nil probe is skipped rather than bound:
+/// the copy is one dispatch per set field and nothing reads the result.
+nonisolated public struct DeepSeekV41ParityProbes {
+    /// The stack the attention coefficients are projected from (`mult * hidden`).
+    public var beforeAttention: MTLBuffer?
+    /// `(2 + mult) * mult` logits for each sub-layer's projection.
+    public var attentionLogits: MTLBuffer?
+    public var feedForwardLogits: MTLBuffer?
+    /// The stack after the attention sub-layer's `hc_post` (`mult * hidden`).
+    public var afterAttention: MTLBuffer?
+
+    public init(
+        beforeAttention: MTLBuffer? = nil,
+        attentionLogits: MTLBuffer? = nil,
+        feedForwardLogits: MTLBuffer? = nil,
+        afterAttention: MTLBuffer? = nil
+    ) {
+        self.beforeAttention = beforeAttention
+        self.attentionLogits = attentionLogits
+        self.feedForwardLogits = feedForwardLogits
+        self.afterAttention = afterAttention
+    }
+}
+
 // MARK: - Executor
 
 /// One loaded DeepSeek-V4.1 checkpoint, driven one position at a time.
@@ -546,6 +575,16 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// Committed command buffers whose results the host has not needed yet. Drained
     /// by `settlePending` at every readback and at the end of a token.
     private var pending: [(buffer: MTLCommandBuffer, stage: String)] = []
+
+    /// Diagnostic readback, off in every production path.
+    ///
+    /// The intermediates a layer derives live in buffers a later stage of the SAME
+    /// layer reuses: the feed-forward's coefficient projection overwrites the
+    /// attention's logits, and the collapse overwrites the stack. A parity harness
+    /// that compares this port with its host reference needs to see what the device
+    /// computed and what it computed FROM; without that a disagreement can only be
+    /// reported, not attributed to a stage.
+    public var parityProbes = DeepSeekV41ParityProbes()
 
     public init(runtime: DeepSeekV41Runtime, shardBuffers: [UInt32: MTLBuffer]) {
         self.config = runtime.config
@@ -1131,6 +1170,11 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
 
         switch stage {
         case .hcAttentionCoefficients:
+            if let probe = parityProbes.beforeAttention {
+                try encodeCopy(
+                    encoder, from: workspace.streams, to: probe, count: mult * shapes.hidden
+                )
+            }
             try encodeHyperConnectionCoefficients(
                 encoder,
                 layer: index,
@@ -1306,7 +1350,14 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                     scale: weights.scaleTensor(.attnWoA, layer: index),
                     groups: shape.outputGroups,
                     inDim: shapes.attentionOutputWidth,
-                    outDim: max(1, config.oLoraRank),
+                    // `outDim` is the CONCATENATED total, `groups * o_lora_rank`,
+                    // and `inDim` is the width of all the heads: the published
+                    // matrix is `groups` blocks stacked along the rows, each
+                    // `heads * head_dim / groups` columns wide. Passing the
+                    // per-group rank here splits the rows a second time, so every
+                    // group reads a quarter of its own rows and writes them at a
+                    // quarter of the stride.
+                    outDim: shapes.outputReducedWidth,
                     input: workspace.attentionOut,
                     output: workspace.reduced
                 )
@@ -1337,6 +1388,11 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 gains: workspace.hcAttentionPost,
                 comb: workspace.hcAttentionComb
             )
+            if let probe = parityProbes.afterAttention {
+                try encodeCopy(
+                    encoder, from: workspace.streams, to: probe, count: mult * shapes.hidden
+                )
+            }
 
         case .hcFFNCoefficients:
             try encodeHyperConnectionCoefficients(
@@ -2144,6 +2200,12 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// over it would read every column, which is a different matrix. Each group is
     /// therefore its own dispatch, offset into the weight, its scale, the input and
     /// the output; a single group degenerates to the ordinary GEMV.
+    ///
+    /// `inDim` and `outDim` are both TOTALS. The column count the checkpoint
+    /// publishes is one group's share of the input, and the row count is every
+    /// group's share summed, so only the two quotients are per group — dividing
+    /// `outDim` a second time by `groups` at the call site reads a quarter of each
+    /// block and writes it at a quarter of the stride.
     private func encodeBlockDiagonalProjection(
         _ encoder: MTLComputeCommandEncoder,
         weight: DeepSeekV41DeviceTensor,
@@ -2411,6 +2473,12 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
         )
         encoder.memoryBarrier(scope: .buffers)
+
+        if let probe = function == .hcAttnFn
+            ? parityProbes.attentionLogits
+            : parityProbes.feedForwardLogits {
+            try encodeCopy(encoder, from: workspace.hcLogits, to: probe, count: mixCount)
+        }
     }
 
     /// `hc_pre`: collapse the stack with `mix` into `output`, optionally snapshotting

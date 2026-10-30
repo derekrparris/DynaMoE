@@ -8736,8 +8736,13 @@ kernel void dsv41_hc_sinkhorn(
 /// stack. The RMS is recomputed per row rather than staged: `outDim` is 24, so the
 /// extra pass costs less than the barrier a shared reduction would need.
 /// Grid: (outDim, 1, 1).
+///
+/// The weight arrives as raw BYTES and is cast here: `weightOffset` is the tensor's
+/// byte offset inside its shard, and advancing a `float*` by it reads four times
+/// too far. Every other projection kernel takes a `uchar*` for exactly this reason,
+/// and a test that binds the weight at offset 0 cannot see the difference.
 kernel void dsv41_hc_project_f32(
-    device const float* rawWeightBuffer [[buffer(0)]],
+    device const uchar* rawWeightBuffer [[buffer(0)]],
     device const float* streamBuffer [[buffer(1)]],
     device float* logitsBuffer [[buffer(2)]],
     constant uint64_t& weightOffset [[buffer(3)]],
@@ -8747,7 +8752,8 @@ kernel void dsv41_hc_project_f32(
     uint row [[thread_position_in_grid]]
 ) {
     if (row >= outDim || width == 0) return;
-    device const float* wPtr = rawWeightBuffer + weightOffset + (uint64_t)row * width;
+    device const float* wPtr = (device const float*)(rawWeightBuffer + weightOffset)
+        + (uint64_t)row * width;
 
     float sumSquares = 0.0f;
     for (uint32_t i = 0; i < width; ++i) sumSquares += streamBuffer[i] * streamBuffer[i];
