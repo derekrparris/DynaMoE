@@ -224,13 +224,25 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         }
     }
 
-    /// The chunk seam returns the walk's logits.
+    /// A block of one is a decode step: the same tokens, the same graph, and the
+    /// same logits, wherever the block machinery differs from the walk's.
+    func testABlockOfOneMatchesTheWalk() throws {
+        let runtime = try makeRuntime(checkpoint)
+        let chunk = try runtime.forward().prefillChunk([6])
+        let walked = try makeRuntime(checkpoint).forward().forwardToken(6, position: 0)
+        XCTAssertEqual(chunk.last.count, walked.count)
+        XCTAssertLessThan(worstDelta(chunk.last, walked), 1e-5)
+    }
+
+    /// A prefilled chunk returns exactly the logits a walk returns.
     ///
-    /// `prefillChunk` walks until the device graph batches, so this pins the
-    /// contract the batched form has to keep rather than a separate computation.
+    /// The prompt is longer than one block (the block is capped by the ring), so
+    /// this crosses a block boundary and wraps the ring: the second block's
+    /// addressing reads rows the first block's writes have since rotated.
     func testTheChunkSeamReturnsTheWalksLogits() throws {
         let runtime = try makeRuntime(checkpoint)
-        let tokens = [4, 9, 11]
+        let tokens = (0..<(checkpoint.shape.window * 2 - 1)).map { 3 + $0 }
+        XCTAssertGreaterThan(tokens.count, checkpoint.shape.window)
         let chunk = try runtime.forward().prefillChunk(tokens)
 
         let walked = try makeRuntime(checkpoint).forward()
@@ -611,6 +623,78 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
                 pointer[row], expected[row], accuracy: 1e-5,
                 "row \(row) read from byte offset \(byteOffset)"
             )
+        }
+    }
+
+    /// A GEMV dispatched over a block of rows.
+    ///
+    /// The kernels index the input and the output by `thread_position_in_grid.y`,
+    /// which is what makes a batched projection a grid height. A block whose rows
+    /// each got the first row's answer would look like a plausible model and be
+    /// wrong everywhere after the first token, so this pins the contract.
+    func testTheGemvDispatchesOneRowPerToken() throws {
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let library = device.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "bf16_gemv"),
+              let gemv = try? device.makeComputePipelineState(function: function),
+              let queue = device.makeCommandQueue() else {
+            throw XCTSkip("No Metal device or kernel")
+        }
+        let rows = 3
+        let inDim = 16
+        let outDim = 5
+        let values = (0..<(outDim * inDim)).map { index in
+            DeepSeekV41SyntheticCheckpoint.truncateToBF16(Float((index % 9) - 4) / 8)
+        }
+        let input = (0..<(rows * inDim)).map { index in Float((index % 13) - 6) / 8 }
+        let halves = values.map { UInt16(truncatingIfNeeded: $0.bitPattern >> 16) }
+
+        guard let weight = halves.withUnsafeBytes({ raw -> MTLBuffer? in
+                  device.makeBuffer(
+                      bytes: raw.baseAddress!, length: raw.count, options: .storageModeShared
+                  )
+              }),
+              let inputBuffer = input.withUnsafeBytes({ raw -> MTLBuffer? in
+                  device.makeBuffer(
+                      bytes: raw.baseAddress!, length: raw.count, options: .storageModeShared
+                  )
+              }),
+              let output = device.makeBuffer(
+                  length: rows * outDim * MemoryLayout<Float>.stride, options: .storageModeShared
+              ),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw XCTSkip("could not allocate the batched projection's buffers")
+        }
+        encoder.setComputePipelineState(gemv)
+        encoder.setBuffer(weight, offset: 0, index: 0)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 1)
+        encoder.setBuffer(output, offset: 0, index: 2)
+        var weightOffset = UInt64(0)
+        var inDimension = UInt32(inDim)
+        var outDimension = UInt32(outDim)
+        encoder.setBytes(&weightOffset, length: 8, index: 3)
+        encoder.setBytes(&inDimension, length: 4, index: 4)
+        encoder.setBytes(&outDimension, length: 4, index: 5)
+        encoder.dispatchThreads(
+            MTLSize(width: outDim, height: rows, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        let matrix = DeepSeekV41Matrix(rows: outDim, columns: inDim, values: values)
+        let pointer = output.contents().assumingMemoryBound(to: Float.self)
+        for row in 0..<rows {
+            let expected = matrix.apply(Array(input[(row * inDim)..<((row + 1) * inDim)]))
+            for column in 0..<outDim {
+                XCTAssertEqual(
+                    pointer[row * outDim + column], expected[column], accuracy: 1e-5,
+                    "token \(row) row \(column)"
+                )
+            }
         }
     }
 

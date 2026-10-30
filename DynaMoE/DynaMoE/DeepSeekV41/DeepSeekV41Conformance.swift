@@ -221,26 +221,40 @@ nonisolated public enum DeepSeekV41Conformance {
     ///
     /// The RULE a batched pass needs is matched: `chunkAddressing` pins which cache
     /// rows each query of a chunk reads and which rows a chunk pools, and
-    /// `DeepSeekV41ChunkGoldenTests` carries the reference vectors. What is open is
-    /// the device graph AROUND that rule.
+    /// `DeepSeekV41ChunkGoldenTests` carries the reference vectors.
     ///
-    /// The linear kernels are already there: `dsv41_fp8_block32_gemv`,
-    /// `dsv41_mxfp4_gemv`, `bf16_gemv` and both SwiGLU kernels read the token from
-    /// `thread_position_in_grid.y`, so a batch costs a grid height rather than a new
-    /// kernel. What is missing is everything around them. The down-accumulate pair
-    /// (`dsv41_*_down_accumulate`) addresses one token's activation and accumulator
-    /// with no token index, and the workspace in `DeepSeekV41Engine` holds a single
-    /// position: `normed`, `query`, `latent`, the router logits and every
-    /// hyper-connection buffer are one vector, and each stage binds them at offset 0.
-    /// A batch therefore means a slot dimension on the workspace and a base offset on
-    /// every stage, which no test can check: the local shards are header-only stubs
-    /// and the device forward has never been run, so a batched pass that disagrees
-    /// with the walk would produce different logits at full speed and nothing would
-    /// say which is right.
+    /// The GRAPH around the rule now exists. `DeepSeekV41MetalForward.prefillChunk`
+    /// runs a prompt in blocks of `workspace.slots` positions, and each block is one
+    /// pass: the norm, the linear stages and the RoPE dispatches cover every position
+    /// at once (the kernels read the token from `thread_position_in_grid.y`, except
+    /// the norm and embedding kernels, whose index is scalar and therefore X), while
+    /// the stages that cannot batch run per position inside the same command buffer —
+    /// the cache write and the attention that reads it, the mHC coefficients, the
+    /// Engram stage, and the routed mixture.
     ///
-    /// The turn loop already routes a from-position-0 prompt through
-    /// `DeepSeekV41PositionForward.prefillChunk`, so the swap is confined to the
-    /// executor once there are weights to compare against.
+    /// Two bounds decide the shape rather than convenience. The cache is a RING of
+    /// `window` rows, so writing position `p + 1` evicts a row a query at `p` still
+    /// needs: the write, the pool and the attention therefore stay in one per-position
+    /// loop, and a block is capped at the window. And the expert ARENA holds a handful
+    /// of experts, so a block's union does not fit: the mixture stays per position,
+    /// with the wait that keeps the next read out of the slot the previous kernels are
+    /// still reading. Batching the mixture needs an arena redesign, not a wider grid.
+    ///
+    /// What changed about the gate's own reasoning: the local shards are still
+    /// header-only stubs, but the device forward is no longer unrun.
+    /// `DeepSeekV41SyntheticCheckpoint` publishes the checkpoint's own tensor names at
+    /// widths the config derives, feeds that graph and the host reference identical
+    /// values, and `DeepSeekV41DeviceGraphParityTests` compares a block with the walk
+    /// (bit for bit, across a block boundary and a ring wrap) and the walk with the
+    /// reference stage by stage. That is what found the three wiring bugs the old
+    /// note predicted nothing could — a byte offset read as floats, a grouped output
+    /// projection splitting its rows twice, and a RoPE batch rotating one row.
+    ///
+    /// What stays open: no comparison against the checkpoint's own numbers at real
+    /// weights, and no measurement of what the pass is worth on real weights. The turn
+    /// loop already routes a from-position-0 prompt through
+    /// `DeepSeekV41PositionForward.prefillChunk`, so nothing outside the executor has
+    /// to change either way.
     public static let batchedDevicePrefill: Gate = .unverified
 
     /// The vision tower's patch grid, image token layout, and the tower forward.

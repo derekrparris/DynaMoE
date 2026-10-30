@@ -481,7 +481,14 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
                   device: device,
                   shapes: shapes,
                   config: config,
-                  compressedOwners: plan.filter(\.ownsCompressedKV).count
+                  compressedOwners: plan.filter(\.ownsCompressedKV).count,
+                  // Prefill runs a block of positions per dispatch, so every
+                  // per-position vector is replicated for the block. The ring
+                  // caps the block: it holds `window` rows, and a wider block
+                  // would write a row before the query that needs it attended.
+                  slots: DeepSeekV41DevicePlan.chunkSlots(
+                      config: config, contextLength: max(1, contextLength)
+                  )
               ) else {
             DeepSeekV41Runtime.record("the per-token workspace could not be allocated")
             return nil
@@ -768,14 +775,31 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
     public let engramSlots: [DeepSeekV41EngramSlot]
     /// Rows the gather allocates for one layer's attention: window + compressed.
     public let gatherRows: Int
+    /// Positions the vectors are replicated for.
+    ///
+    /// A decode step uses slot 0 only. A prefilled chunk runs its dense stages for
+    /// several positions per dispatch — the kernels index the token from
+    /// `thread_position_in_grid.y` — so every per-position vector lives in `slots`
+    /// consecutive copies and a stage binds the copy it is working on. The
+    /// per-position scratch (`gathered`, `intermediate`, the compressor block, the
+    /// Engram staging) stays single: those are used one position at a time no
+    /// matter how wide the dispatch is.
+    public let slots: Int
+
+    /// Byte offset of one position's copy of a `width`-wide vector.
+    public func slotOffset(_ slot: Int, width: Int) -> Int {
+        min(max(slot, 0), max(0, slots - 1)) * width * MemoryLayout<Float>.stride
+    }
 
     public init?(
         device: MTLDevice,
         shapes: DeepSeekV41TensorShapes,
         config: DeepSeekV41Config,
-        compressedOwners: Int
+        compressedOwners: Int,
+        slots: Int = 1
     ) {
         let mult = max(1, config.hcMult)
+        let slots = max(1, slots)
         let maxCompressed = max(1, config.compressRatios.max() ?? 1)
         // `Compressor` keeps one group per module instance, so a layer's slots are
         // its own. The block is the widest ratio wide; a narrow owner leaves the
@@ -798,16 +822,19 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
         func make(_ bytes: Int) -> MTLBuffer? {
             device.makeBuffer(length: max(bytes, 16), options: .storageModeShared)
         }
-        guard let hidden = make(float4(shapes.hidden)),
-              let normed = make(float4(shapes.hidden)),
-              let query = make(float4(shapes.queryWidth)),
-              let latent = make(float4(shapes.latentWidth)),
+        func slotBytes(_ width: Int) -> Int {
+            float4(max(1, width)) * slots
+        }
+        guard let hidden = make(slotBytes(shapes.hidden)),
+              let normed = make(slotBytes(shapes.hidden)),
+              let query = make(slotBytes(shapes.queryWidth)),
+              let latent = make(slotBytes(shapes.latentWidth)),
               let gathered = make(float4(gather * shapes.latentWidth)),
-              let attentionOut = make(float4(shapes.attentionOutputWidth)),
-              let output = make(float4(shapes.hidden)),
-              let routerLogits = make(float4(config.numRoutedExperts)),
-              let expertIndices = make(max(4 * config.numActivatedExperts, 16)),
-              let expertWeights = make(float4(config.numActivatedExperts)),
+              let attentionOut = make(slotBytes(shapes.attentionOutputWidth)),
+              let output = make(slotBytes(shapes.hidden)),
+              let routerLogits = make(slotBytes(config.numRoutedExperts)),
+              let expertIndices = make(max(4 * config.numActivatedExperts, 16) * slots),
+              let expertWeights = make(slotBytes(config.numActivatedExperts)),
               let intermediate = make(float4(shapes.expertIntermediate)),
               let sharedIntermediate = make(float4(shapes.sharedIntermediate)),
               let pooled = make(float4(shapes.latentWidth)),
@@ -817,25 +844,25 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
               let compressorScores = make(
                   float4(maxCompressed * compressorGroups * shapes.latentWidth)
               ),
-              let reduced = make(float4(max(1, max(shapes.qLoraRank, shapes.outputReducedWidth)))),
-              let moeOut = make(float4(shapes.hidden)),
-              let streams = make(float4(mult * shapes.hidden)),
-              let hcLogits = make(float4((2 + mult) * mult)),
-              let hcMix = make(float4(mult)),
-              let hcAttentionPre = make(float4(mult)),
-              let hcAttentionPost = make(float4(mult)),
-              let hcAttentionComb = make(float4(mult * mult)),
-              let hcFFNPre = make(float4(mult)),
-              let hcFFNPost = make(float4(mult)),
-              let hcFFNComb = make(float4(mult * mult)),
-              let hcResidual = make(float4(mult * shapes.hidden)),
+              let reduced = make(slotBytes(max(1, max(shapes.qLoraRank, shapes.outputReducedWidth)))),
+              let moeOut = make(slotBytes(shapes.hidden)),
+              let streams = make(slotBytes(mult * shapes.hidden)),
+              let hcLogits = make(slotBytes((2 + mult) * mult)),
+              let hcMix = make(slotBytes(mult)),
+              let hcAttentionPre = make(slotBytes(mult)),
+              let hcAttentionPost = make(slotBytes(mult)),
+              let hcAttentionComb = make(slotBytes(mult * mult)),
+              let hcFFNPre = make(slotBytes(mult)),
+              let hcFFNPost = make(slotBytes(mult)),
+              let hcFFNComb = make(slotBytes(mult * mult)),
+              let hcResidual = make(slotBytes(mult * shapes.hidden)),
               let logits = make(float4(config.vocabSize)),
               let rowIndices = make(4 * gather),
               let tokenIDs = make(4),
               let engramRaw = make(engramRawBytes),
               let engramValues = make(float4(engramValueCount)),
-              let engramKV = make(float4(engramKVCount)),
-              let engramGates = make(float4(mult)) else {
+              let engramKV = make(slotBytes(engramKVCount)),
+              let engramGates = make(slotBytes(mult)) else {
             return nil
         }
 
@@ -877,5 +904,6 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
         self.engramGates = engramGates
         self.engramSlots = engramSlots
         self.gatherRows = gather
+        self.slots = slots
     }
 }
