@@ -4121,3 +4121,68 @@ Tests: `testWhereABlocksRemainingTimeGoesAtThePublishedWidths` (the table above,
 opt-in, so it is the seventh skipped case in a default run) plus the
 `publishedWidths` shape preset it runs on; every pre-existing case unchanged — 406
 tests, 7 skipped, 0 failures.
+
+## DSV4.1 #8: ONE DISPATCH PER HEAD GROUP PER BLOCK, NOT PER POSITION
+
+**What the published-widths table said.** `#7` ranked the dense half at the widths
+the checkpoint runs and found `outputDown` at 1.864 ms/position — 57.6% of it —
+because `encodeBlockDiagonalProjection` was dispatched inside the per-slot loop:
+eight head groups by eight positions, each dispatch reading that group's whole weight
+slab, so every position re-read all 134 MB of BF16 `attn.wo_a`.
+
+**The change.** Each group's projection now runs ONCE for the block, with the grid's
+height carrying the positions. The GEMV kernels gained two row strides
+(`bf16_gemv` at buffers 6 and 7, `dsv41_fp8_block32_gemv` and `dsv41_mxfp4_gemv` at 8
+and 9), because a band of a block-diagonal projection reads `perGroupIn` = 8,192 of a
+row that is `attentionOutputWidth` = 65,536 wide and writes `perGroupOut` = 1,024 of
+an `outputReducedWidth` = 8,192 vector: `inDim`/`outDim` no longer describe the row
+layout the way they do for a dense projection. A stride of zero means "the dimension",
+so every other caller of those kernels is unchanged — including the generic engine
+path in `ContentView`, which now binds the two strides explicitly rather than relying
+on that fallback.
+
+**What it cost before and after** (same case, same machine, 640-position prompt,
+block of 8, per-stage command buffers):
+
+| stage | before | after | change |
+|---|---:|---:|---:|
+| `outputDown` | 1.864 | 0.214 | 8.7x |
+| whole block, ms/position | 3.22 | 1.57 | 2.05x |
+| dense device, ms/position | 3.236 | 1.581 | 2.05x |
+
+`outputDown` is now 13.5% of the dense half instead of 57.6%, and a block's per
+position cost halved. The 8.7x matches the eightfold traffic reduction the change was
+made for, which is the check that the cost really was the re-read and not something
+else that moved with it.
+
+**The table it leaves** (ms/position, published widths):
+
+| stage | ms/pos | share |
+|---|---:|---:|
+| `hcAttentionCoefficients` | 0.393 | 24.8% |
+| `hcFFNCoefficients` | 0.350 | 22.1% |
+| `writeLatent` | 0.248 | 15.7% |
+| `outputDown` | 0.214 | 13.5% |
+| `queryUp` | 0.095 | 6.0% |
+| `latentNorm` | 0.081 | 5.1% |
+| `outputUp` | 0.079 | 5.0% |
+
+The mHC coefficient projections are now the largest term between them, at 0.74
+ms/position — 47% of the dense half — and `#7` already described why: `hc_mult` 4
+makes the output 24 wide, so `dsv41_hc_project_f32` dispatches 24 threads and each
+walks a 28,672-wide reduction serially. That is a grid shape, not a traffic problem,
+and the fix is the one `#5` applied to attention: make the reduction parallel across
+a threadgroup and keep the partials in threadgroup memory.
+
+**Caveats.** The synthetic weights are BF16, so the absolute `outputDown` numbers are
+larger than the checkpoint's own (its attention projections are quantised): the win
+is the eightfold re-read that the change removes, and the fraction of a block it
+represents scales with the dtype. `writeLatent` reads only the window half of its row
+budget here (no compressed layers), so its 0.248 is a floor rather than the guarantee.
+The case is opt-in and takes ~40 s to build the 190M-value blob. Device time is one
+command buffer per stage.
+
+Tests: the batched path is pinned by `DeepSeekV41DeviceGraphParityTests` —
+`testTheDeviceAndTheHostAgreeStageByStage` and
+`testTheChunkSeamReturnsTheWalksLogits` (bit-identical) — and the whole DeepSeek suite
+is green: 406 tests, 7 skipped, 0 failures.

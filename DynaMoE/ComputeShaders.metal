@@ -1520,15 +1520,23 @@ kernel void bf16_gemv(
     constant uint64_t& weightOffset [[buffer(3)]],
     constant uint32_t& inDim [[buffer(4)]],
     constant uint32_t& outDim [[buffer(5)]],
+    // A block-diagonal projection reads ONE group's columns out of a row wider than
+    // the group and writes one group's rows into a vector wider than the group, so a
+    // caller batching several positions binds the row strides. Zero means the row is
+    // exactly the dimension, which is what every other caller wants.
+    constant uint32_t& inputRowStride [[buffer(6)]],
+    constant uint32_t& outputRowStride [[buffer(7)]],
     uint2 pos [[thread_position_in_grid]]
 ) {
     uint row = pos.x;
     uint tokenIdx = pos.y;
     if (row >= outDim) return;
 
+    uint32_t inStride = inputRowStride != 0u ? inputRowStride : inDim;
+    uint32_t outStride = outputRowStride != 0u ? outputRowStride : outDim;
     uint64_t rowWeightStart = (weightOffset / 2) + ((uint64_t)row * inDim);
     device const ushort* wRow = rawWeightBuffer + rowWeightStart;
-    device const float* inPtr = inputVector + ((uint64_t)tokenIdx * inDim);
+    device const float* inPtr = inputVector + ((uint64_t)tokenIdx * inStride);
 
     float dot0 = 0.0f;
     float dot1 = 0.0f;
@@ -1541,7 +1549,7 @@ kernel void bf16_gemv(
         dot1 += (bf16_to_fp32(w4.z) * in4.z) + (bf16_to_fp32(w4.w) * in4.w);
     }
 
-    outputVector[((uint64_t)tokenIdx * outDim) + row] = dot0 + dot1;
+    outputVector[((uint64_t)tokenIdx * outStride) + row] = dot0 + dot1;
 }
 
 /// MSL Kernel: Per-Head RMSNorm for Attention Heads (32-Thread SIMDgroup Cooperative, 2D Grid Aware)
@@ -8384,6 +8392,8 @@ kernel void dsv41_fp8_block32_gemv(
     constant uint64_t& scaleOffset [[buffer(5)]],
     constant uint32_t& inDim [[buffer(6)]],
     constant uint32_t& outDim [[buffer(7)]],
+    constant uint32_t& inputRowStride [[buffer(8)]],
+    constant uint32_t& outputRowStride [[buffer(9)]],
     uint2 pos [[thread_position_in_grid]]
 ) {
     uint row = pos.x;
@@ -8392,8 +8402,10 @@ kernel void dsv41_fp8_block32_gemv(
 
     const uint32_t blockCount = inDim / 32u;
     const uint32_t scaleRowBase = (row / 32u) * blockCount;
+    uint32_t inStride = inputRowStride != 0u ? inputRowStride : inDim;
+    uint32_t outStride = outputRowStride != 0u ? outputRowStride : outDim;
     device const uchar* wPtr = rawWeightBuffer + weightOffset + ((uint64_t)row * inDim);
-    device const float* xPtr = inputVector + ((uint64_t)tokenIdx * inDim);
+    device const float* xPtr = inputVector + ((uint64_t)tokenIdx * inStride);
 
     float total = 0.0f;
     for (uint32_t block = 0; block < blockCount; ++block) {
@@ -8411,7 +8423,7 @@ kernel void dsv41_fp8_block32_gemv(
         }
         total += blockDot * blockScale;
     }
-    outputVector[((uint64_t)tokenIdx * outDim) + row] = total;
+    outputVector[((uint64_t)tokenIdx * outStride) + row] = total;
 }
 
 /// MSL Kernel: MXFP4 GEMV (y = W_e2m1 * x, one E8M0 scale per 32 values).
@@ -8426,6 +8438,8 @@ kernel void dsv41_mxfp4_gemv(
     constant uint64_t& scaleOffset [[buffer(5)]],
     constant uint32_t& inDim [[buffer(6)]],
     constant uint32_t& outDim [[buffer(7)]],
+    constant uint32_t& inputRowStride [[buffer(8)]],
+    constant uint32_t& outputRowStride [[buffer(9)]],
     uint2 pos [[thread_position_in_grid]]
 ) {
     uint row = pos.x;
@@ -8434,9 +8448,11 @@ kernel void dsv41_mxfp4_gemv(
 
     const uint32_t byteCount = inDim / 2u;
     const uint32_t scaleCount = inDim / 32u;
+    uint32_t inStride = inputRowStride != 0u ? inputRowStride : inDim;
+    uint32_t outStride = outputRowStride != 0u ? outputRowStride : outDim;
     device const uchar* wPtr = rawWeightBuffer + weightOffset + ((uint64_t)row * byteCount);
     device const uchar* sPtr = rawScaleBuffer + scaleOffset + ((uint64_t)row * scaleCount);
-    device const float* xPtr = inputVector + ((uint64_t)tokenIdx * inDim);
+    device const float* xPtr = inputVector + ((uint64_t)tokenIdx * inStride);
 
     float total = 0.0f;
     for (uint32_t block = 0; block < scaleCount; ++block) {
@@ -8451,7 +8467,7 @@ kernel void dsv41_mxfp4_gemv(
         }
         total += blockDot * blockScale;
     }
-    outputVector[((uint64_t)tokenIdx * outDim) + row] = total;
+    outputVector[((uint64_t)tokenIdx * outStride) + row] = total;
 }
 
 /// MSL Kernel: fused MXFP4 SwiGLU gate+up with the checkpoint's `swiglu_limit`.

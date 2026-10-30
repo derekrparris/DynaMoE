@@ -3733,6 +3733,10 @@ struct ContentView: View {
                     computeEncoder.setBytes(&oProjOffset, length: MemoryLayout<UInt64>.stride, index: 3)
                     computeEncoder.setBytes(&inAttnDim, length: MemoryLayout<UInt32>.stride, index: 4)
                     computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 5)
+                    var inRowStride = UInt32(inAttnDim)
+                    var outRowStride = UInt32(hiddenDim)
+                    computeEncoder.setBytes(&inRowStride, length: MemoryLayout<UInt32>.stride, index: 6)
+                    computeEncoder.setBytes(&outRowStride, length: MemoryLayout<UInt32>.stride, index: 7)
                     computeEncoder.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), bf16GemvPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                 }
             }
@@ -4166,6 +4170,10 @@ struct ContentView: View {
                         computeEncoder.setBytes(&oProjOffset, length: MemoryLayout<UInt64>.stride, index: 3)
                         computeEncoder.setBytes(&inAttnDim, length: MemoryLayout<UInt32>.stride, index: 4)
                         computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 5)
+                        var inRowStride = UInt32(inAttnDim)
+                        var outRowStride = UInt32(hiddenDim)
+                        computeEncoder.setBytes(&inRowStride, length: MemoryLayout<UInt32>.stride, index: 6)
+                        computeEncoder.setBytes(&outRowStride, length: MemoryLayout<UInt32>.stride, index: 7)
                         computeEncoder.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), bf16GemvPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                     }
                 }

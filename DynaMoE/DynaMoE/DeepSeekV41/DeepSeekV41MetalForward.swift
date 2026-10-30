@@ -1594,24 +1594,23 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
 
         case .outputDown:
             if config.oLoraRank > 0, let down = weights.tensor(.attnWoA, layer: index) {
-                try eachSlot { slot in
-                    try encodeBlockDiagonalProjection(
-                        encoder,
-                        weight: down,
-                        scale: weights.scaleTensor(.attnWoA, layer: index),
-                        groups: shape.outputGroups,
-                        inDim: shapes.attentionOutputWidth,
-                        outDim: shapes.outputReducedWidth,
-                        input: workspace.attentionOut,
-                        output: workspace.reduced,
-                        inputByteOffset: workspace.slotOffset(
-                            slot, width: shapes.attentionOutputWidth
-                        ),
-                        outputByteOffset: workspace.slotOffset(
-                            slot, width: shapes.outputReducedWidth
-                        )
-                    )
-                }
+                // One dispatch per head group for the WHOLE block, not one per group per
+                // position: `attn.wo_a` is 65,536 columns wide and every position of a
+                // block reads the same bytes, so the per-slot loop this replaces read
+                // all of it once per position (`Benchmarks/PERF_FINDINGS.md`,
+                // "DSV4.1 #7"). The block's rows are contiguous at the full widths,
+                // which is what the row strides say.
+                try encodeBlockDiagonalProjection(
+                    encoder,
+                    weight: down,
+                    scale: weights.scaleTensor(.attnWoA, layer: index),
+                    groups: shape.outputGroups,
+                    inDim: shapes.attentionOutputWidth,
+                    outDim: shapes.outputReducedWidth,
+                    input: workspace.attentionOut,
+                    output: workspace.reduced,
+                    rows: count
+                )
             }
 
         case .outputUp:
@@ -3158,7 +3157,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         scaleByteOffset: UInt64 = 0,
         inputByteOffset: Int = 0,
         outputByteOffset: Int = 0,
-        rows: Int = 1
+        rows: Int = 1,
+        inputRowStride: Int = 0,
+        outputRowStride: Int = 0
     ) throws {
         guard inDim > 0, outDim > 0 else {
             throw DeepSeekV41EngineError.allocationFailed("a \(outDim)x\(inDim) projection")
@@ -3187,19 +3188,29 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.setBuffer(output, offset: outputByteOffset, index: 3)
             var weightOffset = UInt64(weight.byteOffset) + weightByteOffset
             var scaleOffset = UInt64(scale.byteOffset) + scaleByteOffset
+            var inStride = UInt32(inputRowStride)
+            var outStride = UInt32(outputRowStride)
             encoder.setBytes(&weightOffset, length: 8, index: 4)
             encoder.setBytes(&scaleOffset, length: 8, index: 5)
             encoder.setBytes(&inDimension, length: 4, index: 6)
             encoder.setBytes(&outDimension, length: 4, index: 7)
+            // Zero lets the kernel use the dimension, so only a caller batching rows
+            // out of a wider row layout has to think about these.
+            encoder.setBytes(&inStride, length: 4, index: 8)
+            encoder.setBytes(&outStride, length: 4, index: 9)
         case .bf16:
             encoder.setComputePipelineState(pipelines.bf16Gemv)
             encoder.setBuffer(weightBuffer, offset: 0, index: 0)
             encoder.setBuffer(input, offset: inputByteOffset, index: 1)
             encoder.setBuffer(output, offset: outputByteOffset, index: 2)
             var weightOffset = UInt64(weight.byteOffset) + weightByteOffset
+            var inStride = UInt32(inputRowStride)
+            var outStride = UInt32(outputRowStride)
             encoder.setBytes(&weightOffset, length: 8, index: 3)
             encoder.setBytes(&inDimension, length: 4, index: 4)
             encoder.setBytes(&outDimension, length: 4, index: 5)
+            encoder.setBytes(&inStride, length: 4, index: 6)
+            encoder.setBytes(&outStride, length: 4, index: 7)
         case .unsupported:
             throw DeepSeekV41EngineError.unsupportedDtype("a projection", weight.dtype)
         }
@@ -3234,14 +3245,16 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         input: MTLBuffer,
         output: MTLBuffer,
         inputByteOffset: Int = 0,
-        outputByteOffset: Int = 0
+        outputByteOffset: Int = 0,
+        rows: Int = 1
     ) throws {
         let groupCount = max(1, groups)
         guard groupCount > 1 else {
             try encodeGemv(
                 encoder, weight: weight, scale: scale, inDim: inDim, outDim: outDim,
                 input: input, output: output,
-                inputByteOffset: inputByteOffset, outputByteOffset: outputByteOffset
+                inputByteOffset: inputByteOffset, outputByteOffset: outputByteOffset,
+                rows: rows, inputRowStride: inDim, outputRowStride: outDim
             )
             return
         }
@@ -3272,7 +3285,14 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 inputByteOffset: inputByteOffset
                     + group * perGroupIn * MemoryLayout<Float>.stride,
                 outputByteOffset: outputByteOffset
-                    + group * perGroupOut * MemoryLayout<Float>.stride
+                    + group * perGroupOut * MemoryLayout<Float>.stride,
+                rows: rows,
+                // A band reads `perGroupIn` of the caller's `inDim` columns and writes
+                // `perGroupOut` of its `outDim` rows, so one dispatch can carry every
+                // row of the batch when the caller lays those rows out at the full
+                // widths.
+                inputRowStride: inDim,
+                outputRowStride: outDim
             )
         }
     }
