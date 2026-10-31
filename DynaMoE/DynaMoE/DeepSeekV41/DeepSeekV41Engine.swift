@@ -77,6 +77,10 @@ nonisolated public final class DeepSeekV41DeviceWeights: @unchecked Sendable {
     public let problems: [String]
     /// One reader per Engram table, keyed by layer.
     public let engramReaders: [Int: DeepSeekV41EngramReader]
+    /// Why a table has no reader, keyed by layer, in the words of the thing that
+    /// refused it. A missing shard, an offset past the file end and a wrong scale
+    /// shape all read as "could not be opened" without this.
+    public let engramReaderProblems: [Int: String]
     public let engramLayouts: [Int: DeepSeekV41EngramLayout]
 
     private var tensors: [String: DeepSeekV41DeviceTensor]
@@ -141,30 +145,74 @@ nonisolated public final class DeepSeekV41DeviceWeights: @unchecked Sendable {
         // Engram tables are opened here so a truncated download fails at load rather
         // than mid-generation. They are never mapped: the reader preads single rows.
         var readers: [Int: DeepSeekV41EngramReader] = [:]
+        // Why a table could not be opened, keyed by layer. The readiness report
+        // prints this instead of a generic "could not be opened": a missing shard,
+        // a wrong offset and a refused descriptor are different downloads.
+        var readerProblems: [Int: String] = [:]
         // The primes are drawn once across every Engram layer, so the layouts are
         // built together; one table in isolation would address the wrong rows.
         let layouts = (try? DeepSeekV41EngramLayout.make(specs: config.engramTables)) ?? [:]
         if let snapshotDir {
             for spec in config.engramTables {
-                guard let slot = catalog.tensor(.engramTable, layer: spec.layer),
-                      let tensor = summary.tensors.first(where: { $0.name == slot.name }) else {
+                let layer = spec.layer
+                guard let valuesRef = catalog.tensor(.engramTable, layer: layer),
+                      let values = summary.tensors.first(where: { $0.name == valuesRef.name }) else {
+                    readerProblems[layer] = "layers.\(layer): the Engram table tensor is missing "
+                        + "from the catalog"
                     continue
                 }
-                let shardName = summary.shards.first(where: { $0.index == tensor.shardIndex })?.filename
-                    ?? "model-\(tensor.shardIndex).safetensors"
-                let tableURL = snapshotDir.appendingPathComponent(shardName)
-                // Requests are table-relative; the tensor's own offset inside the
-                // shard is the base the reader adds before every pread.
-                if let reader = try? DeepSeekV41EngramReader(
-                    fileURL: tableURL,
-                    spec: spec,
-                    baseOffset: Int(tensor.offsetStart)
-                ) {
-                    readers[spec.layer] = reader
+                // `engram.embed.scale` is a SEPARATE tensor in the checkpoint, so the
+                // reader has to be told where its block starts. Its absence is not
+                // fatal only when the table stores each row's scales inline, which no
+                // published Engram table does; a table whose rows carry block scales
+                // without a companion tensor is refused rather than read as garbage.
+                let scaleRef = catalog.tensor(.engramTable, layer: layer, scale: true)
+                let scale = scaleRef.flatMap { ref in
+                    summary.tensors.first(where: { $0.name == ref.name })
+                }
+                guard let scale else {
+                    // The reference stores the block scales in their own tensor
+                    // (`ParallelEngramEmbedding.scale`). Assuming they are inline
+                    // would read the next row's values as this row's exponents, which
+                    // decodes to plausible garbage, so a table without them is
+                    // refused instead.
+                    readerProblems[layer] = "layers.\(layer): the table has no "
+                        + "engram.embed.scale companion, so its rows' block scales "
+                        + "are not addressable"
+                    continue
+                }
+                let shape = DeepSeekV41WeightCatalog.shape(from: scale.shapeDisplay)
+                let expected = [spec.rowCount, spec.rowBytes - spec.headDimension]
+                if shape != expected {
+                    readerProblems[layer] = "layers.\(layer): \(scale.name) is \(shape), "
+                        + "but the table's \(spec.rowCount) rows carry \(expected.last ?? 0) "
+                        + "block scales each"
+                    continue
+                }
+                guard let filename = DeepSeekV41EngramTableLocator.shardFilename(
+                    forTensorNamed: valuesRef.name,
+                    in: snapshotDir
+                ) else {
+                    readerProblems[layer] = "layers.\(layer): no shard in the snapshot publishes "
+                        + "\(valuesRef.name) (looked in the index and in every header)"
+                    continue
+                }
+                do {
+                    readers[layer] = try DeepSeekV41EngramReader(
+                        fileURL: snapshotDir.appendingPathComponent(filename),
+                        spec: spec,
+                        valuesOffset: Int(values.offsetStart),
+                        // Streamed tensors are passed through segmentation untouched,
+                        // so their offsets stay relative to the whole FILE.
+                        scalesOffset: Int(scale.offsetStart)
+                    )
+                } catch {
+                    readerProblems[layer] = "layers.\(layer): \(error)"
                 }
             }
         }
         self.engramReaders = readers
+        self.engramReaderProblems = readerProblems
         self.engramLayouts = layouts
     }
 
@@ -668,6 +716,14 @@ nonisolated public struct DeepSeekV41EngramSlot: Sendable, Equatable {
     public let rawByteOffset: Int
     /// Element offset of this table's decoded rows in `engramValues`.
     public let valueOffset: Int
+    /// Positions this table's staging block is replicated for.
+    ///
+    /// A prefilled block reads every position's rows BEFORE the layer's command
+    /// buffer exists, so one shared block left every position of the block with the
+    /// LAST position's n-gram memory. One block per position is ~6 KB of raw rows
+    /// and ~24 KB decoded at the published table, which is nothing against the
+    /// workspace around it.
+    public let positionSlots: Int
 
     public var rawByteCount: Int { columns * rowBytes }
     public var valueCount: Int { columns * headDimension }
@@ -675,11 +731,31 @@ nonisolated public struct DeepSeekV41EngramSlot: Sendable, Equatable {
     /// Width of the concatenated rows the `wkv` projection reads.
     public var flatWidth: Int { columns * headDimension }
 
+    /// Bytes this table owns in `engramRaw`, every position included.
+    public var rawByteStride: Int { rawByteCount * positionSlots }
+    /// Elements this table owns in `engramValues`, every position included.
+    public var valueStride: Int { valueCount * positionSlots }
+
+    /// Where one position's raw rows start inside `engramRaw`.
+    public func rawBytes(atPositionSlot slot: Int) -> Int {
+        rawByteOffset + min(max(slot, 0), max(0, positionSlots - 1)) * rawByteCount
+    }
+
+    /// Where one position's decoded rows start inside `engramValues`, in BYTES.
+    public func valueBytes(atPositionSlot slot: Int) -> Int {
+        (valueOffset + min(max(slot, 0), max(0, positionSlots - 1)) * valueCount)
+            * MemoryLayout<Float>.stride
+    }
+
     /// One slot per Engram table, in `config.engramTables` order so the index is
     /// `layer.engramTable`. A table with no hash columns gets an empty slot rather
     /// than being dropped: the caller looks slots up by index, and shifting the
     /// array would hand a layer its neighbour's rows.
-    public static func slots(config: DeepSeekV41Config) -> [DeepSeekV41EngramSlot] {
+    public static func slots(
+        config: DeepSeekV41Config,
+        positions: Int = 1
+    ) -> [DeepSeekV41EngramSlot] {
+        let positionSlots = max(1, positions)
         var rawCursor = 0
         var valueCursor = 0
         return config.engramTables.enumerated().map { table, spec in
@@ -691,10 +767,11 @@ nonisolated public struct DeepSeekV41EngramSlot: Sendable, Equatable {
                 headDimension: spec.headDimension,
                 rowBytes: spec.rowBytes,
                 rawByteOffset: rawCursor,
-                valueOffset: valueCursor
+                valueOffset: valueCursor,
+                positionSlots: positionSlots
             )
-            rawCursor += slot.rawByteCount
-            valueCursor += slot.valueCount
+            rawCursor += slot.rawByteStride
+            valueCursor += slot.valueStride
             return slot
         }
     }
@@ -706,7 +783,8 @@ nonisolated public struct DeepSeekV41EngramSlot: Sendable, Equatable {
         headDimension: Int,
         rowBytes: Int,
         rawByteOffset: Int,
-        valueOffset: Int
+        valueOffset: Int,
+        positionSlots: Int = 1
     ) {
         self.layer = layer
         self.table = table
@@ -715,6 +793,7 @@ nonisolated public struct DeepSeekV41EngramSlot: Sendable, Equatable {
         self.rowBytes = rowBytes
         self.rawByteOffset = rawByteOffset
         self.valueOffset = valueOffset
+        self.positionSlots = max(1, positionSlots)
     }
 }
 
@@ -841,9 +920,9 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
         // Engram staging is sized for exactly the rows one position reads, which is
         // well under the 64-row block the memory plan prices, so the allocation can
         // never outgrow the budget the load log reports.
-        let engramSlots = DeepSeekV41EngramSlot.slots(config: config)
-        let engramRawBytes = engramSlots.reduce(0) { $0 + $1.rawByteCount }
-        let engramValueCount = engramSlots.reduce(0) { $0 + $1.valueCount }
+        let engramSlots = DeepSeekV41EngramSlot.slots(config: config, positions: slots)
+        let engramRawBytes = engramSlots.reduce(0) { $0 + $1.rawByteStride }
+        let engramValueCount = engramSlots.reduce(0) { $0 + $1.valueStride }
         let engramKVCount = (mult + 1) * shapes.hidden
 
         func make(_ bytes: Int) -> MTLBuffer? {
@@ -885,8 +964,13 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
               let hcResidual = make(slotBytes(mult * shapes.hidden)),
               let logits = make(float4(config.vocabSize)),
               let rowIndices = make(4 * gather * slots),
-              let tokenIDs = make(4),
+              // One token id per position: a prefilled block writes its whole
+              // prompt slice here and binds one id per embedding dispatch, so a
+              // single entry overruns the buffer at position 4 of 8.
+              let tokenIDs = make(slotBytes(1)),
               let engramRaw = make(engramRawBytes),
+              // One decoded block per position: `engramValueCount` already counts
+              // every position of the block.
               let engramValues = make(float4(engramValueCount)),
               let engramKV = make(slotBytes(engramKVCount)),
               let engramGates = make(slotBytes(mult)) else {

@@ -313,6 +313,57 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
     /// writes only that position's stream, and `prefillChunk` samples only the last
     /// position's logits — so the after-attention probe is what makes it visible:
     /// slot 0 of a block is a position whose attention dispatch is not the last one.
+    /// The published model runs four hyper-connection copies in blocks of eight.
+    /// The default fixture is two copies in blocks of four, so every per-copy
+    /// vector is half as wide and half as many slots deep — which is exactly the
+    /// space a binding one slot too far hides in.
+    func testABlockRunsAtFourHyperConnectionCopies() throws {
+        var shape = DeepSeekV41SyntheticShape.compressedSmall()
+        shape.window = 10
+        shape.contextLength = 64
+        shape.hcMult = 4
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+        let width = DeepSeekV41DevicePlan.chunkSlots(
+            config: checkpoint.config, contextLength: shape.contextLength
+        )
+        XCTAssertEqual(width, 8)
+        XCTAssertEqual(checkpoint.config.hcMult, 4)
+
+        let runtime = try makeRuntime(checkpoint)
+        let tokens = (0..<(width * 3)).map { 3 + $0 }
+        let chunk = try runtime.forward().prefillChunk(tokens)
+        XCTAssertEqual(chunk.last.count, checkpoint.config.vocabSize)
+    }
+
+    /// A block binds one token id per position, so the id buffer has to be as wide
+    /// as the block. It was allocated for ONE token, which no fixture showed because
+    /// the default window caps a block at four positions: at the published window a
+    /// block is eight wide, and positions 4-7 both wrote past that 16-byte buffer
+    /// and bound an offset outside it. Metal rejects the offset (the app's first
+    /// prompt died on exactly that assertion), and the writes before it had already
+    /// overrun the allocation.
+    func testABlockHoldsATokenIDForEveryPosition() throws {
+        var shape = DeepSeekV41SyntheticShape()
+        shape.window = 10
+        shape.contextLength = 64
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+        let blockWidth = DeepSeekV41DevicePlan.chunkSlots(
+            config: checkpoint.config,
+            contextLength: shape.contextLength
+        )
+        XCTAssertGreaterThan(blockWidth, 4, "the fixture has to reach past the old width")
+
+        let runtime = try makeRuntime(checkpoint)
+        let capacity = runtime.workspace.tokenIDs.length / MemoryLayout<UInt32>.stride
+        XCTAssertGreaterThanOrEqual(
+            capacity, blockWidth,
+            "the workspace holds \(capacity) token ids for a \(blockWidth)-position block"
+        )
+
+        let chunk = try runtime.forward().prefillChunk((0..<blockWidth).map { 3 + $0 })
+        XCTAssertEqual(chunk.last.count, checkpoint.config.vocabSize)
+    }
+
     func testEveryPositionOfABlockAttendsOverItsOwnRows() throws {
         let metal = try XCTUnwrap(MTLCreateSystemDefaultDevice())
         // A ring wider than the block, which is the checkpoint's own ratio (128 over
@@ -1031,9 +1082,15 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         var weightOffset = UInt64(0)
         var inDimension = UInt32(inDim)
         var outDimension = UInt32(outDim)
+        // Zero means "one row of the dimension", which is the unbatched contract;
+        // the kernel declares them, so they have to be bound.
+        var inStride: UInt32 = 0
+        var outStride: UInt32 = 0
         encoder.setBytes(&weightOffset, length: 8, index: 3)
         encoder.setBytes(&inDimension, length: 4, index: 4)
         encoder.setBytes(&outDimension, length: 4, index: 5)
+        encoder.setBytes(&inStride, length: 4, index: 6)
+        encoder.setBytes(&outStride, length: 4, index: 7)
         encoder.dispatchThreads(
             MTLSize(width: outDim, height: rows, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
@@ -1391,9 +1448,15 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
             var weightOffset = UInt64(group * perGroupOut * perGroupIn * valueBytes)
             var inDimension = UInt32(perGroupIn)
             var outDimension = UInt32(perGroupOut)
+            // Zero is "one row of the dimension"; the kernel declares both, so an
+            // unbound stride is a validation failure even when it is unused.
+            var inStride: UInt32 = 0
+            var outStride: UInt32 = 0
             encoder.setBytes(&weightOffset, length: 8, index: 3)
             encoder.setBytes(&inDimension, length: 4, index: 4)
             encoder.setBytes(&outDimension, length: 4, index: 5)
+            encoder.setBytes(&inStride, length: 4, index: 6)
+            encoder.setBytes(&outStride, length: 4, index: 7)
             encoder.dispatchThreads(
                 MTLSize(width: perGroupOut, height: 1, depth: 1),
                 threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)

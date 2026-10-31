@@ -347,6 +347,21 @@ final class DeepSeekV41DevicePlanTests: XCTestCase {
         XCTAssertEqual(slots[1].rawByteOffset, slots[0].rawByteCount)
         XCTAssertEqual(slots[0].valueOffset, 0)
         XCTAssertEqual(slots[1].valueOffset, slots[0].valueCount)
+
+        // A prefilled block stages every position before its command buffer exists,
+        // so the block is replicated per position and the tables stay disjoint.
+        let wide = DeepSeekV41EngramSlot.slots(config: config, positions: 8)
+        XCTAssertEqual(wide[0].rawByteStride, wide[0].rawByteCount * 8)
+        XCTAssertEqual(wide[1].rawByteOffset, wide[0].rawByteStride)
+        XCTAssertEqual(wide[0].rawBytes(atPositionSlot: 3), wide[0].rawByteCount * 3)
+        XCTAssertEqual(
+            wide[1].rawBytes(atPositionSlot: 7),
+            wide[0].rawByteStride + wide[1].rawByteCount * 7
+        )
+        XCTAssertEqual(
+            wide[1].valueBytes(atPositionSlot: 2),
+            (wide[0].valueStride + wide[1].valueCount * 2) * MemoryLayout<Float>.stride
+        )
     }
 
     func testACompressedLayerWithoutASelectionBudgetIsReported() throws {
@@ -564,7 +579,7 @@ final class DeepSeekV41NormDispatchTests: XCTestCase {
         encoder.setBytes(&dim, length: 4, index: 3)
         encoder.setBytes(&eps, length: 4, index: 4)
         let lanes = 256
-        encoder.setThreadgroupMemoryLength((lanes / 32) * MemoryLayout<Float>.stride, index: 0)
+        encoder.setThreadgroupMemoryLength(max(16, ((lanes / 32) * 4 + 15) & ~15), index: 0)
         let grid = DeepSeekV41DevicePlan.normDispatch(width: width, lanes: lanes)
         encoder.dispatchThreadgroups(grid.threadgroups, threadsPerThreadgroup: grid.threadsPerThreadgroup)
         encoder.endEncoding()
@@ -775,9 +790,21 @@ final class DeepSeekV41AttentionKernelTests: XCTestCase {
         encoder.setBytes(&headWidth, length: 4, index: 6)
         encoder.setBytes(&headValue, length: 4, index: 7)
         encoder.setBytes(&recordWidth, length: 4, index: 8)
-        encoder.setThreadgroupMemoryLength(
-            (rows + 32) * MemoryLayout<Float>.stride, index: 0
+        // The dispatch sizes its scores block the way the executor does: rounded up
+        // to a 16-byte multiple, which Metal requires and a short row count does not
+        // give on its own (1 row is 132 bytes).
+        let scoreBytes = (
+            (rows + 32) * MemoryLayout<Float>.stride + 15
+        ) & ~15
+        encoder.setThreadgroupMemoryLength(scoreBytes, index: 0)
+        // Bound even for one position: the kernel takes the single-position path
+        // either way, and an unbound `constant` pointer fails validation.
+        var plan = DeepSeekV41AttentionSlotPlan(slotCount: 1, keyRowStride: UInt32(rows))
+        encoder.setBytes(
+            &plan, length: MemoryLayout<DeepSeekV41AttentionSlotPlan>.stride, index: 9
         )
+        var slotRows = UInt32(rows)
+        encoder.setBytes(&slotRows, length: 4, index: 10)
         encoder.dispatchThreadgroups(
             MTLSize(width: heads, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
@@ -827,6 +854,9 @@ final class DeepSeekV41AttentionKernelTests: XCTestCase {
         let rows = 1
         let query: [Float] = [1, 0, 0, 0, 0, 1, 0, 0]
         let keys: [Float16] = [0.5, -0.25, 1.5, -2]
+        // The sink is disabled, not absent: an unbound `constant` pointer fails
+        // Metal's validation even though the kernel tests it against nullptr.
+        let sink = [Float](repeating: -1e30, count: heads)
 
         guard let queryBuffer = device.makeBuffer(
                   bytes: query,
@@ -835,6 +865,10 @@ final class DeepSeekV41AttentionKernelTests: XCTestCase {
               let keyBuffer = device.makeBuffer(
                   bytes: keys,
                   length: keys.count * MemoryLayout<Float16>.stride,
+                  options: .storageModeShared),
+              let sinkBuffer = device.makeBuffer(
+                  bytes: sink,
+                  length: sink.count * MemoryLayout<Float>.stride,
                   options: .storageModeShared),
               let outputBuffer = device.makeBuffer(
                   length: heads * vHeadDim * MemoryLayout<Float>.stride,
@@ -848,6 +882,7 @@ final class DeepSeekV41AttentionKernelTests: XCTestCase {
         encoder.setComputePipelineState(pipeline)
         encoder.setBuffer(queryBuffer, offset: 0, index: 0)
         encoder.setBuffer(keyBuffer, offset: 0, index: 1)
+        encoder.setBuffer(sinkBuffer, offset: 0, index: 2)
         encoder.setBuffer(outputBuffer, offset: 0, index: 3)
         var rowCount = UInt32(rows)
         var headCount = UInt32(heads)
@@ -859,9 +894,21 @@ final class DeepSeekV41AttentionKernelTests: XCTestCase {
         encoder.setBytes(&headWidth, length: 4, index: 6)
         encoder.setBytes(&headValue, length: 4, index: 7)
         encoder.setBytes(&recordWidth, length: 4, index: 8)
-        encoder.setThreadgroupMemoryLength(
-            (rows + 32) * MemoryLayout<Float>.stride, index: 0
+        // The dispatch sizes its scores block the way the executor does: rounded up
+        // to a 16-byte multiple, which Metal requires and a short row count does not
+        // give on its own (1 row is 132 bytes).
+        let scoreBytes = (
+            (rows + 32) * MemoryLayout<Float>.stride + 15
+        ) & ~15
+        encoder.setThreadgroupMemoryLength(scoreBytes, index: 0)
+        // Bound even for one position: the kernel takes the single-position path
+        // either way, and an unbound `constant` pointer fails validation.
+        var plan = DeepSeekV41AttentionSlotPlan(slotCount: 1, keyRowStride: UInt32(rows))
+        encoder.setBytes(
+            &plan, length: MemoryLayout<DeepSeekV41AttentionSlotPlan>.stride, index: 9
         )
+        var slotRows = UInt32(rows)
+        encoder.setBytes(&slotRows, length: 4, index: 10)
         encoder.dispatchThreadgroups(
             MTLSize(width: heads, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
@@ -1233,7 +1280,7 @@ final class DeepSeekV41EngramGateKernelTests: XCTestCase {
         encoder.setBytes(&copies, length: 4, index: 6)
         encoder.setBytes(&epsilon, length: 4, index: 7)
         let lanes = 64
-        encoder.setThreadgroupMemoryLength((lanes / 32) * MemoryLayout<Float>.stride, index: 0)
+        encoder.setThreadgroupMemoryLength(max(16, ((lanes / 32) * 4 + 15) & ~15), index: 0)
         encoder.dispatchThreadgroups(
             MTLSize(width: mult, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
@@ -1316,7 +1363,7 @@ final class DeepSeekV41EngramGateKernelTests: XCTestCase {
         encoder.setBytes(&copies, length: 4, index: 6)
         encoder.setBytes(&epsilon, length: 4, index: 7)
         let lanes = 64
-        encoder.setThreadgroupMemoryLength((lanes / 32) * MemoryLayout<Float>.stride, index: 0)
+        encoder.setThreadgroupMemoryLength(max(16, ((lanes / 32) * 4 + 15) & ~15), index: 0)
         encoder.dispatchThreadgroups(
             MTLSize(width: mult, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)

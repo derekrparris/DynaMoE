@@ -862,7 +862,8 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             }
             if runtime.weights.engramReaders[layer.index] == nil {
                 problems.append(
-                    "layers.\(layer.index): the Engram table file could not be opened, "
+                    runtime.weights.engramReaderProblems[layer.index]
+                        ?? "layers.\(layer.index): the Engram table file could not be opened, "
                         + "so its rows cannot be read"
                 )
             }
@@ -1228,7 +1229,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         // table's staging block before the layer's command buffer exists.
         if layer.engramTable != nil {
             for index in 0..<count {
-                try readEngramRows(layer: layer, position: startPosition + index)
+                try readEngramRows(
+                    layer: layer, position: startPosition + index, positionSlot: index
+                )
             }
         }
 
@@ -1851,13 +1854,19 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 comb: workspace.hcFFNComb,
                 slot: slot
             )
+            // The mix the NEXT layer's attention collapse uses is this FFN's `pre`,
+            // which is `hc_mult` wide per position: `Block.forward` returns
+            // `ffn_pre`, not the split. `mixCount` is the projection's ROW count
+            // (pre + post + comb), so copying that many floats per position both
+            // overran `hcMix` (which holds `mult` per position) and wrote several
+            // positions' worth into one.
             try encodeCopy(
                 encoder,
                 from: workspace.hcFFNPre,
                 to: workspace.hcMix,
-                count: mixCount,
-                sourceByteOffset: workspace.slotOffset(slot, width: mixCount),
-                destinationByteOffset: workspace.slotOffset(slot, width: mixCount)
+                count: mult,
+                sourceByteOffset: workspace.slotOffset(slot, width: mult),
+                destinationByteOffset: workspace.slotOffset(slot, width: mult)
             )
         case .collapseStreams:
             try encodeHyperConnectionPre(
@@ -1923,6 +1932,17 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// with one dispatch.
     private func encodeEmbeddingBlock(_ tokens: [Int], startPosition: Int) throws {
         let count = tokens.count
+        // Every position's id goes into one entry of `tokenIDs`, and each dispatch
+        // binds its own entry, so a block wider than the workspace would both write
+        // past the buffer and bind an offset outside it (Metal refuses the second,
+        // the first would corrupt the neighbouring allocation).
+        let tokenCapacity = workspace.tokenIDs.length / MemoryLayout<UInt32>.stride
+        guard count <= tokenCapacity else {
+            throw DeepSeekV41EngineError.unsupportedStage(
+                "embedding a \(count)-position block into the \(tokenCapacity) token ids "
+                    + "the workspace holds"
+            )
+        }
         let commandBuffer = try makeCommandBuffer()
         let encoder = try makeEncoder(commandBuffer)
 
@@ -2496,9 +2516,12 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             )
             // Whatever this feed-forward decided is what the NEXT layer's attention
             // collapses with, and after the last layer what the head collapses with
-            // (`Transformer.forward` returns `ffn_pre` up the stack).
+            // (`Transformer.forward` returns `ffn_pre` up the stack). That is one
+            // coefficient per copy, which is all `hcMix` holds; copying `mixCount`
+            // floats read past the split's `pre` section and into `hcMix`'s other
+            // positions.
             try encodeCopy(
-                encoder, from: workspace.hcFFNPre, to: workspace.hcMix, count: mixCount
+                encoder, from: workspace.hcFFNPre, to: workspace.hcMix, count: mult
             )
 
         case .collapseStreams:
@@ -2525,7 +2548,11 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// A dead position reads nothing: `Engram.forward` zeroes the gate wherever
     /// `token_mask` is false, so the residual passes through untouched rather than
     /// taking pad rows into the stream.
-    private func readEngramRows(layer: DeepSeekV41LayerPlan, position: Int? = nil) throws {
+    private func readEngramRows(
+        layer: DeepSeekV41LayerPlan,
+        position: Int? = nil,
+        positionSlot: Int = 0
+    ) throws {
         guard !skipEngram, let table = layer.engramTable else { return }
         // A walk reads the newest position; a block names the one it is on, because
         // the whole block's tokens are already in the history.
@@ -2557,7 +2584,8 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 "engram rows for layer \(layer.index): \(requests.count) of \(slot.columns) columns"
             )
         }
-        let destination = workspace.engramRaw.contents().advanced(by: slot.rawByteOffset)
+        let destination = workspace.engramRaw.contents()
+            .advanced(by: slot.rawBytes(atPositionSlot: positionSlot))
         try reader.readRows(requests, into: destination)
     }
 
@@ -2595,8 +2623,12 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         var rowCount = UInt32(staging.columns)
         var headDimension = UInt32(staging.headDimension)
         encoder.setComputePipelineState(pipelines.engramDequantRows)
-        encoder.setBuffer(workspace.engramRaw, offset: staging.rawByteOffset, index: 0)
-        encoder.setBuffer(workspace.engramValues, offset: staging.valueByteOffset, index: 1)
+        encoder.setBuffer(
+            workspace.engramRaw, offset: staging.rawBytes(atPositionSlot: slot), index: 0
+        )
+        encoder.setBuffer(
+            workspace.engramValues, offset: staging.valueBytes(atPositionSlot: slot), index: 1
+        )
         encoder.setBytes(&rowCount, length: 4, index: 2)
         encoder.setBytes(&headDimension, length: 4, index: 3)
         encoder.dispatchThreads(
@@ -2617,7 +2649,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             outDim: shapes.hidden * (mult + 1),
             input: workspace.engramValues,
             output: workspace.engramKV,
-            inputByteOffset: staging.valueByteOffset,
+            inputByteOffset: staging.valueBytes(atPositionSlot: slot),
             outputByteOffset: workspace.slotOffset(slot, width: shapes.hidden * (mult + 1))
         )
 
@@ -2676,7 +2708,10 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         encoder.setBytes(&streams, length: 4, index: 6)
         encoder.setBytes(&epsilon, length: 4, index: 7)
         let lanes = max(32, min(256, pipelines.engramGate.maxTotalThreadsPerThreadgroup))
-        encoder.setThreadgroupMemoryLength((lanes / 32) * MemoryLayout<Float>.stride, index: 0)
+        // One float per SIMD group, rounded up to Metal's 16-byte granularity: a
+        // 64-thread threadgroup asks for 8 bytes and is refused outright.
+        let gatePartials = (lanes / 32) * MemoryLayout<Float>.stride
+        encoder.setThreadgroupMemoryLength((gatePartials + 15) & ~15, index: 0)
         encoder.dispatchThreadgroups(
             MTLSize(width: mult, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
@@ -3011,17 +3046,21 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                     "batched attention needs the block's slots in order from 0"
                 )
             }
-            var plan = DeepSeekV41AttentionSlotPlan(
-                slotCount: UInt32(slots.count),
-                keyRowStride: UInt32(gatherRows)
-            )
-            encoder.setBytes(
-                &plan, length: MemoryLayout<DeepSeekV41AttentionSlotPlan>.stride, index: 9
-            )
-            let counts = rowCounts.map { UInt32($0) }
-            counts.withUnsafeBytes { bytes in
-                encoder.setBytes(bytes.baseAddress!, length: bytes.count, index: 10)
-            }
+        }
+        // The plan is bound even for ONE position, where the kernel takes the
+        // single-position path anyway: a `constant Dsv41AttentionSlotPlan*` left
+        // unbound is a binding error under Metal's validation layer, and a decode
+        // step would trip it on every token.
+        var plan = DeepSeekV41AttentionSlotPlan(
+            slotCount: UInt32(slots.count),
+            keyRowStride: UInt32(gatherRows)
+        )
+        encoder.setBytes(
+            &plan, length: MemoryLayout<DeepSeekV41AttentionSlotPlan>.stride, index: 9
+        )
+        let counts = rowCounts.map { UInt32($0) }
+        counts.withUnsafeBytes { bytes in
+            encoder.setBytes(bytes.baseAddress!, length: bytes.count, index: 10)
         }
         encoder.dispatchThreadgroups(
             MTLSize(width: shape.numHeads * slots.count, height: 1, depth: 1),

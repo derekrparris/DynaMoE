@@ -1288,7 +1288,7 @@ final class DeepSeekV41EngramReaderTests: XCTestCase {
         try shard.write(to: url)
         defer { try? FileManager.default.removeItem(at: url) }
 
-        let reader = try DeepSeekV41EngramReader(fileURL: url, spec: spec, baseOffset: base)
+        let reader = try DeepSeekV41EngramReader(fileURL: url, spec: spec, valuesOffset: base)
         defer { reader.closeNow() }
         let buffer = UnsafeMutableRawPointer.allocate(byteCount: spec.rowBytes, alignment: 8)
         defer { buffer.deallocate() }
@@ -1312,6 +1312,245 @@ final class DeepSeekV41EngramReaderTests: XCTestCase {
         let url = try makeTable(rows: 8, rowBytes: spec.rowBytes)
         defer { try? FileManager.default.removeItem(at: url) }
         XCTAssertThrowsError(try DeepSeekV41EngramReader(fileURL: url, spec: spec))
+    }
+
+    /// The checkpoint publishes a row as TWO tensors: `engram.embed.weight` holds
+    /// every row's E4M3 values and `engram.embed.scale` holds every row's E8M0
+    /// block scales, in two blocks that are gigabytes apart. A reader that assumes
+    /// one contiguous `head_dim + head_dim/32` row takes the next row's values as
+    /// this row's exponents, which decodes to finite garbage instead of failing.
+    func testReadsASplitTablesScaleBlock() throws {
+        let spec = spec(rowCount: 64)
+        let scaleBytes = spec.rowBytes - spec.headDimension
+        XCTAssertEqual(scaleBytes, 1)
+
+        var shard = Data(repeating: 0xEE, count: 32)
+        let valuesOffset = shard.count
+        for row in 0..<spec.rowCount {
+            shard.append(contentsOf: [UInt8](repeating: UInt8(row & 0xFF), count: spec.headDimension))
+        }
+        shard.append(contentsOf: [UInt8](repeating: 0xEE, count: 16))
+        let scalesOffset = shard.count
+        for row in 0..<spec.rowCount {
+            shard.append(UInt8(0x40 + row))
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dsv41-engram-split-\(UUID().uuidString).bin")
+        try shard.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let reader = try DeepSeekV41EngramReader(
+            fileURL: url, spec: spec, valuesOffset: valuesOffset, scalesOffset: scalesOffset
+        )
+        defer { reader.closeNow() }
+
+        let rows = [3, 17, 63]
+        let requests = rows.enumerated().map { column, row in
+            DeepSeekV41EngramRowRequest(
+                layer: 1, column: column, bucket: 0, row: row,
+                byteOffset: row * spec.rowBytes, byteCount: spec.rowBytes
+            )
+        }
+        let buffer = UnsafeMutableRawPointer.allocate(
+            byteCount: requests.count * spec.rowBytes, alignment: 8
+        )
+        defer { buffer.deallocate() }
+        _ = try reader.readRows(requests, into: buffer)
+
+        for (index, row) in rows.enumerated() {
+            let slice = buffer.advanced(by: index * spec.rowBytes)
+                .assumingMemoryBound(to: UInt8.self)
+            for value in 0..<spec.headDimension {
+                XCTAssertEqual(slice[value], UInt8(row & 0xFF), "row \(row) value \(value)")
+            }
+            XCTAssertEqual(
+                slice[spec.headDimension], UInt8(0x40 + row),
+                "row \(row) took another row's block scale"
+            )
+        }
+    }
+
+    /// The published table itself, which no fixture can stand in for: its rows are
+    /// two tensors 98 GB apart, and its shard is the one segmentation renumbers.
+    /// Skips when the checkpoint is not downloaded.
+    func testThePublishedTableOpensAndDecodesSaneRows() throws {
+        let hub = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(
+                ".cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots"
+            )
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: hub, includingPropertiesForKeys: nil
+        ), let snapshot = entries.first(where: {
+            FileManager.default.fileExists(
+                atPath: $0.appendingPathComponent("model.safetensors.index.json").path
+            )
+        }) else {
+            throw XCTSkip("DeepSeek-V4.1 snapshot not downloaded")
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let summary = try engine.getSummary()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let catalog = DeepSeekV41WeightCatalog.from(
+            summary: summary, layerCount: config.numHiddenLayers
+        )
+        XCTAssertFalse(config.engramTables.isEmpty)
+
+        for spec in config.engramTables {
+            let valuesRef = try XCTUnwrap(catalog.tensor(.engramTable, layer: spec.layer))
+            let scaleRef = try XCTUnwrap(
+                catalog.tensor(.engramTable, layer: spec.layer, scale: true),
+                "layer \(spec.layer) publishes no scale companion"
+            )
+            let values = try XCTUnwrap(summary.tensors.first { $0.name == valuesRef.name })
+            let scale = try XCTUnwrap(summary.tensors.first { $0.name == scaleRef.name })
+            // The scale block must be a DIFFERENT span of the same file, or this
+            // test would pass on an interleaved table that no checkpoint ships.
+            XCTAssertNotEqual(values.offsetStart, scale.offsetStart)
+            // The readiness check in `DeepSeekV41DeviceWeights` refuses a table
+            // whose scale companion is not one entry per row per block.
+            XCTAssertEqual(
+                DeepSeekV41WeightCatalog.shape(from: scale.shapeDisplay),
+                [spec.rowCount, spec.rowBytes - spec.headDimension]
+            )
+
+            let filename = try XCTUnwrap(
+                DeepSeekV41EngramTableLocator.shardFilename(
+                    forTensorNamed: valuesRef.name, in: snapshot
+                ),
+                "layer \(spec.layer)'s table shard could not be located"
+            )
+            let reader = try DeepSeekV41EngramReader(
+                fileURL: snapshot.appendingPathComponent(filename),
+                spec: spec,
+                valuesOffset: Int(values.offsetStart),
+                scalesOffset: Int(scale.offsetStart)
+            )
+            defer { reader.closeNow() }
+
+            let rows = [0, 1, 7, spec.rowCount / 2, spec.rowCount - 1]
+            let requests = rows.enumerated().map { column, row in
+                DeepSeekV41EngramRowRequest(
+                    layer: spec.layer, column: column, bucket: 0, row: row,
+                    byteOffset: row * spec.rowBytes, byteCount: spec.rowBytes
+                )
+            }
+            let buffer = UnsafeMutableRawPointer.allocate(
+                byteCount: requests.count * spec.rowBytes, alignment: 8
+            )
+            defer { buffer.deallocate() }
+            _ = try reader.readRows(requests, into: buffer)
+
+            for (index, row) in rows.enumerated() {
+                let raw = UnsafeBufferPointer(
+                    start: buffer.advanced(by: index * spec.rowBytes)
+                        .assumingMemoryBound(to: UInt8.self),
+                    count: spec.rowBytes
+                )
+                let decoded = DeepSeekV41EngramRowDequantizer.row(
+                    Array(raw), headDimension: spec.headDimension
+                )
+                XCTAssertEqual(decoded.count, spec.headDimension)
+                // A dequantized embedding row is a few units wide. Reading the next
+                // row's values as this row's block scales puts exponents in the
+                // 1e-5..1e+30 range, which this catches.
+                let largest = decoded.map { abs($0) }.max() ?? 0
+                XCTAssertTrue(largest.isFinite, "row \(row) decoded to \(largest)")
+                XCTAssertLessThan(largest, 64, "row \(row) decoded to \(largest)")
+                XCTAssertFalse(decoded.allSatisfy { $0 == 0 }, "row \(row) decoded to zeros")
+            }
+        }
+    }
+
+    /// A split table whose scale block is missing must be refused at open rather
+    /// than read short.
+    func testSplitTableWithoutItsScaleBlockIsRefused() throws {
+        let spec = spec(rowCount: 64)
+        var shard = Data()
+        for row in 0..<spec.rowCount {
+            shard.append(contentsOf: [UInt8](repeating: UInt8(row & 0xFF), count: spec.headDimension))
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dsv41-engram-noscale-\(UUID().uuidString).bin")
+        try shard.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        XCTAssertThrowsError(
+            try DeepSeekV41EngramReader(
+                fileURL: url, spec: spec, valuesOffset: 0, scalesOffset: shard.count + 1
+            )
+        )
+    }
+
+    /// A layer's table is addressed by NAME, and the segmented summary cannot be
+    /// trusted to name its file: a streamed table's shard is renumbered into
+    /// segments (or dropped when it holds nothing else). The checkpoint's own
+    /// manifest supplies the filename.
+    func testTheTableFileComesFromTheManifest() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dsv41-locate-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let map: [String: Any] = [
+            "weight_map": [
+                "layers.1.engram.embed.weight": "model-00047-of-00048.safetensors",
+                "layers.1.attn.wkv.weight": "model-00001-of-00048.safetensors"
+            ]
+        ]
+        try JSONSerialization.data(withJSONObject: map)
+            .write(to: dir.appendingPathComponent("model.safetensors.index.json"))
+
+        XCTAssertEqual(
+            DeepSeekV41EngramTableLocator.shardFilename(
+                forTensorNamed: "layers.1.engram.embed.weight", in: dir
+            ),
+            "model-00047-of-00048.safetensors"
+        )
+        XCTAssertNil(
+            DeepSeekV41EngramTableLocator.shardFilename(
+                forTensorNamed: "layers.14.engram.embed.weight", in: dir
+            )
+        )
+    }
+
+    /// Without an index the shards' own headers have to answer, because a
+    /// directory of safetensors carries no other manifest.
+    func testTheTableFileFallsBackToTheShardHeaders() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dsv41-headers-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        func writeShard(_ name: String, tensors: [String]) throws {
+            let header: [String: Any] = Dictionary(
+                uniqueKeysWithValues: tensors.map { ($0, ["dtype": "BF16", "shape": [2], "data_offsets": [0, 4]]) }
+            )
+            let json = try JSONSerialization.data(withJSONObject: header)
+            var file = Data()
+            var length = UInt64(json.count)
+            withUnsafeBytes(of: &length) { file.append(contentsOf: $0) }
+            file.append(json)
+            file.append(contentsOf: [0, 0, 0, 0])
+            try file.write(to: dir.appendingPathComponent(name))
+        }
+
+        try writeShard("model-00001-of-00002.safetensors", tensors: ["layers.7.attn.wkv.weight"])
+        try writeShard("model-00002-of-00002.safetensors", tensors: ["layers.14.engram.embed.weight"])
+
+        XCTAssertEqual(
+            DeepSeekV41EngramTableLocator.shardFilename(
+                forTensorNamed: "layers.14.engram.embed.weight", in: dir
+            ),
+            "model-00002-of-00002.safetensors"
+        )
+        XCTAssertNil(
+            DeepSeekV41EngramTableLocator.shardFilename(
+                forTensorNamed: "layers.99.present.nowhere", in: dir
+            )
+        )
     }
 
     func testRowFromAnotherLayerIsRefused() throws {
@@ -1346,6 +1585,98 @@ final class DeepSeekV41EngramReaderTests: XCTestCase {
             byteOffset: spec.totalBytes, byteCount: spec.rowBytes
         )
         XCTAssertThrowsError(try reader.readRows([request], into: buffer))
+    }
+}
+
+// MARK: - Streamed shard segmentation
+
+final class DeepSeekV41StreamedSegmentationTests: XCTestCase {
+
+    /// The published Engram shards hold a ~98 GB table plus a few hundred megabytes
+    /// of dense projections, and the table's 3 GB scale companion. Treating every
+    /// `.engram.` tensor as unmappable left those shards with NOTHING to segment:
+    /// no buffer for `engram.wkv`/`q_weight`/`k_weight`, and no shard entry left to
+    /// name the table's own file. Only the table and its scale stay unmapped, so
+    /// the shard keeps a segment and the rest of its tensors land in it.
+    func testAnEngramShardKeepsTheTensorsThatMustBeMapped() throws {
+        let limit: UInt64 = 1 << 30
+        let tableBytes = UInt64(4) << 30
+        let summary = ModelSummary(
+            sizeGb: 5,
+            tensorCount: 5,
+            layerCount: 2,
+            maxExpertId: 0,
+            shards: [
+                ShardMetadata(
+                    index: 0, filename: "model-00001-of-00002.safetensors",
+                    baseAddress: 0x1000_0000, length: 1 << 16
+                ),
+                ShardMetadata(
+                    index: 1, filename: "model-00002-of-00002.safetensors",
+                    baseAddress: 0x2000_0000, length: tableBytes + (1 << 20)
+                )
+            ],
+            tensors: [
+                TensorMetadata(
+                    name: "layers.0.attn_norm.weight", shapeDisplay: "[64]", dtype: "BF16",
+                    sizeMb: 0.001, shardIndex: 0, offsetStart: 0, offsetEnd: 128,
+                    category: "Multi-Head Latent Attention (MLA)", layerIndex: 0, expertId: nil
+                ),
+                TensorMetadata(
+                    name: "layers.1.engram.embed.weight", shapeDisplay: "[1024, 256]",
+                    dtype: "F8_E4M3", sizeMb: 0.25, shardIndex: 1,
+                    offsetStart: 0, offsetEnd: tableBytes,
+                    category: "Engram (n-gram memory)", layerIndex: 1, expertId: nil
+                ),
+                TensorMetadata(
+                    name: "layers.1.engram.embed.scale", shapeDisplay: "[1024, 8]",
+                    dtype: "F8_E8M0", sizeMb: 0.008, shardIndex: 1,
+                    offsetStart: tableBytes, offsetEnd: tableBytes + 8_192,
+                    category: "Engram (n-gram memory)", layerIndex: 1, expertId: nil
+                ),
+                TensorMetadata(
+                    name: "layers.1.engram.q_weight", shapeDisplay: "[4, 5120]", dtype: "BF16",
+                    sizeMb: 0.04, shardIndex: 1,
+                    offsetStart: tableBytes + 8_192, offsetEnd: tableBytes + 49_152,
+                    category: "Engram (n-gram memory)", layerIndex: 1, expertId: nil
+                ),
+                TensorMetadata(
+                    name: "layers.1.engram.wkv.weight", shapeDisplay: "[25600, 6144]",
+                    dtype: "F8_E4M3", sizeMb: 150.0, shardIndex: 1,
+                    offsetStart: tableBytes + 49_152,
+                    offsetEnd: tableBytes + 49_152 + (1 << 19),
+                    category: "Engram (n-gram memory)", layerIndex: 1, expertId: nil
+                )
+            ],
+            layers: []
+        )
+
+        let split = try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: limit)
+
+        // The Engram shard must still be addressable: one segment holding the
+        // dense projections, since the table itself is streamed.
+        XCTAssertGreaterThan(split.shards.count, summary.shards.count - 1)
+        let mapped = try XCTUnwrap(
+            split.tensors.first { $0.name == "layers.1.engram.wkv.weight" }
+        )
+        let segment = try XCTUnwrap(
+            split.shards.first { $0.index == mapped.shardIndex },
+            "the shard holding engram.wkv produced no segment at all"
+        )
+        XCTAssertLessThanOrEqual(segment.length, limit)
+        XCTAssertLessThanOrEqual(
+            mapped.offsetEnd, segment.length,
+            "the mapped tensor must address inside its segment"
+        )
+        XCTAssertEqual(mapped.offsetEnd - mapped.offsetStart, 1 << 19)
+
+        // The table and its scale are passed through untouched, keeping the
+        // whole-file shard index the reader's locator no longer depends on.
+        for name in ["layers.1.engram.embed.weight", "layers.1.engram.embed.scale"] {
+            let tensor = try XCTUnwrap(split.tensors.first { $0.name == name })
+            XCTAssertEqual(tensor.shardIndex, 1, "\(name) must stay file-addressed")
+            XCTAssertEqual(tensor.offsetStart, name.contains("scale") ? tableBytes : 0)
+        }
     }
 }
 
@@ -1887,6 +2218,12 @@ final class DeepSeekV41ConfigEdgeTests: XCTestCase {
         XCTAssertTrue(DeepSeekV41WeightCatalog.isStreamedName("layers.1.engram.embed.weight"))
         XCTAssertTrue(DeepSeekV41WeightCatalog.isStreamedName("layers.14.engram.embed.scale"))
         XCTAssertFalse(DeepSeekV41WeightCatalog.isStreamedName("layers.1.attn.wkv.weight"))
+        // The table's neighbours in the same shard are hundreds of megabytes, not
+        // a hundred gigabytes, and the graph reads them from mapped buffers.
+        XCTAssertFalse(DeepSeekV41WeightCatalog.isStreamedName("layers.1.engram.wkv.weight"))
+        XCTAssertFalse(DeepSeekV41WeightCatalog.isStreamedName("layers.1.engram.q_weight"))
+        XCTAssertFalse(DeepSeekV41WeightCatalog.isStreamedName("layers.1.engram.k_weight"))
+        XCTAssertFalse(DeepSeekV41WeightCatalog.isStreamedName("layers.1.engram.wkv.scale"))
     }
 
     /// `layerCount` was accepted and never read, so a manifest placing a

@@ -49,10 +49,17 @@ nonisolated public enum DeepSeekV41EngramReadError: Error, Equatable, CustomStri
 /// disjoint offsets, so sharing it across the concurrent reads is safe.
 nonisolated private struct ReadContext: @unchecked Sendable {
     let fd: Int32
-    /// Byte offset of the table tensor inside the shard file. Requests carry
-    /// table-relative offsets, so every pread adds this base.
-    let baseOffset: Int
+    /// Byte offset of the table's VALUES block inside the shard file. Requests
+    /// carry interleaved table-relative offsets, so a split table turns one into a
+    /// row index before addressing `row * head_dimension`.
+    let valuesOffset: Int
     let rowBytes: Int
+    /// Value bytes per row (`head_dimension`). The staged row is values first.
+    let valueBytes: Int
+    /// File offset of the scale tensor's first byte, or nil when the table keeps
+    /// each row's scales inline.
+    let scalesOffset: Int?
+    let scaleBytes: Int
     let requests: [DeepSeekV41EngramRowRequest]
     let destination: UnsafeMutableRawPointer
     let failures: FailureBox
@@ -60,29 +67,40 @@ nonisolated private struct ReadContext: @unchecked Sendable {
     func read(_ index: Int) {
         let request = requests[index]
         let slice = destination.advanced(by: index * rowBytes)
+        let row = request.byteOffset / rowBytes
+        // The checkpoint publishes a row's values and its E8M0 scales as TWO
+        // tensors, so a row is two spans that happen to be `rowCount * valueBytes`
+        // apart. The staged row is still values-then-scales, which is what the
+        // dequant kernel reads.
+        guard let scalesOffset else {
+            readSpan(into: slice, from: valuesOffset + request.byteOffset, length: valueBytes)
+            return
+        }
+        readSpan(into: slice, from: valuesOffset + row * valueBytes, length: valueBytes)
+        readSpan(
+            into: slice.advanced(by: valueBytes),
+            from: scalesOffset + row * scaleBytes,
+            length: scaleBytes
+        )
+    }
+
+    private func readSpan(into destination: UnsafeMutableRawPointer, from: Int, length: Int) {
+        guard length > 0 else { return }
         var total = 0
-        while total < rowBytes {
+        while total < length {
             let got = pread(
                 fd,
-                slice.advanced(by: total),
-                rowBytes - total,
-                off_t(baseOffset + request.byteOffset + total)
+                destination.advanced(by: total),
+                length - total,
+                off_t(from + total)
             )
             if got < 0 {
                 if errno == EINTR { continue }
-                failures.record(.shortRead(
-                    offset: baseOffset + request.byteOffset + total,
-                    wanted: rowBytes - total,
-                    got: Int(got)
-                ))
+                failures.record(.shortRead(offset: from + total, wanted: length - total, got: Int(got)))
                 return
             }
             if got == 0 {
-                failures.record(.shortRead(
-                    offset: baseOffset + request.byteOffset + total,
-                    wanted: rowBytes - total,
-                    got: 0
-                ))
+                failures.record(.shortRead(offset: from + total, wanted: length - total, got: 0))
                 return
             }
             total += got
@@ -113,23 +131,40 @@ nonisolated private final class FailureBox: @unchecked Sendable {
 nonisolated public final class DeepSeekV41EngramReader: @unchecked Sendable {
     public let spec: DeepSeekV41EngramSpec
     public let fileSize: Int
-    /// Byte offset of this table tensor inside the shard file.
-    public let baseOffset: Int
+    /// Byte offset of the table tensor inside the shard file.
+    public let valuesOffset: Int
+    /// File offset of the table's scale tensor, or nil when each row's E8M0
+    /// scales follow its values in place.
+    ///
+    /// The published checkpoint splits the two: `engram.embed.weight` is
+    /// `[rows, head_dim]` of E4M3 and `engram.embed.scale` is `[rows, head_dim/32]`
+    /// of E8M0, and the two blocks sit megabytes to gigabytes apart in the shard.
+    /// Reading `head_dim + head_dim/32` bytes at `row * rowBytes` therefore takes
+    /// the NEXT row's values as this row's exponents, which produces finite,
+    /// plausible-looking garbage rather than a failure.
+    public let scalesOffset: Int?
 
     private let descriptor: Int32
     private let lock = NSLock()
     private var isClosed = false
+
+    /// Value bytes in a staged row: values first, then the block scales.
+    public var valueBytes: Int { spec.headDimension }
+    /// E8M0 scales in a staged row.
+    public var scaleBytes: Int { spec.rowBytes - spec.headDimension }
 
     /// Opens the table file and validates it against the spec, so a truncated
     /// or half-downloaded table fails at load rather than mid-generation.
     public init(
         fileURL: URL,
         spec: DeepSeekV41EngramSpec,
-        baseOffset: Int = 0
+        valuesOffset: Int = 0,
+        scalesOffset: Int? = nil
     ) throws {
-        guard baseOffset >= 0 else {
+        guard valuesOffset >= 0, (scalesOffset ?? 0) >= 0 else {
             throw DeepSeekV41EngramReadError.cannotOpen(
-                "\(fileURL.lastPathComponent): negative table offset \(baseOffset)"
+                "\(fileURL.lastPathComponent): negative table offset "
+                    + "\(valuesOffset)/\(scalesOffset.map(String.init) ?? "-")"
             )
         }
         let fd = open(fileURL.path, O_RDONLY | O_CLOEXEC)
@@ -147,17 +182,28 @@ nonisolated public final class DeepSeekV41EngramReader: @unchecked Sendable {
         }
         let size = Int(status.st_size)
         // The table starts at the tensor's own offset inside the shard; only the
-        // bytes after that offset belong to it.
-        guard baseOffset <= size, size - baseOffset >= spec.totalBytes else {
+        // bytes after that offset belong to it. A split table is checked as two
+        // spans, because each one is addressed on its own.
+        let valueSpan = spec.rowCount * spec.headDimension
+        let scaleSpan = spec.rowCount * (spec.rowBytes - spec.headDimension)
+        let valuesFit = valuesOffset <= size && size - valuesOffset >= valueSpan
+        let scalesFit: Bool
+        if let scalesOffset {
+            scalesFit = scalesOffset <= size && size - scalesOffset >= scaleSpan
+        } else {
+            scalesFit = valuesOffset <= size && size - valuesOffset >= spec.totalBytes
+        }
+        guard valuesFit, scalesFit else {
             close(fd)
             throw DeepSeekV41EngramReadError.tableTooSmall(
-                expected: baseOffset + spec.totalBytes, actual: size
+                expected: valuesOffset + spec.totalBytes, actual: size
             )
         }
         self.descriptor = fd
         self.spec = spec
         self.fileSize = size
-        self.baseOffset = baseOffset
+        self.valuesOffset = valuesOffset
+        self.scalesOffset = scalesOffset
     }
 
     deinit {
@@ -212,12 +258,22 @@ nonisolated public final class DeepSeekV41EngramReader: @unchecked Sendable {
                 )
             }
             guard request.byteOffset >= 0,
-                  baseOffset + request.byteOffset + rowBytes <= fileSize else {
+                  valuesOffset + request.byteOffset + valueBytes <= fileSize else {
                 throw DeepSeekV41EngramReadError.rowOutOfRange(
-                    offset: baseOffset + request.byteOffset,
-                    length: rowBytes,
+                    offset: valuesOffset + request.byteOffset,
+                    length: valueBytes,
                     fileSize: fileSize
                 )
+            }
+            if let scalesOffset {
+                let scaleStart = scalesOffset + (request.byteOffset / rowBytes) * scaleBytes
+                guard scaleStart + scaleBytes <= fileSize else {
+                    throw DeepSeekV41EngramReadError.rowOutOfRange(
+                        offset: scaleStart,
+                        length: scaleBytes,
+                        fileSize: fileSize
+                    )
+                }
             }
         }
 
@@ -226,8 +282,11 @@ nonisolated public final class DeepSeekV41EngramReader: @unchecked Sendable {
         let failures = FailureBox()
         let shared = ReadContext(
             fd: fd,
-            baseOffset: baseOffset,
+            valuesOffset: valuesOffset,
             rowBytes: rowBytes,
+            valueBytes: valueBytes,
+            scalesOffset: scalesOffset,
+            scaleBytes: scaleBytes,
             requests: requests,
             destination: destination,
             failures: failures
@@ -245,6 +304,84 @@ nonisolated public final class DeepSeekV41EngramReader: @unchecked Sendable {
 
         if let firstError = failures.first { throw firstError }
         return requests.count * rowBytes
+    }
+}
+
+// MARK: - Locating a table's file
+
+/// Finds the shard FILE that holds one Engram table.
+///
+/// The segmented `ModelSummary` cannot answer this. A table is streamed, so
+/// `segmentShardsForMetal` leaves the table's `shardIndex` pointing into the
+/// original whole-file numbering while the summary's own shard list has been
+/// renumbered, and a shard that held nothing but streamed tensors produces no
+/// segment and is dropped from that list entirely. The name is resolved from the
+/// checkpoint's own manifest instead, and falls back to reading the shards'
+/// headers, so opening a table never depends on how the shards were mapped.
+nonisolated public enum DeepSeekV41EngramTableLocator {
+
+    /// The shard filename, relative to `snapshotDir`, that publishes `tensor`.
+    public static func shardFilename(
+        forTensorNamed tensor: String,
+        in snapshotDir: URL
+    ) -> String? {
+        if let listed = indexWeightMap(in: snapshotDir)[tensor], !listed.isEmpty {
+            return listed
+        }
+        let shards = shardFiles(in: snapshotDir)
+        if shards.count == 1 { return shards[0] }
+        for shard in shards where headerNames(
+            in: snapshotDir.appendingPathComponent(shard)
+        ).contains(tensor) {
+            return shard
+        }
+        return nil
+    }
+
+    /// `tensor name -> shard filename` from the directory's `*.index.json`.
+    static func indexWeightMap(in snapshotDir: URL) -> [String: String] {
+        let contents = (try? FileManager.default.contentsOfDirectory(atPath: snapshotDir.path)) ?? []
+        for name in contents.sorted() where name.hasSuffix(".index.json") {
+            let url = snapshotDir.appendingPathComponent(name)
+            guard let data = try? Data(contentsOf: url),
+                  let object = try? JSONSerialization.jsonObject(with: data),
+                  let root = object as? [String: Any],
+                  let map = root["weight_map"] as? [String: String] else { continue }
+            return map
+        }
+        return [:]
+    }
+
+    static func shardFiles(in snapshotDir: URL) -> [String] {
+        let contents = (try? FileManager.default.contentsOfDirectory(atPath: snapshotDir.path)) ?? []
+        return contents.filter { $0.hasSuffix(".safetensors") }.sorted()
+    }
+
+    /// The tensor names a safetensors file's header declares. Only the length
+    /// prefix and the JSON header are read, never the tensor data.
+    static func headerNames(in url: URL) -> Set<String> {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
+        defer { try? handle.close() }
+        guard let lengthData = try? handle.read(upToCount: 8),
+              lengthData.count == 8 else { return [] }
+        let length = lengthData.withUnsafeBytes { $0.load(as: UInt64.self) }
+        // Far past any real header (the published checkpoint's is under 1 KB).
+        guard length > 0, length < 64 << 20 else { return [] }
+        var header = Data()
+        while header.count < Int(length) {
+            let remaining = Int(length) - header.count
+            let piece: Data?
+            do {
+                piece = try handle.read(upToCount: remaining)
+            } catch {
+                return []
+            }
+            guard let piece, !piece.isEmpty else { return [] }
+            header.append(piece)
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: header),
+              let root = object as? [String: Any] else { return [] }
+        return Set(root.keys.filter { $0 != "__metadata__" })
     }
 }
 
