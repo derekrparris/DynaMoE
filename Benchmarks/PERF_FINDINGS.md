@@ -5726,3 +5726,56 @@ the 128-row ring, i.e. the shape the acceptance number will be taken with.
 `draftExpertCounts` — 128 routed, 3 active — and the MXFP4 mixture), the chaining of the
 three stages, and the last stage's head plus the additive Markov bias and confidence
 head. Then the acceptance rate.
+
+## DSV4.1 #24c: THE DRAFT BLOCK'S MIXTURE, AND THE ORDERING BUG THE PARITY CHECK FOUND
+
+With the attention in place (#24b) the draft block is one feed-forward short of a full
+round: `hc_ffn_fn` coefficients, the FFN's `hc_pre`, `ffn_norm`, the router under
+`draftExpertCounts`, the routed mixture, the shared expert, and the `pre` mix the next
+stage collapses with. All of it is a backbone layer's machinery with two deliberate
+differences.
+
+### Two differences, both from the checkpoint
+
+- **The counts are DSpark's.** The published stages route 128 experts and activate 3,
+  against the backbone's 384 and 6. `encodeRouter` and `readRouting` now take them as
+  parameters instead of reading the backbone's, and the parity fixture sets 3/2 against
+  a backbone of 4/2 so a stage that read the wrong pair routes differently and says so.
+- **The experts come straight from the shard mappings, not the arena.** The arena is
+  keyed by `(layer, expert)`, and a draft stage's layer 0 IS the backbone's layer 0 — one
+  key, two different matrices. Sharing it would serve one model's expert to the other,
+  which is the same class of bug as the two namespaced lookups #24 removed. The draft
+  therefore passes `residents: nil` and pays the mmap fault path; at 9 experts a round
+  (3 stages x 3 active x 17.7 MB) it is a cost to revisit only if the drafter ships.
+
+### The bug: the router reads the FFN's NORMED input, not the attention's
+
+The first version of `draftStageOutputs` ran the router as its own step before the
+feed-forward, which put it BEFORE `hc_pre`/`ffnNorm` — so the router scored the drafter's
+attention input. The symptom was not an exception or a wrong shape: the mixture came out
+0.05 off on a 0.37 scale, which reads like a kernel rounding problem, and the routing
+carried it: device `[2, 0]` against the host's `[0, 1]`.
+
+The bisect that found it is worth keeping: `Trace.ffnInputs` matched the device's
+`workspace.normed` to 6e-8 (so the mix, the coefficient and the norm were right), while
+`Trace.ffnOutputs` was 0.05 off (so the mixture was wrong), and printing both sides'
+router logits showed the device's logits for the last two slots were IDENTICAL — the same
+input row, twice. A stack dump read after a two-stage run is useless here, by the way:
+`workspace.normed` and `moeOut` are reused by every stage, so the dump has to be taken
+with a one-stage fixture.
+
+The fix is the backbone's own pipeline order, split into two command buffers so the
+readback still lands between them: coefficients, mix and norm first, then the router,
+then the mixture.
+
+### Verified
+
+`testTheDraftBlockChainsItsStagesLikeTheHostBlock` compares every stage's residual
+(`Trace.stageOutputs`) for every position and copy at relative 5e-4, with shared experts
+published on both the backbone and the draft side so `encodeSharedExpert`'s namespaced
+lookup is exercised too. The mixture itself lands at 1.6e-8 against the host, i.e. float
+rounding rather than a rule difference.
+
+**What is left.** The last stage's head — `hc_pre` with the final mix, `norm`, the
+129,280-row projection (the backbone's own `head.weight`), the additive Markov bias at
+each step and the confidence head — and then the acceptance rate this was all for.

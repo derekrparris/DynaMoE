@@ -107,6 +107,11 @@ nonisolated struct DeepSeekV41SyntheticShape {
     /// routes a different number of experts and says so in its logits.
     var draftRoutedExperts: Int = 3
     var draftActivatedExperts: Int = 2
+    /// `n_shared_experts`. Zero by default, like the checkpoint's `intermediate_size`
+    /// being absent: a fixture that sets it publishes `ffn.shared_experts.*` on every
+    /// backbone layer AND every draft stage, which is the only way the shared-expert
+    /// path gets a parity check at all (`encodeSharedExpert(scope: .draft)`).
+    var sharedExperts: Int = 0
     /// Forces a role's every value to one constant. A bisecting aid: with the
     /// hyper-connection scale and base pinned, the split's `pre`/`post`/`comb` are a
     /// pure function of the projection's logits, so a disagreement has to be in the
@@ -316,7 +321,7 @@ nonisolated final class DeepSeekV41SyntheticCheckpoint {
             "o_lora_rank": shape.oLoraRank,
             "intermediate_size": 0,
             "moe_intermediate_size": shape.moeIntermediate,
-            "n_shared_experts": 0,
+            "n_shared_experts": shape.sharedExperts,
             "n_routed_experts": shape.routedExperts,
             "n_activated_experts": shape.activatedExperts,
             "moe_router_enable_expert_bias": false,
@@ -543,6 +548,16 @@ nonisolated final class DeepSeekV41SyntheticCheckpoint {
                     shape: [hidden, shape.moeIntermediate])
             }
 
+            if shape.sharedExperts > 0 {
+                let width = max(1, shape.moeIntermediate * shape.sharedExperts)
+                add("\(prefix).ffn.shared_experts.w1.weight", .sharedExpertW1,
+                    layer: layer, shape: [width, hidden])
+                add("\(prefix).ffn.shared_experts.w3.weight", .sharedExpertW3,
+                    layer: layer, shape: [width, hidden])
+                add("\(prefix).ffn.shared_experts.w2.weight", .sharedExpertW2,
+                    layer: layer, shape: [hidden, width])
+            }
+
             for (suffix, base) in [
                 ("hc_attn_fn", DeepSeekV41TensorRole.hcAttnFn),
                 ("hc_ffn_fn", DeepSeekV41TensorRole.hcFfnFn)
@@ -622,6 +637,15 @@ nonisolated final class DeepSeekV41SyntheticCheckpoint {
                         shape: [shape.moeIntermediate, hidden])
                     add("\(base).w2.weight", .expertW2, layer: stage, expert: expert,
                         shape: [hidden, shape.moeIntermediate])
+                }
+                if shape.sharedExperts > 0 {
+                    let sharedWidth = max(1, shape.moeIntermediate * shape.sharedExperts)
+                    add("\(prefix).ffn.shared_experts.w1.weight", .sharedExpertW1,
+                        layer: stage, shape: [sharedWidth, hidden])
+                    add("\(prefix).ffn.shared_experts.w3.weight", .sharedExpertW3,
+                        layer: stage, shape: [sharedWidth, hidden])
+                    add("\(prefix).ffn.shared_experts.w2.weight", .sharedExpertW2,
+                        layer: stage, shape: [hidden, sharedWidth])
                 }
                 for (suffix, base) in [
                     ("hc_attn_fn", DeepSeekV41TensorRole.hcAttnFn),

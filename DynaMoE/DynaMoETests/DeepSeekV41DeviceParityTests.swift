@@ -726,6 +726,87 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         }
     }
 
+    /// The whole draft block: three stages of attention and mixture, chained.
+    ///
+    /// The reference is the host block's `Trace.stageOutputs`, the residual each stage
+    /// leaves behind after BOTH of its sub-layers, so this covers the `hc_ffn_fn`
+    /// coefficients, the FFN's `hc_pre` taken from the ATTENTION sub-layer's mix, the
+    /// router under `draftExpertCounts` (3 routed / 2 active here against the
+    /// backbone's 4 / 2), the routed mixture, the shared expert and the `pre` mix the
+    /// next stage collapses with. The fixture publishes shared experts for the
+    /// backbone too, so `encodeSharedExpert`'s namespaced lookup is exercised on both
+    /// sides.
+    func testTheDraftBlockChainsItsStagesLikeTheHostBlock() throws {
+        var shape = DeepSeekV41SyntheticShape()
+        shape.layers = 2
+        shape.draftTargetLayers = [1, 0]
+        shape.draftStages = 2
+        shape.draftBlockSize = 3
+        shape.draftNoiseTokenID = 5
+        shape.routedExperts = 4
+        shape.activatedExperts = 2
+        shape.draftRoutedExperts = 3
+        shape.draftActivatedExperts = 2
+        shape.sharedExperts = 1
+        shape.window = 4
+        shape.contextLength = 16
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+        XCTAssertEqual(checkpoint.catalogProblems(), [])
+        XCTAssertEqual(checkpoint.config.sharedExpertCount, 1)
+        XCTAssertEqual(checkpoint.config.draftExpertCounts.routed, 3)
+        XCTAssertNotEqual(
+            checkpoint.config.draftExpertCounts.routed,
+            checkpoint.config.numRoutedExperts,
+            "the fixture's draft counts must differ or a stage reading the wrong pair passes"
+        )
+
+        let runtime = try makeRuntime(checkpoint)
+        let device = runtime.forward()
+        device.capturesDraftInput = true
+
+        let tokens = [3, 4, 5, 6, 7, 8]
+        let host = makeHost(checkpoint)
+        var rows: [[Float]] = []
+        for (position, token) in tokens.enumerated() {
+            _ = try device.forwardToken(token, position: position)
+            _ = host.forwardToken(token, position: position)
+            rows.append(try XCTUnwrap(host.mainHidden(position: position)))
+        }
+        let drafter = DeepSeekV41DSparkBlock(forward: host)
+        let mainX = drafter.mainX(rows)
+        drafter.seed(mainX)
+        _ = try device.seedDraftRings(through: tokens.count)
+
+        let startPosition = tokens.count - 1
+        let token = tokens[startPosition]
+        _ = drafter.draft(
+            token: token, mainX: mainX[startPosition], startPosition: startPosition
+        )
+        let trace = try XCTUnwrap(drafter.lastTrace)
+        let expected = trace.stageOutputs
+        XCTAssertEqual(expected.count, 2, "one entry per draft stage")
+
+        let stages = try device.draftStageOutputs(
+            token: token, startPosition: startPosition
+        )
+        XCTAssertEqual(stages.count, expected.count)
+        for stage in expected.indices {
+            XCTAssertEqual(stages[stage].count, expected[stage].count)
+            for position in expected[stage].indices {
+                for copy in expected[stage][position].indices {
+                    let reference = expected[stage][position][copy]
+                    let scale = max(reference.map(abs).max() ?? 1, 1e-6)
+                    let delta = worstDelta(stages[stage][position][copy], reference)
+                    XCTAssertLessThan(
+                        delta / scale, 5e-4,
+                        "stage \(stage) position \(position) copy \(copy): the draft "
+                            + "stack is off the host by \(delta) against a \(scale) scale"
+                    )
+                }
+            }
+        }
+    }
+
     /// The device captures exactly the row the host forward calls `mainHidden`.
     ///
     /// The DSpark drafter conditions on the mean over the hyper-connection copies of

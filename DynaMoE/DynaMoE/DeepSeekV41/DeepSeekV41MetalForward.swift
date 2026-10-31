@@ -2256,14 +2256,14 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         switch stage {
         case .routedExperts:
             try encodeRoutedExperts(
-                layer: layer,
+                layer: layer.index,
                 encoder: encoder,
                 routing: routing,
                 residents: residents,
                 slot: slot
             )
         case .sharedExpert:
-            try encodeSharedExpert(layer: layer, encoder: encoder, slot: slot)
+            try encodeSharedExpert(layer: layer.index, encoder: encoder, slot: slot)
         case .writeFFNStreams:
             try encodeHyperConnectionPost(
                 encoder,
@@ -2967,11 +2967,11 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             try encodeRouter(encoder, layer: index)
 
         case .sharedExpert:
-            try encodeSharedExpert(layer: layer, encoder: encoder)
+            try encodeSharedExpert(layer: index, encoder: encoder)
 
         case .routedExperts:
             try encodeRoutedExperts(
-                layer: layer, encoder: encoder, routing: routing, residents: residents
+                layer: index, encoder: encoder, routing: routing, residents: residents
             )
 
         case .writeFFNStreams:
@@ -3591,17 +3591,18 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     // MARK: Feed-forward stages
 
     private func encodeSharedExpert(
-        layer: DeepSeekV41LayerPlan,
+        layer index: Int,
         encoder: MTLComputeCommandEncoder,
+        scope: DeepSeekV41TensorScope = .backbone,
         slot: Int = 0
     ) throws {
         // The shared expert runs for every token, unscaled, and accumulates into the
         // same vector the routed experts do. A checkpoint that declares no shared
         // expert does not run one, so its absence is not a missing tensor.
         guard config.sharedExpertCount > 0 else { return }
-        guard let w1 = weights.tensor(.sharedExpertW1, layer: layer.index),
-              let w3 = weights.tensor(.sharedExpertW3, layer: layer.index),
-              let w2 = weights.tensor(.sharedExpertW2, layer: layer.index) else {
+        guard let w1 = weights.tensor(.sharedExpertW1, scope: scope, layer: index),
+              let w3 = weights.tensor(.sharedExpertW3, scope: scope, layer: index),
+              let w2 = weights.tensor(.sharedExpertW2, scope: scope, layer: index) else {
             throw DeepSeekV41EngineError.missingTensor("ffn.shared_experts")
         }
         let width = shapes.sharedIntermediate
@@ -3615,9 +3616,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         try encodeSwiGLU(
             encoder,
             gate: w1,
-            gateScale: weights.scaleTensor(.sharedExpertW1, layer: layer.index),
+            gateScale: weights.scaleTensor(.sharedExpertW1, scope: scope, layer: index),
             up: w3,
-            upScale: weights.scaleTensor(.sharedExpertW3, layer: layer.index),
+            upScale: weights.scaleTensor(.sharedExpertW3, scope: scope, layer: index),
             inDim: shapes.hidden,
             outDim: width,
             input: workspace.normed,
@@ -3627,7 +3628,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         try encodeDown(
             encoder,
             weight: w2,
-            scale: weights.scaleTensor(.sharedExpertW2, layer: layer.index),
+            scale: weights.scaleTensor(.sharedExpertW2, scope: scope, layer: index),
             inDim: width,
             outDim: shapes.hidden,
             activation: buffer,
@@ -3644,8 +3645,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// expert's bytes, already filled. Without it the weights are read through the
     /// shard mappings, which is correct and much slower (`PERF_FINDINGS.md`).
     private func encodeRoutedExperts(
-        layer: DeepSeekV41LayerPlan,
+        layer index: Int,
         encoder: MTLComputeCommandEncoder,
+        scope: DeepSeekV41TensorScope = .backbone,
         routing: DeepSeekV41Routing?,
         residents: [DeepSeekV41ResidentExpert]?,
         slot: Int = 0
@@ -3662,19 +3664,23 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             let weight = rank < routing.weights.count ? routing.weights[rank] : 0
             if weight == 0 { continue }
             let resident = residents.flatMap { rank < $0.count ? $0[rank] : nil }
-            guard let w1 = weights.tensor(.expertW1, layer: layer.index, expert: expert),
-                  let w3 = weights.tensor(.expertW3, layer: layer.index, expert: expert),
-                  let w2 = weights.tensor(.expertW2, layer: layer.index, expert: expert) else {
+            guard let w1 = weights.tensor(.expertW1, scope: scope, layer: index, expert: expert),
+                  let w3 = weights.tensor(.expertW3, scope: scope, layer: index, expert: expert),
+                  let w2 = weights.tensor(.expertW2, scope: scope, layer: index, expert: expert) else {
                 throw DeepSeekV41EngineError.missingTensor(
-                    "layers.\(layer.index).ffn.experts.\(expert)"
+                    "\(scope.rawValue) layer \(index).ffn.experts.\(expert)"
                 )
             }
             try encodeSwiGLU(
                 encoder,
                 gate: w1,
-                gateScale: weights.scaleTensor(.expertW1, layer: layer.index, expert: expert),
+                gateScale: weights.scaleTensor(
+                    .expertW1, scope: scope, layer: index, expert: expert
+                ),
                 up: w3,
-                upScale: weights.scaleTensor(.expertW3, layer: layer.index, expert: expert),
+                upScale: weights.scaleTensor(
+                    .expertW3, scope: scope, layer: index, expert: expert
+                ),
                 inDim: shapes.hidden,
                 outDim: shapes.expertIntermediate,
                 input: workspace.normed,
@@ -3685,7 +3691,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             try encodeDown(
                 encoder,
                 weight: w2,
-                scale: weights.scaleTensor(.expertW2, layer: layer.index, expert: expert),
+                scale: weights.scaleTensor(
+                    .expertW2, scope: scope, layer: index, expert: expert
+                ),
                 inDim: shapes.expertIntermediate,
                 outDim: shapes.hidden,
                 activation: buffer,
@@ -3706,6 +3714,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     private func encodeRouter(
         _ encoder: MTLComputeCommandEncoder,
         layer: Int,
+        scope: DeepSeekV41TensorScope = .backbone,
+        expertCount: Int? = nil,
+        activated: Int? = nil,
         count: Int = 1
     ) throws {
         guard config.scoringFunction != .softmax else {
@@ -3717,15 +3728,19 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             )
         }
         let slots = max(1, count)
+        // The DSpark stages route under their own counts (`draftExpertCounts`), which
+        // the checkpoint makes different from the backbone's.
+        let routed = max(1, expertCount ?? config.numRoutedExperts)
+        let topKCount = max(1, activated ?? config.numActivatedExperts)
         // The readback buffer pads each slot to at least four entries, so the kernel
         // is told that stride rather than assuming `topK`.
-        let indexStride = max(4 * config.numActivatedExperts, 16)  // bytes per slot
+        let indexStride = max(4 * topKCount, 16)  // bytes per slot
         encoder.setComputePipelineState(pipelines.router)
         encoder.setBuffer(workspace.routerLogits, offset: 0, index: 0)
         // An absent bias is a bound zero vector, not an unbound slot: the kernel
         // checks the pointer against `nullptr` and then dereferences it.
-        let bias = vectors.buffer(.routerBias, layer: layer)
-            .flatMap { $0.length >= config.numRoutedExperts * MemoryLayout<Float>.stride ? $0 : nil }
+        let bias = vectors.buffer(.routerBias, scope: scope, layer: layer)
+            .flatMap { $0.length >= routed * MemoryLayout<Float>.stride ? $0 : nil }
             ?? zeros
         if let bias {
             encoder.setBuffer(bias, offset: 0, index: 1)
@@ -3734,13 +3749,13 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         }
         encoder.setBuffer(workspace.expertIndices, offset: 0, index: 2)
         encoder.setBuffer(workspace.expertWeights, offset: 0, index: 3)
-        var expertCount = UInt32(config.numRoutedExperts)
-        var topK = UInt32(max(1, config.numActivatedExperts))
+        var routedCount = UInt32(routed)
+        var topK = UInt32(topKCount)
         var scaling = config.routedScalingFactor
         var normalise: UInt32 = config.normalizeTopKProb ? 1 : 0
         var scoring: UInt32 = config.scoringFunction == .sigmoid ? 0 : 1
         var temperature = config.gateTemp
-        encoder.setBytes(&expertCount, length: 4, index: 4)
+        encoder.setBytes(&routedCount, length: 4, index: 4)
         encoder.setBytes(&topK, length: 4, index: 5)
         encoder.setBytes(&scaling, length: 4, index: 6)
         encoder.setBytes(&normalise, length: 4, index: 7)
@@ -3758,13 +3773,17 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
 
     /// The routing the router kernel wrote. `bias` is per layer, so it is bound from
     /// the layer's slot by the caller before this runs.
-    private func readRouting(slot: Int = 0) -> DeepSeekV41Routing {
-        let count = max(0, min(config.numActivatedExperts, workspace.expertIndices.length / 4))
+    private func readRouting(
+        slot: Int = 0,
+        activated: Int? = nil
+    ) -> DeepSeekV41Routing {
+        let topK = max(0, activated ?? config.numActivatedExperts)
+        let count = max(0, min(topK, workspace.expertIndices.length / 4))
         let indexPointer = workspace.expertIndices.contents()
-            .advanced(by: slot * max(4 * config.numActivatedExperts, 16))
+            .advanced(by: slot * max(4 * topK, 16))
             .assumingMemoryBound(to: UInt32.self)
         let weightPointer = workspace.expertWeights.contents()
-            .advanced(by: workspace.slotOffset(slot, width: config.numActivatedExperts))
+            .advanced(by: workspace.slotOffset(slot, width: topK))
             .assumingMemoryBound(to: Float.self)
         var ids: [Int] = []
         var weights: [Float] = []
@@ -5038,6 +5057,194 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 )
             }
         }
+    }
+
+    /// One draft stage's feed-forward, over the block's positions.
+    ///
+    /// The shape is a backbone layer's (`hc_ffn_fn` coefficients, `ffn_norm`, the
+    /// router, the mixture), with two differences that are the whole of DSpark's
+    /// feed-forward story: the mix the collapse uses is the ATTENTION sub-layer's
+    /// `pre` (a backbone layer does exactly the same), and the router runs under
+    /// `draftExpertCounts` — 128 routed and 3 active on the published checkpoint
+    /// against the backbone's 384 and 6.
+    ///
+    /// The experts are read through the shard mappings rather than the arena. The
+    /// arena is keyed by `(layer, expert)`, and a draft stage's layer 0 is the
+    /// BACKBONE's layer 0, so sharing it would serve one model's expert to the other.
+    private func encodeDraftFeedForwardFront(
+        _ encoder: MTLComputeCommandEncoder,
+        stage: Int,
+        count: Int
+    ) throws {
+        guard count > 0, shapes.hidden > 0 else { return }
+        try encodeHyperConnectionCoefficients(
+            encoder,
+            layer: stage,
+            scope: .draft,
+            function: .hcFfnFn,
+            base: .hcFfnBase,
+            scale: .hcFfnScale,
+            pre: workspace.hcFFNPre,
+            post: workspace.hcFFNPost,
+            comb: workspace.hcFFNComb,
+            count: count
+        )
+        for slot in 0..<count {
+            try encodeHyperConnectionPre(
+                encoder,
+                mix: workspace.hcAttentionPre,
+                output: workspace.normed,
+                snapshotting: true,
+                slot: slot
+            )
+        }
+        try encodeNorm(
+            encoder,
+            input: workspace.normed,
+            gain: vectors.gain(.ffnNorm, scope: .draft, layer: stage, width: shapes.hidden),
+            output: workspace.normed,
+            width: shapes.hidden,
+            rows: count
+        )
+    }
+
+    /// The mixture half, which reads the routing the host read back out of
+    /// `ffnNorm`'s output.
+    private func encodeDraftFeedForwardMixture(
+        _ encoder: MTLComputeCommandEncoder,
+        stage: Int,
+        routing: [DeepSeekV41Routing],
+        count: Int
+    ) throws {
+        guard count > 0, shapes.hidden > 0 else { return }
+        for slot in 0..<count {
+            try encodeRoutedExperts(
+                layer: stage,
+                encoder: encoder,
+                scope: .draft,
+                routing: routing.indices.contains(slot) ? routing[slot] : nil,
+                residents: nil,
+                slot: slot
+            )
+            try encodeSharedExpert(
+                layer: stage, encoder: encoder, scope: .draft, slot: slot
+            )
+        }
+        for slot in 0..<count {
+            try encodeHyperConnectionPost(
+                encoder,
+                output: workspace.moeOut,
+                gains: workspace.hcFFNPost,
+                comb: workspace.hcFFNComb,
+                slot: slot
+            )
+            // The mix the NEXT stage's attention collapses with is this FFN's `pre`,
+            // which is `mult` wide per position — not the projection's row count.
+            try encodeCopy(
+                encoder,
+                from: workspace.hcFFNPre,
+                to: workspace.hcMix,
+                count: mult,
+                sourceByteOffset: workspace.slotOffset(slot, width: mult),
+                destinationByteOffset: workspace.slotOffset(slot, width: mult)
+            )
+        }
+    }
+
+    /// The draft block's router, for one stage, over the block's positions.
+    private func encodeDraftRouter(
+        _ encoder: MTLComputeCommandEncoder,
+        stage: Int,
+        count: Int
+    ) throws {
+        let counts = config.draftExpertCounts
+        guard let gate = weights.tensor(.routerWeight, scope: .draft, layer: stage) else {
+            throw DeepSeekV41EngineError.missingTensor("mtp.\(stage).ffn.gate")
+        }
+        try encodeGemv(
+            encoder,
+            weight: gate,
+            scale: weights.scaleTensor(.routerWeight, scope: .draft, layer: stage),
+            inDim: shapes.hidden,
+            outDim: counts.routed,
+            input: workspace.normed,
+            output: workspace.routerLogits,
+            rows: count
+        )
+        encoder.memoryBarrier(scope: .buffers)
+        try encodeRouter(
+            encoder,
+            layer: stage,
+            scope: .draft,
+            expertCount: counts.routed,
+            activated: counts.activated,
+            count: count
+        )
+    }
+
+    /// One full draft round's hidden states: every stage in order, over the block's
+    /// positions, starting from the draft stack.
+    ///
+    /// Returns `[stage][position][copy][hidden]`, which is what the host block records
+    /// as `Trace.stageOutputs` — the residual each stage leaves behind, after both of
+    /// its sub-layers. The head is NOT run: it is the last stage's `hc_pre`, a norm, a
+    /// 129,280-row projection and the Markov chain, and the chain needs one round trip
+    /// per drawn token, which makes it a seam of its own.
+    public func draftStageOutputs(
+        token: Int,
+        startPosition: Int
+    ) throws -> [[[[Float]]]] {
+        guard !draftStages.isEmpty, draftShape != nil,
+              draftSeededPositions >= startPosition + 1 else { return [] }
+        let tokens = draftStackTokens(seed: token)
+        let count = tokens.count
+        try encodeEmbeddingBlock(tokens, startPosition: startPosition + 1)
+        let activated = config.draftExpertCounts.activated
+
+        var outputs: [[[[Float]]]] = []
+        for stage in draftStages {
+            var command = try makeCommandBuffer()
+            var encoder = try makeEncoder(command)
+            try encodeDraftAttentionStage(
+                encoder, stage: stage, startPosition: startPosition, count: count
+            )
+            encoder.endEncoding()
+            try commit(command, stage: "draft attention (stage \(stage))")
+
+            // The router's readback is what binds each expert's bytes, so it sits
+            // between the two halves exactly as it does in a backbone layer.
+            command = try makeCommandBuffer()
+            encoder = try makeEncoder(command)
+            try encodeDraftFeedForwardFront(encoder, stage: stage, count: count)
+            try encodeDraftRouter(encoder, stage: stage, count: count)
+            encoder.endEncoding()
+            try commit(command, stage: "draft ffn front (stage \(stage))")
+            let routings = (0..<count).map { readRouting(slot: $0, activated: activated) }
+
+            command = try makeCommandBuffer()
+            encoder = try makeEncoder(command)
+            try encodeDraftFeedForwardMixture(
+                encoder, stage: stage, routing: routings, count: count
+            )
+            encoder.endEncoding()
+            try commit(command, stage: "draft ffn (stage \(stage))")
+
+            let pointer = workspace.streams.contents().assumingMemoryBound(to: Float.self)
+            let stride = mult * shapes.hidden
+            outputs.append(
+                (0..<count).map { slot in
+                    (0..<mult).map { copy in
+                        Array(
+                            UnsafeBufferPointer(
+                                start: pointer + slot * stride + copy * shapes.hidden,
+                                count: shapes.hidden
+                            )
+                        )
+                    }
+                }
+            )
+        }
+        return outputs
     }
 
     private func encodeHyperConnectionPre(
