@@ -5664,3 +5664,65 @@ position. Against a ~150 ms decode step, maintaining the drafter's ring is free.
 one shared index list for every query, not causal within the block), the MoE under the
 draft expert counts, and the last stage's head plus the Markov bias — then an acceptance
 rate, which is the number that decides whether any of this ships.
+
+## DSV4.1 #24b: THE DRAFT BLOCK'S ATTENTION, AND WHY ITS INDEX LIST IS THE WHOLE RULE
+
+The draft attention is the one attention in this file that reads no cache. Its keys
+are the stage's own ring (`seedDraftRings`, #24) followed by the block's five rows, and
+ONE list serves every query: `get_dspark_topk_idxs` builds `arange(min(window,
+start_pos + 1)) ++ window + arange(block_size)` once and expands it across the block, so
+draft position 0 attends over draft position 4. Every other attention here is causal
+within a position's own write, which is exactly the assumption a port carries in by
+habit.
+
+Three consequences, all of them load-bearing:
+
+- **The block's rows come from the draft stack, not the ring.** The ring holds what the
+  TARGET saw (`kv_norm(wkv(main_x))`); the block's rows are
+  `kv_norm(wkv(attn_norm(hc_pre(stack))))` of the drafter's own tokens. Mixing them up
+  is a silent swap of one 512-wide record for another.
+- **Ring order, not position order.** After a wrapped seed, slot order and position
+  order disagree. The reference gathers slots `0..<min(win, start_pos + 1)`, so the port
+  copies the ring from slot 0. The parity fixture runs six positions over a four-row
+  window for exactly this: its ring at the draft's position is slots 0-3 = positions
+  4, 5, 2, 3, and a position-ordered copy fails.
+- **Every slot reads the SAME rows.** The kernel's slot dimension exists so a block can
+  share one launch, and `keyRowStride` is what separates slots when they read different
+  rows. The draft's index list is identical for every query, so the stride is ZERO and
+  the per-slot row count repeats. That is a real use of the kernel, not a workaround:
+  the alternative is five launches of the same dispatch.
+
+The block is `dspark_block_size` positions (5 on the published checkpoint), and their
+query positions are `start_pos + 1 ..< start_pos + 1 + block_size` because the ring row
+for `start_pos` is already written when the drafter runs.
+
+### Verified against the host block
+
+`testTheDraftAttentionMatchesTheHostBlock` compares the stack `hc_post` leaves behind
+(what the host records as `Trace.postAttention`) for every position and every
+hyper-connection copy, relative 5e-4, on a fixture with a 4-row window so the ring is
+wrapped and out of position order. That one comparison covers the query path
+(`wq_a` → `q_norm` → `wq_b` → rope), the block's own latents (`wkv` → `kv_norm` → rope),
+the key block's two halves, the attention, the output's rope conjugate and the grouped
+`wo_a`/`wo_b`. It passed first try, which is the point of having built the seed and the
+projection in the two slices before it.
+
+The device takes the FP32 attention kernel (`dsv41_attention_csa2_f32`, now registered as
+`pipelines.attentionF32`) rather than the shipping FP16 one: the ring is floats, and an
+fp16 key block would put a rounding floor under the parity bar that hides which row or
+which rope slice a mistake is in. The ring is 128 x 512 x 4 = 256 KB per stage, so the
+bytes are not the issue; if a later slice wants the half-key kernel it is a drop-in once
+the ring is stored as halves.
+
+### On the published checkpoint
+
+The ring probe now also runs one draft attention: 5 positions over an 8-row prefix in
+**1.72 ms**, all finite, |x| 15-19 per 5,120-wide copy for the noise positions and 132 for
+the first (which embeds the real token, where the others embed
+`dspark_noise_token_id` 128,799). That is the shipped 64-head, 512-wide geometry against
+the 128-row ring, i.e. the shape the acceptance number will be taken with.
+
+**What is left.** The stage's FFN (`hc_ffn_fn` coefficients, `ffn_norm`, the router under
+`draftExpertCounts` — 128 routed, 3 active — and the MXFP4 mixture), the chaining of the
+three stages, and the last stage's head plus the additive Markov bias and confidence
+head. Then the acceptance rate.

@@ -377,6 +377,11 @@ nonisolated public struct DeepSeekV41Pipelines {
     /// half-key kernel; the FP32 form is kept in the shader library as the baseline
     /// the measurement A/Bs against (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #17").
     public let attention: MTLComputePipelineState
+    /// The same graph over FP32 keys. The DSpark draft block reads its own ring,
+    /// which the seed writes as floats, so it takes this form: a half-key ring would
+    /// put an fp16 rounding floor under the parity bar that hides which row or which
+    /// rope slice a mistake is in.
+    public let attentionF32: MTLComputePipelineState
     public let poolLatents: MTLComputePipelineState
     public let indexerScores: MTLComputePipelineState
     public let router: MTLComputePipelineState
@@ -428,6 +433,7 @@ nonisolated public struct DeepSeekV41Pipelines {
         self.storeLatent = try make("dsv41_store_latent_f16")
         self.gatherLatents = try make("dsv41_gather_latents_f16")
         self.attention = try make("dsv41_attention_csa2_f16")
+        self.attentionF32 = try make("dsv41_attention_csa2_f32")
         self.poolLatents = try make("dsv41_pool_latents_f32")
         self.indexerScores = try make("dsv41_indexer_scores_f32")
         self.router = try make("dsv41_router_topk")

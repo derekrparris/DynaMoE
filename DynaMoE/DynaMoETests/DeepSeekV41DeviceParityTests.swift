@@ -659,6 +659,73 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         }
     }
 
+    /// The draft block's attention sub-layer: the ring, the block's own rows, and one
+    /// index list shared by every query.
+    ///
+    /// This is the piece with no precedent in the file. Every other attention here
+    /// reads the CSA2 cache and is causal; this one reads the stage's OWN ring, is not
+    /// causal inside the block (draft position 0 attends over draft position 4), and
+    /// conjugates its output's rope payload back out before the grouped projection.
+    /// The reference is the host block's `Trace.postAttention`, which is the stack the
+    /// same five positions leave behind after `hc_post`.
+    func testTheDraftAttentionMatchesTheHostBlock() throws {
+        var shape = DeepSeekV41SyntheticShape()
+        shape.layers = 2
+        shape.draftTargetLayers = [1, 0]
+        shape.draftStages = 2
+        shape.draftBlockSize = 3
+        shape.draftNoiseTokenID = 5
+        shape.window = 4
+        shape.contextLength = 16
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+        XCTAssertEqual(checkpoint.catalogProblems(), [])
+        XCTAssertEqual(checkpoint.config.dsparkNoiseTokenID, 5)
+
+        let runtime = try makeRuntime(checkpoint)
+        let device = runtime.forward()
+        device.capturesDraftInput = true
+
+        let tokens = [3, 4, 5, 6, 7, 8]
+        let host = makeHost(checkpoint)
+        var rows: [[Float]] = []
+        for (position, token) in tokens.enumerated() {
+            _ = try device.forwardToken(token, position: position)
+            _ = host.forwardToken(token, position: position)
+            rows.append(try XCTUnwrap(host.mainHidden(position: position)))
+        }
+        let drafter = DeepSeekV41DSparkBlock(forward: host)
+        let mainX = drafter.mainX(rows)
+        drafter.seed(mainX)
+        _ = try device.seedDraftRings(through: tokens.count)
+
+        // The draft validates the position AFTER the target's newest one, so the ring
+        // row for `startPosition` has to be in place — the seed wrote it.
+        let startPosition = tokens.count - 1
+        let token = tokens[startPosition]
+        _ = drafter.draft(
+            token: token, mainX: mainX[startPosition], startPosition: startPosition
+        )
+        let trace = try XCTUnwrap(drafter.lastTrace)
+        let expected = trace.postAttention
+        XCTAssertEqual(expected.count, shape.draftBlockSize)
+
+        let stack = try device.draftAttentionStack(
+            token: token, startPosition: startPosition
+        )
+        XCTAssertEqual(stack.count, expected.count, "the block's position count")
+        for position in expected.indices {
+            for copy in expected[position].indices {
+                let scale = max(expected[position][copy].map(abs).max() ?? 1, 1e-6)
+                let delta = worstDelta(stack[position][copy], expected[position][copy])
+                XCTAssertLessThan(
+                    delta / scale, 5e-4,
+                    "position \(position) copy \(copy): the draft stack is off the host "
+                        + "by \(delta) against a \(scale) scale"
+                )
+            }
+        }
+    }
+
     /// The device captures exactly the row the host forward calls `mainHidden`.
     ///
     /// The DSpark drafter conditions on the mean over the hyper-connection copies of

@@ -1065,6 +1065,13 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// Prefix positions the draft rings hold, so a round only projects the positions
     /// it has not seen. Monotonic; `reset()` clears it.
     public private(set) var draftSeededPositions = 0
+    /// `[ring + block][latentWidth]`: the key block one draft attention reads. The
+    /// reference concatenates the stage's whole live ring with the block's own rows,
+    /// and every query reads that one list, so this is contiguous by construction
+    /// rather than gathered through a row index.
+    private var draftKeys: MTLBuffer?
+    /// Rows `draftKeys` holds: a full window plus one block.
+    private let draftKeyRows: Int
     /// `1 / hcMult` over `hcMult` entries: `hc_pre` with a uniform mix IS the mean
     /// over copies, so the capture is the same kernel the sub-layer uses.
     private var draftMeanMix: MTLBuffer?
@@ -1131,6 +1138,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         self.draftTargets = targets
         self.draftWidth = max(0, targets.count * runtime.config.hiddenSize)
         self.draftRingSlots = max(1, runtime.config.windowSize)
+        self.draftKeyRows = self.draftRingSlots + max(1, runtime.config.dsparkBlockSize)
         self.draftStages = Set(
             runtime.catalog.slots
                 .filter { $0.scope == .draft && $0.role == .attnNorm }
@@ -1173,6 +1181,14 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                     length: max(
                         16,
                         self.draftRingSlots * latentWidth * MemoryLayout<Float>.stride
+                    ),
+                    options: .storageModeShared
+                )
+                self.draftKeys = runtime.device.makeBuffer(
+                    length: max(
+                        16,
+                        (self.draftRingSlots + max(1, runtime.config.dsparkBlockSize))
+                            * latentWidth * MemoryLayout<Float>.stride
                     ),
                     options: .storageModeShared
                 )
@@ -4310,6 +4326,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     private func encodeHyperConnectionCoefficients(
         _ encoder: MTLComputeCommandEncoder,
         layer: Int,
+        scope: DeepSeekV41TensorScope = .backbone,
         function: DeepSeekV41TensorRole,
         base: DeepSeekV41TensorRole,
         scale: DeepSeekV41TensorRole,
@@ -4324,7 +4341,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         // runs its positions side by side as grid rows instead of one chain after
         // another.
         let slots = max(1, count)
-        guard let projection = weights.tensor(function, layer: layer),
+        guard let projection = weights.tensor(function, scope: scope, layer: layer),
               let buffer = shardBuffer(projection) else {
             throw DeepSeekV41EngineError.missingTensor(function.rawValue)
         }
@@ -4333,8 +4350,8 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 "\(function.rawValue) (expected FP32)", projection.dtype
             )
         }
-        guard let baseBuffer = vectors.buffer(base, layer: layer),
-              let scaleBuffer = vectors.buffer(scale, layer: layer) else {
+        guard let baseBuffer = vectors.buffer(base, scope: scope, layer: layer),
+              let scaleBuffer = vectors.buffer(scale, scope: scope, layer: layer) else {
             throw DeepSeekV41EngineError.missingTensor(base.rawValue)
         }
 
@@ -4655,6 +4672,371 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                     count: latentWidth
                 )
             )
+        }
+    }
+
+    /// Which ring belongs to a stage. The rings are indexed by the stage's position in
+    /// `draftStages`, not by its layer id, so a `mtp.N` numbering that does not start
+    /// at zero still lands in its own ring.
+    private func draftRingIndex(of stage: Int) -> Int? {
+        draftStages.firstIndex(of: stage)
+    }
+
+    /// The block's tokens: the token being drafted from, then `dspark_noise_token_id`
+    /// to fill the block (`DSparkBlock.forward_embed`).
+    private func draftStackTokens(seed token: Int) -> [Int] {
+        let size = max(1, config.dsparkBlockSize)
+        let noise = config.dsparkNoiseTokenID >= 0 ? config.dsparkNoiseTokenID : 0
+        return [token] + Array(repeating: noise, count: size - 1)
+    }
+
+    /// One draft stage's attention sub-layer, over the block's positions.
+    ///
+    /// Unlike every other attention in this file it reads no cache. The keys are the
+    /// stage's own ring — the target's latents, seeded by `seedDraftRings` — followed
+    /// by the block's own rows, and ONE index list serves every query: the block is
+    /// not causal inside itself, so draft position 0 sees draft position 4. A port
+    /// that masked siblings from each other computes a different graph, and the
+    /// difference is invisible in the logit magnitudes (`Tools/dsv41_goldens.py
+    /// dspark_block`).
+    ///
+    /// Query and output positions are `startPosition + 1 + offset`: the ring row for
+    /// `startPosition` was written by the seed, so the block occupies the positions
+    /// AFTER it.
+    private func encodeDraftAttentionStage(
+        _ encoder: MTLComputeCommandEncoder,
+        stage: Int,
+        startPosition: Int,
+        count: Int
+    ) throws {
+        guard let shape = draftShape, count > 0,
+              let ringIndex = draftRingIndex(of: stage),
+              let ring = draftRing, let keys = draftKeys,
+              draftRingSlots > 0, draftKeyRows > 0 else { return }
+        let latentWidth = shape.latentWidth
+        guard latentWidth > 0, shapes.hidden > 0 else { return }
+        let first = startPosition + 1
+        let floatBytes = MemoryLayout<Float>.stride
+
+        // The coefficients the collapse uses, then the collapse itself. On the first
+        // stage the mix is the identity the embedding block wrote.
+        try encodeHyperConnectionCoefficients(
+            encoder,
+            layer: stage,
+            scope: .draft,
+            function: .hcAttnFn,
+            base: .hcAttnBase,
+            scale: .hcAttnScale,
+            pre: workspace.hcAttentionPre,
+            post: workspace.hcAttentionPost,
+            comb: workspace.hcAttentionComb,
+            count: count
+        )
+        for slot in 0..<count {
+            try encodeHyperConnectionPre(
+                encoder,
+                mix: workspace.hcMix,
+                output: workspace.normed,
+                snapshotting: true,
+                slot: slot
+            )
+        }
+        try encodeNorm(
+            encoder,
+            input: workspace.normed,
+            gain: vectors.gain(
+                .attnNorm, scope: .draft, layer: stage, width: shapes.hidden
+            ),
+            output: workspace.normed,
+            width: shapes.hidden,
+            rows: count
+        )
+
+        // The query rail: down to the lora rank, normed there, back up to every head,
+        // then its own rope payload rotated at the block's positions.
+        let rank = max(0, config.qLoraRank)
+        if rank > 0 {
+            guard let down = weights.tensor(.attnWqA, scope: .draft, layer: stage) else {
+                throw DeepSeekV41EngineError.missingTensor("mtp.\(stage).attn.wq_a")
+            }
+            try encodeGemv(
+                encoder,
+                weight: down,
+                scale: weights.scaleTensor(.attnWqA, scope: .draft, layer: stage),
+                inDim: shapes.hidden,
+                outDim: rank,
+                input: workspace.normed,
+                output: workspace.reduced,
+                rows: count
+            )
+            try encodeNorm(
+                encoder,
+                input: workspace.reduced,
+                gain: vectors.gain(
+                    .attnWqANorm, scope: .draft, layer: stage, width: rank
+                ),
+                output: workspace.reduced,
+                width: rank,
+                rows: count
+            )
+        }
+        guard let up = weights.tensor(.attnWqB, scope: .draft, layer: stage) else {
+            throw DeepSeekV41EngineError.missingTensor("mtp.\(stage).attn.wq_b")
+        }
+        try encodeGemv(
+            encoder,
+            weight: up,
+            scale: weights.scaleTensor(.attnWqB, scope: .draft, layer: stage),
+            inDim: rank > 0 ? rank : shapes.hidden,
+            outDim: shapes.queryWidth,
+            input: rank > 0 ? workspace.reduced : workspace.normed,
+            output: workspace.query,
+            rows: count
+        )
+        try encodeRope(
+            encoder,
+            vector: workspace.query,
+            rowWidth: shape.queryWidth,
+            headDim: shape.qkHeadDim,
+            sliceStart: shape.queryRopeStart,
+            sliceLength: shape.queryRopeWidth,
+            table: .window,
+            latent: false,
+            position: first,
+            batch: count
+        )
+
+        // The block's OWN latents come from the draft stack, not from the ring: the
+        // ring holds what the TARGET saw, these are what the drafter is adding.
+        guard let wkv = weights.tensor(.attnWkv, scope: .draft, layer: stage) else {
+            throw DeepSeekV41EngineError.missingTensor("mtp.\(stage).attn.wkv")
+        }
+        try encodeGemv(
+            encoder,
+            weight: wkv,
+            scale: weights.scaleTensor(.attnWkv, scope: .draft, layer: stage),
+            inDim: shapes.hidden,
+            outDim: latentWidth,
+            input: workspace.normed,
+            output: workspace.latent,
+            rows: count
+        )
+        try encodeNorm(
+            encoder,
+            input: workspace.latent,
+            gain: vectors.gain(
+                .attnKvNorm, scope: .draft, layer: stage, width: latentWidth
+            ),
+            output: workspace.latent,
+            width: latentWidth,
+            rows: count
+        )
+        try encodeRope(
+            encoder,
+            vector: workspace.latent,
+            rowWidth: latentWidth,
+            headDim: 0,
+            sliceStart: shape.latentRopeStart,
+            sliceLength: shape.latentRopeWidth,
+            table: .window,
+            latent: true,
+            position: first,
+            batch: count
+        )
+
+        // Keys: the ring's live prefix in slot order, then the block's rows. The ring
+        // is contiguous from slot 0 for exactly `min(window, startPosition + 1)` rows
+        // because the seed writes `position % window` in position order.
+        let live = min(draftRingSlots, max(0, startPosition + 1))
+        guard live + count <= draftKeyRows else {
+            throw DeepSeekV41EngineError.allocationFailed(
+                "a draft attention reads \(live + count) rows against the "
+                    + "\(draftKeyRows) the key block holds"
+            )
+        }
+        if live > 0 {
+            try encodeCopy(
+                encoder,
+                from: ring,
+                to: keys,
+                count: live * latentWidth,
+                sourceByteOffset: ringIndex * draftRingSlots * latentWidth * floatBytes
+            )
+        }
+        try encodeCopy(
+            encoder,
+            from: workspace.latent,
+            to: keys,
+            count: count * latentWidth,
+            destinationByteOffset: live * latentWidth * floatBytes
+        )
+        encoder.memoryBarrier(scope: .buffers)
+
+        try encodeDraftAttentionDispatch(
+            encoder,
+            shape: shape,
+            stage: stage,
+            slots: count,
+            rows: live + count
+        )
+
+        // The output's rope payload is conjugated back out at ITS OWN position, then
+        // the grouped `wo_a` and `wo_b` project it home.
+        if shape.outputCarriesRope {
+            try encodeRope(
+                encoder,
+                vector: workspace.attentionOut,
+                rowWidth: shapes.attentionOutputWidth,
+                headDim: shape.vHeadDim,
+                sliceStart: shape.outputRopeStart,
+                sliceLength: shape.latentRopeWidth,
+                table: .window,
+                latent: true,
+                position: first,
+                inverse: true,
+                batch: count
+            )
+        }
+        if config.oLoraRank > 0,
+           let down = weights.tensor(.attnWoA, scope: .draft, layer: stage) {
+            try encodeBlockDiagonalProjection(
+                encoder,
+                weight: down,
+                scale: weights.scaleTensor(.attnWoA, scope: .draft, layer: stage),
+                groups: shape.outputGroups,
+                inDim: shapes.attentionOutputWidth,
+                outDim: shapes.outputReducedWidth,
+                input: workspace.attentionOut,
+                output: workspace.reduced,
+                rows: count
+            )
+        }
+        guard let output = weights.tensor(.attnWoB, scope: .draft, layer: stage) else {
+            throw DeepSeekV41EngineError.missingTensor("mtp.\(stage).attn.wo_b")
+        }
+        let hasDown = config.oLoraRank > 0
+        try encodeGemv(
+            encoder,
+            weight: output,
+            scale: weights.scaleTensor(.attnWoB, scope: .draft, layer: stage),
+            inDim: hasDown ? shapes.outputReducedWidth : shapes.attentionOutputWidth,
+            outDim: shapes.hidden,
+            input: hasDown ? workspace.reduced : workspace.attentionOut,
+            output: workspace.output,
+            rows: count
+        )
+        for slot in 0..<count {
+            try encodeHyperConnectionPost(
+                encoder,
+                output: workspace.output,
+                gains: workspace.hcAttentionPost,
+                comb: workspace.hcAttentionComb,
+                slot: slot
+            )
+        }
+    }
+
+    /// One attention dispatch over the draft key block, every slot reading the SAME
+    /// rows.
+    ///
+    /// The kernel's slot dimension exists so a block's positions can share one launch;
+    /// its `keyRowStride` is what separates them. Zero is the draft's case: the index
+    /// list is identical for every query, so the stride is zero and the per-slot row
+    /// count repeats.
+    private func encodeDraftAttentionDispatch(
+        _ encoder: MTLComputeCommandEncoder,
+        shape: DeepSeekV41AttentionShape,
+        stage: Int,
+        slots: Int,
+        rows: Int
+    ) throws {
+        guard let keys = draftKeys, rows > 0, slots > 0 else { return }
+        encoder.setComputePipelineState(pipelines.attentionF32)
+        encoder.setBuffer(workspace.query, offset: 0, index: 0)
+        encoder.setBuffer(keys, offset: 0, index: 1)
+        let sink = vectors.buffer(.attnSink, scope: .draft, layer: stage)
+            .flatMap { $0.length >= shape.numHeads * MemoryLayout<Float>.stride ? $0 : nil }
+            ?? sinkDisabled
+        guard let sink else {
+            throw DeepSeekV41EngineError.allocationFailed("the attention sink placeholder")
+        }
+        encoder.setBuffer(sink, offset: 0, index: 2)
+        encoder.setBuffer(workspace.attentionOut, offset: 0, index: 3)
+        var rowCount = UInt32(rows)
+        var heads = UInt32(shape.numHeads)
+        var qkHeadDim = UInt32(shape.qkHeadDim)
+        var valueDim = UInt32(shape.vHeadDim)
+        var width = UInt32(shape.latentWidth)
+        encoder.setBytes(&rowCount, length: 4, index: 4)
+        encoder.setBytes(&heads, length: 4, index: 5)
+        encoder.setBytes(&qkHeadDim, length: 4, index: 6)
+        encoder.setBytes(&valueDim, length: 4, index: 7)
+        encoder.setBytes(&width, length: 4, index: 8)
+        let scoreBytes = (
+            (rows + Self.attentionReductionSlots) * MemoryLayout<Float>.stride + 15
+        ) & ~15
+        guard scoreBytes <= device.maxThreadgroupMemoryLength else {
+            throw DeepSeekV41EngineError.allocationFailed(
+                "\(rows) rows of draft attention scores need \(scoreBytes) bytes against "
+                    + "a \(device.maxThreadgroupMemoryLength)-byte limit"
+            )
+        }
+        encoder.setThreadgroupMemoryLength(scoreBytes, index: 0)
+        var plan = DeepSeekV41AttentionSlotPlan(
+            slotCount: UInt32(slots),
+            keyRowStride: 0
+        )
+        encoder.setBytes(
+            &plan, length: MemoryLayout<DeepSeekV41AttentionSlotPlan>.stride, index: 9
+        )
+        let counts = [UInt32](repeating: UInt32(rows), count: slots)
+        counts.withUnsafeBytes { bytes in
+            encoder.setBytes(bytes.baseAddress!, length: bytes.count, index: 10)
+        }
+        encoder.dispatchThreadgroups(
+            MTLSize(width: shape.numHeads * slots, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: Self.attentionThreadgroupWidth, height: 1, depth: 1
+            )
+        )
+        encoder.memoryBarrier(scope: .buffers)
+    }
+
+    /// One draft stage's attention sub-layer, as the stack it leaves behind.
+    ///
+    /// Returns `[position][copy][hidden]`, which is what the host block records as
+    /// `Trace.postAttention` — the residual after `hc_post` has mixed the projected
+    /// attention output back in. Stage 0 only: every later stage reads the FFN output
+    /// of the one before it, which does not exist until the mixture is built.
+    public func draftAttentionStack(
+        token: Int,
+        startPosition: Int,
+        stage: Int? = nil
+    ) throws -> [[[Float]]] {
+        guard let first = draftStages.first, let shape = draftShape,
+              draftSeededPositions >= startPosition + 1 else { return [] }
+        let target = stage ?? first
+        guard target == first else { return [] }
+        let tokens = draftStackTokens(seed: token)
+        try encodeEmbeddingBlock(tokens, startPosition: startPosition + 1)
+        let commandBuffer = try makeCommandBuffer()
+        let encoder = try makeEncoder(commandBuffer)
+        try encodeDraftAttentionStage(
+            encoder, stage: target, startPosition: startPosition, count: tokens.count
+        )
+        encoder.endEncoding()
+        try commit(commandBuffer, stage: "draftAttention")
+        let pointer = workspace.streams.contents().assumingMemoryBound(to: Float.self)
+        let stride = mult * shapes.hidden
+        return (0..<tokens.count).map { slot in
+            (0..<mult).map { copy in
+                Array(
+                    UnsafeBufferPointer(
+                        start: pointer + slot * stride + copy * shapes.hidden,
+                        count: shapes.hidden
+                    )
+                )
+            }
         }
     }
 

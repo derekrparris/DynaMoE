@@ -785,6 +785,34 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
                     )
                 }
             }
+            // One draft attention over the ring, which is the only place the FP32
+            // attention kernel, the 128-row ring and the 64-head geometry meet.
+            let attentionStart = DispatchTime.now().uptimeNanoseconds
+            let stack = try executor.draftAttentionStack(
+                token: 270, startPosition: tokens.count
+            )
+            let attentionMilliseconds =
+                Double(DispatchTime.now().uptimeNanoseconds - attentionStart) / 1_000_000
+            guard !stack.isEmpty else { return "the draft attention returned no positions" }
+            var attentionLines: [String] = []
+            for (position, copies) in stack.enumerated() {
+                let collapsed = copies.first ?? []
+                let finite = collapsed.allSatisfy { $0.isFinite }
+                let norm = (collapsed.reduce(Float(0)) { $0 + $1 * $1 }).squareRoot()
+                let peak = collapsed.map(abs).max() ?? 0
+                attentionLines.append(
+                    String(
+                        format: "p%d %@ |x| %.2f max %.3f",
+                        position, finite ? "" : "NOT FINITE", norm, peak
+                    )
+                )
+            }
+            lines.append(
+                String(
+                    format: "attention %d positions in %.2f ms: ",
+                    stack.count, attentionMilliseconds
+                ) + attentionLines.joined(separator: ", ")
+            )
             return String(format: "%d rows in %.2f ms, then 1 warm row in %.2f ms; ",
                           seeded, seedMilliseconds, warmMilliseconds)
                 + lines.joined(separator: " | ")
