@@ -1246,6 +1246,89 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         }
     }
 
+    /// The two-row tile form, with an ODD output count so the last tile runs short.
+    ///
+    /// A threadgroup whose second row does not exist still walks the first row's
+    /// weights; the guard that stops it reading past the end of the matrix is the
+    /// thing this case exists for, and the published shapes never exercise it because
+    /// every attention projection's row count is a multiple of two.
+    func testThePairGemvFillsBothRowsOfItsTile() throws {
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let library = device.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "bf16_gemv_rows8x2"),
+              let gemv = try? device.makeComputePipelineState(function: function),
+              let queue = device.makeCommandQueue() else {
+            throw XCTSkip("No Metal device or kernel")
+        }
+        let inDim = 8
+        let outDim = 5
+        let rows = 8
+
+        let values = (0..<(outDim * inDim)).map { index in
+            DeepSeekV41SyntheticCheckpoint.truncateToBF16(Float((index % 17) - 8) / 8)
+        }
+        let input = (0..<(rows * inDim)).map { index in Float((index % 7) - 3) / 8 }
+        let halves = values.map { UInt16(truncatingIfNeeded: $0.bitPattern >> 16) }
+        guard let weightBytes = halves.withUnsafeBytes({ raw -> MTLBuffer? in
+                  device.makeBuffer(
+                      bytes: raw.baseAddress!, length: raw.count, options: .storageModeShared
+                  )
+              }),
+              let inputBuffer = input.withUnsafeBytes({ raw -> MTLBuffer? in
+                  device.makeBuffer(
+                      bytes: raw.baseAddress!, length: raw.count, options: .storageModeShared
+                  )
+              }),
+              let output = device.makeBuffer(
+                  length: rows * outDim * MemoryLayout<Float>.stride, options: .storageModeShared
+              ),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw XCTSkip("could not allocate the pair projection's buffers")
+        }
+        memset(output.contents(), 0, output.length)
+
+        encoder.setComputePipelineState(gemv)
+        encoder.setBuffer(weightBytes, offset: 0, index: 0)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 1)
+        encoder.setBuffer(output, offset: 0, index: 2)
+        var weightOffset = UInt64(0)
+        var inDimension = UInt32(inDim)
+        var outDimension = UInt32(outDim)
+        var inStride = UInt32(inDim)
+        var outStride = UInt32(outDim)
+        encoder.setBytes(&weightOffset, length: 8, index: 3)
+        encoder.setBytes(&inDimension, length: 4, index: 4)
+        encoder.setBytes(&outDimension, length: 4, index: 5)
+        encoder.setBytes(&inStride, length: 4, index: 6)
+        encoder.setBytes(&outStride, length: 4, index: 7)
+        encoder.setThreadgroupMemoryLength(
+            32 * 8 * 2 * MemoryLayout<Float>.stride, index: 0
+        )
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (outDim + 1) / 2, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        let pointer = output.contents().assumingMemoryBound(to: Float.self)
+        for token in 0..<rows {
+            for row in 0..<outDim {
+                var expected: Float = 0
+                for index in 0..<inDim {
+                    expected += values[row * inDim + index] * input[token * inDim + index]
+                }
+                XCTAssertEqual(
+                    pointer[token * outDim + row], expected, accuracy: 1e-4,
+                    "token \(token) row \(row)"
+                )
+            }
+        }
+    }
+
     /// A grouped output projection, dispatched the way the executor dispatches it.
     ///
     /// `attn.wo_a` is `groups` blocks stacked along the ROWS, each as wide as one

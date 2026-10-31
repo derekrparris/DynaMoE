@@ -4946,3 +4946,100 @@ run against. The parity suite that matters for the graph —
 `testEveryPositionOfABlockAttendsOverItsOwnRows`, `testTheDeviceAndTheHostAgreeOnCompressedRows`,
 `testACompressedBlockPrefillsLikeTheWalk` — passes unchanged at its existing bars. Whole
 DeepSeek suite: 420 tests, 14 skipped, 0 failures.
+
+## DSV4.1 #18: THE DENSE PROJECTIONS ARE INPUT-BOUND, AND A WIDER BLOCK IS NOT FREE
+
+`#17` closed with three stages level with each other — `queryUp` 0.046, `outputDown`
+0.045, `outputUp` 0.044 ms/pos/layer — reading 201, 134 and 117 MB of weights apiece, i.e.
+at 580, 408 and 342 GB/s. Those are plausible streaming rates, so the reading was that the
+stages buy bytes and that the only way to buy fewer per position is to amortize one weight
+read over more positions. `bf16_gemv_rows8` already amortizes over the eight positions of a
+block. The obvious next step was sixteen.
+
+Sixteen is worse. That was the whole of this entry's first result, and it inverted the
+model.
+
+**Block width** (`bf16_gemv_rows16`, since removed), same matrices, same band structure,
+same caller layout, only the block width differing:
+
+| projection | weight | block 8 | block 16 | per position |
+|---|---:|---:|---:|---:|
+| `queryUp` (1,536 -> 65,536) | 192 MB | 0.346 ms | 0.715 ms | 0.97x |
+| `outputDown` (8 x 8,192 -> 1,024) | 128 MB | 0.330 ms | 1.053 ms | 0.63x |
+| `outputUp` (8,192 -> 7,168) | 112 MB | 0.343 ms | 1.269 ms | 0.54x |
+
+A wider block reads the SAME weight bytes for twice the positions, so if the weight read
+were the binding cost the per-position figure would halve. Instead the cost grew, and grew
+most where the row is longest. What doubles with the block is the INPUT: a threadgroup
+reading one output row loads every position's vector for the length of that row, once per
+row, over tens of thousands of rows — 1.9 GB of activation reads per block for `outputUp`
+against 112 MB of weights. The stage is not streaming weights at the memory limit; it is
+re-reading activations out of cache, and the weight stream rides along.
+
+**Rows per threadgroup** is the lever that follows, because it divides that input traffic
+without touching the weight read. Two rows per threadgroup (`bf16_gemv_rows8x2`, shipped)
+halves it; four (`bf16_gemv_rows8x4`, removed) quarters it but costs thirty-two
+accumulators:
+
+| projection | rows8 | rows8x2 | rows8x4 |
+|---|---:|---:|---:|
+| `queryUp` | 0.347 | 0.353 (0.98x) | 0.422 (0.82x) |
+| `outputDown` | 0.329 | 0.275 (**1.20x**) | 0.399 (0.82x) |
+| `outputUp` | 0.344 | 0.256 (**1.34x**) | 0.264 (1.30x) |
+
+So the answer to "how many" is two, and it depends only on the LENGTH of the row. Sweeping
+input width at a fixed 7,168-row output:
+
+| inDim | 1,024 | 1,536 | 2,048 | 3,072 | 4,096 | 6,144 | 8,192 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| rows8x2 vs rows8, run A | 0.94x | 1.00x | 1.06x | 1.05x | 0.97x | 1.20x | 1.20x |
+| rows8x2 vs rows8, run B | 0.95x | 1.03x | 1.11x | 1.22x | 1.32x | 1.08x | 1.26-1.31x |
+
+The two runs agree at both ends and disagree in the middle, so `rowSharingWidth` is set to
+6,144: below it the pair form is neutral to 6% worse, and above it every measurement wins
+by 20-34%. The published attention stack lands on the right side of that line without
+being asked to — `attn.wq_b` is 1,536 wide and keeps the one-row form, `attn.wo_a`,
+`attn.wo_b` and `attn.wq_a` are 7,168-8,192 wide and take the pair.
+
+**In situ** (`testWhereABlocksRemainingTimeGoesWithCompressedLayers`, two layers, 1,024
+positions):
+
+| stage | `#17` | `#18` | change |
+|---|---:|---:|---:|
+| `outputDown` | 0.045 | **0.037** | 1.22x |
+| `outputUp` | 0.044 | **0.033** | 1.33x |
+| `queryDown` | 0.019 | **0.013** | 1.46x |
+| `queryUp` | 0.046 | 0.046 | unchanged |
+| dense device | 0.3457 | **0.3179** | 8% |
+| whole block | 1.54 | **1.50** | 2.6% |
+
+Close to what the isolated A/B predicted, which is the point of taking both. `queryDown` is
+the pleasant one: it was not in the A/B's three named geometries, and it took the pair form
+because its input is `hidden` (7,168), so a rule keyed on the measured quantity picked up a
+stage nobody aimed at.
+
+**What is left of the dense half, and the question it opens.** `writeLatent` is 30.9%,
+then `queryUp` at 14.0% — unchanged by everything above, at 65,536 output rows of a 1,536
+input. By this entry's own model it should have been the BEST candidate for row sharing
+(small input, huge output) and it measured 0.98x. Something else dominates there, and the
+shape of it is the next thing to measure rather than assume: 65,536 threadgroups of 384
+iterations each is a grid a fifth of a millisecond wide, so per-row scheduling and the
+`outDim`-threadgroups-per-SM tail are the suspects.
+
+**Caveats.** Same synthetic-weight caveat. The absolute times in the two crossover runs
+differ by 1.65x (0.347 vs 0.574 ms for the same `queryUp` dispatch on the same fixtures),
+which is why every decision here is a ratio taken from interleaved arms inside one run and
+why the crossover itself is reported as a pair of runs rather than one line. Four rows per
+threadgroup was measured once; two was measured twice. The M5 Max was carrying other work
+during at least one of these runs, and the isolated table is cache-warm and is not additive
+into the block table.
+
+**Tests.** The pair kernel's contract is pinned by
+`testThePairGemvFillsBothRowsOfItsTile`, which deliberately uses an ODD output count so the
+last tile carries one row: the published projections are all even, so nothing else exercises
+the guard that stops a threadgroup reading past the end of the matrix. Sensitivity checked
+in the usual direction — pointing the second row's weight read at the first row's bytes
+fails it with 14 assertion failures. `testTheWideGemvGridIsChosenByHowMuchWorkTheProjectionHas`
+now asserts the form rule's new parameter: a 1,536-wide block stays `.block`, an 8,192-wide
+block takes `.blockPair`, and a short batch still falls back to the two-way rule. Whole
+DeepSeek suite: 422 tests, 15 skipped, 0 failures.

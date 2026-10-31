@@ -1973,4 +1973,327 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
             )
         }
     }
+
+    /// What a dense projection's shape costs, swept three ways: block width, rows per
+    /// threadgroup, and input width.
+    ///
+    /// `#17` left the dense half's three big projections level with each other —
+    /// `queryUp` 0.046, `outputDown` 0.045, `outputUp` 0.044 ms/pos/layer — despite
+    /// reading 201, 134 and 117 MB of weights apiece. Reading bytes at 580, 408 and
+    /// 342 GB/s looked like a streaming band that only a wider block could divide.
+    ///
+    /// It is not. A sixteen-position block measured 0.97x, 0.62x and 0.54x per
+    /// position — WORSE, and worst where the row is longest — because the weight is
+    /// already read once per block and what doubles with the block is the INPUT: a
+    /// threadgroup reading one output row loads every position's vector for the length
+    /// of that row, once per row, over tens of thousands of rows. So the shapes that
+    /// matter are rows-per-threadgroup and input width, and this case sweeps both.
+    ///
+    /// Same matrices, same band structure, same caller layout as the executor uses
+    /// (`attn.wo_a` as eight bands of 8,192 -> 1,024 reading `inDim`-wide rows).
+    ///
+    /// Measured elsewhere and left out here rather than shipped, in the same session
+    /// and on the same fixtures: a four-row threadgroup lost everywhere (0.82x, 0.82x,
+    /// 1.30x) because thirty-two accumulators cost more occupancy than the input they
+    /// save, and a sixteen-position block lost as above.
+    func testWhatAWiderBlockSavesOnAWeightRead() throws {
+        guard let metal = MTLCreateSystemDefaultDevice(),
+              let library = metal.makeDefaultLibrary(),
+              let narrowFunction = library.makeFunction(name: "bf16_gemv_rows8"),
+              let twoRowFunction = library.makeFunction(name: "bf16_gemv_rows8x2"),
+              let narrow = try? metal.makeComputePipelineState(function: narrowFunction),
+              let twoRow = try? metal.makeComputePipelineState(function: twoRowFunction),
+              let queue = metal.makeCommandQueue() else {
+            throw XCTSkip("No Metal device or block GEMV kernels")
+        }
+
+        struct Projection {
+            let name: String
+            let inDim: Int
+            let bandOutDim: Int
+            let bands: Int
+            /// The caller's row width, which is the module's full input width even
+            /// when one band reads only a slice of it.
+            let inStride: Int
+            let outStride: Int
+        }
+        // The published text_config: hidden 7,168, q_lora_rank 1,536, 128 heads of
+        // 512, o_lora_rank 1,024 over 8 output groups.
+        let projections = [
+            Projection(
+                name: "queryUp", inDim: 1_536, bandOutDim: 65_536, bands: 1,
+                inStride: 1_536, outStride: 65_536
+            ),
+            Projection(
+                name: "outputDown", inDim: 8_192, bandOutDim: 1_024, bands: 8,
+                inStride: 65_536, outStride: 8_192
+            ),
+            Projection(
+                name: "outputUp", inDim: 8_192, bandOutDim: 7_168, bands: 1,
+                inStride: 8_192, outStride: 7_168
+            )
+        ]
+        // The pair form is a win where a row is long and neutral where it is short
+        // (1,536), so the rule needs the crossover rather than a guess: the same
+        // output shape swept across input widths, which is the only thing that moves.
+        let crossover = [1_024, 1_536, 2_048, 3_072, 4_096, 6_144].map { width in
+            Projection(
+                name: "inDim \(width)", inDim: width, bandOutDim: 7_168, bands: 1,
+                inStride: width, outStride: 7_168
+            )
+        }
+        let widestOut = projections.map(\.outStride).max() ?? 1
+        let widestIn = projections.map(\.inStride).max() ?? 1
+        let maxWeightBytes = projections
+            .map { $0.bands * $0.bandOutDim * $0.inDim * MemoryLayout<UInt16>.stride }
+            .max() ?? 1
+        let slots = 16
+        let laneWidth = 64
+
+        guard let weight = metal.makeBuffer(length: maxWeightBytes, options: .storageModeShared),
+              let input = metal.makeBuffer(
+                  length: slots * widestIn * MemoryLayout<Float>.stride,
+                  options: .storageModeShared
+              ),
+              let output = metal.makeBuffer(
+                  length: slots * widestOut * MemoryLayout<Float>.stride,
+                  options: .storageModeShared
+              ) else {
+            throw XCTSkip("could not allocate the block GEMV buffers")
+        }
+
+        var state: UInt64 = 0x9E37_79B9_7F4A_7C15
+        func nextUnit() -> Float {
+            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return Float(Int32(truncatingIfNeeded: state >> 33)) / Float(1 << 30)
+        }
+        // BF16 values truncated exactly as the checkpoint's own reader widens them,
+        // so the host rule below reads the same numbers the GPU does.
+        let weightTile: [UInt16] = (0..<4_096).map { _ in
+            UInt16(
+                truncatingIfNeeded:
+                    DeepSeekV41SyntheticCheckpoint.truncateToBF16(nextUnit() * 0.125).bitPattern >> 16
+            )
+        }
+        let inputTile: [Float] = (0..<4_096).map { _ in nextUnit() }
+        func fill<T>(_ buffer: MTLBuffer, bytes: Int, values: [T]) {
+            let stride = MemoryLayout<T>.stride
+            let destination = buffer.contents()
+            values.withUnsafeBytes { source in
+                guard let base = source.baseAddress else { return }
+                var written = 0
+                while written < bytes {
+                    let chunk = min(values.count * stride, bytes - written)
+                    memcpy(destination + written, base, chunk)
+                    written += chunk
+                }
+            }
+        }
+
+        func encode(
+            _ encoder: MTLComputeCommandEncoder,
+            pipeline: MTLComputePipelineState,
+            projection: Projection,
+            block: Int,
+            rowsPerGroup: Int = 1
+        ) {
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(weight, offset: 0, index: 0)
+            encoder.setBuffer(input, offset: 0, index: 1)
+            var inDimension = UInt32(projection.inDim)
+            var bandOut = UInt32(projection.bandOutDim)
+            var inStride = UInt32(projection.inStride)
+            var outStride = UInt32(projection.outStride)
+            var noBand = UInt32(0)
+            for band in 0..<projection.bands {
+                var weightOffset = UInt64(band)
+                    * UInt64(projection.bandOutDim * projection.inDim)
+                    * UInt64(MemoryLayout<UInt16>.stride)
+                encoder.setBuffer(
+                    output,
+                    offset: band * projection.bandOutDim * MemoryLayout<Float>.stride,
+                    index: 2
+                )
+                encoder.setBytes(&weightOffset, length: 8, index: 3)
+                encoder.setBytes(&inDimension, length: 4, index: 4)
+                encoder.setBytes(&bandOut, length: 4, index: 5)
+                encoder.setBytes(&inStride, length: 4, index: 6)
+                encoder.setBytes(&outStride, length: 4, index: 7)
+                encoder.setBytes(&noBand, length: 4, index: 8)
+                encoder.setBytes(&noBand, length: 4, index: 9)
+                encoder.setBytes(&noBand, length: 4, index: 10)
+                encoder.setThreadgroupMemoryLength(
+                    32 * block * rowsPerGroup * MemoryLayout<Float>.stride, index: 0
+                )
+                encoder.dispatchThreadgroups(
+                    MTLSize(
+                        width: (projection.bandOutDim + rowsPerGroup - 1) / rowsPerGroup,
+                        height: 1,
+                        depth: 1
+                    ),
+                    threadsPerThreadgroup: MTLSize(width: laneWidth, height: 1, depth: 1)
+                )
+            }
+        }
+
+        func measure(
+            pipeline: MTLComputePipelineState,
+            projection: Projection,
+            block: Int,
+            repeats: Int,
+            rowsPerGroup: Int = 1
+        ) -> Double? {
+            guard let command = queue.makeCommandBuffer(),
+                  let encoder = command.makeComputeCommandEncoder() else { return nil }
+            encoder.setThreadgroupMemoryLength(
+                32 * block * rowsPerGroup * MemoryLayout<Float>.stride, index: 0
+            )
+            for _ in 0..<repeats {
+                encode(
+                    encoder, pipeline: pipeline, projection: projection, block: block,
+                    rowsPerGroup: rowsPerGroup
+                )
+            }
+            encoder.endEncoding()
+            command.commit()
+            command.waitUntilCompleted()
+            return (command.gpuEndTime - command.gpuStartTime) / Double(repeats) * 1000
+        }
+
+        print("[dsv41 block width] laneWidth=\(laneWidth) arms: rows8 (1 row/group) vs rows8x2 (2)")
+
+        for projection in projections + crossover {
+            let weightBytes = projection.bands * projection.bandOutDim * projection.inDim * 2
+            fill(weight, bytes: weightBytes, values: weightTile)
+            fill(input, bytes: slots * widestIn * MemoryLayout<Float>.stride, values: inputTile)
+            memset(output.contents(), 0, output.length)
+
+            // Correctness before timing: the last band's row 3 for a position at
+            // each end of the block, against the host dot product.
+            let arms: [(name: String, pipeline: MTLComputePipelineState, block: Int, rows: Int)] = [
+                ("rows8", narrow, 8, 1),
+                ("rows8x2", twoRow, 8, 2)
+            ]
+            for arm in arms {
+                guard let command = queue.makeCommandBuffer(),
+                      let encoder = command.makeComputeCommandEncoder() else { return }
+                encode(
+                    encoder, pipeline: arm.pipeline, projection: projection, block: arm.block,
+                    rowsPerGroup: arm.rows
+                )
+                encoder.endEncoding()
+                command.commit()
+                command.waitUntilCompleted()
+                XCTAssertNil(command.error)
+
+                let band = projection.bands - 1
+                let row = 3
+                let weights = weight.contents().assumingMemoryBound(to: UInt16.self)
+                let inputs = input.contents().assumingMemoryBound(to: Float.self)
+                let values = output.contents().assumingMemoryBound(to: Float.self)
+                for position in [0, arm.block - 1] {
+                    var expected: Float = 0
+                    for index in 0..<projection.inDim {
+                        let base = (band * projection.bandOutDim + row) * projection.inDim + index
+                        expected += Float(bitPattern: UInt32(weights[base]) << 16)
+                            * inputs[position * projection.inStride + index]
+                    }
+                    let actual = values[
+                        band * projection.bandOutDim + row + position * projection.outStride
+                    ]
+                    XCTAssertLessThan(
+                        abs(actual - expected) / max(abs(expected), 1e-3),
+                        1e-4,
+                        "\(projection.name) \(arm.name): position \(position) disagrees"
+                            + " with the host rule"
+                    )
+                }
+            }
+            // The two-row form also has to fill its SECOND row, which is a different
+            // threadgroup's worth of output in every other form.
+            do {
+                guard let command = queue.makeCommandBuffer(),
+                      let encoder = command.makeComputeCommandEncoder() else { return }
+                encode(
+                    encoder, pipeline: twoRow, projection: projection, block: 8, rowsPerGroup: 2
+                )
+                encoder.endEncoding()
+                command.commit()
+                command.waitUntilCompleted()
+                let band = projection.bands - 1
+                let weights = weight.contents().assumingMemoryBound(to: UInt16.self)
+                let inputs = input.contents().assumingMemoryBound(to: Float.self)
+                let values = output.contents().assumingMemoryBound(to: Float.self)
+                for row in [2, 4] {
+                    var expected: Float = 0
+                    for index in 0..<projection.inDim {
+                        let base = (band * projection.bandOutDim + row) * projection.inDim + index
+                        expected += Float(bitPattern: UInt32(weights[base]) << 16)
+                            * inputs[5 * projection.inStride + index]
+                    }
+                    let actual = values[band * projection.bandOutDim + row + 5 * projection.outStride]
+                    XCTAssertLessThan(
+                        abs(actual - expected) / max(abs(expected), 1e-3),
+                        1e-4,
+                        "\(projection.name) rows8x2: row \(row) disagrees with the host rule"
+                    )
+                }
+            }
+
+            // Interleaved, so a clock ramp cannot favour whichever arm went first.
+            let repeats = 3
+            for arm in arms {
+                _ = measure(
+                    pipeline: arm.pipeline, projection: projection, block: arm.block,
+                    repeats: 1, rowsPerGroup: arm.rows
+                )
+            }
+            var best = [Double](repeating: .infinity, count: arms.count)
+            for _ in 0..<5 {
+                for (index, arm) in arms.enumerated() {
+                    if let value = measure(
+                        pipeline: arm.pipeline, projection: projection, block: arm.block,
+                        repeats: repeats, rowsPerGroup: arm.rows
+                    ) {
+                        best[index] = min(best[index], value)
+                    }
+                }
+            }
+            guard best.allSatisfy({ $0.isFinite }) else {
+                XCTFail("\(projection.name) did not run")
+                return
+            }
+            let megabytes = Double(weightBytes) / 1_048_576
+            var perPosition: [Double] = []
+            var columns: [String] = []
+            for (index, arm) in arms.enumerated() {
+                let milliseconds = best[index]
+                let position = milliseconds / Double(arm.block)
+                perPosition.append(position)
+                let gigabytes = Double(weightBytes) / (milliseconds / 1000) / 1e9
+                columns.append(
+                    String(
+                        format: "%@ %6.3f ms (%5.3f/pos, %4.0f GB/s)",
+                        arm.name as NSString,
+                        milliseconds,
+                        position,
+                        gigabytes
+                    )
+                )
+            }
+            var ratios = String(format: "   rows8/pos against:")
+            for index in 1..<perPosition.count {
+                ratios += String(
+                    format: " %@ %.2fx", arms[index].name as NSString,
+                    perPosition[0] / perPosition[index]
+                )
+            }
+            let head = String(
+                format: "[dsv41 block width] %-11@ %5.0f MB  ",
+                projection.name as NSString,
+                megabytes
+            )
+            print(head + columns.joined(separator: "  ") + ratios)
+        }
+    }
 }

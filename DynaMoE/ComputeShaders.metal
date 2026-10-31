@@ -1753,6 +1753,138 @@ kernel void bf16_gemv_rows8(
     }
 }
 
+
+/// MSL Kernel: `bf16_gemv_rows8` over TWO output rows per threadgroup.
+///
+/// The block-width A/B (`testWhatAWiderBlockSavesOnAWeightRead`) showed that
+/// widening a block from eight positions to sixteen makes these projections WORSE
+/// per position — 0.97x, 0.63x, 0.55x — which rules out the weight read as the
+/// binding cost, because a wider block reads the same weight bytes for twice the
+/// positions. What doubles instead is the INPUT: a threadgroup reading one output
+/// row loads every position's vector for the length of that row, so the block's
+/// `2 * heads`-wide activations are re-read once per output row, and there are tens
+/// of thousands of rows.
+///
+/// This form shares one input load between two output rows. Same weight bytes, same
+/// block width, same total arithmetic; half the input traffic and sixteen
+/// accumulators instead of eight. If the input re-read is what the stage pays for,
+/// this halves it; if it changes nothing, the input was never the limit and the
+/// remaining cost is issue rate.
+kernel void bf16_gemv_rows8x2(
+    device const ushort* rawWeightBuffer [[buffer(0)]],
+    device const float* inputVector [[buffer(1)]],
+    device float* outputVector [[buffer(2)]],
+    constant uint64_t& weightOffset [[buffer(3)]],
+    constant uint32_t& inDim [[buffer(4)]],
+    constant uint32_t& outDim [[buffer(5)]],
+    constant uint32_t& inputRowStride [[buffer(6)]],
+    constant uint32_t& outputRowStride [[buffer(7)]],
+    threadgroup float* partials [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint laneInSimd [[thread_index_in_simdgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
+) {
+    if (inDim == 0u || outDim == 0u) return;
+
+    uint32_t inStride = inputRowStride != 0u ? inputRowStride : inDim;
+    uint32_t outStride = outputRowStride != 0u ? outputRowStride : outDim;
+    uint32_t row0 = tile * 2u;
+    if (row0 >= outDim) return;
+    uint32_t row1 = row0 + 1u;
+    bool hasSecond = row1 < outDim;
+
+    device const ushort* wBase =
+        rawWeightBuffer + (weightOffset / 2) + ((uint64_t)row0 * inDim);
+    device const float* inPtr = inputVector;
+
+    float a00 = 0.0f, a01 = 0.0f, a02 = 0.0f, a03 = 0.0f;
+    float a04 = 0.0f, a05 = 0.0f, a06 = 0.0f, a07 = 0.0f;
+    float a10 = 0.0f, a11 = 0.0f, a12 = 0.0f, a13 = 0.0f;
+    float a14 = 0.0f, a15 = 0.0f, a16 = 0.0f, a17 = 0.0f;
+    uint32_t num4 = inDim / 4;
+    for (uint32_t i = lane; i < num4; i += laneCount) {
+        uint32_t base = i * 4;
+        // The input load is shared by both rows: that is the whole point of the form.
+        device const float* p = inPtr + base;
+        float4 i0 = *(device const float4*)(p);
+        float4 i1 = *(device const float4*)(p + inStride);
+        float4 i2 = *(device const float4*)(p + 2 * inStride);
+        float4 i3 = *(device const float4*)(p + 3 * inStride);
+        float4 i4 = *(device const float4*)(p + 4 * inStride);
+        float4 i5 = *(device const float4*)(p + 5 * inStride);
+        float4 i6 = *(device const float4*)(p + 6 * inStride);
+        float4 i7 = *(device const float4*)(p + 7 * inStride);
+
+        ushort4 w0 = load_ushort4_unaligned(wBase + base);
+        float x0 = bf16_to_fp32(w0.x);
+        float x1 = bf16_to_fp32(w0.y);
+        float x2 = bf16_to_fp32(w0.z);
+        float x3 = bf16_to_fp32(w0.w);
+        a00 += x0 * i0.x + x1 * i0.y + x2 * i0.z + x3 * i0.w;
+        a01 += x0 * i1.x + x1 * i1.y + x2 * i1.z + x3 * i1.w;
+        a02 += x0 * i2.x + x1 * i2.y + x2 * i2.z + x3 * i2.w;
+        a03 += x0 * i3.x + x1 * i3.y + x2 * i3.z + x3 * i3.w;
+        a04 += x0 * i4.x + x1 * i4.y + x2 * i4.z + x3 * i4.w;
+        a05 += x0 * i5.x + x1 * i5.y + x2 * i5.z + x3 * i5.w;
+        a06 += x0 * i6.x + x1 * i6.y + x2 * i6.z + x3 * i6.w;
+        a07 += x0 * i7.x + x1 * i7.y + x2 * i7.z + x3 * i7.w;
+
+        if (!hasSecond) continue;
+        ushort4 w1 = load_ushort4_unaligned(wBase + inDim + base);
+        float y0 = bf16_to_fp32(w1.x);
+        float y1 = bf16_to_fp32(w1.y);
+        float y2 = bf16_to_fp32(w1.z);
+        float y3 = bf16_to_fp32(w1.w);
+        a10 += y0 * i0.x + y1 * i0.y + y2 * i0.z + y3 * i0.w;
+        a11 += y0 * i1.x + y1 * i1.y + y2 * i1.z + y3 * i1.w;
+        a12 += y0 * i2.x + y1 * i2.y + y2 * i2.z + y3 * i2.w;
+        a13 += y0 * i3.x + y1 * i3.y + y2 * i3.z + y3 * i3.w;
+        a14 += y0 * i4.x + y1 * i4.y + y2 * i4.z + y3 * i4.w;
+        a15 += y0 * i5.x + y1 * i5.y + y2 * i5.z + y3 * i5.w;
+        a16 += y0 * i6.x + y1 * i6.y + y2 * i6.z + y3 * i6.w;
+        a17 += y0 * i7.x + y1 * i7.y + y2 * i7.z + y3 * i7.w;
+    }
+
+    // Row-major over (row, position), so a warp's writes stay contiguous.
+    float acc[16] = {
+        a00, a01, a02, a03, a04, a05, a06, a07,
+        a10, a11, a12, a13, a14, a15, a16, a17
+    };
+    float sums[16];
+    for (uint32_t index = 0; index < 16u; ++index) {
+        sums[index] = simd_sum(acc[index]);
+    }
+    if (laneInSimd == 0u) {
+        uint32_t base = simdIdx * 16u;
+        for (uint32_t index = 0; index < 16u; ++index) {
+            partials[base + index] = sums[index];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u) {
+        uint32_t simdCount = (laneCount + 31u) / 32u;
+        float total[16];
+        for (uint32_t index = 0; index < 16u; ++index) {
+            float sum = 0.0f;
+            for (uint32_t group = 0; group < simdCount; ++group) {
+                sum += partials[group * 16u + index];
+            }
+            total[index] = sum;
+        }
+        for (uint32_t position = 0; position < 8u; ++position) {
+            outputVector[row0 + position * outStride] = total[position];
+        }
+        if (hasSecond) {
+            for (uint32_t position = 0; position < 8u; ++position) {
+                outputVector[row1 + position * outStride] = total[8u + position];
+            }
+        }
+    }
+}
+
+
 /// MSL Kernel: Per-Head RMSNorm for Attention Heads (32-Thread SIMDgroup Cooperative, 2D Grid Aware)
 kernel void per_head_rmsnorm_bf16(
     device float* qkVector [[buffer(0)]],

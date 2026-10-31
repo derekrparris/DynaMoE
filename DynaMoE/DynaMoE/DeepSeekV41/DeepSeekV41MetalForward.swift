@@ -100,6 +100,8 @@ nonisolated public enum DeepSeekV41Kernels {
     public static let bf16Gemv = "bf16_gemv"
     public static let bf16GemvRows = "bf16_gemv_rows"
     public static let bf16GemvBlock = "bf16_gemv_rows8"
+    /// The same block form over two output rows per threadgroup.
+    public static let bf16GemvBlockPair = "bf16_gemv_rows8x2"
     public static let bf16SwiGLU = "bf16_swiglu_gate_up"
     public static let bf16DownAccumulate = "bf16_down_proj_accumulate"
     public static let bf16Embedding = "lookup_embeddings_bf16"
@@ -107,12 +109,14 @@ nonisolated public enum DeepSeekV41Kernels {
     public static let rmsNorm = "dsv41_rmsnorm_f32_gain"
 }
 
-/// The three shapes of one BF16 dot product: one thread per output row, one
-/// threadgroup per (row, position), or one threadgroup per row covering a whole block.
+/// The shapes of one BF16 dot product: one thread per output row, one threadgroup
+/// per (row, position), one threadgroup per row covering a whole block, or one
+/// threadgroup per PAIR of rows covering a whole block.
 nonisolated public enum DeepSeekV41BF16GemvForm: Equatable, Sendable {
     case perRow
     case wideGrid
     case block
+    case blockPair
 }
 
 /// Swift mirror of `Dsv41AttentionSlotPlan` in `ComputeShaders.metal`, bound at buffer
@@ -218,17 +222,42 @@ nonisolated public enum DeepSeekV41DevicePlan {
         return outDim * height <= 8_192
     }
 
-    /// Which of the three BF16 GEMV kernels a projection gets.
+    /// Input width at which one output row stops being the cheapest unit of work.
+    ///
+    /// A threadgroup reading one output row loads every position's vector for the
+    /// length of that row, so a block of eight re-reads its activations once per row
+    /// and there are tens of thousands of rows. Sharing that load between two rows
+    /// halves it, and whether that beats the extra accumulators depends only on how
+    /// long the row is: swept across input widths at a fixed 7,168-row output the
+    /// pair form measured 0.94x at 1,024, 1.00x at 1,536, 1.06x at 2,048, 1.05x at
+    /// 3,072, 0.97x at 4,096, 1.20x at 6,144 and 1.20-1.34x at 8,192. A second run
+    /// put 3,072 and 4,096 at 1.22x and 1.32x, so the crossover is somewhere between
+    /// 2,048 and 6,144 and this line errs to the conservative side of it. The
+    /// published `attn.wq_b` (1,536 wide) keeps the one-row form either way and
+    /// `attn.wo_a`, `attn.wo_b` and `attn.wq_a` (7,168-8,192) take the pair
+    /// (`DeepSeekV41PrefillMeasurementTests.testWhatAWiderBlockSavesOnAWeightRead`).
+    /// Four rows per threadgroup was measured too and lost everywhere (0.82x, 0.82x,
+    /// 1.30x), because thirty-two accumulators cost more than the input they save.
+    public static let rowSharingWidth = 6_144
+
+    /// Which BF16 GEMV kernel a projection gets.
     ///
     /// A full block of eight positions — `chunkSlots`' ceiling — takes
     /// `bf16_gemv_rows8`, which gives a threadgroup one output row and streams it once
     /// for every position, so the weight is read as often as it changes instead of once
     /// per position. It measured faster than both other forms at every published shape,
     /// from 448 rows to 73,728, so there is no threshold to pick: an eight-position
-    /// block always wants it. A shorter batch has no such kernel and falls back to the
-    /// two-way rule in `bf16GemvWantsWideGrid`.
-    public static func bf16GemvForm(outDim: Int, rows: Int) -> DeepSeekV41BF16GemvForm {
-        if max(1, rows) == 8 { return .block }
+    /// block always wants a block form. Which of the two, `rowSharingWidth` decides. A
+    /// shorter batch has neither and falls back to the two-way rule in
+    /// `bf16GemvWantsWideGrid`.
+    public static func bf16GemvForm(
+        outDim: Int,
+        inDim: Int,
+        rows: Int
+    ) -> DeepSeekV41BF16GemvForm {
+        if max(1, rows) == 8 {
+            return max(1, inDim) >= rowSharingWidth ? .blockPair : .block
+        }
         return bf16GemvWantsWideGrid(outDim: outDim, rows: rows) ? .wideGrid : .perRow
     }
 
@@ -3395,10 +3424,13 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             // Three shapes of the same dot product, and which one is cheaper depends
             // on how much work the grid has and on whether a whole block is running, so
             // the choice is a plan rule rather than a constant.
-            let form = DeepSeekV41DevicePlan.bf16GemvForm(outDim: outDim, rows: max(1, rows))
+            let form = DeepSeekV41DevicePlan.bf16GemvForm(
+                outDim: outDim, inDim: inDim, rows: max(1, rows)
+            )
             let wideGrid = form != .perRow
             switch form {
             case .block: encoder.setComputePipelineState(pipelines.bf16GemvBlock)
+            case .blockPair: encoder.setComputePipelineState(pipelines.bf16GemvBlockPair)
             case .wideGrid: encoder.setComputePipelineState(pipelines.bf16GemvRows)
             case .perRow: encoder.setComputePipelineState(pipelines.bf16Gemv)
             }
@@ -3413,14 +3445,18 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.setBytes(&outDimension, length: 4, index: 5)
             encoder.setBytes(&inStride, length: 4, index: 6)
             encoder.setBytes(&outStride, length: 4, index: 7)
-            if form == .block {
-                // One threadgroup per output row, each streaming the row once for all
-                // eight positions: the partials are eight floats per warp.
+            if form == .block || form == .blockPair {
+                // One threadgroup per output row (or per pair of rows), each streaming
+                // its rows once for all eight positions: the partials are eight floats
+                // per warp, or sixteen when the threadgroup carries two rows.
+                let rowsPerGroup = form == .blockPair ? 2 : 1
                 encoder.setThreadgroupMemoryLength(
-                    32 * 8 * MemoryLayout<Float>.stride, index: 0
+                    32 * 8 * rowsPerGroup * MemoryLayout<Float>.stride, index: 0
                 )
                 encoder.dispatchThreadgroups(
-                    MTLSize(width: outDim, height: 1, depth: 1),
+                    MTLSize(
+                        width: (outDim + rowsPerGroup - 1) / rowsPerGroup, height: 1, depth: 1
+                    ),
                     threadsPerThreadgroup: MTLSize(
                         width: Self.gemvLaneWidth, height: 1, depth: 1
                     )
