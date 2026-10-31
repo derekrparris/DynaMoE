@@ -218,6 +218,9 @@ nonisolated public struct DeepSeekV41Pipelines {
     public let rope: MTLComputePipelineState
     public let storeLatent: MTLComputePipelineState
     public let gatherLatents: MTLComputePipelineState
+    /// CSA2 attention over the gathered block. The block is FP16, so this is the
+    /// half-key kernel; the FP32 form is kept in the shader library as the baseline
+    /// the measurement A/Bs against (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #17").
     public let attention: MTLComputePipelineState
     public let poolLatents: MTLComputePipelineState
     public let indexerScores: MTLComputePipelineState
@@ -264,7 +267,7 @@ nonisolated public struct DeepSeekV41Pipelines {
         self.rope = try make("dsv41_rope_latent")
         self.storeLatent = try make("dsv41_store_latent_f16")
         self.gatherLatents = try make("dsv41_gather_latents_f16")
-        self.attention = try make("dsv41_attention_csa2_f32")
+        self.attention = try make("dsv41_attention_csa2_f16")
         self.poolLatents = try make("dsv41_pool_latents_f32")
         self.indexerScores = try make("dsv41_indexer_scores_f32")
         self.router = try make("dsv41_router_topk")
@@ -826,6 +829,12 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
         // provisioned wider than this.
         let gather = DeepSeekV41DevicePlan.gatherRowBudget(config: config)
         let float4: (Int) -> Int = { $0 * MemoryLayout<Float>.stride }
+        // The gathered block holds the cache's own records, so its values are two
+        // bytes and not four: the block is a copy of cache rows, and the executor
+        // refuses any cache that is not FP16 (`DeepSeekV41DevicePlan.problems`), so
+        // widening each record on the way out doubled both the block and every
+        // head's read of it (`dsv41_attention_csa2_f16`).
+        let gatheredValueBytes = MemoryLayout<UInt16>.stride
         // Engram staging is sized for exactly the rows one position reads, which is
         // well under the 64-row block the memory plan prices, so the allocation can
         // never outgrow the budget the load log reports.
@@ -844,7 +853,7 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
               let normed = make(slotBytes(shapes.hidden)),
               let query = make(slotBytes(shapes.queryWidth)),
               let latent = make(slotBytes(shapes.latentWidth)),
-              let gathered = make(float4(gather * shapes.latentWidth * slots)),
+              let gathered = make(gather * shapes.latentWidth * slots * gatheredValueBytes),
               let attentionOut = make(slotBytes(shapes.attentionOutputWidth)),
               let output = make(slotBytes(shapes.hidden)),
               let routerLogits = make(slotBytes(config.numRoutedExperts)),

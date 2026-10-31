@@ -4839,3 +4839,110 @@ compressed table: three compressor tensors on the owner, the indexer's weights o
 index source, and the gather budget is `window + index_topk`),
 `testTheDeviceAndTheHostAgreeOnCompressedRows`, `testACompressedBlockPrefillsLikeTheWalk`,
 and the two opt-in tables above. Whole DeepSeek suite: 419 tests, 13 skipped, 0 failures.
+
+## DSV4.1 #17: THE ATTENTION WAS CHAIN-BOUND, NOT BANDWIDTH-BOUND
+
+`#16` closed by naming the lever: `writeLatent` is 128 heads each reading the whole
+gathered block, so it comes down "by reading fewer BYTES per row". That was a model, not a
+measurement — 57.7 MB over the measured 0.149 ms is 387 GB/s, which is a believable number
+for this machine, and believable is not the same as checked. The check was cheap: halve the
+record and change nothing else.
+
+Halving the record did nothing. That falsified the model, and the stage turned out to be
+bound by something the arithmetic had hidden.
+
+**The A/B** (`testWhatAnFP16KeyBlockSavesOverAnFP32One`, opt-in, published geometry: 128
+heads, 512-wide record, sink on). Both arms are fed the SAME key values: the block is
+sampled as `half` and the FP32 arm reads those values widened, which is exactly what the
+gather did to a cache row. Row counts 136 (one window plus the first compressed row), 640
+(`window + index_topk`) and 1,152 (what a block's late positions read). The arms INTERLEAVE
+inside each attempt and every number is a minimum of six attempts, because GPU clocks ramp
+across a sweep and a first-timed arm reads slow for reasons that have nothing to do with its
+code; without interleaving, the first row count read 14% slow purely for being first.
+
+| form | 136 rows | 640 rows | 1,152 rows |
+|---|---:|---:|---:|
+| FP32 records, one accumulator (what `#16` shipped) | 0.121 | 0.456 | **0.820** |
+| FP16 records, one accumulator | 0.094 | 0.531 | 0.808 |
+| FP32 records, four accumulators | 0.045 | 0.339 | 0.299 |
+| FP16 records, four accumulators | 0.040 | 0.314 | 0.274 |
+| FP16, four accumulators, `half4` score pass (shipped) | **0.038** | **0.149** | **0.265** |
+
+All in ms per dispatch. The 1,152 row is the one to read: it is stable to 0.001 across four
+runs, where the 640 row moves up to 50% between runs. As a ratio, the shipped form is
+roughly 3.2x / 3.1x / 3.1x faster than the form `#16` measured.
+
+**Reading the table.** Row 2 against row 1 is the byte hypothesis alone: 0.820 → 0.808, i.e.
+1.01x, at every row count. Halving the bytes moved by the dominant read bought nothing, so
+the stage was not paying for bandwidth. Row 3 against row 1 is the thing it WAS paying for:
+the same FP32 records, with the dot product and the value sum split across four independent
+accumulators, are 2.74x faster at 1,152 rows. `dot += q * k` is a `width`-long chain of
+dependent FMAs — 512 of them, ~4 cycles each, in one lane per row — and that chain, not the
+memory system, set the cost. Row 4 against row 3 says the bytes are worth 9% once the chain
+is gone, so both changes are real but they are not additive in the way the byte model
+implied, and the byte half only pays because the chain was fixed first.
+
+The last row is the shipped kernel. `half4` vectorisation of the score pass — a row is
+contiguous and the record width is a multiple of four, so it is one 8-byte load per four
+values instead of four 2-byte loads — is worth a further 3-4%, measured at both large row
+counts.
+
+Both arms are validated against `DeepSeekV41AttentionReference.attend` before any number is
+printed, and against each other at a float-rounding bar: the two kernels can sum in
+different orders, so they agree to rounding rather than to the bit. Correctness of the
+graph is unaffected because the rule, the addressing, the slot dimension and the threadgroup
+shape are all unchanged.
+
+**What shipped.** `dsv41_attention_csa2_f16`: FP16 key records, four accumulators in both
+passes, `half4` score pass. The gather now writes the cache's own 2-byte records instead of
+widening them to FP32 (`dsv41_gather_latents_f16` is a plain copy), which also halves the
+gathered block — 10 MB to 5 MB at eight slots of a 1,152-row budget — and the executor
+dispatches the FP16 kernel. The FP32 kernel stays in the library untouched, as the baseline
+this A/B measured against.
+
+**In situ** (the two opt-in tables from `#16`, re-taken, 1,024 positions):
+
+| stage | window-only `#16` | window-only `#17` | compressed `#16` | compressed `#17` |
+|---|---:|---:|---:|---:|
+| `writeLatent`, ms/pos | 0.149 | **0.070** | 0.271 | **0.136** |
+| dense device, ms/pos | 0.382 | **0.303** | 0.504 | **0.370** |
+| whole block, ms/pos | 0.83 | **0.75** | 0.97 | **0.84** |
+
+2.13x on the window-only `writeLatent` and 1.99x on the compressed one, and the compressed
+penalty over its window-only arm falls from +0.122 to +0.066 ms/pos (+17% → +12% on the
+block). The model-shaped table (two layers, 0.77 ms/position/layer) goes from 1.75 to
+**1.54 ms/position whole block**, with `writeLatent` 0.211 → **0.103** — 45.5% of the dense
+half down to 29.4%.
+
+In situ is 2.0x where the isolated A/B is 3.1x, and the gap is not noise: `writeLatent`
+carries the store, the pool, the gather and the latent rope as well, and the surrounding
+dispatches evict the block, so the in-situ arm is not the cache-warm one the isolated table
+measures. Neither number is the other's prediction; the isolated table ranks kernel FORMS,
+the block table measures the stage.
+
+**The ranking it leaves.** `writeLatent` is still first at 29.4%, but it is no longer in a
+class of its own: `queryUp` 0.046, `outputDown` 0.045 and `outputUp` 0.044 are ~13% each,
+i.e. three weight-read GEMV stages that together are 39% of the dense half. Those are now
+what the attention was before this entry — the biggest single thing left, and worth a
+measurement of their own rather than an inference from the attention's.
+
+**Caveats.** Synthetic weights, as always: the checkpoint's attention and compressor
+projections are quantised, so absolute numbers differ while rankings hold, and the synthetic
+mixture (`moe_intermediate` 32) is still dispatch overhead at 0.41 ms/position, which caps
+how far a 12% block reduction can look. The isolated table is cache-warm and is not additive
+into the block table. The published-geometry timing case
+(`testWhatOneAttentionDispatchCostsAtThePublishedWidths`) reads the shipped kernel too now,
+but its harness averages two attempts of five dispatches and spreads far wider than the
+interleaved A/B — it says 0.061 / 0.056 / 0.426 ms at 128 / 136 / 640 rows — so treat the
+A/B above as the decision instrument and that case as a coarse cross-check.
+
+**Tests.** The kernels that ship are the kernels that are pinned:
+`DeepSeekV41AttentionKernelTests` (both cases, including the 200-row threadgroup reduction
+and the value head wider than the record) and `DeepSeekV41GatherKernelTests` now read FP16
+records. Sensitivity was checked in the usual direction: transposing one lane of the
+`half4` load (`record.w` → `record.z`) fails 3 of the 5 attention and parity cases it was
+run against. The parity suite that matters for the graph —
+`testTheDeviceAndTheHostAgreeStageByStage`, `testTheChunkSeamReturnsTheWalksLogits`,
+`testEveryPositionOfABlockAttendsOverItsOwnRows`, `testTheDeviceAndTheHostAgreeOnCompressedRows`,
+`testACompressedBlockPrefillsLikeTheWalk` — passes unchanged at its existing bars. Whole
+DeepSeek suite: 420 tests, 14 skipped, 0 failures.

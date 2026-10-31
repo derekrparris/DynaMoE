@@ -496,7 +496,7 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
             throw XCTSkip("No Metal device")
         }
         guard let library = metal.makeDefaultLibrary(),
-              let function = library.makeFunction(name: "dsv41_attention_csa2_f32"),
+              let function = library.makeFunction(name: "dsv41_attention_csa2_f16"),
               let pipeline = try? metal.makeComputePipelineState(function: function),
               let queue = metal.makeCommandQueue() else {
             XCTFail("the attention kernel is not in the default library")
@@ -557,8 +557,15 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
         print("[dsv41 attention] heads=\(heads) qkHeadDim=\(qkHeadDim) width=\(width) sink=on")
 
         for rows in [128, 136, 640] {
-            let keys = sample(rows * width, seed: UInt64(rows) &+ 7)
-            guard let keyBuffer = buffer(keys) else {
+            // The records arrive at the cache's width; the host rule is given them
+            // widened, which is lossless.
+            let keys = sample(rows * width, seed: UInt64(rows) &+ 7).map { Float16($0) }
+            let widenedKeys = keys.map { Float($0) }
+            guard let keyBuffer = keys.withUnsafeBytes({ bytes in
+                metal.makeBuffer(
+                    bytes: bytes.baseAddress!, length: bytes.count, options: .storageModeShared
+                )
+            }) else {
                 XCTFail("the \(rows)-row key block did not allocate")
                 return
             }
@@ -626,7 +633,7 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
             let reference = DeepSeekV41AttentionReference.attend(
                 query: query,
                 keys: (0..<rows).map {
-                    Array(keys[($0 * width)..<(($0 + 1) * width)])
+                    Array(widenedKeys[($0 * width)..<(($0 + 1) * width)])
                 },
                 shape: shape,
                 sink: sink
@@ -652,6 +659,277 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
         }
     }
 
+    /// An FP16 gathered block against an FP32 one, at the published geometry.
+    ///
+    /// `#16` left one fact behind it: on a compressed layer `writeLatent` is 45% of
+    /// the dense half and essentially all of that IS the attention, whose cost is
+    /// the bytes it reads rather than the arithmetic it does. Every head reads the
+    /// whole gathered block twice — once for the scores, once for the values — and
+    /// the block is the SAME rows for all 128 of them, so the stage moves
+    /// `2 * heads * rows * recordBytes` per position. The record is 512 wide,
+    /// arrives from an FP16 cache, and was widened to FP32 by the gather, so half
+    /// of that traffic is padding that no kernel asked for.
+    ///
+    /// The two arms see the SAME key values: the block is sampled as `half` and the
+    /// FP32 arm reads those values widened, which is exactly what the gather does
+    /// to a cache row today. So this is an A/B of storage width alone, and the arms
+    /// must agree to the bit — which is also the assertion that makes wiring it
+    /// safe.
+    func testWhatAnFP16KeyBlockSavesOverAnFP32One() throws {
+        guard let metal = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal device")
+        }
+        guard let library = metal.makeDefaultLibrary(),
+              let fp32Function = library.makeFunction(name: "dsv41_attention_csa2_f32"),
+              let fp16Function = library.makeFunction(name: "dsv41_attention_csa2_f16"),
+              let fp32Pipeline = try? metal.makeComputePipelineState(function: fp32Function),
+              let fp16Pipeline = try? metal.makeComputePipelineState(function: fp16Function),
+              let queue = metal.makeCommandQueue() else {
+            XCTFail("both attention kernels must be in the default library")
+            return
+        }
+
+        let heads = 128
+        let qkHeadDim = 512
+        let valueDim = 512
+        let width = 512
+        let shape = DeepSeekV41AttentionShape(
+            numHeads: heads,
+            headsPerGroup: 16,
+            qkHeadDim: qkHeadDim,
+            vHeadDim: valueDim,
+            latentWidth: width,
+            qLoraRank: 1536,
+            oLoraRank: 1024,
+            isCompressed: true,
+            compressRatio: 2,
+            ropeTheta: 160000,
+            rotaryDim: 64
+        )
+
+        func sample(_ count: Int, seed: UInt64) -> [Float] {
+            var state = seed
+            return (0..<count).map { _ in
+                state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+                return Float(Int32(truncatingIfNeeded: state >> 33)) / Float(1 << 30)
+            }
+        }
+
+        let query = sample(heads * qkHeadDim, seed: 1)
+        let sink = sample(heads, seed: 3).map { $0 * 4 }
+
+        func floatBuffer(_ values: [Float]) -> MTLBuffer? {
+            values.withUnsafeBytes { bytes in
+                metal.makeBuffer(
+                    bytes: bytes.baseAddress!, length: bytes.count, options: .storageModeShared
+                )
+            }
+        }
+        func halfBuffer(_ values: [Float16]) -> MTLBuffer? {
+            values.withUnsafeBytes { bytes in
+                metal.makeBuffer(
+                    bytes: bytes.baseAddress!, length: bytes.count, options: .storageModeShared
+                )
+            }
+        }
+
+        guard let queryBuffer = floatBuffer(query),
+              let sinkBuffer = floatBuffer(sink),
+              let fp32Output = metal.makeBuffer(
+                  length: heads * valueDim * MemoryLayout<Float>.stride,
+                  options: .storageModeShared
+              ),
+              let fp16Output = metal.makeBuffer(
+                  length: heads * valueDim * MemoryLayout<Float>.stride,
+                  options: .storageModeShared
+              ) else {
+            XCTFail("the attention buffers did not allocate")
+            return
+        }
+
+        // Ramp the clocks before the sweep, so the first row count is not the
+        // slowest one by construction.
+        do {
+            let warmKeys = halfBuffer([Float16](repeating: 0.5, count: 1152 * width))
+            let warmOutput = metal.makeBuffer(
+                length: heads * valueDim * MemoryLayout<Float>.stride, options: .storageModeShared
+            )
+            if let warmKeys, let warmOutput, let command = queue.makeCommandBuffer(),
+               let encoder = command.makeComputeCommandEncoder() {
+                encoder.setComputePipelineState(fp16Pipeline)
+                encoder.setBuffer(queryBuffer, offset: 0, index: 0)
+                encoder.setBuffer(warmKeys, offset: 0, index: 1)
+                encoder.setBuffer(sinkBuffer, offset: 0, index: 2)
+                encoder.setBuffer(warmOutput, offset: 0, index: 3)
+                var warmRows = UInt32(1152)
+                var warmHeads = UInt32(heads)
+                var warmWidth = UInt32(qkHeadDim)
+                var warmValue = UInt32(valueDim)
+                var warmRecord = UInt32(width)
+                encoder.setBytes(&warmRows, length: 4, index: 4)
+                encoder.setBytes(&warmHeads, length: 4, index: 5)
+                encoder.setBytes(&warmWidth, length: 4, index: 6)
+                encoder.setBytes(&warmValue, length: 4, index: 7)
+                encoder.setBytes(&warmRecord, length: 4, index: 8)
+                encoder.setThreadgroupMemoryLength(
+                    (1152 + 32) * MemoryLayout<Float>.stride, index: 0
+                )
+                for _ in 0..<40 {
+                    encoder.dispatchThreadgroups(
+                        MTLSize(width: heads, height: 1, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
+                    )
+                }
+                encoder.endEncoding()
+                command.commit()
+                command.waitUntilCompleted()
+            }
+        }
+
+        print("[dsv41 key width] heads=\(heads) record=\(width) sink=on")
+
+        // 136 is one window plus the first compressed row, 640 is the published
+        // compressed layer's `window + index_topk`, and 1,152 is what a block's
+        // late positions read once the ring is full and the pool has filled.
+        for rows in [136, 640, 1152] {
+            let halfKeys: [Float16] = sample(rows * width, seed: UInt64(rows) &+ 11)
+                .map { Float16($0) }
+            let floatKeys = halfKeys.map { Float($0) }
+            guard let fp32Keys = floatBuffer(floatKeys),
+                  let fp16Keys = halfBuffer(halfKeys) else {
+                XCTFail("the \(rows)-row key blocks did not allocate")
+                return
+            }
+
+            func encode(
+                _ encoder: MTLComputeCommandEncoder,
+                pipeline: MTLComputePipelineState,
+                keys: MTLBuffer,
+                output: MTLBuffer
+            ) {
+                encoder.setComputePipelineState(pipeline)
+                encoder.setBuffer(queryBuffer, offset: 0, index: 0)
+                encoder.setBuffer(keys, offset: 0, index: 1)
+                encoder.setBuffer(sinkBuffer, offset: 0, index: 2)
+                encoder.setBuffer(output, offset: 0, index: 3)
+                var rowCount = UInt32(rows)
+                var headCount = UInt32(heads)
+                var headWidth = UInt32(qkHeadDim)
+                var headValue = UInt32(valueDim)
+                var recordWidth = UInt32(width)
+                encoder.setBytes(&rowCount, length: 4, index: 4)
+                encoder.setBytes(&headCount, length: 4, index: 5)
+                encoder.setBytes(&headWidth, length: 4, index: 6)
+                encoder.setBytes(&headValue, length: 4, index: 7)
+                encoder.setBytes(&recordWidth, length: 4, index: 8)
+            }
+
+            // One dispatch's GPU window, `repeats` of them per command buffer so
+            // submission cost divides out.
+            func window(
+                pipeline: MTLComputePipelineState,
+                keys: MTLBuffer,
+                output: MTLBuffer,
+                repeats: Int
+            ) -> Double? {
+                guard let command = queue.makeCommandBuffer(),
+                      let encoder = command.makeComputeCommandEncoder() else { return nil }
+                encode(encoder, pipeline: pipeline, keys: keys, output: output)
+                encoder.setThreadgroupMemoryLength(
+                    (rows + 32) * MemoryLayout<Float>.stride, index: 0
+                )
+                for _ in 0..<repeats {
+                    encoder.dispatchThreadgroups(
+                        MTLSize(width: heads, height: 1, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
+                    )
+                }
+                encoder.endEncoding()
+                command.commit()
+                command.waitUntilCompleted()
+                let elapsed = command.gpuEndTime - command.gpuStartTime
+                return elapsed / Double(repeats) * 1000
+            }
+
+            // The arms are INTERLEAVED rather than run one after the other: GPU
+            // clocks ramp across a sweep, and a first arm timed before the ramp
+            // reads slower than the same arm timed after it. Both arms get the same
+            // number of attempts, in the same clock state.
+            let repeats = rows >= 640 ? 8 : 24
+            let attempts = 6
+            _ = window(pipeline: fp32Pipeline, keys: fp32Keys, output: fp32Output, repeats: 1)
+            _ = window(pipeline: fp16Pipeline, keys: fp16Keys, output: fp16Output, repeats: 1)
+            var fp32Milliseconds = Double.infinity
+            var fp16Milliseconds = Double.infinity
+            for _ in 0..<attempts {
+                if let value = window(
+                    pipeline: fp32Pipeline, keys: fp32Keys, output: fp32Output, repeats: repeats
+                ) {
+                    fp32Milliseconds = min(fp32Milliseconds, value)
+                }
+                if let value = window(
+                    pipeline: fp16Pipeline, keys: fp16Keys, output: fp16Output, repeats: repeats
+                ) {
+                    fp16Milliseconds = min(fp16Milliseconds, value)
+                }
+            }
+            guard fp32Milliseconds.isFinite, fp16Milliseconds.isFinite else {
+                XCTFail("the \(rows)-row A/B did not run")
+                return
+            }
+
+            // Both arms are the same computation over the same values, so compare
+            // them to each other before comparing either to the host rule. The bar
+            // is a float-rounding one rather than exactness because the two kernels
+            // may sum their accumulators in different orders; when they sum them the
+            // same way it holds to the bit.
+            let fp32Values = floats(fp32Output, count: heads * valueDim)
+            let fp16Values = floats(fp16Output, count: heads * valueDim)
+            let outputScale = fp32Values.map(abs).max() ?? 1
+            XCTAssertLessThan(
+                worstDelta(fp32Values, fp16Values) / max(outputScale, 1e-6), 1e-5,
+                "\(rows) rows: halving the record changed the answer"
+            )
+
+            let reference = DeepSeekV41AttentionReference.attend(
+                query: query,
+                keys: (0..<rows).map { Array(floatKeys[($0 * width)..<(($0 + 1) * width)]) },
+                shape: shape,
+                sink: sink
+            )
+            for head in [0, 37] {
+                let range = (head * valueDim)..<((head + 1) * valueDim)
+                let scale = reference[range].map(abs).max() ?? 1
+                for (label, values) in [("fp32", fp32Values), ("fp16", fp16Values)] {
+                    XCTAssertLessThan(
+                        worstDelta(Array(values[range]), Array(reference[range]))
+                            / max(scale, 1e-6),
+                        1e-4,
+                        "\(rows) rows (\(label)): head \(head) does not match the host rule"
+                    )
+                }
+            }
+
+            // Two passes over the block per head, which is what the kernel reads:
+            // `qkHeadDim` wide for the scores and `valueDim` wide for the output.
+            let passBytes = Double(rows * (qkHeadDim + valueDim))
+            let fp32Traffic = 2 * Double(heads) * passBytes
+            let fp16Traffic = Double(heads) * passBytes
+            print(
+                String(
+                    format: "[dsv41 key width] %4d rows  fp32 %7.3f ms (%6.0f GB/s)  "
+                        + "fp16 %7.3f ms (%6.0f GB/s)  %5.2fx",
+                    rows,
+                    fp32Milliseconds,
+                    fp32Traffic / (fp32Milliseconds / 1000) / 1e9,
+                    fp16Milliseconds,
+                    fp16Traffic / (fp16Milliseconds / 1000) / 1e9,
+                    fp32Milliseconds / fp16Milliseconds
+                )
+            )
+        }
+    }
+
     /// One batched attention launch against eight single-position ones.
     ///
     /// `#14` established that `writeLatent`'s time IS the attention and that the
@@ -672,7 +950,7 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
             throw XCTSkip("No Metal device")
         }
         guard let library = metal.makeDefaultLibrary(),
-              let function = library.makeFunction(name: "dsv41_attention_csa2_f32"),
+              let function = library.makeFunction(name: "dsv41_attention_csa2_f16"),
               let pipeline = try? metal.makeComputePipelineState(function: function),
               let queue = metal.makeCommandQueue() else {
             XCTFail("the attention kernel is not in the default library")
@@ -723,10 +1001,18 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
         }
 
         let query = sampled(slots * heads * qkHeadDim, seed: 11)
-        let keys = sampled(slots * rowStride * width, seed: 13)
+        // Records at the cache's width, widened for the host rule. Both arms read
+        // the same block, so the A/B is still launch count and nothing else.
+        let keys = sampled(slots * rowStride * width, seed: 13).map { Float16($0) }
+        let widenedKeys = keys.map { Float($0) }
         let sink = sampled(heads, seed: 17).map { $0 * 4 }
+        let halfKeys = keys.withUnsafeBytes { bytes in
+            metal.makeBuffer(
+                bytes: bytes.baseAddress!, length: bytes.count, options: .storageModeShared
+            )
+        }
         guard let queryBuffer = buffer(query),
-              let keyBuffer = buffer(keys),
+              let keyBuffer = halfKeys,
               let sinkBuffer = buffer(sink),
               let outputBuffer = metal.makeBuffer(
                   length: slots * heads * valueDim * MemoryLayout<Float>.stride,
@@ -745,7 +1031,7 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
         }
 
         let querySlotBytes = heads * qkHeadDim * MemoryLayout<Float>.stride
-        let keySlotBytes = rowStride * width * MemoryLayout<Float>.stride
+        let keySlotBytes = rowStride * width * MemoryLayout<Float16>.stride
         let outputSlotBytes = heads * valueDim * MemoryLayout<Float>.stride
         let scoreBytes = (rowStride + 32) * MemoryLayout<Float>.stride
 
@@ -851,7 +1137,11 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
             let reference = DeepSeekV41AttentionReference.attend(
                 query: Array(query[queryBase..<(queryBase + heads * qkHeadDim)]),
                 keys: (0..<rowsBySlot[slot]).map {
-                    Array(keys[((slot * rowStride + $0) * width)..<((slot * rowStride + $0 + 1) * width)])
+                    Array(
+                        widenedKeys[
+                            ((slot * rowStride + $0) * width)..<((slot * rowStride + $0 + 1) * width)
+                        ]
+                    )
                 },
                 shape: shape,
                 sink: sink

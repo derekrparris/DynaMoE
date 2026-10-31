@@ -601,7 +601,7 @@ final class DeepSeekV41GatherKernelTests: XCTestCase {
                   length: indices.count * MemoryLayout<UInt32>.stride,
                   options: .storageModeShared),
               let dense = device.makeBuffer(
-                  length: 2 * width * MemoryLayout<Float>.stride,
+                  length: 2 * width * MemoryLayout<UInt16>.stride,
                   options: .storageModeShared),
               let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
@@ -634,10 +634,16 @@ final class DeepSeekV41GatherKernelTests: XCTestCase {
         commandBuffer.waitUntilCompleted()
         XCTAssertNil(commandBuffer.error)
 
-        let out = dense.contents().assumingMemoryBound(to: Float.self)
+        // The destination is the cache's own width, so this is a copy of FP16 rows
+        // rather than a widening of them.
+        let out = dense.contents().assumingMemoryBound(to: UInt16.self)
+        func row(_ index: Int) -> [Float] {
+            Array(UnsafeBufferPointer(start: out + index * width, count: width))
+                .map { Float(Float16(bitPattern: $0)) }
+        }
         // Bound at offset 0 this would read rows 77 and 77 (out of the buffer).
-        XCTAssertEqual(Array(UnsafeBufferPointer(start: out, count: 4)), [30, 31, 32, 33])
-        XCTAssertEqual(Array(UnsafeBufferPointer(start: out + 4, count: 4)), [10, 11, 12, 13])
+        XCTAssertEqual(row(0), [30, 31, 32, 33])
+        XCTAssertEqual(row(1), [10, 11, 12, 13])
     }
 }
 
@@ -645,12 +651,15 @@ final class DeepSeekV41GatherKernelTests: XCTestCase {
 
 final class DeepSeekV41AttentionKernelTests: XCTestCase {
 
+    /// The kernel production dispatches. The FP32 form is still in the library as
+    /// the A/B baseline for `Benchmarks/PERF_FINDINGS.md` "DSV4.1 #17", but the
+    /// contract that has to hold is the one the executor binds.
     private func makePipeline() throws -> (MTLDevice, MTLComputePipelineState, MTLCommandQueue) {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw XCTSkip("No Metal GPU device")
         }
         guard let library = device.makeDefaultLibrary(),
-              let function = library.makeFunction(name: "dsv41_attention_csa2_f32"),
+              let function = library.makeFunction(name: "dsv41_attention_csa2_f16"),
               let pipeline = try? device.makeComputePipelineState(function: function),
               let queue = device.makeCommandQueue() else {
             XCTFail("Could not build the attention pipeline")
@@ -702,7 +711,10 @@ final class DeepSeekV41AttentionKernelTests: XCTestCase {
             rotaryDim: 0
         )
         let query = values(heads * qkHeadDim, seed: 1)
-        let keys = values(rows * width, seed: 2)
+        // Records arrive at the cache's width. `values` produces eighths, which are
+        // exact in FP16, so widening them back for the host rule is lossless.
+        let keys = values(rows * width, seed: 2).map { Float16($0) }
+        let widenedKeys = keys.map { Float($0) }
         let sink = values(heads, seed: 3)
 
         guard let queryBuffer = device.makeBuffer(
@@ -711,7 +723,7 @@ final class DeepSeekV41AttentionKernelTests: XCTestCase {
                   options: .storageModeShared),
               let keyBuffer = device.makeBuffer(
                   bytes: keys,
-                  length: keys.count * MemoryLayout<Float>.stride,
+                  length: keys.count * MemoryLayout<Float16>.stride,
                   options: .storageModeShared),
               let sinkBuffer = device.makeBuffer(
                   bytes: sink,
@@ -755,7 +767,9 @@ final class DeepSeekV41AttentionKernelTests: XCTestCase {
 
         var reference = DeepSeekV41AttentionReference.attend(
             query: query,
-            keys: (0..<rows).map { Array(keys[($0 * width)..<(($0 + 1) * width)]) },
+            keys: (0..<rows).map {
+                Array(widenedKeys[($0 * width)..<(($0 + 1) * width)])
+            },
             shape: shape,
             sink: sink
         )
@@ -790,7 +804,7 @@ final class DeepSeekV41AttentionKernelTests: XCTestCase {
         let width = 4
         let rows = 1
         let query: [Float] = [1, 0, 0, 0, 0, 1, 0, 0]
-        let keys: [Float] = [0.5, -0.25, 1.5, -2]
+        let keys: [Float16] = [0.5, -0.25, 1.5, -2]
 
         guard let queryBuffer = device.makeBuffer(
                   bytes: query,
@@ -798,7 +812,7 @@ final class DeepSeekV41AttentionKernelTests: XCTestCase {
                   options: .storageModeShared),
               let keyBuffer = device.makeBuffer(
                   bytes: keys,
-                  length: keys.count * MemoryLayout<Float>.stride,
+                  length: keys.count * MemoryLayout<Float16>.stride,
                   options: .storageModeShared),
               let outputBuffer = device.makeBuffer(
                   length: heads * vHeadDim * MemoryLayout<Float>.stride,
@@ -839,8 +853,8 @@ final class DeepSeekV41AttentionKernelTests: XCTestCase {
         // query only scales the score, and a single weight normalizes away.
         let output = floats(outputBuffer, count: heads * vHeadDim)
         for dim in 0..<vHeadDim {
-            XCTAssertEqual(output[dim], keys[dim], accuracy: 1e-6)
-            XCTAssertEqual(output[vHeadDim + dim], keys[dim], accuracy: 1e-6)
+            XCTAssertEqual(output[dim], Float(keys[dim]), accuracy: 1e-6)
+            XCTAssertEqual(output[vHeadDim + dim], Float(keys[dim]), accuracy: 1e-6)
         }
     }
 }

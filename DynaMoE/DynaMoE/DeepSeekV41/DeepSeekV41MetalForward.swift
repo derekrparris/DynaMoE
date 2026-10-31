@@ -2928,6 +2928,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             offset: workspace.slotOffset(first, width: shape.queryWidth),
             index: 0
         )
+        // The gathered block holds FP16 records, the cache's own width, so the
+        // kernel that reads it is the half-key form. The row strides below are in
+        // rows, which is why nothing else about the dispatch changed.
         encoder.setBuffer(workspace.gathered, offset: 0, index: 1)
         // The slot is always bound: an absent sink becomes a buffer of `-1e30`, the
         // kernel's own "disabled" spelling, instead of an undefined slot.
