@@ -5130,3 +5130,134 @@ same log: the turn read 23.25 GB of experts at 8.6 GB/s with a 40.5% arena hit r
 ~2.6 GB of expert misses per token, about 0.30 s of the 0.37 s/token. The dense half is no
 longer the cost; the arena's hit rate is, and that is the next measurement rather than
 another kernel.
+
+## DSV4.1 #20: THE DECODE STEP WAS TWO KERNEL SHAPES, NOT THE DISK
+
+`#19` closed by naming the expert arena's hit rate as the next lever, on the strength of a
+turn that spent 0.30 s of 0.37 s/token waiting on 2.6 GB of expert misses. Measuring it said
+something else, and the difference matters because it sends the next slice somewhere else
+entirely.
+
+**The instrument.** The block path had `DeepSeekV41BlockTiming`; a decode step runs the walk,
+which commits two command buffers per layer and blocks on the host twice, so a token's cost
+can sit anywhere between the host and the GPU. `DeepSeekV41WalkTiming` (off unless
+`DeepSeekV41MetalForward.recordsWalkTiming` is on) now splits it into front encode, front
+wait, expert fill, mixture encode, and each half's own `gpuStartTime`/`gpuEndTime` window, and
+`DeepSeekV41PublishedTurnTests.testWhatADecodePositionCosts` runs the real checkpoint over a
+53-token prompt+answer sequence and prints the split. Per decoded position, before anything
+below was changed:
+
+| bucket | ms/position |
+|---|---:|
+| front encode (host) | 4.9 |
+| front wait (host, blocked) | 253.3 |
+| expert fill (host, pread) | 136.2 |
+| mixture encode (host) | 3.6 |
+| front half, device | 38.7 |
+| mixture half, device | 39.1 |
+| whole position | 398.0 |
+
+**The disk was already at its ceiling.** A raw measurement of the same read pattern
+against `model-00047` (5.9 MB ranges, distinct spans, `F_NOCACHE`): 13.43 GB/s at concurrency
+1, 13.84 at 4, 16, and 36; 13.19 GB/s for a batch of only 36 ranges (0.18 GB); 13.79 for
+0.5 GB. The streamer's own pread timers report 13-14 GB/s over a fill at the start of a
+sequence. A fill is therefore worth exactly the bytes it moves, and the bytes are the arena's
+hit rate — but the fill was 136 ms of 398, not 300 of 370: the token had moved on.
+
+**What the token was actually spending.** Each half read its weights through a kernel that
+gives a thread a WHOLE OUTPUT ROW and walks it block by block. With 32 lanes per warp a row
+apart, every lane's load pulls a 32-byte sector for one to sixteen useful bytes, and the
+reduction is one dependent chain per row. This is the same defect `#10`, `#13` and `#17`
+fixed for BF16 and for attention, and it had simply never been fixed for the two
+block-scaled formats this checkpoint actually ships.
+
+Isolated A/B of the new forms (`threadgroup` per output row, lanes striding the blocks,
+`simd_sum` reduction, threadgroup memory sized one float per SIMD group), one dispatch
+amortized over six distinct weight regions in one command buffer, best of 8:
+
+FP8 32x32 ue8m0, decode (one position):
+
+| projection | one thread/row | coalesced, 32 lanes | coalesced, 64 lanes |
+|---|---:|---:|---:|
+| `attn.wq_b` 32,768x1,280 | **0.308 ms** | 0.394 (0.78x) | 0.351 (0.88x) |
+| `attn.wo_b` 5,120x8,192 | 0.261 | **0.108 (2.42x, 370 GB/s)** | 0.110 (2.37x) |
+| `attn.wo_a` band 1,024x4,096 | 0.128 | **0.033 (3.93x)** | 0.033 (3.94x) |
+| `attn.wq_a` 1,280x5,120 | 0.156 | 0.039 (4.00x) | **0.038 (4.13x)** |
+| `attn.wkv` 512x5,120 | 0.153 | 0.032 (4.74x) | **0.028 (5.41x)** |
+| `shared_experts.w1` 2,304x5,120 | 0.174 | 0.052 (3.38x) | **0.045 (3.88x)** |
+
+MXFP4 routed expert, decode:
+
+| kernel | one thread/row | coalesced, 32 lanes | coalesced, 64 lanes |
+|---|---:|---:|---:|
+| fused gate+up 2,304x5,120 | 0.472 ms (48 GB/s) | **0.075 (6.33x, 300 GB/s)** | 0.092 (5.13x) |
+| down 5,120x2,304 | 0.133 (42 GB/s) | **0.057 (2.32x)** | 0.059 (2.26x) |
+
+Two things the table says that a rule needs:
+
+- **`wq_b` keeps the one-thread form.** It is 32,768 rows over 1,280 columns: 40 blocks, so a
+  32-lane row has one of them and only 40 lanes of a 64-lane group are ever busy, while the
+  grid becomes 32,768 threadgroups of almost no work. At a block of eight positions it is
+  worse still (0.588 → 0.850 ms, 0.69x). `fp8GemvWantsWideGrid` therefore requires
+  `inDim >= 1,024` AND leaves tall-narrow shapes on the old form until a rows-per-threadgroup
+  kernel exists; `wq_b` is ~12 ms/token of the dense half, so that is worth doing.
+- **32 lanes wins for the mixture and 64 for FP8.** A 32-lane group is one SIMD group, so
+  `simd_sum` finishes the reduction and the kernel returns without touching threadgroup
+  memory or a barrier at all; the fused gate+up pays for four accumulators, which is where the
+  wider group's barrier hurts most. Both widths measured, both shipped as measured
+  (`mixtureLaneWidth` 32, `gemvLaneWidth` 64).
+
+**After.** Same sequence, same tokens, only the kernels differing:
+
+| bucket | before | after |
+|---|---:|---:|
+| front half, device | 38.7 ms | **28.7 ms** |
+| mixture half, device | 39.1 ms | **27.0 ms** |
+| expert fill | 136.2 ms | 67.1 ms |
+| whole position | 398.0 ms | **204.6 ms** |
+| 53 positions, average | 315.6 ms | **220.1 ms** |
+
+The fill moved too, and not because of the kernels: the run above had the page cache serving
+part of it. The honest reading is that the GPU halves fell by 2.7x and 1.5x and the fill is a
+function of the arena's hit rate on the day.
+
+**The turn**, `Write three sentences about why the ocean is salty.`, greedy, 39 tokens:
+
+| | before | after |
+|---|---:|---:|
+| prefill (14 positions) | 7.15 s | **2.49 s** (2.04 s on an idle machine) |
+| decode (39 tokens) | 19.02 s (**488 ms/token**) | **8.35 s (214 ms/token)** |
+| answer | identical | identical |
+
+A second run immediately after another app-hosted test measured 12.42 s of decode, i.e. 318
+ms/token, with identical read counts — the difference is machine state (a 70 GB arena being
+released by the previous process and the page cache reclaiming), which is why the tables
+above are A/Bs inside one run rather than comparisons across runs.
+
+**`F_NOCACHE` on the expert descriptors was implemented, measured, and REVERTED.** The arena
+is the expert cache (~70 GB of whole pairs) and each pread also inserts its bytes into the
+unified buffer cache, so bypassing it looks like a way to stop two caches competing for the
+same RAM. It is a 2.2x loss: fills ran at 2-4 GB/s against 13.4-13.9 through the page cache,
+and the GPU halves slowed to 60 ms each as well, so the time was going somewhere other than
+the disk. A cold read of the same ranges through a plain buffer measures 13.8 GB/s either way,
+which says the cost is this destination (Metal shared memory), not the file cache. Do not
+re-propose it without a number that beats 13.9.
+
+**Tests.** `DeepSeekV41FP8GemvKernelTests` pins the coalesced FP8 form against a host rule
+(including the 32x32 scale grid, where 32 consecutive rows share one scale row), against the
+one-thread form, on a batch with input/output strides wider than the shape, and on a row
+shorter than the block count of a lane. `testWhatTheCoalescedFP8FormIsWorth` and
+`testWhatTheCoalescedMixtureIsWorth` are the A/Bs above, opt-in like the rest of the
+measurement file. The published turn answers identically and runs clean under
+`MTL_DEBUG_LAYER=1`; whole DeepSeek suite 457 tests, 23 skipped, 0 failures.
+
+**What is left, in the order the buckets now rank.** The expert fill is the largest single
+item (67 ms of 205) and it is disk-bound at 13-14 GB/s, so what improves it is fewer misses:
+the arena is `0.6 * RAM` (3,760 slots on 128 GB, ~71 GB) against 15,360 pairs, and one run
+measured the fill degrading from 13.9 GB/s to 8 GB/s as the arena filled, which is memory
+pressure rather than the disk. Second is `front wait` (130 ms of which ~56 ms is the two
+halves' own device time): a decode step makes 80 host round trips per token, and the queue's
+turnaround at ~1.9 ms/layer is now larger than the work it is waiting for. Third is the two
+shapes the rules deliberately left alone: `wq_b` (~12 ms/token) and the shared experts'
+FP8 swiglu and down (~21 ms/token), both of which want the same treatment with several rows
+per threadgroup rather than one.

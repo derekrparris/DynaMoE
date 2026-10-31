@@ -42,18 +42,38 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
     /// Touching this file runs the turn with the Engram layers silenced, which is
     /// how the memory path is ruled in or out as the cause of a bad answer.
     static let engramOffMarkerPath = "/tmp/dynamoe_dsv41_engram_off_test"
+    /// A prompt to use instead of the default, one line.
+    static let promptPath = "/tmp/dynamoe_dsv41_prompt"
+    /// Tokens to draw, for a run long enough to see the arena's steady state.
+    static let tokensPath = "/tmp/dynamoe_dsv41_tokens"
 
-    /// Fixed prompt. Short on purpose: every position costs a full 40-layer pass,
-    /// and the first turn pays the expert reads for all of them. Overridable from
-    /// the environment so a run can ask a question whose answer is not stylistic.
+    /// The prompt, readable from the environment or from a file beside the marker,
+    /// because `xcodebuild` does not forward the invoking shell's environment into
+    /// an app-hosted test. Short on purpose: every position costs a full 40-layer
+    /// pass, and the first turn pays the expert reads for all of them.
     private var userText: String {
-        ProcessInfo.processInfo.environment["DYNAMOE_DSV41_PROMPT"] ?? "hey"
+        if let text = ProcessInfo.processInfo.environment["DYNAMOE_DSV41_PROMPT"], !text.isEmpty {
+            return text
+        }
+        if let text = try? String(contentsOfFile: Self.promptPath, encoding: .utf8) {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return "hey"
     }
 
     /// Tokens the turn may draw. Enough to see a sentence start, small enough that
     /// a wrong graph is not paid for 200 times. Every token is a full 40-layer pass
-    /// over freshly streamed experts, so this is the test's whole cost.
-    private let firstTurnTokens = 8
+    /// over freshly streamed experts, so this is the test's whole cost. A number in
+    /// the marker file raises it, which is how a run measures the arena once it has
+    /// filled instead of during its first few cold tokens.
+    private var firstTurnTokens: Int {
+        if let text = try? String(contentsOfFile: Self.tokensPath, encoding: .utf8),
+           let count = Int(text.trimmingCharacters(in: .whitespacesAndNewlines)), count > 0 {
+            return count
+        }
+        return 8
+    }
 
     override func setUpWithError() throws {
         let enabled = ProcessInfo.processInfo.environment["DYNAMOE_DSV41_REAL_TURN"] == "1"
@@ -153,14 +173,78 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
 
     /// The draws the graph made, printed for the first few so a run that produces
     /// no words still says whether the logits were flat or confident.
+    ///
+    /// It also carries the arena's byte counter, because a decoded token's cost is
+    /// the expert bytes it misses on divided by the disk's rate: a token that reads
+    /// more than the six experts per layer it routed is an arena problem, and one
+    /// that reads exactly that is the hit rate to fix.
     private final class DrawLog: @unchecked Sendable {
+        private let lock = NSLock()
         private var count = 0
-        func record(logits: [Float], drawn: UInt32, generated: Int) {
-            guard count < 3 else { return }
+        private var previousBytes = -1
+        private var previousHits = 0
+        private var previousAcquisitions = 0
+        private var prefillBytes = 0
+        private var perTokenBytes: [Int] = []
+        private var perTokenHits: [(hits: Int, acquisitions: Int)] = []
+
+        func record(
+            logits: [Float],
+            drawn: UInt32,
+            generated: Int,
+            bytesRead: Int,
+            hits: Int,
+            acquisitions: Int
+        ) {
+            lock.lock()
+            defer { lock.unlock() }
+            if count < 3 {
+                let top = logits.enumerated().sorted { $0.element > $1.element }.prefix(5)
+                let shown = top.map { "\($0.offset):\(String(format: "%.2f", $0.element))" }
+                print("🔎 [dsv41 real] draw \(generated): \(drawn) top5 \(shown.joined(separator: " "))")
+            }
+            if previousBytes < 0 {
+                prefillBytes = bytesRead
+                print(
+                    "🔎 [dsv41 real] prefill read "
+                        + String(format: "%.2f GB", Double(bytesRead) / 1_073_741_824)
+                )
+            } else {
+                let delta = bytesRead - previousBytes
+                perTokenBytes.append(delta)
+                perTokenHits.append((hits - previousHits, acquisitions - previousAcquisitions))
+                if perTokenBytes.count <= 32 {
+                    let ratio = Double(hits - previousHits) / Double(max(1, acquisitions - previousAcquisitions))
+                    print(
+                        "🔎 [dsv41 real] token \(generated): read "
+                            + String(format: "%.1f MB, %.0f%% hit", Double(delta) / 1_048_576, ratio * 100)
+                    )
+                }
+            }
+            previousBytes = bytesRead
+            previousHits = hits
+            previousAcquisitions = acquisitions
             count += 1
-            let top = logits.enumerated().sorted { $0.element > $1.element }.prefix(5)
-            let shown = top.map { "\($0.offset):\(String(format: "%.2f", $0.element))" }
-            print("🔎 [dsv41 real] draw \(generated): \(drawn) top5 \(shown.joined(separator: " "))")
+        }
+
+        /// The steady-state view: the last half of the draws, which is after the
+        /// arena has filled, because a turn's first tokens are always cold.
+        func summary() -> String {
+            lock.lock()
+            defer { lock.unlock() }
+            guard !perTokenBytes.isEmpty else { return "no decode draws" }
+            let tail = perTokenBytes.suffix(max(1, perTokenBytes.count / 2))
+            let tailHits = perTokenHits.suffix(max(1, perTokenHits.count / 2))
+            let meanBytes = tail.reduce(0, +) / tail.count
+            let acquisitions = tailHits.reduce(0) { $0 + $1.acquisitions }
+            let hits = tailHits.reduce(0) { $0 + $1.hits }
+            return String(
+                format: "prefill %.2f GB, steady-state %.1f MB/token at %.0f%% hit over %d token(s)",
+                Double(prefillBytes) / 1_073_741_824,
+                Double(meanBytes) / 1_048_576,
+                Double(hits) / Double(max(1, acquisitions)) * 100,
+                tail.count
+            )
         }
     }
 
@@ -554,8 +638,90 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         withExtendedLifetime(engine) {}
     }
 
-    func testAPublishedPromptCompletesATurn() async throws {
+    /// What one decoded position costs, and which bucket holds it.
+    ///
+    /// A turn's decode loop is the whole user-visible speed of this model, and it is
+    /// one position at a time through the walk: two command buffers per layer, a host
+    /// block on the first of each, and an arena fill in between. The block path
+    /// reports its buckets, the walk did not, so this turns the walk's timing on and
+    /// prints the split instead of guessing from a wall clock. The first positions
+    /// are spent filling the arena and are printed but not averaged.
+    func testWhatADecodePositionCosts() async throws {
         let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        // The prompt a real turn renders followed by the tokens that turn drew, so the
+        // routing and the cache depth are the ones a decode loop actually sees. A
+        // short prefix routes to a narrow expert set and the arena then serves most of
+        // it from the page cache, which is not what a long answer costs.
+        let tokens = [
+            0, 128803, 21750, 2038, 15174, 943, 3939, 270, 15571, 344, 83779, 16, 128804, 128822,
+            19, 16, 17289, 9372, 344, 10526, 44691, 305, 14, 1060, 15390, 294, 1737, 14, 1843,
+            5258, 20450, 377, 3155, 14, 30663, 32453, 19504, 46885, 965, 35868, 20012, 305,
+            32604, 965, 23418, 27124, 396, 7457, 1066, 304, 270, 8343, 603
+        ]
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: tokens.count,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let carryOn = try await Task.detached { [runtime] () -> String in
+            let executor = runtime.forward()
+            executor.reset()
+            executor.recordsWalkTiming = true
+            var measured: [Double] = []
+            var host: [Double] = []
+            for (position, token) in tokens.enumerated() {
+                executor.resetWalkTiming()
+                let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
+                let timingBefore = runtime.expertStreamer?.timing
+                    ?? (reading: 0, allocating: 0, slotsAllocated: 0)
+                let started = DispatchTime.now().uptimeNanoseconds
+                _ = try executor.forwardToken(token, position: position)
+                let nanoseconds = DispatchTime.now().uptimeNanoseconds - started
+                let read = (runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore
+                let timingAfter = runtime.expertStreamer?.timing
+                    ?? (reading: 0, allocating: 0, slotsAllocated: 0)
+                if position % 4 == 0 || position == tokens.count - 1 {
+                    print(
+                        "🔎 [dsv41 real] position \(position): "
+                            + String(format: "%.1f ms, read %.1f MB, pread %.1f ms, "
+                                     + "slot alloc %.1f ms (%d new)",
+                                     Double(nanoseconds) / 1_000_000,
+                                     Double(read) / 1_048_576,
+                                     (timingAfter.reading - timingBefore.reading) * 1000,
+                                     (timingAfter.allocating - timingBefore.allocating) * 1000,
+                                     timingAfter.slotsAllocated - timingBefore.slotsAllocated)
+                    )
+                    print("🔎 [dsv41 real]   \(executor.walkTiming.describe())")
+                }
+                if position > 0 {
+                    measured.append(Double(nanoseconds) / 1_000_000)
+                    host.append(Double(executor.walkTiming.hostNanoseconds) / 1_000_000)
+                }
+            }
+            func mean(_ values: [Double]) -> Double {
+                values.reduce(0, +) / Double(max(1, values.count))
+            }
+            return String(
+                format: "decode position over %d position(s): %.1f ms wall, %.1f ms host, "
+                    + "so %.1f ms is device and the head",
+                measured.count,
+                mean(measured),
+                mean(host),
+                mean(measured) - mean(host)
+            )
+        }.value
+        print("🔎 [dsv41 real] \(carryOn)")
+        withExtendedLifetime(engine) {}
+    }
+
+    func testAPublishedPromptCompletesATurn() async throws {        let snapshot = try snapshotDirectory()
         let config = try DeepSeekV41Config.decode(
             contentsOf: snapshot.appendingPathComponent("config.json")
         )
@@ -623,7 +789,14 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
                 settings: settings,
                 sample: { logits, generated in
                     let token = Self.argmax(logits)
-                    draws.record(logits: logits, drawn: token, generated: generated.count)
+                    draws.record(
+                        logits: logits,
+                        drawn: token,
+                        generated: generated.count,
+                        bytesRead: runtime.expertStreamer?.bytesRead ?? 0,
+                        hits: runtime.arena.hits,
+                        acquisitions: runtime.arena.acquisitions
+                    )
                     return token
                 },
                 decode: { (try? tokenizer.decode(ids: $0)) ?? "" }
@@ -644,6 +817,7 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             "🔎 [dsv41 real] experts after turn: \(runtime.arena.residentCount)/\(runtime.arena.capacity) resident, "
                 + String(format: "%.1f%% hit rate", runtime.arena.hitRate * 100)
         )
+        print("🔎 [dsv41 real] read: \(draws.summary())")
         print("🔎 [dsv41 real] \(runtime.expertStreamer?.describe() ?? "no streamer")")
         withExtendedLifetime(engine) {}
     }

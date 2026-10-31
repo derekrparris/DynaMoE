@@ -1784,3 +1784,290 @@ final class DeepSeekV41HyperConnectionKernelTests: XCTestCase {
         }
     }
 }
+
+// MARK: - FP8 block-scaled GEMV forms
+
+/// The two shapes of one 32x32 ue8m0 dot product, checked against each other and
+/// against the host rule.
+///
+/// `dsv41_fp8_block32_gemv` walks a row in one lane; `dsv41_fp8_block32_gemv_rows`
+/// strides the row across a threadgroup. They must agree to rounding, and both must
+/// agree with the arithmetic the checkpoint's scale grid describes, because a lane
+/// reading the wrong scale row (the grid is 32x32, so 32 consecutive rows share one)
+/// still produces numbers of a plausible size.
+final class DeepSeekV41FP8GemvKernelTests: XCTestCase {
+
+    private func environment() throws -> (MTLDevice, MTLLibrary, MTLCommandQueue) {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        guard let library = device.makeDefaultLibrary() else {
+            XCTFail("the default library is missing")
+            throw XCTSkip("no default library")
+        }
+        guard let queue = device.makeCommandQueue() else {
+            XCTFail("no compute queue")
+            throw XCTSkip("no compute queue")
+        }
+        return (device, library, queue)
+    }
+
+    /// E4M3 bytes whose exponents stay in the finite range, so a decoded value is a
+    /// plain number: exponent 0 is subnormal and 15 is NaN/Inf territory.
+    private func weightBytes(_ count: Int) -> [UInt8] {
+        (0..<count).map { index in
+            let sign: UInt8 = (index % 7 == 3) ? 0x80 : 0
+            let exponent = UInt8((index / 5) % 9)
+            let mantissa = UInt8(index % 8)
+            return sign | (exponent << 3) | mantissa
+        }
+    }
+
+    /// Block scales near 2^0, so the block sums stay in a range where a relative bar
+    /// means something.
+    private func scaleBytes(_ count: Int) -> [UInt8] {
+        (0..<count).map { index in UInt8(124 + (index % 7)) }
+    }
+
+    private func values(_ count: Int) -> [Float] {
+        (0..<count).map { index in Float((index &* 29 &+ 7) % 17 - 8) / 16 }
+    }
+
+    /// The host rule: per 32-value block, the dot product scaled by that block's
+    /// E8M0 byte, summed over the row. The scale row is `row / 32` because the
+    /// checkpoint's grid is 32x32.
+    private func reference(
+        weight: [UInt8],
+        scales: [UInt8],
+        inDim: Int,
+        outDim: Int,
+        tokens: Int,
+        input: [Float],
+        inputRowStride: Int,
+        outputRowStride: Int
+    ) -> [Float] {
+        let blocks = max(1, inDim / 32)
+        var out = [Float](repeating: 0, count: tokens * outputRowStride)
+        for token in 0..<tokens {
+            for row in 0..<outDim {
+                var total: Float = 0
+                for block in 0..<blocks {
+                    let scale = DeepSeekV41EngramRowDequantizer.e8m0(
+                        scales[(row / 32) * blocks + block]
+                    )
+                    var blockDot: Float = 0
+                    for index in 0..<32 {
+                        let at = row * inDim + block * 32 + index
+                        blockDot += DeepSeekV41EngramRowDequantizer.e4m3(weight[at])
+                            * input[token * inputRowStride + block * 32 + index]
+                    }
+                    total += blockDot * scale
+                }
+                out[token * outputRowStride + row] = total
+            }
+        }
+        return out
+    }
+
+    /// Runs the shipped shape and the coalesced one over the same bytes.
+    private func dispatch(
+        pipeline: MTLComputePipelineState,
+        wideGrid: Bool,
+        device: MTLDevice,
+        queue: MTLCommandQueue,
+        weight: MTLBuffer,
+        scale: MTLBuffer,
+        input: MTLBuffer,
+        output: MTLBuffer,
+        inDim: Int,
+        outDim: Int,
+        tokens: Int,
+        inputRowStride: Int,
+        outputRowStride: Int
+    ) throws {
+        guard let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("no command buffer")
+            return
+        }
+        var weightOffset = UInt64(0)
+        var scaleOffset = UInt64(0)
+        var inDimension = UInt32(inDim)
+        var outDimension = UInt32(outDim)
+        var inStride = UInt32(inputRowStride)
+        var outStride = UInt32(outputRowStride)
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(weight, offset: 0, index: 0)
+        encoder.setBuffer(scale, offset: 0, index: 1)
+        encoder.setBuffer(input, offset: 0, index: 2)
+        encoder.setBuffer(output, offset: 0, index: 3)
+        encoder.setBytes(&weightOffset, length: 8, index: 4)
+        encoder.setBytes(&scaleOffset, length: 8, index: 5)
+        encoder.setBytes(&inDimension, length: 4, index: 6)
+        encoder.setBytes(&outDimension, length: 4, index: 7)
+        encoder.setBytes(&inStride, length: 4, index: 8)
+        encoder.setBytes(&outStride, length: 4, index: 9)
+        if wideGrid {
+            encoder.setThreadgroupMemoryLength(
+                32 * MemoryLayout<Float>.stride, index: 0
+            )
+            encoder.dispatchThreadgroups(
+                MTLSize(width: outDim * tokens, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
+            )
+        } else {
+            encoder.dispatchThreads(
+                MTLSize(width: outDim, height: tokens, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
+            )
+        }
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+    }
+
+    private func floats(_ buffer: MTLBuffer, count: Int) -> [Float] {
+        let pointer = buffer.contents().assumingMemoryBound(to: Float.self)
+        return Array(UnsafeBufferPointer(start: pointer, count: count))
+    }
+
+    /// One shape through all three: the host rule, the one-thread form, the
+    /// coalesced form. `inDim` 1,280 is 40 blocks against 64 lanes, so most lanes
+    /// read one block and the tail of the threadgroup has nothing to do — the case a
+    /// reduction across SIMD groups gets wrong if it reads an unwritten partial.
+    private func check(
+        outDim: Int,
+        inDim: Int,
+        tokens: Int,
+        inputRowStride: Int? = nil,
+        outputRowStride: Int? = nil
+    ) throws {
+        let (device, library, queue) = try environment()
+        guard let perRowFunction = library.makeFunction(
+                  name: DeepSeekV41Kernels.fp8Gemv
+              ),
+              let rowsFunction = library.makeFunction(
+                  name: DeepSeekV41Kernels.fp8GemvRows
+              ),
+              let perRow = try? device.makeComputePipelineState(function: perRowFunction),
+              let rows = try? device.makeComputePipelineState(function: rowsFunction) else {
+            XCTFail("the FP8 GEMV kernels are not in the default library")
+            return
+        }
+        let inStride = inputRowStride ?? inDim
+        let outStride = outputRowStride ?? outDim
+        let blocks = inDim / 32
+        let weight = weightBytes(outDim * inDim)
+        let scales = scaleBytes((outDim / 32) * blocks)
+        let input = values(tokens * inStride)
+        guard let weightBuffer = device.makeBuffer(
+                  bytes: weight,
+                  length: weight.count * MemoryLayout<UInt8>.stride,
+                  options: .storageModeShared),
+              let scaleBuffer = device.makeBuffer(
+                  bytes: scales,
+                  length: scales.count * MemoryLayout<UInt8>.stride,
+                  options: .storageModeShared),
+              let inputBuffer = device.makeBuffer(
+                  bytes: input,
+                  length: input.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let perRowOutput = device.makeBuffer(
+                  length: tokens * outStride * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let rowsOutput = device.makeBuffer(
+                  length: tokens * outStride * MemoryLayout<Float>.stride,
+                  options: .storageModeShared) else {
+            XCTFail("the FP8 GEMV buffers did not allocate")
+            return
+        }
+        memset(perRowOutput.contents(), 0, perRowOutput.length)
+        memset(rowsOutput.contents(), 0, rowsOutput.length)
+
+        try dispatch(
+            pipeline: perRow, wideGrid: false, device: device, queue: queue,
+            weight: weightBuffer, scale: scaleBuffer, input: inputBuffer,
+            output: perRowOutput, inDim: inDim, outDim: outDim, tokens: tokens,
+            inputRowStride: inStride, outputRowStride: outStride
+        )
+        try dispatch(
+            pipeline: rows, wideGrid: true, device: device, queue: queue,
+            weight: weightBuffer, scale: scaleBuffer, input: inputBuffer,
+            output: rowsOutput, inDim: inDim, outDim: outDim, tokens: tokens,
+            inputRowStride: inStride, outputRowStride: outStride
+        )
+
+        let expected = reference(
+            weight: weight, scales: scales, inDim: inDim, outDim: outDim, tokens: tokens,
+            input: input, inputRowStride: inStride, outputRowStride: outStride
+        )
+        let shipped = floats(perRowOutput, count: tokens * outStride)
+        let coalesced = floats(rowsOutput, count: tokens * outStride)
+        var worstExpected: Float = 0
+        var worstShipped: Float = 0
+        for token in 0..<tokens {
+            for row in 0..<outDim {
+                let at = token * outStride + row
+                worstExpected = max(worstExpected, abs(coalesced[at] - expected[at]))
+                worstShipped = max(worstShipped, abs(shipped[at] - expected[at]))
+            }
+        }
+        // The two forms sum the same products in a different order, and the host rule
+        // in a third; a bar scaled to the values keeps it a rounding check.
+        let magnitude = max(1, expected.map { abs($0) }.max() ?? 1)
+        XCTAssertLessThan(
+            worstExpected, magnitude * 1e-4,
+            "coalesced form drifted from the host rule at \(outDim)x\(inDim), \(tokens) token(s)"
+        )
+        XCTAssertLessThan(
+            worstShipped, magnitude * 1e-4,
+            "the shipped form drifted from the host rule at \(outDim)x\(inDim)"
+        )
+    }
+
+    func testTheCoalescedFormMatchesTheHostRuleAtAPublishedWidth() throws {
+        try check(outDim: 96, inDim: 1_280, tokens: 1)
+    }
+
+    /// A block of positions addresses its rows with strides wider than the shape, so
+    /// a kernel that ignores them writes every position on top of the first.
+    func testTheCoalescedFormHonoursPositionStrides() throws {
+        try check(
+            outDim: 64, inDim: 2_304, tokens: 3,
+            inputRowStride: 2_560, outputRowStride: 96
+        )
+    }
+
+    /// Rows shorter than the block count of a lane: 512 values is 16 blocks against
+    /// 64 lanes, so 48 lanes contribute a zero partial.
+    func testTheCoalescedFormHandlesAShortRow() throws {
+        try check(outDim: 96, inDim: 1_024, tokens: 1)
+    }
+
+    /// The rule that decides the dispatch: every published dense projection is wide
+    /// enough for the coalesced form, and a shape too short to amortize the reduction
+    /// barrier is not.
+    func testTheFormRuleCoversThePublishedDenseShapes() {
+        let published = [
+            ("attn.wq_b", 32_768, 1_280),
+            ("attn.wo_b", 5_120, 8_192),
+            ("attn.wo_a band", 1_024, 4_096),
+            ("attn.wq_a", 1_280, 5_120),
+            ("attn.wkv", 512, 5_120),
+            ("shared_experts.w1", 2_304, 5_120)
+        ]
+        for (name, outDim, inDim) in published {
+            XCTAssertTrue(
+                DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(
+                    outDim: outDim, inDim: inDim, rows: 1
+                ),
+                "\(name) should take the coalesced form"
+            )
+        }
+        XCTAssertFalse(
+            DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(outDim: 16, inDim: 512, rows: 1),
+            "16 rows over 512 columns is too little work to pay for a barrier"
+        )
+    }
+}

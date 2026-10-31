@@ -340,9 +340,15 @@ nonisolated public final class DeepSeekV41DeviceWeights: @unchecked Sendable {
 /// hard load failure rather than a silently skipped stage.
 nonisolated public struct DeepSeekV41Pipelines {
     public let fp8Block32Gemv: MTLComputePipelineState
+    /// The same 32x32 ue8m0 dot product with one output row per threadgroup, so a
+    /// warp's weight loads are adjacent rather than a row apart.
+    public let fp8Block32GemvRows: MTLComputePipelineState
     public let mxfp4Gemv: MTLComputePipelineState
     public let mxfp4SwiGLU: MTLComputePipelineState
     public let mxfp4DownAccumulate: MTLComputePipelineState
+    /// The same two with one output row per threadgroup (coalesced weight loads).
+    public let mxfp4SwiGLURows: MTLComputePipelineState
+    public let mxfp4DownAccumulateRows: MTLComputePipelineState
     public let engramDequantRows: MTLComputePipelineState
     /// The Engram gate and residual add, one threadgroup per hyper-connection copy.
     public let engramGate: MTLComputePipelineState
@@ -394,9 +400,12 @@ nonisolated public struct DeepSeekV41Pipelines {
             return try device.makeComputePipelineState(function: function)
         }
         self.fp8Block32Gemv = try make("dsv41_fp8_block32_gemv")
+        self.fp8Block32GemvRows = try make("dsv41_fp8_block32_gemv_rows")
         self.mxfp4Gemv = try make("dsv41_mxfp4_gemv")
         self.mxfp4SwiGLU = try make("dsv41_mxfp4_swiglu_gate_up")
         self.mxfp4DownAccumulate = try make("dsv41_mxfp4_down_accumulate")
+        self.mxfp4SwiGLURows = try make("dsv41_mxfp4_swiglu_gate_up_rows")
+        self.mxfp4DownAccumulateRows = try make("dsv41_mxfp4_down_accumulate_rows")
         self.engramDequantRows = try make("dsv41_engram_dequant_rows")
         self.engramGate = try make("dsv41_engram_gate_f32")
         self.hcSinkhorn = try make("dsv41_hc_sinkhorn")

@@ -2296,4 +2296,490 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
             print(head + columns.joined(separator: "  ") + ratios)
         }
     }
+
+    // MARK: FP8 block-scaled GEMV forms
+
+    /// What the coalesced FP8 form is worth, at the widths the checkpoint publishes.
+    ///
+    /// The dense half of a decoded token is ~6.2 GB of E4M3 read exactly once, and
+    /// every one of those projections runs `dsv41_fp8_block32_gemv`: a thread per
+    /// output row, so a warp's 32 lanes are a full row apart and a 32-byte sector
+    /// serves one byte. `dsv41_fp8_block32_gemv_rows` gives the row a threadgroup and
+    /// strides its blocks across the lanes, which makes each step a contiguous
+    /// window, at the cost of a reduction barrier per row.
+    ///
+    /// Each shape is timed in both forms, interleaved inside each repetition so a
+    /// first-timed arm does not pay for being first (`Benchmarks/PERF_FINDINGS.md`,
+    /// "DSV4.1 #5"), and both outputs are checked against each other before the
+    /// numbers are printed, so a 10x that is computing something else cannot pass
+    /// for a win. `rows` 1 is a decode step and 8 is a full prefill block.
+    func testWhatTheCoalescedFP8FormIsWorth() throws {
+        guard let metal = MTLCreateSystemDefaultDevice(),
+              let library = metal.makeDefaultLibrary(),
+              let perRowFunction = library.makeFunction(name: DeepSeekV41Kernels.fp8Gemv),
+              let rowsFunction = library.makeFunction(name: DeepSeekV41Kernels.fp8GemvRows),
+              let perRow = try? metal.makeComputePipelineState(function: perRowFunction),
+              let rowsPipeline = try? metal.makeComputePipelineState(function: rowsFunction),
+              let queue = metal.makeCommandQueue() else {
+            XCTFail("the FP8 GEMV kernels are not in the default library")
+            return
+        }
+
+        let repetitions = 8
+
+        // Safe E4M3 patterns: exponents 0-8 keep every decoded value finite, and the
+        // scales sit near 2^0, so the two forms can be compared numerically.
+        let weightTile: [UInt8] = (0..<4_096).map { index in
+            let sign: UInt8 = (index % 7 == 3) ? 0x80 : 0
+            return sign | (UInt8((index / 5) % 9) << 3) | UInt8(index % 8)
+        }
+        let scaleTile: [UInt8] = (0..<256).map { UInt8(124 + ($0 % 7)) }
+        let inputTile: [Float] = (0..<4_096).map { Float(($0 &* 29 &+ 7) % 17 - 8) / 16 }
+
+        func fill<T>(_ buffer: MTLBuffer, bytes: Int, tile: [T]) {
+            let valueStride = MemoryLayout<T>.stride
+            let destination = buffer.contents()
+            tile.withUnsafeBytes { source in
+                guard let base = source.baseAddress else { return }
+                var written = 0
+                while written < bytes {
+                    let chunk = min(tile.count * valueStride, bytes - written)
+                    memcpy(destination + written, base, chunk)
+                    written += chunk
+                }
+            }
+        }
+
+        func encode(
+            _ pipeline: MTLComputePipelineState,
+            wide: Bool,
+            lanes: Int,
+            weight: MTLBuffer,
+            scale: MTLBuffer,
+            input: MTLBuffer,
+            output: MTLBuffer,
+            inDim: Int,
+            outDim: Int,
+            tokens: Int,
+            weightBytes: Int,
+            repeats: Int
+        ) {
+            guard let commandBuffer = queue.makeCommandBuffer(),
+                  let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+            var scaleOffset = UInt64(0)
+            var inDimension = UInt32(inDim)
+            var outDimension = UInt32(outDim)
+            var zero = UInt32(0)
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(weight, offset: 0, index: 0)
+            encoder.setBuffer(scale, offset: 0, index: 1)
+            encoder.setBuffer(input, offset: 0, index: 2)
+            encoder.setBuffer(output, offset: 0, index: 3)
+            encoder.setBytes(&scaleOffset, length: 8, index: 5)
+            encoder.setBytes(&inDimension, length: 4, index: 6)
+            encoder.setBytes(&outDimension, length: 4, index: 7)
+            encoder.setBytes(&zero, length: 4, index: 8)
+            encoder.setBytes(&zero, length: 4, index: 9)
+            if wide {
+                encoder.setThreadgroupMemoryLength(32 * MemoryLayout<Float>.stride, index: 0)
+            }
+            for repeatIndex in 0..<max(1, repeats) {
+                // A different region per dispatch, so the queue is reading a weight the
+                // previous dispatch did not just pull into the cache.
+                var weightOffset = UInt64(repeatIndex * weightBytes)
+                encoder.setBytes(&weightOffset, length: 8, index: 4)
+                if wide {
+                    encoder.dispatchThreadgroups(
+                        MTLSize(width: outDim * tokens, height: 1, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+                    )
+                } else {
+                    encoder.dispatchThreads(
+                        MTLSize(width: outDim, height: tokens, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+                    )
+                }
+            }
+            encoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+        }
+
+        /// One shape: validate the two forms against each other, then time them.
+        ///
+        /// `dispatches` distinct weight regions in one command buffer, so the
+        /// commit-and-wait round trip (~0.1 ms, which is most of a small projection's
+        /// whole cost) is amortized and each region is read cold rather than served
+        /// from the cache the previous one left behind. Every number below is that
+        /// total divided by `dispatches`.
+        func measure(
+            name: String,
+            outDim: Int,
+            inDim: Int,
+            tokens: Int,
+            dispatches: Int = 6,
+            laneWidths: [Int] = [32, 64]
+        ) {
+            let weightBytes = outDim * inDim
+            let blocks = inDim / 32
+            let scaleBytes = (outDim / 32) * blocks
+            guard let weight = metal.makeBuffer(
+                      length: weightBytes * dispatches, options: .storageModeShared
+                  ),
+                  let scale = metal.makeBuffer(length: scaleBytes, options: .storageModeShared),
+                  let input = metal.makeBuffer(
+                      length: tokens * inDim * MemoryLayout<Float>.stride,
+                      options: .storageModeShared
+                  ),
+                  let perRowOutput = metal.makeBuffer(
+                      length: tokens * outDim * MemoryLayout<Float>.stride,
+                      options: .storageModeShared
+                  ),
+                  let rowsOutput = metal.makeBuffer(
+                      length: tokens * outDim * MemoryLayout<Float>.stride,
+                      options: .storageModeShared
+                  ) else {
+                XCTFail("\(name): buffers did not allocate")
+                return
+            }
+            fill(weight, bytes: weightBytes * dispatches, tile: weightTile)
+            fill(scale, bytes: scaleBytes, tile: scaleTile)
+            fill(input, bytes: tokens * inDim * MemoryLayout<Float>.stride, tile: inputTile)
+            memset(perRowOutput.contents(), 0, perRowOutput.length)
+            memset(rowsOutput.contents(), 0, rowsOutput.length)
+
+            func run(
+                _ pipeline: MTLComputePipelineState,
+                wide: Bool,
+                lanes: Int,
+                output: MTLBuffer,
+                repeats: Int
+            ) {
+                encode(
+                    pipeline, wide: wide, lanes: lanes, weight: weight, scale: scale,
+                    input: input, output: output, inDim: inDim, outDim: outDim,
+                    tokens: tokens, weightBytes: weightBytes, repeats: repeats
+                )
+            }
+
+            run(perRow, wide: false, lanes: 64, output: perRowOutput, repeats: 1)
+            run(rowsPipeline, wide: true, lanes: laneWidths[0], output: rowsOutput, repeats: 1)
+            let first = floats(perRowOutput, count: tokens * outDim)
+            let second = floats(rowsOutput, count: tokens * outDim)
+            let magnitude = max(1, first.map { abs($0) }.max() ?? 1)
+            let drift = worstDelta(first, second)
+            print(
+                String(
+                    format: "[dsv41 fp8 form] %-22@ %5dx%-5d rows %d  drift %.3g / %.3g",
+                    name as NSString, outDim, inDim, tokens, drift, magnitude
+                )
+            )
+            guard drift < magnitude * 1e-3 else {
+                print("[dsv41 fp8 form] \(name): the two forms disagree, not timing it")
+                return
+            }
+
+            var perRowBest = Double.infinity
+            for _ in 0..<repetitions {
+                perRowBest = min(perRowBest, milliseconds {
+                    run(perRow, wide: false, lanes: 64, output: perRowOutput, repeats: dispatches)
+                })
+            }
+            // Interleaved inside each repetition, so a first-timed arm does not pay
+            // for being first; that mistake once swung this file's numbers by half
+            // (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #5").
+            var wideBest: [Int: Double] = [:]
+            for lane in laneWidths { wideBest[lane] = Double.infinity }
+            for _ in 0..<repetitions {
+                for lane in laneWidths {
+                    wideBest[lane] = min(wideBest[lane] ?? .infinity, milliseconds {
+                        run(rowsPipeline, wide: true, lanes: lane, output: rowsOutput,
+                            repeats: dispatches)
+                    })
+                }
+                perRowBest = min(perRowBest, milliseconds {
+                    run(perRow, wide: false, lanes: 64, output: perRowOutput, repeats: dispatches)
+                })
+            }
+
+            func gigabytesPerSecond(_ nanoseconds: Double) -> Double {
+                Double(weightBytes * dispatches) / (nanoseconds / 1e9) / 1e9
+            }
+            var columns = String(
+                format: "[dsv41 fp8 form] %-22@ %6.1f MB  per-row %7.3f ms (%5.0f GB/s)",
+                name as NSString,
+                Double(weightBytes) / 1_048_576,
+                perRowBest / Double(dispatches),
+                gigabytesPerSecond(perRowBest)
+            )
+            for lane in laneWidths {
+                guard let best = wideBest[lane] else { continue }
+                columns += String(
+                    format: "  %d-lane %7.3f ms (%5.0f GB/s) %4.2fx",
+                    lane,
+                    best / Double(dispatches),
+                    gigabytesPerSecond(best),
+                    perRowBest / best
+                )
+            }
+            print(columns)
+        }
+
+        // The published dense projections: wq_b and wo_b are the 40 MB pair that
+        // dominate a layer, wo_a is one band of its block-diagonal dispatch, wq_a and
+        // wkv are narrow, and the shared experts are the FFN half of the dense block.
+        for tokens in [1, 8] {
+            measure(name: "attn.wq_b", outDim: 32_768, inDim: 1_280, tokens: tokens)
+            measure(name: "attn.wo_b", outDim: 5_120, inDim: 8_192, tokens: tokens)
+            measure(name: "attn.wo_a band", outDim: 1_024, inDim: 4_096, tokens: tokens)
+            measure(name: "attn.wq_a", outDim: 1_280, inDim: 5_120, tokens: tokens)
+            measure(name: "attn.wkv", outDim: 512, inDim: 5_120, tokens: tokens)
+            measure(name: "shared_experts.w1", outDim: 2_304, inDim: 5_120, tokens: tokens)
+        }
+    }
+
+    // MARK: Routed mixture forms
+
+    /// What the coalesced forms are worth on the routed mixture.
+    ///
+    /// At decode the mixture reads 4.4 GB of MXFP4 per token — six experts of gate,
+    /// up and down in every one of forty layers — through two kernels that give a
+    /// thread a whole row. That is the largest single block of a token's GPU time
+    /// (`DeepSeekV41WalkTiming.mixtureDeviceNanoseconds`, ~82 ms), and the FP8 A/B
+    /// above says the shape of the defect is the same one: a warp's lanes a row
+    /// apart instead of adjacent.
+    ///
+    /// Each arm runs `dispatches` distinct weight regions inside one command buffer,
+    /// so the commit-and-wait round trip is amortized and no arm reads bytes another
+    /// arm just cached. Both are checked against each other before being timed.
+    func testWhatTheCoalescedMixtureIsWorth() throws {
+        guard let metal = MTLCreateSystemDefaultDevice(),
+              let library = metal.makeDefaultLibrary(),
+              let oldSwiGLU = library.makeFunction(name: DeepSeekV41Kernels.mxfp4SwiGLU),
+              let newSwiGLU = library.makeFunction(name: DeepSeekV41Kernels.mxfp4SwiGLURows),
+              let oldDown = library.makeFunction(name: DeepSeekV41Kernels.mxfp4DownAccumulate),
+              let newDown = library.makeFunction(name: DeepSeekV41Kernels.mxfp4DownAccumulateRows),
+              let swigluOld = try? metal.makeComputePipelineState(function: oldSwiGLU),
+              let swigluNew = try? metal.makeComputePipelineState(function: newSwiGLU),
+              let downOld = try? metal.makeComputePipelineState(function: oldDown),
+              let downNew = try? metal.makeComputePipelineState(function: newDown),
+              let queue = metal.makeCommandQueue() else {
+            XCTFail("the mixture kernels are not in the default library")
+            return
+        }
+
+        let repetitions = 6
+        let dispatches = 6
+
+        var state: UInt64 = 0xC0FF_EE00_1234_5678
+        func nextByte() -> UInt8 {
+            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return UInt8(truncatingIfNeeded: state >> 33)
+        }
+        // Any byte is two valid E2M1 values, so the weight tile needs no care; the
+        // scales sit near 2^0 so the sums stay in range.
+        let weightTile: [UInt8] = (0..<4_096).map { _ in nextByte() }
+        let scaleTile: [UInt8] = (0..<256).map { UInt8(124 + ($0 % 7)) }
+        let inputTile: [Float] = (0..<4_096).map { Float(($0 &* 29 &+ 7) % 17 - 8) / 16 }
+
+        func fill<T>(_ buffer: MTLBuffer, bytes: Int, tile: [T]) {
+            let valueStride = MemoryLayout<T>.stride
+            let destination = buffer.contents()
+            tile.withUnsafeBytes { source in
+                guard let base = source.baseAddress else { return }
+                var written = 0
+                while written < bytes {
+                    let chunk = min(tile.count * valueStride, bytes - written)
+                    memcpy(destination + written, base, chunk)
+                    written += chunk
+                }
+            }
+        }
+
+        /// One shape: gate+up through both swiglu forms, or down through both.
+        ///
+        /// `weightMatrices` is 2 for the fused swiglu (gate and up) and 1 for down.
+        func measure(
+            name: String,
+            outDim: Int,
+            inDim: Int,
+            tokens: Int,
+            isSwiGLU: Bool
+        ) {
+            let matrices = isSwiGLU ? 2 : 1
+            let rowBytes = inDim / 2
+            let scaleRowBytes = inDim / 32
+            let matrixBytes = outDim * rowBytes
+            let scaleMatrixBytes = outDim * scaleRowBytes
+            guard let weight = metal.makeBuffer(
+                      length: matrices * matrixBytes * dispatches, options: .storageModeShared
+                  ),
+                  let scale = metal.makeBuffer(
+                      length: matrices * scaleMatrixBytes * dispatches,
+                      options: .storageModeShared
+                  ),
+                  let input = metal.makeBuffer(
+                      length: tokens * inDim * MemoryLayout<Float>.stride,
+                      options: .storageModeShared
+                  ),
+                  let oldOutput = metal.makeBuffer(
+                      length: tokens * outDim * MemoryLayout<Float>.stride,
+                      options: .storageModeShared
+                  ),
+                  let newOutput = metal.makeBuffer(
+                      length: tokens * outDim * MemoryLayout<Float>.stride,
+                      options: .storageModeShared
+                  ) else {
+                XCTFail("\(name): buffers did not allocate")
+                return
+            }
+            fill(weight, bytes: matrices * matrixBytes * dispatches, tile: weightTile)
+            fill(scale, bytes: matrices * scaleMatrixBytes * dispatches, tile: scaleTile)
+            fill(input, bytes: tokens * inDim * MemoryLayout<Float>.stride, tile: inputTile)
+
+            func encode(
+                pipeline: MTLComputePipelineState,
+                wide: Bool,
+                lanes: Int,
+                output: MTLBuffer,
+                repeats: Int
+            ) {
+                guard let commandBuffer = queue.makeCommandBuffer(),
+                      let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+                var inDimension = UInt32(inDim)
+                var outDimension = UInt32(outDim)
+                var limit: Float = 7
+                var routing: Float = 0.5
+                encoder.setComputePipelineState(pipeline)
+                encoder.setBuffer(weight, offset: 0, index: isSwiGLU ? 0 : 0)
+                encoder.setBuffer(scale, offset: 0, index: 1)
+                if isSwiGLU {
+                    encoder.setBuffer(weight, offset: 0, index: 2)
+                    encoder.setBuffer(scale, offset: 0, index: 3)
+                    encoder.setBuffer(input, offset: 0, index: 4)
+                    encoder.setBuffer(output, offset: 0, index: 5)
+                } else {
+                    encoder.setBuffer(input, offset: 0, index: 2)
+                    encoder.setBuffer(output, offset: 0, index: 3)
+                }
+                if wide {
+                    encoder.setThreadgroupMemoryLength(
+                        (isSwiGLU ? 64 : 32) * MemoryLayout<Float>.stride, index: 0
+                    )
+                }
+                for repeatIndex in 0..<max(1, repeats) {
+                    let step = repeatIndex % max(1, dispatches)
+                    var gateWeightOffset = UInt64(step * matrixBytes)
+                    var gateScaleOffset = UInt64(step * scaleMatrixBytes)
+                    var upWeightOffset = UInt64(step * matrixBytes + matrixBytes * dispatches)
+                    var upScaleOffset = UInt64(step * scaleMatrixBytes + scaleMatrixBytes * dispatches)
+                    if isSwiGLU {
+                        encoder.setBytes(&gateWeightOffset, length: 8, index: 6)
+                        encoder.setBytes(&gateScaleOffset, length: 8, index: 7)
+                        encoder.setBytes(&upWeightOffset, length: 8, index: 8)
+                        encoder.setBytes(&upScaleOffset, length: 8, index: 9)
+                        encoder.setBytes(&inDimension, length: 4, index: 10)
+                        encoder.setBytes(&outDimension, length: 4, index: 11)
+                        encoder.setBytes(&limit, length: 4, index: 12)
+                    } else {
+                        encoder.setBytes(&gateWeightOffset, length: 8, index: 4)
+                        encoder.setBytes(&gateScaleOffset, length: 8, index: 5)
+                        encoder.setBytes(&inDimension, length: 4, index: 6)
+                        encoder.setBytes(&outDimension, length: 4, index: 7)
+                        encoder.setBytes(&routing, length: 4, index: 8)
+                    }
+                    if wide {
+                        encoder.dispatchThreadgroups(
+                            MTLSize(width: outDim * (isSwiGLU ? tokens : 1), height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+                        )
+                    } else if isSwiGLU {
+                        encoder.dispatchThreads(
+                            MTLSize(width: outDim, height: tokens, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
+                        )
+                    } else {
+                        encoder.dispatchThreads(
+                            MTLSize(width: outDim, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
+                        )
+                    }
+                }
+                encoder.endEncoding()
+                commandBuffer.commit()
+                commandBuffer.waitUntilCompleted()
+            }
+
+            // Validate once, on clean outputs. The down kernel accumulates, so a
+            // second run over the same buffer is not comparable to the first.
+            for buffer in [oldOutput, newOutput] {
+                memset(buffer.contents(), 0, buffer.length)
+            }
+            encode(pipeline: isSwiGLU ? swigluOld : downOld, wide: false, lanes: 64,
+                   output: oldOutput, repeats: 1)
+            encode(pipeline: isSwiGLU ? swigluNew : downNew, wide: true, lanes: 64,
+                   output: newOutput, repeats: 1)
+            let first = floats(oldOutput, count: tokens * outDim)
+            let second = floats(newOutput, count: tokens * outDim)
+            let magnitude = max(1, first.map { abs($0) }.max() ?? 1)
+            let drift = worstDelta(first, second)
+            let bytesPerDispatch = matrices * matrixBytes
+            print(
+                String(
+                    format: "[dsv41 mixture] %-18@ %5dx%-5d rows %d  drift %.3g / %.3g",
+                    name as NSString, outDim, inDim, tokens, drift, magnitude
+                )
+            )
+            guard drift < magnitude * 1e-3 else {
+                print("[dsv41 mixture] \(name): the two forms disagree, not timing it")
+                return
+            }
+
+            var oldBest = Double.infinity
+            var wideBest: [Int: Double] = [:]
+            for lane in [32, 64] { wideBest[lane] = Double.infinity }
+            for _ in 0..<repetitions {
+                for lane in [32, 64] {
+                    wideBest[lane] = min(wideBest[lane] ?? .infinity, milliseconds {
+                        encode(pipeline: isSwiGLU ? swigluNew : downNew, wide: true, lanes: lane,
+                               output: newOutput, repeats: dispatches)
+                    })
+                }
+                oldBest = min(oldBest, milliseconds {
+                    encode(pipeline: isSwiGLU ? swigluOld : downOld, wide: false, lanes: 64,
+                           output: oldOutput, repeats: dispatches)
+                })
+            }
+            func gigabytesPerSecond(_ nanoseconds: Double) -> Double {
+                Double(bytesPerDispatch * dispatches) / (nanoseconds / 1e9) / 1e9
+            }
+            var line = String(
+                format: "[dsv41 mixture] %-18@ %6.1f MB  one-thread %7.3f ms (%5.0f GB/s)",
+                name as NSString,
+                Double(bytesPerDispatch) / 1_048_576,
+                oldBest / Double(dispatches),
+                gigabytesPerSecond(oldBest)
+            )
+            for lane in [32, 64] {
+                guard let best = wideBest[lane] else { continue }
+                line += String(
+                    format: "  %d-lane %7.3f ms (%5.0f GB/s) %4.2fx",
+                    lane,
+                    best / Double(dispatches),
+                    gigabytesPerSecond(best),
+                    oldBest / best
+                )
+            }
+            print(line)
+        }
+
+        // The published routed expert: gate and up are 2,304 rows over 5,120 values,
+        // down is 5,120 over 2,304. Both a decode position and a full block.
+        for tokens in [1, 8] {
+            measure(name: "expert gate+up", outDim: 2_304, inDim: 5_120, tokens: tokens, isSwiGLU: true)
+        }
+        for tokens in [1, 8] {
+            measure(name: "expert down", outDim: 5_120, inDim: 2_304, tokens: tokens, isSwiGLU: false)
+        }
+    }
 }

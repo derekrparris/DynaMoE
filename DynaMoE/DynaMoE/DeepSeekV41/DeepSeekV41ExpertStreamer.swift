@@ -225,6 +225,15 @@ nonisolated public final class DeepSeekV41ExpertShardReader: @unchecked Sendable
                 "\(url.lastPathComponent): fstat failed, errno \(code)"
             )
         }
+        // Deliberately NOT `F_NOCACHE`. The arena holds ~70 GB of whole experts and
+        // makes a read per miss, so bypassing the unified buffer cache looks like a
+        // way to stop the two caches competing for RAM. Measured on the published
+        // checkpoint it is a 2.2x loss: a fill runs at 13.4-13.9 GB/s through the file
+        // cache and 2-4 GB/s with `F_NOCACHE`, and the loss lands on the GPU sides too
+        // because the reads stall while pages are allocated one at a time
+        // (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #20"). A cold read of the same
+        // ranges through a plain buffer measures 13.8 GB/s either way, so the cost is
+        // this destination — Metal's shared memory — not the disk.
         self.descriptor = fd
         self.path = url.lastPathComponent
         self.fileSize = Int(status.st_size)
@@ -409,6 +418,21 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
     /// Wall time spent inside `pread` batches. Reported beside the byte count so a
     /// slow turn can be told apart from a slow disk without a profiler.
     private var secondsReading: Double = 0
+    /// Wall time spent creating a slot's `MTLBuffer`, and how many were created.
+    ///
+    /// A slot is allocated on first use, and allocating 19 MB is not free: the pages
+    /// are committed and faulted as the pread writes them, so the cost lands inside
+    /// the token loop rather than at load. Kept separate from `secondsReading` because
+    /// it is the one part of a fill that a bigger arena would not repeat.
+    private var secondsAllocating: Double = 0
+    private var slotsAllocated: Int = 0
+
+    /// Read and allocation time so far, for the walk instrumentation.
+    public var timing: (reading: Double, allocating: Double, slotsAllocated: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (secondsReading, secondsAllocating, slotsAllocated)
+    }
 
     public init(
         device: MTLDevice,
@@ -690,6 +714,7 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
             throw DeepSeekV41ExpertStreamError.allocationFailed(slot: slot, bytes: geometry.slotBytes)
         }
         if let existing = slotBuffers[slot] { return existing }
+        let allocationStarted = DispatchTime.now().uptimeNanoseconds
         guard let buffer = device.makeBuffer(
             length: max(geometry.slotBytes, 16),
             options: .storageModeShared
@@ -700,6 +725,10 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
         }
         buffer.label = "dsv41.expert.slot.\(slot)"
         slotBuffers[slot] = buffer
+        secondsAllocating += Double(
+            DispatchTime.now().uptimeNanoseconds - allocationStarted
+        ) / 1_000_000_000
+        slotsAllocated += 1
         return buffer
     }
 }
